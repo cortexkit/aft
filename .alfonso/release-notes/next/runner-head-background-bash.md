@@ -1,1 +1,0 @@
-- A `bash` call with `background: true` from a head agent running on Thalamus now answers at once with the task id instead of holding the call until the command ends; the completion arrives later as a notice in that session.

@@ -481,8 +481,8 @@
           "status": "unavailable",
           "code": "callgraph_unavailable",
           "index": {
-            "status": "unavailable",
-            "reason": "runtime_not_observed"
+            "status": "off",
+            "reason": "not_bound"
           }
         }
       }

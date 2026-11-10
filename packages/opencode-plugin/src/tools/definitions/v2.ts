@@ -1,3 +1,4 @@
+import { BashPermissionLoopError } from "@cortexkit/aft-bridge";
 import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
@@ -110,6 +111,87 @@ function failure(error: unknown): Error {
     }
   })();
   return new Error(`V2 tool execution rejected with a non-Error value: ${detail}`);
+}
+
+function tagOf(value: unknown): unknown {
+  return typeof value === "object" && value !== null
+    ? (value as { _tag?: unknown })._tag
+    : undefined;
+}
+
+type HostErrorClass = new (props: Record<string, unknown>) => Error & Record<string, unknown>;
+
+/**
+ * Report AFT's shell permission refusal as the host's own permission failure,
+ * so OpenCode 2 files it as `permission.rejected` rather than `tool.execution`.
+ *
+ * When a deny rule matches, or the person rejects the prompt with feedback,
+ * the host's `permission.assert` fails with a `Tool.Error` whose `error` is the
+ * host's `Permission.BlockedError` or `Permission.CorrectedError`. The host
+ * classifies a failed tool call by the error the tool fails with: a
+ * `Tool.Error` holding one of those permission errors becomes
+ * `permission.rejected`, and the model is shown the inner error's text (the
+ * blocked error's `message`, which is its `reason` when set, or the
+ * correction's `feedback`). Every other failure becomes `tool.execution`.
+ * See `toSessionError` in @opencode/core 2.0.29 and 2.1.0
+ * (`src/session/to-session-error.ts`) and the plugin `permission.assert`
+ * adapter (`src/plugin/host.ts`).
+ *
+ * The bash permission loop wraps the host's failure in a
+ * `BashPermissionLoopError` carrying AFT's refusal text, which loses that
+ * classification. The plugin API exports no permission error classes, so the
+ * replacement errors are built with the constructors of the errors the host
+ * failed with, and carry AFT's text in the field the host shows the model.
+ * If the host's errors do not have exactly that shape, the original error is
+ * returned: the model sees the same text, filed as a tool execution failure.
+ */
+export function hostPermissionRefusal(error: unknown): unknown {
+  if (!(error instanceof BashPermissionLoopError) || !error.message) return error;
+  const hostError = error.cause;
+  if (!(hostError instanceof Error) || tagOf(hostError) !== "Tool.Error") return error;
+  const inner = (hostError as { error?: unknown }).error;
+  if (!(inner instanceof Error)) return error;
+  const text = error.message;
+  try {
+    const InnerClass = inner.constructor as HostErrorClass;
+    let rebuilt: Error & Record<string, unknown>;
+    let shown: unknown;
+    switch (tagOf(inner)) {
+      case "Permission.BlockedError": {
+        const { rules, permission, resources } = inner as Error & Record<string, unknown>;
+        rebuilt = new InnerClass({ rules, permission, resources, reason: text });
+        shown = rebuilt.message;
+        break;
+      }
+      case "Permission.CorrectedError":
+        rebuilt = new InnerClass({ feedback: text });
+        shown = rebuilt.feedback;
+        break;
+      default:
+        return error;
+    }
+    if (!(rebuilt instanceof InnerClass) || tagOf(rebuilt) !== tagOf(inner) || shown !== text) {
+      return error;
+    }
+    const ToolErrorClass = hostError.constructor as HostErrorClass;
+    const metadata = (hostError as { metadata?: unknown }).metadata;
+    const refusal = new ToolErrorClass({
+      message: text,
+      error: rebuilt,
+      ...(metadata === undefined ? {} : { metadata }),
+    });
+    if (
+      !(refusal instanceof ToolErrorClass) ||
+      tagOf(refusal) !== "Tool.Error" ||
+      refusal.message !== text ||
+      refusal.error !== rebuilt
+    ) {
+      return error;
+    }
+    return refusal;
+  } catch {
+    return error;
+  }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -439,7 +521,7 @@ export function projectV2Tool(
             // return denial text. Rejecting without feedback must instead end
             // the model's current step, so preserve the host's original defect.
             if (stepAbort) throw new PermissionStepAbort(stepAbort.error);
-            throw error;
+            throw hostPermissionRefusal(error);
           } finally {
             signal.removeEventListener("abort", onAbort);
           }

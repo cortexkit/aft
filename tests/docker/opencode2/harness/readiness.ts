@@ -1,10 +1,8 @@
-import { existsSync } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { Database } from "bun:sqlite";
+import { resolve } from "node:path";
 
 import { fail, type HarnessFailureCode } from "./errors.js";
 import type { ReadinessGate, ScriptedTurn } from "./types.js";
+import { asRecord } from "./util.js";
 
 /**
  * How long a row's call is held back for the callgraph store. A small fixture
@@ -15,7 +13,12 @@ import type { ReadinessGate, ScriptedTurn } from "./types.js";
 export const CALLGRAPH_READY_TIMEOUT_MS = 60_000;
 const READINESS_POLL_MS = 250;
 
-export type ReadinessProbe = () => Promise<boolean>;
+export interface ReadinessObservation {
+  ready: boolean;
+  status: unknown;
+}
+
+export type ReadinessProbe = (remainingMs: number) => Promise<ReadinessObservation>;
 export type ReadinessProbes = Record<ReadinessGate["subject"], ReadinessProbe>;
 
 const NEVER_READY_CODE: Record<ReadinessGate["subject"], HarnessFailureCode> = {
@@ -28,65 +31,47 @@ export interface ReadinessRecord {
   timeout_ms: number;
   waited_ms: number;
   polls: number;
+  last_status: unknown;
 }
 
 /**
- * Whether AFT has published a built callgraph store under `storageDir`.
- *
- * This reads the same on-disk state AFT's own read path accepts as ready: the
- * `<key>.current` pointer in `<storage>/callgraph/<key>/` names a generation
- * database, and that database's `meta` table carries `ready = 1`. A store that
- * is still being built has no pointer yet, or points at nothing marked ready.
- * The scenario owns its storage directory, so any published store there is the
- * fixture project's.
+ * Poll the product's raw status response, not an index's storage layout.
+ * A ready graph for another root must not release this scenario's turn.
  */
-export async function callgraphStorePublished(storageDir: string): Promise<boolean> {
-  const root = join(storageDir, "callgraph");
-  let keys: string[];
-  try {
-    keys = await readdir(root);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
-  for (const key of keys) {
-    const directory = join(root, key);
-    let entries: string[];
+export function callgraphReadinessProbe(
+  projectRoot: string,
+  readStatus: (remainingMs: number) => Promise<unknown>,
+): ReadinessProbe {
+  return async (remainingMs) => {
     try {
-      entries = await readdir(directory);
-    } catch {
-      continue;
+      const response = asRecord(await readStatus(remainingMs));
+      const callgraph = asRecord(response?.callgraph_store);
+      const rootMatches = [response?.project_root, response?.canonical_root].some(
+        (root) => typeof root === "string" && resolve(root) === resolve(projectRoot),
+      );
+      return {
+        ready: response?.success === true && rootMatches && callgraph?.status === "ready",
+        status: {
+          success: response?.success,
+          project_root: response?.project_root,
+          canonical_root: response?.canonical_root,
+          callgraph_store: callgraph ?? null,
+          status: response?.status,
+          code: response?.code,
+          message: response?.message,
+        },
+      };
+    } catch (error) {
+      return {
+        ready: false,
+        status: {
+          status: "unavailable",
+          reason: "status_request_failed",
+          error: error instanceof Error ? error.message : String(error),
+        },
+      };
     }
-    for (const pointer of entries.filter((entry) => entry.endsWith(".current"))) {
-      const generation = (
-        await readFile(join(directory, pointer), "utf8").catch(() => "")
-      ).trim();
-      if (!generation) continue;
-      const databasePath = join(directory, generation);
-      if (existsSync(databasePath) && storeMarkedReady(databasePath)) return true;
-    }
-  }
-  return false;
-}
-
-function storeMarkedReady(databasePath: string): boolean {
-  let database: Database | undefined;
-  try {
-    database = new Database(databasePath, { readonly: true });
-    // AFT may still be writing the database; wait for that write instead of
-    // failing the read with "database is locked".
-    database.exec("PRAGMA busy_timeout = 5000");
-    const row = database
-      .query<{ v: string }, []>("SELECT v FROM meta WHERE k = 'ready'")
-      .get();
-    return row?.v === "1";
-  } catch {
-    // A generation that is mid-publish can be unreadable for a moment; the
-    // next poll reads it again.
-    return false;
-  } finally {
-    database?.close();
-  }
+  };
 }
 
 /**
@@ -105,21 +90,29 @@ export async function awaitReadiness(
   let polls = 0;
   for (;;) {
     polls += 1;
-    if (await probe()) {
+    const observation = await probe(Math.max(1, deadline - Date.now()));
+    if (observation.ready) {
       return {
         subject: gate.subject,
         turn,
         timeout_ms: gate.timeout_ms,
         waited_ms: Date.now() - startedAt,
         polls,
+        last_status: observation.status,
       };
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
       fail(
         NEVER_READY_CODE[gate.subject],
-        `${gate.subject} never became ready within ${gate.timeout_ms}ms before turn ${turn}`,
-        { subject: gate.subject, turn, timeout_ms: gate.timeout_ms, polls },
+        `${gate.subject} never became ready within ${gate.timeout_ms}ms before turn ${turn}; last status: ${JSON.stringify(observation.status)}`,
+        {
+          subject: gate.subject,
+          turn,
+          timeout_ms: gate.timeout_ms,
+          polls,
+          last_status: observation.status,
+        },
       );
     }
     await Bun.sleep(Math.min(pollMs, remaining));

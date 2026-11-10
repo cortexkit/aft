@@ -403,7 +403,7 @@ fn rollback_rename(
     rollback: &RenameRollback,
 ) -> super::rollback_outcome::RollbackOutcome {
     let _view_intent =
-        crate::views::intent::record_paths(rollback.files.iter().map(|path| path.as_path()));
+        crate::write_intent::record_paths(rollback.files.iter().map(|path| path.as_path()));
     let result = ctx
         .checkpoint()
         .lock()
@@ -435,7 +435,7 @@ fn apply_collected_changes(
     ctx: &AppContext,
 ) -> Result<Vec<FileChange>, LspError> {
     let _view_intent =
-        crate::views::intent::record_paths(file_changes.keys().map(|path| path.as_path()));
+        crate::write_intent::record_paths(file_changes.keys().map(|path| path.as_path()));
     let mut results = Vec::with_capacity(file_changes.len());
 
     for (path, edits) in file_changes {

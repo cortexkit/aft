@@ -1549,6 +1549,16 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
         )
         .unwrap()
         .contains(&grant));
+        let source: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source FROM access_grants WHERE path=?1",
+                [grant.path.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "person");
     }
 }
 
@@ -3431,10 +3441,12 @@ async fn consent_scope_head_file_only_scope_answer_stores_only_the_file() {
     };
     {
         let db = f.ctx.db().unwrap();
-        crate::db::access_grants::insert(
+        crate::db::access_grants::insert_with_source(
             &db.lock().unwrap(),
             &access_grants::scope_key(&f.head),
             &grant,
+            None,
+            None,
         )
         .unwrap();
     }
@@ -3454,6 +3466,34 @@ async fn consent_scope_head_file_only_scope_answer_stores_only_the_file() {
     let allowed = f.settled_read(&f.worker, &target, 202).await;
     assert!(text(&allowed).contains("unheld contents"), "{allowed}");
     assert_eq!(f.worker_grants(), vec![grant]);
+    let source: Option<String> = f
+        .ctx
+        .db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT source FROM access_grants WHERE scope_ref=?1",
+            [&f.worker.scope.as_ref().unwrap().scope_ref],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source.as_deref(), Some("unknown"),
+        "a legacy head grant cannot establish person-given authority, but the new answer has a recorded source");
+    let listed =
+        crate::subc::permissions::list(&f.ctx.db().unwrap().lock().unwrap(), None, &[]).unwrap();
+    let row = listed["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["holder"]["scope_ref"] == f.worker.scope.as_ref().unwrap().scope_ref)
+        .unwrap();
+    assert_eq!(row["source"], "unknown");
+    assert!(row["granted_at_ms"].is_i64());
+    assert!(
+        row.get("granted_at_bound").is_none(),
+        "new unknown-source answers have exact recorded times"
+    );
     let sibling = f.dir.path().join("sibling.txt");
     std::fs::write(&sibling, "sibling contents").unwrap();
     assert_eq!(
@@ -3492,6 +3532,19 @@ async fn consent_scope_head_directory_still_delegates_directory() {
             operation: AccessOperation::Read,
         }]
     );
+    let source: String = f
+        .ctx
+        .db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT source FROM access_grants WHERE scope_ref=?1",
+            [&f.worker.scope.as_ref().unwrap().scope_ref],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, "head_policy");
 }
 
 #[cfg(unix)]

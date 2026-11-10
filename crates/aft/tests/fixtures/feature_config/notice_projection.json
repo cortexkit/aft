@@ -152,6 +152,28 @@
         }
       },
       "digest": "2670d23b1c83be8016451c8224441d31f76da5e7a6c8944d501d73bfefb8b6fa"
+    },
+    {
+      "name": "data_layer_keys_base_and_harness",
+      "note": "the data-layer keys are projected, so adding one is a new notice identity",
+      "doc": {
+        "views": {
+          "enabled": true,
+          "callgraph_copies": 2,
+          "idle_checkout_hours": 48
+        },
+        "worktree": {
+          "ram_overlay": false
+        },
+        "harnesses": {
+          "pi": {
+            "views": {
+              "enabled": false
+            }
+          }
+        }
+      },
+      "digest": "ef6e9318eb6393c53177f1dee507a2b84810868ec10e040943e45bca63435cd5"
     }
   ]
 }

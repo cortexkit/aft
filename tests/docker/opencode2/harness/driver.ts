@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -43,7 +43,8 @@ import {
   sessionPermissionRules,
 } from "./permission-plan.js";
 import { readPinnedHostVersion, readPinnedV1HostVersion } from "./pin.js";
-import { awaitTurnReadiness, callgraphStorePublished, readinessBudgetMs } from "./readiness.js";
+import { awaitTurnReadiness, callgraphReadinessProbe, readinessBudgetMs } from "./readiness.js";
+import { scenarioStatusSource } from "./status-source.js";
 import {
   type AbortSettlementEvidence,
   callAbortedFailure,
@@ -598,7 +599,16 @@ async function runOneScenario(options: {
             isolation.env.AFT_STORAGE_DIR ?? join(isolation.data, "cortexkit", "aft");
           try {
             const readiness = await awaitTurnReadiness(turn, {
-              callgraph: () => callgraphStorePublished(storageDir),
+              callgraph: callgraphReadinessProbe(
+                await realpath(isolation.project),
+                scenarioStatusSource({
+                  hostGeneration,
+                  projectRoot: isolation.project,
+                  storageDir,
+                  endpointFile: join(isolation.root, "aft-status-endpoint"),
+                  token: isolation.env.AFT_E2E_STATUS_TOKEN ?? "",
+                }),
+              ),
             });
             await forensics.writeJson(`readiness-${turn.label}.json`, readiness);
           } catch (error) {
@@ -791,6 +801,7 @@ async function runOneScenario(options: {
       projectConfig: scenario.project_config,
       userConfig: scenario.user_config,
       scenarioEnv: scenario.env,
+      statusReadiness: scenario.turns.some((turn) => turn.await_ready),
       providerConfig: options.providerConfig,
       providerConfigKey: options.providerConfigKey,
       hostDependencies: config.v1HostDependencies,

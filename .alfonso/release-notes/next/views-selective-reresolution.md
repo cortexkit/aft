@@ -1,1 +1,0 @@
-With views on, after an edit AFT re-resolves only the call-graph entries the edit affects instead of the whole project, so call-graph answers in a worktree are ready much sooner (for example 83 s to 10 s after editing a widely used Rust file in AFT itself).

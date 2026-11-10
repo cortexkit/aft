@@ -15,7 +15,7 @@ fn probe(root: &Path, expected: &str) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "root_cache::location::speech_serving_tests::child",
+            "cache_location::speech_serving_tests::child",
             "--nocapture",
         ])
         .env("AFT_TEST_SPEECH_LOCK_ROOT", root)

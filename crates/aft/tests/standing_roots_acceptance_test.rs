@@ -233,26 +233,24 @@ fn case_a_fence_and_resume_smoke() {
     ));
 }
 
-#[test]
-fn cli_snapshot_daemonless_query_discloses_stale_snapshot() {
-    let standing_root = tempfile::tempdir().expect("standing root");
-    let session_root = tempfile::tempdir().expect("session root");
-    let storage = tempfile::tempdir().expect("storage");
-    let config_home = tempfile::tempdir().expect("config home");
-    let source = standing_root.path().join("src/lib.rs");
+/// A standing root holding one source file, in a Git repository, and a user
+/// configuration under `config_home` that lists it for the search index.
+/// Returns the source file.
+fn standing_search_root(standing_root: &Path, config_home: &Path) -> PathBuf {
+    let source = standing_root.join("src/lib.rs");
     std::fs::create_dir_all(source.parent().expect("source parent")).expect("create source dir");
     std::fs::write(&source, "pub fn needle_symbol() {}\n").expect("write source");
     assert!(
         Command::new("git")
             .args(["init", "--quiet"])
-            .current_dir(standing_root.path())
+            .current_dir(standing_root)
             .status()
             .expect("git init")
             .success(),
         "git init failed"
     );
 
-    let user_config = config_home.path().join("cortexkit/aft.jsonc");
+    let user_config = config_home.join("cortexkit/aft.jsonc");
     std::fs::create_dir_all(user_config.parent().expect("config parent"))
         .expect("create config directory");
     std::fs::write(
@@ -260,7 +258,7 @@ fn cli_snapshot_daemonless_query_discloses_stale_snapshot() {
         serde_json::to_string(&serde_json::json!({
             "index": {
                 "roots": [{
-                    "path": standing_root.path().display().to_string(),
+                    "path": standing_root.display().to_string(),
                     "indexes": ["search"],
                 }]
             }
@@ -268,6 +266,57 @@ fn cli_snapshot_daemonless_query_discloses_stale_snapshot() {
         .expect("serialize user config"),
     )
     .expect("write user config");
+    source
+}
+
+/// `aft index` writes the standing root's data-layer store, so a daemonless
+/// `aft_search` given that root as its path must answer from that store. It
+/// answers from the bounded walk of a root with no index instead.
+#[test]
+fn daemonless_query_reads_the_data_layer_store_aft_index_wrote() {
+    let standing_root = tempfile::tempdir().expect("standing root");
+    let session_root = tempfile::tempdir().expect("session root");
+    let storage = tempfile::tempdir().expect("storage");
+    let config_home = tempfile::tempdir().expect("config home");
+    standing_search_root(standing_root.path(), config_home.path());
+
+    run_cli_snapshot(standing_root.path(), config_home.path(), storage.path());
+    assert!(
+        storage.path().join("data").is_dir(),
+        "aft index wrote no data-layer store"
+    );
+    let daemonless = daemonless_context(session_root.path(), storage.path());
+    let answer = response_value(handle_semantic_search(
+        &search_request(standing_root.path()),
+        &daemonless,
+    ));
+    assert_eq!(answer["success"], true, "{answer:?}");
+    assert_ne!(
+        answer["semantic_status"], "external_unindexed",
+        "the query found no index for a root aft index just indexed: {answer:?}"
+    );
+    // The plan names `fallback_walk` for every regex query, whichever source
+    // answers it, so the lanes are checked on an identifier query, whose
+    // plan names the index lanes only when an index is ready to answer.
+    let mut identifier = search_request(standing_root.path());
+    identifier.params["query"] = serde_json::json!("needle_symbol");
+    let answer = response_value(handle_semantic_search(&identifier, &daemonless));
+    assert_eq!(answer["success"], true, "{answer:?}");
+    assert!(
+        answer["structuredContent"]["plan"]["lanes_run"]
+            .as_array()
+            .is_some_and(|lanes| !lanes.iter().any(|lane| lane == "fallback_walk")),
+        "the query walked the root instead of reading its store: {answer:?}"
+    );
+}
+
+#[test]
+fn cli_snapshot_daemonless_query_discloses_stale_snapshot() {
+    let standing_root = tempfile::tempdir().expect("standing root");
+    let session_root = tempfile::tempdir().expect("session root");
+    let storage = tempfile::tempdir().expect("storage");
+    let config_home = tempfile::tempdir().expect("config home");
+    let source = standing_search_root(standing_root.path(), config_home.path());
 
     run_cli_snapshot(standing_root.path(), config_home.path(), storage.path());
     let daemonless = daemonless_context(session_root.path(), storage.path());

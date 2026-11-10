@@ -107,51 +107,84 @@ fn configure_ignore_change_purges_indexed_file_from_grep() {
 }
 
 #[test]
-fn self_matching_root_gitignore_reload_updates_search_index() {
+fn root_gitignore_reload_updates_search_index() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     for (label, original) in [
-        ("self-matching", "*-old*.json\n.gitignore\n"),
         ("negated", "*-old*.json\n.gitignore\n!.gitignore\n"),
         ("ordinary", "*-old*.json\n"),
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let ignore_path = dir.path().join(".gitignore");
-        fs::write(&ignore_path, original).unwrap();
-        fs::write(dir.path().join("seed.txt"), "seed_marker\n").unwrap();
-        fs::write(dir.path().join("x-zq-0.json"), "indexed_zq_marker\n").unwrap();
-
-        let mut aft = AftProcess::spawn_with_real_watcher();
-        configure_with_search_index(&mut aft, dir.path());
-        wait_for_ready_grep(
-            &mut aft,
-            &format!("{label} initial index"),
-            "indexed_zq_marker",
-            |response| response["total_matches"] == 1,
-        );
-
-        fs::write(&ignore_path, format!("{original}*-zq*.json\n")).unwrap();
-        wait_for_ready_grep(
-            &mut aft,
-            &format!("{label} retired file"),
-            "indexed_zq_marker",
-            |response| response["total_matches"] == 0,
-        );
-
-        fs::write(dir.path().join("x-zq-1.json"), "new_zq_marker\n").unwrap();
-        fs::write(dir.path().join("visible.txt"), "visible_zq_marker\n").unwrap();
-        wait_for_ready_grep(
-            &mut aft,
-            &format!("{label} visible file"),
-            "visible_zq_marker",
-            |response| response["total_matches"] == 1,
-        );
-        let ignored = grep_marker(&mut aft, "new_zq_marker");
-        assert_eq!(ignored["success"], true, "{label}: {ignored:?}");
-        assert_eq!(ignored["total_matches"], 0, "{label}: {ignored:?}");
-
-        let shutdown = aft.shutdown();
-        assert!(shutdown.success());
+        assert_root_gitignore_reload_updates_search_index(label, original);
     }
+}
+
+/// A root `.gitignore` that ignores itself: the watcher reports its change only
+/// as an ignore-rule change, never as a changed path. Today's index rebuilds
+/// its matcher on that event; the data layer hears only changed paths
+/// (`data_note_paths` in the watcher drain), so its checkout keeps serving the
+/// file the new rule ignores.
+#[test]
+fn self_matching_root_gitignore_reload_updates_search_index() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    assert_root_gitignore_reload_updates_search_index("self-matching", "*-old*.json\n.gitignore\n");
+}
+
+fn wait_for_data_layer_search_index(aft: &mut AftProcess, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = aft.send(r#"{"id":"search-index-status","command":"status"}"#);
+        if status["search_index"]["status"] == "ready" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: the data layer never published: {status:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_root_gitignore_reload_updates_search_index(label: &str, original: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let ignore_path = dir.path().join(".gitignore");
+    fs::write(&ignore_path, original).unwrap();
+    fs::write(dir.path().join("seed.txt"), "seed_marker\n").unwrap();
+    fs::write(dir.path().join("x-zq-0.json"), "indexed_zq_marker\n").unwrap();
+
+    let mut aft = AftProcess::spawn_with_real_watcher();
+    configure_with_search_index(&mut aft, dir.path());
+    wait_for_ready_grep(
+        &mut aft,
+        &format!("{label} initial index"),
+        "indexed_zq_marker",
+        |response| response["total_matches"] == 1,
+    );
+    // That grep started the data layer's build of the search index; until the
+    // data layer publishes it, grep answers from today's trigram index, which
+    // this test does not mean to check.
+    wait_for_data_layer_search_index(&mut aft, label);
+
+    fs::write(&ignore_path, format!("{original}*-zq*.json\n")).unwrap();
+    wait_for_ready_grep(
+        &mut aft,
+        &format!("{label} retired file"),
+        "indexed_zq_marker",
+        |response| response["total_matches"] == 0,
+    );
+
+    fs::write(dir.path().join("x-zq-1.json"), "new_zq_marker\n").unwrap();
+    fs::write(dir.path().join("visible.txt"), "visible_zq_marker\n").unwrap();
+    wait_for_ready_grep(
+        &mut aft,
+        &format!("{label} visible file"),
+        "visible_zq_marker",
+        |response| response["total_matches"] == 1,
+    );
+    let ignored = grep_marker(&mut aft, "new_zq_marker");
+    assert_eq!(ignored["success"], true, "{label}: {ignored:?}");
+    assert_eq!(ignored["total_matches"], 0, "{label}: {ignored:?}");
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
 }
 
 #[test]

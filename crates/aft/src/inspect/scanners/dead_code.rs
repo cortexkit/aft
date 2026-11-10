@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -23,8 +23,8 @@ use crate::inspect::oxc_engine::{
     ReExportFact, ReExportKind, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::inspect::{
-    CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
-    InspectResult, InspectScanSuccess,
+    CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory,
+    InspectJob, InspectResult, InspectScanSuccess,
 };
 use crate::parser::{detect_language, grammar_for, LangId};
 
@@ -33,6 +33,15 @@ use super::source_text::{
     MAX_GRAPH_SOURCE_BYTES,
 };
 use super::DEFAULT_EXPORT_MARKER_KIND;
+
+pub(crate) mod engine;
+pub(crate) mod index;
+pub(crate) mod kept;
+pub(crate) mod reads;
+pub(crate) mod section;
+
+use index::Index;
+use reads::{Lookup, Tracked};
 
 pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 11;
 #[cfg(test)]
@@ -104,42 +113,6 @@ fn canonicalize_normalized(path: &Path) -> PathBuf {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct GraphTargets {
-    ordinary: BTreeSet<ExportNode>,
-    // Every confirmed caller in one file shares the same initializer targets.
-    initializers: Option<Arc<BTreeSet<ExportNode>>>,
-    // Synthetic initializer edges exclude self-calls; ordinary self-calls stay.
-    source: Option<ExportNode>,
-}
-
-impl GraphTargets {
-    fn insert(&mut self, node: ExportNode) -> bool {
-        self.ordinary.insert(node)
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &ExportNode> {
-        self.ordinary.iter().chain(
-            self.initializers
-                .iter()
-                .flat_map(|targets| targets.iter())
-                .filter(|target| {
-                    self.source.as_ref() != Some(*target) && !self.ordinary.contains(*target)
-                }),
-        )
-    }
-}
-
-impl<'a> IntoIterator for &'a GraphTargets {
-    type Item = &'a ExportNode;
-    type IntoIter = Box<dyn Iterator<Item = &'a ExportNode> + 'a>;
-    fn into_iter(self) -> Self::IntoIter {
-        Box::new(self.iter())
-    }
-}
-
-type GraphEdges = BTreeMap<ExportNode, GraphTargets>;
-
 #[derive(Debug, Clone)]
 struct GoInitializerContribution {
     callers: Vec<String>,
@@ -152,88 +125,6 @@ struct OutboundCallsByCallerFile<'a> {
     lexical_fallbacks: usize,
 }
 type MethodNamesByLanguage = BTreeMap<String, BTreeSet<String>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RollupKind {
-    Incremental,
-    Full,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RollupVerdict {
-    pub kind: RollupKind,
-    pub reason: Option<&'static str>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DeadCodeRollupState {
-    all: Arc<ReachabilityState>,
-    production: Arc<ReachabilityState>,
-    materialized: Arc<Vec<DeadCodeContribution>>,
-    contribution_hashes: BTreeMap<String, String>,
-    callgraph_hashes: BTreeMap<String, String>,
-    initializer_files: BTreeSet<String>,
-    public_api_files: BTreeSet<String>,
-    roles_fingerprint: String,
-    fragments: BTreeMap<String, DeadCodeFileFragment>,
-    aggregate: Value,
-    drill_down_limit: Option<usize>,
-    cache_key: Option<String>,
-}
-
-impl DeadCodeRollupState {
-    /// The caller must also prove that the callgraph projection is unchanged.
-    pub(crate) fn aggregate_for_unchanged_inputs(
-        &self,
-        cache_key: &str,
-        contributions: &[FileContribution],
-        public_api_files: &BTreeSet<String>,
-        roles: &crate::inspect::entry_points::ProjectRoles,
-    ) -> Option<Value> {
-        (self.cache_key.as_deref() == Some(cache_key)
-            && self.contribution_hashes
-                == contribution_hashes(None, contributions, &BTreeSet::new())
-            && self.public_api_files == *public_api_files
-            && self.roles_fingerprint == format!("{roles:?}")
-            && self.drill_down_limit.is_none())
-        .then(|| self.aggregate.clone())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DeadCodeFileFragment {
-    contribution_hash: String,
-    reachable_exports: BTreeSet<String>,
-    production_reachable_exports: BTreeSet<String>,
-    public_api: bool,
-    roles_fingerprint: String,
-    headline_items: Vec<Value>,
-    generated_items: Vec<Value>,
-    test_only_items: Vec<Value>,
-    uncertain_items: Vec<Value>,
-    by_language: BTreeMap<String, usize>,
-    /// Dead symbols of this file withheld because it is test code.
-    excluded_test_findings: usize,
-}
-
-impl DeadCodeFileFragment {
-    fn rendered_items(&self) -> usize {
-        self.headline_items.len()
-            + self.generated_items.len()
-            + self.test_only_items.len()
-            + self.uncertain_items.len()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ReachabilityState {
-    edges: GraphEdges,
-    imported_by_file: BTreeMap<String, BTreeSet<ExportNode>>,
-    namespace_by_file: BTreeMap<String, BTreeSet<ExportNode>>,
-    roots: BTreeSet<ExportNode>,
-    dispatch_roots: BTreeSet<ExportNode>,
-    reachable: BTreeSet<ExportNode>,
-}
 
 #[derive(Debug, Default)]
 struct ImportedExportLiveness {
@@ -257,6 +148,278 @@ struct FileAnalysis {
     globs_parent_module: bool,
     trait_impl_methods: Vec<String>,
     type_ref_names: BTreeSet<String>,
+}
+
+/// What dead-code analysis reads from one file's syntax tree, recorded
+/// once per content when the data layer parses the file, so an analysis
+/// reads it from the file's content record instead of parsing again.
+///
+/// Records are shared by every path with the same content, so nothing here
+/// depends on the file's path: what does (the files of out-of-line modules,
+/// a Go file's module) is completed for each path by
+/// [`StoredFileFacts::into_analysis`].
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct StoredFileFacts {
+    /// The source is not UTF-8 text, so analysis reads nothing from it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    not_text: bool,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    type_ref_names: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    js: Option<StoredJsFacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rust: Option<StoredRustFacts>,
+    /// A Go file's dispatch facts, without its module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    go: Option<GoDispatchFacts>,
+}
+
+/// A JavaScript or TypeScript file's imports and re-exports, read when the
+/// Oxc engine has no facts for the file.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredJsFacts {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    raw_imports: Vec<RawImportContribution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    raw_reexports: Vec<RawReexportContribution>,
+}
+
+/// A Rust file's facts.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredRustFacts {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    imports: Vec<RawImportContribution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    raw_reexports: Vec<RawReexportContribution>,
+    /// Its API facts. A module declared out of line has a placeholder file
+    /// until the file's path completes it.
+    api: RustApiFacts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attribute_entry_points: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    macro_token_refs: Vec<MacroTokenRefContribution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cfg_test_ranges: Vec<RustCfgTestRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cfg_test_modules: Vec<RustCfgTestModule>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    globs_parent_module: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trait_impl_methods: Vec<String>,
+}
+
+impl StoredFileFacts {
+    /// Whether analysis reads anything from a file in `lang`.
+    fn read_for(lang: LangId) -> bool {
+        supports_type_refs(lang)
+    }
+
+    /// The facts of `source` in `lang`, encoded for a content record:
+    /// `source` as stored (the bytes of the file) and `tree`, the tree the
+    /// data layer parsed it to.
+    pub(crate) fn encode_for_record(
+        source: &[u8],
+        lang: LangId,
+        tree: &tree_sitter::Tree,
+    ) -> Vec<u8> {
+        let facts = match std::str::from_utf8(source) {
+            Ok(source) => Self::extract(source, lang, Some(tree)),
+            Err(_) => Self {
+                not_text: true,
+                ..Self::default()
+            },
+        };
+        serde_json::to_vec(&facts).unwrap_or_default()
+    }
+
+    /// Decodes facts [`Self::encode_for_record`] wrote.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes are not such facts.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+    }
+
+    /// The facts of `source` in `lang`, from `tree`, its syntax tree (`None`
+    /// when parsing failed).
+    fn extract(source: &str, lang: LangId, tree: Option<&tree_sitter::Tree>) -> Self {
+        if !Self::read_for(lang) {
+            return Self::default();
+        }
+        let type_ref_names = tree
+            .map(|tree| extract_type_references(source, tree.root_node(), lang))
+            .unwrap_or_default();
+        // Oxc FileFacts are the raw TS/JS import/re-export/dynamic-import
+        // facts; these are read only for a file Oxc has no facts for.
+        let js = matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript).then(|| {
+            StoredJsFacts {
+                raw_imports: tree
+                    .map(|tree| raw_imports_from_tree(source, tree, lang))
+                    .unwrap_or_default(),
+                raw_reexports: tree
+                    .map(|tree| ts_raw_reexport_contributions(source, tree.root_node()))
+                    .unwrap_or_default(),
+            }
+        });
+        let rust = (lang == LangId::Rust).then(|| {
+            // Module files depend on the file's path; they are completed
+            // per path from the placeholder.
+            let api = tree
+                .map(|tree| rust_api_facts(source, tree.root_node(), ""))
+                .unwrap_or_default();
+            let attribute_entry_points = tree
+                .map(|tree| {
+                    let mut roots = BTreeSet::new();
+                    for entry in
+                        crate::parser::rust_attribute_entry_points(source, tree.root_node())
+                    {
+                        roots.insert(entry.name);
+                        roots.insert(entry.scoped_name);
+                    }
+                    roots.extend(rust_serde_function_references(
+                        source,
+                        tree.root_node(),
+                        api.items.as_slice(),
+                    ));
+                    roots.into_iter().collect()
+                })
+                .unwrap_or_default();
+            StoredRustFacts {
+                imports: tree
+                    .map(|tree| rust_raw_import_contributions(source, tree))
+                    .unwrap_or_default(),
+                raw_reexports: rust_raw_reexport_contributions(source),
+                attribute_entry_points,
+                macro_token_refs: tree
+                    .map(|tree| rust_macro_token_refs(source, tree.root_node()))
+                    .unwrap_or_default(),
+                cfg_test_ranges: tree
+                    .map(|tree| rust_cfg_test_ranges(source, tree.root_node()))
+                    .unwrap_or_default(),
+                cfg_test_modules: tree
+                    .map(|tree| rust_cfg_test_modules(source, tree.root_node()))
+                    .unwrap_or_default(),
+                globs_parent_module: tree
+                    .is_some_and(|tree| rust_globs_parent_module(source, tree.root_node())),
+                trait_impl_methods: tree
+                    .map(|tree| rust_trait_impl_methods(source, tree.root_node()))
+                    .unwrap_or_default(),
+                api,
+            }
+        });
+        let go = (lang == LangId::Go).then(|| {
+            tree.map(|tree| go_dispatch_facts(source, tree.root_node()))
+                .unwrap_or_default()
+        });
+        Self {
+            not_text: false,
+            type_ref_names,
+            js,
+            rust,
+            go,
+        }
+    }
+
+    /// The analysis of the file at `file` (`relative_file` from the project
+    /// root), whose language is `lang`, from its facts. `has_oxc_file` says
+    /// the Oxc engine has facts for it, which replace its raw imports and
+    /// re-exports.
+    fn into_analysis(
+        self,
+        lang: LangId,
+        file: &Path,
+        relative_file: &str,
+        has_oxc_file: bool,
+    ) -> FileAnalysis {
+        if self.not_text || !Self::read_for(lang) {
+            return FileAnalysis::default();
+        }
+        let needs_ts_raw_facts =
+            matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) && !has_oxc_file;
+        let js = self.js.unwrap_or_default();
+        let rust = (lang == LangId::Rust).then(|| {
+            let mut rust = self.rust.unwrap_or_default();
+            for module in &mut rust.api.modules {
+                if module.file.is_some() {
+                    let mut nested = module.scope.clone();
+                    nested.push(module.name.clone());
+                    module.file = Some(rust_module_file(
+                        relative_file,
+                        &nested,
+                        module.path_override.as_deref(),
+                    ));
+                }
+            }
+            rust
+        });
+        let go_dispatch = (lang == LangId::Go).then(|| {
+            let mut facts = self.go.unwrap_or_default();
+            facts.module = go_module_dir(file, relative_file);
+            facts
+        });
+        let raw_reexports = if needs_ts_raw_facts {
+            js.raw_reexports
+        } else {
+            rust.as_ref()
+                .map(|rust| rust.raw_reexports.clone())
+                .unwrap_or_default()
+        };
+        let Some(rust) = rust else {
+            return FileAnalysis {
+                go_dispatch,
+                raw_imports: if needs_ts_raw_facts {
+                    js.raw_imports
+                } else {
+                    Vec::new()
+                },
+                raw_reexports,
+                type_ref_names: self.type_ref_names,
+                ..FileAnalysis::default()
+            };
+        };
+        FileAnalysis {
+            oversized: false,
+            freshness: None,
+            go_dispatch,
+            raw_imports: Vec::new(),
+            raw_reexports,
+            cfg_test_module_files: rust_cfg_test_module_files_for(
+                relative_file,
+                &rust.cfg_test_modules,
+            ),
+            rust_api: Some(rust.api),
+            rust_imports: rust.imports,
+            attribute_entry_points: rust.attribute_entry_points,
+            macro_token_refs: rust.macro_token_refs,
+            cfg_test_ranges: rust.cfg_test_ranges,
+            globs_parent_module: rust.globs_parent_module,
+            trait_impl_methods: rust.trait_impl_methods,
+            type_ref_names: self.type_ref_names,
+        }
+    }
+}
+
+/// The directory of the Go module the file at `file` (`relative_file` from
+/// the project root) belongs to, relative to the root: the nearest
+/// directory above it holding a `go.mod`, or the root's own when none does.
+fn go_module_dir(file: &Path, relative_file: &str) -> String {
+    let mut module = String::new();
+    let mut relative = Path::new(relative_file).parent().unwrap_or(Path::new(""));
+    let mut absolute = file.parent().unwrap_or(Path::new(""));
+    loop {
+        if absolute.join("go.mod").is_file() {
+            module = relative.to_string_lossy().replace('\\', "/");
+            break;
+        }
+        let (Some(next_relative), Some(next_absolute)) = (relative.parent(), absolute.parent())
+        else {
+            break;
+        };
+        relative = next_relative;
+        absolute = next_absolute;
+    }
+    module
 }
 
 #[derive(Debug, Clone)]
@@ -315,21 +478,7 @@ impl DeadCodeFileAnalyzer {
         let Some(lang) = detect_language(file) else {
             return FileAnalysis::default();
         };
-        let needs_type_refs = supports_type_refs(lang);
-        let is_ts_js = matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript);
-        // Oxc FileFacts are the raw TS/JS import/re-export/dynamic-import facts.
-        // Only the legacy non-oxc TS/JS path needs tree-sitter import/re-export facts here.
-        let needs_ts_raw_facts = is_ts_js && !has_oxc_file;
-        let needs_rust_reexports = matches!(lang, LangId::Rust);
-        let needs_rust_attribute_entry_points = matches!(lang, LangId::Rust);
-        let needs_rust_macro_token_refs = matches!(lang, LangId::Rust);
-
-        if !needs_type_refs
-            && !needs_ts_raw_facts
-            && !needs_rust_reexports
-            && !needs_rust_attribute_entry_points
-            && !needs_rust_macro_token_refs
-        {
+        if !StoredFileFacts::read_for(lang) {
             return FileAnalysis::default();
         }
 
@@ -351,160 +500,24 @@ impl DeadCodeFileAnalyzer {
             }
             _ => return FileAnalysis::default(),
         };
-        let needs_tree = needs_type_refs
-            || needs_ts_raw_facts
-            || needs_rust_attribute_entry_points
-            || needs_rust_macro_token_refs;
-        let tree = needs_tree
-            .then(|| {
-                if file.extension().and_then(|ext| ext.to_str()) == Some("h") {
-                    crate::parser::parse_source_with_cached_parser(file, &source, lang).ok()
-                } else {
-                    self.parse_source(lang, &source)
-                }
-            })
-            .flatten();
-
-        let type_ref_names = if needs_type_refs {
-            tree.as_ref()
-                .map(|tree| extract_type_references(&source, tree.root_node(), lang))
-                .unwrap_or_default()
+        let tree = if file.extension().and_then(|ext| ext.to_str()) == Some("h") {
+            crate::parser::parse_source_with_cached_parser(file, &source, lang).ok()
         } else {
-            BTreeSet::new()
+            self.parse_source(lang, &source)
         };
-
-        let raw_imports = if needs_ts_raw_facts {
-            tree.as_ref()
-                .map(|tree| raw_imports_from_tree(&source, tree, lang))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let rust_imports = if needs_rust_macro_token_refs {
-            tree.as_ref()
-                .map(|tree| rust_raw_import_contributions(&source, tree))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let raw_reexports = if needs_ts_raw_facts {
-            tree.as_ref()
-                .map(|tree| ts_raw_reexport_contributions(&source, tree.root_node()))
-                .unwrap_or_default()
-        } else if needs_rust_reexports {
-            rust_raw_reexport_contributions(&source)
-        } else {
-            Vec::new()
-        };
-
-        let rust_api = (lang == LangId::Rust).then(|| {
-            tree.as_ref()
-                .map(|tree| rust_api_facts(&source, tree.root_node(), relative_file))
-                .unwrap_or_default()
+        let mut analysis = StoredFileFacts::extract(&source, lang, tree.as_ref()).into_analysis(
+            lang,
+            file,
+            relative_file,
+            has_oxc_file,
+        );
+        analysis.freshness = Some(crate::cache_freshness::FileFreshness {
+            mtime: metadata
+                .and_then(|metadata| metadata.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH),
+            size: source.len() as u64,
+            content_hash: cache_freshness::hash_bytes(source.as_bytes()),
         });
-        let attribute_entry_points = if needs_rust_attribute_entry_points {
-            tree.as_ref()
-                .map(|tree| {
-                    let mut roots = BTreeSet::new();
-                    for entry in
-                        crate::parser::rust_attribute_entry_points(&source, tree.root_node())
-                    {
-                        roots.insert(entry.name);
-                        roots.insert(entry.scoped_name);
-                    }
-                    roots.extend(rust_serde_function_references(
-                        &source,
-                        tree.root_node(),
-                        rust_api
-                            .as_ref()
-                            .map(|facts| facts.items.as_slice())
-                            .unwrap_or_default(),
-                    ));
-                    roots.into_iter().collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let macro_token_refs = if needs_rust_macro_token_refs {
-            tree.as_ref()
-                .map(|tree| rust_macro_token_refs(&source, tree.root_node()))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let cfg_test_ranges = if lang == LangId::Rust {
-            tree.as_ref()
-                .map(|tree| rust_cfg_test_ranges(&source, tree.root_node()))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let cfg_test_module_files = if lang == LangId::Rust {
-            tree.as_ref()
-                .map(|tree| rust_cfg_test_module_files(&source, tree.root_node(), relative_file))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let globs_parent_module = lang == LangId::Rust
-            && tree
-                .as_ref()
-                .is_some_and(|tree| rust_globs_parent_module(&source, tree.root_node()));
-        let trait_impl_methods = if lang == LangId::Rust {
-            tree.as_ref()
-                .map(|tree| rust_trait_impl_methods(&source, tree.root_node()))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let analysis = FileAnalysis {
-            oversized: false,
-            freshness: Some(crate::cache_freshness::FileFreshness {
-                mtime: metadata
-                    .and_then(|metadata| metadata.modified().ok())
-                    .unwrap_or(std::time::UNIX_EPOCH),
-                size: source.len() as u64,
-                content_hash: cache_freshness::hash_bytes(source.as_bytes()),
-            }),
-            rust_api,
-            go_dispatch: (lang == LangId::Go).then(|| {
-                let mut facts = tree
-                    .as_ref()
-                    .map(|tree| go_dispatch_facts(&source, tree.root_node()))
-                    .unwrap_or_default();
-                let mut relative = Path::new(relative_file).parent().unwrap_or(Path::new(""));
-                let mut absolute = file.parent().unwrap_or(Path::new(""));
-                loop {
-                    if absolute.join("go.mod").is_file() {
-                        facts.module = relative.to_string_lossy().replace('\\', "/");
-                        break;
-                    }
-                    let (Some(next_relative), Some(next_absolute)) =
-                        (relative.parent(), absolute.parent())
-                    else {
-                        break;
-                    };
-                    relative = next_relative;
-                    absolute = next_absolute;
-                }
-                facts
-            }),
-            raw_imports,
-            rust_imports,
-            raw_reexports,
-            attribute_entry_points,
-            macro_token_refs,
-            cfg_test_ranges,
-            cfg_test_module_files,
-            globs_parent_module,
-            trait_impl_methods,
-            type_ref_names,
-        };
         #[cfg(test)]
         AFTER_ANALYSIS.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -550,10 +563,31 @@ fn run_dead_code_scan_with_oxc_started(
     with_job_canonical_paths(|| run_dead_code_scan_body(job, oxc_result, started))
 }
 
+/// [`run_dead_code_scan_with_oxc`] for a caller that keeps only the
+/// files' facts and rolls them up later with every other file's: the
+/// aggregate it returns is empty rather than computed over these files
+/// alone.
+pub(crate) fn run_dead_code_facts_scan_with_oxc(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+) -> InspectResult {
+    let started = Instant::now();
+    with_job_canonical_paths(|| run_dead_code_scan_inner(job, oxc_result, started, false))
+}
+
 fn run_dead_code_scan_body(
     job: &InspectJob,
     oxc_result: Option<&OxcEngineResult>,
     started: Instant,
+) -> InspectResult {
+    run_dead_code_scan_inner(job, oxc_result, started, true)
+}
+
+fn run_dead_code_scan_inner(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+    started: Instant,
+    roll_up: bool,
 ) -> InspectResult {
     let Some(snapshot) = job.callgraph_snapshot.as_deref() else {
         let success = InspectScanSuccess {
@@ -564,7 +598,209 @@ fn run_dead_code_scan_body(
         return InspectResult::success(job, success, started.elapsed());
     };
 
-    let fallback_exports_by_file = fallback_export_contributions_by_file(job, snapshot);
+    // A snapshot from the data layer reads each file's syntax facts from
+    // its content record; any other is scanned by parsing.
+    let scanned = match snapshot.data_layer.as_ref() {
+        Some(view) => view
+            .exported_symbols_of(&job.project_root, &job.scope_files)
+            .and_then(|exported_symbols| {
+                let files = view.files();
+                let lookup = |relative_file: &str| engine::stored_facts(&files, relative_file);
+                scan_dead_code_facts_stored(job, oxc_result, &exported_symbols, &lookup)
+                    .map(|scanned| scanned.map(|(contributions, _)| contributions))
+            }),
+        None => Ok(scan_dead_code_facts(
+            job,
+            oxc_result,
+            &snapshot.exported_symbols,
+        )),
+    };
+    let contributions = match scanned {
+        Ok(Some(contributions)) => contributions,
+        Ok(None) => {
+            return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed())
+        }
+        Err(error) => {
+            return InspectResult::failed(
+                job,
+                &format!("dead-code facts unreadable: {error}"),
+                started.elapsed(),
+            )
+        }
+    };
+
+    if !roll_up {
+        let success = InspectScanSuccess {
+            scanned_files: job.scope_files.clone(),
+            contributions,
+            aggregate: json!({}),
+        };
+        return InspectResult::success(job, success, started.elapsed());
+    }
+    let public_api_files = collect_public_api_files(&job.project_root);
+    if crate::executor::current_job_cancelled() {
+        return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
+    }
+    let roles = crate::inspect::entry_points::resolve_project_roles(&job.project_root);
+    let aggregate = aggregate_dead_code_contributions_with_snapshot(
+        &job.project_root,
+        snapshot,
+        &contributions,
+        &public_api_files,
+        &roles,
+        None,
+    );
+    let success = InspectScanSuccess {
+        scanned_files: job.scope_files.clone(),
+        contributions,
+        aggregate,
+    };
+
+    InspectResult::success(job, success, started.elapsed())
+}
+
+/// The dead-code facts of `job`'s scope files: each file's own facts, with
+/// `exported_symbols` (the call graph's exports) as the exports of a file
+/// the Oxc engine did not analyze. `None` when the job was cancelled.
+pub(crate) fn scan_dead_code_facts(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+    exported_symbols: &[CallgraphExport],
+) -> Option<Vec<FileContribution>> {
+    with_job_canonical_paths(|| {
+        scan_dead_code_facts_body(job, oxc_result, exported_symbols, FactSource::Parse)
+    })
+}
+
+/// The stored syntax facts of a file, by its project-relative path: `None`
+/// when the call graph has no such file, an error when its record cannot be
+/// read or holds no facts.
+pub(crate) type StoredFactsLookup<'a> = dyn Fn(&str) -> Option<Result<Vec<u8>, String>> + Sync + 'a;
+
+/// [`scan_dead_code_facts`], reading each file's syntax facts from the
+/// facts its content record stores (`stored`) rather than parsing it. A
+/// file the call graph does not have is parsed, as the scan always did;
+/// the second value counts those files.
+///
+/// # Errors
+///
+/// When a file's stored facts cannot be read.
+pub(crate) fn scan_dead_code_facts_stored(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+    exported_symbols: &[CallgraphExport],
+    stored: &StoredFactsLookup<'_>,
+) -> Result<Option<(Vec<FileContribution>, usize)>, String> {
+    let failures = parking_lot::Mutex::new(Vec::new());
+    let parsed = std::sync::atomic::AtomicUsize::new(0);
+    let contributions = with_job_canonical_paths(|| {
+        scan_dead_code_facts_body(
+            job,
+            oxc_result,
+            exported_symbols,
+            FactSource::Stored {
+                lookup: stored,
+                failures: &failures,
+                parsed: &parsed,
+            },
+        )
+    });
+    if let Some(failure) = failures.into_inner().into_iter().next() {
+        return Err(failure);
+    }
+    Ok(contributions.map(|contributions| (contributions, parsed.into_inner())))
+}
+
+/// Where a scan reads each file's syntax facts from.
+#[derive(Clone, Copy)]
+enum FactSource<'a> {
+    /// Parsing the file.
+    Parse,
+    /// The facts its content record stores.
+    Stored {
+        lookup: &'a StoredFactsLookup<'a>,
+        /// Files whose stored facts could not be read.
+        failures: &'a parking_lot::Mutex<Vec<String>>,
+        /// Files the call graph does not have, parsed instead.
+        parsed: &'a std::sync::atomic::AtomicUsize,
+    },
+}
+
+impl FactSource<'_> {
+    fn analyze(
+        self,
+        analyzer: &mut DeadCodeFileAnalyzer,
+        file: &Path,
+        relative_file: &str,
+        has_oxc_file: bool,
+    ) -> FileAnalysis {
+        let Self::Stored {
+            lookup,
+            failures,
+            parsed,
+        } = self
+        else {
+            return analyzer.analyze_file(file, relative_file, has_oxc_file);
+        };
+        // A header's language comes from parsing it, and no header language
+        // has facts; every other file's language comes from its extension.
+        if file.extension().and_then(|ext| ext.to_str()) == Some("h") {
+            return FileAnalysis::default();
+        }
+        let Some(lang) = crate::parser::language_for_extension(file) else {
+            return FileAnalysis::default();
+        };
+        if !StoredFileFacts::read_for(lang) {
+            return FileAnalysis::default();
+        }
+        let bytes = match lookup(relative_file) {
+            None => {
+                parsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return analyzer.analyze_file(file, relative_file, has_oxc_file);
+            }
+            Some(Ok(bytes)) => bytes,
+            Some(Err(error)) => {
+                failures.lock().push(error);
+                return FileAnalysis::default();
+            }
+        };
+        let facts = match StoredFileFacts::decode(&bytes) {
+            Ok(facts) => facts,
+            Err(error) => {
+                failures.lock().push(format!(
+                    "stored dead-code facts of {relative_file}: {error}"
+                ));
+                return FileAnalysis::default();
+            }
+        };
+        let mut analysis = facts.into_analysis(lang, file, relative_file, has_oxc_file);
+        analysis.freshness = if has_oxc_file {
+            // The file's Oxc facts carry the hash of the content they were
+            // read from, and a contribution keeps its file's metadata only
+            // when its freshness has that same hash (else the file looks
+            // changed to every later pass, which then scans it again). So
+            // this file is hashed, as parsing it would have.
+            Some(collect_freshness(file))
+        } else {
+            // The facts are the content's the call graph read; nothing here
+            // reads the file again to hash it.
+            fs::metadata(file).ok().map(|metadata| FileFreshness {
+                mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+                size: metadata.len(),
+                content_hash: cache_freshness::zero_hash(),
+            })
+        };
+        analysis
+    }
+}
+
+fn scan_dead_code_facts_body(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+    exported_symbols: &[CallgraphExport],
+    source: FactSource<'_>,
+) -> Option<Vec<FileContribution>> {
+    let fallback_exports_by_file = fallback_export_contributions_by_file(job, exported_symbols);
     let oxc_facts_by_file = oxc_result
         .map(|result| {
             result
@@ -616,6 +852,7 @@ fn run_dead_code_scan_body(
                     &oxc_parse_errors_by_file,
                     &oxc_skipped_files,
                     &mut file_analyzer,
+                    source,
                 )
             }))
         })
@@ -626,41 +863,17 @@ fn run_dead_code_scan_body(
         })
         .collect::<Vec<_>>();
     if crate::executor::current_job_cancelled() {
-        return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
+        return None;
     }
-
-    let public_api_files = collect_public_api_files(&job.project_root);
-    if crate::executor::current_job_cancelled() {
-        return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
-    }
-    let roles = crate::inspect::entry_points::resolve_project_roles(&job.project_root);
-    let aggregate = aggregate_dead_code_contributions_incremental_body(
-        &job.project_root,
-        snapshot,
-        &contributions,
-        &public_api_files,
-        &roles,
-        None,
-        None,
-        None,
-        &BTreeSet::new(),
-    )
-    .0;
-    let success = InspectScanSuccess {
-        scanned_files: job.scope_files.clone(),
-        contributions,
-        aggregate,
-    };
-
-    InspectResult::success(job, success, started.elapsed())
+    Some(contributions)
 }
 
 fn fallback_export_contributions_by_file(
     job: &InspectJob,
-    snapshot: &CallgraphSnapshot,
+    exported_symbols: &[CallgraphExport],
 ) -> BTreeMap<String, Vec<ExportContribution>> {
     let mut by_file: BTreeMap<String, Vec<ExportContribution>> = BTreeMap::new();
-    for export in &snapshot.exported_symbols {
+    for export in exported_symbols {
         if export.kind == DEFAULT_EXPORT_MARKER_KIND {
             continue;
         }
@@ -696,29 +909,20 @@ fn group_outbound_calls_by_caller_file<'a>(
     let mut attempts = 0;
     let mut fallbacks = 0;
     for call in outbound_calls {
-        let absolute = normalize_absolute(project_root, &call.caller_file);
-        // Rebase a root alias before memoization, so its physical and alias
-        // spellings share one file probe. Keys never become reported or persisted paths.
-        let comparison_path = absolute
-            .strip_prefix(&lexical_root)
-            .map(|relative| canonical_root.join(relative))
-            .unwrap_or(absolute);
+        let comparison_path = caller_comparison_path(
+            project_root,
+            &lexical_root,
+            &canonical_root,
+            &call.caller_file,
+        );
         let key = comparison_keys
             .entry(comparison_path.clone())
             .or_insert_with(|| {
                 attempts += 1;
-                let path = match fs::canonicalize(&comparison_path) {
-                    Ok(canonical) => normalize_path(&canonical),
-                    Err(_) => {
-                        fallbacks += 1;
-                        comparison_path
-                    }
-                };
-                path.strip_prefix(&canonical_root)
-                    .or_else(|_| path.strip_prefix(&lexical_root))
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/")
+                let (key, fallback) =
+                    caller_comparison_key(&lexical_root, &canonical_root, comparison_path);
+                fallbacks += usize::from(fallback);
+                key
             });
         by_file.entry(key.clone()).or_default().push(call);
     }
@@ -739,6 +943,58 @@ fn group_outbound_calls_by_caller_file<'a>(
     grouped
 }
 
+/// `caller_file` made absolute, with a root alias rebased onto the
+/// canonical root, so its physical and alias spellings share one file probe.
+fn caller_comparison_path(
+    project_root: &Path,
+    lexical_root: &Path,
+    canonical_root: &Path,
+    caller_file: &Path,
+) -> PathBuf {
+    let absolute = normalize_absolute(project_root, caller_file);
+    absolute
+        .strip_prefix(lexical_root)
+        .map(|relative| canonical_root.join(relative))
+        .unwrap_or(absolute)
+}
+
+/// The project-relative file a caller file's calls are filed under: its
+/// physical path when it still exists, else its spelling (the bool says the
+/// spelling was kept). Keys never become reported or persisted paths.
+fn caller_comparison_key(
+    lexical_root: &Path,
+    canonical_root: &Path,
+    comparison_path: PathBuf,
+) -> (String, bool) {
+    let (path, fallback) = match fs::canonicalize(&comparison_path) {
+        Ok(canonical) => (normalize_path(&canonical), false),
+        Err(_) => (comparison_path, true),
+    };
+    (
+        caller_key_of_physical(lexical_root, canonical_root, &path),
+        fallback,
+    )
+}
+
+/// The key [`caller_comparison_key`] files a caller's calls under, given
+/// its physical path (canonical and normalized).
+fn caller_key_of_physical(lexical_root: &Path, canonical_root: &Path, path: &Path) -> String {
+    path.strip_prefix(canonical_root)
+        .or_else(|_| path.strip_prefix(lexical_root))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// [`relative_path`] of a path already canonical and normalized, which
+/// canonicalizing again would give back unchanged.
+fn relative_path_of_canonical(canonical_root: &Path, path: &Path) -> String {
+    path.strip_prefix(canonical_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 fn gather_file_contribution(
     job: &InspectJob,
     file: &Path,
@@ -747,6 +1003,7 @@ fn gather_file_contribution(
     oxc_parse_errors_by_file: &BTreeMap<String, Vec<String>>,
     oxc_skipped_files: &[Value],
     file_analyzer: &mut DeadCodeFileAnalyzer,
+    source: FactSource<'_>,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
     if super::source_text::graph_source_excluded(&job.project_root, file) {
@@ -809,7 +1066,7 @@ fn gather_file_contribution(
         globs_parent_module,
         trait_impl_methods,
         type_ref_names,
-    } = file_analyzer.analyze_file(file, &file_name, oxc_facts.is_some());
+    } = source.analyze(file_analyzer, file, &file_name, oxc_facts.is_some());
     if oversized {
         return oversized_file_contribution(file, &file_name);
     }
@@ -1011,13 +1268,6 @@ pub(crate) fn callgraph_unavailable_aggregate_for_job(job: &InspectJob) -> serde
     let mut aggregate = callgraph_unavailable_aggregate(job.scope_files.len());
     let disabled = if !job.config.indexes.callgraph {
         Some("call graph is disabled (indexes.callgraph=false)")
-    } else if job.config.views.enabled
-        && crate::views::read::current_generation_lacks_callgraph(
-            &crate::root_cache::cache_root(&job.config),
-            &job.project_root,
-        )
-    {
-        Some(crate::views::read::CALLGRAPH_DISABLED)
     } else {
         None
     };
@@ -1074,554 +1324,39 @@ pub(crate) fn borrow_only_unavailable_aggregate(scanned_files: usize) -> serde_j
     aggregate
 }
 
+/// The dead-code aggregate of `contributions` (every scanned file's facts)
+/// over `snapshot`'s call graph. The drill-down limit is accepted for the
+/// callers' sake: the aggregate always lists every finding.
 pub(crate) fn aggregate_dead_code_contributions_with_snapshot(
     project_root: &Path,
     snapshot: &CallgraphSnapshot,
     contributions: &[FileContribution],
     public_api_files: &BTreeSet<String>,
     roles: &crate::inspect::entry_points::ProjectRoles,
-    drill_down_limit: Option<usize>,
+    _drill_down_limit: Option<usize>,
 ) -> serde_json::Value {
-    aggregate_dead_code_contributions_incremental(
+    match engine::aggregate_with_snapshot(
         project_root,
         snapshot,
         contributions,
         public_api_files,
         roles,
-        drill_down_limit,
-        None,
-        None,
-        &BTreeSet::new(),
-    )
-    .0
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn aggregate_dead_code_contributions_incremental(
-    project_root: &Path,
-    snapshot: &CallgraphSnapshot,
-    contributions: &[FileContribution],
-    public_api_files: &BTreeSet<String>,
-    roles: &crate::inspect::entry_points::ProjectRoles,
-    drill_down_limit: Option<usize>,
-    cache_key: Option<&str>,
-    previous: Option<&DeadCodeRollupState>,
-    changed_files: &BTreeSet<String>,
-) -> (serde_json::Value, DeadCodeRollupState, RollupVerdict) {
-    with_job_canonical_paths(|| {
-        aggregate_dead_code_contributions_incremental_body(
-            project_root,
-            snapshot,
-            contributions,
-            public_api_files,
-            roles,
-            drill_down_limit,
-            cache_key,
-            previous,
-            changed_files,
-        )
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn aggregate_dead_code_contributions_incremental_body(
-    project_root: &Path,
-    snapshot: &CallgraphSnapshot,
-    contributions: &[FileContribution],
-    public_api_files: &BTreeSet<String>,
-    roles: &crate::inspect::entry_points::ProjectRoles,
-    drill_down_limit: Option<usize>,
-    cache_key: Option<&str>,
-    previous: Option<&DeadCodeRollupState>,
-    changed_files: &BTreeSet<String>,
-) -> (serde_json::Value, DeadCodeRollupState, RollupVerdict) {
-    let parsed = parse_dead_code_contributions(project_root, contributions);
-    // Unchanged-state reuse must not hide a new gap or retain an error after
-    // repair. Rebuild from the current facts while either state has a gap.
-    let has_coverage_gaps = has_oversized_sources(&parsed)
-        || parsed.iter().any(|contribution| contribution.decode_failed)
-        || previous.is_some_and(|state| {
-            has_oversized_sources(&state.materialized)
-                || state
-                    .materialized
-                    .iter()
-                    .any(|contribution| contribution.decode_failed)
-        });
-    let exclusions_changed = previous.is_some_and(|state| {
-        let exclusions = |facts: &[DeadCodeContribution]| {
-            facts
-                .iter()
-                .filter(|fact| fact.excluded_from_graph)
-                .map(|fact| fact.file.clone())
-                .collect::<BTreeSet<_>>()
-        };
-        exclusions(&parsed) != exclusions(&state.materialized)
-    });
-    let contribution_hashes = contribution_hashes(
-        previous.map(|state| &state.contribution_hashes),
-        contributions,
-        changed_files,
-    );
-    let callgraph_hashes = callgraph_hashes(
-        project_root,
-        snapshot,
-        previous.map(|state| &state.callgraph_hashes),
-        changed_files,
-        previous.map(|state| &state.initializer_files),
-    );
-    let roles_fingerprint = format!("{roles:?}");
-    let changed_graph_files = previous
-        .map(|state| changed_map_keys(&state.callgraph_hashes, &callgraph_hashes))
-        .unwrap_or_default();
-    if let Some(previous) = previous {
-        let contribution_files = contribution_hashes.keys().cloned().collect::<BTreeSet<_>>();
-        let _retained_rendered_items = previous
-            .fragments
-            .values()
-            .map(DeadCodeFileFragment::rendered_items)
-            .sum::<usize>();
-        let fragments_match = previous.fragments.iter().all(|(file, fragment)| {
-            contribution_hashes.get(file) == Some(&fragment.contribution_hash)
-                && fragment.public_api == public_api_files.contains(file)
-                && fragment.roles_fingerprint == roles_fingerprint
-                && fragment.reachable_exports
-                    == reachable_symbols_for_file(&previous.all.reachable, file)
-                && fragment.production_reachable_exports
-                    == reachable_symbols_for_file(&previous.production.reachable, file)
-        });
-        if !has_coverage_gaps
-            && !exclusions_changed
-            && previous.contribution_hashes == contribution_hashes
-            && previous.public_api_files == *public_api_files
-            && previous.roles_fingerprint == roles_fingerprint
-            && previous.drill_down_limit == drill_down_limit
-            && previous.cache_key.as_deref() == cache_key
-            && previous.materialized.len() <= contribution_hashes.len()
-            && fragments_match
-            && changed_files
-                .iter()
-                .all(|file| !rollup_semantics_file(file))
-            && changed_graph_files.is_disjoint(&contribution_files)
-        {
-            let mut state = previous.clone();
-            state.callgraph_hashes = callgraph_hashes;
-            return (
-                state.aggregate.clone(),
-                state,
-                RollupVerdict {
-                    kind: RollupKind::Incremental,
-                    reason: None,
-                },
+        &mut Vec::new(),
+    ) {
+        Ok(aggregate) => aggregate,
+        Err(reason) => {
+            crate::slog_warn!(
+                "tier2 dead_code: reading the call graph failed for {}: {reason}",
+                project_root.display()
             );
+            // Dead code is not determined without the call graph, so no
+            // count is reported.
+            let mut aggregate = callgraph_unavailable_aggregate(contributions.len());
+            aggregate["notes"] = json!(["callgraph_unavailable", "callgraph_read_failed"]);
+            aggregate["callgraph_unavailable_reason"] = json!(reason);
+            aggregate
         }
     }
-
-    let mut affected_files = changed_files
-        .union(&changed_graph_files)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if has_coverage_gaps
-        || exclusions_changed
-        || previous.is_none()
-        || previous.is_some_and(|state| {
-            state.public_api_files != *public_api_files
-                || state.roles_fingerprint != roles_fingerprint
-        })
-        || affected_files
-            .iter()
-            .any(|file| rollup_semantics_file(file))
-        || changed_export_surface(previous, &parsed, &affected_files)
-        || parsed.iter().any(|contribution| {
-            affected_files.contains(&contribution.file)
-                && (contribution.oxc_facts.is_some()
-                    || contribution.rust_api.is_some()
-                    || contribution.go_dispatch.is_some())
-        })
-    {
-        affected_files = parsed
-            .iter()
-            .map(|contribution| contribution.file.clone())
-            .collect();
-    }
-    let materialized = Arc::new(materialize_dead_code_contributions(
-        project_root,
-        snapshot,
-        parsed,
-        public_api_files,
-        previous.map(|state| state.materialized.as_slice()),
-        &affected_files,
-    ));
-    let all_edges = edges_by_source(materialized.as_ref(), false);
-    let production_edges = edges_by_source(materialized.as_ref(), true);
-    crate::slog_info!("scanner memory: ordinary_calls={} initializer_groups={} initializer_targets={} graph_payload_bytes={}", materialized.iter().map(|c| c.internal_calls.len()).sum::<usize>(), materialized.iter().filter(|c| c.go_initializers.is_some()).count(), materialized.iter().filter_map(|c| c.go_initializers.as_ref()).map(|g| g.targets.len()).sum::<usize>(), scanner_graph_payload_bytes(&all_edges, &production_edges));
-    let dispatched_method_names =
-        collect_dispatched_method_names_by_language(materialized.as_ref());
-    let (all, all_incremental) = build_reachability_state(
-        materialized.as_ref(),
-        all_edges,
-        &dispatched_method_names,
-        previous.map(|state| state.all.as_ref()),
-        changed_files,
-    );
-    let (production, production_incremental) = build_reachability_state(
-        materialized.as_ref(),
-        production_edges,
-        &dispatched_method_names,
-        previous.map(|state| state.production.as_ref()),
-        changed_files,
-    );
-    let verdict = if all_incremental && production_incremental {
-        RollupVerdict {
-            kind: RollupKind::Incremental,
-            reason: None,
-        }
-    } else {
-        RollupVerdict {
-            kind: RollupKind::Full,
-            reason: Some("cold"),
-        }
-    };
-    if let Some(previous) = previous {
-        affected_files.extend(
-            all.reachable
-                .symmetric_difference(&previous.all.reachable)
-                .map(|node| node.0.clone()),
-        );
-        affected_files.extend(
-            production
-                .reachable
-                .symmetric_difference(&previous.production.reachable)
-                .map(|node| node.0.clone()),
-        );
-    }
-    let all = Arc::new(all);
-    let production = Arc::new(production);
-    let mut fragments = previous
-        .map(|state| state.fragments.clone())
-        .unwrap_or_default();
-    fragments.retain(|file, _| contribution_hashes.contains_key(file));
-    let rendered = materialized
-        .iter()
-        .filter(|contribution| previous.is_none() || affected_files.contains(&contribution.file))
-        .cloned()
-        .collect::<Vec<_>>();
-    let rendered_aggregate = aggregate_materialized_dead_code_contributions(
-        project_root,
-        materialized.as_ref(),
-        &rendered,
-        public_api_files,
-        roles,
-        None,
-        rendered.len(),
-        &all.reachable,
-        &production.reachable,
-        &dispatched_method_names,
-    );
-    fragments.extend(fragments_from_aggregate(
-        &rendered,
-        &contribution_hashes,
-        public_api_files,
-        &roles_fingerprint,
-        &all.reachable,
-        &production.reachable,
-        &rendered_aggregate,
-    ));
-    let aggregate = fold_dead_code_fragments(
-        &fragments,
-        materialized.as_ref(),
-        roles,
-        drill_down_limit,
-        contributions.len(),
-    );
-    (
-        aggregate.clone(),
-        DeadCodeRollupState {
-            all,
-            production,
-            materialized,
-            contribution_hashes,
-            callgraph_hashes,
-            initializer_files: snapshot
-                .go_initializers
-                .iter()
-                .map(|group| relative_path(project_root, &group.caller_file))
-                .collect(),
-            public_api_files: public_api_files.clone(),
-            roles_fingerprint,
-            fragments,
-            aggregate,
-            drill_down_limit,
-            cache_key: cache_key.map(str::to_owned),
-        },
-        verdict,
-    )
-}
-
-fn rollup_semantics_file(file: &str) -> bool {
-    let name = Path::new(file)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(file);
-    name == "package.json"
-        || name == "Cargo.toml"
-        || name == "go.mod"
-        || (name.starts_with("tsconfig") && name.ends_with(".json"))
-        || (name.starts_with("jsconfig") && name.ends_with(".json"))
-        || name.ends_with(".config.js")
-        || name.ends_with(".config.ts")
-}
-
-fn changed_export_surface(
-    previous: Option<&DeadCodeRollupState>,
-    parsed: &[DeadCodeContribution],
-    affected_files: &BTreeSet<String>,
-) -> bool {
-    let Some(previous) = previous else {
-        return true;
-    };
-    let old = previous
-        .materialized
-        .iter()
-        .filter(|contribution| affected_files.contains(&contribution.file))
-        .map(|contribution| {
-            (
-                contribution.file.as_str(),
-                contribution
-                    .exports
-                    .iter()
-                    .map(|export| export.symbol.as_str())
-                    .collect::<BTreeSet<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let new = parsed
-        .iter()
-        .filter(|contribution| affected_files.contains(&contribution.file))
-        .map(|contribution| {
-            (
-                contribution.file.as_str(),
-                contribution
-                    .exports
-                    .iter()
-                    .map(|export| export.symbol.as_str())
-                    .collect::<BTreeSet<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    old != new
-}
-
-fn contribution_hashes(
-    previous: Option<&BTreeMap<String, String>>,
-    contributions: &[FileContribution],
-    changed_files: &BTreeSet<String>,
-) -> BTreeMap<String, String> {
-    if let Some(previous) = previous {
-        // A contribution that is no longer present must lose its hash (and with
-        // it its retained fragment) even when the caller's changed-file set did
-        // not name it: a forced deletion arrives spelled by the manager
-        // (backslashes on Windows) while these keys use the contribution's own
-        // `file` field, so membership in `changed_files` cannot be the only
-        // thing that removes a stale key.
-        let current_files = contributions
-            .iter()
-            .map(contribution_file_key)
-            .collect::<BTreeSet<_>>();
-        let mut hashes = previous.clone();
-        hashes.retain(|file, _| current_files.contains(file));
-        for file in changed_files {
-            hashes.remove(file);
-        }
-        for contribution in contributions {
-            let file = contribution_file_key(contribution);
-            if changed_files.contains(&file) || !hashes.contains_key(&file) {
-                let bytes = serde_json::to_vec(&contribution.contribution).unwrap_or_default();
-                hashes.insert(file, blake3::hash(&bytes).to_hex().to_string());
-            }
-        }
-        return hashes;
-    }
-
-    contributions
-        .iter()
-        .map(|contribution| {
-            let file = contribution_file_key(contribution);
-            let bytes = serde_json::to_vec(&contribution.contribution).unwrap_or_default();
-            (file, blake3::hash(&bytes).to_hex().to_string())
-        })
-        .collect()
-}
-
-fn contribution_file_key(contribution: &FileContribution) -> String {
-    contribution
-        .contribution
-        .get("file")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| contribution.file_path.to_string_lossy().replace('\\', "/"))
-}
-
-fn callgraph_hashes(
-    project_root: &Path,
-    snapshot: &CallgraphSnapshot,
-    previous: Option<&BTreeMap<String, String>>,
-    changed_files: &BTreeSet<String>,
-    previous_initializer_files: Option<&BTreeSet<String>>,
-) -> BTreeMap<String, String> {
-    let grouped = group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
-    let mut hashes = previous.cloned().unwrap_or_default();
-    let mut files = if previous.is_some() {
-        for file in changed_files {
-            hashes.remove(file);
-        }
-        changed_files.clone()
-    } else {
-        grouped.by_file.keys().cloned().collect()
-    };
-    // A package's variables can change without changing the files that import
-    // it. Rehash compact initializer groups even on an incremental scan.
-    files.extend(
-        snapshot
-            .go_initializers
-            .iter()
-            .map(|group| relative_path(project_root, &group.caller_file)),
-    );
-    files.extend(previous_initializer_files.into_iter().flatten().cloned());
-    for file in &files {
-        hashes.remove(file);
-    }
-    let mut hashers = BTreeMap::<String, blake3::Hasher>::new();
-    for (file, calls) in &grouped.by_file {
-        if !files.contains(file) {
-            continue;
-        }
-        let hasher = hashers.entry(file.clone()).or_default();
-        for call in calls {
-            hasher.update(call.caller_symbol.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(call.target.as_bytes());
-            hasher.update(&call.line.to_le_bytes());
-            hasher.update(call.provenance.as_bytes());
-        }
-    }
-    for group in &snapshot.go_initializers {
-        let file = relative_path(project_root, &group.caller_file);
-        let hasher = hashers.entry(file).or_default();
-        hasher.update(b"go_package_initializer\0");
-        for caller in &group.callers {
-            hasher.update(caller.as_bytes());
-            hasher.update(&[0]);
-        }
-        hasher.update(&[0]);
-        for (file, symbol) in &group.targets {
-            hasher.update(file.to_string_lossy().as_bytes());
-            hasher.update(&[0]);
-            hasher.update(symbol.as_bytes());
-            hasher.update(&[0]);
-        }
-    }
-    hashes.extend(
-        hashers
-            .into_iter()
-            .map(|(file, hasher)| (file, hasher.finalize().to_hex().to_string())),
-    );
-    hashes
-}
-
-fn changed_map_keys(
-    previous: &BTreeMap<String, String>,
-    current: &BTreeMap<String, String>,
-) -> BTreeSet<String> {
-    previous
-        .keys()
-        .chain(current.keys())
-        .filter(|key| previous.get(*key) != current.get(*key))
-        .cloned()
-        .collect()
-}
-
-fn reachable_symbols_for_file(reachable: &BTreeSet<ExportNode>, file: &str) -> BTreeSet<String> {
-    reachable
-        .range((file.to_string(), String::new())..)
-        .take_while(|node| {
-            #[cfg(test)]
-            REACHABLE_VISITS.with(|visits| visits.set(visits.get() + 1));
-            node.0 == file
-        })
-        .map(|node| node.1.clone())
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fragments_from_aggregate(
-    materialized: &[DeadCodeContribution],
-    contribution_hashes: &BTreeMap<String, String>,
-    public_api_files: &BTreeSet<String>,
-    roles_fingerprint: &str,
-    reachable: &BTreeSet<ExportNode>,
-    production_reachable: &BTreeSet<ExportNode>,
-    aggregate: &Value,
-) -> BTreeMap<String, DeadCodeFileFragment> {
-    let groups = [
-        "items",
-        "generated_items",
-        "test_only_items",
-        "uncertain_items",
-    ]
-    .map(|key| {
-        let mut grouped = BTreeMap::<&str, Vec<&Value>>::new();
-        for item in aggregate[key].as_array().into_iter().flatten() {
-            #[cfg(test)]
-            FRAGMENT_ITEM_VISITS.with(|visits| visits.set(visits.get() + 1));
-            if let Some(file) = item["file"].as_str() {
-                grouped.entry(file).or_default().push(item);
-            }
-        }
-        grouped
-    });
-    let items_for_file = |index: usize, file: &str| {
-        groups[index]
-            .get(file)
-            .into_iter()
-            .flatten()
-            .map(|item| (*item).clone())
-            .collect::<Vec<_>>()
-    };
-    materialized
-        .iter()
-        .map(|contribution| {
-            let file = contribution.file.clone();
-            let headline_items = items_for_file(0, &file)
-                .into_iter()
-                .filter(|item| item.get("generated").is_none())
-                .collect::<Vec<_>>();
-            let headline_count = headline_items.len();
-            (
-                file.clone(),
-                DeadCodeFileFragment {
-                    contribution_hash: contribution_hashes.get(&file).cloned().unwrap_or_default(),
-                    reachable_exports: reachable_symbols_for_file(reachable, &file),
-                    production_reachable_exports: reachable_symbols_for_file(
-                        production_reachable,
-                        &file,
-                    ),
-                    public_api: public_api_files.contains(&file),
-                    roles_fingerprint: roles_fingerprint.to_string(),
-                    headline_items,
-                    generated_items: items_for_file(1, &file),
-                    test_only_items: items_for_file(2, &file),
-                    uncertain_items: items_for_file(3, &file),
-                    by_language: [(language_for_file(&file).to_string(), headline_count)]
-                        .into_iter()
-                        .filter(|(_, count)| *count > 0)
-                        .collect(),
-                    excluded_test_findings: aggregate["excluded_test_by_file"][file.as_str()]
-                        .as_u64()
-                        .unwrap_or(0) as usize,
-                },
-            )
-        })
-        .collect()
 }
 
 // Aggregates retain all findings; presentation applies its page limit after
@@ -1641,114 +1376,6 @@ fn rank_dead_code_items(
         )
     });
     items
-}
-
-fn fold_dead_code_fragments(
-    fragments: &BTreeMap<String, DeadCodeFileFragment>,
-    materialized: &[DeadCodeContribution],
-    roles: &crate::inspect::entry_points::ProjectRoles,
-    _drill_down_limit: Option<usize>,
-    scanned_files: usize,
-) -> Value {
-    let count = fragments
-        .values()
-        .map(|fragment| fragment.headline_items.len())
-        .sum::<usize>();
-    let generated_count = fragments
-        .values()
-        .map(|fragment| fragment.generated_items.len())
-        .sum::<usize>();
-    let test_only_count = fragments
-        .values()
-        .map(|fragment| fragment.test_only_items.len())
-        .sum::<usize>();
-    let uncertain_count = fragments
-        .values()
-        .map(|fragment| fragment.uncertain_items.len())
-        .sum::<usize>();
-    let mut by_language = BTreeMap::<String, usize>::new();
-    for fragment in fragments.values() {
-        for (language, value) in &fragment.by_language {
-            *by_language.entry(language.clone()).or_default() += value;
-        }
-    }
-    let headline_items = rank_dead_code_items(
-        fragments
-            .values()
-            .flat_map(|fragment| fragment.headline_items.iter().cloned())
-            .collect(),
-        roles,
-    );
-    let generated_items = rank_dead_code_items(
-        fragments
-            .values()
-            .flat_map(|fragment| fragment.generated_items.iter().cloned())
-            .collect(),
-        roles,
-    );
-    let test_only_items = rank_dead_code_items(
-        fragments
-            .values()
-            .flat_map(|fragment| fragment.test_only_items.iter().cloned())
-            .collect(),
-        roles,
-    );
-    let uncertain_items = rank_dead_code_items(
-        fragments
-            .values()
-            .flat_map(|fragment| fragment.uncertain_items.iter().cloned())
-            .collect::<Vec<_>>(),
-        roles,
-    );
-    let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
-    let mut dead_items = headline_items;
-    dead_items.extend(generated_items.iter().cloned());
-    let generated_top = generated_items
-        .iter()
-        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
-        .cloned()
-        .collect::<Vec<_>>();
-    let test_only_top = test_only_items
-        .iter()
-        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
-        .cloned()
-        .collect::<Vec<_>>();
-    let (parse_errors, skipped_files, languages_skipped) = dead_code_honesty_fields(materialized);
-    let mut aggregate = json!({
-        "count": count,
-        "generated_count": generated_count,
-        "total_count": count + test_only_count + generated_count,
-        "items": dead_items,
-        "top": top,
-        "generated_items": generated_items,
-        "generated_top": generated_top,
-        "test_only_count": test_only_count,
-        "test_only_items": test_only_items,
-        "test_only_top": test_only_top,
-        "by_language": by_language,
-        "drill_down_capped": false,
-        "generated_drill_down_capped": false,
-        "test_only_drill_down_capped": false,
-        "uncertain_count": uncertain_count,
-        "uncertain_items": uncertain_items,
-        "languages_skipped": languages_skipped,
-        "callgraph_available": true,
-        "scanned_files": scanned_files,
-        "complete": parse_errors.is_empty() && skipped_files.is_empty(),
-    });
-    if !parse_errors.is_empty() {
-        aggregate["parse_errors"] = Value::Array(parse_errors);
-    }
-    if !skipped_files.is_empty() {
-        aggregate["skipped_files_count"] = json!(skipped_files.len());
-        aggregate["skipped_files"] = Value::Array(skipped_files);
-    }
-    let mut excluded = ExcludedTestTally::default();
-    for (file, fragment) in fragments {
-        excluded.record_many(file, fragment.excluded_test_findings);
-    }
-    excluded.write_into(&mut aggregate);
-    aggregate
 }
 
 fn parse_dead_code_contributions(
@@ -1779,539 +1406,845 @@ fn parse_dead_code_contributions(
         .collect::<Vec<_>>()
 }
 
-fn materialize_dead_code_contributions(
+/// A Go initializer group's callers, and its targets as project-relative
+/// (file, symbol) nodes.
+type RelativeInitializerGroup = (Vec<String>, BTreeSet<ExportNode>);
+
+fn relative_initializer_group(
     project_root: &Path,
-    snapshot: &CallgraphSnapshot,
-    parsed: Vec<DeadCodeContribution>,
-    public_api_files: &BTreeSet<String>,
-    previous: Option<&[DeadCodeContribution]>,
-    affected_files: &BTreeSet<String>,
-) -> Vec<DeadCodeContribution> {
-    let liveness_root_files = snapshot
-        .entry_points
-        .iter()
-        .map(|file| relative_path(project_root, file))
-        .collect::<BTreeSet<_>>();
-    let executable_root_exports_by_file =
-        crate::inspect::entry_points::resolve_entry_points(project_root)
-            .executable_root_exports()
-            .into_iter()
-            .map(|(file, exports)| (relative_path(project_root, &file), exports))
-            .collect::<BTreeMap<_, _>>();
-    let attribute_roots_from_snapshot = snapshot
-        .entry_point_symbols
-        .iter()
-        .map(|(file, symbols)| (relative_path(project_root, file), symbols.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let (mut exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
-        exported_symbol_indexes_from_contributions(project_root, snapshot, &parsed);
-    for contribution in &parsed {
-        if let Some(facts) = &contribution.rust_api {
-            exported_symbols_by_file
-                .entry(contribution.file.clone())
-                .or_default()
-                .extend(facts.initializers.iter().map(|init| init.name.clone()));
-        }
-    }
-    let outbound_calls_by_caller_file =
-        group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
-    let initializers_by_file = snapshot
-        .go_initializers
-        .iter()
-        .map(|group| (relative_path(project_root, &group.caller_file), group))
-        .collect::<BTreeMap<_, _>>();
-    let full_materialization = previous.is_none() || affected_files.len() >= parsed.len();
-    let oxc_by_file = if full_materialization {
-        oxc_verdicts_by_file(project_root, snapshot, &parsed, public_api_files)
-    } else {
-        BTreeMap::new()
-    };
-    let previous_by_file = previous
-        .into_iter()
-        .flatten()
-        .map(|contribution| (contribution.file.as_str(), contribution))
-        .collect::<BTreeMap<_, _>>();
-    let test_module_files = cfg_test_module_files(&parsed);
-    let rust_public_items = rust_public_api_items(&parsed, public_api_files);
-    let rust_used_receivers = parsed
-        .iter()
-        .filter_map(|c| c.rust_api.as_ref())
-        .flat_map(|facts| facts.receiver_references.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    let go_live_methods = go_interface_live_methods(&parsed);
-    let rust_items_by_file = parsed
-        .iter()
-        .filter_map(|contribution| {
-            contribution
-                .rust_api
-                .as_ref()
-                .map(|facts| (contribution.file.clone(), facts.items.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let rust_modules = RustModuleIndex::new(&parsed);
-    // Rust type declarations, keyed by (file, symbol) like the edge targets:
-    // the module-qualified name of each type export's own declaration, plus
-    // the short export symbol when every item of the file with that name is
-    // such a declaration. A same-named function in another module
-    // (`callbacks::Probe` beside `types::Probe`) is not the type.
-    let items_by_file = &rust_items_by_file;
-    let rust_type_declarations = parsed
-        .iter()
-        .filter(|contribution| language_for_file(&contribution.file) == "rust")
-        .flat_map(|contribution| {
-            let items = items_by_file
-                .get(&contribution.file)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let type_exports = contribution
-                .exports
-                .iter()
-                .filter(|export| export.is_type_like || is_type_like_kind(&export.kind))
-                .collect::<Vec<_>>();
-            // An export's line can sit on attributes or doc comments before
-            // the item, so its declaration is the first same-named item outside
-            // any impl (`owner` is `None`) starting at or after that line. An
-            // export with no such item keeps every same-named declaration, as
-            // it cannot be told apart.
-            let declared = type_exports
-                .iter()
-                .flat_map(|export| {
-                    let same_named = items
-                        .iter()
-                        .filter(|item| item.owner.is_none() && item.name == export.symbol);
-                    match same_named
-                        .clone()
-                        .filter(|item| item.line >= export.line)
-                        .min_by_key(|item| item.line)
-                    {
-                        Some(item) => vec![rust_qualified_item_name(item)],
-                        None => same_named.map(rust_qualified_item_name).collect(),
-                    }
-                })
-                .collect::<BTreeSet<_>>();
-            let short = type_exports
-                .iter()
-                .filter(|export| {
-                    items
-                        .iter()
-                        .filter(|item| item.owner.is_none() && item.name == export.symbol)
-                        .all(|item| declared.contains(&rust_qualified_item_name(item)))
-                })
-                .map(|export| export.symbol.clone())
-                .collect::<Vec<_>>();
-            declared
-                .into_iter()
-                .chain(short)
-                .map(|symbol| (contribution.file.clone(), symbol))
-                .collect::<Vec<_>>()
-        })
-        .collect::<BTreeSet<_>>();
-    let rust_imports_by_file = parsed
-        .iter()
-        .filter(|contribution| !contribution.rust_imports.is_empty())
-        .map(|contribution| (contribution.file.clone(), contribution.rust_imports.clone()))
-        .collect::<BTreeMap<_, _>>();
-
-    parsed
-        .into_iter()
-        .map(|mut contribution| {
-            // Cached callgraph edges from deliberately excluded files must not
-            // keep another file's symbols live after their source is omitted.
-            if contribution.excluded_from_graph {
-                return contribution;
-            }
-            if !affected_files.contains(&contribution.file) {
-                if let Some(previous) = previous_by_file.get(contribution.file.as_str()) {
-                    return (*previous).clone();
-                }
-            }
-            let _facts_format_version = contribution.facts_format_version;
-            if let Some(facts) = &mut contribution.go_dispatch {
-                facts.live_methods = go_live_methods
-                    .get(&contribution.file)
-                    .cloned()
-                    .unwrap_or_default();
-            }
-            let outbound_calls_for_file = outbound_calls_by_caller_file
-                .by_file
-                .get(&contribution.file)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let mut exports = oxc_by_file
-                .get(&contribution.file)
-                .map(oxc_export_contributions)
-                .unwrap_or_else(|| contribution.exports.clone());
-
-            let imports_in_scope = rust_imports_in_scope(
-                &contribution.file,
-                &contribution.rust_imports,
-                contribution.globs_parent_module,
-                &rust_imports_by_file,
-            );
-            let mut internal_calls = outbound_calls_for_file
-                .iter()
-                .copied()
-                .flat_map(|call| {
-                    let test_origin =
-                        contribution.location_is_test_code(&test_module_files, call.line);
-                    let projected = match project_internal_call(
-                        project_root,
-                        call,
-                        &contribution.file,
-                        test_origin,
-                        &exported_symbols_by_file,
-                        &files_by_exported_symbol,
-                    ) {
-                        Some(internal_call) => vec![internal_call],
-                        None => rust_unresolved_path_call_edges(
-                            call,
-                            &contribution.file,
-                            &imports_in_scope,
-                            test_origin,
-                            &exported_symbols_by_file,
-                            &files_by_exported_symbol,
-                            &rust_modules,
-                            rust_items_by_file
-                                .get(&contribution.file)
-                                .map(Vec::as_slice)
-                                .unwrap_or_default(),
-                        ),
-                    };
-                    projected
-                        .into_iter()
-                        .filter(|call| {
-                            // The stored callgraph can collapse same-named module
-                            // functions to a short callee. Source edges below retain
-                            // the path and are authoritative for ambiguous names.
-                            !rust_items_by_file.get(&call.file).is_some_and(|items| {
-                                !call.symbol.contains("::")
-                                    && items
-                                        .iter()
-                                        .filter(|item| {
-                                            item.owner.is_none() && item.name == call.symbol
-                                        })
-                                        .map(rust_qualified_item_name)
-                                        .collect::<BTreeSet<_>>()
-                                        .len()
-                                        > 1
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            internal_calls.extend(resolve_raw_reexport_liveness_edges(
-                project_root,
-                &contribution.file,
-                &contribution.raw_reexports,
-                &exported_symbols_by_file,
-                &default_export_symbols_by_file,
-            ));
-            if let Some(oxc_facts) = &contribution.oxc_facts {
-                internal_calls.extend(resolve_oxc_reexport_liveness_edges(
-                    project_root,
-                    &contribution.file,
-                    oxc_facts,
-                    &exported_symbols_by_file,
-                    &default_export_symbols_by_file,
-                ));
-            }
-            // References found in source (inside macro tokens, function
-            // bodies and function values) take the test status of their own
-            // line, exactly like the stored callgraph edges above, so a call
-            // made only by test code never counts as production usage. Edges
-            // to type declarations drop that status again below.
-            let source_test_origin =
-                |line: u32| contribution.location_is_test_code(&test_module_files, line);
-            let caller_items = rust_items_by_file
-                .get(&contribution.file)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            internal_calls.extend(resolve_macro_token_liveness_edges(
-                project_root,
-                &contribution.file,
-                &contribution.macro_token_refs,
-                &contribution.rust_imports,
-                &exported_symbols_by_file,
-                &rust_modules,
-                caller_items,
-                &source_test_origin,
-            ));
-            if let Some(facts) = &contribution.rust_api {
-                internal_calls.extend(resolve_macro_token_liveness_edges(
-                    project_root,
-                    &contribution.file,
-                    &facts.initializer_references,
-                    &contribution.rust_imports,
-                    &exported_symbols_by_file,
-                    &rust_modules,
-                    caller_items,
-                    &source_test_origin,
-                ));
-                // The parser does not expose private statics as symbols, so
-                // their calls arrive with a top-level owner. Give each static
-                // its own node; only reading that static activates its body.
-                for call in &mut internal_calls {
-                    if call.caller_symbol == "<top-level>" {
-                        if let Some(init) = facts
-                            .initializers
-                            .iter()
-                            .find(|init| init.range.contains(call.line))
-                        {
-                            call.caller_symbol = init.name.clone();
-                        }
-                    }
-                }
-            }
-            for call in &mut internal_calls {
-                if let Some(items) = rust_items_by_file.get(&contribution.file) {
-                    call.caller_symbol =
-                        rust_method_node(items, &call.caller_symbol, Some(call.line))
-                            .unwrap_or_else(|| {
-                                rust_function_identity(
-                                    items,
-                                    &call.caller_symbol,
-                                    Some(call.line),
-                                    None,
-                                )
-                            });
-                }
-                if let Some(items) = rust_items_by_file.get(&call.file) {
-                    call.symbol =
-                        rust_method_node(items, &call.symbol, None).unwrap_or_else(|| {
-                            rust_function_identity(
-                                items,
-                                &call.symbol,
-                                None,
-                                (call.file == contribution.file)
-                                    .then_some(call.caller_symbol.as_str()),
-                            )
-                        });
-                }
-                // An edge to a struct, enum or other type declaration carries no
-                // test status: production code uses types through type
-                // positions and plain values, which are not edges, so a test
-                // label on an edge alone would mark production-used types
-                // test-only. Edges to functions and methods keep their status.
-                if rust_type_declarations.contains(&(call.file.clone(), call.symbol.clone())) {
-                    call.test_origin = None;
-                }
-            }
-            sort_dedup_internal_calls(&mut internal_calls);
-
-            let dispatched_method_names = outbound_calls_for_file
-                .iter()
-                .copied()
-                .flat_map(|call| dispatched_method_names_from_call(call, &contribution.file))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let imported_export_liveness = resolve_raw_imported_export_liveness_roots(
-                project_root,
-                &contribution.file,
-                &contribution.raw_imports,
-                &exported_symbols_by_file,
-                &default_export_symbols_by_file,
-            );
-            let mut attribute_entry_points = contribution
-                .attribute_entry_points
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if let Some(snapshot_roots) = attribute_roots_from_snapshot.get(&contribution.file) {
-                attribute_entry_points.extend(snapshot_roots.iter().cloned());
-            }
-            // Trait methods in a library need an exported type and trait path;
-            // a private impl is not a blanket public-API root.
-            if !rust_file_in_library(&contribution.file, &rust_public_items) {
-                attribute_entry_points.extend(contribution.trait_impl_methods.iter().cloned());
-            }
-            for export in &mut exports {
-                export.public_api =
-                    rust_item_is_public_api(&contribution, export, &rust_public_items);
-            }
-            if let Some(facts) = &contribution.rust_api {
-                for item in &facts.items {
-                    // A used private receiver can be invoked through a trait
-                    // (including a derived Default on a containing type). Its
-                    // impl body is live even without a public module path.
-                    if item.trait_name.is_some()
-                        && item.owner.as_ref().is_some_and(|owner| {
-                            rust_used_receivers.contains(owner.rsplit("::").next().unwrap_or(owner))
-                        })
-                    {
-                        if let (Some(owner), Some(trait_name)) = (&item.owner, &item.trait_name) {
-                            attribute_entry_points
-                                .insert(format!("{trait_name} for {owner}::{}", item.name));
-                            attribute_entry_points.insert(item.name.clone());
-                        }
-                    }
-                    if rust_public_items
-                        .get(&contribution.file)
-                        .is_some_and(|items| items.contains(&(item.name.clone(), item.line)))
-                    {
-                        if facts
-                            .items
-                            .iter()
-                            .filter(|candidate| candidate.name == item.name)
-                            .count()
-                            == 1
-                        {
-                            attribute_entry_points.insert(item.name.clone());
-                        }
-                        if item.owner.is_none() {
-                            attribute_entry_points
-                                .insert(macro_scoped_symbol(&item.scope, &item.name));
-                        }
-                        if let Some(owner) = &item.owner {
-                            attribute_entry_points.insert(format!("{owner}::{}", item.name));
-                            if let Some(trait_name) = &item.trait_name {
-                                attribute_entry_points
-                                    .insert(format!("{trait_name} for {owner}::{}", item.name));
-                            }
-                        }
-                    }
-                }
-            }
-            let mut root_exports = exports.clone();
-            for export in &mut root_exports {
-                export.symbol = rust_export_identity(export, contribution.rust_api.as_ref());
-            }
-            let mut liveness_roots = liveness_roots_for_file(
-                &contribution.file,
-                &root_exports,
-                &internal_calls,
-                &attribute_entry_points,
-                executable_root_exports_by_file.get(&contribution.file),
-                liveness_root_files.contains(&contribution.file),
-                language_for_file(&contribution.file) != "rust"
-                    && public_api_files.contains(&contribution.file),
-            );
-            // Roots name methods with their impl (`Owner::name`) as well; use
-            // the same method node as the edges above.
-            if let Some(items) = rust_items_by_file.get(&contribution.file) {
-                for root in &mut liveness_roots {
-                    if let Some(node) = rust_method_node(items, root, None) {
-                        *root = node;
-                    }
-                }
-                liveness_roots.sort();
-                liveness_roots.dedup();
-            }
-            contribution.go_initializers =
-                initializers_by_file.get(&contribution.file).map(|group| {
-                    GoInitializerContribution {
-                        callers: group.callers.clone(),
-                        targets: Arc::new(
-                            group
-                                .targets
-                                .iter()
-                                .map(|(file, symbol)| {
-                                    (relative_path(project_root, file), symbol.to_string())
-                                })
-                                .collect(),
-                        ),
-                        test_origin: is_test_code_file(&contribution.file, &test_module_files),
-                    }
-                });
-            if liveness_root_files.contains(&contribution.file)
-                && !executable_root_exports_by_file.contains_key(&contribution.file)
-            {
-                if let Some(group) = &contribution.go_initializers {
-                    liveness_roots.extend(
-                        group
-                            .callers
-                            .iter()
-                            .filter(|caller| {
-                                is_explicit_liveness_symbol(&contribution.file, caller)
-                                    && group.targets.iter().any(|target| {
-                                        target != &(contribution.file.clone(), (*caller).clone())
-                                    })
-                            })
-                            .cloned(),
-                    );
-                    liveness_roots.sort();
-                    liveness_roots.dedup();
-                }
-            }
-            for export in &mut exports {
-                export.is_entry_point = liveness_roots.contains(&rust_export_identity(
-                    export,
-                    contribution.rust_api.as_ref(),
-                ));
-            }
-
-            contribution.exports = exports;
-            contribution.internal_calls = internal_calls
-                .into_iter()
-                .map(InternalCallContribution::from)
-                .collect();
-            contribution.liveness_roots = liveness_roots;
-            contribution.imported_exports = imported_export_liveness.root_exports;
-            contribution.namespace_imported_exports = imported_export_liveness.namespace_exports;
-            contribution.dispatched_method_names = dispatched_method_names;
-            contribution
-        })
-        .collect()
-}
-
-fn exported_symbol_indexes_from_contributions(
-    project_root: &Path,
-    snapshot: &CallgraphSnapshot,
-    contributions: &[DeadCodeContribution],
-) -> (
-    BTreeMap<String, BTreeSet<String>>,
-    BTreeMap<String, BTreeSet<String>>,
-    BTreeMap<String, String>,
-) {
-    let mut exported_symbols_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut files_by_exported_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut default_export_symbols_by_file: BTreeMap<String, String> = BTreeMap::new();
-
-    for contribution in contributions {
-        for export in &contribution.exports {
-            exported_symbols_by_file
-                .entry(contribution.file.clone())
-                .or_default()
-                .insert(export.symbol.clone());
-            files_by_exported_symbol
-                .entry(export.symbol.clone())
-                .or_default()
-                .insert(contribution.file.clone());
-        }
-        if let Some(facts) = &contribution.rust_api {
-            // Macro calls can pass through private helpers before reaching a
-            // reportable export, so local declarations belong in this index too.
-            let symbols = exported_symbols_by_file
-                .entry(contribution.file.clone())
-                .or_default();
-            for item in &facts.items {
-                symbols.insert(rust_qualified_item_name(item));
-            }
-        }
-    }
-
-    for export in &snapshot.exported_symbols {
-        let file = relative_path(project_root, &export.file);
-        if export.kind == DEFAULT_EXPORT_MARKER_KIND {
-            default_export_symbols_by_file.insert(file, export.symbol.clone());
-        }
-    }
-
+    group: &crate::inspect::job::GoInitializerGroup,
+) -> RelativeInitializerGroup {
     (
-        exported_symbols_by_file,
-        files_by_exported_symbol,
-        default_export_symbols_by_file,
+        group.callers.clone(),
+        group
+            .targets
+            .iter()
+            .map(|(file, symbol)| (relative_path(project_root, file), symbol.to_string()))
+            .collect(),
     )
 }
 
-fn oxc_verdicts_by_file(
-    project_root: &Path,
-    snapshot: &CallgraphSnapshot,
-    contributions: &[DeadCodeContribution],
-    public_api_files: &BTreeSet<String>,
-) -> BTreeMap<String, OxcFileVerdicts> {
-    let facts = contributions
+/// The call graph's facts about whole files that materializing reads.
+struct GraphFileFacts {
+    /// Project-relative files the project's entry points name.
+    liveness_root_files: BTreeSet<String>,
+    /// The same files, as the snapshot names them (for the Oxc engine).
+    entry_points: BTreeSet<PathBuf>,
+    /// The symbol each file exports as its default export.
+    default_export_symbols_by_file: BTreeMap<String, String>,
+}
+
+impl GraphFileFacts {
+    fn from_snapshot(project_root: &Path, snapshot: &CallgraphSnapshot) -> Self {
+        let mut default_export_symbols_by_file = BTreeMap::new();
+        for export in &snapshot.exported_symbols {
+            if export.kind == DEFAULT_EXPORT_MARKER_KIND {
+                default_export_symbols_by_file.insert(
+                    relative_path(project_root, &export.file),
+                    export.symbol.clone(),
+                );
+            }
+        }
+        Self::new(
+            project_root,
+            snapshot.entry_points.clone(),
+            default_export_symbols_by_file,
+        )
+    }
+
+    fn new(
+        project_root: &Path,
+        entry_points: BTreeSet<PathBuf>,
+        default_export_symbols_by_file: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            liveness_root_files: entry_points
+                .iter()
+                .map(|file| relative_path(project_root, file))
+                .collect(),
+            entry_points,
+            default_export_symbols_by_file,
+        }
+    }
+}
+
+/// What materializing one file reads about every other file: indexes over
+/// all files' facts, and the call graph's facts about whole files. Built
+/// once per rollup, then each file is materialized on its own.
+struct MaterializeContext<'p> {
+    project_root: &'p Path,
+    public_api_files: Tracked<&'p BTreeSet<String>>,
+    liveness_root_files: Tracked<BTreeSet<String>>,
+    executable_root_exports_by_file: Tracked<Index<BTreeSet<String>>>,
+    exported_symbols_by_file: Tracked<Index<BTreeSet<String>>>,
+    files_by_exported_symbol: Tracked<Index<BTreeSet<String>>>,
+    default_export_symbols_by_file: Tracked<BTreeMap<String, String>>,
+    oxc_by_file: Tracked<Index<OxcFileVerdicts>>,
+    test_module_files: Tracked<BTreeSet<String>>,
+    rust_public_items: Tracked<Index<BTreeSet<(String, u32)>>>,
+    rust_used_receivers: Tracked<BTreeSet<String>>,
+    go_live_methods: Tracked<Index<BTreeSet<String>>>,
+    rust_items_by_file: Tracked<Index<Vec<RustApiItem>>>,
+    rust_modules: RustModuleIndex,
+    /// Rust type declarations, keyed by (file, symbol) like the edge targets:
+    /// the module-qualified name of each type export's own declaration, plus
+    /// the short export symbol when every item of the file with that name is
+    /// such a declaration. A same-named function in another module
+    /// (`callbacks::Probe` beside `types::Probe`) is not the type. Held as
+    /// each file's symbols.
+    rust_type_declarations: Tracked<Index<BTreeSet<String>>>,
+    rust_imports_by_file: Tracked<Index<Vec<RawImportContribution>>>,
+}
+
+/// The whole-project indexes a [`MaterializeContext`] reads, before their
+/// reads are tracked: built from every file's facts, or patched from a kept
+/// dead-code graph.
+struct ContextIndexes {
+    liveness_root_files: BTreeSet<String>,
+    executable_root_exports_by_file: Index<BTreeSet<String>>,
+    exported_symbols_by_file: Index<BTreeSet<String>>,
+    files_by_exported_symbol: Index<BTreeSet<String>>,
+    default_export_symbols_by_file: BTreeMap<String, String>,
+    oxc_by_file: Index<OxcFileVerdicts>,
+    test_module_files: BTreeSet<String>,
+    rust_public_items: Index<BTreeSet<(String, u32)>>,
+    rust_used_receivers: BTreeSet<String>,
+    go_live_methods: Index<BTreeSet<String>>,
+    rust_items_by_file: Index<Vec<RustApiItem>>,
+    rust_modules: RustModuleIndex,
+    rust_type_declarations: Index<BTreeSet<String>>,
+    rust_imports_by_file: Index<Vec<RawImportContribution>>,
+    /// The resolver configuration files the Oxc analysis read (path and
+    /// hash of bytes); empty when it was not run.
+    oxc_config: Vec<(PathBuf, String)>,
+}
+
+/// The symbols `contribution`'s file exports, as the exported-symbols index
+/// holds them: its exports, and for a Rust file every local declaration
+/// (macro calls can pass through private helpers before reaching a
+/// reportable export) and initializer. `None` when it has neither exports
+/// nor Rust facts.
+fn file_exported_symbols(contribution: &DeadCodeContribution) -> Option<BTreeSet<String>> {
+    let mut symbols = None::<BTreeSet<String>>;
+    for export in &contribution.exports {
+        symbols
+            .get_or_insert_with(BTreeSet::new)
+            .insert(export.symbol.clone());
+    }
+    if let Some(facts) = &contribution.rust_api {
+        let symbols = symbols.get_or_insert_with(BTreeSet::new);
+        for item in &facts.items {
+            symbols.insert(rust_qualified_item_name(item));
+        }
+        symbols.extend(facts.initializers.iter().map(|init| init.name.clone()));
+    }
+    symbols
+}
+
+/// The Rust items of `contribution`'s file, `None` without Rust facts.
+fn file_rust_items(contribution: &DeadCodeContribution) -> Option<Vec<RustApiItem>> {
+    contribution
+        .rust_api
+        .as_ref()
+        .map(|facts| facts.items.clone())
+}
+
+impl Tracked<Index<Vec<RustApiItem>>> {
+    /// The items of the Rust file `file` named `name`, recorded as a read of
+    /// that name only, so an edit to the file's other items leaves the
+    /// answer, and every file that asked for it, alone.
+    fn items_named(&self, file: &str, name: &str) -> Vec<RustApiItem> {
+        self.record_as(Lookup::RustItemsNamed, &reads::pair_key(file, name));
+        self.all()
+            .peek(file)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.name == name)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The names whose Rust items differ between a file's `old` and `new` items.
+fn rust_item_names_changed<'a>(
+    old: &'a [RustApiItem],
+    new: &'a [RustApiItem],
+) -> BTreeSet<&'a str> {
+    let by_name = |items: &'a [RustApiItem]| {
+        let mut groups = BTreeMap::<&'a str, Vec<&'a RustApiItem>>::new();
+        for item in items {
+            groups.entry(item.name.as_str()).or_default().push(item);
+        }
+        groups
+    };
+    let (old, new) = (by_name(old), by_name(new));
+    old.keys()
+        .chain(new.keys())
+        .filter(|name| reads::digest(&old.get(*name)) != reads::digest(&new.get(*name)))
+        .copied()
+        .collect()
+}
+
+/// The Rust imports of `contribution`'s file, `None` when it has none.
+fn file_rust_imports(contribution: &DeadCodeContribution) -> Option<Vec<RawImportContribution>> {
+    (!contribution.rust_imports.is_empty()).then(|| contribution.rust_imports.clone())
+}
+
+/// The symbols of `contribution`'s file that name Rust type declarations
+/// (see [`MaterializeContext::rust_type_declarations`]), `None` when there
+/// are none.
+fn file_rust_type_declarations(contribution: &DeadCodeContribution) -> Option<BTreeSet<String>> {
+    if language_for_file(&contribution.file) != "rust" {
+        return None;
+    }
+    let items = contribution
+        .rust_api
+        .as_ref()
+        .map(|facts| facts.items.as_slice())
+        .unwrap_or_default();
+    let type_exports = contribution
+        .exports
         .iter()
+        .filter(|export| export.is_type_like || is_type_like_kind(&export.kind))
+        .collect::<Vec<_>>();
+    // An export's line can sit on attributes or doc comments before the
+    // item, so its declaration is the first same-named item outside any impl
+    // (`owner` is `None`) starting at or after that line. An export with no
+    // such item keeps every same-named declaration, as it cannot be told
+    // apart.
+    let declared = type_exports
+        .iter()
+        .flat_map(|export| {
+            let same_named = items
+                .iter()
+                .filter(|item| item.owner.is_none() && item.name == export.symbol);
+            match same_named
+                .clone()
+                .filter(|item| item.line >= export.line)
+                .min_by_key(|item| item.line)
+            {
+                Some(item) => vec![rust_qualified_item_name(item)],
+                None => same_named.map(rust_qualified_item_name).collect(),
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    let short = type_exports
+        .iter()
+        .filter(|export| {
+            items
+                .iter()
+                .filter(|item| item.owner.is_none() && item.name == export.symbol)
+                .all(|item| declared.contains(&rust_qualified_item_name(item)))
+        })
+        .map(|export| export.symbol.clone())
+        .collect::<Vec<_>>();
+    let symbols = declared.into_iter().chain(short).collect::<BTreeSet<_>>();
+    (!symbols.is_empty()).then_some(symbols)
+}
+
+/// A per-file index of `parsed`: `entry` of each file that has one.
+fn per_file_index<V>(
+    parsed: &[DeadCodeContribution],
+    entry: impl Fn(&DeadCodeContribution) -> Option<V>,
+) -> Index<V> {
+    Index::memory(
+        parsed
+            .iter()
+            .filter_map(|contribution| Some((contribution.file.clone(), entry(contribution)?)))
+            .collect(),
+    )
+}
+
+/// The executable-root exports of the project's entry points, by
+/// project-relative file.
+fn executable_root_exports_by_file(
+    project_root: &Path,
+    entries: &crate::inspect::entry_points::EntryPointSet,
+) -> BTreeMap<String, BTreeSet<String>> {
+    entries
+        .executable_root_exports()
+        .into_iter()
+        .map(|(file, exports)| (relative_path(project_root, &file), exports))
+        .collect()
+}
+
+impl ContextIndexes {
+    /// Every index, built from every file's facts (`parsed`), with the
+    /// project's entry points `entries`. The Oxc verdicts are computed only
+    /// `with_oxc`.
+    fn build(
+        project_root: &Path,
+        graph: GraphFileFacts,
+        parsed: &[DeadCodeContribution],
+        public_api_files: &BTreeSet<String>,
+        entries: &crate::inspect::entry_points::EntryPointSet,
+        with_oxc: bool,
+    ) -> Self {
+        let mut files_by_exported_symbol = BTreeMap::<String, BTreeSet<String>>::new();
+        for contribution in parsed {
+            for export in &contribution.exports {
+                files_by_exported_symbol
+                    .entry(export.symbol.clone())
+                    .or_default()
+                    .insert(contribution.file.clone());
+            }
+        }
+        let (oxc_by_file, oxc_config) = if with_oxc {
+            oxc_verdicts_by_file(
+                project_root,
+                &graph.entry_points,
+                parsed,
+                public_api_files,
+                entries,
+            )
+        } else {
+            (BTreeMap::new(), Vec::new())
+        };
+        Self {
+            liveness_root_files: graph.liveness_root_files,
+            executable_root_exports_by_file: Index::memory(executable_root_exports_by_file(
+                project_root,
+                entries,
+            )),
+            exported_symbols_by_file: per_file_index(parsed, file_exported_symbols),
+            files_by_exported_symbol: Index::memory(files_by_exported_symbol),
+            default_export_symbols_by_file: graph.default_export_symbols_by_file,
+            oxc_by_file: Index::memory(oxc_by_file),
+            test_module_files: cfg_test_module_files(parsed),
+            rust_public_items: Index::memory(rust_public_api_items(parsed, public_api_files)),
+            rust_used_receivers: parsed
+                .iter()
+                .filter_map(|c| c.rust_api.as_ref())
+                .flat_map(|facts| facts.receiver_references.iter().cloned())
+                .collect(),
+            go_live_methods: Index::memory(go_interface_live_methods(parsed)),
+            rust_items_by_file: per_file_index(parsed, file_rust_items),
+            rust_modules: RustModuleIndex::new(parsed),
+            rust_type_declarations: per_file_index(parsed, file_rust_type_declarations),
+            rust_imports_by_file: per_file_index(parsed, file_rust_imports),
+            oxc_config,
+        }
+    }
+}
+
+impl<'p> MaterializeContext<'p> {
+    /// Indexes `parsed`. The Oxc verdicts are computed only `with_oxc`: a
+    /// rollup patched from a kept graph reads the verdicts it needs from
+    /// that graph instead.
+    fn new(
+        project_root: &'p Path,
+        graph: GraphFileFacts,
+        parsed: &[DeadCodeContribution],
+        public_api_files: &'p BTreeSet<String>,
+        with_oxc: bool,
+    ) -> Self {
+        let entries = crate::inspect::entry_points::resolve_entry_points(project_root);
+        let indexes = ContextIndexes::build(
+            project_root,
+            graph,
+            parsed,
+            public_api_files,
+            &entries,
+            with_oxc,
+        );
+        Self::with_indexes(project_root, public_api_files, indexes)
+    }
+
+    /// A context reading `indexes`.
+    fn with_indexes(
+        project_root: &'p Path,
+        public_api_files: &'p BTreeSet<String>,
+        indexes: ContextIndexes,
+    ) -> Self {
+        let ContextIndexes {
+            liveness_root_files,
+            executable_root_exports_by_file,
+            exported_symbols_by_file,
+            files_by_exported_symbol,
+            default_export_symbols_by_file,
+            oxc_by_file,
+            test_module_files,
+            rust_public_items,
+            rust_used_receivers,
+            go_live_methods,
+            rust_items_by_file,
+            rust_modules,
+            rust_type_declarations,
+            rust_imports_by_file,
+            oxc_config: _,
+        } = indexes;
+        Self {
+            project_root,
+            public_api_files: Tracked::new(Lookup::PublicApiFiles, public_api_files),
+            liveness_root_files: Tracked::new(Lookup::LivenessRootFiles, liveness_root_files),
+            executable_root_exports_by_file: Tracked::new(
+                Lookup::ExecutableRootExports,
+                executable_root_exports_by_file,
+            ),
+            exported_symbols_by_file: Tracked::new(
+                Lookup::ExportedSymbolsByFile,
+                exported_symbols_by_file,
+            ),
+            files_by_exported_symbol: Tracked::new(
+                Lookup::FilesByExportedSymbol,
+                files_by_exported_symbol,
+            ),
+            default_export_symbols_by_file: Tracked::new(
+                Lookup::DefaultExportByFile,
+                default_export_symbols_by_file,
+            ),
+            oxc_by_file: Tracked::new(Lookup::OxcByFile, oxc_by_file),
+            test_module_files: Tracked::new(Lookup::TestModuleFiles, test_module_files),
+            rust_public_items: Tracked::new(Lookup::RustPublicItems, rust_public_items),
+            rust_used_receivers: Tracked::new(Lookup::RustUsedReceivers, rust_used_receivers),
+            go_live_methods: Tracked::new(Lookup::GoLiveMethods, go_live_methods),
+            rust_items_by_file: Tracked::new(Lookup::RustItemsByFile, rust_items_by_file),
+            rust_modules,
+            rust_type_declarations: Tracked::new(
+                Lookup::RustTypeDeclarations,
+                rust_type_declarations,
+            ),
+            rust_imports_by_file: Tracked::new(Lookup::RustImportsByFile, rust_imports_by_file),
+        }
+    }
+
+    /// The first kept index entry a patched context could not read: its
+    /// answers are then incomplete.
+    fn failure(&self) -> Option<String> {
+        [
+            self.executable_root_exports_by_file.all().failure(),
+            self.exported_symbols_by_file.all().failure(),
+            self.files_by_exported_symbol.all().failure(),
+            self.oxc_by_file.all().failure(),
+            self.rust_public_items.all().failure(),
+            self.go_live_methods.all().failure(),
+            self.rust_items_by_file.all().failure(),
+            self.rust_type_declarations.all().failure(),
+            self.rust_imports_by_file.all().failure(),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    }
+
+    /// A digest of each whole-project index, to check that indexes built
+    /// from stored inputs equal indexes built from every file's facts. A
+    /// patched index reads every kept entry for this.
+    fn index_digests(&self) -> Vec<(&'static str, u64)> {
+        use reads::digest;
+        vec![
+            ("public_api_files", digest(self.public_api_files.all())),
+            (
+                "liveness_root_files",
+                digest(self.liveness_root_files.all()),
+            ),
+            (
+                "executable_root_exports_by_file",
+                digest(&self.executable_root_exports_by_file.all().entries()),
+            ),
+            (
+                "exported_symbols_by_file",
+                digest(&self.exported_symbols_by_file.all().entries()),
+            ),
+            (
+                "files_by_exported_symbol",
+                digest(&self.files_by_exported_symbol.all().entries()),
+            ),
+            (
+                "default_export_symbols_by_file",
+                digest(self.default_export_symbols_by_file.all()),
+            ),
+            ("oxc_by_file", digest(&self.oxc_by_file.all().entries())),
+            ("test_module_files", digest(self.test_module_files.all())),
+            (
+                "rust_public_items",
+                digest(&self.rust_public_items.all().entries()),
+            ),
+            (
+                "rust_used_receivers",
+                digest(self.rust_used_receivers.all()),
+            ),
+            (
+                "go_live_methods",
+                digest(&self.go_live_methods.all().entries()),
+            ),
+            (
+                "rust_items_by_file",
+                digest(&self.rust_items_by_file.all().entries()),
+            ),
+            ("rust_modules", digest(&self.rust_modules)),
+            (
+                "rust_type_declarations",
+                digest(&self.rust_type_declarations.all().entries()),
+            ),
+            (
+                "rust_imports_by_file",
+                digest(&self.rust_imports_by_file.all().entries()),
+            ),
+        ]
+    }
+
+    /// The project-relative files compiled only for tests by a
+    /// `#[cfg(test)]` module declaration.
+    fn test_module_files(&self) -> &BTreeSet<String> {
+        self.test_module_files.all()
+    }
+
+    /// The node a liveness root of `file` names: a method root is named
+    /// with its impl, as the edges name it.
+    fn root_node(&self, file: &str, root: String) -> String {
+        // The answer looks only at the file's items named like the root's
+        // last path segment.
+        let name = root.rsplit("::").next().unwrap_or_default();
+        let items = self.rust_items_by_file.items_named(file, name);
+        rust_method_node(&items, &root, None).unwrap_or(root)
+    }
+
+    /// Materializes `contribution`: its edges from `outbound_calls` (the
+    /// call graph's calls made in the file) and from its own facts, its
+    /// liveness roots, imported exports and dispatched method names.
+    /// `go_initializers` is the file's Go package initialization group and
+    /// `snapshot_roots` the symbols the call graph marks as keeping
+    /// themselves alive.
+    fn materialize_file(
+        &self,
+        mut contribution: DeadCodeContribution,
+        outbound_calls_for_file: &[&CallgraphOutboundCall],
+        go_initializers: Option<RelativeInitializerGroup>,
+        snapshot_roots: Option<&BTreeSet<String>>,
+    ) -> DeadCodeContribution {
+        let project_root = self.project_root;
+        let public_api_files = &self.public_api_files;
+        let test_module_files = &self.test_module_files;
+        let exported_symbols_by_file = &self.exported_symbols_by_file;
+        let files_by_exported_symbol = &self.files_by_exported_symbol;
+        let default_export_symbols_by_file = &self.default_export_symbols_by_file;
+        let rust_items_by_file = &self.rust_items_by_file;
+        let rust_modules = &self.rust_modules;
+        let rust_public_items = &self.rust_public_items;
+        let rust_used_receivers = &self.rust_used_receivers;
+        let rust_type_declarations = &self.rust_type_declarations;
+        let _facts_format_version = contribution.facts_format_version;
+        if let Some(facts) = &mut contribution.go_dispatch {
+            facts.live_methods = self
+                .go_live_methods
+                .get(&contribution.file)
+                .cloned()
+                .unwrap_or_default();
+        }
+        let mut exports = self
+            .oxc_by_file
+            .get(&contribution.file)
+            .map(oxc_export_contributions)
+            .unwrap_or_else(|| contribution.exports.clone());
+
+        let imports_in_scope = rust_imports_in_scope(
+            &contribution.file,
+            &contribution.rust_imports,
+            contribution.globs_parent_module,
+            &self.rust_imports_by_file,
+        );
+        let mut internal_calls = outbound_calls_for_file
+            .iter()
+            .copied()
+            .flat_map(|call| {
+                let test_origin = contribution.location_is_test_code(test_module_files, call.line);
+                let projected = match project_internal_call(
+                    project_root,
+                    call,
+                    &contribution.file,
+                    test_origin,
+                    exported_symbols_by_file,
+                    files_by_exported_symbol,
+                ) {
+                    Some(internal_call) => vec![internal_call],
+                    None => rust_unresolved_path_call_edges(
+                        call,
+                        &contribution.file,
+                        &imports_in_scope,
+                        test_origin,
+                        exported_symbols_by_file,
+                        files_by_exported_symbol,
+                        rust_modules,
+                        rust_items_by_file
+                            .get(&contribution.file)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    ),
+                };
+                projected
+                    .into_iter()
+                    .filter(|call| {
+                        // The stored callgraph can collapse same-named module
+                        // functions to a short callee. Source edges below retain
+                        // the path and are authoritative for ambiguous names.
+                        call.symbol.contains("::")
+                            || rust_items_by_file
+                                .items_named(&call.file, &call.symbol)
+                                .iter()
+                                .filter(|item| item.owner.is_none())
+                                .map(rust_qualified_item_name)
+                                .collect::<BTreeSet<_>>()
+                                .len()
+                                <= 1
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        internal_calls.extend(resolve_raw_reexport_liveness_edges(
+            project_root,
+            &contribution.file,
+            &contribution.raw_reexports,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        ));
+        if let Some(oxc_facts) = &contribution.oxc_facts {
+            internal_calls.extend(resolve_oxc_reexport_liveness_edges(
+                project_root,
+                &contribution.file,
+                oxc_facts,
+                exported_symbols_by_file,
+                default_export_symbols_by_file,
+            ));
+        }
+        // References found in source (inside macro tokens, function
+        // bodies and function values) take the test status of their own
+        // line, exactly like the stored callgraph edges above, so a call
+        // made only by test code never counts as production usage. Edges
+        // to type declarations drop that status again below.
+        let source_test_origin =
+            |line: u32| contribution.location_is_test_code(test_module_files, line);
+        let caller_items = rust_items_by_file
+            .get(&contribution.file)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        internal_calls.extend(resolve_macro_token_liveness_edges(
+            project_root,
+            &contribution.file,
+            &contribution.macro_token_refs,
+            &contribution.rust_imports,
+            exported_symbols_by_file,
+            rust_modules,
+            caller_items,
+            &source_test_origin,
+        ));
+        if let Some(facts) = &contribution.rust_api {
+            internal_calls.extend(resolve_macro_token_liveness_edges(
+                project_root,
+                &contribution.file,
+                &facts.initializer_references,
+                &contribution.rust_imports,
+                exported_symbols_by_file,
+                rust_modules,
+                caller_items,
+                &source_test_origin,
+            ));
+            // The parser does not expose private statics as symbols, so
+            // their calls arrive with a top-level owner. Give each static
+            // its own node; only reading that static activates its body.
+            for call in &mut internal_calls {
+                if call.caller_symbol == "<top-level>" {
+                    if let Some(init) = facts
+                        .initializers
+                        .iter()
+                        .find(|init| init.range.contains(call.line))
+                    {
+                        call.caller_symbol = init.name.clone();
+                    }
+                }
+            }
+        }
+        for call in &mut internal_calls {
+            if let Some(items) = rust_items_by_file.get(&contribution.file) {
+                call.caller_symbol = rust_method_node(items, &call.caller_symbol, Some(call.line))
+                    .unwrap_or_else(|| {
+                        rust_function_identity(items, &call.caller_symbol, Some(call.line), None)
+                    });
+            }
+            // Both lookups below look only at the callee file's items named
+            // like the callee's last path segment.
+            let callee_name = call.symbol.rsplit("::").next().unwrap_or_default();
+            let items = rust_items_by_file.items_named(&call.file, callee_name);
+            call.symbol = rust_method_node(&items, &call.symbol, None).unwrap_or_else(|| {
+                rust_function_identity(
+                    &items,
+                    &call.symbol,
+                    None,
+                    (call.file == contribution.file).then_some(call.caller_symbol.as_str()),
+                )
+            });
+            // An edge to a struct, enum or other type declaration carries no
+            // test status: production code uses types through type
+            // positions and plain values, which are not edges, so a test
+            // label on an edge alone would mark production-used types
+            // test-only. Edges to functions and methods keep their status.
+            if rust_type_declarations.contains_pair(&(call.file.clone(), call.symbol.clone())) {
+                call.test_origin = None;
+            }
+        }
+        sort_dedup_internal_calls(&mut internal_calls);
+
+        let dispatched_method_names = outbound_calls_for_file
+            .iter()
+            .copied()
+            .flat_map(|call| dispatched_method_names_from_call(call, &contribution.file))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let imported_export_liveness = resolve_raw_imported_export_liveness_roots(
+            project_root,
+            &contribution.file,
+            &contribution.raw_imports,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        );
+        let mut attribute_entry_points = contribution
+            .attribute_entry_points
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Some(snapshot_roots) = snapshot_roots {
+            attribute_entry_points.extend(snapshot_roots.iter().cloned());
+        }
+        // Trait methods in a library need an exported type and trait path;
+        // a private impl is not a blanket public-API root.
+        if !rust_file_in_library(&contribution.file, rust_public_items) {
+            attribute_entry_points.extend(contribution.trait_impl_methods.iter().cloned());
+        }
+        for export in &mut exports {
+            export.public_api = rust_item_is_public_api(&contribution, export, rust_public_items);
+        }
+        if let Some(facts) = &contribution.rust_api {
+            for item in &facts.items {
+                // A used private receiver can be invoked through a trait
+                // (including a derived Default on a containing type). Its
+                // impl body is live even without a public module path.
+                if item.trait_name.is_some()
+                    && item.owner.as_ref().is_some_and(|owner| {
+                        rust_used_receivers.contains(owner.rsplit("::").next().unwrap_or(owner))
+                    })
+                {
+                    if let (Some(owner), Some(trait_name)) = (&item.owner, &item.trait_name) {
+                        attribute_entry_points
+                            .insert(format!("{trait_name} for {owner}::{}", item.name));
+                        attribute_entry_points.insert(item.name.clone());
+                    }
+                }
+                if rust_public_items
+                    .get(&contribution.file)
+                    .is_some_and(|items| items.contains(&(item.name.clone(), item.line)))
+                {
+                    if facts
+                        .items
+                        .iter()
+                        .filter(|candidate| candidate.name == item.name)
+                        .count()
+                        == 1
+                    {
+                        attribute_entry_points.insert(item.name.clone());
+                    }
+                    if item.owner.is_none() {
+                        attribute_entry_points.insert(macro_scoped_symbol(&item.scope, &item.name));
+                    }
+                    if let Some(owner) = &item.owner {
+                        attribute_entry_points.insert(format!("{owner}::{}", item.name));
+                        if let Some(trait_name) = &item.trait_name {
+                            attribute_entry_points
+                                .insert(format!("{trait_name} for {owner}::{}", item.name));
+                        }
+                    }
+                }
+            }
+        }
+        let mut root_exports = exports.clone();
+        for export in &mut root_exports {
+            export.symbol = rust_export_identity(export, contribution.rust_api.as_ref());
+        }
+        let mut liveness_roots = liveness_roots_for_file(
+            &contribution.file,
+            &root_exports,
+            &internal_calls,
+            &attribute_entry_points,
+            self.executable_root_exports_by_file.get(&contribution.file),
+            self.liveness_root_files.contains(&contribution.file),
+            language_for_file(&contribution.file) != "rust"
+                && public_api_files.contains(&contribution.file),
+        );
+        // Roots name methods with their impl (`Owner::name`) as well; use
+        // the same method node as the edges above.
+        if let Some(items) = rust_items_by_file.get(&contribution.file) {
+            for root in &mut liveness_roots {
+                if let Some(node) = rust_method_node(items, root, None) {
+                    *root = node;
+                }
+            }
+            liveness_roots.sort();
+            liveness_roots.dedup();
+        }
+        contribution.go_initializers =
+            go_initializers.map(|(callers, targets)| GoInitializerContribution {
+                callers,
+                targets: Arc::new(targets),
+                test_origin: is_test_tree_file(&contribution.file)
+                    || test_module_files.contains(&contribution.file),
+            });
+        if self.liveness_root_files.contains(&contribution.file)
+            && !self
+                .executable_root_exports_by_file
+                .contains_key(&contribution.file)
+        {
+            if let Some(group) = &contribution.go_initializers {
+                liveness_roots.extend(
+                    group
+                        .callers
+                        .iter()
+                        .filter(|caller| {
+                            is_explicit_liveness_symbol(&contribution.file, caller)
+                                && group.targets.iter().any(|target| {
+                                    target != &(contribution.file.clone(), (*caller).clone())
+                                })
+                        })
+                        .cloned(),
+                );
+                liveness_roots.sort();
+                liveness_roots.dedup();
+            }
+        }
+        for export in &mut exports {
+            export.is_entry_point = liveness_roots.contains(&rust_export_identity(
+                export,
+                contribution.rust_api.as_ref(),
+            ));
+        }
+
+        contribution.exports = exports;
+        contribution.internal_calls = internal_calls
+            .into_iter()
+            .map(InternalCallContribution::from)
+            .collect();
+        contribution.liveness_roots = liveness_roots;
+        contribution.imported_exports = imported_export_liveness.root_exports;
+        contribution.namespace_imported_exports = imported_export_liveness.namespace_exports;
+        contribution.dispatched_method_names = dispatched_method_names;
+        contribution
+    }
+}
+
+/// The Oxc engine's verdicts for the files of `contributions` with current
+/// Oxc facts, by project-relative file, and the resolver configuration files
+/// the analysis read (path and hash of bytes).
+fn oxc_verdicts_by_file<'c>(
+    project_root: &Path,
+    entry_points: &BTreeSet<PathBuf>,
+    contributions: impl IntoIterator<Item = &'c DeadCodeContribution>,
+    public_api_files: &BTreeSet<String>,
+    entries: &crate::inspect::entry_points::EntryPointSet,
+) -> (BTreeMap<String, OxcFileVerdicts>, Vec<(PathBuf, String)>) {
+    let facts = contributions
+        .into_iter()
         .filter_map(|contribution| {
             let oxc_facts = contribution.oxc_facts.as_ref()?;
             if oxc_facts.format_version != FACTS_FORMAT_VERSION {
@@ -2336,29 +2269,35 @@ fn oxc_verdicts_by_file(
         })
         .collect::<Vec<_>>();
     if facts.is_empty() {
-        return BTreeMap::new();
+        return (BTreeMap::new(), Vec::new());
     }
 
-    let entry_points = crate::inspect::entry_points::resolve_entry_points(project_root);
-    analyze_file_facts(
+    let result = analyze_file_facts(
         project_root,
         facts,
         AnalyzeOptions {
-            entry_points: snapshot.entry_points.iter().cloned().collect(),
+            entry_points: entry_points.iter().cloned().collect(),
             public_api_files: public_api_files
                 .iter()
                 .map(|file| project_root.join(file))
                 .collect(),
-            executable_root_exports: entry_points.executable_root_exports(),
+            executable_root_exports: entries.executable_root_exports(),
             force_reparse_files: Vec::new(),
             entry_reachability: true,
         },
         Vec::new(),
-    )
-    .files
-    .into_iter()
-    .map(|file| (file.relative_file.clone(), file))
-    .collect()
+    );
+    let config = result
+        .resolver_config_inputs
+        .iter()
+        .map(|input| (input.path.clone(), input.content_hash.clone()))
+        .collect();
+    let verdicts = result
+        .files
+        .into_iter()
+        .map(|file| (file.relative_file.clone(), file))
+        .collect();
+    (verdicts, config)
 }
 
 fn sort_dedup_internal_calls(internal_calls: &mut Vec<InternalCall>) {
@@ -2381,21 +2320,45 @@ fn sort_dedup_internal_calls(internal_calls: &mut Vec<InternalCall>) {
     });
 }
 
-fn aggregate_materialized_dead_code_contributions(
+/// What rendering the findings asks about the liveness of one node, a
+/// (file, identity) pair as the graph names it.
+trait LivenessAnswers {
+    /// Whether any root reaches the node.
+    fn reachable(&self, file: &str, identity: &str) -> bool;
+    /// Whether a root reaches the node without passing a test-only edge.
+    fn production_reachable(&self, file: &str, identity: &str) -> bool;
+    /// The tests that alone use the node, when only tests use it: no
+    /// production caller reaches it, directly or through other code.
+    fn test_only_callers(&self, file: &str, identity: &str) -> Option<Vec<String>>;
+}
+
+/// What rendering reads about every file at once.
+struct RenderInputs<'a> {
+    /// A source too large to read is a graph-wide gap: it can be the only
+    /// caller or importer of a symbol elsewhere.
+    has_source_gaps: bool,
+    /// Type names referenced in type position anywhere in the project.
+    referenced_type_names: BTreeSet<String>,
+    /// Files compiled only for tests by a `#[cfg(test)]` declaration.
+    test_module_files: BTreeSet<String>,
+    /// Method names called on receivers of unknown type, by language.
+    dispatched_method_names: &'a MethodNamesByLanguage,
+}
+
+/// The dead-code findings of the files `parsed`, from their materialized
+/// facts and the liveness `answers` give.
+fn render_dead_code_findings(
     project_root: &Path,
-    facts: &[DeadCodeContribution],
     parsed: &[DeadCodeContribution],
     public_api_files: &BTreeSet<String>,
     roles: &crate::inspect::entry_points::ProjectRoles,
-    _drill_down_limit: Option<usize>,
     scanned_files: usize,
-    reachable: &BTreeSet<ExportNode>,
-    production_reachable: &BTreeSet<ExportNode>,
-    dispatched_method_names: &MethodNamesByLanguage,
+    answers: &dyn LivenessAnswers,
+    inputs: &RenderInputs<'_>,
 ) -> serde_json::Value {
-    let test_only_callers = test_only_callers_by_target(facts);
-    let referenced_type_names = collect_referenced_type_names(facts);
-    let test_module_files = cfg_test_module_files(facts);
+    let referenced_type_names = &inputs.referenced_type_names;
+    let test_module_files = &inputs.test_module_files;
+    let dispatched_method_names = inputs.dispatched_method_names;
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
@@ -2409,7 +2372,7 @@ fn aggregate_materialized_dead_code_contributions(
     let mut excluded_by_file: BTreeMap<String, usize> = BTreeMap::new();
     // A skipped source can be the only caller/importer of a symbol elsewhere.
     // With no edges from that file, deadness cannot be established graph-wide.
-    let has_source_gaps = has_oversized_sources(facts);
+    let has_source_gaps = inputs.has_source_gaps;
     for contribution in parsed {
         if has_source_gaps {
             continue;
@@ -2423,7 +2386,7 @@ fn aggregate_materialized_dead_code_contributions(
         // files) is analyzed so its calls keep product code live and mark
         // test-only usage, but its own dead symbols are not product findings:
         // they are tallied as excluded instead of counted.
-        let test_code = is_test_code_file(&contribution.file, &test_module_files);
+        let test_code = is_test_code_file(&contribution.file, test_module_files);
         let is_public_api_file = language_for_file(&contribution.file) != "rust"
             && public_api_files.contains(&contribution.file);
         let candidates = contribution
@@ -2510,17 +2473,17 @@ fn aggregate_materialized_dead_code_contributions(
                 }
             } else {
                 let identity = rust_export_identity(export, contribution.rust_api.as_ref());
-                let node = (contribution.file.clone(), identity);
-                if !test_code
+                let file = contribution.file.as_str();
+                let test_only_callers = (!test_code
                     && !is_public_api_file
                     && !export.public_api
                     && !export.is_entry_point
-                    && !production_reachable.contains(&node)
-                    && test_only_callers.contains_key(&node)
-                {
+                    && !answers.production_reachable(file, &identity))
+                .then(|| answers.test_only_callers(file, &identity))
+                .flatten();
+                if let Some(used_by) = test_only_callers {
                     // Transitive test usage names the original tests, not the
                     // production helper in the middle of the chain.
-                    let used_by = &test_only_callers[&node];
                     let mut item = json!({
                         "file": contribution.file,
                         "symbol": export.symbol,
@@ -2540,13 +2503,13 @@ fn aggregate_materialized_dead_code_contributions(
                     }
                     continue;
                 }
-                if reachable.contains(&node)
+                if answers.reachable(file, &identity)
                     || is_public_api_file
                     || export.public_api
                     || dispatch_liveness_keeps_export_live(
                         contribution,
                         export,
-                        &dispatched_method_names,
+                        dispatched_method_names,
                     )
                 {
                     continue;
@@ -2643,10 +2606,6 @@ fn aggregate_materialized_dead_code_contributions(
         excluded.record_many(file, *findings);
     }
     excluded.write_into(&mut aggregate);
-    // Per-file breakdown of the withheld findings. The incremental rollup
-    // stores it in each file's fragment so a later partial re-render keeps an
-    // exact total; the folded aggregate it produces omits this field.
-    aggregate["excluded_test_by_file"] = json!(excluded_by_file);
     aggregate
 }
 
@@ -2732,84 +2691,6 @@ fn has_oversized_sources(contributions: &[DeadCodeContribution]) -> bool {
     })
 }
 
-fn edges_by_source(
-    contributions: &[DeadCodeContribution],
-    exclude_test_origins: bool,
-) -> GraphEdges {
-    let mut edges = GraphEdges::new();
-
-    for contribution in contributions {
-        for call in &contribution.internal_calls {
-            if exclude_test_origins && call.test_origin == Some(true) {
-                continue;
-            }
-            // Keep EVERY resolved edge, regardless of whether the target is an
-            // exported symbol. Liveness must traverse through private
-            // intermediaries (a private router/helper that forwards a root to a
-            // public handler). Restricting targets to exports severed the chain
-            // at the first private hop and made every handler reachable only via
-            // a private function look dead. Node identity is (file, symbol);
-            // private and exported symbols share the same node space.
-            if call.caller_symbol.is_empty() {
-                continue;
-            }
-            let target = (call.file.clone(), call.symbol.clone());
-            let source = (contribution.file.clone(), call.caller_symbol.clone());
-            edges.entry(source).or_default().insert(target);
-        }
-        if let Some(group) = &contribution.go_initializers {
-            if exclude_test_origins && group.test_origin {
-                continue;
-            }
-            for caller in &group.callers {
-                let source = (contribution.file.clone(), caller.clone());
-                if caller.is_empty()
-                    || group.targets.is_empty()
-                    || (group.targets.len() == 1 && group.targets.contains(&source))
-                {
-                    continue;
-                }
-                let targets = edges.entry(source.clone()).or_default();
-                targets.source = Some(source);
-                targets.initializers = Some(Arc::clone(&group.targets));
-            }
-        }
-    }
-
-    edges
-}
-
-// Payload bytes exclude B-tree nodes and allocator bookkeeping, and count each
-// shared initializer target set once across the two reachability graphs.
-fn scanner_graph_payload_bytes(all: &GraphEdges, production: &GraphEdges) -> usize {
-    let node_bytes = |node: &ExportNode| {
-        std::mem::size_of::<ExportNode>() + node.0.capacity() + node.1.capacity()
-    };
-    let mut shared = BTreeSet::new();
-    let mut bytes = 0;
-    for edges in [all, production] {
-        for (source, targets) in edges {
-            bytes += node_bytes(source) + std::mem::size_of::<GraphTargets>();
-            bytes += targets.ordinary.iter().map(&node_bytes).sum::<usize>();
-            if let Some(source) = &targets.source {
-                bytes += node_bytes(source);
-            }
-            if let Some(targets) = &targets.initializers {
-                if shared.insert(Arc::as_ptr(targets) as usize) {
-                    bytes += targets.iter().map(&node_bytes).sum::<usize>();
-                }
-            }
-        }
-    }
-    bytes
-}
-
-#[derive(Default)]
-struct TestOriginLabels {
-    ids: Vec<usize>,
-    queued: bool,
-}
-
 // Both inputs are sorted and unique. Bulk union avoids a B-tree insertion for
 // every label on every graph edge, including edges that add no new origins.
 fn merge_test_origin_ids(ids: &mut Vec<usize>, labels: &[usize]) -> bool {
@@ -2850,424 +2731,6 @@ fn merge_test_origin_ids(ids: &mut Vec<usize>, labels: &[usize]) -> bool {
     }
     *ids = merged;
     true
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_ORIGIN_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn test_only_callers_by_target(
-    contributions: &[DeadCodeContribution],
-) -> BTreeMap<ExportNode, Vec<String>> {
-    let test_files = cfg_test_module_files(contributions);
-    let edges = edges_by_source(contributions, false);
-    let mut origins = BTreeMap::<ExportNode, TestOriginLabels>::new();
-    let mut origin_ids = BTreeMap::<String, usize>::new();
-    let mut frontier = VecDeque::new();
-    for contribution in contributions {
-        for call in contribution.calls() {
-            if call.test_origin == Some(true) {
-                let origin = if is_test_code_file(&contribution.file, &test_files) {
-                    contribution.file.clone()
-                } else if contribution.line_is_cfg_test(call.line) {
-                    format!("{}:{}", contribution.file, call.line)
-                } else {
-                    continue;
-                };
-                let next_id = origin_ids.len();
-                let origin = *origin_ids.entry(origin).or_insert(next_id);
-                let target = (call.file.clone(), call.symbol.clone());
-                let entry = origins.entry(target.clone()).or_default();
-                if let Err(index) = entry.ids.binary_search(&origin) {
-                    entry.ids.insert(index, origin);
-                    if !entry.queued {
-                        entry.queued = true;
-                        frontier.push_back(target);
-                    }
-                }
-            }
-        }
-    }
-    while let Some(node) = frontier.pop_front() {
-        #[cfg(test)]
-        TEST_ORIGIN_NODE_VISITS.with(|visits| visits.set(visits.get() + 1));
-        let entry = origins.get_mut(&node).expect("queued origin node");
-        entry.queued = false;
-        let labels = entry.ids.clone();
-        for target in edges.get(&node).into_iter().flatten() {
-            let entry = origins.entry(target.clone()).or_default();
-            // A pending node will propagate all labels it has accumulated when
-            // popped; queueing it once per new label repeats the same union.
-            if merge_test_origin_ids(&mut entry.ids, &labels) && !entry.queued {
-                entry.queued = true;
-                frontier.push_back(target.clone());
-            }
-        }
-    }
-    crate::slog_info!(
-        "scanner origins: nodes={} labels={} label_payload_bytes={}",
-        origins.len(),
-        origins
-            .values()
-            .map(|labels| labels.ids.len())
-            .sum::<usize>(),
-        origins
-            .values()
-            .map(|labels| labels.ids.len() * std::mem::size_of::<usize>())
-            .sum::<usize>()
-            + origin_ids.keys().map(String::capacity).sum::<usize>()
-    );
-    let mut production = BTreeSet::new();
-    for contribution in contributions {
-        for call in contribution.calls() {
-            if call.test_origin == Some(false)
-                && !origins.contains_key(&(contribution.file.clone(), call.caller_symbol.clone()))
-            {
-                production.insert((call.file.clone(), call.symbol.clone()));
-            }
-        }
-    }
-    // A production caller disqualifies the entire downstream chain, even if
-    // that caller is not reachable from the executable entry point.
-    let mut frontier = production.iter().cloned().collect::<Vec<_>>();
-    while let Some(node) = frontier.pop() {
-        for target in edges.get(&node).into_iter().flatten() {
-            if production.insert(target.clone()) {
-                frontier.push(target.clone());
-            }
-        }
-    }
-    let mut origin_names = vec![String::new(); origin_ids.len()];
-    for (name, id) in origin_ids {
-        origin_names[id] = name;
-    }
-    origins
-        .into_iter()
-        .filter(|(node, _)| !production.contains(node))
-        .map(|(node, files)| {
-            let mut names = files
-                .ids
-                .into_iter()
-                .map(|id| origin_names[id].clone())
-                .collect::<Vec<_>>();
-            names.sort();
-            (node, names)
-        })
-        .collect()
-}
-
-fn collect_dispatched_method_names_by_language(
-    contributions: &[DeadCodeContribution],
-) -> MethodNamesByLanguage {
-    let mut by_language: MethodNamesByLanguage = BTreeMap::new();
-    for contribution in contributions {
-        let language = language_for_file(&contribution.file).to_string();
-        by_language
-            .entry(language)
-            .or_default()
-            .extend(contribution.dispatched_method_names.iter().cloned());
-    }
-    by_language
-}
-
-fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
-    // A type-like export is live if it is referenced in type position ANYWHERE
-    // in the project — not only from call-reachable files. Filtering by
-    // call-reachability under-approximates
-    // liveness: the cross-file call graph is incomplete (constructor/method
-    // edges, workspace-package boundaries), so genuinely-used types referenced
-    // from files the call graph fails to mark reachable were flagged dead.
-    // This mirrors `collect_dispatched_method_names`, which is also unfiltered,
-    // and keeps dead_code biased toward under-reporting (it is a hint, not
-    // authority): a type with zero type-references anywhere is still precise
-    // dead.
-    contributions
-        .iter()
-        .flat_map(|contribution| contribution.type_ref_names.iter().cloned())
-        .collect()
-}
-
-fn build_reachability_state(
-    contributions: &[DeadCodeContribution],
-    edges: GraphEdges,
-    dispatched_method_names: &MethodNamesByLanguage,
-    previous: Option<&ReachabilityState>,
-    changed_files: &BTreeSet<String>,
-) -> (ReachabilityState, bool) {
-    let mut current = reachability_inputs(contributions, edges, dispatched_method_names);
-    let Some(previous) = previous else {
-        current.reachable = traverse_reachable(
-            &current,
-            BTreeSet::new(),
-            current.roots.iter().chain(&current.dispatch_roots).cloned(),
-        );
-        return (current, false);
-    };
-
-    current.reachable = incremental_reachable(previous, &current, changed_files);
-    (current, true)
-}
-
-fn reachability_inputs(
-    contributions: &[DeadCodeContribution],
-    edges: GraphEdges,
-    dispatched_method_names: &MethodNamesByLanguage,
-) -> ReachabilityState {
-    let mut roots = BTreeSet::new();
-    for contribution in contributions {
-        roots.extend(
-            contribution
-                .liveness_roots
-                .iter()
-                .map(|root| (contribution.file.clone(), root.clone())),
-        );
-        roots.extend(
-            contribution
-                .exports
-                .iter()
-                .filter(|export| export.is_entry_point)
-                .map(|export| {
-                    (
-                        contribution.file.clone(),
-                        rust_export_identity(export, contribution.rust_api.as_ref()),
-                    )
-                }),
-        );
-    }
-
-    let dispatch_live_source_names_by_file =
-        dispatch_live_source_names_by_file(contributions, dispatched_method_names);
-    let dispatch_roots = edges
-        .keys()
-        .filter(|source| {
-            dispatch_live_source_names_by_file
-                .get(source.0.as_str())
-                .is_some_and(|entry| entry.contains(symbol_liveness_name(&source.1)))
-        })
-        .cloned()
-        .collect();
-
-    ReachabilityState {
-        edges,
-        imported_by_file: imported_exports_by_file(contributions),
-        namespace_by_file: namespace_imported_exports_by_file(contributions),
-        roots,
-        dispatch_roots,
-        reachable: BTreeSet::new(),
-    }
-}
-
-fn incremental_reachable(
-    previous: &ReachabilityState,
-    current: &ReachabilityState,
-    changed_files: &BTreeSet<String>,
-) -> BTreeSet<ExportNode> {
-    if changed_files.is_empty()
-        && previous.edges == current.edges
-        && previous.imported_by_file == current.imported_by_file
-        && previous.namespace_by_file == current.namespace_by_file
-        && previous.roots == current.roots
-        && previous.dispatch_roots == current.dispatch_roots
-    {
-        return previous.reachable.clone();
-    }
-
-    let mut frontier = BTreeSet::new();
-    for source in previous.edges.keys().chain(current.edges.keys()) {
-        if changed_files.contains(&source.0)
-            || previous.edges.get(source) != current.edges.get(source)
-        {
-            frontier.insert(source.clone());
-            frontier.extend(previous.edges.get(source).into_iter().flatten().cloned());
-            frontier.extend(current.edges.get(source).into_iter().flatten().cloned());
-        }
-    }
-    frontier.extend(previous.roots.symmetric_difference(&current.roots).cloned());
-    frontier.extend(
-        previous
-            .dispatch_roots
-            .symmetric_difference(&current.dispatch_roots)
-            .cloned(),
-    );
-    let import_files = previous
-        .imported_by_file
-        .keys()
-        .chain(current.imported_by_file.keys())
-        .chain(previous.namespace_by_file.keys())
-        .chain(current.namespace_by_file.keys())
-        .collect::<BTreeSet<_>>();
-    for file in import_files {
-        if previous.imported_by_file.get(file) != current.imported_by_file.get(file) {
-            frontier.extend(
-                previous
-                    .imported_by_file
-                    .get(file)
-                    .into_iter()
-                    .flatten()
-                    .cloned(),
-            );
-            frontier.extend(
-                current
-                    .imported_by_file
-                    .get(file)
-                    .into_iter()
-                    .flatten()
-                    .cloned(),
-            );
-        }
-        if previous.namespace_by_file.get(file) != current.namespace_by_file.get(file) {
-            frontier.extend(
-                previous
-                    .namespace_by_file
-                    .get(file)
-                    .into_iter()
-                    .flatten()
-                    .cloned(),
-            );
-            frontier.extend(
-                current
-                    .namespace_by_file
-                    .get(file)
-                    .into_iter()
-                    .flatten()
-                    .cloned(),
-            );
-        }
-    }
-
-    // A removed edge can orphan its complete downstream component, including a
-    // cycle. Invalidate that old component before seeding it again from roots or
-    // unaffected live inbound edges in the new graph.
-    expand_frontier(previous, &mut frontier);
-    expand_frontier(current, &mut frontier);
-
-    let mut retained = previous
-        .reachable
-        .difference(&frontier)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut seeds = current
-        .roots
-        .iter()
-        .chain(&current.dispatch_roots)
-        .filter(|node| frontier.contains(*node))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    for (source, targets) in &current.edges {
-        if retained.contains(source) {
-            seeds.extend(
-                targets
-                    .iter()
-                    .filter(|target| frontier.contains(*target))
-                    .cloned(),
-            );
-        }
-    }
-    let retained_files = retained
-        .iter()
-        .map(|node| node.0.as_str())
-        .collect::<BTreeSet<_>>();
-    for file in retained_files {
-        seeds.extend(
-            current
-                .imported_by_file
-                .get(file)
-                .into_iter()
-                .chain(current.namespace_by_file.get(file))
-                .flatten()
-                .filter(|target| frontier.contains(*target))
-                .cloned(),
-        );
-    }
-
-    retained = traverse_reachable_in_frontier(current, retained, seeds, &frontier);
-    retained
-}
-
-fn expand_frontier(state: &ReachabilityState, frontier: &mut BTreeSet<ExportNode>) {
-    let mut queue = frontier.iter().cloned().collect::<VecDeque<_>>();
-    let mut expanded_files = BTreeSet::new();
-    while let Some(node) = queue.pop_front() {
-        if expanded_files.insert(node.0.clone()) {
-            for target in state
-                .imported_by_file
-                .get(&node.0)
-                .into_iter()
-                .chain(state.namespace_by_file.get(&node.0))
-                .flatten()
-            {
-                if frontier.insert(target.clone()) {
-                    queue.push_back(target.clone());
-                }
-            }
-        }
-        if let Some(targets) = state.edges.get(&node) {
-            for target in targets {
-                if frontier.insert(target.clone()) {
-                    queue.push_back(target.clone());
-                }
-            }
-        }
-    }
-}
-
-fn traverse_reachable(
-    state: &ReachabilityState,
-    reachable: BTreeSet<ExportNode>,
-    seeds: impl IntoIterator<Item = ExportNode>,
-) -> BTreeSet<ExportNode> {
-    traverse_reachable_inner(state, reachable, seeds, None)
-}
-
-fn traverse_reachable_in_frontier(
-    state: &ReachabilityState,
-    reachable: BTreeSet<ExportNode>,
-    seeds: impl IntoIterator<Item = ExportNode>,
-    frontier: &BTreeSet<ExportNode>,
-) -> BTreeSet<ExportNode> {
-    traverse_reachable_inner(state, reachable, seeds, Some(frontier))
-}
-
-fn traverse_reachable_inner(
-    state: &ReachabilityState,
-    mut reachable: BTreeSet<ExportNode>,
-    seeds: impl IntoIterator<Item = ExportNode>,
-    frontier: Option<&BTreeSet<ExportNode>>,
-) -> BTreeSet<ExportNode> {
-    let mut queue = seeds.into_iter().collect::<VecDeque<_>>();
-    let mut expanded_file_imports = reachable
-        .iter()
-        .map(|node| node.0.clone())
-        .collect::<BTreeSet<_>>();
-    while let Some(node) = queue.pop_front() {
-        if frontier.is_some_and(|nodes| !nodes.contains(&node)) || !reachable.insert(node.clone()) {
-            continue;
-        }
-        if expanded_file_imports.insert(node.0.clone()) {
-            queue.extend(
-                state
-                    .imported_by_file
-                    .get(&node.0)
-                    .into_iter()
-                    .chain(state.namespace_by_file.get(&node.0))
-                    .flatten()
-                    .filter(|target| !reachable.contains(*target))
-                    .cloned(),
-            );
-        }
-        queue.extend(
-            state
-                .edges
-                .get(&node)
-                .into_iter()
-                .flatten()
-                .filter(|target| !reachable.contains(*target))
-                .cloned(),
-        );
-    }
-    reachable
 }
 
 /// Per-file dispatch membership for the reachability projection.
@@ -3369,59 +2832,13 @@ fn export_is_method(export: &ExportContribution) -> bool {
     export.kind == "method"
 }
 
-fn imported_exports_by_file(
-    contributions: &[DeadCodeContribution],
-) -> BTreeMap<String, BTreeSet<ExportNode>> {
-    let mut by_file: BTreeMap<String, BTreeSet<ExportNode>> = BTreeMap::new();
-
-    for contribution in contributions {
-        if contribution.imported_exports.is_empty() {
-            continue;
-        }
-        by_file
-            .entry(contribution.file.clone())
-            .or_default()
-            .extend(
-                contribution
-                    .imported_exports
-                    .iter()
-                    .map(|root| (root.file.clone(), root.symbol.clone())),
-            );
-    }
-
-    by_file
-}
-
-fn namespace_imported_exports_by_file(
-    contributions: &[DeadCodeContribution],
-) -> BTreeMap<String, BTreeSet<ExportNode>> {
-    let mut by_file: BTreeMap<String, BTreeSet<ExportNode>> = BTreeMap::new();
-
-    for contribution in contributions {
-        if contribution.namespace_imported_exports.is_empty() {
-            continue;
-        }
-        by_file
-            .entry(contribution.file.clone())
-            .or_default()
-            .extend(
-                contribution
-                    .namespace_imported_exports
-                    .iter()
-                    .map(|root| (root.file.clone(), root.symbol.clone())),
-            );
-    }
-
-    by_file
-}
-
 fn project_internal_call(
     project_root: &Path,
     call: &CallgraphOutboundCall,
     caller_file: &str,
     test_origin: bool,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    files_by_exported_symbol: &Tracked<Index<BTreeSet<String>>>,
 ) -> Option<InternalCall> {
     let target = parse_target(project_root, &call.target);
     let symbol = target.symbol?;
@@ -3476,32 +2893,52 @@ impl RustModuleIndex {
             .iter()
             .map(|contribution| contribution.file.as_str())
             .collect::<BTreeSet<_>>();
+        Self::from_inputs(
+            &known,
+            contributions.iter().map(|contribution| {
+                (
+                    contribution.file.as_str(),
+                    contribution.globs_parent_module,
+                    contribution
+                        .rust_api
+                        .as_ref()
+                        .map(|facts| facts.modules.as_slice())
+                        .unwrap_or_default(),
+                )
+            }),
+        )
+    }
+
+    /// The index of the module rules `inputs` give (each file, whether it
+    /// globs its parent module, and its module declarations), resolving
+    /// out-of-line modules to the `known` files only.
+    fn from_inputs<'a>(
+        known: &BTreeSet<&str>,
+        inputs: impl Iterator<Item = (&'a str, bool, &'a [RustApiModule])>,
+    ) -> Self {
         let mut index = Self::default();
-        for contribution in contributions {
-            if contribution.globs_parent_module {
-                index.globs_parent.insert(contribution.file.clone());
+        for (file, globs_parent_module, modules) in inputs {
+            if globs_parent_module {
+                index.globs_parent.insert(file.to_string());
             }
-            let Some(facts) = &contribution.rust_api else {
-                continue;
-            };
-            for module in &facts.modules {
+            for module in modules {
                 let mut path = module.scope.clone();
                 path.push(module.name.clone());
-                let key = (contribution.file.clone(), path.clone());
+                let key = (file.to_string(), path.clone());
                 let Some(declared) = &module.file else {
                     index.inline.insert(key);
                     continue;
                 };
                 // The declared location, its `mod.rs` form, and (for a crate
                 // root with a manifest-chosen name) the file beside the root.
-                let beside_root = Path::new(&contribution.file)
+                let beside_root = Path::new(file)
                     .parent()
                     .unwrap_or(Path::new(""))
                     .join(path.join("/"))
                     .with_extension("rs")
                     .to_string_lossy()
                     .replace('\\', "/");
-                let Some(file) = [
+                let Some(found) = [
                     declared.clone(),
                     format!("{}/mod.rs", declared.trim_end_matches(".rs")),
                     beside_root.clone(),
@@ -3511,11 +2948,10 @@ impl RustModuleIndex {
                 .find(|candidate| known.contains(candidate.as_str())) else {
                     continue;
                 };
-                index.parents.insert(
-                    file.clone(),
-                    (contribution.file.clone(), module.scope.clone()),
-                );
-                index.files.insert(key, file);
+                index
+                    .parents
+                    .insert(found.clone(), (file.to_string(), module.scope.clone()));
+                index.files.insert(key, found);
             }
         }
         index
@@ -3534,7 +2970,9 @@ impl RustModuleIndex {
         match rest.first().map(String::as_str) {
             Some("crate") => {
                 // Bounded so a cyclic `#[path]` declaration cannot loop.
+                reads::record(Lookup::RustModuleParentCount, "");
                 for _ in 0..=self.parents.len() {
+                    reads::record(Lookup::RustModuleParents, &position.0);
                     let Some((parent, _)) = self.parents.get(&position.0) else {
                         break;
                     };
@@ -3547,6 +2985,7 @@ impl RustModuleIndex {
             _ => {
                 while rest.first().is_some_and(|segment| segment == "super") {
                     if position.1.pop().is_none() {
+                        reads::record(Lookup::RustModuleParents, &position.0);
                         position = self.parents.get(&position.0)?.clone();
                     }
                     rest = &rest[1..];
@@ -3556,9 +2995,14 @@ impl RustModuleIndex {
         for segment in rest {
             let mut key = (position.0.clone(), position.1.clone());
             key.1.push(segment.clone());
+            let read_key = reads::path_key(&key.0, &key.1);
+            reads::record(Lookup::RustModuleFiles, &read_key);
             if let Some(child) = self.files.get(&key) {
                 position = (child.clone(), Vec::new());
-            } else if self.inline.contains(&key) {
+            } else if {
+                reads::record(Lookup::RustModuleInline, &read_key);
+                self.inline.contains(&key)
+            } {
                 position = key;
             } else {
                 return None;
@@ -3578,7 +3022,7 @@ impl RustModuleIndex {
         scope: &[String],
         path: &[String],
         name: &str,
-        exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+        exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
     ) -> Option<ExportNode> {
         if path.is_empty() {
             return None;
@@ -3605,7 +3049,12 @@ impl RustModuleIndex {
             }
             let mut current = file.to_string();
             let mut visited = BTreeSet::new();
-            while self.globs_parent.contains(&current) && visited.insert(current.clone()) {
+            while {
+                reads::record(Lookup::RustModuleGlobsParent, &current);
+                self.globs_parent.contains(&current)
+            } && visited.insert(current.clone())
+            {
+                reads::record(Lookup::RustModuleParents, &current);
                 let (parent, parent_scope) = self.parents.get(&current)?.clone();
                 if let Some(found) = self
                     .resolve_module(&parent, &parent_scope, module_path)
@@ -3663,7 +3112,7 @@ fn rust_imports_in_scope(
     file: &str,
     own_imports: &[RawImportContribution],
     globs_parent_module: bool,
-    rust_imports_by_file: &BTreeMap<String, Vec<RawImportContribution>>,
+    rust_imports_by_file: &Tracked<Index<Vec<RawImportContribution>>>,
 ) -> Vec<RawImportContribution> {
     let mut imports = own_imports.to_vec();
     if globs_parent_module {
@@ -3848,8 +3297,8 @@ fn rust_unresolved_path_call_edges(
     caller_file: &str,
     rust_imports: &[RawImportContribution],
     test_origin: bool,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    files_by_exported_symbol: &Tracked<Index<BTreeSet<String>>>,
     modules: &RustModuleIndex,
     caller_items: &[RustApiItem],
 ) -> Vec<InternalCall> {
@@ -3950,7 +3399,7 @@ fn resolve_macro_token_liveness_edges(
     caller_file: &str,
     refs: &[MacroTokenRefContribution],
     rust_imports: &[RawImportContribution],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
     modules: &RustModuleIndex,
     caller_items: &[RustApiItem],
     test_origin: &dyn Fn(u32) -> bool,
@@ -3991,7 +3440,7 @@ fn resolve_macro_token_ref_target(
     caller_file: &str,
     reference: &MacroTokenRefContribution,
     rust_imports: &[RawImportContribution],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
 ) -> Option<ExportNode> {
     let path = reference.path.as_deref().unwrap_or(&[]);
     if reference.shape == RUST_MACRO_REF_SHAPE_CALL
@@ -4056,7 +3505,7 @@ fn resolve_macro_call_or_struct_ref(
     path: &[String],
     name: &str,
     rust_imports: &[RawImportContribution],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
 ) -> Option<ExportNode> {
     if path.is_empty() {
         if let Some(target) = exported_symbol_target(caller_file, name, exported_symbols_by_file) {
@@ -4091,7 +3540,7 @@ fn resolve_macro_method_ref(
     path: &[String],
     name: &str,
     rust_imports: &[RawImportContribution],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
 ) -> Option<ExportNode> {
     let (type_name, module_path) = path.split_last()?;
     let scoped_symbol = macro_scoped_symbol(path, name);
@@ -4134,7 +3583,7 @@ fn resolve_macro_module_targets(
     module_path: &[String],
     target_symbol: &str,
     rust_imports: &[RawImportContribution],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
 ) -> BTreeSet<ExportNode> {
     let mut targets = BTreeSet::new();
     for candidate in rust_macro_module_path_candidates(module_path, rust_imports) {
@@ -4162,7 +3611,7 @@ fn imported_macro_targets_for_local(
     caller_file: &str,
     local_name: &str,
     rust_imports: &[RawImportContribution],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
 ) -> BTreeSet<ExportNode> {
     let mut targets = BTreeSet::new();
     for import in rust_imports {
@@ -4364,7 +3813,7 @@ fn rust_resolve_segment_candidates(caller_file: &str, segments: &[&str]) -> Vec<
 fn rust_file_for_segments_from_contributions(
     caller_file: &str,
     segments: &[String],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
 ) -> Option<String> {
     let src_prefix = rust_src_prefix_for_rel(caller_file);
     if segments.is_empty() {
@@ -4433,7 +3882,7 @@ fn macro_scoped_symbol(path: &[String], name: &str) -> String {
 fn exported_symbol_target(
     file: &str,
     symbol: &str,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
 ) -> Option<ExportNode> {
     exported_symbols_by_file
         .get(file)
@@ -4489,9 +3938,12 @@ fn rust_raw_import_contributions(
 /// code.
 fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTestRange> {
     let mut ranges = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        let in_function_body = node.parent().is_some_and(|parent| parent.kind() == "block")
+    // Each node with whether its parent is a block. The walk carries this
+    // down rather than asking `Node::parent`, which searches from the root
+    // and is quadratic over a file of many top-level nodes.
+    let mut stack = vec![(root, false)];
+    while let Some((node, parent_is_block)) = stack.pop() {
+        let in_function_body = parent_is_block
             && !matches!(
                 node.kind(),
                 "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
@@ -4521,8 +3973,9 @@ fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTes
 
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
+            let is_block = node.kind() == "block";
             loop {
-                stack.push(cursor.node());
+                stack.push((cursor.node(), is_block));
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -4548,17 +4001,48 @@ fn rust_item_start_line(node: tree_sitter::Node<'_>) -> u32 {
     first.start_position().row as u32 + 1
 }
 
-/// Project-relative files of out-of-line modules declared under `#[cfg(test)]`
-/// (`#[cfg(test)] mod tests;`, optionally with `#[path = "..."]`). Such a file
-/// is compiled only for tests even though its name does not look like a test,
-/// so its calls are test usage and its own items are test code.
-///
-/// Both candidate locations are returned for a plain declaration (`name.rs`
-/// and `name/mod.rs`); callers only ever match them against files that exist.
-fn rust_cfg_test_module_files(
-    source: &str,
-    root: tree_sitter::Node,
+/// An out-of-line module a file declares under `#[cfg(test)]`, by the
+/// `#[path]` it gives or by its name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum RustCfgTestModule {
+    Path(String),
+    Name(String),
+}
+
+/// The file-level `#[cfg(test)]` out-of-line module declarations of a
+/// file, in source order.
+fn rust_cfg_test_modules(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTestModule> {
+    let mut modules = Vec::new();
+    let mut cursor = root.walk();
+    for node in root.children(&mut cursor) {
+        // Only file-level declarations: nested inline modules change the base
+        // directory, and test-only nested declarations are rare.
+        if node.kind() != "mod_item"
+            || node.child_by_field_name("body").is_some()
+            || !rust_node_has_cfg_test_attribute(source, node)
+        {
+            continue;
+        }
+        if let Some(path) = rust_path_attribute_value(source, node) {
+            modules.push(RustCfgTestModule::Path(path));
+            continue;
+        }
+        let Some(name) = node
+            .child_by_field_name("name")
+            .map(|name| node_text(source, name).to_string())
+        else {
+            continue;
+        };
+        modules.push(RustCfgTestModule::Name(name));
+    }
+    modules
+}
+
+/// The project-relative candidate files of `modules`, declared in the file
+/// at `relative_file`.
+fn rust_cfg_test_module_files_for(
     relative_file: &str,
+    modules: &[RustCfgTestModule],
 ) -> Vec<String> {
     let normalized = relative_file.replace('\\', "/");
     let (dir, file_name) = normalized
@@ -4580,30 +4064,18 @@ fn rust_cfg_test_module_files(
     };
 
     let mut files = Vec::new();
-    let mut cursor = root.walk();
-    for node in root.children(&mut cursor) {
-        // Only file-level declarations: nested inline modules change the base
-        // directory, and test-only nested declarations are rare.
-        if node.kind() != "mod_item"
-            || node.child_by_field_name("body").is_some()
-            || !rust_node_has_cfg_test_attribute(source, node)
-        {
-            continue;
+    for module in modules {
+        match module {
+            RustCfgTestModule::Path(path) => {
+                // A `#[path]` on a file-level declaration is relative to the
+                // directory of the declaring file.
+                files.push(normalize_relative_segments(&join(dir, path)));
+            }
+            RustCfgTestModule::Name(name) => {
+                files.push(join(&module_dir, &format!("{name}.rs")));
+                files.push(join(&module_dir, &format!("{name}/mod.rs")));
+            }
         }
-        if let Some(path) = rust_path_attribute_value(source, node) {
-            // A `#[path]` on a file-level declaration is relative to the
-            // directory of the declaring file.
-            files.push(normalize_relative_segments(&join(dir, &path)));
-            continue;
-        }
-        let Some(name) = node
-            .child_by_field_name("name")
-            .map(|name| node_text(source, name).to_string())
-        else {
-            continue;
-        };
-        files.push(join(&module_dir, &format!("{name}.rs")));
-        files.push(join(&module_dir, &format!("{name}/mod.rs")));
     }
     files
 }
@@ -4675,15 +4147,7 @@ fn rust_node_has_cfg_test_attribute(source: &str, node: tree_sitter::Node<'_>) -
     while let Some(attribute) = previous {
         match attribute.kind() {
             "attribute_item" => {
-                let compact = source[attribute.byte_range()]
-                    .chars()
-                    .filter(|ch| !ch.is_whitespace())
-                    .collect::<String>();
-                if compact
-                    .strip_prefix("#[cfg(")
-                    .and_then(|inner| inner.strip_suffix(")]"))
-                    .is_some_and(cfg_predicate_requires_test)
-                {
+                if rust_attribute_requires_test(source, attribute) {
                     return true;
                 }
                 previous = attribute.prev_sibling();
@@ -4693,6 +4157,46 @@ fn rust_node_has_cfg_test_attribute(source: &str, node: tree_sitter::Node<'_>) -
         }
     }
     false
+}
+
+/// `parent`'s named children, each with whether
+/// [`rust_node_has_cfg_test_attribute`] holds for it, worked out in one pass
+/// over the children. Asking each child separately walks back over every
+/// comment before it, which is quadratic in a file of many comment lines.
+fn rust_children_cfg_test_gated<'t>(
+    source: &str,
+    parent: tree_sitter::Node<'t>,
+) -> Vec<(tree_sitter::Node<'t>, bool)> {
+    let mut children = Vec::new();
+    // Whether an attribute requiring `test` is in the run of attributes and
+    // comments right before the current child.
+    let mut run_requires_test = false;
+    let mut cursor = parent.walk();
+    for node in parent.children(&mut cursor) {
+        if node.is_named() {
+            children.push((node, run_requires_test));
+        }
+        match node.kind() {
+            "attribute_item" => {
+                run_requires_test = run_requires_test || rust_attribute_requires_test(source, node);
+            }
+            "line_comment" | "block_comment" => {}
+            _ => run_requires_test = false,
+        }
+    }
+    children
+}
+
+/// Whether `attribute` is `#[cfg(...)]` with a predicate requiring `test`.
+fn rust_attribute_requires_test(source: &str, attribute: tree_sitter::Node<'_>) -> bool {
+    let compact = source[attribute.byte_range()]
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    compact
+        .strip_prefix("#[cfg(")
+        .and_then(|inner| inner.strip_suffix(")]"))
+        .is_some_and(cfg_predicate_requires_test)
 }
 
 fn cfg_predicate_requires_test(predicate: &str) -> bool {
@@ -5353,8 +4857,8 @@ fn resolve_raw_reexport_liveness_edges(
     project_root: &Path,
     file_name: &str,
     raw_reexports: &[RawReexportContribution],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    default_export_symbols_by_file: &Tracked<BTreeMap<String, String>>,
 ) -> Vec<InternalCall> {
     let mut edges = Vec::new();
     let file = project_root.join(file_name);
@@ -5415,8 +4919,8 @@ fn resolve_oxc_reexport_liveness_edges(
     project_root: &Path,
     file_name: &str,
     oxc_facts: &OxcFactsContribution,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    default_export_symbols_by_file: &Tracked<BTreeMap<String, String>>,
 ) -> Vec<InternalCall> {
     let file = project_root.join(file_name);
     let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
@@ -5455,8 +4959,8 @@ fn resolve_reexport_fact_edge(
     imported: Option<&str>,
     exported: Option<&str>,
     line: u32,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    default_export_symbols_by_file: &Tracked<BTreeMap<String, String>>,
     require_declared_export: bool,
 ) -> Vec<InternalCall> {
     match kind {
@@ -5827,9 +5331,9 @@ fn rust_collect_api_facts(
     scope: &[String],
     facts: &mut RustApiFacts,
 ) {
-    let mut cursor = root.walk();
-    for node in root.named_children(&mut cursor) {
-        if rust_node_has_cfg_test_attribute(source, node) {
+    let gated = rust_children_cfg_test_gated(source, root);
+    for (node, gated) in gated {
+        if gated {
             continue;
         }
         // An impl header names its own receiver even when nothing uses it.
@@ -5852,32 +5356,9 @@ fn rust_collect_api_facts(
                 let path_override = rust_path_attribute_value(source, node);
                 let mut nested = scope.to_vec();
                 nested.push(name.clone());
-                let module_file = if body.is_none() {
-                    let base = Path::new(file);
-                    let dir = base.parent().unwrap_or(Path::new(""));
-                    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                    let dir = if matches!(stem, "lib" | "main" | "mod") {
-                        dir.to_path_buf()
-                    } else {
-                        dir.join(stem)
-                    };
-                    Some(if let Some(path) = &path_override {
-                        normalize_relative_segments(
-                            &base
-                                .parent()
-                                .unwrap_or(Path::new(""))
-                                .join(path)
-                                .to_string_lossy(),
-                        )
-                    } else {
-                        dir.join(nested.join("/"))
-                            .with_extension("rs")
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                    })
-                } else {
-                    None
-                };
+                let module_file = body
+                    .is_none()
+                    .then(|| rust_module_file(file, &nested, path_override.as_deref()));
                 facts.modules.push(RustApiModule {
                     scope: scope.to_vec(),
                     name,
@@ -5998,6 +5479,34 @@ fn rust_collect_api_facts(
             }
             _ => {}
         }
+    }
+}
+
+/// The project-relative file of the out-of-line module at `nested` (its
+/// module path inside the declaring file), declared in the file at `file`,
+/// with `path_override` from its `#[path]` attribute.
+fn rust_module_file(file: &str, nested: &[String], path_override: Option<&str>) -> String {
+    let base = Path::new(file);
+    let dir = base.parent().unwrap_or(Path::new(""));
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let dir = if matches!(stem, "lib" | "main" | "mod") {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    };
+    if let Some(path) = path_override {
+        normalize_relative_segments(
+            &base
+                .parent()
+                .unwrap_or(Path::new(""))
+                .join(path)
+                .to_string_lossy(),
+        )
+    } else {
+        dir.join(nested.join("/"))
+            .with_extension("rs")
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 }
 
@@ -6357,14 +5866,14 @@ fn rust_public_api_items(
     result
 }
 
-fn rust_file_in_library(file: &str, public: &BTreeMap<String, BTreeSet<(String, u32)>>) -> bool {
+fn rust_file_in_library(file: &str, public: &Tracked<Index<BTreeSet<(String, u32)>>>) -> bool {
     public.contains_key(file)
 }
 
 fn rust_item_is_public_api(
     contribution: &DeadCodeContribution,
     export: &ExportContribution,
-    public: &BTreeMap<String, BTreeSet<(String, u32)>>,
+    public: &Tracked<Index<BTreeSet<(String, u32)>>>,
 ) -> bool {
     let Some(facts) = &contribution.rust_api else {
         return false;
@@ -6654,8 +6163,8 @@ fn resolve_raw_imported_export_liveness_roots(
     project_root: &Path,
     file_name: &str,
     raw_imports: &[RawImportContribution],
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    default_export_symbols_by_file: &Tracked<BTreeMap<String, String>>,
 ) -> ImportedExportLiveness {
     let file = project_root.join(file_name);
     let from_dir = file.parent().unwrap_or_else(|| Path::new("."));
@@ -6763,8 +6272,8 @@ fn reexport_edges_for_all_target_symbols(
     namespace_export: &str,
     module_entry: &Path,
     line: u32,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    default_export_symbols_by_file: &Tracked<BTreeMap<String, String>>,
     match_current_export_names: bool,
 ) -> Vec<InternalCall> {
     let Some((_, target_symbols)) =
@@ -6907,7 +6416,7 @@ fn rust_normalize_module_path(module_path: &str) -> Vec<String> {
 fn file_exports_symbol(
     file_name: &str,
     symbol: &str,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
 ) -> bool {
     exported_symbols_by_file
         .get(file_name)
@@ -7058,8 +6567,8 @@ fn package_name_for_file(file: &Path) -> Option<String> {
 fn resolve_namespace_import_liveness_roots(
     project_root: &Path,
     module_entry: &Path,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    default_export_symbols_by_file: &Tracked<BTreeMap<String, String>>,
 ) -> Vec<ExportNode> {
     let Some((_, symbols)) =
         exported_symbols_for_resolved_file(project_root, module_entry, exported_symbols_by_file)
@@ -7105,8 +6614,8 @@ fn resolve_imported_export_liveness_root(
     project_root: &Path,
     module_entry: &Path,
     imported_symbol: &str,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    default_export_symbols_by_file: &Tracked<BTreeMap<String, String>>,
 ) -> Option<ExportNode> {
     let mut file_exports_symbol = |path: &Path, symbol_name: &str| {
         exported_symbols_for_resolved_file(project_root, path, exported_symbols_by_file)
@@ -7137,7 +6646,7 @@ fn resolve_imported_export_liveness_root(
 fn exported_symbols_for_resolved_file<'a>(
     project_root: &Path,
     file: &Path,
-    exported_symbols_by_file: &'a BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &'a Tracked<Index<BTreeSet<String>>>,
 ) -> Option<(String, &'a BTreeSet<String>)> {
     let relative = relative_path(project_root, file);
     if let Some(symbols) = exported_symbols_by_file.get(&relative) {
@@ -7157,7 +6666,7 @@ fn exported_symbols_for_resolved_file<'a>(
 fn default_export_symbol_for_resolved_file(
     project_root: &Path,
     file: &Path,
-    default_export_symbols_by_file: &BTreeMap<String, String>,
+    default_export_symbols_by_file: &Tracked<BTreeMap<String, String>>,
 ) -> Option<String> {
     let relative = relative_path(project_root, file);
     if let Some(symbol) = default_export_symbols_by_file.get(&relative) {
@@ -7175,8 +6684,8 @@ fn default_export_symbol_for_resolved_file(
 fn resolve_unqualified_target(
     caller_file: &str,
     symbol: &str,
-    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
+    exported_symbols_by_file: &Tracked<Index<BTreeSet<String>>>,
+    files_by_exported_symbol: &Tracked<Index<BTreeSet<String>>>,
 ) -> Option<String> {
     if exported_symbols_by_file
         .get(caller_file)
@@ -7496,7 +7005,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     crate::inspect::job::normalize_path(path)
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DeadCodeContribution {
     #[serde(default)]
     excluded_from_graph: bool,
@@ -7597,7 +7106,7 @@ struct MacroTokenRefContribution {
     shape: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OxcFactsContribution {
     format_version: u32,
     content_hash: String,
@@ -7613,13 +7122,13 @@ struct OxcFactsContribution {
     parse_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImportedExportContribution {
     file: String,
     symbol: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExportContribution {
     #[serde(default)]
     public_api: bool,
@@ -7644,7 +7153,7 @@ struct ExportContribution {
     also_reexported: Vec<OxcReExportContext>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct InternalCallContribution {
     #[serde(default)]
     line: u32,
@@ -7659,6 +7168,24 @@ struct InternalCallContribution {
 impl DeadCodeContribution {
     /// Whether `line` of this file sits inside a `#[cfg(test)]` item, statement
     /// or block (see `rust_cfg_test_ranges`).
+    /// The facts of this file the whole-project indexes are built from
+    /// ([`MaterializeContext::new`] reads nothing else), kept so a later
+    /// rollup can rebuild the indexes without reading every file's facts.
+    fn index_skeleton(&self) -> DeadCodeContribution {
+        DeadCodeContribution {
+            file: self.file.clone(),
+            exports: self.exports.clone(),
+            rust_api: self.rust_api.clone(),
+            go_dispatch: self.go_dispatch.clone(),
+            oxc_facts: self.oxc_facts.clone(),
+            cfg_test_module_files: self.cfg_test_module_files.clone(),
+            globs_parent_module: self.globs_parent_module,
+            rust_imports: self.rust_imports.clone(),
+            type_ref_names: self.type_ref_names.clone(),
+            ..Default::default()
+        }
+    }
+
     fn line_is_cfg_test(&self, line: u32) -> bool {
         self.cfg_test_ranges
             .iter()
@@ -7669,30 +7196,14 @@ impl DeadCodeContribution {
     /// whole file is test code, or the line is under `#[cfg(test)]`. Every
     /// liveness edge built from a source location takes its test origin from
     /// this one rule, so a test-only call never counts as production usage.
-    fn location_is_test_code(&self, test_module_files: &BTreeSet<String>, line: u32) -> bool {
-        is_test_code_file(&self.file, test_module_files) || self.line_is_cfg_test(line)
-    }
-
-    fn calls(&self) -> impl Iterator<Item = InternalCallContribution> + '_ {
-        self.internal_calls
-            .iter()
-            .cloned()
-            .chain(self.go_initializers.iter().flat_map(move |group| {
-                group.callers.iter().flat_map(move |caller| {
-                    group.targets.iter().filter_map(move |(file, symbol)| {
-                        if file == &self.file && symbol == caller {
-                            return None;
-                        }
-                        Some(InternalCallContribution {
-                            caller_symbol: caller.clone(),
-                            file: file.clone(),
-                            symbol: symbol.clone(),
-                            line: 1,
-                            test_origin: Some(group.test_origin),
-                        })
-                    })
-                })
-            }))
+    fn location_is_test_code(
+        &self,
+        test_module_files: &Tracked<BTreeSet<String>>,
+        line: u32,
+    ) -> bool {
+        is_test_tree_file(&self.file)
+            || test_module_files.contains(&self.file)
+            || self.line_is_cfg_test(line)
     }
 }
 
@@ -7727,90 +7238,12 @@ struct ParsedTarget {
 thread_local! {
     static AFTER_SOURCE_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_ANALYSIS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
-    static REACHABLE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SORT_KEY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static FRAGMENT_ITEM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn legacy_test_only_callers_by_target(
-        contributions: &[DeadCodeContribution],
-    ) -> BTreeMap<ExportNode, Vec<String>> {
-        let test_files = cfg_test_module_files(contributions);
-        let edges = edges_by_source(contributions, false);
-        let mut origins = BTreeMap::<ExportNode, BTreeSet<usize>>::new();
-        let mut origin_ids = BTreeMap::<String, usize>::new();
-        let mut frontier = VecDeque::new();
-        for contribution in contributions {
-            for call in contribution.calls() {
-                if call.test_origin != Some(true) {
-                    continue;
-                }
-                let origin = if is_test_code_file(&contribution.file, &test_files) {
-                    contribution.file.clone()
-                } else if contribution.line_is_cfg_test(call.line) {
-                    format!("{}:{}", contribution.file, call.line)
-                } else {
-                    continue;
-                };
-                let next = origin_ids.len();
-                let origin = *origin_ids.entry(origin).or_insert(next);
-                let target = (call.file.clone(), call.symbol.clone());
-                if origins.entry(target.clone()).or_default().insert(origin) {
-                    frontier.push_back(target);
-                }
-            }
-        }
-        while let Some(node) = frontier.pop_front() {
-            let labels = origins[&node].clone();
-            for target in edges.get(&node).into_iter().flatten() {
-                let entry = origins.entry(target.clone()).or_default();
-                let before = entry.len();
-                entry.extend(labels.iter().copied());
-                if entry.len() != before {
-                    frontier.push_back(target.clone());
-                }
-            }
-        }
-        let mut production = BTreeSet::new();
-        for contribution in contributions {
-            for call in contribution.calls() {
-                if call.test_origin == Some(false)
-                    && !origins
-                        .contains_key(&(contribution.file.clone(), call.caller_symbol.clone()))
-                {
-                    production.insert((call.file.clone(), call.symbol.clone()));
-                }
-            }
-        }
-        let mut frontier = production.iter().cloned().collect::<Vec<_>>();
-        while let Some(node) = frontier.pop() {
-            for target in edges.get(&node).into_iter().flatten() {
-                if production.insert(target.clone()) {
-                    frontier.push(target.clone());
-                }
-            }
-        }
-        let mut names = vec![String::new(); origin_ids.len()];
-        for (name, id) in origin_ids {
-            names[id] = name;
-        }
-        origins
-            .into_iter()
-            .filter(|(node, _)| !production.contains(node))
-            .map(|(node, ids)| {
-                let mut files = ids
-                    .into_iter()
-                    .map(|id| names[id].clone())
-                    .collect::<Vec<_>>();
-                files.sort();
-                (node, files)
-            })
-            .collect()
-    }
 
     #[test]
     fn test_origin_bulk_union_matches_set_union() {
@@ -7832,140 +7265,6 @@ mod tests {
                 assert_eq!(changed, (right & !left) != 0);
             }
         }
-    }
-
-    #[test]
-    fn test_origins_coalesce_high_fanin_and_keep_cycle_and_production_semantics() {
-        let mut contributions = (0..128).map(|n| serde_json::from_value::<DeadCodeContribution>(json!({
-            "file": format!("test{n}_test.go"), "exports": [], "internal_calls": [
-                {"caller_symbol": "Test", "file": "helper.go", "symbol": "entry", "line": 1, "test_origin": true},
-                {"caller_symbol": "Test", "file": "helper.go", "symbol": "entry", "line": 2, "test_origin": true},
-                {"caller_symbol": "Test", "file": "helper.go", "symbol": "cut", "line": 3, "test_origin": true}
-            ]
-        })).unwrap()).collect::<Vec<_>>();
-        let edges = [
-            ("entry", "left"),
-            ("entry", "right"),
-            ("left", "join"),
-            ("right", "join"),
-            ("join", "entry"),
-            ("cut", "sink"),
-            ("production", "cut"),
-        ];
-        contributions.push(serde_json::from_value(json!({"file": "helper.go", "exports": [], "internal_calls": edges.into_iter().map(|(source,target)| json!({
-            "caller_symbol": source, "file": "helper.go", "symbol": target, "line": 1, "test_origin": false
-        })).collect::<Vec<_>>()})).unwrap());
-        let expected = legacy_test_only_callers_by_target(&contributions);
-        TEST_ORIGIN_NODE_VISITS.with(|visits| visits.set(0));
-        let actual = test_only_callers_by_target(&contributions);
-        assert_eq!(
-            serde_json::to_vec(&actual.iter().collect::<Vec<_>>()).unwrap(),
-            serde_json::to_vec(&expected.iter().collect::<Vec<_>>()).unwrap()
-        );
-        assert_eq!(actual.len(), 4);
-        assert!(actual.values().all(|labels| labels.len() == 128));
-        assert!(!actual.contains_key(&("helper.go".into(), "cut".into())));
-        assert!(!actual.contains_key(&("helper.go".into(), "sink".into())));
-        assert_eq!(
-            TEST_ORIGIN_NODE_VISITS.with(|visits| visits.get()),
-            6,
-            "pending nodes propagate once, not once per origin"
-        );
-    }
-
-    #[test]
-    fn test_origins_requeue_previously_visited_nodes_for_late_labels() {
-        let edges = [
-            ("a_test.go", "TestA", "helper.go", "join", true),
-            ("b_test.go", "TestB", "helper.go", "relay", true),
-            ("helper.go", "join", "helper.go", "sink", false),
-            ("helper.go", "relay", "helper.go", "join", false),
-        ];
-        let contributions = edges.into_iter().map(|(file, caller, target, symbol, test_origin)| serde_json::from_value(json!({
-            "file": file, "exports": [], "internal_calls": [{"caller_symbol": caller, "file": target, "symbol": symbol, "line": 1, "test_origin": test_origin}]
-        })).unwrap()).collect::<Vec<_>>();
-        let expected = legacy_test_only_callers_by_target(&contributions);
-        let actual = test_only_callers_by_target(&contributions);
-        assert_eq!(actual, expected);
-        assert_eq!(
-            actual[&("helper.go".into(), "sink".into())],
-            vec!["a_test.go", "b_test.go"]
-        );
-    }
-
-    #[test]
-    #[ignore = "opt-in CPU measurement using a cold callgraph of this checkout"]
-    fn live_cpu_test_origins_checkout_cost() {
-        let root = fs::canonicalize(
-            Path::new(crate::test_support::manifest_dir()).join("../../packages/aft-bridge"),
-        )
-        .unwrap();
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        eprintln!(
-            "test-origin measurement setup: root={} files={}",
-            root.display(),
-            files.len()
-        );
-        let storage = tempfile::tempdir().unwrap();
-        let store = crate::callgraph_store::CallGraphStore::open(
-            storage.path().to_path_buf(),
-            root.clone(),
-        )
-        .unwrap();
-        store.cold_build(&files).unwrap();
-        eprintln!("test-origin measurement setup: callgraph built");
-        let graph =
-            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
-        let job = job(&root, files, graph.clone());
-        let rows = with_job_canonical_paths(|| {
-            let fallback = fallback_export_contributions_by_file(&job, &graph);
-            job.scope_files
-                .iter()
-                .map(|file| {
-                    gather_file_contribution(
-                        &job,
-                        file,
-                        &fallback,
-                        &BTreeMap::new(),
-                        &BTreeMap::new(),
-                        &[],
-                        &mut DeadCodeFileAnalyzer::default(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
-        let parsed = parse_dead_code_contributions(&root, &rows);
-        let affected = parsed
-            .iter()
-            .map(|row| row.file.clone())
-            .collect::<BTreeSet<_>>();
-        let facts = with_job_canonical_paths(|| {
-            materialize_dead_code_contributions(
-                &root,
-                &graph,
-                parsed,
-                &collect_public_api_files(&root),
-                None,
-                &affected,
-            )
-        });
-        eprintln!("test-origin measurement setup: facts materialized; comparing propagation");
-        let before = Instant::now();
-        let expected = legacy_test_only_callers_by_target(&facts);
-        let before_time = before.elapsed();
-        TEST_ORIGIN_NODE_VISITS.with(|visits| visits.set(0));
-        let after = Instant::now();
-        let actual = test_only_callers_by_target(&facts);
-        let after_time = after.elapsed();
-        assert!(
-            !actual.is_empty(),
-            "checkout must exercise test-origin propagation"
-        );
-        assert_eq!(
-            serde_json::to_vec(&actual.iter().collect::<Vec<_>>()).unwrap(),
-            serde_json::to_vec(&expected.iter().collect::<Vec<_>>()).unwrap()
-        );
-        println!("test origins: files={} calls={} attributed_targets={} before={before_time:?} after={after_time:?} node_visits={}", facts.len(), facts.iter().map(|row| row.calls().count()).sum::<usize>(), actual.len(), TEST_ORIGIN_NODE_VISITS.with(|visits| visits.get()));
     }
 
     fn uncached_relative_path(root: &Path, path: &Path) -> String {
@@ -8154,20 +7453,12 @@ mod tests {
             .contributions;
         let public = BTreeSet::new();
         let roles = crate::inspect::entry_points::ProjectRoles::default();
-        let rollup = |facts: &[FileContribution], previous: Option<&DeadCodeRollupState>| {
-            aggregate_dead_code_contributions_incremental(
-                &root,
-                &snapshot,
-                facts,
-                &public,
-                &roles,
-                None,
-                Some("decode-gap"),
-                previous,
-                &BTreeSet::new(),
+        let rollup = |facts: &[FileContribution]| {
+            aggregate_dead_code_contributions_with_snapshot(
+                &root, &snapshot, facts, &public, &roles, None,
             )
         };
-        let (valid, valid_state, _) = rollup(&contributions, None);
+        let valid = rollup(&contributions);
         assert_eq!(valid["complete"], true);
         assert_eq!(valid["count"], 2);
         let inspect_dir = root.join(".aft-cache/inspect");
@@ -8229,7 +7520,7 @@ mod tests {
                         .with_type_ref_names(row.type_ref_names)
                 })
                 .collect::<Vec<_>>();
-            let (cold, state, _) = rollup(&loaded, None);
+            let cold = rollup(&loaded);
             assert_eq!(cold["complete"], false, "{case}");
             assert_eq!(cold["scanned_files"], 2);
             assert_eq!(cold["count"], 1);
@@ -8242,14 +7533,7 @@ mod tests {
                     "message": "cached dead-code contribution could not be decoded",
                 }])
             );
-            let (warm, gap_state, _) = rollup(&loaded, Some(&state));
-            assert_eq!(warm, cold, "unchanged gap: {case}");
-            let (corrupted, _, _) = rollup(&loaded, Some(&valid_state));
-            assert_eq!(
-                corrupted, cold,
-                "corruption without changed-file notice: {case}"
-            );
-            let (repaired, _, _) = rollup(&contributions, Some(&gap_state));
+            let repaired = rollup(&contributions);
             assert_eq!(repaired, valid, "repaired contribution: {case}");
             assert_eq!(
                 borrower
@@ -8294,6 +7578,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &mut DeadCodeFileAnalyzer::default(),
+            FactSource::Parse,
         );
         assert_eq!(
             contribution.freshness.content_hash,
@@ -8304,56 +7589,6 @@ mod tests {
             cache_freshness::verify_file(&path, &contribution.freshness),
             crate::cache_freshness::FreshnessVerdict::Stale
         );
-    }
-
-    #[test]
-    fn audit05_fragments_group_each_item_once() {
-        let files = ["a.rs", "b.rs", "c.rs"];
-        let contributions = files
-            .iter()
-            .map(|file| dispatch_contribution(file, &[]))
-            .collect::<Vec<_>>();
-        let items = files
-            .iter()
-            .map(|file| json!({"file": file, "symbol": "f", "line": 1}))
-            .collect::<Vec<_>>();
-        let aggregate = json!({"items": items, "generated_items": items, "test_only_items": items, "uncertain_items": items});
-        FRAGMENT_ITEM_VISITS.with(|visits| visits.set(0));
-        let fragments = fragments_from_aggregate(
-            &contributions,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-            "roles",
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &aggregate,
-        );
-        for file in files {
-            let fragment = &fragments[file];
-            assert_eq!(fragment.headline_items.len(), 1);
-            assert_eq!(fragment.generated_items.len(), 1);
-            assert_eq!(fragment.test_only_items.len(), 1);
-            assert_eq!(fragment.uncertain_items.len(), 1);
-            assert_eq!(fragment.by_language["rust"], 1);
-        }
-        assert_eq!(FRAGMENT_ITEM_VISITS.with(|visits| visits.get()), 12);
-    }
-
-    #[test]
-    fn audit05_reachability_query_visits_only_the_requested_file() {
-        let mut reachable = BTreeSet::new();
-        for i in 0..100 {
-            reachable.insert(("a.ts".to_string(), format!("symbol{i}")));
-            reachable.insert(("z.ts".to_string(), format!("symbol{i}")));
-        }
-        reachable.insert(("middle.ts".to_string(), "one".to_string()));
-        reachable.insert(("middle.ts".to_string(), "two".to_string()));
-        REACHABLE_VISITS.with(|visits| visits.set(0));
-        assert_eq!(
-            reachable_symbols_for_file(&reachable, "middle.ts"),
-            ["one".to_string(), "two".to_string()].into_iter().collect()
-        );
-        assert_eq!(REACHABLE_VISITS.with(|visits| visits.get()), 3);
     }
 
     #[test]
@@ -8397,6 +7632,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &mut DeadCodeFileAnalyzer::default(),
+            FactSource::Parse,
         );
         assert_eq!(
             contribution.freshness.content_hash,
@@ -8439,6 +7675,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &mut DeadCodeFileAnalyzer::default(),
+            FactSource::Parse,
         );
         assert_eq!(
             contribution.freshness.content_hash,
@@ -8461,27 +7698,6 @@ mod tests {
             rust_impl_scope_name(&node, source),
             "crate::Trait for &crate::Widget"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn audit05_callgraph_hashes_accept_symlink_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("real");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("lib.rs"), "fn caller() {}\n").unwrap();
-        let root = fs::canonicalize(root).unwrap();
-        let alias = dir.path().join("alias");
-        std::os::unix::fs::symlink(&root, &alias).unwrap();
-        let snapshot = snapshot(
-            vec![],
-            vec![],
-            vec![outbound(&root, "lib.rs", "caller", "target")],
-        );
-        let expected = callgraph_hashes(&root, &snapshot, None, &BTreeSet::new(), None);
-        let actual = callgraph_hashes(&alias, &snapshot, None, &BTreeSet::new(), None);
-        assert_eq!(expected.len(), 1);
-        assert_eq!(actual, expected);
     }
 
     #[cfg(unix)]
@@ -8528,45 +7744,6 @@ mod tests {
         assert_eq!(grouped.by_file["src/missing.rs"].len(), 2);
     }
 
-    fn reachability_fixture(edges: &[(&str, &str)], roots: &[&str]) -> ReachabilityState {
-        let mut by_source = GraphEdges::new();
-        for (source, target) in edges {
-            by_source
-                .entry(("graph.ts".to_string(), (*source).to_string()))
-                .or_default()
-                .insert(("graph.ts".to_string(), (*target).to_string()));
-        }
-        let mut roots = roots
-            .iter()
-            .map(|root| ("graph.ts".to_string(), (*root).to_string()))
-            .collect::<BTreeSet<_>>();
-        roots.insert(("stable.ts".to_string(), "stable_root".to_string()));
-        let mut state = ReachabilityState {
-            edges: by_source,
-            imported_by_file: BTreeMap::new(),
-            namespace_by_file: BTreeMap::new(),
-            roots,
-            dispatch_roots: BTreeSet::new(),
-            reachable: BTreeSet::new(),
-        };
-        state.reachable = traverse_reachable(&state, BTreeSet::new(), state.roots.iter().cloned());
-        state
-    }
-
-    fn assert_incremental_reachability_parity(
-        previous: &ReachabilityState,
-        mut current: ReachabilityState,
-    ) -> ReachabilityState {
-        let full = current.reachable.clone();
-        current.reachable = incremental_reachable(
-            previous,
-            &current,
-            &["graph.ts".to_string()].into_iter().collect(),
-        );
-        assert_eq!(current.reachable, full);
-        current
-    }
-
     /// Builds a contribution the way the production path does — from the JSON
     /// facts record — so every `#[serde(default)]` field keeps its default.
     fn dispatch_contribution(file: &str, exports: &[(&str, &str)]) -> DeadCodeContribution {
@@ -8578,90 +7755,6 @@ mod tests {
                 .collect::<Vec<_>>(),
         }))
         .expect("contribution facts")
-    }
-
-    /// One edge per source, all pointing at the same target: only the source
-    /// side of an edge decides whether it is a dispatch root.
-    fn dispatch_edges(sources: &[(&str, &str)]) -> GraphEdges {
-        sources
-            .iter()
-            .map(|(file, symbol)| {
-                (
-                    ((*file).to_string(), (*symbol).to_string()),
-                    GraphTargets {
-                        ordinary: BTreeSet::from([(
-                            "src/target.ts".to_string(),
-                            "target".to_string(),
-                        )]),
-                        ..GraphTargets::default()
-                    },
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn dispatch_roots_require_a_contribution_and_a_dispatched_name() {
-        // Two non-Go languages, Go, and a language with no dispatched names.
-        let contributions = vec![
-            dispatch_contribution("src/service.ts", &[("render", "method")]),
-            dispatch_contribution("src/worker.py", &[("process", "function")]),
-            dispatch_contribution(
-                "src/server.go",
-                &[
-                    ("Serve", "method"),
-                    ("Handle", "function"),
-                    ("helper", "method"),
-                ],
-            ),
-            dispatch_contribution("src/plain.zig", &[("render", "method")]),
-        ];
-        let dispatched_method_names = MethodNamesByLanguage::from([
-            (
-                "typescript".to_string(),
-                BTreeSet::from(["render".to_string(), "handle".to_string()]),
-            ),
-            (
-                "python".to_string(),
-                BTreeSet::from(["process".to_string()]),
-            ),
-            (
-                "go".to_string(),
-                BTreeSet::from(["Serve".to_string(), "Handle".to_string()]),
-            ),
-        ]);
-        let edges = dispatch_edges(&[
-            // Non-Go: membership is the language's name set, with no
-            // method-kind gate.
-            ("src/service.ts", "render"),
-            ("src/service.ts", "handle"),
-            ("src/service.ts", "missing"),
-            ("src/worker.py", "process"),
-            // Go: explicit dispatched names apply only to method exports.
-            ("src/server.go", "Serve"),
-            ("src/server.go", "Handle"),
-            ("src/server.go", "helper"),
-            // The file's language has no dispatched names at all.
-            ("src/plain.zig", "render"),
-            // The extension maps to a language that has the name, but the file
-            // is not a contribution, so it can never be a dispatch root.
-            ("src/absent.ts", "render"),
-            ("src/absent.py", "process"),
-            // Unknown extension.
-            ("src/absent.xyz", "render"),
-        ]);
-
-        let state = reachability_inputs(&contributions, edges, &dispatched_method_names);
-
-        assert_eq!(
-            state.dispatch_roots,
-            BTreeSet::from([
-                ("src/service.ts".to_string(), "render".to_string()),
-                ("src/service.ts".to_string(), "handle".to_string()),
-                ("src/worker.py".to_string(), "process".to_string()),
-                ("src/server.go".to_string(), "Serve".to_string()),
-            ])
-        );
     }
 
     #[test]
@@ -8718,77 +7811,7 @@ mod tests {
     }
 
     #[test]
-    fn vanished_contribution_drops_its_fragment_without_a_changed_file_entry() {
-        // A deleted file's contribution disappears from the set the rollup is
-        // given, but the host may spell the deletion differently from the
-        // contribution key (Windows backslashes) or not name it at all; the
-        // fragment must go regardless.
-        let (_temp, root, files) = fixture_project(&[
-            ("main.rs", "pub fn main() {}\n"),
-            ("dead.rs", "pub fn planted_dead() {}\n"),
-        ]);
-        let snapshot = snapshot_with_entry_points(
-            files.clone(),
-            vec![
-                export(&root, "main.rs", "main", "function"),
-                export(&root, "dead.rs", "planted_dead", "function"),
-            ],
-            Vec::new(),
-            [root.join("main.rs")].into_iter().collect(),
-        );
-        let scan_job = job(&root, files.clone(), snapshot.clone());
-        let contributions = run_dead_code_scan(&scan_job)
-            .outcome
-            .expect("initial scan")
-            .contributions;
-        let public = BTreeSet::new();
-        let roles = crate::inspect::entry_points::ProjectRoles::default();
-        let (initial, state, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            Some("vanish"),
-            None,
-            &BTreeSet::new(),
-        );
-        assert!(aggregate_has_item(&initial, "dead.rs", "planted_dead"));
-
-        let remaining = contributions
-            .iter()
-            .filter(|contribution| contribution.contribution["file"] != "dead.rs")
-            .cloned()
-            .collect::<Vec<_>>();
-        let (incremental, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &snapshot,
-            &remaining,
-            &public,
-            &roles,
-            None,
-            Some("vanish"),
-            Some(&state),
-            &["dead\\.rs".to_string()].into_iter().collect(),
-        );
-        let (full, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &snapshot,
-            &remaining,
-            &public,
-            &roles,
-            None,
-            Some("vanish"),
-            None,
-            &BTreeSet::new(),
-        );
-        assert_eq!(incremental, full);
-        assert!(!aggregate_has_item(&incremental, "dead.rs", "planted_dead"));
-    }
-
-    #[test]
-    fn compact_initializers_rehash_unchanged_callers_and_match_expanded_rollup() {
+    fn compact_initializers_match_expanded_calls() {
         let (_temp, root, files) = fixture_project(&[
             ("main.go", "package main\nfunc main() {}\n"),
             (
@@ -8818,355 +7841,40 @@ mod tests {
             .contributions;
         let roles = crate::inspect::entry_points::ProjectRoles::default();
         let public = BTreeSet::new();
-        let (initial, state, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            None,
-            None,
-            &BTreeSet::new(),
-        );
+        let rollup = |snapshot: &CallgraphSnapshot| {
+            aggregate_dead_code_contributions_with_snapshot(
+                &root,
+                snapshot,
+                &contributions,
+                &public,
+                &roles,
+                None,
+            )
+        };
+        let initial = rollup(&snapshot);
         assert!(!aggregate_has_item(&initial, "lib/lib.go", "Alive"));
         assert!(aggregate_has_item(&initial, "lib/lib.go", "Dead"));
 
+        // The group's target moves: the one group's calls answer as the
+        // same calls written out one by one.
         snapshot.go_initializers[0].targets[0].1 = Arc::from("Dead");
-        let changed = ["unrelated.txt".to_string()].into_iter().collect();
-        let (incremental, next_state, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            None,
-            Some(&state),
-            &changed,
-        );
-        let (full, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            None,
-            None,
-            &BTreeSet::new(),
-        );
+        let compact = rollup(&snapshot);
         let mut expanded = snapshot.clone();
         expanded.outbound_calls = snapshot.expanded_outbound_calls();
         expanded.go_initializers.clear();
-        let (legacy, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &expanded,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            None,
-            None,
-            &BTreeSet::new(),
-        );
-        assert!(aggregate_has_item(&incremental, "lib/lib.go", "Alive"));
-        assert!(!aggregate_has_item(&incremental, "lib/lib.go", "Dead"));
+        let written_out = rollup(&expanded);
+        assert!(aggregate_has_item(&compact, "lib/lib.go", "Alive"));
+        assert!(!aggregate_has_item(&compact, "lib/lib.go", "Dead"));
         assert_eq!(
-            serde_json::to_vec(&incremental).unwrap(),
-            serde_json::to_vec(&full).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_vec(&full).unwrap(),
-            serde_json::to_vec(&legacy).unwrap()
+            serde_json::to_vec(&compact).unwrap(),
+            serde_json::to_vec(&written_out).unwrap()
         );
         snapshot.go_initializers.clear();
-        let (removed, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            None,
-            Some(&next_state),
-            &changed,
-        );
-        let (removed_full, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            None,
-            None,
-            &BTreeSet::new(),
-        );
+        let removed = rollup(&snapshot);
         assert!(aggregate_has_item(&removed, "lib/lib.go", "Alive"));
         assert!(aggregate_has_item(&removed, "lib/lib.go", "Dead"));
-        assert_eq!(removed, removed_full);
     }
 
-    #[test]
-    fn compact_initializer_graph_shares_targets_and_preserves_ordinary_self_calls() {
-        let node = |symbol: &str| ("main.go".to_string(), symbol.to_string());
-        let targets = Arc::new(BTreeSet::from([node("A"), node("B")]));
-        let mut contribution = serde_json::from_value::<DeadCodeContribution>(json!({
-            "file": "main.go", "exports": [], "internal_calls": [{
-                "caller_symbol": "A", "file": "main.go", "symbol": "A",
-                "line": 3, "test_origin": false,
-            }]
-        }))
-        .unwrap();
-        contribution.go_initializers = Some(GoInitializerContribution {
-            callers: vec!["A".into(), "B".into()],
-            targets: Arc::clone(&targets),
-            test_origin: false,
-        });
-        let edges = edges_by_source(std::slice::from_ref(&contribution), false);
-        for caller in ["A", "B"] {
-            assert!(Arc::ptr_eq(
-                edges[&node(caller)].initializers.as_ref().unwrap(),
-                &targets
-            ));
-        }
-        assert_eq!(edges[&node("A")].ordinary, BTreeSet::from([node("A")]));
-        assert!(edges[&node("B")].ordinary.is_empty());
-        assert_eq!(
-            edges[&node("A")].iter().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from([node("A"), node("B")])
-        );
-        assert_eq!(
-            edges[&node("B")].iter().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from([node("A")])
-        );
-
-        // A synthetic self-call alone must not create a dispatch-root key, but
-        // excluding it must not erase an ordinary self-call on the same source.
-        contribution.go_initializers.as_mut().unwrap().targets =
-            Arc::new(BTreeSet::from([node("A")]));
-        let edges = edges_by_source(std::slice::from_ref(&contribution), false);
-        assert_eq!(
-            edges[&node("A")].iter().collect::<Vec<_>>(),
-            vec![&node("A")]
-        );
-        contribution.internal_calls.clear();
-        let edges = edges_by_source(&[contribution], false);
-        assert!(!edges.contains_key(&node("A")));
-        assert!(edges.contains_key(&node("B")));
-    }
-
-    #[test]
-    fn interned_test_origins_preserve_distinct_sorted_transitive_labels() {
-        let facts = |file: &str, caller: &str, target: &str, symbol: &str, test_origin: bool| {
-            serde_json::from_value::<DeadCodeContribution>(json!({
-                "file": file, "exports": [], "internal_calls": [{
-                    "caller_symbol": caller, "file": target, "symbol": symbol,
-                    "line": 1, "test_origin": test_origin,
-                }]
-            }))
-            .unwrap()
-        };
-        let contributions = vec![
-            facts("z_test.go", "TestZ", "helper.go", "relay", true),
-            facts("a_test.go", "TestA", "helper.go", "relay", true),
-            facts("helper.go", "relay", "product.go", "Live", false),
-        ];
-        let origins = test_only_callers_by_target(&contributions);
-        assert_eq!(
-            origins[&("product.go".into(), "Live".into())],
-            vec!["a_test.go", "z_test.go"]
-        );
-        assert_eq!(
-            origins[&("helper.go".into(), "relay".into())],
-            vec!["a_test.go", "z_test.go"]
-        );
-    }
-
-    #[test]
-    fn incremental_aggregate_matches_full_for_reachability_flip_and_contribution_change() {
-        let (_temp, root, files) = fixture_project(&[
-            ("main.rs", "pub fn main() { target(); }\n"),
-            ("target.rs", "pub fn target() {}\n"),
-        ]);
-        let live_snapshot = snapshot_with_entry_points(
-            files.clone(),
-            vec![
-                export(&root, "main.rs", "main", "function"),
-                export(&root, "target.rs", "target", "function"),
-            ],
-            vec![outbound(&root, "main.rs", "main", "target.rs::target")],
-            [root.join("main.rs")].into_iter().collect(),
-        );
-        let scan_job = job(&root, files.clone(), live_snapshot.clone());
-        let contributions = run_dead_code_scan(&scan_job)
-            .outcome
-            .expect("initial scan")
-            .contributions;
-        let public = BTreeSet::new();
-        let roles = crate::inspect::entry_points::ProjectRoles::default();
-        let (live, state, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &live_snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            Some("sequence"),
-            None,
-            &BTreeSet::new(),
-        );
-
-        let orphaned_snapshot = snapshot_with_entry_points(
-            files,
-            vec![
-                export(&root, "main.rs", "main", "function"),
-                export(&root, "target.rs", "target", "function"),
-            ],
-            Vec::new(),
-            [root.join("main.rs")].into_iter().collect(),
-        );
-        let changed = ["main.rs".to_string()].into_iter().collect();
-        let (incremental, state, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &orphaned_snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            Some("sequence"),
-            Some(&state),
-            &changed,
-        );
-        let (full, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &orphaned_snapshot,
-            &contributions,
-            &public,
-            &roles,
-            None,
-            Some("sequence"),
-            None,
-            &BTreeSet::new(),
-        );
-        assert_eq!(incremental, full);
-        assert_ne!(incremental, live);
-        assert!(aggregate_has_item(&incremental, "target.rs", "target"));
-
-        let mut changed_contributions = contributions.clone();
-        let target = changed_contributions
-            .iter_mut()
-            .find(|contribution| contribution.contribution["file"] == "target.rs")
-            .expect("target contribution");
-        target.contribution["exports"][0]["line"] = json!(99);
-        let changed = ["target.rs".to_string()].into_iter().collect();
-        let (incremental, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &orphaned_snapshot,
-            &changed_contributions,
-            &public,
-            &roles,
-            None,
-            Some("sequence"),
-            Some(&state),
-            &changed,
-        );
-        let (full, _, _) = aggregate_dead_code_contributions_incremental(
-            &root,
-            &orphaned_snapshot,
-            &changed_contributions,
-            &public,
-            &roles,
-            None,
-            Some("sequence"),
-            None,
-            &BTreeSet::new(),
-        );
-        assert_eq!(incremental, full);
-        assert_eq!(incremental["items"][0]["line"], json!(99));
-    }
-
-    #[test]
-    fn incremental_reachability_matches_full_across_cycle_diamond_and_orphan_edits() {
-        let initial = reachability_fixture(
-            &[
-                ("root", "a"),
-                ("a", "b"),
-                ("a", "c"),
-                ("b", "d"),
-                ("c", "d"),
-                ("d", "e"),
-                ("e", "d"),
-                ("a", "orphan"),
-                ("x", "y"),
-            ],
-            &["root"],
-        );
-        let removed_only_path = assert_incremental_reachability_parity(
-            &initial,
-            reachability_fixture(
-                &[
-                    ("root", "a"),
-                    ("a", "b"),
-                    ("a", "c"),
-                    ("b", "d"),
-                    ("c", "d"),
-                    ("d", "e"),
-                    ("e", "d"),
-                    ("x", "y"),
-                ],
-                &["root"],
-            ),
-        );
-        assert!(!removed_only_path
-            .reachable
-            .contains(&("graph.ts".to_string(), "orphan".to_string())));
-
-        let newly_reached = assert_incremental_reachability_parity(
-            &removed_only_path,
-            reachability_fixture(
-                &[
-                    ("root", "a"),
-                    ("a", "b"),
-                    ("a", "c"),
-                    ("b", "d"),
-                    ("c", "d"),
-                    ("d", "e"),
-                    ("e", "d"),
-                    ("c", "orphan"),
-                    ("x", "z"),
-                ],
-                &["root"],
-            ),
-        );
-        assert!(newly_reached
-            .reachable
-            .contains(&("graph.ts".to_string(), "orphan".to_string())));
-
-        let root_removed = assert_incremental_reachability_parity(
-            &newly_reached,
-            reachability_fixture(
-                &[
-                    ("a", "b"),
-                    ("a", "c"),
-                    ("b", "d"),
-                    ("c", "d"),
-                    ("d", "e"),
-                    ("e", "d"),
-                    ("c", "orphan"),
-                    ("x", "z"),
-                ],
-                &[],
-            ),
-        );
-        assert_eq!(
-            root_removed.reachable,
-            [("stable.ts".to_string(), "stable_root".to_string())]
-                .into_iter()
-                .collect()
-        );
-    }
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, RwLock};
 
@@ -9196,7 +7904,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_js_ts_sources_are_unopened_graph_wide_gaps_including_incremental_rollups() {
+    fn oversized_js_ts_sources_are_unopened_graph_wide_gaps_including_cached_rollups() {
         for extension in ["js", "ts"] {
             let importer = format!("src/importer.{extension}");
             let target = format!("src/target.{extension}");
@@ -9227,23 +7935,13 @@ mod tests {
                         run_dead_code_scan(&scan_job).outcome.unwrap()
                     }
                 };
-                let rollup = |facts: &[FileContribution],
-                              previous: Option<&DeadCodeRollupState>| {
-                    aggregate_dead_code_contributions_incremental(
-                        &root,
-                        &snapshot,
-                        facts,
-                        &public,
-                        &roles,
-                        None,
-                        None,
-                        previous,
-                        &BTreeSet::from([importer.clone()]),
+                let rollup = |facts: &[FileContribution]| {
+                    aggregate_dead_code_contributions_with_snapshot(
+                        &root, &snapshot, facts, &public, &roles, None,
                     )
                 };
                 let initial = scan();
                 assert_eq!(initial.aggregate["count"], 2);
-                let (_, initial_state, _) = rollup(&initial.contributions, None);
                 let source_reads =
                     super::super::source_text::source_read_count_for_debug(&files[0]);
                 let head_bytes = crate::file_kind::read_probe::bytes_read(&files[0]);
@@ -9258,10 +7956,8 @@ mod tests {
                 );
                 assert_eq!(skipped.aggregate["complete"], false);
                 assert_eq!(skipped.aggregate["skipped_files"], expected);
-                let (cached, state, _) = rollup(&skipped.contributions, Some(&initial_state));
+                let cached = rollup(&skipped.contributions);
                 assert_eq!(cached, skipped.aggregate);
-                let (warm, _, _) = rollup(&skipped.contributions, Some(&state));
-                assert_eq!(warm, cached);
                 assert_eq!(
                     super::super::source_text::source_read_count_for_debug(&files[0]),
                     source_reads
@@ -9273,7 +7969,7 @@ mod tests {
                 drop(probe);
                 fs::write(&files[0], &handwritten).unwrap();
                 let repaired = scan();
-                let (cached_repair, _, _) = rollup(&repaired.contributions, Some(&state));
+                let cached_repair = rollup(&repaired.contributions);
                 assert_eq!(cached_repair, initial.aggregate);
             }
         }
@@ -9367,6 +8063,7 @@ mod tests {
             go_initializers: Vec::new(),
             entry_points,
             entry_point_symbols: BTreeMap::new(),
+            data_layer: None,
         }
     }
 
@@ -9541,15 +8238,11 @@ mod tests {
 
     fn stored_rust_fixture_scan(files: &[(&str, &str)]) -> Value {
         let (temp, root, paths) = canonical_fixture(files);
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .unwrap();
-        store.cold_build(&paths).unwrap();
-        let snapshot =
-            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
-        scan(job(&root, paths, snapshot))
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
+        let aggregate = scan(job(&root, paths, snapshot));
+        drop(temp);
+        aggregate
     }
 
     #[test]
@@ -9592,14 +8285,8 @@ mod tests {
 "#,
             ),
         ]);
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .unwrap();
-        store.cold_build(&paths).unwrap();
-        let snapshot =
-            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert_eq!(
             headline_symbols(&aggregate),
@@ -9607,47 +8294,22 @@ mod tests {
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
-        for (helper, caller) in [
-            ("Handler::with_draw", "Handler::new"),
-            ("Handler::register_in", "Handler::register"),
-        ] {
-            let sites = store
-                .direct_callers_of(Path::new("src/main.rs"), helper)
-                .unwrap();
-            assert_eq!(sites.len(), 1, "{helper}: {sites:#?}");
-            assert_eq!(sites[0].caller.symbol, caller);
-            assert_eq!(sites[0].kind, "call");
-        }
-        let tree = store
-            .call_tree(Path::new("src/main.rs"), "Handler::with_draw", 1)
-            .unwrap();
+
+        let view = crate::callgraph_store::dead_code_projection::view_for_test(&root);
+        let tree = crate::commands::callgraph_store_adapter::call_tree_result(
+            &view.callgraph(),
+            Path::new("src/main.rs"),
+            "Handler::with_draw",
+            1,
+            true,
+        )
+        .unwrap();
         assert!(
             tree.children.is_empty(),
             "function values are not executed: {tree:#?}"
         );
-        for symbol in ["check", "draw", "assigned", "arrayed", "argument"] {
-            let callers = store
-                .direct_callers_of(Path::new("src/checks.rs"), symbol)
-                .unwrap();
-            let caller = callers
-                .iter()
-                .find(|caller| caller.caller.file == "src/main.rs")
-                .unwrap_or_else(|| panic!("{symbol}: {callers:#?}"));
-            assert_eq!(
-                caller.kind,
-                if symbol == "check" {
-                    "call"
-                } else {
-                    "callback_ref"
-                }
-            );
-            let source = fs::read_to_string(root.join("src/main.rs")).unwrap();
-            let written = &source[caller.byte_start..caller.byte_end];
-            assert!(
-                written.contains(&format!("checks::{symbol}")),
-                "{symbol}: {written}"
-            );
-        }
+
+        drop(temp);
     }
 
     #[test]
@@ -9699,14 +8361,8 @@ pub(crate) fn drop(_value: i32) {}
 "#,
             ),
         ]);
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .unwrap();
-        store.cold_build(&paths).unwrap();
-        let snapshot =
-            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert_eq!(
             headline_symbols(&aggregate),
@@ -9714,23 +8370,8 @@ pub(crate) fn drop(_value: i32) {}
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
-        for (file, symbol, expected_count) in [
-            ("src/driver.rs", "outer::child::plain", 2),
-            ("src/driver.rs", "outer::child::typed", 2),
-            ("src/driver.rs", "outer::child::via_self", 1),
-            ("src/driver.rs", "via_super", 2),
-            ("src/targets.rs", "via_crate", 1),
-            ("src/targets.rs", "via_alias", 1),
-        ] {
-            let callers = store.direct_callers_of(Path::new(file), symbol).unwrap();
-            assert_eq!(callers.len(), expected_count, "{symbol}: {callers:#?}");
-            assert!(
-                callers
-                    .iter()
-                    .all(|caller| caller.kind == "call" && caller.resolved),
-                "{symbol}: {callers:#?}"
-            );
-        }
+
+        drop(temp);
     }
 
     #[test]
@@ -10159,10 +8800,18 @@ mod tests {
     /// A free function in a module named like a type (`Config::production` in
     /// `mod Config`) is not that type's method, even when one impl in the file
     /// defines a method with the same name: a call to the free function keeps
-    /// the free function live, and the uncalled method stays dead together
-    /// with the helper only its body calls. The planted dead
-    /// `other::production` makes the short name ambiguous, so only the source
-    /// scan, which keeps the module path, links the call.
+    /// the free function live, and the planted dead `other::production` stays
+    /// dead. That short name is ambiguous, so only the source scan, which
+    /// keeps the module path, links the call.
+    ///
+    /// For now the index store roots every exported (pub or pub(crate))
+    /// method and type, so the uncalled method stays live as well. AFT
+    /// 0.63's SQLite call-graph store, which the index store replaced,
+    /// reported it dead, and the index store can return to that verdict once
+    /// member calls it cannot resolve keep their method name live (a
+    /// name-based dispatch rescue); without that rescue, dropping the
+    /// exported roots reports called methods dead.
+    /// The helper only the method's body calls stays live with it.
     #[test]
     fn review_module_qualified_free_function_is_not_the_same_named_method() {
         let aggregate = stored_rust_fixture_scan(&[(
@@ -10187,14 +8836,22 @@ mod types {
         )]);
         assert_eq!(
             headline_symbol_lines(&aggregate),
-            vec!["helper:15", "production:13", "production:8"],
+            vec!["production:8"],
             "{aggregate:#}"
         );
     }
 
     /// The same in a nested module (`settings::Config::production`): the call
-    /// from `main` keeps the free function live, and the uncalled method is
-    /// still reported dead.
+    /// from `main` keeps the free function live, and the planted dead
+    /// `other::production` stays dead.
+    ///
+    /// For now the index store roots every exported (pub or pub(crate))
+    /// method and type, so the uncalled method stays live as well. AFT
+    /// 0.63's SQLite call-graph store, which the index store replaced,
+    /// reported it dead, and the index store can return to that verdict once
+    /// member calls it cannot resolve keep their method name live (a
+    /// name-based dispatch rescue); without that rescue, dropping the
+    /// exported roots reports called methods dead.
     #[test]
     fn review_nested_module_free_function_called_from_main_stays_live() {
         let aggregate = stored_rust_fixture_scan(&[(
@@ -10220,7 +8877,7 @@ mod types {
         )]);
         assert_eq!(
             headline_symbol_lines(&aggregate),
-            vec!["production:15", "production:9"],
+            vec!["production:9"],
             "{aggregate:#}"
         );
     }
@@ -10663,20 +9320,32 @@ pub(crate) fn unused() {{}}
     fn used_test_file_exports_are_not_tallied_as_excluded_dead_findings() {
         let (_temp, root, _) = canonical_fixture(&[("tests/helper.rs", "pub fn called() {}\n")]);
         let contribution = dispatch_contribution("tests/helper.rs", &[("called", "function")]);
-        let reachable = [("tests/helper.rs".to_string(), "called".to_string())]
-            .into_iter()
-            .collect();
-        let aggregate = aggregate_materialized_dead_code_contributions(
+        /// Every node is reached by production code.
+        struct AllReached;
+        impl LivenessAnswers for AllReached {
+            fn reachable(&self, _: &str, _: &str) -> bool {
+                true
+            }
+            fn production_reachable(&self, _: &str, _: &str) -> bool {
+                true
+            }
+            fn test_only_callers(&self, _: &str, _: &str) -> Option<Vec<String>> {
+                None
+            }
+        }
+        let aggregate = render_dead_code_findings(
             &root,
-            std::slice::from_ref(&contribution),
             std::slice::from_ref(&contribution),
             &BTreeSet::new(),
             &crate::inspect::entry_points::resolve_project_roles(&root),
-            None,
             1,
-            &reachable,
-            &reachable,
-            &BTreeMap::new(),
+            &AllReached,
+            &RenderInputs {
+                has_source_gaps: false,
+                referenced_type_names: BTreeSet::new(),
+                test_module_files: BTreeSet::new(),
+                dispatched_method_names: &BTreeMap::new(),
+            },
         );
         assert_eq!(
             aggregate["excluded_test_count"], 0,
@@ -11241,6 +9910,15 @@ testOnly();
         assert_eq!(rolled_up["test_only_count"], 0, "{rolled_up:#}");
     }
 
+    /// A receiver call inside a macro in a `#[cfg(test)]` module, whose
+    /// receiver (`Index(1)`) the index store cannot type, never makes the
+    /// method production code: it is not in the dead-code headline. AFT
+    /// 0.63's SQLite call-graph store, which the index store replaced,
+    /// reported the method in the test-only bucket. For now the index store
+    /// roots every exported (pub or pub(crate)) method, so it is in neither
+    /// bucket; the test-only verdict returns once member calls the index
+    /// store cannot resolve keep their method name live (a name-based
+    /// dispatch rescue), which dropping the exported roots needs.
     #[test]
     fn rust_macro_receiver_call_in_cfg_test_module_is_test_only() {
         let (temp_dir, root, paths) = fixture_project(&[
@@ -11292,23 +9970,18 @@ mod tests {
             "cfg(test) module should classify its receiver call line as test-only: {:?}",
             analysis.cfg_test_ranges
         );
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp_dir.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .expect("open callgraph store");
-        store.cold_build(&paths).expect("build callgraph store");
-        let snapshot = crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path())
-            .expect("project dead-code snapshot");
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert!(
-            aggregate_test_only_item(&aggregate, "src/index.rs", "shares_index_with").is_some(),
-            "receiver method should be reported only in the test-only bucket: {aggregate:#}"
+            aggregate_test_only_item(&aggregate, "src/index.rs", "shares_index_with").is_none(),
+            "the exported receiver method is rooted until the name rescue lands: {aggregate:#}"
         );
         assert!(
             !aggregate_has_item(&aggregate, "src/index.rs", "shares_index_with"),
             "receiver method must not remain in the dead-code headline: {aggregate:#}"
         );
+        drop(temp_dir);
     }
 
     #[test]
@@ -11444,11 +10117,6 @@ mod tests {
         assert_eq!(items.len(), 150, "{aggregate:#}");
         assert_eq!(items[0]["symbol"], "dead000");
         assert_eq!(items[149]["symbol"], "dead149");
-    }
-
-    #[test]
-    fn go_module_manifest_invalidates_rollup_semantics() {
-        assert!(rollup_semantics_file("nested/go.mod"));
     }
 
     #[test]
@@ -12022,14 +10690,8 @@ pub fn false_helper() -> String { "dead".to_string() }
             "[package]\nname = \"path-forms\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .expect("write manifest");
-        let store = crate::callgraph_store::CallGraphStore::open(
-            temp_dir.path().join("callgraph-store"),
-            root.clone(),
-        )
-        .expect("open callgraph store");
-        store.cold_build(&paths).expect("build callgraph store");
-        let snapshot = crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path())
-            .expect("project dead-code snapshot");
+
+        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
 
         assert_eq!(
@@ -12038,6 +10700,7 @@ pub fn false_helper() -> String { "dead".to_string() }
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
+        drop(temp_dir);
     }
 
     #[test]
@@ -12436,3 +11099,7 @@ pub fn false_helper() -> String { "dead".to_string() }
         assert_eq!(item["other_lines"], json!([7]), "{item:#}");
     }
 }
+
+#[cfg(test)]
+#[path = "dead_code/projected_tests.rs"]
+mod projected_tests;

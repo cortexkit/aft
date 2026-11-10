@@ -308,16 +308,11 @@ mod tests {
         }
 
         let test_env = without_whitespace(include_str!("test_env.rs"));
-        let artifact_owner = without_whitespace(include_str!("artifact_owner.rs"));
         let configure = without_whitespace(include_str!("commands/configure.rs"));
 
         assert!(test_env.contains("lock_test_mutex(process_env_mutex())"));
         let process_env_bare_unwrap = ["process_env_mutex()", ".lock()", ".unwrap()"].concat();
         assert!(!test_env.contains(&process_env_bare_unwrap));
-        assert!(artifact_owner.contains("lock_test_mutex(artifact_owner_test_mutex())"));
-        let artifact_owner_bare_unwrap =
-            ["artifact_owner_test_mutex()", ".lock()", ".unwrap()"].concat();
-        assert!(!artifact_owner.contains(&artifact_owner_bare_unwrap));
-        assert!(!configure.contains(&artifact_owner_bare_unwrap));
+        assert!(!configure.contains(&process_env_bare_unwrap));
     }
 }

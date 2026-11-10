@@ -11,7 +11,6 @@
 //! edge never dispatches against `AppContext` inline; per-actor executor lanes
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
-pub mod blob_store;
 pub(crate) mod tool_views;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -73,7 +72,7 @@ const ATTACH_RETRY_JITTER_PERCENT: u64 = 20;
 const HELLO_CORR: u64 = 1;
 
 /// Per-session in-memory replay cap for must-deliver Push frames. This covers
-/// detach/re-attach while AFT stays alive; cross-restart replay is phased later.
+/// detach/re-attach while AFT stays alive; unacked registry tasks recover across restarts.
 const PUSH_BUFFER_MAX_PER_KEY: usize = 256;
 
 /// Bounded guard for control-frame sends. If the daemon stops reading and the
@@ -253,6 +252,7 @@ pub use self::health::SubcTestHealthRollupProbe;
 mod keepalive;
 mod manifest;
 mod page_collect;
+mod permissions;
 mod persistence;
 #[cfg(test)]
 mod prepared_bind_tests;
@@ -346,6 +346,13 @@ pub enum SubcLifecycleEvent {
         route_epoch: u32,
         corr: u64,
         phase: String,
+    },
+    /// Input capture and dispatch finished; the command's ordinary wait loop
+    /// now owns the detach target, rather than the startup capture waiter.
+    BashCommandWaitReady {
+        route_channel: u16,
+        route_epoch: u32,
+        corr: u64,
     },
 }
 
@@ -488,6 +495,16 @@ impl SubcTestLifecycleProbe {
             corr,
             phase: phase.to_string(),
         });
+    }
+
+    fn bash_command_wait_ready(&self, route: RouteChannel, corr: u64) {
+        let _ = self
+            .events_tx
+            .send(SubcLifecycleEvent::BashCommandWaitReady {
+                route_channel: route.channel,
+                route_epoch: route.epoch,
+                corr,
+            });
     }
 
     fn reliable_completion_retained(&self, task_id: &str, session_id: &str) {
@@ -1621,6 +1638,8 @@ enum ManagementAdmission {
     #[default]
     FirstParty,
     FlowOnly,
+    /// Cingulate's route: the `permissions/v1` operations and nothing else.
+    PermissionsOnly,
     /// Tool-provider metadata without a project root; grants no management authority.
     ProjectFree {
         workdir: Option<String>,
@@ -2257,7 +2276,7 @@ fn quiesce_unbound_root_with(
         // Parent folders have no local build progress to retain. Their watcher
         // owns exclusion retries independently of the child-reader session, so
         // release both lifetimes when the final route closes.
-        if crate::views::parent::release_context(ctx) || ctx.root_too_broad() {
+        if crate::data_layer::parent_session::release_context(ctx) || ctx.root_too_broad() {
             ctx.stop_watcher_runtime();
             ctx.invalidate_artifacts_after_watcher_gap();
         }
@@ -3067,6 +3086,7 @@ fn purge_deleted_root_residents(
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
 ) -> Vec<Frame> {
+    push::purge_completion_root(metrics, root_id, push_buffer, retry_buffer);
     let mut terminals = Vec::new();
     let mut push_terminal = |built: Result<Frame, SubcError>| match built {
         Ok(frame) => terminals.push(frame),
@@ -4223,6 +4243,7 @@ async fn teardown_installed_route(
     // cannot run before the route is removed and a completion is recorded for replay.
     delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
+        metrics.completion_delivery.route_closed(channel);
         sync_bg_live_delivery_sessions(executor, routes, Some(&identity.root), Some(metrics));
         if let Some(probe) = lifecycle_probe {
             probe.route_detached(channel, &identity.session);
@@ -4557,24 +4578,6 @@ fn run_subc_mode_on_runtime_thread(
     let exit_started = Instant::now();
     let actor_contexts = executor.actor_contexts();
     log::info!("subc exit phase=drain_done elapsed_ms=0");
-    // Index persistence and language-server teardown are independent. Starting
-    // both now keeps their separate deadlines from adding to the restart gap.
-    let flush_contexts = actor_contexts.clone();
-    let flush_indexes = matches!(
-        loop_result,
-        Ok(ModuleLoopExit::Graceful | ModuleLoopExit::ConnectionLost)
-    );
-    let index_flush = std::thread::spawn(move || {
-        record_exit_phase_event("index_flush", "start");
-        if flush_indexes {
-            flush_actor_indexes_on_graceful_shutdown(&flush_contexts, exit_started);
-        }
-        record_exit_phase_event("index_flush", "end");
-        log::info!(
-            "subc exit phase=index_flush_done elapsed_ms={}",
-            exit_started.elapsed().as_millis()
-        );
-    });
     let mut clients = Vec::new();
     for actor_ctx in &actor_contexts {
         // Connection teardown left every root's running servers in its
@@ -4602,7 +4605,6 @@ fn run_subc_mode_on_runtime_thread(
         exit_started.elapsed().as_millis()
     );
 
-    let _ = index_flush.join();
     log::info!(
         "subc exit phase=runtime_shutdown_start budget_ms={} elapsed_ms={}",
         EXIT_RUNTIME_SHUTDOWN_WAIT.as_millis(),
@@ -4722,91 +4724,13 @@ fn note_fatal_panic_response(response: &Response) -> bool {
     fatal
 }
 
-/// Flush every root's search index and the queued call-graph refreshes on a
-/// graceful exit. `drained_at` is when the module loop ended; both flushes
-/// finish by [`crate::callgraph_store::exit_index_flush_deadline`] while LSP
-/// shutdown runs independently. Returns the logged summary line.
-fn flush_actor_indexes_on_graceful_shutdown(
-    actor_contexts: &[Arc<AppContext>],
-    drained_at: Instant,
-) -> String {
-    flush_actor_indexes_on_graceful_shutdown_with(actor_contexts, drained_at, || {
-        // The opt-in timing hook lets process regressions exercise a busy
-        // persistence worker without relying on cache size or disk speed.
-        #[cfg(any(test, feature = "test-timing-hooks"))]
-        if let Ok(delay) = std::env::var("AFT_TEST_EXIT_INDEX_DELAY_MS") {
-            if let Ok(ms) = delay.parse::<u64>() {
-                std::thread::sleep(Duration::from_millis(ms));
-            }
-        }
-        crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown()
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn record_exit_index_flush_worker(worker: std::thread::JoinHandle<()>) {
-    tests::record_exit_index_flush_worker(worker);
-}
-
-fn flush_actor_indexes_on_graceful_shutdown_with(
-    actor_contexts: &[Arc<AppContext>],
-    drained_at: Instant,
-    callgraph_flush: impl FnOnce() -> bool + Send + 'static,
-) -> String {
-    log::info!(
-        "subc exit phase=index_flush_start roots={} budget_ms={} elapsed_ms={}",
-        actor_contexts.len(),
-        crate::callgraph_store::exit_index_flush_deadline(drained_at)
-            .saturating_duration_since(Instant::now())
-            .as_millis(),
-        drained_at.elapsed().as_millis()
-    );
-    // Index deltas can be rebuilt after a restart. Give the independent roots
-    // one short shared window to persist them, without extending the outage
-    // when a rebuild or a cache lock holds one root for several seconds.
-    let started = Instant::now();
-    let flush_deadline = crate::callgraph_store::exit_index_flush_deadline(drained_at);
-    let deadline =
-        (started + crate::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT).min(flush_deadline);
-    let report = crate::context::flush_search_indexes_before(actor_contexts, deadline);
-    // Refreshes are reconstructible, so exit waits for them only until the
-    // flush deadline and otherwise leaves them to the next start.
-    let refreshed =
-        crate::callgraph_store::run_exit_callgraph_flush_before(flush_deadline, callgraph_flush);
-    let line = format!(
-        "subc exit phase=index_flush roots={} completed={} flushed={} callgraph={} elapsed_ms={}",
-        actor_contexts.len(),
-        report.completed,
-        report.flushed,
-        refreshed.as_str(),
-        started.elapsed().as_millis()
-    );
-    if refreshed == crate::callgraph_store::ExitCallgraphFlush::Abandoned {
-        log::warn!(
-            "{line}: abandoned an unfinished call-graph refresh to exit on time; the next start refreshes the call graph"
-        );
-    } else {
-        log::info!("{line}");
-    }
-    line
-}
-
 /// Record phase boundaries for process-level shutdown tests without relying on
 /// log timestamps, which are rounded and intended for diagnostics.
-#[cfg(debug_assertions)]
-static EXIT_PHASE_EVENT_LOCK: StdMutex<[bool; 2]> = StdMutex::new([false; 2]);
-
-#[cfg(debug_assertions)]
-static EXIT_PHASE_EVENT_READY: std::sync::Condvar = std::sync::Condvar::new();
-
 #[cfg(debug_assertions)]
 fn record_exit_phase_event(phase: &str, boundary: &str) {
     use std::io::Write;
 
     let Some(path) = std::env::var_os("AFT_TEST_EXIT_PHASE_EVENTS") else {
-        return;
-    };
-    let Ok(mut started) = EXIT_PHASE_EVENT_LOCK.lock() else {
         return;
     };
     if let Ok(mut events) = std::fs::OpenOptions::new()
@@ -4815,33 +4739,6 @@ fn record_exit_phase_event(phase: &str, boundary: &str) {
         .open(path)
     {
         let _ = writeln!(events, "{phase}:{boundary}");
-        if boundary == "start"
-            && std::env::var("AFT_TEST_EXIT_PHASE_RENDEZVOUS").as_deref() == Ok("1")
-        {
-            let phase_index = match phase {
-                "index_flush" => 0,
-                "lsp_shutdown" => 1,
-                _ => return,
-            };
-            // Hold both phases at entry until their peer arrives. A sequential
-            // teardown records a timeout instead of hanging the test process.
-            // Reuse the LSP shutdown budget to bound this test-only wait.
-            started[phase_index] = true;
-            EXIT_PHASE_EVENT_READY.notify_all();
-            let Ok((started, _)) = EXIT_PHASE_EVENT_READY.wait_timeout_while(
-                started,
-                crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET,
-                |started| !started.iter().all(|arrived| *arrived),
-            ) else {
-                return;
-            };
-            let outcome = if started.iter().all(|arrived| *arrived) {
-                "peer_started"
-            } else {
-                "peer_timeout"
-            };
-            let _ = writeln!(events, "{phase}:{outcome}");
-        }
     }
 }
 
@@ -6167,6 +6064,13 @@ where
                                 }
                                 continue;
                             }
+                            if permissions::is_request(body) {
+                                spawn_permissions_request(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.principal.as_ref(), body, &shared_app, &executor,
+                                );
+                                continue;
+                            }
                         }
                         // A codemode program's tool call runs with its owner route's
                         // access (the head agent's, or a worker run's own worker's):
@@ -6482,9 +6386,9 @@ where
                         }
                         // A held bash call never passes through the active
                         // tool calls above: its wait task holds it. The caller
-                        // is gone, so answer it now and let the command finish
-                        // as a background task instead of holding the request
-                        // (and the daemon's credit for it) until it exits.
+                        // cancelled the request, so answer it now and release
+                        // the daemon's credit. Server-completion calls stop
+                        // their command; legacy waits hand it to the background.
                         if dispatch_path_metrics.held_bash_calls.request_cancel(channel, corr) {
                             if let Err(error) = bash::answer_held_bash_calls_from_module_loop(
                                 &writer_tx,
@@ -6831,6 +6735,12 @@ where
                 );
                 if let Some(keys) = completion.unacked_bg_keys {
                     bg_unacked_keys_by_root.insert(root_id.clone(), keys);
+                }
+                if let Some(ctx) = executor.actor_context(&root_id) {
+                    push::recover_registry_completions(
+                        &writer_tx, &dispatch_path_metrics, ctx.bash_background(),
+                        &routes, &root_channels, &mut push_buffer, &root_id, lifecycle_probe.as_ref(),
+                    );
                 }
                 record_bg_runtime_from_snapshots(
                     &dispatch_path_metrics,
@@ -7981,6 +7891,18 @@ async fn handle_route_bind_completion(
         );
     }
     queue_post_bind_configure_and_completion_maintenance(&completion.bind_root_id, live_roots);
+    if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
+        push::recover_registry_completions(
+            tx,
+            metrics,
+            ctx.bash_background(),
+            routes,
+            root_channels,
+            push_buffer,
+            &completion.bind_root_id,
+            lifecycle_probe,
+        );
+    }
     let replayed = push::replay_buffered_push_frames(
         tx,
         metrics,
@@ -8604,6 +8526,7 @@ async fn handle_control_request(
                 if !project_free
                     && !matches!(bind_trust, BindTrust::FirstParty)
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
+                    && !permissions::is_cingulate(principal.as_ref())
                 {
                     return send_route_bind_error(
                         tx,
@@ -8624,6 +8547,12 @@ async fn handle_control_request(
                     .is_some_and(diagnostics_findings::is_flow_scope)
                 {
                     ManagementAdmission::FlowOnly
+                } else if !matches!(bind_trust, BindTrust::FirstParty)
+                    && permissions::is_cingulate(principal.as_ref())
+                {
+                    // Cingulate is not a first-party AFT principal: it binds
+                    // only to list and revoke the person's saved grants.
+                    ManagementAdmission::PermissionsOnly
                 } else {
                     ManagementAdmission::FirstParty
                 };
@@ -9677,6 +9606,69 @@ fn spawn_gh_relay(
 /// (`Flags::is_binary`). subc-protocol does not export the constant.
 const FRAME_FLAG_BINARY: u8 = 0b0000_0001;
 
+/// Answer a `permissions/v1` request off the frame loop: listing reads
+/// aft.db, and a revoke may stop running commands.
+#[allow(clippy::too_many_arguments)]
+fn spawn_permissions_request(
+    tx: &WriterSender,
+    metrics: &Arc<DispatchPathMetrics>,
+    frame: &Frame,
+    principal: Option<&Principal>,
+    body: &Value,
+    shared_app: &Arc<App>,
+    executor: &Arc<Executor>,
+) {
+    let admitted = permissions::admit(principal, body);
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let metrics = Arc::clone(metrics);
+    let db = shared_app.db();
+    let executor = Arc::clone(executor);
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let result = match admitted {
+            Err(error) => Err(error),
+            Ok(request) => tokio::task::spawn_blocking(move || {
+                let registries = executor
+                    .actor_contexts()
+                    .iter()
+                    .map(|ctx| ctx.bash_background().clone())
+                    .collect::<Vec<_>>();
+                permissions::answer(db.as_deref(), &request, |row| {
+                    permissions::stop_folder_tasks(&registries, row)
+                })
+            })
+            .await
+            .unwrap_or_else(|error| Err(ErrorBody::new("internal_error", error.to_string()))),
+        };
+        let sent = match result {
+            Err(error) => send_provider_error(&tx, &metrics, &frame, error).await,
+            Ok(answer) => match serde_json::to_vec(&json!({ "result": answer }))
+                .map_err(SubcError::Json)
+                .and_then(|body| {
+                    Frame::build_with_version(
+                        frame.header.ver,
+                        FrameType::Response,
+                        frame.header.flags,
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .map_err(SubcError::FrameBuild)
+                }) {
+                Ok(response) => {
+                    send_reliable_writer_frame(&tx, &metrics, response, "permissions reply").await
+                }
+                Err(error) => Err(error),
+            },
+        };
+        if let Err(error) = sent {
+            log::warn!("permissions/v1: could not queue the reply: {error}");
+        }
+    });
+}
+
 /// Run a page-bundle operation off the frame loop: a collection reads files
 /// and checks policy, and every operation touches the snapshot folder.
 #[allow(clippy::too_many_arguments)]
@@ -10164,6 +10156,16 @@ fn admit_management_flow_request(
     identity: &ManagementIdentity,
     body: Option<&Value>,
 ) -> Result<(), ErrorBody> {
+    if identity.admission == ManagementAdmission::PermissionsOnly {
+        return if body.is_some_and(permissions::is_request) {
+            Ok(())
+        } else {
+            Err(ErrorBody::new(
+                "route_not_admitted",
+                "Cingulate's AFT management route serves only permissions.list and permissions.revoke",
+            ))
+        };
+    }
     if identity.admission != ManagementAdmission::FlowOnly {
         return Ok(());
     }
@@ -10595,7 +10597,7 @@ impl PlainToolRun {
                 for name in names.filter(|name| !name.contains("://") && !name.is_empty()) {
                     let root = tool_call_context
                         .project_root
-                        .join(crate::readonly_artifacts::expand_tilde(name));
+                        .join(crate::git_root_resolution::expand_tilde(name));
                     crate::bounded_io::name_walk_root(&root, Path::new(name));
                 }
             }
@@ -12617,6 +12619,10 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
     // the next tick's tail probe) resumes it once the waiting writer has run.
     let stepped_aside = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
     runtime_drain::drain_configure_warning_events(ctx);
+    if !stepped_aside {
+        crate::data_layer::runtime::root_bound(ctx);
+        crate::data_layer::outline::root_bound(ctx);
+    }
     let identity_replay = (!stepped_aside && ctx.configure_tail_idle())
         .then(|| crate::provisional_identity_retry::poll(ctx))
         .flatten();
@@ -12777,10 +12783,6 @@ fn submit_maintenance_job(
             }
             MaintenanceDrainKind::ConfigureTail => run_configure_tail_maintenance(ctx),
             MaintenanceDrainKind::CompletionDrains => {
-                runtime_drain::drain_search_index_events(ctx);
-                runtime_drain::drain_callgraph_store_events(ctx);
-                runtime_drain::drain_semantic_index_events(ctx);
-                runtime_drain::drain_semantic_refresh_events(ctx);
                 runtime_drain::drain_inspect_events_for_generation(ctx, maintenance_generation);
                 let empty_bg_sessions = bg_sessions_to_check
                     .into_iter()
@@ -16064,204 +16066,6 @@ mod tests {
         }
     }
 
-    fn cpu_hunt_process_cpu_us() -> u64 {
-        #[cfg(unix)]
-        {
-            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-            // getrusage initializes the output on success; no pointer escapes.
-            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
-                let usage = unsafe { usage.assume_init() };
-                return (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64 * 1_000_000
-                    + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as u64;
-            }
-        }
-        0
-    }
-
-    #[test]
-    fn route_bind_does_not_recompute_fleet_health() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("bind runtime");
-        runtime.block_on(async {
-            let (dir, root) = test_root("bind-health-work-count");
-            let app = App::default_shared();
-            let executor = Arc::new(Executor::new());
-            let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
-            let mut fixture_dirs = Vec::new();
-            // The opt-in probe accepts only an already-copied artifact below this
-            // checkout's target directory; normal tests never open a live store.
-            if let Some(copy) = std::env::var_os("AFT_CPU_HUNT_STORE_COPY") {
-                let copy = std::fs::canonicalize(copy).expect("copied store exists");
-                let project = Path::new(crate::test_support::manifest_dir())
-                    .parent()
-                    .expect("crates directory")
-                    .parent()
-                    .expect("checkout directory")
-                    .canonicalize()
-                    .expect("canonical checkout");
-                assert!(copy.starts_with(project.join("target")));
-                for index in 0..36 {
-                    let actor = if index == 0 {
-                        Arc::clone(&ctx)
-                    } else {
-                        Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()))
-                    };
-                    actor.update_config(|config| config.project_root = Some(project.clone()));
-                    *actor.callgraph_store().write().expect("store slot") = Some(Arc::new(
-                        crate::callgraph_store::CallGraphStore::open_readonly(
-                            copy.clone(),
-                            project.clone(),
-                        )
-                        .expect("open copied graph")
-                        .expect("copied graph ready"),
-                    ));
-                    if index > 0 {
-                        let (fixture, id) = test_root(&format!("cpu-hunt-{index}"));
-                        assert!(executor.register_actor(id, actor));
-                        fixture_dirs.push(fixture);
-                    }
-                }
-            }
-            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-            let cache = HealthRollupCache::new();
-            if !fixture_dirs.is_empty() {
-                let started = Instant::now();
-                let cpu = cpu_hunt_process_cpu_us();
-                cache.refresh(&executor, &app);
-                eprintln!(
-                    "cpu_hunt health_rollup wall_us={} cpu_us={}",
-                    started.elapsed().as_micros(),
-                    cpu_hunt_process_cpu_us().saturating_sub(cpu)
-                );
-                let started = Instant::now();
-                let cpu = cpu_hunt_process_cpu_us();
-                std::hint::black_box(ctx.build_status_snapshot());
-                eprintln!(
-                    "cpu_hunt status wall_us={} cpu_us={}",
-                    started.elapsed().as_micros(),
-                    cpu_hunt_process_cpu_us().saturating_sub(cpu)
-                );
-            }
-            let refreshes_before = cache.refresh_count_for_test();
-            let metrics = Arc::new(DispatchPathMetrics::new());
-            let (writer_tx, _writer_rx) = mpsc::channel(8);
-            let (completion_tx, mut completion_rx) = mpsc::channel(8);
-            let (lossy_tx, _lossy_rx) = mpsc::channel(8);
-            let (reliable_tx, _reliable_rx) = mpsc::unbounded_channel();
-            let senders = PushSenders {
-                lossy_tx,
-                reliable_tx,
-                lossy_overflow: Arc::new(push::LossyOverflow::default()),
-                lossy_seq: Arc::new(AtomicU64::new(0)),
-                fleet_status_client: FleetStatusClient::channel(1).0,
-            };
-            let request = {
-                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
-                    route_channel: 1,
-                    epoch: 1,
-                    target: RouteTarget::ToolProvider {
-                        module_id: "aft".to_string(),
-                    },
-                    identity: subc_protocol::BindIdentity::new(
-                        "opencode",
-                        "bind-health-work-count",
-                    ),
-                    principal: Some(subc_protocol::Principal::Direct),
-                    consumer_capabilities: None,
-                    admission_facts: Default::default(),
-                    scope: None,
-                    role_versions: None,
-                    call_mode: None,
-                })
-                .unwrap();
-                bind["identity"]["project_root"] = serde_json::json!(root.as_path());
-
-                bind
-            };
-            let frame = Frame::build_with_version(
-                PROTOCOL_VERSION,
-                FrameType::Request,
-                control_flags(),
-                0,
-                0,
-                1,
-                serde_json::to_vec(&request).expect("bind body"),
-            )
-            .expect("bind frame");
-            let mut pending_binds = HashMap::new();
-            let started = Instant::now();
-            let cpu = cpu_hunt_process_cpu_us();
-            handle_control_request(
-                &writer_tx,
-                &writer_tx,
-                &A0Egress::new(writer_tx.clone(), completion_tx.clone()),
-                &frame,
-                &app,
-                &executor,
-                &Arc::new(standing::StandingActor::new(
-                    Arc::clone(&app),
-                    Arc::clone(&executor),
-                )),
-                &mut HashMap::new(),
-                &mut pending_binds,
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &mut HashMap::new(),
-                &Arc::new(StdMutex::new(HashMap::new())),
-                &mut PendingSubcResponses::default(),
-                &mut RetryBuffer::new(),
-                &mut HashMap::new(),
-                &Arc::new(Notify::new()),
-                &completion_tx,
-                &metrics,
-                None,
-                &cache,
-                &senders,
-                |request, ctx| {
-                    if request.command == "configure" {
-                        crate::commands::configure::handle_configure(&request, ctx)
-                    } else {
-                        Response::success(request.id, json!({}))
-                    }
-                },
-                Some(&test_support::bind_config_without_indexes(dir.path())),
-                usize::MAX,
-                None,
-                &ctx.storage_dir(),
-            )
-            .await
-            .expect("admit route bind");
-            eprintln!(
-                "route_bind_health admission_us={} cpu_us={} refreshes={}",
-                started.elapsed().as_micros(),
-                cpu_hunt_process_cpu_us().saturating_sub(cpu),
-                cache.refresh_count_for_test() - refreshes_before
-            );
-            let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
-                .await
-                .expect("configure completes")
-                .expect("completion delivered");
-            let ControlCompletion::ConfigureReady(completion) = completion else {
-                panic!("configure completion expected");
-            };
-            assert!(completion.configure_response.success);
-            assert_eq!(pending_binds.len(), 1, "the bind must reach admission");
-            assert_eq!(
-                cache.refresh_count_for_test() - refreshes_before,
-                0,
-                "route admission must not perform a fleet-wide health census"
-            );
-        });
-    }
-
     #[test]
     fn channel_zero_health_response_does_not_wait_for_bash_background_db() {
         let (dir, root) = test_root("health-does-not-lock-bash-db");
@@ -16524,812 +16328,6 @@ mod tests {
     thread_local! {
         static EXIT_INDEX_FLUSH_WORKERS: std::cell::RefCell<Vec<std::thread::JoinHandle<()>>> =
             const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    pub(super) fn record_exit_index_flush_worker(worker: std::thread::JoinHandle<()>) {
-        EXIT_INDEX_FLUSH_WORKERS.with(|workers| workers.borrow_mut().push(worker));
-    }
-
-    fn actor_ctx_with_dirty_search_index(
-        root: &Path,
-        storage: &Path,
-        file_name: &str,
-        old_contents: &str,
-        new_contents: &str,
-    ) -> (Arc<AppContext>, PathBuf, PathBuf) {
-        let file = root.join(file_name);
-        std::fs::write(&file, old_contents).expect("write source");
-        let canonical_root = std::fs::canonicalize(root).expect("canonical root");
-        let ctx = Arc::new(AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Config {
-                project_root: Some(root.to_path_buf()),
-                storage_dir: Some(storage.to_path_buf()),
-                ..Config::default()
-            },
-        ));
-        ctx.set_canonical_cache_root(canonical_root.clone());
-
-        let cache_dir = crate::search_index::resolve_cache_dir(&canonical_root, Some(storage));
-        let mut index = crate::search_index::SearchIndex::build(&canonical_root);
-        let git_head = index.stored_git_head().map(str::to_owned);
-        index.write_to_disk(&cache_dir, git_head.as_deref());
-
-        std::fs::write(&file, new_contents).expect("edit source");
-        index.update_file(&file);
-        assert!(
-            index.has_pending_disk_changes(),
-            "fixture must have a delta to flush"
-        );
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        (ctx, canonical_root, cache_dir)
-    }
-
-    #[test]
-    fn a_held_callgraph_flush_is_abandoned_within_the_exit_budget() {
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let drained_at = Instant::now();
-        let line = flush_actor_indexes_on_graceful_shutdown_with(&[], drained_at, move || {
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-            finished_tx.send(()).unwrap();
-            true
-        });
-        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-        // An unfinished flush must be abandoned because its deadline expired,
-        // not because the flush completed. Runner scheduling can delay observation.
-        assert!(matches!(
-            finished_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        assert!(Instant::now() >= crate::callgraph_store::exit_index_flush_deadline(drained_at));
-        let flush_window = crate::callgraph_store::exit_index_flush_deadline(drained_at)
-            .saturating_duration_since(drained_at);
-        // The rest of the exit, LSP shutdown, still fits in the exit budget.
-        assert!(
-            flush_window + crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET
-                <= crate::callgraph_store::EXIT_BUDGET_AFTER_DRAIN
-        );
-        assert!(line.contains("callgraph=abandoned"), "{line}");
-        release_tx.send(()).unwrap();
-        finished_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-    }
-
-    #[test]
-    fn graceful_shutdown_reports_failed_search_flush_root() {
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        let (root_dir, _) = test_root("failed-shutdown-flush");
-        let (ctx, root, cache_dir) = actor_ctx_with_dirty_search_index(
-            root_dir.path(),
-            storage.path(),
-            "source.txt",
-            "old token\n",
-            "new token\n",
-        );
-        // Make replacement fail without depending on Windows sharing flags or
-        // an antivirus scanner holding a particular file open.
-        std::fs::rename(cache_dir.join("cache.bin"), cache_dir.join("old-cache.bin"))
-            .expect("move old cache");
-        std::fs::create_dir(cache_dir.join("cache.bin")).expect("block cache replacement");
-        let (report, logs) = crate::logging::capture_log_lines(|| {
-            crate::context::flush_search_indexes_before(
-                &[Arc::clone(&ctx)],
-                Instant::now() + Duration::from_secs(30),
-            )
-        });
-        assert_eq!(report.completed, 1, "{report:?}");
-        assert_eq!(report.flushed, 0, "{report:?}");
-        assert_eq!(report.failed_roots, vec![root.clone()]);
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("shutdown flush failed root=")
-                    && line.contains(&root.display().to_string())
-                    && line.contains("disk cache write failed")),
-            "{logs:?}"
-        );
-        assert!(ctx
-            .search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .has_pending_disk_changes());
-    }
-
-    #[test]
-    fn graceful_shutdown_reports_unfinished_search_flush_root() {
-        let (root_dir, _) = test_root("unfinished-shutdown-flush");
-        let root = std::fs::canonicalize(root_dir.path()).expect("canonical root");
-        let ctx = Arc::new(AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Config {
-                project_root: Some(root.clone()),
-                ..Config::default()
-            },
-        ));
-        ctx.set_canonical_cache_root(root.clone());
-        // Keep the worker from finishing until the coordinator has classified
-        // the root. An already expired deadline makes this independent of load.
-        let held = ctx.search_index().write().unwrap();
-        let (report, logs) = crate::logging::capture_log_lines(|| {
-            crate::context::flush_search_indexes_before(&[Arc::clone(&ctx)], Instant::now())
-        });
-        drop(held);
-        assert_eq!(report.completed, 0, "{report:?}");
-        assert_eq!(report.unfinished_roots, vec![root.clone()]);
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("shutdown flush unfinished root=")
-                    && line.contains(&root.display().to_string())),
-            "{logs:?}"
-        );
-    }
-
-    #[test]
-    fn graceful_shutdown_flushes_every_actor_search_index() {
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        let (root1_dir, root1) = test_root("shutdown-flush-root-1");
-        let (root2_dir, root2) = test_root("shutdown-flush-root-2");
-        let (ctx1, canonical_root1, cache_dir1) = actor_ctx_with_dirty_search_index(
-            root1_dir.path(),
-            storage.path(),
-            "alpha.txt",
-            "old actor one token\n",
-            "new actor one token\n",
-        );
-        let (ctx2, canonical_root2, cache_dir2) = actor_ctx_with_dirty_search_index(
-            root2_dir.path(),
-            storage.path(),
-            "beta.txt",
-            "old actor two token\n",
-            "new actor two token\n",
-        );
-
-        let executor = Executor::new();
-        assert!(executor.register_actor(root1.clone(), Arc::clone(&ctx1)));
-        assert!(executor.register_actor(root2.clone(), Arc::clone(&ctx2)));
-
-        // Wait for the workers' completion messages, not the transport's short
-        // best-effort exit window, before reopening their cache files.
-        let report = crate::context::flush_search_indexes_before(
-            &executor.actor_contexts(),
-            Instant::now() + Duration::from_secs(30),
-        );
-        assert_eq!(report.completed, 2, "{report:?}");
-        assert_eq!(report.flushed, 2, "{report:?}");
-
-        // Shutdown deliberately stops waiting after its shared flush budget.
-        // Join the actual workers before checking persistence: this tests that
-        // every actor was flushed, not that disk writes always fit that budget.
-        let workers =
-            EXIT_INDEX_FLUSH_WORKERS.with(|workers| std::mem::take(&mut *workers.borrow_mut()));
-        assert_eq!(workers.len(), 2, "one flush worker per actor");
-        for worker in workers {
-            worker.join().expect("search index flush worker");
-        }
-
-        let mut restored1 =
-            crate::search_index::SearchIndex::read_from_disk(&cache_dir1, &canonical_root1)
-                .expect("load flushed root one index");
-        restored1.ready = true;
-        assert_eq!(
-            restored1
-                .grep("new actor one token", true, &[], &[], &canonical_root1, 10)
-                .unwrap()
-                .matches
-                .len(),
-            1,
-            "graceful subc shutdown should flush the first root's trigram delta"
-        );
-
-        let mut restored2 =
-            crate::search_index::SearchIndex::read_from_disk(&cache_dir2, &canonical_root2)
-                .expect("load flushed root two index");
-        restored2.ready = true;
-        assert_eq!(
-            restored2
-                .grep("new actor two token", true, &[], &[], &canonical_root2, 10)
-                .unwrap()
-                .matches
-                .len(),
-            1,
-            "graceful subc shutdown should flush every registered root"
-        );
-    }
-
-    #[test]
-    fn idle_root_reaper_closes_artifacts_and_stops_watcher() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let (root_dir, root) = test_root("idle-root-reaper");
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        std::fs::write(
-            root_dir.path().join("main.rs"),
-            "fn entry() { leaf(); }\nfn leaf() {}\n",
-        )
-        .expect("source file");
-        let canonical_root = std::fs::canonicalize(root_dir.path()).expect("canonical root");
-        let app = App::default_shared();
-        let ctx = Arc::new(AppContext::from_app(
-            Arc::clone(&app),
-            Config {
-                project_root: Some(canonical_root.clone()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                indexes: crate::config::IndexesConfig {
-                    trigram: true,
-                    semantic: false,
-                    callgraph: true,
-                },
-                ..Config::default()
-            },
-        ));
-        ctx.set_canonical_cache_root(canonical_root.clone());
-        let project_key = crate::search_index::artifact_cache_key(&canonical_root);
-        crate::root_cache::configure_artifact_access(&canonical_root, &project_key, false);
-        assert!(ctx
-            .ensure_callgraph_store()
-            .expect("build callgraph store")
-            .is_some());
-
-        let cache_dir =
-            crate::search_index::resolve_cache_dir(&canonical_root, Some(storage.path()));
-        let mut index = crate::search_index::SearchIndex::build(&canonical_root);
-        let git_head = index.stored_git_head().map(str::to_owned);
-        index.write_to_disk(&cache_dir, git_head.as_deref());
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        // Seed a completed warm verification so the test can prove eviction
-        // downgrades it to Strict rather than passing vacuously.
-        let seeded_generation =
-            crate::cache_freshness::artifact_generation(&cache_dir.join("cache.bin"))
-                .expect("seeded artifact generation");
-        crate::cache_freshness::record_verify_completed(
-            &canonical_root,
-            crate::cache_freshness::VerifyArtifact::Search,
-            Some(seeded_generation),
-        );
-        assert!(
-            matches!(
-                crate::cache_freshness::warm_verify_plan(
-                    canonical_root.as_path(),
-                    crate::cache_freshness::VerifyArtifact::Search,
-                    Some(seeded_generation),
-                ),
-                crate::cache_freshness::WarmVerifyPlan::Skip
-            ),
-            "memo must be warm before eviction for the downgrade assertion to bite"
-        );
-
-        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
-        let _dispatch_tx = dispatch_tx;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = Arc::clone(&shutdown);
-        let join = std::thread::spawn(move || {
-            while !thread_shutdown.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-        });
-        ctx.install_watcher_runtime(
-            dispatch_rx,
-            crate::watcher_filter::WatcherThreadHandle::new(shutdown, join),
-        );
-        wait_for_watcher_count(&ctx, 1);
-
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        ctx.mark_subc_unbound();
-        let mut live_roots = HashMap::new();
-        let mut meta = RootMeta::new(Instant::now());
-        meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
-        meta.unbound_quiesced = true;
-        live_roots.insert(root.clone(), meta);
-
-        let message = idle_root_eviction_message(&root, &ctx.memory_root_snapshot(), None);
-        assert!(message.contains("evicted idle root"));
-        assert!(message.contains("freed ~"));
-        assert!(message.contains("semantic"));
-        assert!(!message.contains("semantic not estimated retained"));
-        assert!(message.contains("trigram"));
-        assert!(message.contains("retained: bash"));
-        assert!(message.contains("parser_pool"));
-
-        let count_before_probe = crate::context::semantic_family_arena_measurements_for_test();
-        let _ = ctx.semantic_family_arena_bytes_for_test();
-        assert_eq!(
-            crate::context::semantic_family_arena_measurements_for_test(),
-            count_before_probe + 1,
-            "the test hook must count family-arena measurement requests"
-        );
-        let arena_measurements_before =
-            crate::context::semantic_family_arena_measurements_for_test();
-        let outcome = reap_idle_roots(
-            Instant::now(),
-            &mut live_roots,
-            &HashMap::new(),
-            &HashMap::new(),
-            &executor,
-            &DispatchPathMetrics::new(),
-        );
-        assert_eq!(outcome.evicted, 1);
-        assert_eq!(
-            crate::context::semantic_family_arena_measurements_for_test(),
-            arena_measurements_before,
-            "the frame-loop reaper must not measure the shared semantic family arena"
-        );
-        assert!(ctx.search_index().read().unwrap().is_none());
-        wait_for_watcher_count(&ctx, 0);
-        // The watcher stopped with the eviction, so the idle interval is
-        // unobserved: the pre-seeded warm-verify memo (Skip) must fall back to
-        // strict content verification (stat-first would miss same-size,
-        // preserved-mtime edits made while nobody was watching).
-        assert!(
-            matches!(
-                crate::cache_freshness::warm_verify_plan(
-                    canonical_root.as_path(),
-                    crate::cache_freshness::VerifyArtifact::Search,
-                    Some(seeded_generation),
-                ),
-                crate::cache_freshness::WarmVerifyPlan::Strict
-            ),
-            "idle eviction must force strict re-verification"
-        );
-        assert!(
-            crate::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root).is_some()
-        );
-        ctx.mark_subc_bound();
-        assert!(ctx
-            .ensure_callgraph_store()
-            .expect("reopen callgraph store")
-            .is_some());
-        assert!(live_roots[&root].idle_artifacts_evicted);
-    }
-
-    #[test]
-    fn idle_root_reaper_applies_ttl_to_unbound_roots() {
-        let (_root_dir, root) = test_root("idle-root-ttl-gate");
-        let ctx = test_ctx();
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), ctx));
-        let ctx = executor.actor_context(&root).expect("actor context");
-        ctx.mark_subc_unbound();
-        let now = Instant::now();
-        let mut meta = RootMeta::new(now);
-        meta.unbound_quiesced = true;
-        let mut live_roots = HashMap::from([(root.clone(), meta)]);
-
-        // A recently-unbound root stays warm: a transient unbind (host
-        // restart) must not pay the strict-verify + forced-rebuild teardown
-        // on the next maintenance sweep.
-        assert_eq!(
-            reap_idle_roots(
-                now,
-                &mut live_roots,
-                &HashMap::new(),
-                &HashMap::new(),
-                &executor,
-                &DispatchPathMetrics::new(),
-            )
-            .evicted,
-            0
-        );
-        assert!(!live_roots[&root].idle_artifacts_evicted);
-
-        // Past the TTL the same unbound root pays the full teardown. The
-        // pending reconciliation paths retained across the transient-unbind
-        // window would block eviction forever through
-        // `artifact_eviction_blocked`; the reaper disposes them because the
-        // strict gap invalidation subsumes their purpose.
-        ctx.add_pending_search_index_paths([root.as_path().join("retained.rs")]);
-        assert_eq!(
-            reap_idle_roots(
-                now + IDLE_ROOT_TTL,
-                &mut live_roots,
-                &HashMap::new(),
-                &HashMap::new(),
-                &executor,
-                &DispatchPathMetrics::new(),
-            )
-            .evicted,
-            1
-        );
-        assert!(live_roots[&root].idle_artifacts_evicted);
-        assert!(
-            ctx.take_pending_search_index_paths().is_empty(),
-            "TTL eviction must dispose retained pending reconciliation paths"
-        );
-    }
-
-    #[test]
-    fn blocked_ttl_eviction_restores_taken_pending_reconciliation_state() {
-        let (_root_dir, root) = test_root("ttl-eviction-blocked-restore");
-        let ctx = test_ctx();
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        ctx.mark_subc_unbound();
-
-        // Retained pending path from the transient-unbind window plus a
-        // SECONDARY eviction blocker (a non-ready resident search index, the
-        // dirty-index blocker in artifact_eviction_blocked). Disposal must be
-        // transactional: the blocked eviction may be followed by a rebind, and
-        // the path is the only repair record for its consumed watcher event.
-        let pending = root.as_path().join("edited-while-unbound.rs");
-        ctx.add_pending_search_index_paths([pending.clone()]);
-        let dirty_source = root.as_path().join("dirty.rs");
-        std::fs::write(&dirty_source, "fn dirty() {}\n").expect("dirty source");
-        let mut dirty = crate::search_index::SearchIndex::new();
-        dirty.ready = true;
-        dirty.update_file(&dirty_source);
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dirty);
-        assert!(ctx.artifact_eviction_blocked());
-
-        let mut live_roots = HashMap::new();
-        let mut meta = RootMeta::new(Instant::now());
-        meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
-        meta.unbound_quiesced = true;
-        live_roots.insert(root.clone(), meta);
-
-        assert_eq!(
-            reap_idle_roots(
-                Instant::now(),
-                &mut live_roots,
-                &HashMap::new(),
-                &HashMap::new(),
-                &executor,
-                &DispatchPathMetrics::new(),
-            )
-            .evicted,
-            0,
-            "the dirty index must still block this eviction"
-        );
-        assert_eq!(
-            ctx.take_pending_search_index_paths(),
-            vec![pending],
-            "a blocked eviction must restore the taken pending paths"
-        );
-    }
-
-    /// An unbound, quiesced, TTL-aged writer root whose resident search index
-    /// holds a watcher edit that was never written to `cache.bin`.
-    struct DirtyUnboundRoot {
-        _root_dir: tempfile::TempDir,
-        _storage: tempfile::TempDir,
-        root: ProjectRootId,
-        canonical: PathBuf,
-        cache_dir: PathBuf,
-        ctx: Arc<AppContext>,
-        executor: Arc<Executor>,
-        live_roots: HashMap<ProjectRootId, RootMeta>,
-    }
-
-    impl DirtyUnboundRoot {
-        fn new(name: &str) -> Self {
-            let (root_dir, root) = test_root(name);
-            let storage = tempfile::tempdir().expect("storage dir");
-            let canonical = std::fs::canonicalize(root.as_path()).expect("canonical root");
-            let ctx = Arc::new(AppContext::new(
-                Box::new(crate::parser::TreeSitterProvider::new()),
-                Config {
-                    project_root: Some(canonical.clone()),
-                    storage_dir: Some(storage.path().to_path_buf()),
-                    ..Config::default()
-                },
-            ));
-            ctx.set_canonical_cache_root(canonical.clone());
-            let executor = Arc::new(Executor::new());
-            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-
-            // Persisted base first, then the watcher edit that only lives in
-            // the resident delta.
-            let cache_dir =
-                crate::search_index::resolve_cache_dir(&canonical, Some(storage.path()));
-            let mut index = crate::search_index::SearchIndex::build(&canonical);
-            assert!(
-                index.write_to_disk(&cache_dir, None),
-                "base cache.bin write"
-            );
-            let edited = canonical.join("edited.rs");
-            std::fs::write(&edited, "fn edited_delta_marker() {}\n").unwrap();
-            index.ready = true;
-            index.update_file(&edited);
-            assert!(index.has_pending_disk_changes());
-            *ctx.search_index().write().unwrap() = Some(index);
-
-            let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-            quiesce_unbound_root(&root, &mut live_roots, &executor);
-            live_roots.get_mut(&root).unwrap().last_touched =
-                Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
-            assert_eq!(
-                ctx.artifact_eviction_blocker(),
-                Some(crate::context::ArtifactEvictionBlocker::SearchDeltaUnpersisted)
-            );
-            Self {
-                _root_dir: root_dir,
-                _storage: storage,
-                root,
-                canonical,
-                cache_dir,
-                ctx,
-                executor,
-                live_roots,
-            }
-        }
-
-        fn reap(
-            &mut self,
-            now: Instant,
-            root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-            metrics: &DispatchPathMetrics,
-        ) -> IdleReapOutcome {
-            reap_idle_roots(
-                now,
-                &mut self.live_roots,
-                &HashMap::new(),
-                root_channels,
-                &self.executor,
-                metrics,
-            )
-        }
-
-        fn wait_for_actor_idle(&self) {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !self.executor.actor_is_idle(&self.root) {
-                assert!(Instant::now() < deadline, "teardown persist never finished");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-
-        fn has_pending_disk_changes(&self) -> bool {
-            self.ctx
-                .search_index()
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|index| index.has_pending_disk_changes())
-        }
-
-        fn cache_bin(&self) -> Vec<u8> {
-            std::fs::read(self.cache_dir.join("cache.bin")).expect("read cache.bin")
-        }
-    }
-
-    #[test]
-    fn unbound_root_with_unpersisted_search_delta_is_persisted_then_evicted() {
-        let mut fixture = DirtyUnboundRoot::new("unpersisted-delta");
-        let cache_before = fixture.cache_bin();
-        let metrics = DispatchPathMetrics::new();
-        let start = Instant::now();
-
-        // The first TTL sweep finds the delta as the only blocker and queues
-        // the persist instead of holding the root forever.
-        assert_eq!(fixture.reap(start, &HashMap::new(), &metrics).evicted, 0);
-        fixture.wait_for_actor_idle();
-        assert!(
-            !fixture.has_pending_disk_changes(),
-            "the teardown persist must write the delta before eviction"
-        );
-        assert!(fixture.ctx.search_index().read().unwrap().is_some());
-        assert_ne!(
-            fixture.cache_bin(),
-            cache_before,
-            "cache.bin must be rewritten"
-        );
-        let mut restored = crate::search_index::SearchIndex::read_from_disk(
-            &fixture.cache_dir,
-            &fixture.canonical,
-        )
-        .expect("reload cache.bin");
-        restored.set_ready(true);
-        assert_eq!(
-            restored
-                .grep(
-                    "edited_delta_marker",
-                    true,
-                    &[],
-                    &[],
-                    &fixture.canonical,
-                    10
-                )
-                .unwrap()
-                .matches
-                .len(),
-            1,
-            "the persisted cache.bin must carry the delta"
-        );
-
-        let mut evicted = 0;
-        for hours_later in [1u64, 6, 24] {
-            evicted += fixture
-                .reap(
-                    start + Duration::from_secs(hours_later * 3600),
-                    &HashMap::new(),
-                    &metrics,
-                )
-                .evicted;
-        }
-        assert_eq!(evicted, 1, "the persisted root is evicted exactly once");
-        assert!(fixture.live_roots[&fixture.root].idle_artifacts_evicted);
-        assert!(!fixture.ctx.artifact_eviction_blocked());
-        assert!(fixture.ctx.search_index().read().unwrap().is_none());
-    }
-
-    #[test]
-    fn rebind_during_unbound_teardown_persist_keeps_root_resident() {
-        let mut fixture = DirtyUnboundRoot::new("rebind-mid-persist");
-        let (_gate, reached, release) =
-            crate::context::gate_unbound_teardown_persist_for_test(fixture.canonical.clone());
-        let metrics = DispatchPathMetrics::new();
-        let start = Instant::now();
-
-        assert_eq!(fixture.reap(start, &HashMap::new(), &metrics).evicted, 0);
-        reached
-            .recv_timeout(Duration::from_secs(10))
-            .expect("teardown persist reached its gate");
-
-        // The route rebinds while the persist is in flight: the transport
-        // loop reopens lifecycle admission and records the bound channel.
-        fixture.ctx.mark_subc_bound();
-        fixture
-            .live_roots
-            .get_mut(&fixture.root)
-            .unwrap()
-            .reactivate_bound();
-        let root_channels =
-            HashMap::from([(fixture.root.clone(), HashSet::from([route_key(7, 1)]))]);
-        release.send(()).unwrap();
-        fixture.wait_for_actor_idle();
-
-        for hours_later in [1u64, 24] {
-            assert_eq!(
-                fixture
-                    .reap(
-                        start + Duration::from_secs(hours_later * 3600),
-                        &root_channels,
-                        &metrics,
-                    )
-                    .evicted,
-                0,
-                "a rebound root must not be evicted"
-            );
-        }
-        assert!(!fixture.live_roots[&fixture.root].idle_artifacts_evicted);
-        assert!(
-            fixture.ctx.search_index().read().unwrap().is_some(),
-            "the rebound root keeps its resident index"
-        );
-    }
-
-    #[test]
-    fn unbound_root_held_past_ttl_is_counted_with_its_blocker() {
-        // No canonical cache root, so the teardown persist cannot write and
-        // the delta keeps holding the root.
-        let (_root_dir, root) = test_root("held-root-census");
-        let ctx = test_ctx();
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let edited = root.as_path().join("edited.rs");
-        std::fs::write(&edited, "fn edited() {}\n").unwrap();
-        let mut index = crate::search_index::SearchIndex::new();
-        index.ready = true;
-        index.update_file(&edited);
-        *ctx.search_index().write().unwrap() = Some(index);
-
-        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-        quiesce_unbound_root(&root, &mut live_roots, &executor);
-        live_roots.get_mut(&root).unwrap().last_touched =
-            Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
-        let metrics = DispatchPathMetrics::new();
-        let outcome = reap_idle_roots(
-            Instant::now(),
-            &mut live_roots,
-            &HashMap::new(),
-            &HashMap::new(),
-            &executor,
-            &metrics,
-        );
-        assert_eq!(outcome.evicted, 0);
-        assert_eq!(
-            live_roots[&root].ttl_retention_logged,
-            Some("search_delta_unpersisted")
-        );
-
-        let app = crate::context::App::default_shared();
-        let health_rollup_cache = HealthRollupCache::new();
-        health_rollup_cache.refresh(&executor, &app);
-        let report = build_health_report(
-            &health_rollup_cache,
-            &executor,
-            &HashMap::new(),
-            &metrics,
-            &app,
-        );
-        let reap = report
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.get("reap"))
-            .expect("reap health metrics");
-        assert_eq!(reap["unbound_retained"].as_u64(), Some(1));
-        assert_eq!(
-            reap["unbound_blockers"]["search_delta_unpersisted"].as_u64(),
-            Some(1)
-        );
-        assert_eq!(reap["unbound_blockers"]["actor_busy"].as_u64(), Some(0));
-        // Deleted-root accounting is unchanged.
-        assert_eq!(reap["deleted_retained"].as_u64(), Some(0));
-        assert_eq!(
-            reap["blockers"]["artifact_eviction_blocked"].as_u64(),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn borrow_only_root_ram_delta_does_not_block_ttl_eviction() {
-        let (_root_dir, root) = test_root("borrow-only-delta");
-        let ctx = test_ctx();
-        ctx.set_cache_role(true, None);
-        assert!(ctx.shared_artifacts_read_only());
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let edited = root.as_path().join("edited.rs");
-        std::fs::write(&edited, "fn edited() {}\n").unwrap();
-        let mut index = crate::search_index::SearchIndex::new();
-        index.ready = true;
-        index.update_file(&edited);
-        assert!(index.has_pending_disk_changes());
-        *ctx.search_index().write().unwrap() = Some(index);
-        // A borrow-only root can never write this delta, so it is not work
-        // the eviction would lose.
-        assert!(!ctx.artifact_eviction_blocked());
-
-        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-        quiesce_unbound_root(&root, &mut live_roots, &executor);
-        live_roots.get_mut(&root).unwrap().last_touched =
-            Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
-        let outcome = reap_idle_roots(
-            Instant::now(),
-            &mut live_roots,
-            &HashMap::new(),
-            &HashMap::new(),
-            &executor,
-            &DispatchPathMetrics::new(),
-        );
-        assert_eq!(outcome.evicted, 1);
-        assert!(ctx.search_index().read().unwrap().is_none());
-    }
-
-    #[test]
-    fn control_unbound_root_with_clean_search_index_is_evicted() {
-        let (_root_dir, root) = test_root("clean-index");
-        let ctx = test_ctx();
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-
-        let mut index = crate::search_index::SearchIndex::new();
-        index.ready = true;
-        assert!(!index.has_pending_disk_changes());
-        *ctx.search_index().write().unwrap() = Some(index);
-
-        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-        quiesce_unbound_root(&root, &mut live_roots, &executor);
-        live_roots.get_mut(&root).unwrap().last_touched =
-            Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
-
-        let outcome = reap_idle_roots(
-            Instant::now(),
-            &mut live_roots,
-            &HashMap::new(),
-            &HashMap::new(),
-            &executor,
-            &DispatchPathMetrics::new(),
-        );
-        assert_eq!(outcome.evicted, 1);
-        assert!(live_roots[&root].idle_artifacts_evicted);
-        assert!(ctx.search_index().read().unwrap().is_none());
     }
 
     #[test]
@@ -18656,118 +17654,6 @@ mod tests {
     }
 
     #[test]
-    fn unbound_root_quiesces_maintenance_without_removing_actor() {
-        let (_root_dir, root) = test_root("unbound-root-quiesce");
-        let ctx = test_ctx();
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let mut meta = RootMeta::new(Instant::now());
-        meta.maintenance_pending = true;
-        meta.maintenance_jobs_in_flight = 1;
-        meta.maintenance_queued_kinds
-            .push_back(MaintenanceDrainKind::ConfigureTail);
-        let mut live_roots = HashMap::from([(root.clone(), meta)]);
-        // Warm state planted before the unbind: quiesce must keep it.
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(crate::search_index::SearchIndex::new());
-        ctx.set_cache_writer_capabilities(true, true);
-        let pending = root.as_path().join("pending.rs");
-        ctx.add_pending_search_index_paths([pending.clone()]);
-        // A warm verify memo must survive the transient unbind: the watcher
-        // keeps running, so no unobserved window exists and the next warm
-        // reload must not pay a strict full-corpus re-hash.
-        let canonical_root = root.as_path().to_path_buf();
-        let artifact = canonical_root.join("cache.bin");
-        std::fs::write(&artifact, b"warm-artifact").expect("write artifact");
-        let seeded_generation = crate::cache_freshness::artifact_generation(&artifact);
-        crate::cache_freshness::record_verify_completed(
-            &canonical_root,
-            crate::cache_freshness::VerifyArtifact::Search,
-            seeded_generation,
-        );
-        assert!(matches!(
-            crate::cache_freshness::warm_verify_plan(
-                &canonical_root,
-                crate::cache_freshness::VerifyArtifact::Search,
-                seeded_generation,
-            ),
-            crate::cache_freshness::WarmVerifyPlan::Skip
-        ));
-        // A live watcher runtime must survive quiesce (its events accumulate
-        // for the rebind replay).
-        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
-        let _dispatch_tx = dispatch_tx;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = Arc::clone(&shutdown);
-        let join = std::thread::spawn(move || {
-            while !thread_shutdown.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
-        ctx.install_watcher_runtime(
-            dispatch_rx,
-            crate::watcher_filter::WatcherThreadHandle::new(shutdown, join),
-        );
-        assert!(ctx.watcher_runtime_active());
-
-        quiesce_unbound_root(&root, &mut live_roots, &executor);
-        let meta = &live_roots[&root];
-        assert!(meta.unbound_quiesced);
-        assert!(ctx.subc_unbound_quiesced());
-        assert!(meta.maintenance_pending);
-        assert!(meta.maintenance_queued_kinds.is_empty());
-        assert!(executor.actor_registered(&root));
-        // Transient unbind keeps the root warm: resident artifacts stay
-        // resident, no forced callgraph rebuild is planted, and pending
-        // reconciliation paths survive for the rebind replay.
-        assert!(
-            ctx.search_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some(),
-            "quiesce must not evict resident artifacts"
-        );
-        assert_eq!(
-            ctx.pending_callgraph_store_force_token(),
-            None,
-            "quiesce must not force a callgraph rebuild"
-        );
-        assert_eq!(
-            ctx.take_pending_search_index_paths(),
-            vec![pending],
-            "quiesce must retain pending watcher-derived paths"
-        );
-        assert!(
-            matches!(
-                crate::cache_freshness::warm_verify_plan(
-                    &canonical_root,
-                    crate::cache_freshness::VerifyArtifact::Search,
-                    seeded_generation,
-                ),
-                crate::cache_freshness::WarmVerifyPlan::Skip
-            ),
-            "quiesce must not invalidate the warm verify memo"
-        );
-        assert!(
-            ctx.watcher_runtime_active(),
-            "quiesce must not stop a running watcher"
-        );
-        ctx.stop_watcher_runtime();
-
-        let meta = live_roots.get_mut(&root).expect("root metadata");
-        note_maintenance_completion(
-            meta,
-            Some(MaintenanceDrainKind::ConfigureTail),
-            false,
-            meta.unbound_quiesced,
-        );
-        assert!(!meta.maintenance_pending);
-        assert!(meta.maintenance_queued_kinds.is_empty());
-    }
-
-    #[test]
     #[ignore = "process thread census requires an isolated test process and real watchers"]
     fn bound_roots_share_http_runtime_threads() {
         root_thread_census_regression();
@@ -18940,7 +17826,7 @@ mod tests {
         let _failure = crate::watcher_filter::force_exclusion_failure_for_test(root.as_path());
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
         crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-        let parent = crate::views::parent::session_for(&ctx).expect("parent session");
+        let parent = crate::data_layer::parent_session::session_for(&ctx).expect("parent session");
         assert!(parent.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);
         let counters = crate::context::watcher_counters_for_root(root.as_path());
@@ -18983,7 +17869,7 @@ mod tests {
             parent.stopped(),
             "last parent route must release its child readers"
         );
-        assert!(crate::views::parent::session_for_root(root.as_path()).is_none());
+        assert!(crate::data_layer::parent_session::session_for_root(root.as_path()).is_none());
         assert!(ctx.watcher_rx().lock().is_none());
         crate::commands::configure::ensure_project_watcher(&ctx);
         assert!(
@@ -18994,7 +17880,8 @@ mod tests {
         roots.get_mut(&root).unwrap().reactivate_bound();
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
         crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-        let rebound = crate::views::parent::session_for(&ctx).expect("rebound parent session");
+        let rebound =
+            crate::data_layer::parent_session::session_for(&ctx).expect("rebound parent session");
         assert!(!Arc::ptr_eq(&parent, &rebound));
         assert!(rebound.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);
@@ -19240,9 +18127,7 @@ mod tests {
                 MaintenanceProbeLock::LspManager => MaintenanceDrainKind::Lsp,
                 MaintenanceProbeLock::ConfigureMaintenanceJobs
                 | MaintenanceProbeLock::ParkedConfigureTail => MaintenanceDrainKind::ConfigureTail,
-                MaintenanceProbeLock::SearchIndexReceiver
-                | MaintenanceProbeLock::CallgraphStoreReceiver
-                | MaintenanceProbeLock::SemanticIndexReceiver
+                MaintenanceProbeLock::SemanticIndexReceiver
                 | MaintenanceProbeLock::SemanticRefreshEvents
                 | MaintenanceProbeLock::SemanticRefreshWorker => {
                     MaintenanceDrainKind::CompletionDrains
@@ -19383,308 +18268,6 @@ mod tests {
             deferred,
             "a busy scheduler defers the root to the next tick"
         );
-    }
-
-    /// What the idle-reap test holds: one of the root's own locks, or the
-    /// executor's scheduler lock.
-    #[derive(Clone, Copy, Debug)]
-    enum ReapHeldLock {
-        Root(crate::context::IdleReapLock),
-        ExecutorState,
-    }
-
-    /// The idle reaper runs on the frame loop. With any lock it reads held by
-    /// another thread, a sweep must return promptly and leave the root for a
-    /// later sweep, and the next sweep with nothing held must evict it.
-    #[test]
-    fn idle_reap_does_not_wait_for_a_held_lock() {
-        let held_locks = crate::context::IdleReapLock::ALL
-            .into_iter()
-            .map(ReapHeldLock::Root)
-            .chain([ReapHeldLock::ExecutorState]);
-        for held in held_locks {
-            let (_root_dir, root) = test_root("idle-reap-held-lock");
-            let ctx = test_ctx();
-            let executor = Arc::new(Executor::new());
-            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-            ctx.mark_subc_unbound();
-            let now = Instant::now();
-            let mut meta = RootMeta::new(now);
-            meta.unbound_quiesced = true;
-            let live_roots = HashMap::from([(root.clone(), meta)]);
-            let reap_at = now + IDLE_ROOT_TTL;
-
-            // Registration wakes the scheduler even though no jobs were queued.
-            // Wait for that event to release the scheduler lock so only the
-            // deliberately held lock can keep this root from being evicted.
-            let scheduler = executor.dispatch_loop_liveness();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while scheduler.has_pending_work() {
-                assert!(
-                    Instant::now() < deadline,
-                    "{held:?}: the registration wake did not settle"
-                );
-                std::thread::yield_now();
-            }
-
-            let holder_ctx = Arc::clone(&ctx);
-            let holder_executor = Arc::clone(&executor);
-            let reap_executor = Arc::clone(&executor);
-            let outcome = run_while_held(
-                move |while_held| match held {
-                    ReapHeldLock::Root(lock) => {
-                        holder_ctx.hold_idle_reap_lock_for_test(lock, while_held)
-                    }
-                    ReapHeldLock::ExecutorState => {
-                        holder_executor.hold_state_lock_for_test(while_held)
-                    }
-                },
-                move || {
-                    let mut live_roots = live_roots;
-                    let evicted = reap_idle_roots(
-                        reap_at,
-                        &mut live_roots,
-                        &HashMap::new(),
-                        &HashMap::new(),
-                        &reap_executor,
-                        &DispatchPathMetrics::new(),
-                    )
-                    .evicted;
-                    (evicted, live_roots)
-                },
-                Duration::from_secs(5),
-            );
-            let (evicted, mut live_roots) = outcome
-                .unwrap_or_else(|| panic!("{held:?}: the idle reaper waited for the held lock"));
-            assert_eq!(
-                evicted, 0,
-                "{held:?}: a held lock leaves the root for later"
-            );
-            assert!(!live_roots[&root].idle_artifacts_evicted, "{held:?}");
-
-            // Nothing held: the same root is evicted, so the root above was a
-            // real eviction candidate and the held lock alone kept it.
-            let evicted = reap_idle_roots(
-                reap_at,
-                &mut live_roots,
-                &HashMap::new(),
-                &HashMap::new(),
-                &executor,
-                &DispatchPathMetrics::new(),
-            )
-            .evicted;
-            assert_eq!(
-                evicted, 1,
-                "{held:?}: the root was not an eviction candidate"
-            );
-        }
-    }
-
-    async fn assert_slow_configure_tail_admission(
-        config: crate::executor::ExecutorConfig,
-        shape: &'static str,
-    ) {
-        let root_dir = tempfile::tempdir().unwrap();
-        let root_path = std::fs::canonicalize(root_dir.path()).unwrap();
-        let root = ProjectRootId::from_path(&root_path).unwrap();
-        let ctx = test_ctx();
-        ctx.mark_subc_bound();
-        let storage_root = ctx.storage_dir();
-        ctx.enqueue_configure_maintenance(crate::context::ConfigureMaintenanceJob {
-            artifact_root: ctx.cache_dir(),
-            generation: ctx.configure_generation(),
-            root_path: root_path.clone(),
-            canonical_cache_root: root_path.clone(),
-            project_key: String::new(),
-            harness: crate::harness::Harness::Opencode,
-            storage_root: storage_root.clone(),
-            harness_dir: storage_root.join("opencode"),
-            session_id: "first-search-admission".to_string(),
-            root_too_broad: false,
-            format_tool_cache_clear_needed: false,
-            run_bash_replay: false,
-            configure_database_runtime: false,
-            refresh_project_runtime: false,
-            sync_bash_compress_flag: false,
-            reset_filter_registry: false,
-            clear_failed_spawns: false,
-            warm_callgraph_store: false,
-            supersede_search_artifact_persistence: false,
-            supersede_callgraph_artifact_persistence: false,
-            supersede_semantic_artifact_persistence: false,
-            search_artifact_load_start: None,
-            semantic_artifact_load_start: None,
-        })
-        .expect("queue configure maintenance");
-        let (_gate, maintenance_reached, release_maintenance) =
-            crate::commands::configure::gate_configure_deferred_maintenance_for_test(
-                root_path.clone(),
-            );
-
-        let expected_pool_size = config.pool_size;
-        let expected_actor_cap = config.actor_cap;
-        let executor = Arc::new(Executor::with_config(config));
-        assert_eq!(executor.pool_size(), expected_pool_size);
-        assert_eq!(executor.actor_cap(), expected_actor_cap);
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let metrics = Arc::new(DispatchPathMetrics::new());
-        let (completion_tx, mut completion_rx) = mpsc::channel(2);
-        submit_maintenance_job(
-            &executor,
-            root.clone(),
-            MaintenanceDrainKind::ConfigureTail,
-            Vec::new(),
-            &completion_tx,
-            &metrics,
-        );
-        maintenance_reached
-            .recv_timeout(Duration::from_secs(2))
-            .expect("configure tail reached gate");
-
-        let admission_started = std::time::Instant::now();
-        let (search_admitted_tx, search_admitted_rx) = crossbeam_channel::bounded(1);
-        let search = executor.submit_async(
-            root.clone(),
-            Lane::HeavyInit,
-            "first-search".to_string(),
-            Box::new(move |_ctx| {
-                search_admitted_tx
-                    .send(())
-                    .expect("signal search admission");
-                Response::success("first-search", json!({}))
-            }),
-        );
-        let (mutation_started_tx, mutation_started_rx) = crossbeam_channel::bounded(1);
-        let mutation = executor.submit_async(
-            root,
-            Lane::Mutating,
-            "queued-mutation".to_string(),
-            Box::new(move |_ctx| {
-                mutation_started_tx.send(()).expect("signal mutation start");
-                Response::success("queued-mutation", json!({}))
-            }),
-        );
-
-        // The decision under test is ORDERING, not latency: this recv happens
-        // while the maintenance gate is still held, so a search that could only
-        // admit after maintenance completes can never satisfy it. The budget is
-        // a hang catch - a tight bound here just measures runner scheduling
-        // (the census S-class shape) and flaked on loaded macOS CI at 100ms.
-        let search_admission = search_admitted_rx.recv_timeout(Duration::from_secs(10));
-        let admission_elapsed = admission_started.elapsed();
-        let mutation_waited = mutation_started_rx.try_recv().is_err();
-        release_maintenance
-            .send(())
-            .expect("release configure maintenance");
-        search_admission
-            .expect("first search must admit while configure maintenance remains gated");
-        eprintln!(
-            "first-search admission while configure maintenance is gated ({shape}): {}ms",
-            admission_elapsed.as_millis()
-        );
-        assert!(
-            mutation_waited,
-            "mutating work must wait for configure maintenance to release its read epoch"
-        );
-        tokio::time::timeout(Duration::from_secs(5), search)
-            .await
-            .expect("first search completion timed out")
-            .expect("first search completion channel closed");
-        tokio::time::timeout(Duration::from_secs(5), mutation)
-            .await
-            .expect("mutation completion timed out")
-            .expect("mutation completion channel closed");
-        tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
-            .await
-            .expect("configure-tail completion timed out")
-            .expect("configure-tail completion channel closed");
-    }
-
-    #[tokio::test]
-    async fn slow_configure_tail_admits_first_search_but_not_mutating_work() {
-        assert_slow_configure_tail_admission(
-            crate::executor::ExecutorConfig {
-                pool_size: 2,
-                read_cap: 1,
-                actor_cap: 1,
-                heavy_permits: 1,
-                drr_quantum: 1,
-            },
-            "pool=2 actor_cap=1",
-        )
-        .await;
-        assert_slow_configure_tail_admission(
-            crate::executor::ExecutorConfig {
-                pool_size: 4,
-                read_cap: 3,
-                actor_cap: 3,
-                heavy_permits: 3,
-                drr_quantum: 1,
-            },
-            "pool=4 actor_cap=3",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn subc_configure_tail_precedes_completed_search_install() {
-        let root_dir = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = ProjectRootId::from_path(root_dir.path()).unwrap();
-        let (ctx, ignored_path) =
-            runtime_drain::configure_search_order_context_for_test(root_dir.path(), storage.path());
-        let ctx = Arc::new(ctx);
-        assert!(!runtime_drain::watcher_path_is_ignored_by_current_matcher(
-            &ctx,
-            &ignored_path
-        ));
-
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let metrics = Arc::new(DispatchPathMetrics::new());
-        let (completion_tx, mut completion_rx) = mpsc::channel(4);
-        submit_maintenance_job(
-            &executor,
-            root.clone(),
-            MaintenanceDrainKind::ConfigureTail,
-            Vec::new(),
-            &completion_tx,
-            &metrics,
-        );
-        submit_maintenance_job(
-            &executor,
-            root,
-            MaintenanceDrainKind::CompletionDrains,
-            Vec::new(),
-            &completion_tx,
-            &metrics,
-        );
-
-        let first = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
-            .await
-            .expect("configure-tail completion timed out")
-            .expect("configure-tail completion channel closed");
-        let second = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
-            .await
-            .expect("completion-drains completion timed out")
-            .expect("completion-drains completion channel closed");
-        assert!(first.response.id.contains("configure-tail"));
-        assert!(second.response.id.contains("completion-drains"));
-        assert!(runtime_drain::watcher_path_is_ignored_by_current_matcher(
-            &ctx,
-            &ignored_path
-        ));
-        assert_eq!(
-            ctx.search_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .expect("completed search index installed")
-                .file_count(),
-            0,
-            "configure must install the ignore matcher before pending paths replay"
-        );
-        ctx.stop_watcher_runtime();
     }
 
     #[test]
@@ -22339,7 +20922,7 @@ mod tests {
     /// retry sleeps, and it delays maintenance of the other folder.
     #[test]
     fn standing_ticks_over_an_unreadable_git_session_ask_git_nothing() {
-        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let executor = Arc::new(Executor::new());
         let configured = ConfiguredRoot::unconfigured(&executor);
@@ -22352,7 +20935,7 @@ mod tests {
         // Its sender is dropped at once, so no probe attempt is held.
         let (_, release) = std::sync::mpsc::channel();
         let _probe =
-            crate::search_index::force_git_root_commit_probe_held_transient_for_paths_for_test(
+            crate::root_identity::key::force_git_root_commit_probe_held_transient_for_paths_for_test(
                 vec![canonical_root.clone()],
                 Arc::clone(&attempts),
                 release,
@@ -22381,7 +20964,7 @@ mod tests {
             .artifact_identity_provisional_reason()
             .expect("an unreadable Git identity leaves the bind provisional");
         assert!(
-            reason.starts_with(crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON),
+            reason.starts_with(crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON),
             "{reason}"
         );
         assert!(!ctx.provisional_identity_retry().is_armed());
@@ -22409,317 +20992,6 @@ mod tests {
             "standing maintenance asked Git about a session folder whose Git identity is unreadable"
         );
         assert!(ctx.artifact_identity_provisional());
-    }
-
-    /// A bind that finds aft.db busy leaves the session provisional, so its
-    /// standing step claims only the standing entry for its own folder, and a
-    /// standing entry for a sibling checkout of the same repository stays
-    /// active. When the identity retry settles the session, its replayed bind
-    /// must take that sibling over from standing maintenance, inside the
-    /// bind's admission and before the session's first index load starts.
-    /// Otherwise both checkouts publish into one index family and replace
-    /// each other's results.
-    #[test]
-    fn identity_retry_settle_pauses_a_sibling_standing_entry_before_the_session_builds() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let executor = Arc::new(Executor::new());
-        let configured = ConfiguredRoot::unconfigured(&executor);
-        let root_id = configured.root.clone();
-        let canonical_root = configured.canonical_root.clone();
-        let ctx = Arc::clone(&configured.ctx);
-        let sibling_parent = tempfile::tempdir().unwrap();
-        let sibling = sibling_parent.path().join("sibling");
-        let mut clone = std::process::Command::new("git");
-        crate::test_env::apply_hermetic_git_env(&mut clone);
-        assert!(clone
-            .args(["clone", "--quiet"])
-            .arg(configured.dir.path())
-            .arg(&sibling)
-            .status()
-            .unwrap()
-            .success());
-        let sibling = std::fs::canonicalize(&sibling).unwrap();
-        let sibling_literal = sibling.to_string_lossy().into_owned();
-
-        // Rollback-journal mode, so the exclusive transaction also blocks the
-        // bind's read of its legacy identity pin.
-        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
-        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
-            .unwrap();
-        let bind: RawRequest = serde_json::from_value(json!({
-            "id": "subc-bind-identity-retry-sibling",
-            "command": "configure",
-            "project_root": configured.dir.path(),
-            "storage_dir": configured.storage.path(),
-            "harness": "opencode",
-            "session_id": "identity-retry-sibling-session",
-            "config": [{
-                "tier": "user",
-                "source": "/u/aft.jsonc",
-                "doc": json!({
-                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
-                    "views": { "enabled": false },
-                    "index": { "roots": [{ "path": sibling_literal, "indexes": ["search"] }] },
-                }).to_string(),
-            }],
-        }))
-        .unwrap();
-        let bound = configured
-            .submit_bind(&executor, bind)
-            .blocking_recv()
-            .expect("provisional bind completes");
-        assert!(bound.success, "{}", bound.data);
-        assert!(
-            ctx.artifact_identity_provisional(),
-            "{:?}",
-            ctx.degraded_reasons()
-        );
-        assert!(!ctx.config().indexes.trigram);
-        lock.execute_batch("ROLLBACK").unwrap();
-        drop(lock);
-
-        // The standing half of the provisional bind: with no key yet it claims
-        // only the session's own folder, so the sibling's entry stays active.
-        let standing = Arc::new(
-            standing::StandingActor::new(ctx.app(), Arc::clone(&executor))
-                .with_startup_storage_dir(configured.storage.path()),
-        );
-        standing.begin_session_bind(&ctx);
-        assert!(
-            standing.admits_build_for_test(&sibling_literal),
-            "fixture: the provisional bind leaves the sibling's standing entry active"
-        );
-
-        let loads_before =
-            crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
-                &canonical_root,
-            );
-        let replay = pump_until_identity_replay(&executor, &root_id);
-        let mut meta = RootMeta::new(Instant::now());
-        let replayed =
-            submit_identity_replay_bind(&executor, &mut meta, root_id.clone(), replay, &standing)
-                .blocking_recv()
-                .expect("replayed bind completes");
-        assert!(replayed.success, "{}", replayed.data);
-        assert!(
-            ctx.artifact_identity_provisional_reason().is_none(),
-            "{:?}",
-            ctx.degraded_reasons()
-        );
-        assert!(ctx.config().indexes.trigram);
-        let settled_key = ctx
-            .cached_artifact_cache_key(&canonical_root)
-            .expect("the settled bind publishes its key");
-        assert_eq!(
-            standing
-                .entry_artifact_key_for_test(&sibling_literal)
-                .as_deref(),
-            Some(settled_key.as_str()),
-            "fixture: the sibling's standing entry shares the session's settled key"
-        );
-        // The session's index loads start only from its configure tail, which
-        // has not run yet; the sibling must already be paused here.
-        assert_eq!(
-            crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
-                &canonical_root
-            ),
-            loads_before,
-            "the session's index load started before its configure tail ran"
-        );
-        assert!(
-            !standing.admits_build_for_test(&sibling_literal),
-            "the settled session's replayed bind left the sibling's standing entry publishing into its index family"
-        );
-
-        // Run the session's configure tail until its first search load
-        // starts; standing maintenance stays paused through it and after.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
-            &canonical_root,
-        ) == loads_before
-        {
-            assert!(
-                Instant::now() < deadline,
-                "the settled session's search load never started"
-            );
-            let tail = executor.submit_maintenance_async(
-                root_id.clone(),
-                Lane::MaintenanceCommit,
-                "subc-maintenance-drain-configure-tail-identity-retry-sibling".to_string(),
-                Box::new(|ctx| {
-                    run_configure_tail_maintenance(ctx);
-                    Response::success("tail", json!({}))
-                }),
-            );
-            let _ = tail.blocking_recv();
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(!standing.admits_build_for_test(&sibling_literal));
-        standing.tick();
-        assert!(
-            !standing.admits_build_for_test(&sibling_literal),
-            "maintenance resumed a standing entry the bound session took over"
-        );
-    }
-
-    /// Run the configure-tail maintenance job on the root's actor, as the module
-    /// loop's tick does, until the identity retry hands back a bind to replay.
-    fn pump_until_identity_replay(
-        executor: &Executor,
-        root_id: &ProjectRootId,
-    ) -> crate::provisional_identity_retry::PreparedReplay {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(1);
-            let tail = executor.submit_maintenance_async(
-                root_id.clone(),
-                Lane::MaintenanceCommit,
-                "subc-maintenance-drain-configure-tail-identity-retry".to_string(),
-                Box::new(move |ctx| {
-                    let _ = outcome_tx.send(run_configure_tail_maintenance(ctx));
-                    Response::success("tail", json!({}))
-                }),
-            );
-            let _ = tail.blocking_recv();
-            if let Some(replay) = outcome_rx
-                .try_recv()
-                .ok()
-                .and_then(|outcome| outcome.identity_replay)
-            {
-                return replay;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the identity retry never found aft.db free"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// The last route unbinds while a replayed bind is admitted as the root's
-    /// writer but has not sealed its commit. Quiescing the root cancels the
-    /// replay like a route's own pending bind: it publishes nothing, schedules
-    /// and installs no index load, starts no watcher, and the root stays
-    /// quiesced.
-    #[test]
-    fn quiescing_the_root_cancels_an_admitted_identity_retry_bind() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let executor = Arc::new(Executor::new());
-        let configured = ConfiguredRoot::unconfigured(&executor);
-        let root_id = configured.root.clone();
-        let canonical_root = configured.canonical_root.clone();
-        let ctx = Arc::clone(&configured.ctx);
-        let mut live_roots = HashMap::from([(root_id.clone(), RootMeta::new(Instant::now()))]);
-
-        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
-        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
-            .unwrap();
-        let bind: RawRequest = serde_json::from_value(json!({
-            "id": "subc-bind-identity-retry-unbind-test",
-            "command": "configure",
-            "project_root": configured.dir.path(),
-            "storage_dir": configured.storage.path(),
-            "harness": "opencode",
-            "session_id": "identity-retry-unbind-session",
-            "config": [{
-                "tier": "user",
-                "source": "/u/aft.jsonc",
-                "doc": json!({
-                    "indexes": { "trigram": true, "semantic": false, "callgraph": true },
-                    "views": { "enabled": false },
-                }).to_string(),
-            }],
-        }))
-        .unwrap();
-        let bound = configured
-            .submit_bind(&executor, bind)
-            .blocking_recv()
-            .expect("provisional bind completes");
-        assert!(bound.success, "{}", bound.data);
-        assert!(
-            ctx.artifact_identity_provisional(),
-            "{:?}",
-            ctx.degraded_reasons()
-        );
-        lock.execute_batch("ROLLBACK").unwrap();
-        drop(lock);
-
-        let replay = pump_until_identity_replay(&executor, &root_id);
-        let watcher_before = ctx.watcher_runtime_thread_id_for_test();
-        let (writer_admitted, release_writer) =
-            crate::commands::configure::gate_configure_stage_for_test(
-                canonical_root.clone(),
-                crate::commands::configure::ConfigureGateStage::WriterAdmitted,
-            );
-        let session = replay.session();
-        let standing = Arc::new(standing::StandingActor::new(
-            ctx.app(),
-            Arc::clone(&executor),
-        ));
-        let replayed = submit_identity_replay_bind(
-            &executor,
-            live_roots.get_mut(&root_id).unwrap(),
-            root_id.clone(),
-            replay,
-            &standing,
-        );
-        assert!(
-            roots_with_bind_in_flight(&HashMap::new(), &live_roots).contains(&root_id),
-            "maintenance must treat the replay as a bind in flight"
-        );
-        writer_admitted
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the replay is admitted as the root's writer");
-
-        // The last route unbinds: route teardown fences the lifecycle, then
-        // quiesces the root.
-        ctx.mark_subc_unbound();
-        quiesce_unbound_root(&root_id, &mut live_roots, &executor);
-        release_writer.send(()).unwrap();
-        let response = replayed.blocking_recv().expect("replay completes");
-
-        // State the replay left, before `finish_identity_replay` settles its
-        // completion.
-        assert_eq!(
-            response.data["code"], "request_cancelled",
-            "a replay that loses the race to quiesce must not commit: {}",
-            response.data
-        );
-        assert!(!ctx.config().indexes.trigram && !ctx.config().indexes.callgraph);
-        assert!(
-            ctx.artifact_identity_provisional(),
-            "{:?}",
-            ctx.degraded_reasons()
-        );
-        assert!(ctx.search_index_rx().read().unwrap().is_none());
-        assert!(ctx.search_index().read().unwrap().is_none());
-        assert!(ctx.callgraph_store_rx().lock().is_none());
-        assert!(ctx.callgraph_store().read().unwrap().is_none());
-        assert!(ctx.semantic_index_rx().lock().is_none());
-        assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
-        assert_eq!(
-            crate::root_identity::read(&canonical_root, configured.storage.path()).unwrap(),
-            None
-        );
-        assert_eq!(ctx.watcher_runtime_thread_id_for_test(), watcher_before);
-        assert!(!ctx.configure_tail_has_work());
-
-        finish_identity_replay(
-            &IdentityReplayDone {
-                root_id: root_id.clone(),
-                session,
-                response,
-            },
-            &mut live_roots,
-            &HashMap::new(),
-            &executor,
-        );
-        assert!(ctx.subc_unbound_quiesced());
-        assert!(live_roots[&root_id].unbound_quiesced);
-        assert!(live_roots[&root_id].identity_replay.is_none());
-        assert!(!roots_with_bind_in_flight(&HashMap::new(), &live_roots).contains(&root_id));
-        assert!(!ctx.config().indexes.trigram);
-        assert_eq!(ctx.watcher_runtime_thread_id_for_test(), watcher_before);
     }
 
     /// A [`ConfiguredRoot`] whose configure tail runs on the executor and is
@@ -22819,8 +21091,8 @@ mod tests {
     }
 
     #[test]
-    fn fresh_root_catalog_and_role_describe_do_not_wait_for_view_load_or_index_work() {
-        let mut fixture = HeldConfigureTail::start("view_load");
+    fn fresh_root_catalog_and_role_describe_do_not_wait_for_the_configure_tail() {
+        let mut fixture = HeldConfigureTail::start("process_flags");
         let (started, running) = std::sync::mpsc::channel();
         let (release, held) = std::sync::mpsc::channel();
         let index = fixture.executor.submit_async(
@@ -22884,7 +21156,7 @@ mod tests {
     fn same_root_rebind_herd_is_acked_while_the_configure_tail_is_held_in_a_slow_stage() {
         const BINDS: usize = 16;
         const ACK_BOUND: Duration = Duration::from_secs(2);
-        let mut fixture = HeldConfigureTail::start("view_load");
+        let mut fixture = HeldConfigureTail::start("process_flags");
         let generation = fixture.ctx.configure_generation();
 
         let started = Instant::now();
@@ -22927,7 +21199,7 @@ mod tests {
             acked.len(),
             BINDS,
             "only {} of {BINDS} same-root rebinds were acked within {ACK_BOUND:?} while the \
-             tail was held in view_load: acked={acked:?} blockers={blockers:?}",
+             tail was held in process_flags: acked={acked:?} blockers={blockers:?}",
             acked.len()
         );
         // None of the herd re-ran the root's configure: the generation is the
@@ -22935,7 +21207,7 @@ mod tests {
         assert_eq!(fixture.ctx.configure_generation(), generation);
         let records =
             crate::commands::configure::configure_unit_records_for_root(&fixture.canonical_root);
-        for stage in ["project_runtime", "watcher", "view_load", "callgraph"] {
+        for stage in ["project_runtime", "watcher", "process_flags"] {
             assert_eq!(
                 records
                     .iter()
@@ -23136,121 +21408,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn route_bind_acks_before_database_open_and_rebinds_beside_blocked_open() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let executor = Arc::new(Executor::new());
-        let fixture = ConfiguredRoot::unconfigured(&executor);
-        let (_gate, reached, release) =
-            crate::commands::configure::gate_configure_tail_stage_for_test(
-                fixture.canonical_root.clone(),
-                "database_runtime",
-            );
-        let started = Instant::now();
-        let mut first = fixture.submit_bind(&executor, fixture.bind_request(0, "opencode"));
-        // The database open stays gated until `release` is sent, so a bind that
-        // waited for it would never answer within any deadline. Polling up to the
-        // product's own bind deadline proves the ordering without failing a
-        // correct bind that a loaded host merely slowed down.
-        let deadline = started + ROUTE_BIND_DEADLINE;
-        let first_response = loop {
-            if let Ok(response) = first.try_recv() {
-                break Some(response);
-            }
-            if Instant::now() >= deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        };
-        let first_latency = started.elapsed();
-        if first_response.is_none() {
-            let _ = release.send(());
-            let _ = first.blocking_recv();
-            panic!("route bind waited for database open: {first_latency:?}");
-        }
-        assert!(first_response.unwrap().success);
-        assert!(
-            reached.try_recv().is_err(),
-            "database open ran before maintenance"
-        );
-        assert!(fixture.ctx.search_index_rx().read().unwrap().is_some());
-        assert!(fixture.ctx.search_index().read().unwrap().is_none());
-        let generation = fixture.ctx.configure_generation();
-        for name in ["bash", "aft_safety", "write", "db_set_state"] {
-            assert_database_refuses_wire_tool(&executor, &fixture, name, "database_initializing");
-        }
-        assert!(!fixture.storage.path().join("aft.db").exists());
-        let tail = executor.submit_maintenance_async(
-            fixture.root.clone(),
-            Lane::MaintenanceCommit,
-            "subc-maintenance-drain-configure-tail-blocked-database".to_string(),
-            Box::new(|ctx| {
-                let requeue = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
-                Response::success("tail", json!({ "requeue": requeue }))
-            }),
-        );
-        reached
-            .recv_timeout(Duration::from_secs(5))
-            .expect("database open reached after ack");
-        assert_database_refuses_wire_tool(&executor, &fixture, "bash", "database_initializing");
-        assert_read_works_during_database_open(&executor, &fixture);
-        assert!(!fixture.storage.path().join("aft.db").exists());
-        let mut second = fixture.submit_bind(&executor, fixture.bind_request(1, "opencode"));
-        let started = Instant::now();
-        let deadline = started + ROUTE_BIND_DEADLINE;
-        let second_response = loop {
-            if let Ok(response) = second.try_recv() {
-                break Some(response);
-            }
-            if Instant::now() >= deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        };
-        let second_latency = started.elapsed();
-        let release_thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            let _ = release.send(());
-        });
-        let bash = database_wire_tool(&executor, &fixture, "bash", BASH_AFTER_OPEN_BUDGET);
-        release_thread.join().unwrap();
-        assert_eq!(
-            bash["success"], true,
-            "bash must proceed when database opens: {bash}"
-        );
-        assert!(tail.blocking_recv().unwrap().success);
-        if second_response.is_none() {
-            let _ = second.blocking_recv();
-        }
-        assert!(
-            second_response.is_some(),
-            "equivalent bind queued behind database open: {second_latency:?}"
-        );
-        assert!(second_response.unwrap().success);
-        assert_eq!(fixture.ctx.configure_generation(), generation);
-        assert!(fixture
-            .ctx
-            .database_runtime_refusal("ready", "bash")
-            .is_none());
-        assert!(fixture.ctx.db().is_some());
-        assert!(fixture.storage.path().join("aft.db").is_file());
-        let db = fixture.ctx.db().unwrap();
-        let rows: i64 = db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM bash_tasks WHERE session_id = 'herd-session-0'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            rows > 0,
-            "bash admitted after notification must persist its task row"
-        );
-        eprintln!("blocked database open: first bind {first_latency:?}, equivalent bind {second_latency:?}");
-    }
-
     /// Poll until `ctx` would admit bash (its database is open and published)
     /// or `within` passes; the elapsed time when it became ready.
     fn wait_for_database_ready(ctx: &AppContext, within: Duration) -> Option<Duration> {
@@ -23313,7 +21470,7 @@ mod tests {
             let (gate, _held, release) =
                 crate::commands::configure::gate_configure_tail_stage_for_test(
                     root.canonical_root.clone(),
-                    "view_load",
+                    "process_flags",
                 );
             gates.push(gate);
             releases.push(release);
@@ -23346,7 +21503,7 @@ mod tests {
                 start_post_ack_database_open(&executor, &root.root);
                 acked_at[index] = Some(Instant::now());
                 // Queue the root's configure tail; the executor admits only
-                // a few maintenance jobs, and admitted tails hold at view_load.
+                // a few maintenance jobs, and admitted tails hold at process_flags.
                 tails.push(executor.submit_maintenance_async(
                     root.root.clone(),
                     Lane::MaintenanceCommit,
@@ -23783,71 +21940,8 @@ mod tests {
     }
 
     #[test]
-    fn storage_sweeps_do_not_hold_bind_or_bash_admission() {
-        const HANG_GUARD: Duration = Duration::from_secs(30);
-        let mut fixture = HeldConfigureTail::start("storage_sweeps");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let generation = fixture.ctx.configure_generation();
-        let mut rebind = fixture.submit_bind(fixture.bind_request(1, "opencode"));
-        let rebound =
-            runtime.block_on(async { tokio::time::timeout(HANG_GUARD, &mut rebind).await });
-        let rebound_generation = fixture.ctx.configure_generation();
-
-        // Even a bind that needs exclusive use must not wait for sweep I/O.
-        // Leaving that writer queued would also fence off bash's shared admission.
-        let mut bind = fixture.submit_bind(fixture.bind_request(2, "pi"));
-        let bound = runtime.block_on(async { tokio::time::timeout(HANG_GUARD, &mut bind).await });
-        // Exercise the real wire and executor admission path, but stop at the
-        // dispatch boundary: admission needs no shell child to leave running.
-        let bash = database_wire_tool_with_dispatch(
-            &fixture.executor,
-            &fixture.configured,
-            "bash",
-            HANG_GUARD,
-            (HANG_GUARD, HANG_GUARD),
-            |req, _ctx| {
-                assert_eq!(req.command, "bash");
-                Response::success(req.id, json!({ "admitted": true }))
-            },
-        );
-        // All replies above must arrive before releasing the sweep. These are
-        // hang guards, not latency requirements on a loaded runner.
-        fixture.release_tail();
-        for (timed_out, pending) in [(rebound.is_err(), rebind), (bound.is_err(), bind)] {
-            if timed_out {
-                runtime
-                    .block_on(async { tokio::time::timeout(HANG_GUARD, pending).await })
-                    .expect("bind completes after releasing the sweep")
-                    .expect("bind response");
-            }
-        }
-        assert!(
-            rebound.is_ok(),
-            "an equivalent bind waited on the held storage sweep"
-        );
-        assert!(rebound.unwrap().unwrap().success);
-        assert_eq!(rebound_generation, generation);
-        assert!(
-            bound.is_ok(),
-            "a config-changing bind waited on the held storage sweep: {bound:?}; bash={bash}"
-        );
-        assert!(bound.unwrap().unwrap().success);
-        assert_eq!(
-            bash["success"], true,
-            "bash waited on the held storage sweep: {bash}"
-        );
-        assert!(
-            bash["admitted"] == true,
-            "bash never reached dispatch while the sweep was held: {bash}"
-        );
-    }
-
-    #[test]
     fn equivalent_new_session_without_a_watcher_does_not_require_exclusive_use() {
-        let mut fixture = HeldConfigureTail::start("view_load");
+        let mut fixture = HeldConfigureTail::start("process_flags");
         fixture.ctx.stop_watcher_runtime();
         let generation = fixture.ctx.configure_generation();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -23873,7 +21967,7 @@ mod tests {
     /// reconfigures once the tail steps aside.
     #[test]
     fn config_changing_bind_waits_for_the_held_tail_before_reconfiguring() {
-        let mut fixture = HeldConfigureTail::start("view_load");
+        let mut fixture = HeldConfigureTail::start("process_flags");
         let generation = fixture.ctx.configure_generation();
 
         let request = fixture.bind_request(1, "pi");
@@ -23895,7 +21989,7 @@ mod tests {
         assert!(
             blockers
                 .iter()
-                .any(|blocker| blocker.starts_with("configure_tail_stage(stage=view_load,")),
+                .any(|blocker| blocker.starts_with("configure_tail_stage(stage=process_flags,")),
             "{blockers:?}"
         );
         let response = bind.blocking_recv().expect("bind completion");
@@ -23920,8 +22014,8 @@ mod tests {
             drr_quantum: 1,
         }));
         let unrelated = ConfiguredRoot::new(&executor);
-        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
-        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
+        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "process_flags");
+        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "process_flags");
 
         // Fill what is left of the general pool with long reads elsewhere.
         let busy_dir = tempfile::tempdir().unwrap();
@@ -24042,8 +22136,8 @@ mod tests {
             heavy_permits: 2,
             drr_quantum: 1,
         }));
-        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
-        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
+        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "process_flags");
+        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "process_flags");
         let generation_a = held_a.ctx.configure_generation();
 
         let mut rebind_a = held_a.submit_bind(held_a.bind_request(1, "pi"));
@@ -24143,7 +22237,7 @@ mod tests {
     /// the tail would cancel the job and forget the session after the ack.
     #[test]
     fn rebind_of_a_quiesced_root_keeps_its_session_despite_the_running_tail() {
-        let mut fixture = HeldConfigureTail::start("view_load");
+        let mut fixture = HeldConfigureTail::start("process_flags");
         fixture.ctx.mark_subc_unbound();
 
         let request = fixture.bind_request(1, "opencode");
@@ -24527,7 +22621,6 @@ mod compile_fence_tests {
     fn subc_delay_and_ttl_hooks_require_explicit_test_hooks() {
         let source = compact(include_str!("mod.rs"));
         assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]{ifletOk(raw)=std::env::var(\"AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS\")"));
-        assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]ifletOk(delay)=std::env::var(\"AFT_TEST_EXIT_INDEX_DELAY_MS\")"));
         let source = compact(include_str!("../subc_config.rs"));
         assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]ifletSome(delay_ms)=std::env::var(\"AFT_TEST_SUBC_CONFIG_READ_DELAY_MS\")"));
     }

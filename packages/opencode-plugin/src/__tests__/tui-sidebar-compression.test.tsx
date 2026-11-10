@@ -222,22 +222,17 @@ describe("collapsedHealthLights (collapsed Code Health traffic lights)", () => {
   const bar = (overrides = {}) => ({
     errors: 0,
     warnings: 0,
-    dead_code: 0,
-    unused_exports: 0,
-    duplicates: 0,
     todos: 0,
-    tier2_stale: false,
     ...overrides,
   });
 
-  test("returns null when status bar is undefined (Tier-2 not populated)", () => {
+  test("returns null when status bar is undefined (not populated yet)", () => {
     expect(collapsedHealthLights(undefined)).toBeNull();
   });
 
   test("all green on a fully proven clean bar", () => {
     expect(collapsedHealthLights(bar())).toEqual({
       diagnostics: "ok",
-      code: "ok",
       todos: "ok",
     });
   });
@@ -245,7 +240,6 @@ describe("collapsedHealthLights (collapsed Code Health traffic lights)", () => {
   test("missing categories stay muted instead of appearing clean", () => {
     expect(collapsedHealthLights({ errors: 0 })).toEqual({
       diagnostics: "muted",
-      code: "muted",
       todos: "muted",
     });
   });
@@ -256,15 +250,6 @@ describe("collapsedHealthLights (collapsed Code Health traffic lights)", () => {
 
   test("diagnostics light: yellow on warnings only", () => {
     expect(collapsedHealthLights(bar({ warnings: 3 }))?.diagnostics).toBe("warn");
-  });
-
-  test("code light: yellow when duplicates are non-zero", () => {
-    expect(collapsedHealthLights(bar({ duplicates: 1167 }))?.code).toBe("warn");
-  });
-
-  test("code light: dead_code / unused_exports drive the light", () => {
-    expect(collapsedHealthLights(bar({ dead_code: 999 }))?.code).toBe("warn");
-    expect(collapsedHealthLights(bar({ unused_exports: 999 }))?.code).toBe("warn");
   });
 
   test("todos light: yellow when any todos, green otherwise", () => {

@@ -10,6 +10,7 @@ use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
     MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND, UNRESOLVED_CALL_SITE_COUNT_LIMIT,
 };
+use crate::commands::callgraph_roots::{RootKind, RootTally, Roots};
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
@@ -240,6 +241,10 @@ pub struct StoreImpactResult {
     pub hidden_test_callers: usize,
     pub affected_files: usize,
     pub callers: Vec<StoreImpactCaller>,
+    /// Distinct roots among the affected callers (test callers only when
+    /// tests are included), per kind.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub root_counts: BTreeMap<RootKind, usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub_summary: Option<StoreHubSummary>,
     pub depth_limited: bool,
@@ -259,7 +264,13 @@ pub struct StoreImpactCaller {
     pub line: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    pub is_entry_point: bool,
+    /// The caller's kind when it is a root: nothing in the repository
+    /// calls it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<RootKind>,
+    /// The entry attribute of a root of kind `attribute`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribute: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_expression: Option<String>,
     pub parameters: Vec<String>,
@@ -276,15 +287,25 @@ pub struct StoreTraceHop {
     pub line: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    pub is_entry_point: bool,
+    /// Whether the function is exported. An exported function a caller
+    /// reaches stays inside the path; only a root ends it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub exported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approximate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
 }
 
+/// One path of callers, from its root (the first hop, which nothing in the
+/// repository calls) to the traced symbol (the last hop).
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreTracePath {
+    /// The first hop's kind as a root.
+    pub root: RootKind,
+    /// The first hop's entry attribute, for a root of kind `attribute`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribute: Option<String>,
     pub hops: Vec<StoreTraceHop>,
 }
 
@@ -298,8 +319,13 @@ pub struct StoreTraceToResult {
     pub total_paths_is_lower_bound: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub_summary: Option<StoreHubSummary>,
-    pub entry_points_found: usize,
+    /// Distinct roots of every path found (test paths only when tests are
+    /// included), per kind.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub root_counts: BTreeMap<RootKind, usize>,
     pub max_depth_reached: bool,
+    /// Paths the trace stopped before a root: at the depth limit, or where
+    /// every caller was already on the path.
     pub truncated_paths: usize,
 }
 
@@ -398,6 +424,8 @@ struct ResolvedStoreSymbol {
 struct TraceElem {
     node: StoreNode,
     edge: EdgeMarker,
+    /// The test fact of the call site that reached this node, if any.
+    caller_is_test: Option<bool>,
 }
 
 fn edge_marker(site: &StoreCallSite) -> EdgeMarker {
@@ -519,10 +547,6 @@ fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<Strin
     })
 }
 
-fn trace_path_starts_in_test(path: &StoreTracePath) -> bool {
-    path.hops.first().is_some_and(|hop| is_test_file(&hop.file))
-}
-
 fn dedup_sites_for_summary(sites: Vec<StoreCallSite>) -> Vec<StoreCallSite> {
     let mut seen = BTreeSet::new();
     sites
@@ -546,38 +570,63 @@ fn dedup_paths_for_summary(paths: Vec<StoreTracePath>) -> Vec<StoreTracePath> {
         .collect()
 }
 
+/// Paths by root kind (programs' starts first), then root symbol and file,
+/// then length, then the hops themselves, so the order never depends on how
+/// the walk met them.
 fn trace_path_order(left: &StoreTracePath, right: &StoreTracePath) -> std::cmp::Ordering {
-    let left_entry = left
-        .hops
-        .first()
-        .map(|hop| hop.symbol.as_str())
-        .unwrap_or("");
-    let right_entry = right
-        .hops
-        .first()
-        .map(|hop| hop.symbol.as_str())
-        .unwrap_or("");
-    left_entry
-        .cmp(right_entry)
+    fn root(path: &StoreTracePath) -> (&str, &str) {
+        path.hops
+            .first()
+            .map(|hop| (hop.symbol.as_str(), hop.file.as_str()))
+            .unwrap_or(("", ""))
+    }
+    fn hops(path: &StoreTracePath) -> impl Iterator<Item = (&str, &str, u32)> {
+        path.hops
+            .iter()
+            .map(|hop| (hop.file.as_str(), hop.symbol.as_str(), hop.line))
+    }
+    left.root
+        .cmp(&right.root)
+        .then_with(|| root(left).cmp(&root(right)))
         .then(left.hops.len().cmp(&right.hops.len()))
+        .then_with(|| hops(left).cmp(hops(right)))
 }
 
-fn store_trace_path(elems: &[TraceElem]) -> StoreTracePath {
+/// The path `elems` walked, from its root (the last element) to the traced
+/// symbol, with the root's kind.
+fn store_trace_path(elems: &[TraceElem], root: RootKind) -> StoreTracePath {
     let hops = elems
         .iter()
         .rev()
-        .enumerate()
-        .map(|(index, elem)| StoreTraceHop {
+        .map(|elem| StoreTraceHop {
             symbol: elem.node.symbol.clone(),
             file: elem.node.file.clone(),
             line: elem.node.line,
             signature: elem.node.signature.clone(),
-            is_entry_point: index == 0 && elem.node.is_entry_point,
+            exported: elem.node.exported || elem.node.entry.default_export,
             approximate: elem.edge.approximate,
             resolved_by: elem.edge.resolved_by.clone(),
         })
         .collect();
-    StoreTracePath { hops }
+    let attribute = (root == RootKind::Attribute)
+        .then(|| {
+            elems
+                .last()
+                .and_then(|elem| elem.node.entry.entry_attribute.clone())
+        })
+        .flatten();
+    StoreTracePath {
+        root,
+        attribute,
+        hops,
+    }
+}
+
+/// Whether `site` is `node` calling itself. A function's calls to itself
+/// do not make it reachable from anywhere else, so they do not keep it
+/// from being a root.
+fn calls_itself(site: &StoreCallSite, node: &StoreNode) -> bool {
+    site.caller.file == node.file && site.caller.symbol == node.symbol
 }
 
 fn retain_trace_path(retained: &mut Vec<StoreTracePath>, path: StoreTracePath) {
@@ -635,7 +684,7 @@ pub fn callers_result(
         &mut sites,
         &mut boundary,
     )?;
-    let (depth_limited, truncated) = omitted_boundary_callers(store, boundary, &visited)?;
+    let (depth_limited, truncated, _) = omitted_boundary_callers(store, boundary, &visited)?;
 
     let mut sites = dedup_call_sites(sites);
     sites.sort_by(|left, right| {
@@ -985,7 +1034,8 @@ pub fn impact_result(
         &mut sites,
         &mut boundary,
     )?;
-    let (depth_limited, truncated) = omitted_boundary_callers(store, boundary, &visited)?;
+    let (depth_limited, truncated, boundary_counts) =
+        omitted_boundary_callers(store, boundary, &visited)?;
 
     let mut sites = dedup_call_sites(sites);
     sites.sort_by(|left, right| {
@@ -1010,6 +1060,32 @@ pub fn impact_result(
         .iter()
         .filter(|site| site.kind == "callback_ref")
         .count();
+
+    // Which affected callers are roots: nothing calls them, by the edges
+    // this answer lists (calls and callback references). A caller whose own
+    // callers were fetched is a root when the only ones are itself; one at
+    // the depth limit has only a count of its callers, which cannot tell
+    // calls to itself apart, so it is a root when that count is zero.
+    let mut roots = Roots::new(store.project_root());
+    let mut root_kinds: HashMap<(String, String), Option<RootKind>> = HashMap::new();
+    let mut root_tally = RootTally::default();
+    for site in &visible_sites {
+        let key = (site.caller.file.clone(), site.caller.symbol.clone());
+        if root_kinds.contains_key(&key) {
+            continue;
+        }
+        let is_root = match callers_by_symbol.get(&key) {
+            Some(callers) => callers
+                .iter()
+                .all(|caller| calls_itself(caller, &site.caller)),
+            None => boundary_counts.get(&key) == Some(&0),
+        };
+        let kind = is_root.then(|| roots.kind(&site.caller, site.caller_is_test));
+        if let Some(kind) = kind {
+            root_tally.add(kind, &site.caller);
+        }
+        root_kinds.insert(key, kind);
+    }
 
     let summarize = hub_selector_activated(post_filter_count);
     let affected_files = visible_sites
@@ -1082,13 +1158,20 @@ pub fn impact_result(
     for site in visible_sites {
         let lines = source_lines.get(&site.caller.file).and_then(Option::as_ref);
         let stale = stale_files.contains(&site.caller.file);
+        let root = root_kinds
+            .get(&(site.caller.file.clone(), site.caller.symbol.clone()))
+            .copied()
+            .flatten();
         callers.push(StoreImpactCaller {
             relation: (site.kind == "callback_ref").then_some("callback_reference"),
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
             line: site.line,
             signature: site.caller.signature.clone(),
-            is_entry_point: site.caller.is_entry_point,
+            root,
+            attribute: (root == Some(RootKind::Attribute))
+                .then(|| site.caller.entry.entry_attribute.clone())
+                .flatten(),
             call_expression: lines
                 .and_then(|lines| lines.get(&(site.line.saturating_sub(1) as usize)))
                 .cloned(),
@@ -1130,6 +1213,7 @@ pub fn impact_result(
         hidden_test_callers: if include_tests { 0 } else { hidden_tests },
         affected_files,
         callers,
+        root_counts: root_tally.counts(),
         hub_summary,
         depth_limited,
         truncated,
@@ -1166,6 +1250,13 @@ pub fn trace_to_result(
     .map(|(result, _)| result)
 }
 
+/// Follows callers from the symbol until each path reaches a root (a
+/// function no caller in the repository calls), the depth limit, or a
+/// function whose callers are all already on the path. Every path that
+/// reaches a root is a complete path, labelled with the root's kind; an
+/// exported function a caller reaches stays inside the path. The walk stops
+/// after `expansion_budget` paths have been extended, and then reports its
+/// counts as lower bounds.
 fn trace_to_result_with_budget(
     store: &impl CallGraphRead,
     file: &Path,
@@ -1176,25 +1267,17 @@ fn trace_to_result_with_budget(
 ) -> StoreAdapterResult<(StoreTraceToResult, usize)> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_max = if max_depth == 0 { 10 } else { max_depth };
+    let mut roots = Roots::new(store.project_root());
+    let mut root_tally = RootTally::default();
 
     let initial = vec![TraceElem {
         node: target.representative.clone(),
         edge: EdgeMarker::default(),
+        caller_is_test: None,
     }];
     let mut retained_paths = Vec::new();
     let mut total_paths = 0usize;
     let mut hidden_tests = 0usize;
-    if target.representative.is_entry_point {
-        total_paths = 1;
-        let path = store_trace_path(&initial);
-        if trace_path_starts_in_test(&path) {
-            hidden_tests = 1;
-        }
-        if include_tests || hidden_tests == 0 {
-            retain_trace_path(&mut retained_paths, path);
-        }
-    }
-
     let mut queue = vec![(initial, 0usize)];
     let mut max_depth_reached = false;
     let mut truncated_paths = 0usize;
@@ -1209,10 +1292,6 @@ fn trace_to_result_with_budget(
             break;
         }
         expansions += 1;
-        if depth >= effective_max {
-            max_depth_reached = true;
-            continue;
-        }
         let Some(current) = path.last() else {
             continue;
         };
@@ -1239,10 +1318,24 @@ fn trace_to_result_with_budget(
         let callers = callers_by_symbol
             .get(&caller_key)
             .expect("trace caller cache populated above");
-        if callers.is_empty() {
-            if path.len() > 1 {
-                truncated_paths += 1;
+        // A root ends the path, at the depth limit too: its callers were
+        // fetched with the rest of the frontier.
+        if callers.iter().all(|site| calls_itself(site, &current.node)) {
+            let root = roots.kind(&current.node, current.caller_is_test);
+            total_paths = total_paths.saturating_add(1);
+            let from_test = root == RootKind::Test;
+            if from_test {
+                hidden_tests = hidden_tests.saturating_add(1);
             }
+            if include_tests || !from_test {
+                root_tally.add(root, &current.node);
+                retain_trace_path(&mut retained_paths, store_trace_path(&path, root));
+            }
+            continue;
+        }
+        if depth >= effective_max {
+            max_depth_reached = true;
+            truncated_paths += 1;
             continue;
         }
 
@@ -1256,38 +1349,29 @@ fn trace_to_result_with_budget(
             has_new_path = true;
             let mut next_path = path.clone();
             if let Some(current) = next_path.last_mut() {
-                current.edge = edge_marker(&site);
+                current.edge = edge_marker(site);
             }
             next_path.push(TraceElem {
                 node: site.caller.clone(),
                 edge: EdgeMarker::default(),
+                caller_is_test: site.caller_is_test,
             });
-            if site.caller.is_entry_point {
-                total_paths = total_paths.saturating_add(1);
-                let completed = store_trace_path(&next_path);
-                let from_test = trace_path_starts_in_test(&completed);
-                if from_test {
-                    hidden_tests = hidden_tests.saturating_add(1);
-                }
-                if include_tests || !from_test {
-                    retain_trace_path(&mut retained_paths, completed);
-                }
-            }
             // Reserve at most one future expansion slot per queued path. This
             // bounds queue memory as well as the number of paths actually popped.
             if expansions.saturating_add(queue.len()) >= expansion_budget {
                 budget_exhausted = true;
                 break 'traversal;
             }
-            if depth + 1 < effective_max {
-                let key = trace_endpoint_key(&site.caller);
-                if !callers_by_symbol.contains_key(&key) {
-                    pending_endpoints.insert(key);
-                }
+            // Callers at the depth limit are fetched too, to tell a root
+            // there from a path the limit cuts.
+            let key = trace_endpoint_key(&site.caller);
+            if !callers_by_symbol.contains_key(&key) {
+                pending_endpoints.insert(key);
             }
             queue.push((next_path, depth + 1));
         }
-        if !has_new_path && path.len() > 1 {
+        if !has_new_path {
+            // Every caller is already on the path: a cycle.
             truncated_paths += 1;
         }
     }
@@ -1314,14 +1398,6 @@ fn trace_to_result_with_budget(
         None
     };
 
-    let entry_points_found = paths
-        .iter()
-        .filter_map(|path| path.hops.first())
-        .filter(|hop| hop.is_entry_point)
-        .map(|hop| (hop.file.clone(), hop.symbol.clone()))
-        .collect::<HashSet<_>>()
-        .len();
-
     Ok((
         StoreTraceToResult {
             target_symbol: target.representative.symbol,
@@ -1330,7 +1406,7 @@ fn trace_to_result_with_budget(
             total_paths_is_lower_bound: budget_exhausted,
             hub_summary,
             paths,
-            entry_points_found,
+            root_counts: root_tally.counts(),
             max_depth_reached,
             truncated_paths,
         },
@@ -1413,9 +1489,14 @@ pub fn trace_to_symbol_result(
             let Some((current_file, current_symbol, path, depth)) = queue.pop_front() else {
                 break;
             };
-            let calls = calls_by_symbol
-                .remove(&(current_file, current_symbol))
+            let mut calls = calls_by_symbol
+                .remove(&(current_file.clone(), current_symbol.clone()))
                 .unwrap_or_default();
+            if current_symbol.ends_with('!') {
+                for node in store.nodes_for_stored(&current_file, &current_symbol)? {
+                    calls.extend(macro_template_calls(store, &node)?.0);
+                }
+            }
             let callees = forward_resolved_callees(calls);
 
             if depth >= effective_max {
@@ -2348,7 +2429,7 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
         CallGraphStoreError::Unavailable(message) => Response::error(
             req_id,
             "callgraph_unavailable",
-            format!("{operation}: persisted callgraph store unavailable: {message}"),
+            format!("{operation}: callgraph store unavailable: {message}"),
         ),
         CallGraphStoreError::StaleFiles(files) => Response::error(
             req_id,
@@ -2366,21 +2447,14 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
     }
 }
 
-/// Do not turn missing coverage into a claim that a source symbol is absent.
-/// Check the generation's file inventory before any graph or parser lookup.
-pub fn ensure_target_indexed(
+/// The refusal for a target file the call graph does not cover, naming
+/// whether the project's ignore rules exclude it.
+pub fn not_indexed_response(
     req_id: &str,
     operation: &str,
     ctx: &AppContext,
-    store: &crate::callgraph_store::ReadonlyCallGraphStore,
-    file: &Path,
-) -> Result<(), Response> {
-    match store.is_file_indexed(file) {
-        Ok(true) => return Ok(()),
-        Err(error) => return Err(store_error_response(req_id, operation, error)),
-        Ok(false) => {}
-    }
-    let path = absolute_file(store, file);
+    path: &Path,
+) -> Response {
     let ignored = ctx.gitignore().is_some_and(|matcher| {
         matcher
             .matched_path_or_any_parents(&path, false)
@@ -2391,12 +2465,12 @@ pub fn ensure_target_indexed(
     } else {
         ("not_in_generation", "path is not part of this call graph generation (excluded, unsupported, or not yet indexed)")
     };
-    Err(Response::error_with_data(
+    Response::error_with_data(
         req_id,
         "not_indexed",
         format!("{operation}: not_indexed: {detail}: {}; use grep or aft_search with pattern to find references", path.display()),
         serde_json::json!({ "reason": reason, "file": path, "results": serde_json::Value::Null }),
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -2493,89 +2567,24 @@ pub fn index_refusal_response(
     ctx: &AppContext,
     access: &CallgraphStoreAccess,
 ) -> Response {
+    // Configure switches the call graph off for a home root, so the home-root
+    // cause must be named before the switch: telling the user to turn the
+    // index on would not help there.
+    if ctx.is_home_root() {
+        return home_root_disabled_response(req_id, operation);
+    }
     match access {
         CallgraphStoreAccess::Off => off_response(req_id, operation),
         CallgraphStoreAccess::Building => {
             note_callgraph_building(ctx, operation);
-            if let Some(view) = ctx.view_runtime_snapshot().filter(|view| {
-                view.pending_inputs
-                    .values()
-                    .any(|input| input.plane == "checkout")
-            }) {
-                let mut response = callgraph_index_refusal(
-                    req_id,
-                    "callgraph_building",
-                    format!("{operation}: call graph is waiting for working-tree verification and view publication; retry shortly"),
-                    IndexObservation::building(),
-                );
-                response.data["progress"] = serde_json::json!({
-                    "phase": "working_tree_refresh",
-                    "pending_paths": view.pending_paths.len(),
-                    "waiting_on": [{"plane": "checkout", "reason": "working-tree verification and view publication"}],
-                });
-                return response;
-            }
-            if ctx.config().views.enabled && ctx.is_worktree_bridge() {
-                let view = ctx.view_runtime_snapshot();
-                // Semantic fill is independent of callgraph publication. Only
-                // report inputs that can actually prevent this graph's publish.
-                let waiting_on = view.as_ref().map_or_else(Vec::new, |view| {
-                    view.pending_inputs
-                        .iter()
-                        .filter(|(_, input)| input.plane != "semantic")
-                        .map(|(path, input)| {
-                            serde_json::json!({
-                                "path": String::from_utf8_lossy(path),
-                                "plane": input.plane,
-                                "reason": input.reason,
-                                "blob_key": input.blob_key,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                });
-                let waiting_details = waiting_on
-                    .iter()
-                    .map(|input| {
-                        format!(
-                            "{} [{}: {}]",
-                            input["path"].as_str().unwrap_or_default(),
-                            input["plane"].as_str().unwrap_or_default(),
-                            input["reason"].as_str().unwrap_or_default(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let message = if waiting_on.is_empty() {
-                    format!("{operation}: call graph for this worktree is assembling; retry shortly; use grep or aft_search with pattern meanwhile")
-                } else if waiting_on.iter().any(|input| input["plane"] == "callgraph") {
-                    format!("{operation}: call graph for this worktree is waiting for shared blobs: {waiting_details}; full blob keys are in progress.waiting_on; an artifact writer must publish the missing blobs; retry after the inputs are available; use grep or aft_search with pattern meanwhile")
-                } else {
-                    format!("{operation}: call graph for this worktree is waiting for publication inputs: {waiting_details}; retry after the inputs are available; use grep or aft_search with pattern meanwhile")
-                };
-                let mut response = callgraph_index_refusal(
-                    req_id,
-                    "callgraph_building",
-                    message,
-                    IndexObservation::building(),
-                );
-                // Report the local view's phase and known pending count without
-                // opening a store or enumerating checkout files on the query.
-                response.data["progress"] = serde_json::json!({
-                    "phase": if view.is_some() { "view_assembly" } else { "configure_maintenance" },
-                    "pending_paths": view.as_ref().map(|view| if view.pending_inputs.is_empty() { view.pending_paths.len() } else { waiting_on.len() }),
-                    "waiting_on": waiting_on,
-                });
-                response
-            } else {
-                building_response(req_id, operation)
-            }
+            building_response(req_id, operation)
         }
         CallgraphStoreAccess::Suspended(suspension) => {
             suspended_response(req_id, operation, suspension)
         }
-        CallgraphStoreAccess::Unavailable
-        | CallgraphStoreAccess::Ready(_)
-        | CallgraphStoreAccess::Error(_) => unavailable_for(req_id, operation, ctx),
+        CallgraphStoreAccess::Unavailable | CallgraphStoreAccess::Error(_) => {
+            unavailable_for(req_id, operation, ctx)
+        }
     }
 }
 
@@ -2807,21 +2816,20 @@ fn prefetch_callers(
 
 /// Count callers omitted beyond the depth boundary once per symbol. A symbol
 /// expanded through a shorter path has already contributed its callers.
+/// Also returns each counted boundary symbol's own count.
 fn omitted_boundary_callers(
     store: &impl CallGraphRead,
     mut boundary: BTreeSet<(String, String)>,
     expanded: &HashMap<(String, String), usize>,
-) -> StoreAdapterResult<(bool, usize)> {
+) -> StoreAdapterResult<(bool, usize, HashMap<(String, String), usize>)> {
     boundary.retain(|key| !expanded.contains_key(key));
     if boundary.is_empty() {
-        return Ok((false, 0));
+        return Ok((false, 0, HashMap::new()));
     }
     let boundary = boundary.into_iter().collect::<Vec<_>>();
-    let omitted = store
-        .direct_caller_counts_of(&boundary)?
-        .into_values()
-        .fold(0usize, usize::saturating_add);
-    Ok((omitted > 0, omitted))
+    let counts = store.direct_caller_counts_of(&boundary)?;
+    let omitted = counts.values().copied().fold(0usize, usize::saturating_add);
+    Ok((omitted > 0, omitted, counts))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3074,6 +3082,9 @@ fn forward_calls_for_nodes(
                 .into_iter()
                 .map(ForwardCall::Unresolved),
         );
+        let (resolved, unresolved) = macro_template_calls(store, node)?;
+        calls.extend(resolved.into_iter().map(ForwardCall::Resolved));
+        calls.extend(unresolved.into_iter().map(ForwardCall::Unresolved));
     }
     calls.sort_by(|left, right| {
         left.byte_start()
@@ -3083,6 +3094,51 @@ fn forward_calls_for_nodes(
     let mut seen = BTreeSet::new();
     calls.retain(|call| seen.insert(call.call_site_key()));
     Ok(calls)
+}
+
+/// The calls written inside the `macro_rules!` template of `node`, when it
+/// is a macro owner (`name!`), split into those matched to a symbol and those
+/// left unresolved. They are matched by name only, as `callers` lists them
+/// (see [`macro_via_entries`]), so each match is marked name-resolved. A name
+/// that several symbols share stays unresolved, because nothing tells which
+/// of them the template calls.
+fn macro_template_calls(
+    store: &impl CallGraphRead,
+    node: &StoreNode,
+) -> StoreAdapterResult<(Vec<StoreCallSite>, Vec<StoreUnresolvedCall>)> {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    if !node.symbol.ends_with('!') {
+        return Ok((resolved, unresolved));
+    }
+    for call in store.macro_template_calls_of(node)? {
+        let mut candidates = store
+            .nodes_matching(&call.symbol)?
+            .into_iter()
+            .filter(|candidate| candidate.name == call.symbol)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| (&a.file, &a.symbol).cmp(&(&b.file, &b.symbol)));
+        candidates.dedup_by(|a, b| a.file == b.file && a.symbol == b.symbol);
+        if candidates.len() != 1 {
+            unresolved.push(call);
+            continue;
+        }
+        let target = candidates.remove(0);
+        resolved.push(StoreCallSite {
+            kind: MACRO_BODY_CALL_REF_KIND.to_string(),
+            caller_is_test: None,
+            caller: node.clone(),
+            target_file: target.file.clone(),
+            target_symbol: target.symbol.clone(),
+            target: Some(target),
+            line: call.line,
+            byte_start: call.byte_start,
+            byte_end: call.byte_end,
+            resolved: true,
+            provenance: crate::callgraph_store::PROVENANCE_NAME_MATCH.to_string(),
+        });
+    }
+    Ok((resolved, unresolved))
 }
 
 fn forward_resolved_callees(calls: Vec<StoreCallSite>) -> Vec<(StoreNode, EdgeMarker)> {
@@ -3178,27 +3234,37 @@ fn content_matches_store(
     Ok(
         stored == crate::cache_freshness::zero_hash().to_hex().as_str()
             || stored == current.to_hex().as_str()
-            || stored == view_blob_key(file, current).unwrap_or_default(),
+            || data_layer_record_keys(file, current).contains(&stored),
     )
 }
 
-/// A view-materialized graph records each file's call-graph blob key rather
-/// than its raw content hash. The key is derived from the content hash, the
-/// file's language and the extractor version, so the current bytes match
-/// exactly when they derive the stored key.
-fn view_blob_key(file: &str, current: blake3::Hash) -> Option<String> {
-    let language = if crate::views::assembly::is_resolution_input(file.as_bytes()) {
-        "config".to_owned()
+/// The data layer's call graph records each file's content-record key, which
+/// is derived from the file's content key (the first 128 bits of the BLAKE3
+/// hash of its bytes), the language it was parsed as and the extractor
+/// version, so the current bytes match exactly when they derive the stored
+/// key. A `.h` header's language comes from parsing its bytes, so a key is
+/// derived for each language it can be parsed as: any of them matching still
+/// proves the record was extracted from these bytes.
+fn data_layer_record_keys(file: &str, current: blake3::Hash) -> Vec<String> {
+    use crate::data_layer::content::{language_for, EXTRACTOR_VERSION};
+    let content =
+        aft_store::ids::ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&current));
+    let languages = if Path::new(file)
+        .extension()
+        .is_some_and(|extension| extension == "h")
+    {
+        vec!["c".to_string(), "cpp".to_string(), "objc".to_string()]
     } else {
-        format!("{:?}", crate::parser::detect_language(Path::new(file))?).to_lowercase()
+        language_for(file, &[]).into_iter().collect()
     };
-    let key = crate::blob_store::CallgraphKey::from_source_digest(
-        *current.as_bytes(),
-        language,
-        crate::views::callgraph::PRODUCER,
-    )
-    .full_key();
-    Some(crate::blob_store::v2::FamilyKey::from(&key).to_hex())
+    languages
+        .iter()
+        .map(|language| {
+            aft_store::content::RecordKey::new(content, language, EXTRACTOR_VERSION)
+                .digest()
+                .to_string()
+        })
+        .collect()
 }
 
 fn file_matches_store(
@@ -3929,7 +3995,9 @@ mod trace_to_tests {
             1_000,
         )
         .unwrap();
-        assert_eq!(result.total_paths, 1);
+        // Every uncalled wide caller is a root, and so is the end of the
+        // deep chain.
+        assert_eq!(result.total_paths, 200);
         TRACE_ENDPOINT_READS.with(|count| {
             assert!(
                 count.get() <= expansions * 2 + 1,
@@ -4069,7 +4137,7 @@ mod trace_to_tests {
             .expect("impact result");
         assert_eq!(
             serde_json::to_string(&impact).unwrap(),
-            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":5,"hidden_test_callers":1,"affected_files":3,"callers":[{"caller_symbol":"alpha","caller_file":"alpha.ts","line":2,"is_entry_point":false,"parameters":[]},{"caller_symbol":"beta","caller_file":"beta.ts","line":3,"is_entry_point":false,"parameters":[]},{"caller_symbol":"shared","caller_file":"shared.ts","line":4,"is_entry_point":false,"parameters":[]},{"caller_symbol":"shared","caller_file":"shared.ts","line":4,"is_entry_point":false,"parameters":[]}],"depth_limited":true,"truncated":3,"sites_list_envelope":{"shown":4,"total":{"kind":"at_least","value":4},"unit":"sites","reason":"depth","causes":["depth"],"narrow":["depth","includeTests"]}}"#
+            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":5,"hidden_test_callers":1,"affected_files":3,"callers":[{"caller_symbol":"alpha","caller_file":"alpha.ts","line":2,"parameters":[]},{"caller_symbol":"beta","caller_file":"beta.ts","line":3,"parameters":[]},{"caller_symbol":"shared","caller_file":"shared.ts","line":4,"parameters":[]},{"caller_symbol":"shared","caller_file":"shared.ts","line":4,"parameters":[]}],"depth_limited":true,"truncated":3,"sites_list_envelope":{"shown":4,"total":{"kind":"at_least","value":4},"unit":"sites","reason":"depth","causes":["depth"],"narrow":["depth","includeTests"]}}"#
         );
     }
 
@@ -4188,7 +4256,7 @@ mod trace_to_tests {
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(
             serde_json::to_string(&impact).expect("serialize impact result"),
-            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"is_entry_point":false,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":2,"sites_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"sites","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#
+            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":2,"sites_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"sites","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#
         );
     }
 
@@ -4323,7 +4391,8 @@ mod trace_to_tests {
         assert!(summary.counts_are_lower_bounds);
         assert!(summary.message.contains("at least"));
         for path in result.paths {
-            assert!(path.hops.first().is_some_and(|hop| hop.is_entry_point));
+            // The fixture's outermost layer is exported and uncalled.
+            assert_eq!(path.root, RootKind::PublicApi);
             assert_eq!(
                 path.hops.last().map(|hop| hop.symbol.as_str()),
                 Some("target")
@@ -4355,7 +4424,7 @@ mod trace_to_tests {
 
         assert_eq!(
             serde_json::to_string(&result).expect("serialize trace result"),
-            r#"{"target_symbol":"target","target_file":"target.ts","paths":[{"hops":[{"symbol":"entry","file":"entry.ts","line":1,"is_entry_point":true},{"symbol":"middle","file":"middle.ts","line":1,"is_entry_point":false},{"symbol":"target","file":"target.ts","line":1,"is_entry_point":false}]}],"total_paths":1,"entry_points_found":1,"max_depth_reached":false,"truncated_paths":1}"#
+            r#"{"target_symbol":"target","target_file":"target.ts","paths":[{"root":"public_api","hops":[{"symbol":"entry","file":"entry.ts","line":1,"exported":true},{"symbol":"middle","file":"middle.ts","line":1},{"symbol":"target","file":"target.ts","line":1}]}],"total_paths":1,"root_counts":{"public_api":1},"max_depth_reached":false,"truncated_paths":0}"#
         );
     }
 }
@@ -4363,12 +4432,3 @@ mod trace_to_tests {
 #[cfg(test)]
 #[path = "callgraph_regression_tests.rs"]
 mod callgraph_regression_tests;
-
-#[cfg(test)]
-pub(crate) fn store_diet_trace_data_origin(
-    file: &Path,
-    symbol: &str,
-    cache: &SharedSymbolCache,
-) -> bool {
-    resolve_symbol_query_with_cache(file, symbol, cache).is_ok()
-}

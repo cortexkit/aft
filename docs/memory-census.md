@@ -128,10 +128,59 @@ evicts a root, it also releases the root's semantic view: the arena drops the
 runs no other view of the family still reads, and the root's next semantic
 query reports that semantic search is reloading until the view is loaded again.
 
+With the data layer on, each root's checkout in it is counted in the planes
+that read it: the text plane's bytes in `planes.search`, the call graph's in
+`planes.callgraph`, and meaning search's in `planes.semantic`, each also named
+`data_layer_bytes` in that plane's detail. `planes.data_layer` is what those
+planes share: the checkout state lists (the publication's, the current one
+while edits are recorded, and the ones the call graph's engine and its last
+refresh resolved over), each edited path's record, and the publication's open
+segments and snapshot. Until the older index stores (the trigram search
+index, the semantic index and the call-graph store) are removed, a plane adds
+what its older store holds to what the data layer holds for it, since both
+hold memory. The row's `data_layer` object itemises
+the figures (`search_bytes`, `callgraph_bytes` with `callgraph_engine_bytes`
+among them, `semantic_bytes`, `text_overlay_bytes`) and the counts behind them;
+the first three are already in their planes, not more to add. What each part
+holds:
+
+- text: the publication's per-path text membership and section handles, each
+  published path's memoised text-index status, the overlay of edited contents'
+  trigrams, and the text members trigram lookups share;
+- call graph: the publication's stored slices with every slice decoded so far,
+  the graph served with the files resolved since laid over it, the last
+  refresh's parses and resolutions, the dead-code snapshot (unless
+  `aft_inspect`'s projection holds the same one: `planes.callgraph_projection`
+  counts it then), edited files' parses, and the incremental engine's decoded
+  parses and resolutions, bound files and the inputs of each pass;
+- meaning: the vector generation the plane loaded (its snapshot, the index of
+  every vector's text digest, each chunk map's holder, the segments it opened)
+  and the members of the view it searched last. The vectors themselves are
+  read through the block cache, and a local embedding model is counted once
+  for the process with the embedding sessions.
+
+The block cache every checkout reads through is shared, so it is counted once,
+in `process.data_layer_block_cache_bytes` (with `data_layer_block_cache`:
+`resident_bytes` of block data within `budget_bytes`, block and hit counts);
+its figure is the cached blocks plus the cache's lookup tables.
+
+Every data-layer figure is measured, not estimated from counts: the census
+walks the live structures and adds up what each part owns on the heap, from
+the containers' own lengths and capacities (a string or vector its capacity
+times its element size; a hash map the table its capacity allocates; a shared
+allocation once however many places hold it). Two limits are stated rather
+than guessed around: a B-tree map is counted as full nodes, because the
+standard library does not say how full its nodes are, so its figure is a lower
+bound; and the allocator's own bookkeeping is not counted. The walk never
+waits for a lock: a part another thread holds is left out, counted as
+`locked_parts`, and named in `not_estimated`, which makes the figure
+`partial`. When the idle reaper releases a root's checkout, its next census
+reports `bound_checkouts: 0` and no data-layer bytes.
+
 `evictable_in_ms` is null while a root has a bound
 route, and otherwise is the configured root idle TTL minus its request age
-(clamped at zero). `evictable_bytes` is the artifact, symbol, and inspect data
-released by the idle reaper, not a second estimate.
+(clamped at zero). `evictable_bytes` is the artifact, symbol, inspect and
+data-layer checkout data released by the idle reaper, not a second estimate.
 
 `allocator_slack_bytes` is address-space slack: allocator-mapped bytes minus
 bytes in use. It is not resident memory. Allocators return free pages to the OS

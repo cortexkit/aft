@@ -1,12 +1,10 @@
 use std::path::Path;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::{
-    index_refusal_response, note_callgraph_served, serialized_value, store_error_response,
-    trace_data_result,
+    note_callgraph_served, serialized_value, store_error_response, trace_data_result,
 };
 use crate::commands::trace_to::trace;
-use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_data` request.
@@ -30,15 +28,7 @@ use crate::protocol::{RawRequest, Response};
 /// - call graph not initialized (configure not called)
 /// - symbol not found in the file
 pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_trace_data(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Checkout,
-        BorrowedOp::TraceData,
-    );
-    response
+    answer_trace_data(req, ctx)
 }
 
 fn answer_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -110,37 +100,34 @@ fn answer_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let store = match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Error(error) => {
-            return store_error_response(&req.id, "trace_data", error)
-        }
-        other => return index_refusal_response(&req.id, "trace_data", ctx, &other),
-    };
-
-    if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
+    let (snapshot, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
         &req.id,
         "trace_data",
         ctx,
-        &store,
-        &file_path,
+        &[file_path.as_path()],
     ) {
-        return response;
-    }
-
-    // The pinned reader remains in scope until the snapshot answer is built.
-    let snapshot = match store.read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => return store_error_response(&req.id, "trace_data", error),
+        Ok(graph) => graph,
+        Err(response) => return response,
     };
-    match trace_data_result(
+    // With the data layer on, the file's symbols come from its stored
+    // record, when the file still holds that content, instead of a parse.
+    if let Some(view) = data_view.as_ref() {
+        crate::data_layer::outline::warm_file(view, &ctx.symbol_cache(), &file_path);
+    }
+    let outcome = trace_data_result(
         &snapshot,
         &file_path,
         symbol,
         expression,
         depth,
         ctx.symbol_cache(),
-    ) {
+    );
+    if let Some(response) =
+        crate::data_layer::tools::callgraph::failed_reads(&req.id, "trace_data", data_view.as_ref())
+    {
+        return response;
+    }
+    match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_data", 0, "ok");
             let envelope =

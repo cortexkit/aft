@@ -66,10 +66,30 @@ pub(crate) fn atomic_write_source(
     path: &Path,
     bytes: &[u8],
 ) -> std::io::Result<SourceWriteOutcome> {
+    let started = std::time::Instant::now();
+    let result = atomic_write_source_with(path, bytes, |file, bytes| {
+        use std::io::Write;
+        file.write_all(bytes)
+    });
+    crate::backup::latency::log_if_slow(
+        "write",
+        &crate::backup::latency::Part::WRITE,
+        started.elapsed(),
+        path,
+    );
+    result
+}
+
+/// [`atomic_write_source`] without its slow-write log line, so the
+/// `edit_latency_probe` example can read the write's split from
+/// [`crate::backup::latency::take`] afterwards. Not for production callers.
+#[doc(hidden)]
+pub fn write_source_for_probe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write_source_with(path, bytes, |file, bytes| {
         use std::io::Write;
         file.write_all(bytes)
     })
+    .map(|_| ())
 }
 
 fn atomic_write_source_with(
@@ -106,6 +126,7 @@ fn atomic_write_source_with(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let write_temp = crate::backup::latency::time(crate::backup::latency::Part::WriteTemp);
     let temporary = parent.join(format!(".aft-source-{}.tmp", random_suffix()?));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -154,8 +175,11 @@ fn atomic_write_source_with(
         // Writing can clear set-id bits; restore the exact original mode.
         file.set_permissions(metadata.permissions())?;
     }
+    drop(write_temp);
+    let write_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteSync);
     file.sync_all()
         .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
+    drop(write_sync);
     cleanup.file.take();
     #[cfg(windows)]
     if let Some(metadata) = original.as_ref() {
@@ -169,9 +193,13 @@ fn atomic_write_source_with(
         warnings.push("non_atomic_windows_write: atomic replacement is unavailable for this file; saved in place without removing its name. Concurrent readers may see incomplete contents.".to_owned());
         return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
     }
-    crate::fs_lock::rename_over(&temporary, &destination)?;
+    {
+        let _rename = crate::backup::latency::time(crate::backup::latency::Part::WriteRename);
+        crate::fs_lock::rename_over(&temporary, &destination)?;
+    }
     // The replacement has already committed; a directory sync failure cannot
     // be reported as a failed edit without implying the original still exists.
+    let _dir_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteDirSync);
     if let Ok(directory) = fs::File::open(parent) {
         let _ = directory.sync_all();
     }
@@ -1330,15 +1358,34 @@ pub(crate) fn auto_backup_observed(
     let _locks = mutation::lock_files(&[path]);
     observation.expected.check(path)?;
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
-    let mut store = ctx.backup().lock();
+    let started = std::time::Instant::now();
+    crate::backup::latency::take();
+    let mut store = {
+        let _wait = crate::backup::latency::time(crate::backup::latency::Part::StoreLock);
+        ctx.backup().lock()
+    };
     // Recheck after waiting for the backup store. Never replace the observed
     // baseline with a newer file: that would bless a stale edit's undo data.
     observation.expected.check(path)?;
-    if let Some(capture) = observation.capture.as_ref() {
+    let result = if let Some(capture) = observation.capture.as_ref() {
         store.snapshot_with_op_from_capture(session, path, description, op_id, capture)
     } else {
         store.snapshot_with_op(session, path, description, op_id)
-    }
+    };
+    drop(store);
+    log_slow_backup(started, path);
+    result
+}
+
+/// Log where a slow backup phase spent its time; see
+/// [`crate::backup::latency::log_if_slow`].
+fn log_slow_backup(started: std::time::Instant, path: &Path) {
+    crate::backup::latency::log_if_slow(
+        "backup",
+        &crate::backup::latency::Part::BACKUP,
+        started.elapsed(),
+        path,
+    );
 }
 
 pub(crate) struct ObservedFinalText {
@@ -1602,10 +1649,17 @@ pub fn auto_backup(
         return Ok(None);
     }
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
+    let started = std::time::Instant::now();
+    crate::backup::latency::take();
     let backup_id = {
-        let mut store = ctx.backup().lock();
-        store.snapshot_with_op(session, path, description, op_id)?
+        let mut store = {
+            let _wait = crate::backup::latency::time(crate::backup::latency::Part::StoreLock);
+            ctx.backup().lock()
+        };
+        store.snapshot_with_op(session, path, description, op_id)
     }; // borrow dropped here
+    log_slow_backup(started, path);
+    let backup_id = backup_id?;
     Ok(backup_id)
 }
 
@@ -1640,10 +1694,17 @@ pub(crate) fn auto_backup_from_capture(
     capture: &crate::backup::CapturedRegularFile,
 ) -> Result<Option<String>, AftError> {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
+    let started = std::time::Instant::now();
+    crate::backup::latency::take();
     let backup_id = {
-        let mut store = ctx.backup().lock();
-        store.snapshot_with_op_from_capture(session, path, description, op_id, capture)?
+        let mut store = {
+            let _wait = crate::backup::latency::time(crate::backup::latency::Part::StoreLock);
+            ctx.backup().lock()
+        };
+        store.snapshot_with_op_from_capture(session, path, description, op_id, capture)
     };
+    log_slow_backup(started, path);
+    let backup_id = backup_id?;
     Ok(backup_id)
 }
 
@@ -2171,7 +2232,7 @@ fn write_format_validate_impl(
         .as_deref()
         .and_then(|source| validate_captured_syntax(path, source));
 
-    let _view_intent = crate::views::intent::record_paths([path]);
+    let _view_intent = crate::write_intent::record_paths([path]);
     // Step 1: Write
     let write_phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Write);
     let mut write_warnings = atomic_write_source(path, content.as_bytes())

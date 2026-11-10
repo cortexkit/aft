@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,51 +27,11 @@ use super::oxc_engine::{
     ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
-#[cfg(test)]
-use crate::callgraph_store::project_dead_code_snapshot;
 use crate::callgraph_store::{
-    project_dead_code_snapshot_incremental_with_costs, project_dead_code_snapshot_with_revision,
-    CallGraphStore, CallGraphStoreError, ProjectionCostEstimates, ProjectionKind,
-    ProjectionVerdict, ReadonlyCallGraphStore, MAX_DELTA_BYTES,
+    CallGraphStoreError, ProjectionCostEstimates, ProjectionKind, ProjectionVerdict,
+    MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
-use crate::config::Config;
-
-#[cfg(test)]
-use crate::views::read::{record_checkout_view_refusal, take_checkout_view_refusal};
-
-// Recording and message formatting compile only in tests; the fallible reads
-// below still return None on exactly the same branches in production.
-macro_rules! note_checkout_view_refusal {
-    ($($arg:tt)*) => {
-        #[cfg(test)]
-        record_checkout_view_refusal(format!($($arg)*));
-    };
-}
-
-macro_rules! checkout_view_some {
-    ($value:expr, $($reason:tt)*) => {
-        match $value {
-            Some(value) => value,
-            None => {
-                note_checkout_view_refusal!($($reason)*);
-                return None;
-            }
-        }
-    };
-}
-
-macro_rules! checkout_view_ok {
-    ($value:expr, $($reason:tt)*) => {
-        match $value {
-            Ok(value) => value,
-            Err(_error) => {
-                note_checkout_view_refusal!("{}: {_error}", format!($($reason)*));
-                return None;
-            }
-        }
-    };
-}
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -81,6 +41,24 @@ fn inspect_category_is_off(
 ) -> bool {
     // Retired categories still take their existing unsupported-category path.
     category.is_active() && !config.category_enabled(category)
+}
+
+/// How long the dead-code graph a request builds stays in memory without
+/// another dead-code request. Dead code and unused exports read it; it holds
+/// hundreds of MB on a large repository, and nothing else uses it, so an
+/// agent that stopped asking for dead code does not keep paying for it. The
+/// next request builds it again.
+pub(crate) const DEAD_CODE_GRAPH_IDLE_RELEASE: Duration = Duration::from_secs(10 * 60);
+
+/// What [`InspectManager::release_idle_dead_code_graph`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadCodeGraphRelease {
+    /// No dead-code request is outstanding: nothing to release.
+    NotHeld,
+    /// The graph was released.
+    Released,
+    /// The graph stays; check again after this long.
+    KeepFor(Duration),
 }
 
 type WaiterTx = Sender<JobOutcome>;
@@ -147,22 +125,16 @@ struct CachedCallgraphProjection {
     snapshot: Arc<CallgraphSnapshot>,
     estimated_bytes: u64,
     costs: ProjectionCostEstimates,
-    rollup: Option<(
-        CallgraphProjectionIdentity,
-        Arc<super::scanners::dead_code::DeadCodeRollupState>,
-    )>,
 }
 
 // Projection snapshots are useful only as whole-root splice bases. Bound their
 // aggregate residency rather than multiplying a per-root cap by every manager.
-const DEAD_CODE_SNAPSHOT_FLEET_BUDGET: u64 = 1024 * 1024 * 1024;
 
 type ProjectionSlot = Mutex<Option<CachedCallgraphProjection>>;
 
 struct ProjectionFleetEntry {
     slot: Weak<ProjectionSlot>,
     bytes: u64,
-    touched: u64,
 }
 
 #[derive(Default)]
@@ -170,7 +142,6 @@ struct ProjectionFleet {
     entries: HashMap<PathBuf, ProjectionFleetEntry>,
     bytes: u64,
     drops: u64,
-    clock: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,61 +152,6 @@ pub(crate) struct DeadCodeSnapshotCensus {
 }
 
 impl ProjectionFleet {
-    fn admit(&mut self, root: PathBuf, slot: Weak<ProjectionSlot>, bytes: u64, budget: u64) {
-        self.clock = self.clock.saturating_add(1);
-        if let Some(previous) = self.entries.remove(&root) {
-            self.bytes = self.bytes.saturating_sub(previous.bytes);
-        }
-        // A snapshot that cannot fit alone must not evict useful roots before
-        // eventually evicting itself. It is still available to the scan caller.
-        if bytes > budget {
-            if let Some(slot) = slot.upgrade() {
-                if let Ok(mut cached) = slot.lock() {
-                    cached.take();
-                }
-            }
-            self.drops = self.drops.saturating_add(1);
-            return;
-        }
-        self.bytes = self.bytes.saturating_add(bytes);
-        self.entries.insert(
-            root,
-            ProjectionFleetEntry {
-                slot,
-                bytes,
-                touched: self.clock,
-            },
-        );
-
-        while self.bytes > budget {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.touched)
-                .map(|(root, _)| root.clone())
-            else {
-                break;
-            };
-            let Some(entry) = self.entries.remove(&oldest) else {
-                continue;
-            };
-            self.bytes = self.bytes.saturating_sub(entry.bytes);
-            if let Some(slot) = entry.slot.upgrade() {
-                if let Ok(mut cached) = slot.lock() {
-                    cached.take();
-                }
-            }
-            self.drops = self.drops.saturating_add(1);
-        }
-    }
-
-    fn touch(&mut self, root: &Path) {
-        if let Some(entry) = self.entries.get_mut(root) {
-            self.clock = self.clock.saturating_add(1);
-            entry.touched = self.clock;
-        }
-    }
-
     fn forget(&mut self, root: &Path) {
         if let Some(entry) = self.entries.remove(root) {
             self.bytes = self.bytes.saturating_sub(entry.bytes);
@@ -277,30 +193,6 @@ pub(crate) fn dead_code_snapshot_census() -> DeadCodeSnapshotCensus {
 }
 
 #[derive(Debug, Clone)]
-pub struct Tier2RunSubmissionError {
-    pub category: InspectCategory,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Tier2RunSubmission {
-    pub queued_categories: Vec<InspectCategory>,
-    pub newly_queued_categories: Vec<InspectCategory>,
-    pub deferred_categories: Vec<InspectCategory>,
-    /// Categories not started because their last build failed and the
-    /// automatic-retry pause has not elapsed.
-    pub retry_paused: Vec<Tier2RetryPause>,
-    pub resource_waits: Vec<Tier2ResourceWait>,
-    pub errors: Vec<Tier2RunSubmissionError>,
-}
-
-impl Tier2RunSubmission {
-    pub fn has_new_work(&self) -> bool {
-        !self.newly_queued_categories.is_empty()
-    }
-}
-
-#[derive(Debug, Clone)]
 struct Tier2ReuseOptions {
     inventory: Option<Arc<super::inventory::InspectInventory>>,
     force_rescan_paths: BTreeSet<PathBuf>,
@@ -336,6 +228,7 @@ pub(crate) enum InspectBuilderState {
     WaitingForCacheWriterLease,
     QueuedBehindColdBuilds,
     GatedBySemanticSeed,
+    #[cfg(test)]
     Suspended,
     BuildDenied,
     Absent,
@@ -348,6 +241,7 @@ impl InspectBuilderState {
             Self::WaitingForCacheWriterLease => "waiting_for_inspect_cache_writer_lease",
             Self::QueuedBehindColdBuilds => "queued_behind_cold_builds",
             Self::GatedBySemanticSeed => "gated_by_semantic_seed",
+            #[cfg(test)]
             Self::Suspended => "suspended",
             Self::BuildDenied => "build_denied (borrow-only)",
             Self::Absent => "absent",
@@ -370,19 +264,6 @@ struct BuilderStateEntry {
     first_attempt_unix: u64,
     attempt_count: u64,
     last_failure: Option<String>,
-    /// Consecutive failed attempts whose terminal equals `last_failure`.
-    identical_failures: u32,
-    /// Automatic refreshes skip this category until this instant (and unix
-    /// millisecond), because its last build failed for a reason a rerun with
-    /// the same inputs would only repeat.
-    retry_paused_until: Option<(Instant, u64)>,
-    /// A resource wait survives source edits: they do not release a foreign lease.
-    resource_retry_at: Option<(Instant, u64)>,
-    cache_writer_timeouts: u32,
-    /// The manager's input-change epoch when the current (or last) attempt
-    /// started. A failure is not paused when inputs changed during the attempt,
-    /// because the build may not have seen that change.
-    input_epoch_at_start: u64,
     suspension: Option<crate::build_breaker::BuildSuspension>,
     progress: String,
 }
@@ -397,11 +278,6 @@ impl BuilderStateEntry {
             first_attempt_unix: now,
             attempt_count: 0,
             last_failure: None,
-            identical_failures: 0,
-            retry_paused_until: None,
-            resource_retry_at: None,
-            cache_writer_timeouts: 0,
-            input_epoch_at_start: 0,
             suspension: None,
             progress: "checking cached analysis".into(),
         }
@@ -421,7 +297,6 @@ impl BuilderStateEntry {
     fn begin_attempt(&mut self, state: InspectBuilderState) {
         self.state = Some(state);
         self.suspension = None;
-        self.resource_retry_at = None;
         self.started_at = Instant::now();
         self.started_unix = unix_now_secs();
         if self.attempt_count == 0 && self.last_failure.is_none() {
@@ -429,48 +304,12 @@ impl BuilderStateEntry {
         }
     }
 
-    /// Record a failed attempt. When `pause_retries` is set, automatic
-    /// refreshes skip the category for a pause that doubles with every
-    /// consecutive failure carrying the same terminal. A watcher-observed
-    /// change to an input ends the pause early (see
-    /// [`InspectManager::note_tier2_input_paths_changed`]); the count of
-    /// identical failures is kept, so a failure that repeats after such a
-    /// change still pauses for longer.
-    fn record_failure(&mut self, terminal: String, pause_retries: bool) {
+    /// Record a failed attempt.
+    fn record_failure(&mut self, terminal: String) {
         self.state = None;
         self.suspension = None;
-        self.resource_retry_at = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
-        self.identical_failures = if self.last_failure.as_deref() == Some(terminal.as_str()) {
-            self.identical_failures.saturating_add(1)
-        } else {
-            1
-        };
         self.last_failure = Some(terminal);
-        self.retry_paused_until = pause_retries.then(|| {
-            let pause =
-                super::tier2_scheduler::tier2_failed_build_retry_backoff(self.identical_failures);
-            (
-                Instant::now() + pause,
-                unix_millis_now().saturating_add(pause.as_millis() as u64),
-            )
-        });
-    }
-
-    /// The unix millisecond automatic retries resume, while a pause is active.
-    fn retry_paused_until_at(&self, now: Instant) -> Option<u64> {
-        self.retry_paused_until
-            .filter(|(until, _)| now < *until)
-            .map(|(_, until_ms)| until_ms)
-    }
-
-    fn record_suspension(&mut self, suspension: crate::build_breaker::BuildSuspension) {
-        self.state = Some(InspectBuilderState::Suspended);
-        self.last_failure = None;
-        self.identical_failures = 0;
-        self.retry_paused_until = None;
-        self.resource_retry_at = None;
-        self.suspension = Some(suspension);
     }
 
     fn record_cache_writer_wait(&mut self) {
@@ -478,51 +317,17 @@ impl BuilderStateEntry {
         self.suspension = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_failure = None;
-        self.identical_failures = 0;
-        self.retry_paused_until = None;
-        self.cache_writer_timeouts = self.cache_writer_timeouts.saturating_add(1);
-        let delay =
-            super::tier2_scheduler::tier2_cache_writer_retry_backoff(self.cache_writer_timeouts);
-        self.resource_retry_at = Some((
-            Instant::now() + delay,
-            unix_millis_now().saturating_add(delay.as_millis() as u64),
-        ));
     }
 
     /// Record a pass that found the published call graph view's database
-    /// locked. Nothing else would wake the category once the lock clears: the
-    /// lock clearing is neither a view publication nor a source edit, and the
-    /// pass already consumed any owed publication refresh. So it keeps a
-    /// resource retry with the same bound as a cache writer lease wait. The
-    /// lock says nothing about the inputs, so it is not a failure and does not
-    /// pause retries.
+    /// locked. The lock says nothing about the inputs, so it is not a failure.
     fn record_view_busy_wait(&mut self) {
         self.state = None;
         self.suspension = None;
         self.last_failure = None;
-        self.identical_failures = 0;
-        self.retry_paused_until = None;
-        let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
-        self.resource_retry_at = Some((
-            Instant::now() + delay,
-            unix_millis_now().saturating_add(delay.as_millis() as u64),
-        ));
     }
 
     fn detail_at(&self, now_ms: u64) -> String {
-        if let Some((_, retry_at_ms)) = self.resource_retry_at {
-            // Only a cache writer lease wait sets its own state; a resource
-            // retry without it was armed by a locked view database.
-            let waiting_for = if self.state == Some(InspectBuilderState::WaitingForCacheWriterLease)
-            {
-                "the inspect cache writer lease"
-            } else {
-                "the locked checkout call graph view"
-            };
-            return format!(
-                "waiting for {waiting_for}; automatic resource retry at unix_ms={retry_at_ms}"
-            );
-        }
         if let Some(suspension) = self.suspension.as_ref() {
             return format!(
                 "suspended domain={} deaths={} age_s={} reason={}",
@@ -533,18 +338,10 @@ impl BuilderStateEntry {
             );
         }
         if let Some(terminal) = self.last_failure.as_deref() {
-            let mut detail = format!(
+            return format!(
                 "last attempt failed: {terminal} (attempt {}, first at {})",
                 self.attempt_count, self.first_attempt_unix
             );
-            if let Some(until_ms) = self.retry_paused_until_at(Instant::now()) {
-                detail.push_str(&format!(
-                    "; automatic retries paused until {} after {} identical failure(s)",
-                    until_ms / 1_000,
-                    self.identical_failures
-                ));
-            }
-            return detail;
         }
         match self.state {
             Some(InspectBuilderState::Building) => format!(
@@ -639,8 +436,7 @@ enum BuilderAttemptTerminal {
 fn builder_attempt_terminal(outcome: &JobOutcome) -> BuilderAttemptTerminal {
     match outcome {
         JobOutcome::Fresh { payload }
-            if payload["status"] == "pending"
-                && payload["code"] == CheckoutViewUnavailable::Busy.kind() =>
+            if payload["status"] == "pending" && payload["code"] == "callgraph_building" =>
         {
             BuilderAttemptTerminal::ViewBusyWait
         }
@@ -689,107 +485,8 @@ fn builder_failure_terminal(message: &str) -> String {
     }
 }
 
-/// Whether a failed attempt should pause automatic retries of its category.
-///
-/// Failures that say nothing about the category's inputs are excluded: the
-/// work was stopped or never got its turn (cancellation, admission limits,
-/// a worker that exited early), or it waited on another plane that becomes
-/// ready on its own (the call graph dead code needs). Everything else, such
-/// as a file the scanner cannot read or a pass that timed out, would only
-/// repeat on the same inputs, so automatic refreshes stop rerunning it on
-/// every refresh.
-fn failure_pauses_automatic_retries(outcome: &JobOutcome) -> bool {
-    const NOT_INPUT_DETERMINED: &[&str] = &[
-        "callgraph_unavailable",
-        "tier2 dead_code aggregate did not complete",
-        "tier2 pass cancelled",
-        "admission was cancelled",
-        "limiter slot deadline",
-        "cold build concurrency limit",
-        "exited without publishing a result",
-        "lock poisoned",
-        "writer_lease_timeout:",
-    ];
-    match outcome {
-        JobOutcome::Failed { message } => !NOT_INPUT_DETERMINED
-            .iter()
-            .any(|marker| message.contains(marker)),
-        JobOutcome::Fresh { .. } | JobOutcome::Stale { .. } | JobOutcome::Pending { .. } => false,
-    }
-}
-
-/// An automatic-retry pause on a Tier-2 category whose last build failed
-/// for an input-determined reason. Resource waits are reported separately.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tier2RetryPause {
-    pub category: InspectCategory,
-    /// First line of the failure, as health and the builder detail show it.
-    pub reason: String,
-    /// Consecutive failures with this same reason.
-    pub identical_failures: u32,
-    /// Unix millisecond at which automatic refreshes may retry.
-    pub retry_at_ms: u64,
-}
-
-/// A short resource wait, distinct from failures determined by source inputs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tier2ResourceWait {
-    pub category: InspectCategory,
-    pub retry_at_ms: u64,
-}
-
-/// Ignore files whose edits change which files the Tier-2 scope walk yields.
-const TIER2_SCOPE_IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".aftignore", ".ignore"];
-
-/// Whether a changed path could be a Tier-2 input: a file the project scope
-/// walk can include (judged from the path alone, see
-/// [`crate::callgraph::walk_could_include`]) or an ignore file that reshapes
-/// that walk. Absolute paths outside the project root are not inputs.
-fn path_may_be_tier2_input(
-    project_root: Option<&Path>,
-    canonical_root: Option<&Path>,
-    path: &Path,
-) -> bool {
-    let relative = if path.is_absolute() {
-        let Some(relative) = [project_root, canonical_root]
-            .into_iter()
-            .flatten()
-            .find_map(|root| path.strip_prefix(root).ok())
-        else {
-            return false;
-        };
-        relative
-    } else {
-        path
-    };
-    if relative
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| TIER2_SCOPE_IGNORE_FILE_NAMES.contains(&name))
-    {
-        return true;
-    }
-    crate::callgraph::walk_could_include(&relative.to_string_lossy())
-}
-
-fn retry_pause_from_states(
-    states: &HashMap<JobKey, BuilderStateEntry>,
-    category: InspectCategory,
-    now: Instant,
-) -> Option<Tier2RetryPause> {
-    let entry = states.get(&JobKey::for_project_category(category))?;
-    let retry_at_ms = entry.retry_paused_until_at(now)?;
-    Some(Tier2RetryPause {
-        category,
-        reason: entry.last_failure.clone().unwrap_or_default(),
-        identical_failures: entry.identical_failures,
-        retry_at_ms,
-    })
-}
-
 fn wake_cache_writer_if_available(
     identity: &InspectCacheIdentity,
-    states: &Mutex<HashMap<JobKey, BuilderStateEntry>>,
     waits: &Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>,
     caches: &Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
 ) {
@@ -815,13 +512,6 @@ fn wake_cache_writer_if_available(
             caches.remove(identity);
         }
     }
-    if let Ok(mut states) = states.lock() {
-        for entry in states.values_mut() {
-            if entry.state == Some(InspectBuilderState::WaitingForCacheWriterLease) {
-                entry.resource_retry_at = Some((Instant::now(), unix_millis_now()));
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -838,7 +528,7 @@ impl From<String> for Tier2RunError {
 
 impl From<CallGraphStoreError> for Tier2RunError {
     fn from(error: CallGraphStoreError) -> Self {
-        if error.is_transient_lock_contention() {
+        if error.is_transient_lock_contention() || matches!(error, CallGraphStoreError::Building) {
             Self::CallgraphBusy
         } else {
             Self::Failed(error.to_string())
@@ -848,6 +538,22 @@ impl From<CallGraphStoreError> for Tier2RunError {
 
 fn callgraph_pending_payload() -> Value {
     json!({"status": "pending", "reason": "callgraph_building", "complete": false})
+}
+
+/// One wait counted in a counter for as long as it lasts.
+struct CountedWait<'a>(&'a AtomicUsize);
+
+impl<'a> CountedWait<'a> {
+    fn start(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for CountedWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn callgraph_pending_result(job: &InspectJob, duration: Duration) -> InspectResult {
@@ -903,34 +609,6 @@ fn retry_dead_code_store_read<T>(
     }
 }
 
-fn callgraph_store_ready_for_dead_code(
-    callgraph_dir: PathBuf,
-    project_root: PathBuf,
-) -> Result<bool, CallGraphStoreError> {
-    let readiness = match CallGraphStore::open_readonly(callgraph_dir, project_root) {
-        Ok(Some(store)) => store.stale_files().map(|files| files.is_empty()),
-        Ok(None) => Ok(false),
-        Err(error) => Err(error),
-    };
-    match readiness {
-        Err(error) if error.is_transient_lock_contention() => Err(error),
-        other => Ok(other.unwrap_or(false)),
-    }
-}
-
-fn callgraph_store_busy_for_dead_code(inspect_dir: &Path, project_root: &Path) -> bool {
-    for dir in callgraph_store_dirs_from_inspect_dir(inspect_dir, project_root) {
-        match retry_dead_code_store_read(|| {
-            callgraph_store_ready_for_dead_code(dir.clone(), project_root.to_path_buf())
-        }) {
-            Ok(true) => return false,
-            Err(_) => return true,
-            Ok(false) => {}
-        }
-    }
-    false
-}
-
 /// Completes the builder registration and sends `Failed` to leftover waiters
 /// if a reuse worker returns, panics, or is cancelled without going through the
 /// completion router. Admission and exit must be paired; a leftover registration
@@ -975,33 +653,8 @@ fn cached_tier2_aggregate_usable(
     true
 }
 
-struct CheckoutViewVerification {
-    root: PathBuf,
-    ticket: u64,
-    files: BTreeMap<PathBuf, crate::views::read::VerifiedCallgraphFile>,
-}
-
-#[derive(Default)]
-struct DeferredViewRefresh {
-    publication_epoch: u64,
-    // The publication observed by the job that could not project its graph.
-    // A later publication makes the owed refresh eligible for dispatch.
-    pending_epoch: Option<u64>,
-}
-
-/// The deferred-refresh map's key for `root`. Callers name the same checkout
-/// in different spellings: the configured cache root is the raw
-/// `fs::canonicalize` result (a `\\?\C:\...` verbatim path on Windows), while
-/// background Tier-2 jobs carry the normalized form. Both must reach one entry,
-/// or a publication bumps one key while the pending result and its dispatch
-/// live under another, and the owed refresh is never cleared or never fires.
-fn deferred_view_key(root: &Path) -> PathBuf {
-    crate::inspect::job::normalize_path(root)
-}
-
 pub struct InspectManager {
     file_progress: Arc<HashMap<InspectCategory, crate::run_tool_call::progress::FileProgress>>,
-    deferred_view_refreshes: Mutex<HashMap<PathBuf, DeferredViewRefresh>>,
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     dispatcher: InspectDispatcher,
     result_rx: Receiver<InspectResult>,
@@ -1035,32 +688,28 @@ pub struct InspectManager {
     /// both surfaces treat a category as busy when it has an entry here, and
     /// fall back to the waiter map if the registry is empty.
     builder_states: Arc<Mutex<HashMap<JobKey, BuilderStateEntry>>>,
-    /// Advances whenever a watcher-observed change could alter the Tier-2
-    /// inputs (a file the scope walk can include, an ignore file, a rescan or
-    /// a config change). Compared against each attempt's start epoch.
-    tier2_input_epoch: AtomicU64,
     completed_build_durations: Mutex<HashMap<InspectCategory, Duration>>,
-    checkout_view_verification: Mutex<Option<CheckoutViewVerification>>,
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
-    automatic_tier2_schedule_count: AtomicU64,
-    /// Monotonic count of Tier-2 completions delivered via the reuse path
-    /// (watcher-driven scheduler runs). These bypass `result_rx`/
-    /// `drain_completions`, so the `&AppContext`-side drain polls this counter
-    /// to know when to refresh the agent status bar after a background scan.
+    /// Monotonic count of Tier-2 completions delivered via the reuse path,
+    /// which bypass `result_rx`/`drain_completions`.
     reuse_completions: AtomicU64,
-    /// Successful reuse completions are tracked separately because failed passes
-    /// must not make a stale health plane look ready.
-    successful_reuse_completions: AtomicU64,
     /// Test observability for distinguishing queued reuse work from a worker that
     /// has actually begun executing it.
     reuse_starts: AtomicU64,
     source_scan_files: AtomicU64,
-    /// Project roots whose latest dead-code pass found the analysis
-    /// unavailable because the root is borrow-only. That result is not stored
-    /// in the inspect cache, so status readers consult this set instead of a
-    /// cached count from an earlier pass.
-    dead_code_borrow_only_roots: Mutex<BTreeSet<PathBuf>>,
+    /// The data-layer checkouts dead code reads its call graph from while
+    /// they are ready; empty unless the process runs the data layer.
+    data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources,
+    /// When an `aft_inspect` that read the dead-code graph last finished;
+    /// `None` once the graph was released, or before any such request.
+    last_dead_code_request: Mutex<Option<Instant>>,
+    /// Set while a thread is waiting to release the dead-code graph.
+    dead_code_release_armed: AtomicBool,
+    /// How many dead-code passes are waiting for their call graph right now:
+    /// for it to be published, or to catch up with recorded edits. A pass
+    /// that is building but not waiting is working out dead code itself.
+    dead_code_callgraph_waits: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -1201,7 +850,6 @@ impl InspectManager {
         let dispatcher = InspectDispatcher::new(guarded_worker);
         Self {
             file_progress,
-            deferred_view_refreshes: Mutex::new(HashMap::new()),
             root_work_cancellation,
             result_rx: dispatcher.result_rx.clone(),
             pool: Arc::clone(&dispatcher.pool),
@@ -1224,18 +872,17 @@ impl InspectManager {
             semantic_cold_seed_active,
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
             interactive_tier2_permits: Mutex::new(HashMap::new()),
-            dead_code_borrow_only_roots: Mutex::new(BTreeSet::new()),
+            data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources::default(),
+            last_dead_code_request: Mutex::new(None),
+            dead_code_release_armed: AtomicBool::new(false),
+            dead_code_callgraph_waits: AtomicUsize::new(0),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Arc::new(Mutex::new(HashMap::new())),
-            tier2_input_epoch: AtomicU64::new(0),
             completed_build_durations: Mutex::new(HashMap::new()),
-            checkout_view_verification: Mutex::new(None),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
-            automatic_tier2_schedule_count: AtomicU64::new(0),
             reuse_completions: AtomicU64::new(0),
-            successful_reuse_completions: AtomicU64::new(0),
             reuse_starts: AtomicU64::new(0),
             source_scan_files: AtomicU64::new(0),
         }
@@ -1355,18 +1002,10 @@ impl InspectManager {
 
     fn set_builder_state(&self, key: &JobKey, state: InspectBuilderState) {
         if let Ok(mut states) = self.builder_states.lock() {
-            let epoch = self.tier2_input_epoch.load(Ordering::SeqCst);
             if let Some(entry) = states.get_mut(key) {
-                // Only a new attempt takes the epoch; a state change within
-                // one attempt (queued, then building) keeps its start epoch.
-                if !entry.is_in_flight() {
-                    entry.input_epoch_at_start = epoch;
-                }
                 entry.begin_attempt(state);
             } else {
-                let mut entry = BuilderStateEntry::new(state);
-                entry.input_epoch_at_start = epoch;
-                states.insert(key.clone(), entry);
+                states.insert(key.clone(), BuilderStateEntry::new(state));
             }
         }
     }
@@ -1408,16 +1047,11 @@ impl InspectManager {
                     .record_view_busy_wait();
             }
             BuilderAttemptTerminal::Failed(terminal) => {
-                let epoch = self.tier2_input_epoch.load(Ordering::SeqCst);
-                let pause_retries = failure_pauses_automatic_retries(outcome);
                 if let Some(entry) = states.get_mut(key) {
-                    // Inputs changed while this attempt ran: it may not have
-                    // seen the change, so the next refresh should try again.
-                    let inputs_unchanged = entry.input_epoch_at_start == epoch;
-                    entry.record_failure(terminal, pause_retries && inputs_unchanged);
+                    entry.record_failure(terminal);
                 } else {
                     let mut entry = BuilderStateEntry::new(InspectBuilderState::Building);
-                    entry.record_failure(terminal, pause_retries);
+                    entry.record_failure(terminal);
                     states.insert(key.clone(), entry);
                 }
             }
@@ -1472,16 +1106,8 @@ impl InspectManager {
         outcome: JobOutcome,
     ) {
         let Some(waiters) = self.take_waiters_after(key, identity, || {
-            let succeeded = matches!(
-                builder_attempt_terminal(&outcome),
-                BuilderAttemptTerminal::Succeeded
-            );
             self.record_builder_attempt_outcome(key, &outcome);
             self.reuse_completions.fetch_add(1, Ordering::SeqCst);
-            if succeeded {
-                self.successful_reuse_completions
-                    .fetch_add(1, Ordering::SeqCst);
-            }
         }) else {
             return;
         };
@@ -1576,127 +1202,33 @@ impl InspectManager {
         })
     }
 
-    /// The automatic-retry pause on `category`, if its last build failed and
-    /// the pause has not elapsed. An explicit `aft_inspect` is not subject to
-    /// it; only automatic (watcher, idle and maintenance) refreshes are.
-    pub fn tier2_retry_pause(&self, category: InspectCategory) -> Option<Tier2RetryPause> {
-        let states = self
-            .builder_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retry_pause_from_states(&states, category, Instant::now())
-    }
-
-    pub(crate) fn tier2_resource_wait(
-        &self,
-        category: InspectCategory,
-    ) -> Option<Tier2ResourceWait> {
-        let states = self.builder_states.lock().ok()?;
-        let entry = states.get(&JobKey::for_project_category(category))?;
-        let (retry_at, retry_at_ms) = entry.resource_retry_at?;
-        (Instant::now() < retry_at).then_some(Tier2ResourceWait {
-            category,
-            retry_at_ms,
-        })
-    }
-
-    /// Include expired waits so maintenance can retry without a source change.
-    /// Disabled categories and active attempts must not keep arming dispatches.
-    pub(crate) fn try_tier2_resource_retry_at(&self, config: &Config) -> Option<Option<Instant>> {
-        let states = self.builder_states.try_lock().ok()?;
+    /// What a dead-code pass still building waits for, as the pending
+    /// reason inspect reports: `callgraph_building` while it waits for its
+    /// call graph, `dead_code_building` while it works out dead code itself
+    /// (or waits for a build slot to). `None` when no pass is building.
+    pub(crate) fn dead_code_pending_reason(&self) -> Option<&'static str> {
+        if !self.dead_code_build_is_pending() {
+            return None;
+        }
         Some(
-            states
-                .iter()
-                .filter_map(|(key, entry)| {
-                    (config.inspect.enabled
-                        && config.inspect.category_enabled(key.category)
-                        && (key.category != InspectCategory::DeadCode || config.indexes.callgraph)
-                        && !entry.is_in_flight())
-                    .then_some(entry.resource_retry_at)
-                    .flatten()
-                    .map(|(at, _)| at)
-                })
-                .min(),
+            if self.dead_code_callgraph_waits.load(Ordering::SeqCst) > 0 {
+                "callgraph_building"
+            } else {
+                "dead_code_building"
+            },
         )
     }
 
-    /// Record watcher-observed (or agent-written) changes. When any of
-    /// `paths` could be a Tier-2 input, every automatic-retry pause ends, so
-    /// the next automatic refresh rebuilds a failed category instead of
-    /// waiting out its pause: the change may be the fix. Paths the scope walk
-    /// can never include (unsupported file types, hidden or always-excluded
-    /// directories, paths outside the root) leave pauses in place.
-    ///
-    /// All Tier-2 categories walk the same project scope, so an input of one
-    /// is an input of all. Returns true when the change counted as an input
-    /// change.
-    pub fn note_tier2_input_paths_changed<'a>(
-        &self,
-        project_root: Option<&Path>,
-        paths: impl IntoIterator<Item = &'a Path>,
-    ) -> bool {
-        let mut states = self
-            .builder_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Nothing to end and no attempt that could miss the change: skip the
-        // per-path work on the watcher drain's hot path.
-        if !states.values().any(|entry| {
-            entry.retry_paused_until.is_some()
-                || entry.is_in_flight()
-                || entry.cache_writer_timeouts > 0
-        }) {
-            return false;
+    /// Marks a dead-code pass as waiting for its call graph, or no longer.
+    #[cfg(test)]
+    pub(crate) fn set_dead_code_waiting_for_callgraph_for_test(&self, waiting: bool) {
+        if waiting {
+            self.dead_code_callgraph_waits
+                .fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.dead_code_callgraph_waits
+                .fetch_sub(1, Ordering::SeqCst);
         }
-        let canonical_root = project_root.map(crate::inspect::job::canonicalize_normalized);
-        let affects_inputs = paths
-            .into_iter()
-            .any(|path| path_may_be_tier2_input(project_root, canonical_root.as_deref(), path));
-        if affects_inputs {
-            self.end_tier2_retry_pauses_locked(&mut states);
-        }
-        affects_inputs
-    }
-
-    /// End every automatic-retry pause because the Tier-2 inputs may have
-    /// changed in a way no single path names: a watcher rescan, an ignore-rule
-    /// change, or a config change.
-    pub fn clear_tier2_retry_pauses(&self) {
-        let mut states = self
-            .builder_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.end_tier2_retry_pauses_locked(&mut states);
-    }
-
-    fn end_tier2_retry_pauses_locked(&self, states: &mut HashMap<JobKey, BuilderStateEntry>) {
-        self.tier2_input_epoch.fetch_add(1, Ordering::SeqCst);
-        for entry in states.values_mut() {
-            entry.retry_paused_until = None;
-            entry.cache_writer_timeouts = 0;
-            if entry.state == Some(InspectBuilderState::WaitingForCacheWriterLease) {
-                let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
-                entry.resource_retry_at = Some((
-                    Instant::now() + delay,
-                    unix_millis_now() + delay.as_millis() as u64,
-                ));
-            }
-        }
-    }
-
-    /// Every active automatic-retry pause, for health. `None` when the
-    /// registry is busy, so a health poll never waits on a build.
-    pub(crate) fn try_tier2_retry_pauses(&self) -> Option<Vec<Tier2RetryPause>> {
-        let states = self.builder_states.try_lock().ok()?;
-        let now = Instant::now();
-        Some(
-            InspectCategory::active()
-                .iter()
-                .copied()
-                .filter(|category| category.is_tier2())
-                .filter_map(|category| retry_pause_from_states(&states, category, now))
-                .collect(),
-        )
     }
 
     fn record_build_progress(&self, key: &JobKey, progress: impl Into<String>) {
@@ -1778,6 +1310,7 @@ impl InspectManager {
                     let age =
                         generated_at.map(|at| unix_now_secs().saturating_sub(at.max(0) as u64));
                     let cached = filter_outcome_for_scope_with_contributions(
+                        &self.data_layer_dead_code,
                         None,
                         JobOutcome::Fresh { payload: cached },
                         snapshot,
@@ -1802,225 +1335,6 @@ impl InspectManager {
         payload
     }
 
-    /// Open only this checkout's published view and prove its source keys still
-    /// describe the files used by the scan. This does not acquire a legacy writer.
-    pub(crate) fn current_checkout_view(
-        &self,
-        snapshot: &InspectSnapshot,
-        files: &[PathBuf],
-        observed_stats: Option<&[(PathBuf, u64, SystemTime)]>,
-    ) -> Option<Arc<ReadonlyCallGraphStore>> {
-        #[cfg(test)]
-        let _ = take_checkout_view_refusal();
-        if !snapshot.config.views.enabled || !snapshot.config.indexes.callgraph {
-            note_checkout_view_refusal!(
-                "config_gate: views.enabled={} indexes.callgraph={}",
-                snapshot.config.views.enabled,
-                snapshot.config.indexes.callgraph
-            );
-            return None;
-        }
-        let (store, generation) = checkout_view_some!(
-            current_view_projection_store(
-                &snapshot.project_root,
-                &snapshot.inspect_dir,
-                &snapshot.config,
-                &[],
-            ),
-            "projection_unavailable: root={:?} inspect_dir={:?}",
-            snapshot.project_root,
-            snapshot.inspect_dir
-        );
-        let cache_storage = snapshot.config.cache_storage_dir();
-        let storage = checkout_view_some!(
-            cache_storage.as_ref(),
-            "verification_storage_missing: config.storage_dir=None root={:?}",
-            snapshot.project_root
-        );
-        let view = checkout_view_ok!(
-            crate::views::ViewStore::open(
-                storage,
-                &crate::path_identity::project_scope_key(&snapshot.project_root),
-            ),
-            "verification_view_open: storage={storage:?} root={:?}",
-            snapshot.project_root
-        );
-        let manifest = checkout_view_ok!(
-            view.load_manifest(&generation),
-            "verification_manifest_load: generation={generation} view_dir={:?}",
-            view.view_dir()
-        );
-        // The graph must cover the complete source set, not merely the files
-        // that still exist. Deletions and untracked additions can change liveness.
-        if files
-            .iter()
-            .filter(|path| callgraph_store_indexes_path(path))
-            .any(|path| {
-                let Ok(relative) = path.strip_prefix(&snapshot.project_root) else {
-                    note_checkout_view_refusal!("coverage_root_mismatch: path={path:?} root={:?}", snapshot.project_root);
-                    return true;
-                };
-                crate::views::RelPath::from_os_path(relative)
-                    .map_err(|_error| {
-                        note_checkout_view_refusal!("coverage_relative_path_invalid: path={path:?} relative={relative:?} error={_error}");
-                        _error
-                    })
-                    .ok()
-                    .is_none_or(|relative| {
-                        let missing = manifest.get(&relative).is_none();
-                        if missing {
-                            note_checkout_view_refusal!("coverage_manifest_missing: path={path:?} relative={relative:?} generation={generation} manifest_files={} observed_files={}", manifest.entries().count(), files.len());
-                        }
-                        missing
-                    })
-            })
-        {
-            return None;
-        }
-        let manifest_paths = manifest.entries().filter_map(|(path, entry)| {
-            matches!(entry, crate::views::ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some())
-                .then(|| crate::views::segment_store::rel_path_to_os(path).map_err(|_error| {
-                    note_checkout_view_refusal!("manifest_path_decode: path={path:?} generation={generation} error={_error}");
-                    _error
-                }).ok().map(|path| snapshot.project_root.join(path)))
-        }).collect::<Option<Vec<_>>>();
-        let manifest_paths = checkout_view_some!(
-            manifest_paths,
-            "manifest_paths_unavailable: generation={generation}"
-        );
-        let ticket = crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
-        let mut verification = checkout_view_ok!(
-            self.checkout_view_verification.lock(),
-            "verification_mutex_poisoned: root={:?}",
-            snapshot.project_root
-        );
-        if verification
-            .as_ref()
-            .is_none_or(|cached| cached.root != snapshot.project_root || cached.ticket != ticket)
-        {
-            *verification = Some(CheckoutViewVerification {
-                root: snapshot.project_root.clone(),
-                ticket,
-                files: BTreeMap::new(),
-            });
-        }
-        if !checkout_view_ok!(
-            crate::views::read::callgraph_paths_match_cached(
-                &manifest,
-                &snapshot.project_root,
-                &manifest_paths,
-                observed_stats,
-                &mut checkout_view_some!(
-                    verification.as_mut(),
-                    "verification_memo_missing: root={:?} ticket={ticket}",
-                    snapshot.project_root
-                )
-                .files,
-            ),
-            "source_verification_error: root={:?} generation={generation}",
-            snapshot.project_root
-        ) {
-            note_checkout_view_refusal!("source_verification_false: root={:?} generation={generation} manifest_files={} observed_files={:?}", snapshot.project_root, manifest_paths.len(), observed_stats.map(<[_]>::len));
-            return None;
-        }
-        let completed_ticket =
-            crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
-        if completed_ticket != ticket {
-            note_checkout_view_refusal!(
-                "invalidation_ticket_changed: root={:?} before={ticket} after={completed_ticket}",
-                snapshot.project_root
-            );
-            *verification = None;
-            return None;
-        }
-        Some(Arc::new(store))
-    }
-
-    pub(crate) fn checkout_view_unavailability(
-        &self,
-        snapshot: &InspectSnapshot,
-        files: &[PathBuf],
-    ) -> CheckoutViewUnavailable {
-        let epoch = self.view_publication_epoch(&snapshot.project_root);
-        let reason = match current_view_projection_result(
-            &snapshot.project_root,
-            &snapshot.inspect_dir,
-            &snapshot.config,
-            files,
-        ) {
-            Err(reason) => reason,
-            // The reader opened, but the full coverage/freshness proof did not.
-            // Absence of that proof does not establish a source or config change.
-            Ok(_) => CheckoutViewUnavailable::Unverified,
-        };
-        if matches!(reason, CheckoutViewUnavailable::Pending) {
-            self.note_view_pending(&snapshot.project_root, epoch);
-        }
-        reason
-    }
-
-    fn view_publication_epoch(&self, root: &Path) -> u64 {
-        self.deferred_view_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&deferred_view_key(root))
-            .map_or(0, |state| state.publication_epoch)
-    }
-
-    fn note_view_pending(&self, root: &Path, epoch: u64) {
-        self.deferred_view_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(deferred_view_key(root))
-            .or_default()
-            .pending_epoch
-            .get_or_insert(epoch);
-    }
-
-    pub(crate) fn note_view_publication(&self, root: &Path) -> bool {
-        let mut states = self
-            .deferred_view_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = states.entry(deferred_view_key(root)).or_default();
-        state.publication_epoch = state.publication_epoch.wrapping_add(1);
-        state.pending_epoch.is_some()
-    }
-
-    pub(crate) fn deferred_view_refresh_ready(&self, root: &Path) -> bool {
-        self.deferred_view_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&deferred_view_key(root))
-            .is_some_and(|state| {
-                state
-                    .pending_epoch
-                    .is_some_and(|epoch| epoch != state.publication_epoch)
-            })
-    }
-
-    pub(crate) fn try_deferred_view_refresh_ready(&self, root: &Path) -> Option<bool> {
-        let states = self.deferred_view_refreshes.try_lock().ok()?;
-        Some(states.get(&deferred_view_key(root)).is_some_and(|state| {
-            state
-                .pending_epoch
-                .is_some_and(|epoch| epoch != state.publication_epoch)
-        }))
-    }
-
-    fn view_refresh_dispatched(&self, root: &Path, category: InspectCategory) {
-        if category == InspectCategory::DeadCode {
-            if let Some(state) = self
-                .deferred_view_refreshes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_mut(&deferred_view_key(root))
-            {
-                state.pending_epoch = None;
-            }
-        }
-    }
-
     pub(crate) fn tier2_builder_state_detail_at(
         &self,
         category: InspectCategory,
@@ -2033,31 +1347,6 @@ impl InspectManager {
             }
         }
         self.tier2_builder_state(category).as_str().to_string()
-    }
-
-    fn record_tier2_build_suspension(
-        &self,
-        key: &JobKey,
-        suspension: crate::build_breaker::BuildSuspension,
-    ) {
-        if let Ok(mut states) = self.builder_states.lock() {
-            if let Some(entry) = states.get_mut(key) {
-                entry.record_suspension(suspension);
-            } else {
-                let mut entry = BuilderStateEntry::new(InspectBuilderState::Suspended);
-                entry.record_suspension(suspension);
-                states.insert(key.clone(), entry);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_tier2_build_suspension_for_test(
-        &self,
-        category: InspectCategory,
-        suspension: crate::build_breaker::BuildSuspension,
-    ) {
-        self.record_tier2_build_suspension(&JobKey::for_project_category(category), suspension);
     }
 
     fn builder_state_detail_for_job(&self, job: &InspectJob) -> String {
@@ -2083,30 +1372,14 @@ impl InspectManager {
         self.try_tier2_any_in_flight()
     }
 
-    /// Whether a published callgraph store can back a dead_code snapshot.
-    ///
-    /// This is the same readiness predicate the builder uses before projection:
-    /// a store that opens but still has `backend_file_state='stale'` rows is
-    /// not ready, because `project_dead_code_snapshot` refuses those rows.
+    /// Whether the root has a published call graph a dead_code snapshot can be
+    /// built from. Edits pending on a published graph don't count against
+    /// it: the snapshot brings them in.
     pub(crate) fn callgraph_ready_for_snapshot(&self, snapshot: &InspectSnapshot) -> bool {
-        if !snapshot.config.indexes.callgraph {
-            return false;
-        }
-        if snapshot.config.views.enabled {
-            return current_view_projection_store(
-                &snapshot.project_root,
-                &snapshot.inspect_dir,
-                &snapshot.config,
-                &[],
-            )
-            .is_some();
-        }
-        callgraph_store_dirs_from_inspect_dir(&snapshot.inspect_dir, &snapshot.project_root)
-            .into_iter()
-            .any(|dir| {
-                callgraph_store_ready_for_dead_code(dir, snapshot.project_root.clone())
-                    .unwrap_or(false)
-            })
+        snapshot.config.indexes.callgraph
+            && !self
+                .data_layer_dead_code
+                .callgraph_busy(&snapshot.project_root)
     }
 
     pub fn set_automatic_tier2_refresh_allowed(&self, allowed: bool) {
@@ -2127,7 +1400,7 @@ impl InspectManager {
                 .automatic_tier2_skip_logged
                 .swap(true, Ordering::SeqCst)
         {
-            crate::slog_debug!("automatic Tier-2 scan scheduling skipped for linked worktree root");
+            crate::slog_debug!("automatic TODO refresh skipped for linked worktree root");
         }
         allowed
     }
@@ -2135,11 +1408,6 @@ impl InspectManager {
     #[doc(hidden)]
     pub fn inspect_pool_for_test(&self) -> Arc<rayon::ThreadPool> {
         Arc::clone(&self.pool)
-    }
-
-    #[doc(hidden)]
-    pub fn automatic_tier2_schedule_count_for_test(&self) -> u64 {
-        self.automatic_tier2_schedule_count.load(Ordering::SeqCst)
     }
 
     fn category_needs_heavy_root_work(category: InspectCategory) -> bool {
@@ -2283,260 +1551,6 @@ impl InspectManager {
         Ok(key)
     }
 
-    pub fn submit_tier2_run_with_reuse_background(
-        self: &Arc<Self>,
-        snapshot: InspectSnapshot,
-        category: InspectCategory,
-    ) -> Result<Option<JobKey>, String> {
-        if inspect_category_is_off(&snapshot.config.inspect, category) {
-            return Ok(None);
-        }
-        if !category.is_active() {
-            return Err(format!(
-                "inspect category '{category}' is disabled in v0.33"
-            ));
-        }
-        if !category.is_tier2() {
-            return Err(format!(
-                "inspect category '{category}' is not a Tier 2 category"
-            ));
-        }
-        if !self.heavy_root_work_allowed() {
-            return Err(Self::heavy_root_work_block_message(category));
-        }
-        if !self.automatic_tier2_refresh_allowed() {
-            return Ok(None);
-        }
-        if self.tier2_retry_pause(category).is_some() {
-            return Ok(None);
-        }
-        if self.tier2_resource_wait(category).is_some() {
-            return Ok(None);
-        }
-        self.automatic_tier2_schedule_count
-            .fetch_add(1, Ordering::SeqCst);
-
-        let job = self.tier2_reuse_job(snapshot, category, None);
-        let key = job.key.clone();
-        let mut in_flight = self
-            .in_flight
-            .lock()
-            .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
-        if in_flight.contains_key(&key) {
-            return Ok(Some(key));
-        }
-        let limiter = self.cold_build_limiter();
-        let request = cold_build_limiter::ColdBuildAdmissionRequest::for_root(
-            job.project_root.display().to_string(),
-            format!("tier2-background:{}", category.as_str()),
-            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
-        );
-        let Some(permit) =
-            cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
-        else {
-            return Err(format!(
-                "cold build concurrency limit ({}) reached; retrying later",
-                limiter.limit()
-            ));
-        };
-        let permit_slot = Arc::new(Mutex::new(Some(permit)));
-        let worker_permit_slot = Arc::clone(&permit_slot);
-        in_flight.insert(key.clone(), InFlightRegistration::new(Vec::new()));
-        drop(in_flight);
-        self.record_flight_start(&key);
-
-        self.view_refresh_dispatched(&job.project_root, category);
-
-        let manager = Arc::clone(self);
-        let pool = Arc::clone(&self.pool);
-        let cancellation = self
-            .root_work_cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let cancellation = cancellation.with_root(&job.project_root);
-        pool.spawn_fifo(move || {
-            let _cancel = crate::executor::install_job_cancellation(cancellation);
-            let _flight = manager.tier2_flight_exit_guard(job.key.clone());
-            let result = manager.tier2_run_with_reuse_job_result_catching(
-                job,
-                Tier2ReuseOptions::default(),
-                Some(worker_permit_slot),
-            );
-            manager.route_tier2_reuse_completion(result);
-        });
-
-        Ok(Some(key))
-    }
-
-    pub fn submit_tier2_run_with_reuse_serial_background(
-        self: &Arc<Self>,
-        snapshot: InspectSnapshot,
-        categories: Vec<InspectCategory>,
-    ) -> Tier2RunSubmission {
-        let mut submission = Tier2RunSubmission::default();
-        let mut requested = Vec::new();
-
-        for category in categories {
-            if inspect_category_is_off(&snapshot.config.inspect, category) {
-                continue;
-            }
-            if !category.is_active() {
-                submission.errors.push(Tier2RunSubmissionError {
-                    category,
-                    message: format!("inspect category '{category}' is disabled in v0.33"),
-                });
-                continue;
-            }
-            if !category.is_tier2() {
-                submission.errors.push(Tier2RunSubmissionError {
-                    category,
-                    message: format!("inspect category '{category}' is not a Tier 2 category"),
-                });
-                continue;
-            }
-            requested.push(category);
-        }
-
-        if requested.is_empty() {
-            return submission;
-        }
-        if !self.heavy_root_work_allowed() {
-            for category in requested {
-                submission.errors.push(Tier2RunSubmissionError {
-                    category,
-                    message: Self::heavy_root_work_block_message(category),
-                });
-            }
-            return submission;
-        }
-        if !self.automatic_tier2_refresh_allowed() {
-            return submission;
-        }
-        // A category whose last build failed is not rebuilt by every
-        // automatic refresh: it waits out its retry pause. An explicit
-        // `aft_inspect` takes the blocking path and is not held back.
-        requested.retain(|category| match self.tier2_retry_pause(*category) {
-            Some(pause) => {
-                submission.retry_paused.push(pause);
-                false
-            }
-            None => true,
-        });
-        requested.retain(|category| match self.tier2_resource_wait(*category) {
-            Some(wait) => {
-                submission.resource_waits.push(wait);
-                false
-            }
-            None => true,
-        });
-        if requested.is_empty() {
-            return submission;
-        }
-        self.automatic_tier2_schedule_count
-            .fetch_add(requested.len() as u64, Ordering::SeqCst);
-
-        let mut in_flight = match self.in_flight.lock() {
-            Ok(in_flight) => in_flight,
-            Err(_) => {
-                for category in requested {
-                    submission.errors.push(Tier2RunSubmissionError {
-                        category,
-                        message: "inspect in-flight map lock poisoned".to_string(),
-                    });
-                }
-                return submission;
-            }
-        };
-
-        let mut started = Vec::new();
-        for category in requested {
-            let key = JobKey::for_project_category(category);
-            submission.queued_categories.push(category);
-            if in_flight.contains_key(&key) {
-                continue;
-            }
-            in_flight.insert(key.clone(), InFlightRegistration::new(Vec::new()));
-            started.push(key);
-            submission.newly_queued_categories.push(category);
-        }
-        drop(in_flight);
-        for key in &started {
-            self.record_flight_start(key);
-        }
-
-        if submission.newly_queued_categories.is_empty() {
-            return submission;
-        }
-
-        let limiter = self.cold_build_limiter();
-        let request = cold_build_limiter::ColdBuildAdmissionRequest::for_root(
-            snapshot.project_root.display().to_string(),
-            "tier2-serial-background",
-            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
-        );
-        let Some(permit) =
-            cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
-        else {
-            let deferred = submission.newly_queued_categories.clone();
-            if let Ok(mut in_flight) = self.in_flight.lock() {
-                for category in &deferred {
-                    in_flight.remove(&JobKey::for_project_category(*category));
-                }
-            }
-            for category in &deferred {
-                self.clear_builder_state(&JobKey::for_project_category(*category));
-            }
-            submission
-                .queued_categories
-                .retain(|category| !deferred.contains(category));
-            submission.deferred_categories = deferred;
-            submission.newly_queued_categories.clear();
-            return submission;
-        };
-
-        let permit_slot = Arc::new(Mutex::new(Some(permit)));
-        let categories_for_worker = submission.newly_queued_categories.clone();
-        for category in &categories_for_worker {
-            self.view_refresh_dispatched(&snapshot.project_root, *category);
-        }
-        let manager = Arc::clone(self);
-        let pool = Arc::clone(&self.pool);
-        let cancellation = self
-            .root_work_cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let cancellation = cancellation.with_root(&snapshot.project_root);
-        pool.spawn_fifo(move || {
-            let _cancel = crate::executor::install_job_cancellation(cancellation);
-            for category in categories_for_worker {
-                let job = manager.tier2_reuse_job(snapshot.clone(), category, None);
-                let _flight = manager.tier2_flight_exit_guard(job.key.clone());
-                let permit_available = permit_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some();
-                let result = if permit_available {
-                    manager.tier2_run_with_reuse_job_result_catching(
-                        job,
-                        Tier2ReuseOptions::default(),
-                        Some(Arc::clone(&permit_slot)),
-                    )
-                } else {
-                    InspectResult::failed(
-                        &job,
-                        "serial Tier-2 run stopped after the limiter slot deadline",
-                        Duration::ZERO,
-                    )
-                };
-                manager.route_tier2_reuse_completion(result);
-            }
-        });
-
-        submission
-    }
-
     pub fn tier2_any_in_flight(&self) -> bool {
         self.in_flight
             .lock()
@@ -2598,21 +1612,6 @@ impl InspectManager {
         self.finish_tier2_flight(&key, outcome);
     }
 
-    /// Bring every armed resource retry due now, standing in for its delay
-    /// elapsing, so a test need not sleep through the real backoff.
-    #[cfg(test)]
-    pub(crate) fn expire_tier2_resource_waits_for_test(&self) {
-        let mut states = self
-            .builder_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for entry in states.values_mut() {
-            if entry.resource_retry_at.is_some() {
-                entry.resource_retry_at = Some((Instant::now(), unix_millis_now()));
-            }
-        }
-    }
-
     /// Release per-project inspect caches so their SQLite readers and writer
     /// leases do not remain open after a root has gone idle. Callers must check
     /// [`Self::tier2_any_in_flight`] first so a running scan never loses its
@@ -2632,9 +1631,6 @@ impl InspectManager {
             gates.clear();
         }
         self.clear_callgraph_projection();
-        if let Ok(mut verified) = self.checkout_view_verification.lock() {
-            *verified = None;
-        }
         if let Ok(mut facts) = self.oxc_facts_cache.lock() {
             *facts = OxcFactsCache::new();
         }
@@ -2703,55 +1699,16 @@ impl InspectManager {
             .count_u64("callgraph_projection_snapshot_bytes", bytes)
     }
 
-    fn cached_callgraph_projection(
-        &self,
-        identity: &CallgraphProjectionIdentity,
-    ) -> Option<Arc<CallgraphSnapshot>> {
-        let snapshot = {
-            let projection = self.callgraph_projection.lock().ok()?;
-            projection
-                .as_ref()
-                .filter(|cached| cached.identity == *identity)
-                .map(|cached| Arc::clone(&cached.snapshot))
-        }?;
-        if let Ok(mut fleet) = projection_fleet().lock() {
-            fleet.touch(&identity.project_root);
-        }
-        Some(snapshot)
-    }
-
-    fn previous_callgraph_projection(
-        &self,
-        identity: &CallgraphProjectionIdentity,
-    ) -> Option<(u64, Arc<CallgraphSnapshot>)> {
-        let previous = {
-            let projection = self.callgraph_projection.lock().ok()?;
-            let cached = projection.as_ref()?;
-            let mut expected = identity.clone();
-            expected.write_revision = cached.identity.write_revision;
-            (cached.identity == expected)
-                .then(|| (cached.identity.write_revision, Arc::clone(&cached.snapshot)))
-        }?;
-        if let Ok(mut fleet) = projection_fleet().lock() {
-            fleet.touch(&identity.project_root);
-        }
-        Some(previous)
-    }
-
-    fn callgraph_projection_costs(
-        &self,
-        identity: &CallgraphProjectionIdentity,
-    ) -> ProjectionCostEstimates {
-        self.callgraph_projection
-            .lock()
-            .ok()
-            .and_then(|projection| {
-                projection
-                    .as_ref()
-                    .filter(|cached| cached.identity.project_root == identity.project_root)
-                    .map(|cached| cached.costs)
-            })
-            .unwrap_or_default()
+    /// The full-graph projection this root's manager holds, if any, so a
+    /// memory census that reaches the same snapshot elsewhere (the data
+    /// layer's dead-code memo) leaves it to the projection's figure. `None`
+    /// when there is none, or when its slot is held: that figure then counts
+    /// nothing.
+    pub(crate) fn try_callgraph_projection_snapshot(&self) -> Option<Arc<CallgraphSnapshot>> {
+        let projection = self.callgraph_projection.try_lock().ok()?;
+        projection
+            .as_ref()
+            .map(|projection| Arc::clone(&projection.snapshot))
     }
 
     fn observe_callgraph_projection_cost(
@@ -2768,85 +1725,6 @@ impl InspectManager {
                 cached.costs.observe(verdict, elapsed);
             }
         }
-    }
-
-    fn cache_callgraph_projection(
-        &self,
-        identity: CallgraphProjectionIdentity,
-        snapshot: Arc<CallgraphSnapshot>,
-    ) {
-        let estimated_bytes = estimate_callgraph_snapshot_bytes(snapshot.as_ref());
-        crate::slog_info!("projection memory: ordinary={} initializer={} initializer_groups={} initializer_targets={} owned_bytes={}", snapshot.outbound_calls.len(), snapshot.go_initializers.iter().map(|g| g.edge_count()).sum::<usize>(), snapshot.go_initializers.len(), snapshot.go_initializers.iter().map(|g| g.targets.len()).sum::<usize>(), estimated_bytes);
-        let root = identity.project_root.clone();
-        if let Ok(mut cached) = self.callgraph_projection.lock() {
-            let previous = cached.take();
-            let costs = previous
-                .as_ref()
-                .filter(|cached| cached.identity.project_root == root)
-                .map(|cached| cached.costs)
-                .unwrap_or_default();
-            let rollup = previous.and_then(|cached| cached.rollup);
-            *cached = Some(CachedCallgraphProjection {
-                identity,
-                snapshot,
-                estimated_bytes,
-                costs,
-                rollup,
-            });
-        } else {
-            return;
-        }
-        if let Ok(mut fleet) = projection_fleet().lock() {
-            fleet.admit(
-                root,
-                Arc::downgrade(&self.callgraph_projection),
-                estimated_bytes,
-                DEAD_CODE_SNAPSHOT_FLEET_BUDGET,
-            );
-        }
-    }
-
-    fn previous_dead_code_rollup_state(
-        &self,
-        project_root: &Path,
-    ) -> Option<Arc<super::scanners::dead_code::DeadCodeRollupState>> {
-        let cached = self.callgraph_projection.lock().ok()?;
-        let cached = cached.as_ref()?;
-        let (identity, state) = cached.rollup.as_ref()?;
-        (identity.project_root == project_root
-            && identity.generation == cached.identity.generation
-            && identity.legacy_sqlite_path == cached.identity.legacy_sqlite_path)
-            .then(|| Arc::clone(state))
-    }
-
-    fn cache_dead_code_rollup_state(
-        &self,
-        project_root: &Path,
-        state: super::scanners::dead_code::DeadCodeRollupState,
-        snapshot: &CallgraphSnapshot,
-    ) {
-        if let Ok(mut cached) = self.callgraph_projection.lock() {
-            if let Some(cached) = cached.as_mut().filter(|cached| {
-                cached.identity.project_root == project_root
-                    && std::ptr::eq(cached.snapshot.as_ref(), snapshot)
-            }) {
-                cached.rollup = Some((cached.identity.clone(), Arc::new(state)));
-            }
-        }
-    }
-
-    fn current_dead_code_rollup_state(
-        &self,
-        project_root: &Path,
-        snapshot: &CallgraphSnapshot,
-    ) -> Option<Arc<super::scanners::dead_code::DeadCodeRollupState>> {
-        let cached = self.callgraph_projection.lock().ok()?;
-        let cached = cached.as_ref()?;
-        let (identity, state) = cached.rollup.as_ref()?;
-        (identity.project_root == project_root
-            && *identity == cached.identity
-            && std::ptr::eq(cached.snapshot.as_ref(), snapshot))
-        .then(|| Arc::clone(state))
     }
 
     fn clear_callgraph_projection(&self) {
@@ -2881,6 +1759,115 @@ impl InspectManager {
         .map(|(snapshot, _, _)| snapshot)
     }
 
+    /// Lets dead code at `project_root` read its call graph from the data
+    /// layer's `checkout` whenever that graph is ready, in place of today's
+    /// database (see `data_layer::tools::inspect`).
+    pub(crate) fn read_dead_code_from_data_layer(
+        &self,
+        project_root: &Path,
+        checkout: &Arc<crate::data_layer::runtime::DataCheckout>,
+    ) {
+        self.data_layer_dead_code.bind(project_root, checkout);
+    }
+
+    /// Note that an `aft_inspect` which read the dead-code graph finished at
+    /// `now`, and make sure a thread will release the graph once it has gone
+    /// [`DEAD_CODE_GRAPH_IDLE_RELEASE`] without another such request.
+    pub(crate) fn note_dead_code_request(self: &Arc<Self>, now: Instant) {
+        self.record_dead_code_request(now);
+        if self.dead_code_release_armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let manager = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("aft-dead-code-release".into())
+            .spawn(move || loop {
+                // Hold the manager only while checking, so dropping the
+                // manager ends the thread at its next wake-up.
+                let Some(current) = manager.upgrade() else {
+                    return;
+                };
+                match current.release_idle_dead_code_graph(Instant::now()) {
+                    DeadCodeGraphRelease::KeepFor(wait) => {
+                        drop(current);
+                        std::thread::sleep(wait);
+                    }
+                    DeadCodeGraphRelease::Released | DeadCodeGraphRelease::NotHeld => {
+                        current
+                            .dead_code_release_armed
+                            .store(false, Ordering::SeqCst);
+                        // A request noted while this thread was deciding found
+                        // it armed and started none; keep watching for it.
+                        let pending = current
+                            .last_dead_code_request
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_some();
+                        if !pending || current.dead_code_release_armed.swap(true, Ordering::SeqCst)
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        if spawned.is_err() {
+            self.dead_code_release_armed.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Record a dead-code request at `now` without arming the release thread.
+    pub(crate) fn record_dead_code_request(&self, now: Instant) {
+        *self
+            .last_dead_code_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
+    }
+
+    /// Release the dead-code graph once [`DEAD_CODE_GRAPH_IDLE_RELEASE`] has
+    /// passed since the last dead-code request, as of `now`: the call-graph
+    /// projection, the Oxc facts and the dead-code snapshot each bound
+    /// checkout's view keeps. A dead-code or unused-exports run still in
+    /// flight keeps the graph until it finishes.
+    pub(crate) fn release_idle_dead_code_graph(&self, now: Instant) -> DeadCodeGraphRelease {
+        let mut last = self
+            .last_dead_code_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(requested_at) = *last else {
+            return DeadCodeGraphRelease::NotHeld;
+        };
+        let idle = now.saturating_duration_since(requested_at);
+        if idle < DEAD_CODE_GRAPH_IDLE_RELEASE {
+            return DeadCodeGraphRelease::KeepFor(DEAD_CODE_GRAPH_IDLE_RELEASE - idle);
+        }
+        let reading_graph = self.in_flight.lock().is_ok_and(|in_flight| {
+            in_flight.keys().any(|key| {
+                matches!(
+                    key.category,
+                    InspectCategory::DeadCode | InspectCategory::UnusedExports
+                )
+            })
+        });
+        if reading_graph {
+            return DeadCodeGraphRelease::KeepFor(Duration::from_secs(60));
+        }
+        *last = None;
+        drop(last);
+        self.clear_callgraph_projection();
+        if let Ok(mut facts) = self.oxc_facts_cache.lock() {
+            *facts = OxcFactsCache::new();
+        }
+        let snapshots = self.data_layer_dead_code.release_dead_code_snapshots();
+        crate::slog_info!(
+            "dead-code graph released after {} idle minutes: checkout snapshots={snapshots}",
+            DEAD_CODE_GRAPH_IDLE_RELEASE.as_secs() / 60
+        );
+        // Return what the graph held to the system rather than leaving it as
+        // free allocator space.
+        crate::memory::spawn_allocator_slack_relief_if_due(Instant::now());
+        DeadCodeGraphRelease::Released
+    }
+
     /// Build the dead-code snapshot and report how it was produced, so the
     /// `perf tier2 phases` line can name the projection verdict instead of
     /// leaving the operator to infer it from timings.
@@ -2892,6 +1879,11 @@ impl InspectManager {
         refresh_paths: &[PathBuf],
     ) -> Result<Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)>, CallGraphStoreError>
     {
+        // While this waits, a dead-code pass that inspect stops waiting for
+        // is reported as waiting for the call graph, not as working out dead
+        // code (see `dead_code_pending_reason`).
+        let _waiting = (job.category == InspectCategory::DeadCode)
+            .then(|| CountedWait::start(&self.dead_code_callgraph_waits));
         build_tier2_callgraph_snapshot_with_refresh_inner(
             job,
             allow_cold_build,
@@ -2938,79 +1930,9 @@ impl InspectManager {
         self.cache_for_paths(snapshot.inspect_dir.clone(), snapshot.project_root.clone())
     }
 
-    /// Latest persisted counts for the three Tier-2 categories, in
-    /// `(dead_code, unused_exports, duplicates)` order. Reads the most recent
-    /// aggregate regardless of contribution-hash freshness (last-known), so the
-    /// agent status bar can refresh after a background scan completes without a
-    /// freshness round-trip. A category with no readable aggregate reports
-    /// `None` (never a fabricated `0`), so the status bar can preserve any
-    /// last-known value and stay suppressed until every category is real. Status
-    /// observation only uses resident caches; it never acquires a writer lease.
-    pub fn latest_tier2_counts(
-        &self,
-        inspect_dir: PathBuf,
-        project_root: PathBuf,
-    ) -> (Option<usize>, Option<usize>, Option<usize>) {
-        let dead_code_unavailable = self.dead_code_borrow_only_unavailable(&project_root);
-        let Some(cache) = self.resident_cache_for_paths(inspect_dir, project_root) else {
-            return (None, None, None);
-        };
-        let count_of = |category: InspectCategory| -> Option<usize> {
-            cache
-                .latest_aggregate_any_hash(category)
-                .ok()
-                .flatten()
-                .and_then(|payload| {
-                    if category == InspectCategory::DeadCode
-                        && payload
-                            .get("callgraph_available")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(false)
-                    {
-                        return None;
-                    }
-                    payload
-                        .get("count")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|count| count as usize)
-                })
-        };
-        (
-            if dead_code_unavailable {
-                None
-            } else {
-                count_of(InspectCategory::DeadCode)
-            },
-            count_of(InspectCategory::UnusedExports),
-            count_of(InspectCategory::Duplicates),
-        )
-    }
-
-    /// Whether the latest dead-code pass for `project_root` found dead code
-    /// unavailable because the root is borrow-only.
-    pub fn dead_code_borrow_only_unavailable(&self, project_root: &Path) -> bool {
-        let root = crate::inspect::job::canonicalize_normalized(project_root);
-        self.dead_code_borrow_only_roots
-            .lock()
-            .map(|roots| roots.contains(&root))
-            .unwrap_or(false)
-    }
-
-    fn set_dead_code_borrow_only_unavailable(&self, project_root: &Path, unavailable: bool) {
-        let root = crate::inspect::job::canonicalize_normalized(project_root);
-        if let Ok(mut roots) = self.dead_code_borrow_only_roots.lock() {
-            if unavailable {
-                roots.insert(root);
-            } else {
-                roots.remove(&root);
-            }
-        }
-    }
-
     /// Latest project-wide TODO count, or `None` when no project-scoped todos
     /// scan has completed yet. Todos is a Tier-1 category whose result lives in
-    /// the cache's in-memory aggregates rather than the Tier-2 table, so
-    /// [`Self::latest_tier2_counts`] cannot see it.
+    /// the cache's in-memory aggregates rather than the Tier-2 table.
     pub fn latest_project_todos_count(
         &self,
         inspect_dir: PathBuf,
@@ -3028,32 +1950,6 @@ impl InspectManager {
             .get("count")
             .and_then(serde_json::Value::as_u64)
             .map(|count| count as usize)
-    }
-
-    /// Whether the latest persisted dead_code aggregate reported
-    /// `callgraph_available:false` — i.e. dead_code was suppressed because the
-    /// callgraph store was not ready when it scanned. Health uses this to avoid
-    /// reporting tier2 as permanently "building" for a root whose only missing
-    /// category is dead_code blocked on the callgraph store. Mirrors the
-    /// suppression rule in [`Self::latest_tier2_counts`].
-    pub fn dead_code_blocked_on_callgraph(
-        &self,
-        inspect_dir: PathBuf,
-        project_root: PathBuf,
-    ) -> bool {
-        let Some(cache) = self.resident_cache_for_paths(inspect_dir, project_root) else {
-            return false;
-        };
-        cache
-            .latest_aggregate_any_hash(InspectCategory::DeadCode)
-            .ok()
-            .flatten()
-            .and_then(|payload| {
-                payload
-                    .get("callgraph_available")
-                    .and_then(serde_json::Value::as_bool)
-            })
-            == Some(false)
     }
 
     fn cache_identity(
@@ -3111,12 +2007,7 @@ impl InspectManager {
     }
 
     fn wake_cache_writer_if_available(&self, identity: &InspectCacheIdentity) {
-        wake_cache_writer_if_available(
-            identity,
-            &self.builder_states,
-            &self.cache_writer_waits,
-            &self.caches,
-        );
+        wake_cache_writer_if_available(identity, &self.cache_writer_waits, &self.caches);
     }
 
     fn watch_cache_writer(&self, dir: &Path, identity: InspectCacheIdentity) {
@@ -3130,7 +2021,6 @@ impl InspectManager {
             return;
         };
         let lease = crate::root_cache::writer_lease_path(&dir);
-        let states = Arc::clone(&self.builder_states);
         let waits = Arc::clone(&self.cache_writer_waits);
         let caches = Arc::clone(&self.caches);
         let watched_identity = identity.clone();
@@ -3142,7 +2032,7 @@ impl InspectManager {
             if let Ok(event) = event {
                 let release = crate::callgraph_store::refresh_lease_release_event(&event, &lease);
                 if release {
-                    wake_cache_writer_if_available(&watched_identity, &states, &waits, &caches);
+                    wake_cache_writer_if_available(&watched_identity, &waits, &caches);
                 }
                 #[cfg(test)]
                 if let Some(observer) = &event_observer {
@@ -3311,6 +2201,25 @@ impl InspectManager {
         run_tier2_scan(job, oxc)
     }
 
+    /// [`Self::scan_with_file_progress`] for a scan whose files' facts are
+    /// stored and rolled up later with every other file's: dead code then
+    /// skips working out an aggregate of these files alone, which nothing
+    /// reads.
+    fn scan_facts_with_file_progress(
+        &self,
+        job: &InspectJob,
+        oxc: Option<&OxcEngineResult>,
+    ) -> InspectResult {
+        if job.category != InspectCategory::DeadCode {
+            return self.scan_with_file_progress(job, oxc);
+        }
+        let _files = self
+            .file_progress
+            .get(&job.category)
+            .map(|progress| progress.enter());
+        super::scanners::dead_code::run_dead_code_facts_scan_with_oxc(job, oxc)
+    }
+
     pub fn tier2_run_with_reuse(
         &self,
         snapshot: InspectSnapshot,
@@ -3353,6 +2262,7 @@ impl InspectManager {
 
         match waiter_rx.recv() {
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                &self.data_layer_dead_code,
                 Some(self),
                 outcome,
                 &snapshot,
@@ -3364,68 +2274,6 @@ impl InspectManager {
                 message: "inspect Tier-2 waiter dropped without a terminal outcome".to_string(),
             },
         }
-    }
-
-    /// Run against the request's already waited, pinned view reader. This path
-    /// bypasses background reuse so a previous generation cannot answer a newer
-    /// request. An unavailable reader never falls back to a legacy database.
-    pub fn tier2_run_with_pinned_view(
-        self: &Arc<Self>,
-        mut snapshot: InspectSnapshot,
-        category: InspectCategory,
-        scope: JobScope,
-        store: Option<Arc<crate::callgraph_store::ReadonlyCallGraphStore>>,
-    ) -> JobOutcome {
-        if inspect_category_is_off(&snapshot.config.inspect, category) {
-            return JobOutcome::off();
-        }
-        if let Err(outcome) = validate_tier2_read_category(category) {
-            return outcome;
-        }
-        if !self.heavy_root_work_allowed() {
-            return JobOutcome::Failed {
-                message: Self::heavy_root_work_block_message(category),
-            };
-        }
-        let projected = store
-            .as_ref()
-            .filter(|_| category == InspectCategory::DeadCode)
-            .and_then(|store| {
-                crate::callgraph_store::project_dead_code_snapshot_from_view(store)
-                    .ok()
-                    .map(|(_, snapshot, _, _)| Arc::new(snapshot))
-            });
-        let mut config = (*snapshot.config).clone();
-        config.indexes.callgraph = false;
-        snapshot.config = Arc::new(config);
-        let mut job = self.tier2_reuse_job(snapshot, category, projected);
-        job.scope_files = scope_files(
-            &job.project_root,
-            &JobScope::for_project(job.project_root.clone()),
-        );
-        let oxc = match self.oxc_result_for_scan(&job, &job.scope_files, &[]) {
-            Ok(oxc) => oxc,
-            Err(message) => return JobOutcome::Failed { message },
-        };
-        let result = self.scan_with_file_progress(&job, oxc.as_ref());
-        // A view projection needs no inspect writer either. Persisting with the
-        // temporary no-legacy-fallback config would also poison cache identity.
-        let outcome = match result.outcome {
-            Ok(success) => JobOutcome::Fresh {
-                // Scope full contributions before capping rows, just like the
-                // persisted read path. Otherwise out-of-scope rows can exhaust
-                // the project-wide cap and hide all of this scope's findings.
-                payload: if scope.is_project_wide() {
-                    success.aggregate
-                } else {
-                    let full =
-                        roll_up_tier2_contributions_with_limit(&job, &success.contributions, None);
-                    filter_payload_for_scope(full, &scope)
-                },
-            },
-            Err(message) => JobOutcome::Failed { message },
-        };
-        filter_outcome_for_scope(outcome, &scope)
     }
 
     /// Run a Tier-2 category to a terminal outcome for an explicit inspect.
@@ -3538,49 +2386,7 @@ impl InspectManager {
         Ok(true)
     }
 
-    fn wait_for_tier2_reuse_waiter_for_debug(&self, job: &InspectJob) {
-        #[cfg(not(debug_assertions))]
-        let _ = job;
-        #[cfg(debug_assertions)]
-        {
-            const WAIT_ROOT_ENV: &str = "AFT_TEST_TIER2_REUSE_WAIT_FOR_WAITER_ROOT";
-            if std::env::var_os(WAIT_ROOT_ENV).is_none()
-                || !env_project_root_matches(WAIT_ROOT_ENV, &job.project_root)
-            {
-                return;
-            }
-
-            // This test gate releases on the actual waiter registration, not elapsed
-            // wall-clock time, so a queued background job cannot finish before the
-            // direct-reuse request has attached on a contended runner.
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut in_flight = self
-                .in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            loop {
-                match in_flight.get(&job.key) {
-                    Some(registration) if registration.waiters.is_empty() => {}
-                    _ => return,
-                }
-                let now = Instant::now();
-                if now >= deadline {
-                    return;
-                }
-                let (next, wait_result) = self
-                    .in_flight_changed
-                    .wait_timeout(in_flight, deadline.saturating_duration_since(now))
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                in_flight = next;
-                if wait_result.timed_out() {
-                    return;
-                }
-            }
-        }
-    }
-
     fn spawn_tier2_reuse_job(self: &Arc<Self>, job: InspectJob, options: Tier2ReuseOptions) {
-        self.view_refresh_dispatched(&job.project_root, job.category);
         // Rebinds retain the persisted contribution cache. Let quick reuse prove
         // that cache before joining the cold-build queue, so an unchanged root can
         // answer immediately even while unrelated background builds own the slots.
@@ -3608,6 +2414,7 @@ impl InspectManager {
             // Scoped completions need the shared scan's revision-checked graph
             // and contribution-checked rollup, not a full projection per waiter.
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                &self.data_layer_dead_code,
                 Some(self),
                 outcome,
                 snapshot,
@@ -3625,8 +2432,8 @@ impl InspectManager {
     /// scanner — returns the latest cached aggregate if present and verifies
     /// its contribution freshness so warm cache hits are reported as fresh.
     /// This is the non-blocking variant intended for the synchronous `inspect`
-    /// command path; Tier 2 scans run via the watcher-driven scheduler or the
-    /// compatibility `aft_inspect_tier2_run` command.
+    /// command path; Tier 2 scans run only from an explicit `aft_inspect`
+    /// through the blocking variants.
     pub fn tier2_read_cached(
         &self,
         snapshot: InspectSnapshot,
@@ -3706,6 +2513,7 @@ impl InspectManager {
             Ok(Some(payload)) => {
                 match self.tier2_cached_aggregate_is_fresh(snapshot, category, cache) {
                     Ok(true) => filter_outcome_for_scope_with_contributions(
+                        &self.data_layer_dead_code,
                         // Only verified source inventories may reuse a rollup.
                         // Stale/last-complete reads still reconstruct it below.
                         Some(self),
@@ -3716,6 +2524,7 @@ impl InspectManager {
                         caller_scope,
                     ),
                     Ok(false) => filter_outcome_for_scope_with_contributions(
+                        &self.data_layer_dead_code,
                         None,
                         JobOutcome::Stale {
                             cached: Some(payload),
@@ -3731,6 +2540,7 @@ impl InspectManager {
             }
             Ok(None) => match cache.latest_aggregate_any_hash(category) {
                 Ok(Some(payload)) => filter_outcome_for_scope_with_contributions(
+                    &self.data_layer_dead_code,
                     None,
                     JobOutcome::Stale {
                         cached: Some(payload),
@@ -3853,7 +2663,6 @@ impl InspectManager {
             );
         }
         self.reuse_starts.fetch_add(1, Ordering::SeqCst);
-        self.wait_for_tier2_reuse_waiter_for_debug(&job);
         panic_tier2_reuse_for_debug(&job);
         if !job.category.is_active() {
             let result = InspectResult::failed(
@@ -3887,12 +2696,22 @@ impl InspectManager {
             return result;
         }
 
+        // A root whose first call graph isn't published yet has nothing to
+        // analyse; wait for that build as any exact reader does (the inspect
+        // call's own deadline may still answer pending first, naming the call
+        // graph), and answer pending only if the graph is still missing.
         if job.category == InspectCategory::DeadCode
             && job.config.indexes.callgraph
-            && !job.config.views.enabled
-            && callgraph_store_busy_for_dead_code(&job.inspect_dir, &job.project_root)
+            && self.data_layer_dead_code.callgraph_busy(&job.project_root)
         {
-            return callgraph_pending_result(&job, started.elapsed());
+            let still_missing = {
+                let _waiting = CountedWait::start(&self.dead_code_callgraph_waits);
+                self.data_layer_dead_code
+                    .wait_for_first_callgraph(&job.project_root)
+            };
+            if still_missing {
+                return callgraph_pending_result(&job, started.elapsed());
+            }
         }
 
         let project_scope = JobScope::for_project(job.project_root.clone());
@@ -3904,10 +2723,17 @@ impl InspectManager {
             .take()
             .filter(|inventory| inventory.matches(&job.project_root))
             .unwrap_or_else(|| {
-                Arc::new(super::inventory::InspectInventory::collect(
-                    &job.project_root,
-                    || !crate::executor::current_job_cancelled(),
-                ))
+                // The bound index-store checkout already lists the folder's
+                // files; walk it only when no checkout can stand in.
+                Arc::new(
+                    self.data_layer_dead_code
+                        .inventory(&job.project_root)
+                        .unwrap_or_else(|| {
+                            super::inventory::InspectInventory::collect(&job.project_root, || {
+                                !crate::executor::current_job_cancelled()
+                            })
+                        }),
+                )
             });
         let _inventory = inventory.install();
         if crate::executor::current_job_cancelled() {
@@ -4059,6 +2885,46 @@ impl InspectManager {
     /// the rollup (logged) rather than blocking it: the scanner produces a
     /// contribution for every file it is given, so this only covers a file
     /// that vanished or was renamed between the walk and the scan.
+    /// Dead code for `job`'s scope files over `snapshot`, which carries the
+    /// data layer's call graph: read from the dead-code graph kept for the
+    /// graph's publication, or worked out from the files' stored facts. The
+    /// per-file facts the inspect cache holds are not read.
+    fn data_layer_dead_code_aggregate(
+        &self,
+        job: &InspectJob,
+        snapshot: &CallgraphSnapshot,
+    ) -> Result<Value, String> {
+        let started = Instant::now();
+        let public_api_files =
+            super::scanners::dead_code::collect_public_api_files(&job.project_root);
+        let roles = super::entry_points::resolve_project_roles(&job.project_root);
+        let mut timings = Vec::new();
+        let oxc = |files: &[PathBuf]| self.oxc_result_for_scan(job, files, &[]);
+        let mut aggregate = super::scanners::dead_code::section::aggregate_from_view(
+            job,
+            snapshot,
+            &oxc,
+            &public_api_files,
+            &roles,
+            &mut timings,
+            super::scanners::dead_code::section::Use::Kept,
+            None,
+        )?;
+        super::job::attach_dead_code_language_coverage(&mut aggregate, &job.scope_files);
+        crate::slog_info!(
+            "perf tier2_dead_code_rollup: root={} files={} ms={} phases={}",
+            job.project_root.display(),
+            job.scope_files.len(),
+            started.elapsed().as_millis(),
+            timings
+                .iter()
+                .map(|(label, value)| format!("{label}={value:.0}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        Ok(aggregate)
+    }
+
     fn fill_missing_dead_code_facts(
         &self,
         aggregate_job: &InspectJob,
@@ -4079,7 +2945,7 @@ impl InspectManager {
         fill_job.scope_files = missing.clone();
         let oxc_result = self.oxc_result_for_scan(&fill_job, &fill_job.scope_files, &missing)?;
         let filled = self
-            .scan_with_file_progress(&fill_job, oxc_result.as_ref())
+            .scan_facts_with_file_progress(&fill_job, oxc_result.as_ref())
             .outcome
             .map_err(|message| {
                 format!("dead_code scan of files without facts failed: {message}")
@@ -4166,7 +3032,6 @@ impl InspectManager {
         cache: &InspectCache,
         options: &Tier2ReuseOptions,
     ) -> Result<InspectScanSuccess, Tier2RunError> {
-        let view_epoch = self.view_publication_epoch(&job.project_root);
         let mut phases = Tier2PhaseTimings::default();
         self.record_build_progress(
             &job.key,
@@ -4330,13 +3195,7 @@ impl InspectManager {
                         phases.projection = Some(verdict);
                         phases.projection_cost += projection_cost;
                     }
-                    None => {
-                        phases.projection_skip_reason = Some(if job.config.views.enabled {
-                            "view_unavailable"
-                        } else {
-                            "no_callgraph"
-                        })
-                    }
+                    None => phases.projection_skip_reason = Some("no_callgraph"),
                 }
                 phases.snapshot += snapshot_started.elapsed();
             }
@@ -4354,7 +3213,7 @@ impl InspectManager {
             );
             let oxc_result =
                 self.oxc_result_for_scan(&scan_job, &scan_job.scope_files, &force_reparse_files)?;
-            let scan_result = self.scan_with_file_progress(&scan_job, oxc_result.as_ref());
+            let scan_result = self.scan_facts_with_file_progress(&scan_job, oxc_result.as_ref());
             phases.scan += scan_started.elapsed();
             phases.scanned_files += scan_files.len();
             let scan_success = scan_result.outcome.map_err(|message| {
@@ -4468,13 +3327,7 @@ impl InspectManager {
                             phases.projection = Some(verdict);
                             phases.projection_cost += projection_cost;
                         }
-                        None => {
-                            phases.projection_skip_reason = Some(if job.config.views.enabled {
-                                "view_unavailable"
-                            } else {
-                                "no_callgraph"
-                            })
-                        }
+                        None => phases.projection_skip_reason = Some("no_callgraph"),
                     }
                     phases.snapshot += snapshot_started.elapsed();
                 }
@@ -4484,7 +3337,8 @@ impl InspectManager {
                     &rescan_job.scope_files,
                     &force_reparse_files,
                 )?;
-                let scan_result = self.scan_with_file_progress(&rescan_job, oxc_result.as_ref());
+                let scan_result =
+                    self.scan_facts_with_file_progress(&rescan_job, oxc_result.as_ref());
                 phases.scan += scan_started.elapsed();
                 phases.scanned_files += full_scan_files.len();
                 let scan_success = scan_result.outcome.map_err(|message| {
@@ -4556,52 +3410,13 @@ impl InspectManager {
                     phases.projection = Some(verdict);
                     phases.projection_cost += projection_cost;
                 }
-                None => {
-                    phases.projection_skip_reason = Some(if job.config.views.enabled {
-                        "view_unavailable"
-                    } else {
-                        "no_callgraph"
-                    })
-                }
+                None => phases.projection_skip_reason = Some("no_callgraph"),
             }
             phases.snapshot += snapshot_started.elapsed();
         }
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
-            if job.config.views.enabled {
-                let reason = current_view_projection_result(
-                    &job.project_root,
-                    &job.inspect_dir,
-                    &job.config,
-                    &callgraph_refresh_files,
-                )
-                .err()
-                .unwrap_or(CheckoutViewUnavailable::Unverified);
-                // Publication may finish between the projection attempt and
-                // recording its pending result. Preserve its epoch so the next
-                // maintenance tick can recover the missed publication wakeup.
-                if matches!(reason, CheckoutViewUnavailable::Pending)
-                    || (matches!(reason, CheckoutViewUnavailable::Unverified)
-                        && self.view_publication_epoch(&job.project_root) != view_epoch)
-                {
-                    self.note_view_pending(&job.project_root, view_epoch);
-                }
-                phases.projection_skip_reason = Some(reason.kind());
-                phases.log(job.category, &job.project_root);
-                // Preserve the last complete aggregate while publication is pending.
-                // Publishing the view requests a fresh pass even without another query.
-                return Ok(InspectScanSuccess {
-                    scanned_files: scan_files,
-                    contributions: Vec::new(),
-                    aggregate: serde_json::json!({
-                        "callgraph_available": false, "complete": false,
-                        "status": if matches!(reason, CheckoutViewUnavailable::Pending | CheckoutViewUnavailable::Busy) { "pending" } else { "unavailable" }, "code": reason.kind(),
-                        "reason": reason.reason(),
-                        "gaps": [{"kind": reason.kind(), "reason": reason.reason()}],
-                    }),
-                });
-            }
             if options.require_callgraph_snapshot {
                 if let Some(reason) = callgraph_path_identity_gap(job)? {
                     return Ok(InspectScanSuccess {
@@ -4619,7 +3434,6 @@ impl InspectManager {
             // cannot help. Return an unavailable result that names this cause
             // and carries no count, so it is not mistaken for zero dead code.
             if job.config.indexes.callgraph && job_is_borrow_only(job) {
-                self.set_dead_code_borrow_only_unavailable(&job.project_root, true);
                 return Ok(InspectScanSuccess {
                     scanned_files: scan_files,
                     contributions: Vec::new(),
@@ -4641,14 +3455,22 @@ impl InspectManager {
         if crate::executor::current_job_cancelled() {
             return Err("tier2 pass cancelled before rollup".to_string().into());
         }
-        if aggregate_job.category == InspectCategory::DeadCode {
-            // This pass reached a rollup, so dead code is not borrow-only
-            // unavailable any more.
-            self.set_dead_code_borrow_only_unavailable(&job.project_root, false);
-        }
-        let mut contributions = load_contributions(cache, &aggregate_job)?;
+        // Dead code over the data layer's call graph is worked out from the
+        // graph and the facts its content records store; the per-file facts
+        // the inspect cache holds only keep track of which files changed.
+        let data_layer_dead_code = aggregate_job.category == InspectCategory::DeadCode
+            && aggregate_job
+                .callgraph_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.data_layer.is_some());
+        let mut contributions = if data_layer_dead_code && !options.return_contributions {
+            Vec::new()
+        } else {
+            load_contributions(cache, &aggregate_job)?
+        };
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_some()
+            && !data_layer_dead_code
         {
             // Files scanned while no call graph was ready produce no dead-code
             // facts. If the graph became ready before this rollup, rolling up
@@ -4667,7 +3489,13 @@ impl InspectManager {
                 contributions = load_contributions(cache, &aggregate_job)?;
             }
         }
-        let aggregate = if aggregate_job.category == InspectCategory::DeadCode
+        let aggregate = if data_layer_dead_code {
+            let snapshot = aggregate_job
+                .callgraph_snapshot
+                .as_deref()
+                .expect("checked dead-code snapshot");
+            self.data_layer_dead_code_aggregate(&aggregate_job, snapshot)?
+        } else if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_some()
         {
             let snapshot = aggregate_job
@@ -4677,45 +3505,19 @@ impl InspectManager {
             let public_api_files =
                 super::scanners::dead_code::collect_public_api_files(&job.project_root);
             let roles = super::entry_points::resolve_project_roles(&job.project_root);
-            let mut changed_files = scan_files
-                .iter()
-                .filter_map(|path| path.strip_prefix(&job.project_root).ok())
-                .map(|path| path.to_string_lossy().replace('\\', "/"))
-                .collect::<BTreeSet<_>>();
-            // Forced paths are spelled by the host (backslashes on Windows);
-            // the rollup keys files by the contribution's own slash form.
-            changed_files.extend(
-                force_relative
-                    .iter()
-                    .map(|relative| relative.replace('\\', "/")),
-            );
-            let allow_incremental = phases
-                .projection
-                .is_some_and(|verdict| verdict.kind != ProjectionKind::Full);
-            let previous = allow_incremental
-                .then(|| self.previous_dead_code_rollup_state(&job.project_root))
-                .flatten();
-            let (mut aggregate, state, mut verdict) =
-                super::scanners::dead_code::aggregate_dead_code_contributions_incremental(
+            // Every rollup works out liveness from the whole graph: on the
+            // integer graph that costs little more than reusing an earlier
+            // rollup would.
+            let mut aggregate =
+                super::scanners::dead_code::aggregate_dead_code_contributions_with_snapshot(
                     &job.project_root,
                     snapshot,
                     &contributions,
                     &public_api_files,
                     &roles,
                     None,
-                    Some(&contribution_set_hash),
-                    previous.as_deref(),
-                    &changed_files,
                 );
             super::job::attach_dead_code_language_coverage(&mut aggregate, &job.scope_files);
-            if verdict.kind == super::scanners::dead_code::RollupKind::Full {
-                verdict.reason = phases
-                    .projection
-                    .and_then(|projection| projection.reason)
-                    .or(Some("cold"));
-            }
-            phases.rollup_verdict = Some(verdict);
-            self.cache_dead_code_rollup_state(&job.project_root, state, snapshot);
             aggregate
         } else {
             roll_up_tier2_contributions(&aggregate_job, &contributions)
@@ -4727,7 +3529,12 @@ impl InspectManager {
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
             .map_err(|error| error.to_string())?;
         phases.rollup = rollup_started.elapsed();
-        if let Some(verdict) = phases.projection {
+        // The cost estimates predict today's store projections; a snapshot
+        // from the data layer costs something else and is left out of them.
+        if let Some(verdict) = phases
+            .projection
+            .filter(|verdict| *verdict != DATA_LAYER_SNAPSHOT)
+        {
             self.observe_callgraph_projection_cost(
                 &job.project_root,
                 verdict,
@@ -4897,6 +3704,7 @@ impl InspectManager {
                 recv(waiter_rx) -> outcome => {
                     return match outcome {
                         Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                            &self.data_layer_dead_code,
                             None,
                             outcome,
                             &snapshot,
@@ -4956,6 +3764,7 @@ impl InspectManager {
     ) -> JobOutcome {
         match cache.get_aggregated_for_config(key, snapshot.config.as_ref()) {
             Ok(Some(cached)) => filter_outcome_for_scope_with_contributions(
+                &self.data_layer_dead_code,
                 None,
                 JobOutcome::Stale {
                     cached: Some(cached),
@@ -5011,15 +3820,9 @@ impl InspectManager {
         // counts and `~` marker would only update on a manual `aft_inspect`.
     }
 
-    /// Snapshot the cumulative count of reuse-path (watcher-driven) Tier-2
-    /// completions. The main-thread drain compares this against its last-seen
-    /// value to detect background scans that finished since the previous tick.
+    /// Snapshot the cumulative count of reuse-path Tier-2 completions.
     pub fn reuse_completion_count(&self) -> u64 {
         self.reuse_completions.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn successful_reuse_completion_count(&self) -> u64 {
-        self.successful_reuse_completions.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]
@@ -5125,9 +3928,6 @@ struct Tier2PhaseTimings {
     projection: Option<ProjectionVerdict>,
     /// Why a path completed without running the callgraph projection.
     projection_skip_reason: Option<&'static str>,
-    /// Whether dead-code reachability traversed the complete graph or only the
-    /// affected frontier.
-    rollup_verdict: Option<super::scanners::dead_code::RollupVerdict>,
 }
 
 const TIER2_WORK_LOG_THRESHOLD: Duration = Duration::from_millis(50);
@@ -5169,7 +3969,7 @@ impl Tier2PhaseTimings {
         if worked < TIER2_WORK_LOG_THRESHOLD {
             return;
         }
-        let key = crate::search_index::artifact_cache_key_for_build(project_root);
+        let key = crate::root_identity::key::artifact_cache_key_for_build(project_root);
         crate::slog_info!("{}", self.render(category, project_root, &key));
     }
 
@@ -5183,12 +3983,8 @@ impl Tier2PhaseTimings {
                         .unwrap_or_else(|| default_projection_skip_reason(category)),
                 )
             });
-        let rollup = self
-            .rollup_verdict
-            .map(render_rollup_suffix)
-            .unwrap_or_default();
         format!(
-            "perf tier2 phases category={} freshness={}ms snapshot={}ms projection_ms={} scan={}ms({} files) db={}ms(lock={},txn={}) rollup_ms={}{}{} root={} key={}",
+            "perf tier2 phases category={} freshness={}ms snapshot={}ms projection_ms={} scan={}ms({} files) db={}ms(lock={},txn={}) rollup_ms={}{} root={} key={}",
             category,
             self.freshness.as_millis(),
             self.snapshot.as_millis(),
@@ -5199,7 +3995,6 @@ impl Tier2PhaseTimings {
             self.db_lock.as_millis(),
             self.db_txn.as_millis(),
             self.rollup.as_millis(),
-            rollup,
             projection,
             crate::logging::normalize_index_root(project_root),
             key
@@ -5226,22 +4021,12 @@ fn render_no_projection_suffix(reason: &'static str) -> String {
 /// Render the `projection=...` suffix of the `perf tier2 phases` line for one
 /// dead-code snapshot verdict. `reason` is omitted for spliced and reused
 /// projections.
-fn render_rollup_suffix(verdict: super::scanners::dead_code::RollupVerdict) -> String {
-    let kind = match verdict.kind {
-        super::scanners::dead_code::RollupKind::Incremental => "incremental",
-        super::scanners::dead_code::RollupKind::Full => "full",
-    };
-    let reason = verdict
-        .reason
-        .map(|reason| format!(" reason={reason}"))
-        .unwrap_or_default();
-    format!(" rollup={kind}{reason}")
-}
-
 fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
     let kind = match verdict.kind {
+        #[cfg(test)]
         ProjectionKind::Spliced => "spliced",
         ProjectionKind::Full => "full",
+        #[cfg(test)]
         ProjectionKind::Reused => "reused",
     };
     let reason = match verdict.reason {
@@ -5260,23 +4045,41 @@ thread_local! {
     static SCOPE_FILE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {
-    if let Some(inventory) = super::inventory::current(project_root) {
-        return inventory
+pub(crate) fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {
+    let in_scope = |inventory: &super::inventory::InspectInventory| {
+        inventory
             .sources
             .iter()
             .filter(|path| scope.contains(path))
             .cloned()
-            .collect();
+            .collect::<Vec<_>>()
+    };
+    if let Some(inventory) = super::inventory::current(project_root) {
+        return in_scope(&inventory);
     }
+    // No caller installed a census on this thread (background jobs such as
+    // the status bar's TODO refresh never do): the root's bound index-store
+    // checkout lists the same files without touching the disk.
+    let miss = match crate::data_layer::tools::inspect::bound_inventory(project_root) {
+        Ok(inventory) => return in_scope(&inventory),
+        Err(miss) => miss,
+    };
     #[cfg(test)]
     let _profile = super::walk_profile::Walk::start("scope_files");
     #[cfg(test)]
     SCOPE_FILE_WALKS.with(|walks| walks.set(walks.get() + 1));
+    let started = Instant::now();
     let mut files = crate::callgraph::walk_project_files(project_root)
         .filter(|path| scope.contains(path))
         .collect::<Vec<_>>();
     files.sort();
+    crate::slog_info!(
+        "inspect scope files walked: reason={} files={} ms={} root={}",
+        miss.as_str(),
+        files.len(),
+        started.elapsed().as_millis(),
+        crate::logging::normalize_index_root(project_root)
+    );
     files
 }
 
@@ -5441,7 +4244,7 @@ thread_local! {
 }
 
 fn log_tier2_benchmark_category_start(job: &InspectJob) {
-    let key = crate::search_index::artifact_cache_key_for_build(&job.project_root);
+    let key = crate::root_identity::key::artifact_cache_key_for_build(&job.project_root);
     let scope = crate::logging::IndexBuildScope::new(
         crate::logging::IndexPlane::Tier2,
         &job.project_root,
@@ -5549,436 +4352,31 @@ fn build_tier2_callgraph_snapshot(
 }
 
 #[cfg(test)]
-fn build_tier2_callgraph_snapshot_with_refresh(
-    job: &InspectJob,
-    allow_cold_build: bool,
-    refresh_paths: &[PathBuf],
-) -> Option<Arc<CallgraphSnapshot>> {
-    build_tier2_callgraph_snapshot_with_refresh_inner(
-        job,
-        allow_cold_build,
-        false,
-        refresh_paths,
-        None,
-    )
-    .expect("test snapshot readiness")
-    .map(|(snapshot, _, _)| snapshot)
-}
-
-const BLOCKING_CALLGRAPH_STORE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
-const BLOCKING_CALLGRAPH_STORE_RETRY_INTERVAL: Duration = Duration::from_millis(20);
-
-fn open_ready_for_blocking_inspect(
-    callgraph_dir: &Path,
-    project_root: &Path,
-    wait_for_publication: bool,
-) -> Result<Option<CallGraphStore>, CallGraphStoreError> {
-    let deadline = Instant::now() + BLOCKING_CALLGRAPH_STORE_RETRY_TIMEOUT;
-    loop {
-        match CallGraphStore::open_ready_repairing(
-            callgraph_dir.to_path_buf(),
-            project_root.to_path_buf(),
-        ) {
-            Ok(None) if wait_for_publication && Instant::now() < deadline => {}
-            Err(error) if error.is_transient_lock_contention() && Instant::now() < deadline => {}
-            result => return result,
-        }
-        std::thread::sleep(BLOCKING_CALLGRAPH_STORE_RETRY_INTERVAL);
-    }
-}
-
-fn open_or_build_blocking_callgraph_store(
-    callgraph_dir: PathBuf,
-    project_root: PathBuf,
-    allow_cold_build: bool,
-    refresh_paths: &[PathBuf],
-) -> Result<Option<CallGraphStore>, CallGraphStoreError> {
-    if let Some(store) = open_ready_for_blocking_inspect(&callgraph_dir, &project_root, false)? {
-        return Ok(Some(store));
-    }
-    if !allow_cold_build || refresh_paths.is_empty() {
-        return Ok(None);
-    }
-
-    match CallGraphStore::cold_build_with_lease(
-        callgraph_dir.clone(),
-        project_root.clone(),
-        refresh_paths,
-    ) {
-        Ok((store, _)) => Ok(Some(store)),
-        Err(error)
-            if matches!(error, CallGraphStoreError::Unavailable(_))
-                || error.is_transient_lock_contention() =>
-        {
-            // The background builder and an inspect-triggered cold build can
-            // briefly meet on the same generation. Keep either lock loser on
-            // the Building/retry path instead of terminally failing inspect.
-            match open_ready_for_blocking_inspect(&callgraph_dir, &project_root, true)? {
-                Some(store) => Ok(Some(store)),
-                None => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn merge_callgraph_refresh_paths(
-    project_root: &Path,
-    refresh_paths: &[PathBuf],
-    stale: impl IntoIterator<Item = String>,
-) -> Vec<PathBuf> {
-    let mut paths = refresh_paths.to_vec();
-    for rel in stale {
-        let absolute = project_root.join(rel);
-        if !paths.iter().any(|path| path == &absolute) {
-            paths.push(absolute);
-        }
-    }
-    paths
-}
-
-#[cfg(test)]
 thread_local! {
     static LEGACY_VIEW_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn refresh_writable_dead_code_store(
-    store: &CallGraphStore,
-    callgraph_dir: &Path,
-    refresh_paths: &[PathBuf],
-) {
-    let mut io = crate::views::io::Window::new();
-    #[cfg(test)]
-    LEGACY_VIEW_REFRESHES.with(|count| count.set(count.get() + 1));
-    match store.refresh_files(refresh_paths) {
-        Ok(stats) => {
-            crate::slog_info!(
-                "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={} skipped_out_of_root={} skipped_undecodable={} root={} {}",
-                callgraph_dir.display(),
-                refresh_paths.len(),
-                stats.changed_files.len(),
-                stats.deleted_files.len(),
-                stats.refreshed_own_files,
-                stats.skipped_out_of_root.len(),
-                stats.undecodable_files.len(),
-                store.project_root().display(), io.finish()
-            );
-        }
-        Err(error) => {
-            crate::slog_warn!(
-                "tier2 dead_code: failed to refresh callgraph store at {} before projection: {} root={} {}",
-                callgraph_dir.display(),
-                error, store.project_root().display(), io.finish()
-            );
-            if let Err(mark_error) = store.mark_files_stale(refresh_paths) {
-                crate::slog_warn!(
-                    "tier2 dead_code: failed to mark callgraph store files stale at {} after refresh failure: {}",
-                    callgraph_dir.display(),
-                    mark_error
-                );
-            }
-        }
-    }
-}
-
 fn callgraph_path_identity_gap(job: &InspectJob) -> Result<Option<String>, CallGraphStoreError> {
-    if job.config.views.enabled {
-        return Ok(None);
-    }
-    for callgraph_dir in callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root)
-    {
-        let store = match CallGraphStore::open_readonly(callgraph_dir, job.project_root.clone()) {
-            Ok(Some(store)) => store,
-            Err(error) if error.is_transient_lock_contention() => return Err(error),
-            _ => continue,
-        };
-        let reason = match project_dead_code_snapshot_with_revision(store.sqlite_path()) {
-            Err(CallGraphStoreError::Unavailable(reason)) => reason,
-            Err(error) if error.is_transient_lock_contention() => return Err(error),
-            _ => continue,
-        };
-        if reason.starts_with("callgraph_path_identity_mismatch ") {
-            return Ok(Some(reason));
-        }
-    }
+    // Today's call-graph store is retired, so it records no path identity.
+    let _ = job;
     Ok(None)
 }
 
-fn open_writable_dead_code_store(
-    callgraph_dir: PathBuf,
-    project_root: PathBuf,
-    allow_cold_build: bool,
-    build_if_missing: bool,
-    refresh_paths: &[PathBuf],
-) -> Result<Option<CallGraphStore>, CallGraphStoreError> {
-    if build_if_missing {
-        open_or_build_blocking_callgraph_store(
-            callgraph_dir,
-            project_root,
-            allow_cold_build,
-            refresh_paths,
-        )
-    } else if allow_cold_build {
-        CallGraphStore::open_ready_repairing(callgraph_dir, project_root)
-    } else {
-        CallGraphStore::open_ready_no_rebuild(callgraph_dir, project_root)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum CheckoutViewUnavailable {
-    Pending,
-    Busy,
-    Unverified,
-    Failed(String),
-}
-
-impl From<String> for CheckoutViewUnavailable {
-    fn from(error: String) -> Self {
-        Self::Failed(error)
-    }
-}
-
-impl CheckoutViewUnavailable {
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::Pending => "view_pending",
-            Self::Busy => "callgraph_building",
-            Self::Unverified => "view_unverified",
-            Self::Failed(_) => "view_unavailable",
-        }
-    }
-
-    /// True when the view's graph exists but its database was locked: a
-    /// moment of contention to retry, not a missing or broken graph.
-    pub(crate) fn is_busy(&self) -> bool {
-        matches!(self, Self::Busy)
-    }
-
-    pub(crate) fn reason(&self) -> String {
-        match self {
-            Self::Pending => "dead code waits for this checkout's index view to publish; publication schedules a Tier-2 refresh automatically".into(),
-            Self::Busy => "checkout call graph view is temporarily locked; waiting for the published graph reader; retry aft_inspect".into(),
-            Self::Unverified => "checkout call graph view freshness could not be verified; retry aft_inspect after indexing settles".into(),
-            Self::Failed(error) => format!("checkout call graph view could not be read: {error}; retry aft_inspect after indexing recovers"),
-        }
-    }
-}
-
-fn current_view_projection_store(
-    project_root: &Path,
-    inspect_dir: &Path,
-    config: &crate::config::Config,
-    refresh_paths: &[PathBuf],
-) -> Option<(ReadonlyCallGraphStore, String)> {
-    current_view_projection_result(project_root, inspect_dir, config, refresh_paths).ok()
-}
-
-fn current_view_projection_result(
-    project_root: &Path,
-    inspect_dir: &Path,
-    config: &crate::config::Config,
-    refresh_paths: &[PathBuf],
-) -> Result<(ReadonlyCallGraphStore, String), CheckoutViewUnavailable> {
-    let result = (|| -> Result<(ReadonlyCallGraphStore, String), CheckoutViewUnavailable> {
-        let storage = config
-            .cache_storage_dir()
-            .or_else(|| {
-                callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
-                    .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
-            })
-            .ok_or_else(|| {
-                note_checkout_view_refusal!("projection_storage_missing: config.storage_dir={:?} root={project_root:?} inspect_dir={inspect_dir:?}", config.storage_dir);
-                "inspect storage unavailable".to_string()
-            })?;
-        let scope = crate::path_identity::project_scope_key(project_root);
-        // Reading a projection never creates a view folder: a folder made here
-        // for a checkout that was never built (or was already deleted) has no
-        // binding and no registry member, and would only be left behind.
-        let view_dir = storage.join("views").join(&scope);
-        let Some(view) = crate::views::ViewStore::existing_dir(view_dir.clone()) else {
-            note_checkout_view_refusal!(
-                "projection_unpublished: view_dir={view_dir:?} current_generation=None view=absent"
-            );
-            return Err(CheckoutViewUnavailable::Pending);
-        };
-        let Some(generation) = view.current_generation().map_err(|error| {
-            note_checkout_view_refusal!(
-                "projection_pointer_read: view_dir={:?} error={error}",
-                view.view_dir()
-            );
-            error.to_string()
-        })?
-        else {
-            note_checkout_view_refusal!(
-                "projection_unpublished: view_dir={:?} current_generation=None",
-                view.view_dir()
-            );
-            return Err(CheckoutViewUnavailable::Pending);
-        };
-        let pin =
-            crate::pins::QueryPin::acquire(view.view_dir(), &generation).map_err(|error| {
-                note_checkout_view_refusal!(
-                    "projection_pin_acquire: view_dir={:?} generation={generation} error={error}",
-                    view.view_dir()
-                );
-                error.to_string()
-            })?;
-        let Some(head_fingerprint) = crate::views::cached_head_fingerprint(project_root) else {
-            note_checkout_view_refusal!("projection_head_uncached: root={project_root:?} scope={scope} generation={generation} cached_head=None");
-            return Err(CheckoutViewUnavailable::Unverified);
-        };
-        if !crate::views::generation_matches_head(&generation, &head_fingerprint) {
-            note_checkout_view_refusal!("projection_head_mismatch: root={project_root:?} generation={generation} cached_head={head_fingerprint}");
-            return Err(CheckoutViewUnavailable::Pending);
-        }
-        if !refresh_paths.is_empty() {
-            let manifest = view
-                .load_manifest(&generation)
-                .map_err(|error| error.to_string())?;
-            if !crate::views::read::callgraph_paths_match(&manifest, project_root, refresh_paths)
-                .map_err(|error| error.to_string())?
-            {
-                return Err(CheckoutViewUnavailable::Pending);
-            }
-        }
-        let family = crate::search_index::artifact_cache_key_read_only(project_root, &storage)
-            .map_err(|error| error.to_string())?;
-        if !crate::views::read::derived_built(view.view_dir(), &generation) {
-            // A linked worktree builds its own graph on first use. Until then the
-            // main checkout's graph answers while the published files match it.
-            // The generation stays this checkout's, so the projection cache and
-            // the coverage checks keep using this checkout's manifest.
-            let manifest = view
-                .load_manifest(&generation)
-                .map_err(|error| error.to_string())?;
-            let (store, main_generation) = match crate::views::read::main_checkout_callgraph(
-                &storage,
-                project_root,
-                &family,
-                &generation,
-                &manifest,
-            ) {
-                crate::views::read::MainCheckoutGraph::Answer(store, generation) => {
-                    (store, generation)
-                }
-                crate::views::read::MainCheckoutGraph::Busy => {
-                    return Err(CheckoutViewUnavailable::Busy)
-                }
-                crate::views::read::MainCheckoutGraph::Unavailable => {
-                    note_checkout_view_refusal!(
-                        "projection_not_built: root={project_root:?} generation={generation}"
-                    );
-                    return Err(CheckoutViewUnavailable::Pending);
-                }
-            };
-            crate::slog_debug!(
-                "tier2 view reader uses the main checkout graph root={} generation={generation} main_generation={main_generation}",
-                project_root.display()
-            );
-            return Ok((store, generation));
-        }
-        let store = crate::views::read::open_published_callgraph(
-            project_root.to_path_buf(),
-            family,
-            view.view_dir().to_path_buf(),
-            &generation,
-            Some(Arc::new(pin)),
-        )
-        .map_err(|error| {
-            note_checkout_view_refusal!("projection_callgraph_open: root={project_root:?} view_dir={:?} generation={generation} error={error}", view.view_dir());
-            // A writer or checkpoint holding the published database locked says
-            // nothing about whether the graph exists; the next read can succeed.
-            if error.is_transient_lock_contention() {
-                CheckoutViewUnavailable::Busy
-            } else {
-                CheckoutViewUnavailable::Failed(error.to_string())
-            }
-        })?;
-        Ok((store, generation))
-    })();
-    if let Err(CheckoutViewUnavailable::Failed(error)) = &result {
-        crate::slog_warn!(
-            "tier2 view reader unavailable root={}: {}",
-            project_root.display(),
-            error
-        );
-    }
-    result
-}
-
-fn build_view_callgraph_snapshot(
-    job: &InspectJob,
-    projection_cache: Option<&InspectManager>,
-    refresh_paths: &[PathBuf],
-) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)> {
-    let started = Instant::now();
-    let (store, generation) = match current_view_projection_result(
-        &job.project_root,
-        &job.inspect_dir,
-        &job.config,
-        refresh_paths,
-    ) {
-        Ok(store) => store,
-        Err(reason) => {
-            crate::slog_info!(
-                "tier2 dead_code: projection=none reason={} root={}",
-                reason.kind(),
-                job.project_root.display()
-            );
-            return None;
-        }
-    };
-    // View generations are immutable; never share a cache identity with a
-    // mutable legacy database or project across a publication boundary.
-    let identity = CallgraphProjectionIdentity {
-        project_root: job.project_root.clone(),
-        generation: Some(generation),
-        legacy_sqlite_path: None,
-        write_revision: 0,
-    };
-    if let Some(snapshot) =
-        projection_cache.and_then(|cache| cache.cached_callgraph_projection(&identity))
-    {
-        return Some((
-            snapshot,
-            ProjectionVerdict {
-                kind: ProjectionKind::Reused,
-                reason: None,
-                journal_bytes: 0,
-                changed_files: 0,
-            },
-            Duration::ZERO,
-        ));
-    }
-    let (_, snapshot, verdict, cost) =
-        match crate::callgraph_store::project_dead_code_snapshot_from_view(&store) {
-            Ok(projected) => projected,
-            Err(error) => {
-                crate::slog_warn!(
-                    "tier2 view projection unavailable root={}: {}",
-                    job.project_root.display(),
-                    error
-                );
-                return None;
-            }
-        };
-    let snapshot = Arc::new(snapshot);
-    if let Some(cache) = projection_cache {
-        cache.cache_callgraph_projection(identity, Arc::clone(&snapshot));
-    }
-    crate::slog_info!(
-        "perf tier2_callgraph_snapshot: source=view files={} exports={} edges={} entry_points={} ms={}",
-        snapshot.files.len(), snapshot.exported_symbols.len(), snapshot.outbound_calls.len() + snapshot.go_initializers.iter().map(|g| g.edge_count()).sum::<usize>(), snapshot.entry_points.len(), started.elapsed().as_millis()
-    );
-    Some((snapshot, verdict, cost))
-}
+/// The verdict a dead-code snapshot from the data layer reports: a whole
+/// snapshot, not derived from an earlier one, so the rollup recomputes every
+/// verdict rather than patching a previous rollup.
+const DATA_LAYER_SNAPSHOT: ProjectionVerdict = ProjectionVerdict {
+    kind: ProjectionKind::Full,
+    reason: Some("data_layer"),
+    journal_bytes: 0,
+    changed_files: 0,
+};
 
 fn build_tier2_callgraph_snapshot_with_refresh_inner(
     job: &InspectJob,
-    allow_cold_build: bool,
-    build_if_missing: bool,
-    refresh_paths: &[PathBuf],
+    _allow_cold_build: bool,
+    _build_if_missing: bool,
+    _refresh_paths: &[PathBuf],
     projection_cache: Option<&InspectManager>,
 ) -> Result<Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)>, CallGraphStoreError> {
     let started = Instant::now();
@@ -5988,419 +4386,23 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
         );
         return Ok(None);
     }
-
-    if job.config.views.enabled {
-        return Ok(build_view_callgraph_snapshot(
-            job,
-            projection_cache,
-            refresh_paths,
-        ));
-    }
-
-    let callgraph_dirs = callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root);
-    if callgraph_dirs.is_empty() {
-        crate::slog_info!(
-            "tier2 dead_code: inspect_dir has no root-keyed storage parent ({}); reporting callgraph_unavailable",
-            job.inspect_dir.display()
-        );
-        return Ok(None);
+    // The root's checkout in the data layer answers. While its call graph
+    // builds or catches up with edits, dead code reports it as building and
+    // retries; it never answers from another store.
+    let Some(manager) = projection_cache else {
+        return Err(CallGraphStoreError::Building);
     };
-    for callgraph_dir in &callgraph_dirs {
-        match CallGraphStore::cold_build_suspension(callgraph_dir, &job.project_root) {
-            Ok(Some(suspension)) => {
-                // This is a durable admission refusal, not a failed scan attempt.
-                // Preserve it separately so blocking inspect reports the same
-                // breaker tuple that navigation and health expose.
-                if let Some(manager) = projection_cache {
-                    manager.record_tier2_build_suspension(&job.key, suspension.clone());
-                }
-                crate::slog_info!(
-                    "tier2 dead_code: callgraph build suspended for {} after {} deaths",
-                    suspension.domain.as_str(),
-                    suspension.death_count
-                );
-                return Ok(None);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                crate::slog_warn!(
-                    "tier2 dead_code: failed to read callgraph breaker at {}: {}",
-                    callgraph_dir.display(),
-                    error
-                );
-            }
+    match manager.data_layer_dead_code.snapshot(&job.project_root) {
+        crate::data_layer::tools::inspect::DeadCodeSnapshot::Ready(snapshot) => {
+            Ok(Some((snapshot, DATA_LAYER_SNAPSHOT, started.elapsed())))
+        }
+        crate::data_layer::tools::inspect::DeadCodeSnapshot::Building => {
+            Err(CallGraphStoreError::Building)
+        }
+        crate::data_layer::tools::inspect::DeadCodeSnapshot::Failed(reason) => {
+            Err(CallGraphStoreError::Unavailable(reason))
         }
     }
-
-    enum ProjectionStore {
-        ReadOnly(ReadonlyCallGraphStore),
-        Writable(CallGraphStore),
-    }
-
-    impl ProjectionStore {
-        fn sqlite_path(&self) -> &Path {
-            match self {
-                Self::ReadOnly(store) => store.sqlite_path(),
-                Self::Writable(store) => store.sqlite_path(),
-            }
-        }
-
-        fn projection_identity(
-            &self,
-            project_root: &Path,
-            write_revision: u64,
-        ) -> CallgraphProjectionIdentity {
-            let generation = match self {
-                Self::ReadOnly(store) => store.projection_generation(),
-                Self::Writable(store) => store.projection_generation(),
-            }
-            .map(str::to_owned);
-            let legacy_sqlite_path = generation
-                .is_none()
-                .then(|| self.sqlite_path().to_path_buf());
-            CallgraphProjectionIdentity {
-                project_root: project_root.to_path_buf(),
-                generation,
-                legacy_sqlite_path,
-                write_revision,
-            }
-        }
-
-        fn current_projection_identity(
-            &self,
-            project_root: &Path,
-        ) -> Result<Option<CallgraphProjectionIdentity>, CallGraphStoreError> {
-            let stale_files = match self {
-                Self::ReadOnly(store) => store.stale_files()?,
-                Self::Writable(store) => store.stale_files()?,
-            };
-            if !stale_files.is_empty() {
-                return Ok(None);
-            }
-            let write_revision = match self {
-                Self::ReadOnly(store) => store.projection_write_revision()?,
-                Self::Writable(store) => store.projection_write_revision()?,
-            };
-            Ok(write_revision.map(|revision| self.projection_identity(project_root, revision)))
-        }
-    }
-
-    for (index, callgraph_dir) in callgraph_dirs.iter().enumerate() {
-        // Paths without an explicit refresh stay read-only unless the published
-        // store still has stale backend rows. The background refresh worker is
-        // the usual writer for those rows; when it never runs for this root,
-        // dead_code refreshes them inline so projection is not stuck forever.
-        let projection_store = if refresh_paths.is_empty() || !job.callgraph_writer {
-            let store = match CallGraphStore::open_readonly(
-                callgraph_dir.clone(),
-                job.project_root.clone(),
-            ) {
-                Ok(Some(store)) => store,
-                Ok(None) => {
-                    crate::slog_info!(
-                        "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
-                        callgraph_dir.display(),
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-                Err(error) if error.is_transient_lock_contention() => return Err(error),
-                Err(error) => {
-                    crate::slog_warn!(
-                        "tier2 dead_code: failed to open callgraph store read-only at {}: {}; trying fallback={}",
-                        callgraph_dir.display(),
-                        error,
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-            };
-            let stale = job
-                .callgraph_writer
-                .then(|| store.stale_files().ok())
-                .flatten()
-                .unwrap_or_default();
-            if stale.is_empty() {
-                ProjectionStore::ReadOnly(store)
-            } else {
-                drop(store);
-                let refresh =
-                    merge_callgraph_refresh_paths(&job.project_root, refresh_paths, stale);
-                let store = match open_writable_dead_code_store(
-                    callgraph_dir.clone(),
-                    job.project_root.clone(),
-                    allow_cold_build,
-                    build_if_missing,
-                    &refresh,
-                ) {
-                    Ok(Some(store)) => store,
-                    Ok(None) => {
-                        crate::slog_info!(
-                            "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
-                            callgraph_dir.display(),
-                            index + 1 < callgraph_dirs.len()
-                        );
-                        continue;
-                    }
-                    Err(error) if error.is_transient_lock_contention() => return Err(error),
-                    Err(error) => {
-                        crate::slog_warn!(
-                            "tier2 dead_code: failed to open callgraph writer at {}: {}; trying fallback={}",
-                            callgraph_dir.display(),
-                            error,
-                            index + 1 < callgraph_dirs.len()
-                        );
-                        continue;
-                    }
-                };
-                refresh_writable_dead_code_store(&store, callgraph_dir, &refresh);
-                ProjectionStore::Writable(store)
-            }
-        } else {
-            let store = match open_writable_dead_code_store(
-                callgraph_dir.clone(),
-                job.project_root.clone(),
-                allow_cold_build,
-                build_if_missing,
-                refresh_paths,
-            ) {
-                Ok(Some(store)) => store,
-                Ok(None) => {
-                    crate::slog_info!(
-                        "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
-                        callgraph_dir.display(),
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-                Err(error) if error.is_transient_lock_contention() => return Err(error),
-                Err(error) => {
-                    crate::slog_warn!(
-                        "tier2 dead_code: failed to open callgraph writer at {}: {}; trying fallback={}",
-                        callgraph_dir.display(),
-                        error,
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-            };
-            let stale = store.stale_files().unwrap_or_default();
-            let refresh = merge_callgraph_refresh_paths(&job.project_root, refresh_paths, stale);
-            refresh_writable_dead_code_store(&store, callgraph_dir, &refresh);
-            ProjectionStore::Writable(store)
-        };
-
-        let cache_identity = match projection_store.current_projection_identity(&job.project_root) {
-            Ok(identity) => identity,
-            Err(error) if error.is_transient_lock_contention() => return Err(error),
-            Err(error) => {
-                crate::slog_warn!(
-                    "tier2 dead_code: failed to read callgraph projection identity at {}: {}; trying fallback={}",
-                    callgraph_dir.display(),
-                    error,
-                    index + 1 < callgraph_dirs.len()
-                );
-                continue;
-            }
-        };
-        if let (Some(cache), Some(identity)) = (projection_cache, cache_identity.as_ref()) {
-            // The pointer names immutable cold-build generations, while the durable
-            // revision advances in the same SQLite transaction as every in-place
-            // graph mutation. Equal identities therefore prove identical store
-            // bytes for dead-code projection: this cache is exact, not heuristic.
-            if let Some(snapshot) = cache.cached_callgraph_projection(identity) {
-                return Ok(Some((
-                    snapshot,
-                    ProjectionVerdict {
-                        kind: ProjectionKind::Reused,
-                        reason: None,
-                        journal_bytes: 0,
-                        changed_files: 0,
-                    },
-                    Duration::ZERO,
-                )));
-            }
-        } else if cache_identity.is_none() {
-            // Stores from older binaries lack a durable revision, so keeping an
-            // earlier snapshot would make an in-place refresh indistinguishable.
-            if let Some(cache) = projection_cache {
-                cache.clear_callgraph_projection();
-            }
-        }
-
-        let previous = projection_cache
-            .zip(cache_identity.as_ref())
-            .and_then(|(cache, identity)| cache.previous_callgraph_projection(identity));
-        let costs = projection_cache
-            .zip(cache_identity.as_ref())
-            .map(|(cache, identity)| cache.callgraph_projection_costs(identity))
-            .unwrap_or_default();
-        let (write_revision, snapshot, verdict, projection_cost) =
-            match project_dead_code_snapshot_incremental_with_costs(
-                projection_store.sqlite_path(),
-                previous
-                    .as_ref()
-                    .map(|(revision, snapshot)| (*revision, snapshot.as_ref())),
-                costs,
-            ) {
-                Ok(projected) => projected,
-                Err(CallGraphStoreError::Unavailable(message)) => {
-                    crate::slog_info!(
-                        "tier2 dead_code: callgraph store projection unavailable at {} ({}); trying fallback={}",
-                        callgraph_dir.display(),
-                        message,
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-                Err(error) if error.is_transient_lock_contention() => return Err(error),
-                Err(error) => {
-                    crate::slog_warn!(
-                        "tier2 dead_code: callgraph store projection failed at {}: {}; trying fallback={}",
-                        callgraph_dir.display(),
-                        error,
-                        index + 1 < callgraph_dirs.len()
-                    );
-                    continue;
-                }
-            };
-        let snapshot = Arc::new(snapshot);
-        if let (Some(cache), Some(write_revision)) = (projection_cache, write_revision) {
-            cache.cache_callgraph_projection(
-                projection_store.projection_identity(&job.project_root, write_revision),
-                Arc::clone(&snapshot),
-            );
-        }
-
-        if index > 0 {
-            crate::slog_info!(
-                "tier2 dead_code: using ready callgraph store fallback {} for inspect_dir {}",
-                callgraph_dir.display(),
-                job.inspect_dir.display()
-            );
-        }
-
-        crate::slog_info!(
-            "perf tier2_callgraph_snapshot: source=callgraph_store files={} exports={} edges={} entry_points={} ms={}",
-            snapshot.files.len(),
-            snapshot.exported_symbols.len(),
-            snapshot.outbound_calls.len() + snapshot.go_initializers.iter().map(|g| g.edge_count()).sum::<usize>(),
-            snapshot.entry_points.len(),
-            started.elapsed().as_millis()
-        );
-
-        return Ok(Some((snapshot, verdict, projection_cost)));
-    }
-
-    crate::slog_info!(
-        "tier2 dead_code: no ready callgraph store found for inspect_dir {}; reporting callgraph_unavailable",
-        job.inspect_dir.display()
-    );
-    Ok(None)
-}
-
-fn estimate_callgraph_snapshot_bytes(snapshot: &CallgraphSnapshot) -> u64 {
-    let mut interned_files = BTreeSet::new();
-    let mut interned_symbols = BTreeSet::new();
-    let mut initializers = 0u64;
-    for group in &snapshot.go_initializers {
-        initializers += std::mem::size_of_val(group) as u64
-            + crate::memory::path_bytes(&group.caller_file)
-            + (group.callers.capacity() * std::mem::size_of::<String>()) as u64
-            + group
-                .callers
-                .iter()
-                .map(|s| s.capacity() as u64)
-                .sum::<u64>()
-            + (group.targets.capacity() * std::mem::size_of::<(Arc<PathBuf>, Arc<str>)>()) as u64;
-        for (file, symbol) in &group.targets {
-            if interned_files.insert(Arc::as_ptr(file) as usize) {
-                initializers += std::mem::size_of::<PathBuf>() as u64
-                    + 2 * std::mem::size_of::<usize>() as u64
-                    + crate::memory::path_bytes(file);
-            }
-            if interned_symbols.insert(Arc::as_ptr(symbol) as *const u8 as usize) {
-                initializers += symbol.len() as u64 + 2 * std::mem::size_of::<usize>() as u64;
-            }
-        }
-    }
-    let files = snapshot.files.iter().fold(0u64, |bytes, path| {
-        bytes
-            .saturating_add(std::mem::size_of::<PathBuf>() as u64)
-            .saturating_add(crate::memory::path_bytes(path))
-    });
-    let exports = snapshot
-        .exported_symbols
-        .iter()
-        .fold(0u64, |bytes, export| {
-            bytes
-                .saturating_add(std::mem::size_of::<super::job::CallgraphExport>() as u64)
-                .saturating_add(crate::memory::path_bytes(&export.file))
-                .saturating_add(crate::memory::usize_to_u64(export.symbol.len()))
-                .saturating_add(crate::memory::usize_to_u64(export.kind.len()))
-        });
-    let calls = snapshot
-        .outbound_calls
-        .iter()
-        .fold(initializers, |bytes, call| {
-            bytes
-                .saturating_add(std::mem::size_of::<super::job::CallgraphOutboundCall>() as u64)
-                .saturating_add(crate::memory::path_bytes(&call.caller_file))
-                .saturating_add(crate::memory::usize_to_u64(call.caller_symbol.len()))
-                .saturating_add(crate::memory::usize_to_u64(call.target.len()))
-                .saturating_add(crate::memory::usize_to_u64(call.provenance.len()))
-        });
-    let entry_points = snapshot.entry_points.iter().fold(0u64, |bytes, path| {
-        bytes
-            .saturating_add(std::mem::size_of::<PathBuf>() as u64)
-            .saturating_add(crate::memory::path_bytes(path))
-    });
-    let entry_point_symbols =
-        snapshot
-            .entry_point_symbols
-            .iter()
-            .fold(0u64, |bytes, (path, symbols)| {
-                let symbols_bytes = symbols.iter().fold(0u64, |bytes, symbol| {
-                    bytes
-                        .saturating_add(std::mem::size_of::<String>() as u64)
-                        .saturating_add(crate::memory::usize_to_u64(symbol.len()))
-                });
-                bytes
-                    .saturating_add(std::mem::size_of::<(PathBuf, BTreeSet<String>)>() as u64)
-                    .saturating_add(crate::memory::path_bytes(path))
-                    .saturating_add(symbols_bytes)
-            });
-    (std::mem::size_of::<CallgraphSnapshot>() as u64)
-        .saturating_add(files)
-        .saturating_add(exports)
-        .saturating_add(calls)
-        .saturating_add(entry_points)
-        .saturating_add(entry_point_symbols)
-}
-
-fn callgraph_store_dir_from_inspect_dir(
-    inspect_dir: &Path,
-    project_root: &Path,
-) -> Option<PathBuf> {
-    let scope_key = crate::path_identity::project_scope_key(project_root);
-    let storage_dir = if inspect_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == scope_key)
-    {
-        inspect_dir.parent()?.parent()?
-    } else {
-        inspect_dir.parent()?
-    };
-    let project_key =
-        crate::search_index::artifact_cache_key_read_only(project_root, storage_dir).ok()?;
-    Some(storage_dir.join("callgraph").join(project_key))
-}
-
-fn callgraph_store_dirs_from_inspect_dir(inspect_dir: &Path, project_root: &Path) -> Vec<PathBuf> {
-    callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
-        .into_iter()
-        .collect()
 }
 
 #[cfg(test)]
@@ -6650,44 +4652,30 @@ fn scoped_tier2_payload_from_contributions(
         }
         Err(error) => return Err(error.to_string()),
     };
-    let contributions = load_contributions(cache, &rollup_job)?;
     if let (Some(manager), Some(graph)) = (manager, rollup_job.callgraph_snapshot.as_deref()) {
-        let cache_key = cache
-            .contribution_set_hash_for_config(category, snapshot.config.as_ref())
-            .map_err(|error| error.to_string())?;
+        if graph.data_layer.is_some() {
+            // Global liveness includes callers outside the scope, so the
+            // whole project is worked out before the findings are filtered.
+            let payload = manager.data_layer_dead_code_aggregate(&rollup_job, graph)?;
+            return Ok(filter_payload_for_scope(payload, scope));
+        }
+    }
+    let contributions = load_contributions(cache, &rollup_job)?;
+    if let (Some(_), Some(graph)) = (manager, rollup_job.callgraph_snapshot.as_deref()) {
         let public_api_files =
             super::scanners::dead_code::collect_public_api_files(&snapshot.project_root);
         let roles = super::entry_points::resolve_project_roles(&snapshot.project_root);
-        // Global liveness includes callers outside the scope. Reuse the existing
-        // projection's rollup only while its durable revision and all contribution
-        // inputs still match; otherwise rebuild it before filtering findings.
-        if let Some(mut payload) = manager
-            .current_dead_code_rollup_state(&snapshot.project_root, graph)
-            .and_then(|state| {
-                state.aggregate_for_unchanged_inputs(
-                    &cache_key,
-                    &contributions,
-                    &public_api_files,
-                    &roles,
-                )
-            })
-        {
-            super::job::attach_dead_code_language_coverage(&mut payload, &rollup_job.scope_files);
-            return Ok(filter_payload_for_scope(payload, scope));
-        }
-        let (mut payload, state, _) =
-            super::scanners::dead_code::aggregate_dead_code_contributions_incremental(
+        // Global liveness includes callers outside the scope, so the whole
+        // project is rolled up before the findings are filtered.
+        let mut payload =
+            super::scanners::dead_code::aggregate_dead_code_contributions_with_snapshot(
                 &snapshot.project_root,
                 graph,
                 &contributions,
                 &public_api_files,
                 &roles,
                 None,
-                Some(&cache_key),
-                None,
-                &BTreeSet::new(),
             );
-        manager.cache_dead_code_rollup_state(&snapshot.project_root, state, graph);
         super::job::attach_dead_code_language_coverage(&mut payload, &rollup_job.scope_files);
         return Ok(filter_payload_for_scope(payload, scope));
     }
@@ -7485,6 +5473,7 @@ fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<Stri
 }
 
 fn filter_outcome_for_scope_with_contributions(
+    dead_code_sources: &crate::data_layer::tools::inspect::DeadCodeSources,
     manager: Option<&InspectManager>,
     outcome: JobOutcome,
     snapshot: &InspectSnapshot,
@@ -7492,11 +5481,11 @@ fn filter_outcome_for_scope_with_contributions(
     cache: &(impl InspectCacheRead + ?Sized),
     scope: &JobScope,
 ) -> JobOutcome {
-    // Fresh source files do not establish graph liveness while its store is busy.
+    // Fresh source files do not establish graph liveness before the root has a
+    // call graph, so no answer, fresh or cached, is served until it has one.
     if category == InspectCategory::DeadCode
         && snapshot.config.indexes.callgraph
-        && !snapshot.config.views.enabled
-        && callgraph_store_busy_for_dead_code(&snapshot.inspect_dir, &snapshot.project_root)
+        && dead_code_sources.callgraph_busy(&snapshot.project_root)
     {
         return JobOutcome::Fresh {
             payload: callgraph_pending_payload(),
@@ -8086,6 +6075,326 @@ mod guard_tests {
         assert_eq!(scope_files(&root, &scope), vec![root.join("src/one.ts")]);
         assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 0);
     }
+
+    /// A tree where every rule of the source walk decides something: files
+    /// ignored by `.gitignore`, `.aftignore` and a nested repository's own
+    /// `.gitignore`, a nested linked worktree (skipped), a nested independent
+    /// repository (walked), skipped folders, non-source files and symlinks.
+    /// It leaves out the submodule checkout the shared fixture makes: whether
+    /// the index store lists a submodule's files is its scan's own rule,
+    /// tested with the store.
+    /// Returns the root, the folder holding it, and the sorted list a walk of
+    /// it finds.
+    fn store_list_fixture() -> (PathBuf, tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "store_list");
+        let root = canonicalize_for_snapshot(&fixture.root);
+        std::fs::remove_dir_all(&fixture.submodule).unwrap();
+        std::fs::remove_dir_all(root.join(".git/modules")).unwrap();
+        for (path, contents) in [
+            ("src/lib.ts", "export const lib = 1;\n"),
+            (".gitignore", "ignored/\n"),
+            (".aftignore", "aftignored/\n"),
+            ("ignored/skip.rs", "fn skip() {}\n"),
+            ("aftignored/skip.rs", "fn skip() {}\n"),
+            ("node_modules/dep/index.js", "module.exports = 1;\n"),
+            ("src/.hidden.rs", "fn hidden() {}\n"),
+            ("vendor/independent/.gitignore", "generated/\n"),
+            ("vendor/independent/generated/out.rs", "fn out() {}\n"),
+            ("docs/readme.md", "# docs\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("src/main.rs", root.join("link.rs")).unwrap();
+            std::os::unix::fs::symlink("src", root.join("linked_src")).unwrap();
+        }
+        let mut walked = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        walked.sort();
+        for kept in ["src/main.rs", "src/lib.ts", "vendor/independent/inner.rs"] {
+            assert!(walked.contains(&root.join(kept)), "{kept}: {walked:?}");
+        }
+        for left_out in [
+            "ignored/skip.rs",
+            "aftignored/skip.rs",
+            "node_modules/dep/index.js",
+            "src/.hidden.rs",
+            "vendor/independent/generated/out.rs",
+            "link.rs",
+            "linked_src/main.rs",
+        ] {
+            assert!(!walked.contains(&root.join(left_out)), "{left_out}");
+        }
+        assert!(
+            !walked
+                .iter()
+                .any(|path| path.starts_with(&fixture.worktree)),
+            "the nested linked worktree is walked: {walked:?}"
+        );
+        (root, dir, walked)
+    }
+    /// A context whose index-store checkout of `root` is bound and has
+    /// published its scan, as the daemon's is once a root is configured.
+    fn bound_store_context(root: &Path) -> crate::context::AppContext {
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        );
+        crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
+        ctx
+    }
+
+    /// The status bar's TODO refresh enqueues its job from a maintenance
+    /// thread where no request installed a census. With the root's
+    /// index-store checkout bound and published, the enqueue lists the root's
+    /// files from the store and walks nothing, and the list is the one a walk
+    /// of the folder finds.
+    #[test]
+    fn background_todo_refresh_lists_files_from_the_bound_store_without_walking() {
+        let (root, _dir, walked) = store_list_fixture();
+        let ctx = bound_store_context(&root);
+        assert!(ctx
+            .data_checkout()
+            .is_some_and(|checkout| checkout.view().is_some_and(|view| !view.rescanning())));
+        assert!(
+            super::super::inventory::current(&root).is_none(),
+            "no census is installed on this thread"
+        );
+        // The job must not wait for the store's TODO records on a worker.
+        crate::data_layer::tools::inspect::set_todo_store_wait_for_test(&root, Duration::ZERO);
+
+        SCOPE_FILE_WALKS.with(|walks| walks.set(0));
+        crate::callgraph::PROJECT_WALK_ENTRIES.with(|entries| entries.set(0));
+        let manager = InspectManager::new();
+        manager
+            .submit_background(
+                tier1_snapshot(&root),
+                InspectCategory::Todos,
+                JobScope::for_project(root.clone()),
+            )
+            .expect("the refresh is scheduled");
+        let listed = scope_files(&root, &JobScope::for_project(root.clone()));
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            crate::callgraph::PROJECT_WALK_ENTRIES.with(std::cell::Cell::get),
+            0,
+            "no project walk visited an entry"
+        );
+        assert_same_files(&root, &listed, &walked);
+        let scoped = JobScope::from_roots(root.clone(), vec![root.join("vendor")]);
+        assert_eq!(
+            scope_files(&root, &scoped),
+            vec![root.join("vendor/independent/inner.rs")]
+        );
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 0);
+    }
+
+    /// While the store's list can miss changes (a rescan against the disk is
+    /// pending) or there is no store to ask, the files are walked, giving the
+    /// walk's list; once the rescan ends the store's list is used again.
+    #[test]
+    fn scope_files_walks_only_while_the_store_cannot_stand_in() {
+        use super::super::inventory::StoreListMiss;
+        let (root, _dir, walked) = store_list_fixture();
+        let unbound = tempfile::tempdir().unwrap();
+        let unbound = canonicalize_for_snapshot(unbound.path());
+        assert_eq!(
+            crate::data_layer::tools::inspect::bound_inventory(&unbound).err(),
+            Some(StoreListMiss::NotBound)
+        );
+
+        let ctx = bound_store_context(&root);
+        let checkout = ctx.data_checkout().expect("bound");
+        let project = JobScope::for_project(root.clone());
+        checkout.checkout().begin_rescan();
+        assert_eq!(
+            crate::data_layer::tools::inspect::bound_inventory(&root).err(),
+            Some(StoreListMiss::Rescanning)
+        );
+        SCOPE_FILE_WALKS.with(|walks| walks.set(0));
+        assert_eq!(scope_files(&root, &project), walked);
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
+        checkout.checkout().end_rescan();
+        assert_same_files(&root, &scope_files(&root, &project), &walked);
+        assert_eq!(SCOPE_FILE_WALKS.with(std::cell::Cell::get), 1);
+    }
+
+    /// Fails naming the files only one of the two sorted lists holds.
+    fn assert_same_files(root: &Path, listed: &[PathBuf], walked: &[PathBuf]) {
+        let only = |left: &[PathBuf], right: &[PathBuf]| {
+            left.iter()
+                .filter(|path| right.binary_search(path).is_err())
+                .map(|path| {
+                    path.strip_prefix(root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            listed == walked,
+            "only listed: {:?}; only walked: {:?}",
+            only(listed, walked),
+            only(walked, listed)
+        );
+    }
+
+    /// This thread's CPU time in milliseconds: the TODO refresh lists files
+    /// on the thread that enqueues it, so that thread's clock is the cost.
+    fn thread_cpu_ms() -> f64 {
+        #[cfg(unix)]
+        {
+            let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+            if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) } == 0
+            {
+                let time = unsafe { time.assume_init() };
+                return time.tv_sec as f64 * 1000.0 + time.tv_nsec as f64 / 1_000_000.0;
+            }
+        }
+        0.0
+    }
+
+    /// Opt-in replay of a busy worktree on a copy of a real checkout named by
+    /// `AFT_SCOPE_WALK_REPLAY_ROOT` (it edits the files there). It edits
+    /// source files one at a time (`AFT_SCOPE_WALK_REPLAY_EDITS`, default
+    /// 430), records each edit in the index store as the watcher does, and
+    /// after every `AFT_SCOPE_WALK_REPLAY_BATCH` edits (default 10) adds one
+    /// file, removes the previous one, and lists the root's files as the TODO
+    /// refresh's enqueue does: by walking, as it did before it asked the
+    /// store, and through `scope_files`. It prints the walks and this
+    /// thread's CPU for each, why the store could not stand in when it could
+    /// not, and how long a rescan of the checkout stays pending; it fails if
+    /// the two lists ever differ.
+    #[test]
+    #[ignore = "edits a copy of a real checkout named by AFT_SCOPE_WALK_REPLAY_ROOT"]
+    fn scope_files_busy_worktree_replay() {
+        let number = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let root = canonicalize_for_snapshot(Path::new(
+            &std::env::var("AFT_SCOPE_WALK_REPLAY_ROOT").expect("AFT_SCOPE_WALK_REPLAY_ROOT"),
+        ));
+        let edits = number("AFT_SCOPE_WALK_REPLAY_EDITS", 430);
+        let batch = number("AFT_SCOPE_WALK_REPLAY_BATCH", 10).max(1);
+        let bind_started = Instant::now();
+        let ctx = bound_store_context(&root);
+        let bind_ms = bind_started.elapsed().as_millis();
+        let checkout = ctx.data_checkout().expect("bound");
+        let project = JobScope::for_project(root.clone());
+        let targets = crate::callgraph::walk_project_files(&root)
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "rs" || extension == "ts")
+            })
+            .take(64)
+            .collect::<Vec<_>>();
+        assert!(!targets.is_empty(), "no source file to edit");
+        let added_dir = root.join("crates/replay_added");
+        std::fs::create_dir_all(&added_dir).unwrap();
+        let mut previous_added: Option<PathBuf> = None;
+        let (mut listings, mut mismatches) = (0usize, 0usize);
+        let (mut walk_cpu, mut walk_ms, mut store_cpu, mut store_ms) = (0.0, 0.0, 0.0, 0.0);
+        let mut store_walks = 0usize;
+        let mut misses = BTreeMap::<&'static str, usize>::new();
+        let mut files = 0usize;
+        let replay_started = Instant::now();
+        for edit in 0..edits {
+            let target = &targets[edit % targets.len()];
+            let mut contents = std::fs::read(target).unwrap();
+            contents.extend_from_slice(format!("// replay edit {edit}\n").as_bytes());
+            std::fs::write(target, contents).unwrap();
+            checkout.note_paths(std::slice::from_ref(target));
+            if (edit + 1) % batch != 0 {
+                continue;
+            }
+            let added = added_dir.join(format!("added_{edit}.rs"));
+            std::fs::write(&added, "fn added() {}\n").unwrap();
+            let mut changed = vec![added.clone()];
+            if let Some(previous) = previous_added.replace(added) {
+                std::fs::remove_file(&previous).unwrap();
+                changed.push(previous);
+            }
+            checkout.note_paths(&changed);
+
+            let (cpu, started) = (thread_cpu_ms(), Instant::now());
+            let mut walked = crate::callgraph::walk_project_files(&root)
+                .filter(|path| project.contains(path))
+                .collect::<Vec<_>>();
+            walked.sort();
+            walk_cpu += thread_cpu_ms() - cpu;
+            walk_ms += started.elapsed().as_secs_f64() * 1000.0;
+
+            if let Err(miss) = crate::data_layer::tools::inspect::bound_inventory(&root) {
+                *misses.entry(miss.as_str()).or_default() += 1;
+            }
+            let walks = SCOPE_FILE_WALKS.with(std::cell::Cell::get);
+            let (cpu, started) = (thread_cpu_ms(), Instant::now());
+            let listed = scope_files(&root, &project);
+            store_cpu += thread_cpu_ms() - cpu;
+            store_ms += started.elapsed().as_secs_f64() * 1000.0;
+            store_walks += SCOPE_FILE_WALKS.with(std::cell::Cell::get) - walks;
+
+            listings += 1;
+            files = walked.len();
+            if listed != walked {
+                mismatches += 1;
+                let only = |left: &[PathBuf], right: &[PathBuf]| {
+                    left.iter()
+                        .filter(|path| right.binary_search(path).is_err())
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                eprintln!(
+                    "listing {listings} differs: only listed {:?}, only walked {:?}",
+                    only(&listed, &walked),
+                    only(&walked, &listed)
+                );
+            }
+        }
+        let replay_ms = replay_started.elapsed().as_millis();
+
+        // How long a rescan of the checkout against the disk stays pending,
+        // the one state of a bound, published checkout that sends the
+        // listing back to the walk.
+        let rescan_started = Instant::now();
+        checkout.rescan();
+        let mut observed_pending = false;
+        while checkout.view().is_some_and(|view| view.rescanning()) {
+            observed_pending = true;
+            assert!(rescan_started.elapsed() < Duration::from_secs(300));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let rescan_ms = rescan_started.elapsed().as_secs_f64() * 1000.0;
+
+        let per = |total: f64| total / listings.max(1) as f64;
+        let report = serde_json::json!({
+            "root": root.display().to_string(),
+            "files": files,
+            "bind_ms": bind_ms,
+            "edits": edits,
+            "listings": listings,
+            "replay_ms": replay_ms,
+            "walk": {"walks": listings, "cpu_ms_per_listing": per(walk_cpu), "wall_ms_per_listing": per(walk_ms)},
+            "store": {"walks": store_walks, "cpu_ms_per_listing": per(store_cpu), "wall_ms_per_listing": per(store_ms)},
+            "store_misses": misses,
+            "mismatches": mismatches,
+            "rescan": {"observed_pending": observed_pending, "pending_ms": rescan_ms},
+        });
+        eprintln!("scope files replay {report}");
+        assert_eq!(mismatches, 0, "{report}");
+    }
     use super::*;
 
     #[cfg(debug_assertions)]
@@ -8113,7 +6422,7 @@ mod guard_tests {
             .expect("write fixture");
         }
         let canonical_root = std::fs::canonicalize(root).expect("canonical fixture root");
-        let project_key = crate::search_index::artifact_cache_key(&canonical_root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&canonical_root);
         crate::root_cache::configure_artifact_access(&canonical_root, &project_key, false);
         dir
     }
@@ -8234,57 +6543,14 @@ mod guard_tests {
         );
     }
 
-    struct ProjectionObserverReset;
-
-    impl Drop for ProjectionObserverReset {
-        fn drop(&mut self) {
-            crate::callgraph_store::set_projection_before_open_observer(None);
-        }
-    }
-
-    fn count_projections() -> (Arc<std::sync::atomic::AtomicUsize>, ProjectionObserverReset) {
-        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = Arc::clone(&count);
-        crate::callgraph_store::set_projection_before_open_observer(Some(Arc::new(move |_| {
-            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        })));
-        (count, ProjectionObserverReset)
-    }
-
     fn write_projection_cache_file(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().expect("fixture file parent"))
             .expect("create fixture parent");
         std::fs::write(path, contents).expect("write fixture file");
     }
 
-    include!("view_projection_tests.rs");
     include!("completion_perf_tests.rs");
     include!("tier2_refresh_perf_tests.rs");
-
-    fn published_projection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, InspectJob) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
-        write_projection_cache_file(
-            &root.join("src/main.ts"),
-            "import { firstTarget } from './target';\nexport function main() { firstTarget(); }\n",
-        );
-        write_projection_cache_file(
-            &root.join("src/target.ts"),
-            "export function firstTarget() {}\n",
-        );
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        let (store, _) = CallGraphStore::cold_build_with_lease(callgraph_dir, root.clone(), &files)
-            .expect("publish initial generation");
-        drop(store);
-        let mut job = snapshot_job(&root, &inspect_dir, true);
-        job.callgraph_writer = false;
-        (dir, root, inspect_dir, job)
-    }
 
     /// Encoding test fixtures such as php_codesniffer's byte-order-mark files
     /// are deliberately not UTF-8. One of them in the project must not make
@@ -8292,7 +6558,7 @@ mod guard_tests {
     #[test]
     fn dead_code_projection_survives_an_undecodable_source_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        let root = canonicalize_for_snapshot(dir.path());
         write_projection_cache_file(
             &root.join("src/main.ts"),
             "import { firstTarget } from './target';\nexport function main() { firstTarget(); }\n",
@@ -8305,40 +6571,133 @@ mod guard_tests {
         std::fs::write(&undecodable, b"\xff\xfe<\x00?\x00p\x00h\x00p\x00")
             .expect("write undecodable file");
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         assert!(
             files.contains(&undecodable),
             "the walk must reach the undecodable file for this test to mean anything"
         );
-        let (store, _) =
-            CallGraphStore::cold_build_with_lease(callgraph_dir.clone(), root.clone(), &files)
-                .expect("publish initial generation");
-        drop(store);
+        let storage = tempfile::tempdir().expect("storage");
+        let manager = InspectManager::new();
+        let checkout = bind_published_call_graph(&manager, &root, storage.path());
 
         let job = snapshot_job(&root, &inspect_dir, true);
-        let manager = InspectManager::new();
         // A watcher event for the undecodable file must not fail the refresh.
+        checkout.note_paths(std::slice::from_ref(&undecodable));
         let snapshot = manager
             .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[undecodable])
             .expect("dead-code projection must be available");
         assert!(
-            snapshot
-                .exported_symbols
+            data_layer_snapshot_exports(&snapshot, &root)
                 .iter()
                 .any(|export| export.symbol == "neverCalled"),
             "dead-code inputs must include the decodable files"
         );
+    }
 
-        let store = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root.clone())
-            .expect("open store")
-            .expect("ready store");
-        let census = store.stale_path_census().expect("census");
-        assert_eq!(census.stale, 0);
-        assert_eq!(census.undecodable, 1, "the skipped file must be reported");
+    /// The dead-code graph a request builds stays in memory for
+    /// `DEAD_CODE_GRAPH_IDLE_RELEASE` after the last dead-code request, is
+    /// released then, and is built again by the next request. The clock is
+    /// passed in, so the test does not wait out the period.
+    #[test]
+    fn dead_code_graph_is_released_after_ten_idle_minutes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canonicalize_for_snapshot(dir.path());
+        write_projection_cache_file(
+            &root.join("src/main.ts"),
+            "import { used } from './target';\nexport function main() { used(); }\n",
+        );
+        write_projection_cache_file(
+            &root.join("src/target.ts"),
+            "export function used() {}\nexport function neverCalled() {}\n",
+        );
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let storage = tempfile::tempdir().expect("storage");
+        let manager = InspectManager::new();
+        let checkout = bind_published_call_graph(&manager, &root, storage.path());
+        let job = snapshot_job(&root, &inspect_dir, true);
+        let build = || {
+            manager
+                .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+                .expect("dead-code snapshot")
+        };
+        let held = || {
+            checkout
+                .view()
+                .expect("published view")
+                .dead_code_snapshot_held()
+        };
+        assert_eq!(
+            manager.release_idle_dead_code_graph(Instant::now()),
+            DeadCodeGraphRelease::NotHeld
+        );
+
+        drop(build());
+        assert!(held(), "a request keeps the graph for the next one");
+        let requested_at = Instant::now();
+        manager.record_dead_code_request(requested_at);
+        let almost = requested_at + DEAD_CODE_GRAPH_IDLE_RELEASE - Duration::from_secs(1);
+        assert_eq!(
+            manager.release_idle_dead_code_graph(almost),
+            DeadCodeGraphRelease::KeepFor(Duration::from_secs(1))
+        );
+        assert!(held(), "the graph stays until ten idle minutes have passed");
+
+        assert_eq!(
+            manager.release_idle_dead_code_graph(requested_at + DEAD_CODE_GRAPH_IDLE_RELEASE),
+            DeadCodeGraphRelease::Released
+        );
+        assert!(!held(), "ten idle minutes release the graph");
+        assert_eq!(
+            manager.release_idle_dead_code_graph(requested_at + DEAD_CODE_GRAPH_IDLE_RELEASE * 2),
+            DeadCodeGraphRelease::NotHeld
+        );
+
+        assert!(
+            data_layer_snapshot_exports(&build(), &root)
+                .iter()
+                .any(|export| export.symbol == "neverCalled"),
+            "the next request builds the graph again"
+        );
+        assert!(held());
+    }
+
+    /// The exports a data-layer dead-code snapshot gives for its files: it
+    /// lists none itself, and its rollup reads them from the call graph it
+    /// carries.
+    fn data_layer_snapshot_exports(
+        snapshot: &CallgraphSnapshot,
+        root: &Path,
+    ) -> Vec<crate::inspect::job::CallgraphExport> {
+        assert!(snapshot.exported_symbols.is_empty(), "{snapshot:?}");
+        snapshot
+            .data_layer
+            .as_ref()
+            .expect("the snapshot carries the data layer's call graph")
+            .exported_symbols_of(root, &snapshot.files)
+            .expect("the call graph's exports")
+    }
+
+    /// Opens the index-store checkout of `root` under `storage`, waits until
+    /// its call graph is published, and lets `manager`'s dead code read it.
+    /// Dead code reads only that checkout's call graph.
+    fn bind_published_call_graph(
+        manager: &InspectManager,
+        root: &Path,
+        storage: &Path,
+    ) -> Arc<crate::data_layer::runtime::DataCheckout> {
+        let checkout = crate::data_layer::runtime::DataCheckout::open(root, storage, None)
+            .expect("bind the checkout");
+        // A first build publishes the text index before the call graph.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !checkout
+            .view()
+            .is_some_and(|view| view.status().callgraph_published)
+        {
+            assert!(Instant::now() < deadline, "the checkout never published");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        manager.read_dead_code_from_data_layer(root, &checkout);
+        checkout
     }
 
     #[test]
@@ -8438,7 +6797,7 @@ mod guard_tests {
 
     fn artifact_cache_key_for_test(project_root: &std::path::Path) -> String {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        crate::search_index::artifact_cache_key(project_root)
+        crate::root_identity::key::artifact_cache_key(project_root)
     }
 
     #[test]
@@ -8547,62 +6906,6 @@ mod guard_tests {
     }
 
     #[test]
-    fn dead_code_blocked_on_callgraph_reads_latest_aggregate_flag() {
-        // Health asks the manager whether dead_code is only missing because the
-        // callgraph store was not ready when it scanned. The answer must track
-        // the latest persisted dead_code aggregate's `callgraph_available` flag
-        // (mirroring the suppression rule in `latest_tier2_counts`).
-        let dir = tempfile::tempdir().unwrap();
-        let project_root = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::write(project_root.join("lib.rs"), "pub fn marker() {}\n").unwrap();
-        let manager = InspectManager::new();
-        let inspect_dir = dir.path().join("inspect");
-
-        // No aggregate yet → not blocked.
-        assert!(!manager.dead_code_blocked_on_callgraph(inspect_dir.clone(), project_root.clone()));
-
-        let cache = manager
-            .cache_for_paths(inspect_dir.clone(), project_root.clone())
-            .expect("open cache");
-        let key = JobKey::for_project_category(InspectCategory::DeadCode);
-        let hash = cache
-            .contribution_set_hash(InspectCategory::DeadCode)
-            .expect("contribution hash");
-
-        // A callgraph-backed dead_code aggregate → not blocked, count surfaced.
-        cache
-            .store_tier2_aggregate(
-                key.clone(),
-                &hash,
-                serde_json::json!({ "count": 3, "callgraph_available": true }),
-            )
-            .expect("store callgraph-backed aggregate");
-        assert!(!manager.dead_code_blocked_on_callgraph(inspect_dir.clone(), project_root.clone()));
-        assert_eq!(
-            manager
-                .latest_tier2_counts(inspect_dir.clone(), project_root.clone())
-                .0,
-            Some(3)
-        );
-
-        // A callgraph_unavailable aggregate (store not ready) → blocked, and the
-        // count stays suppressed so the status bar never fabricates a zero.
-        cache
-            .store_tier2_aggregate(
-                key,
-                &hash,
-                crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(1),
-            )
-            .expect("store callgraph_unavailable aggregate");
-        assert!(manager.dead_code_blocked_on_callgraph(inspect_dir.clone(), project_root.clone()));
-        assert_eq!(
-            manager.latest_tier2_counts(inspect_dir, project_root).0,
-            None,
-            "callgraph_unavailable dead_code must stay suppressed"
-        );
-    }
-
-    #[test]
     fn foreign_writer_failure_backoff_is_scope_local_and_expires() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -8663,8 +6966,8 @@ mod guard_tests {
             );
             let start = Instant::now();
             assert_eq!(
-                manager.latest_tier2_counts(inspect_dir.clone(), root.clone()),
-                (None, None, None)
+                manager.latest_project_todos_count(inspect_dir.clone(), root.clone()),
+                None
             );
             assert!(start.elapsed() < Duration::from_millis(500));
             assert!(opening
@@ -8719,6 +7022,8 @@ mod guard_tests {
         .unwrap();
         let snapshot = tier1_snapshot(&root);
         let inspect_dir = snapshot.inspect_dir.clone();
+        // The count reads the index store's records of the root.
+        let _store = crate::data_layer::tools::inspect::bind_published_for_test(&root);
         let manager = InspectManager::new();
 
         assert_eq!(
@@ -8810,15 +7115,6 @@ mod guard_tests {
         assert!(manager
             .submit_background(snapshot.clone(), InspectCategory::Todos, scope.clone())
             .is_err());
-        assert!(manager
-            .submit_tier2_run_with_reuse_background(snapshot.clone(), InspectCategory::DeadCode)
-            .unwrap()
-            .is_none());
-        let submission = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::DeadCode],
-        );
-        assert!(submission.queued_categories.is_empty());
         let outcome = manager.tier2_run_with_reuse_blocking(
             snapshot.clone(),
             InspectCategory::DeadCode,
@@ -8831,7 +7127,6 @@ mod guard_tests {
             scope.clone(),
         );
         assert_eq!(outcome.payload().unwrap()["off"], true);
-        assert_eq!(manager.automatic_tier2_schedule_count_for_test(), 0);
         assert_eq!(manager.reuse_starts.load(Ordering::SeqCst), 0);
         assert_eq!(manager.next_job_id.load(Ordering::Relaxed), initial);
         assert!(
@@ -8884,16 +7179,17 @@ mod guard_tests {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap();
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        let (store, _) =
-            CallGraphStore::cold_build_with_lease(callgraph_dir, root.clone(), &files).unwrap();
-        let blocker = store.lock_readiness_for_test();
-        drop(store);
+        // The index store's call graph stays building until the hold drops.
+        let hold = crate::data_layer::checkout::hold_call_graph_for_test(&root);
+        let storage = tempfile::tempdir().expect("storage");
+        let checkout = crate::data_layer::runtime::DataCheckout::open(&root, storage.path(), None)
+            .expect("bind the checkout");
         let mut job = snapshot_job(&root, &inspect_dir, true);
         job.scope_files = files;
         job.callgraph_writer = false;
         let manager = InspectManager::new();
+        manager.read_dead_code_from_data_layer(&root, &checkout);
         let result = manager.tier2_run_with_reuse_job_result(job.clone());
         InspectManager::store_completion(
             &manager.caches,
@@ -8924,6 +7220,7 @@ mod guard_tests {
         );
         let cache = manager.cache_for_snapshot(&snapshot).unwrap();
         let cached = filter_outcome_for_scope_with_contributions(
+            &manager.data_layer_dead_code,
             Some(&manager),
             JobOutcome::Fresh {
                 payload: json!({"count": 0, "items": [], "complete": true}),
@@ -8939,8 +7236,9 @@ mod guard_tests {
             "a cached project-wide zero cannot bypass a busy graph: {cached:?}"
         );
         assert!(cached.payload().unwrap().get("count").is_none());
-        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(hold);
         let scoped = filter_outcome_for_scope_with_contributions(
+            &manager.data_layer_dead_code,
             Some(&manager),
             outcome,
             &snapshot,
@@ -8954,6 +7252,14 @@ mod guard_tests {
             "unlock cannot complete unscanned facts: {scoped:?}"
         );
         assert!(scoped.payload().unwrap().get("count").is_none());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !checkout
+            .view()
+            .is_some_and(|view| view.status().callgraph_published)
+        {
+            assert!(Instant::now() < deadline, "the call graph never published");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let ready = manager.completion_outcome(manager.tier2_run_with_reuse_job_result(job));
         assert_eq!(
             ready.payload().unwrap()["callgraph_available"],
@@ -9037,7 +7343,7 @@ mod guard_tests {
             "export function plantedDead() { return 1; }\n",
         )
         .expect("write source fixture");
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let inspect_dir = root.join(".aft-cache").join("inspect");
         let snapshot = InspectSnapshot::new_with_capabilities(
@@ -9071,6 +7377,9 @@ mod guard_tests {
             Arc::clone(&semantic_seed_active),
         ));
         manager.set_cold_build_limiter(Arc::clone(&limiter));
+        // Dead code reads its call graph from the root's index-store checkout.
+        let storage = tempfile::tempdir().expect("storage");
+        let _checkout = bind_published_call_graph(&manager, &root, storage.path());
 
         let inspect_manager = Arc::clone(&manager);
         let scope = JobScope::for_project(root);
@@ -9155,7 +7464,7 @@ mod guard_tests {
             "export function plantedDead() { return 1; }\n",
         )
         .expect("write source fixture");
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let inspect_dir = root.join(".aft-cache").join("inspect");
         let snapshot = InspectSnapshot::new_with_capabilities(
@@ -9177,6 +7486,9 @@ mod guard_tests {
         let limiter = cold_build_limiter::test_limiter(1);
         let manager = Arc::new(InspectManager::new());
         manager.set_cold_build_limiter(Arc::clone(&limiter));
+        // Dead code reads its call graph from the root's index-store checkout.
+        let storage = tempfile::tempdir().expect("storage");
+        let _checkout = bind_published_call_graph(&manager, &root, storage.path());
         let first = manager.tier2_run_with_reuse_blocking_fresh(
             snapshot.clone(),
             InspectCategory::DeadCode,
@@ -9312,7 +7624,7 @@ mod guard_tests {
     }
 
     #[test]
-    fn background_tier2_reuse_panic_clears_builder_registration() {
+    fn tier2_reuse_panic_clears_builder_registration() {
         use crate::config::Config;
         use crate::parser::SymbolCache;
         use std::sync::RwLock;
@@ -9325,7 +7637,7 @@ mod guard_tests {
             "export function planted() { return 1; }\n",
         )
         .expect("write source fixture");
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let inspect_dir = root.join(".aft-cache").join("inspect");
         let snapshot = InspectSnapshot::new_with_capabilities(
@@ -9372,9 +7684,11 @@ mod guard_tests {
         };
 
         let manager = Arc::new(InspectManager::new());
-        manager
-            .submit_tier2_run_with_reuse_background(snapshot, InspectCategory::Duplicates)
-            .expect("queue background duplicates scan");
+        let _ = manager.tier2_run_with_reuse_blocking(
+            snapshot,
+            InspectCategory::Duplicates,
+            JobScope::for_project(root.clone()),
+        );
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -9673,17 +7987,10 @@ export function bannerUnused() {}
             if name != "aft-packages" {
                 assert!(!excluded.is_empty(), "no generated/minified inputs: {name}");
             }
-            let project_key = crate::search_index::artifact_cache_key(&root);
+            let project_key = crate::root_identity::key::artifact_cache_key(&root);
             crate::root_cache::configure_artifact_access(&root, &project_key, false);
-            let (store, _) = CallGraphStore::cold_build_with_lease(
-                storage.join("callgraph").join(&project_key),
-                root.clone(),
-                &files,
-            )
-            .unwrap();
-            let snapshot = Arc::new(
-                crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap(),
-            );
+            let snapshot =
+                Arc::new(crate::callgraph_store::dead_code_projection::snapshot_for_test(&root));
             let mut job = snapshot_job(&root, &storage.join("inspect").join(&project_key), true);
             job.scope_files = files.clone();
             job.callgraph_snapshot = Some(snapshot.clone());
@@ -9811,46 +8118,6 @@ export function bannerUnused() {}
     }
 
     #[test]
-    fn inspect_callgraph_open_waits_out_transient_sqlite_writer_lock() {
-        let dir = write_ts_project(3);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        let (store, _) =
-            CallGraphStore::cold_build_with_lease(callgraph_dir.clone(), root.clone(), &files)
-                .expect("publish initial generation");
-        let sqlite_path = store.sqlite_path().to_path_buf();
-        drop(store);
-
-        let blocker = rusqlite::Connection::open(&sqlite_path).expect("open blocking connection");
-        blocker
-            .execute_batch(
-                "PRAGMA journal_mode=DELETE;
-                 BEGIN EXCLUSIVE;
-                 UPDATE meta SET v = v WHERE k = 'ready';",
-            )
-            .expect("hold exclusive write transaction");
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let open = std::thread::spawn(move || {
-            started_tx.send(()).expect("signal inspect open start");
-            open_or_build_blocking_callgraph_store(callgraph_dir, root, true, &files)
-        });
-        started_rx.recv().expect("inspect open thread started");
-        std::thread::sleep(Duration::from_millis(100));
-        blocker.execute_batch("COMMIT").expect("release write lock");
-
-        assert!(
-            open.join()
-                .expect("inspect open thread joined")
-                .expect("transient contention must stay on the Building/retry path")
-                .is_some(),
-            "inspect must reopen the ready callgraph instead of failing terminally"
-        );
-    }
-
-    #[test]
     fn callgraph_snapshot_reports_unavailable_when_store_disabled() {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
@@ -9865,347 +8132,201 @@ export function bannerUnused() {}
         );
     }
 
-    #[test]
-    fn callgraph_snapshot_reports_unavailable_when_store_not_ready() {
-        let dir = write_ts_project(3);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let _store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open empty store");
-
-        let snapshot =
-            build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true), false);
-
-        assert!(
-            snapshot.is_none(),
-            "a cold/mid-build store must surface callgraph_unavailable instead of rebuilding inline"
-        );
+    /// `snapshot_job` with views on: the data layer stands in only for the
+    /// views database.
+    fn views_snapshot_job(root: &Path, inspect_dir: &Path) -> InspectJob {
+        let mut job = snapshot_job(root, inspect_dir, true);
+        let config = (*job.config).clone();
+        job.config = Arc::new(config);
+        job
     }
 
     #[test]
-    fn suspended_callgraph_build_sets_distinct_builder_state() {
+    fn callgraph_snapshot_reads_a_ready_data_layer_checkout_and_never_a_pending_one() {
         let dir = write_ts_project(3);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        let key = crate::build_breaker::BreakerKey::new(
-            root.display().to_string(),
-            crate::build_breaker::BuildDomain::CallgraphCold,
-            crate::callgraph_store::callgraph_corpus_fingerprint_for_test(&root, &files)
-                .expect("corpus fingerprint"),
-        );
-        let breaker = crate::build_breaker::BuildDeathBreaker::open(
-            callgraph_dir.join("build-breaker.sqlite"),
-        )
-        .expect("open breaker");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_millis() as u64;
-        for _ in 0..3 {
-            let crate::build_breaker::BreakerAdmission::Admitted(attempt) =
-                breaker.admit_at(&key, 0, now).expect("admit build")
-            else {
-                panic!("early suspension before the threshold");
-            };
-            breaker
-                .record_attributed_death_at(&key, &attempt.attempt_id, 0, 0, now)
-                .expect("record death");
-        }
-
+        let root = canonicalize_for_snapshot(dir.path());
+        let storage = tempfile::tempdir().expect("storage");
+        let inspect_dir = storage.path().join("inspect");
+        let job = views_snapshot_job(&root, &inspect_dir);
         let manager = InspectManager::new();
-        let job = snapshot_job(&root, &inspect_dir, true);
-        assert!(manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, true, true, &files)
-            .is_none());
-        assert_eq!(
-            manager.tier2_builder_state(InspectCategory::DeadCode),
-            InspectBuilderState::Suspended
+        let read_job = |manager: &InspectManager, job: &InspectJob| {
+            manager
+                .build_tier2_callgraph_snapshot_with_refresh_and_verdict(job, false, false, &[])
+                .expect("snapshot readiness")
+        };
+        let read = |manager: &InspectManager| read_job(manager, &job);
+        let unbound = manager.build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+            &job,
+            false,
+            false,
+            &[],
         );
-        let detail = manager.tier2_builder_state_detail(InspectCategory::DeadCode);
-        assert!(detail.starts_with("suspended domain=callgraph_cold deaths=3 age_s="));
-        assert!(detail.ends_with("reason=zero_credit_death_limit"));
-    }
-
-    #[test]
-    fn readonly_tier2_projection_keeps_generation_pinned_through_concurrent_gc() {
-        let dir = write_ts_project(3);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        let (store, _) =
-            CallGraphStore::cold_build_with_lease(callgraph_dir.clone(), root.clone(), &files)
-                .expect("initial generation");
-        let initial_generation = store.sqlite_path().to_path_buf();
-        drop(store);
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::enable_writer_lease_acquisition_counts_for_test();
-        // Delta-based counting: the enable flag is process-global and another
-        // parallel test may have switched it on before this test's own setup
-        // acquired its cold-build lease, so the absolute count is
-        // enable-order-dependent. Only acquisitions inside the observed window
-        // below are this assertion's business.
-        let lease_count_before = crate::root_cache::writer_lease_acquisition_count_for_test(
-            crate::root_cache::RootCacheDomain::Callgraph,
-            &project_key,
-            &root,
+        assert!(
+            matches!(unbound, Err(CallGraphStoreError::Building)),
+            "without a bound checkout dead code waits for one"
         );
 
-        let root_for_observer = root.clone();
-        let dir_for_observer = callgraph_dir.clone();
-        let files_for_observer = files.clone();
-        crate::callgraph_store::set_projection_before_open_observer(Some(Arc::new(
-            move |projected_path| {
-                for _ in 0..3 {
-                    let (published, _) = CallGraphStore::cold_build_with_lease(
-                        dir_for_observer.clone(),
-                        root_for_observer.clone(),
-                        &files_for_observer,
-                    )
-                    .expect("concurrent generation publication");
-                    drop(published);
-                }
-                assert!(
-                    projected_path.is_file(),
-                    "the tier2 reader marker must pin the selected generation through GC"
-                );
-            },
-        )));
-        let mut job = snapshot_job(&root, &inspect_dir, true);
-        job.callgraph_writer = false;
-
-        let snapshot =
-            build_tier2_callgraph_snapshot_with_refresh(&job, false, &[root.join("mod0.ts")]);
-        crate::callgraph_store::set_projection_before_open_observer(None);
-
-        assert!(snapshot.is_some());
-        assert!(initial_generation.is_file());
+        let checkout = crate::data_layer::runtime::DataCheckout::open(&root, storage.path(), None)
+            .expect("bind the checkout");
+        // A first build publishes the text index before the call graph.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !checkout
+            .view()
+            .is_some_and(|view| view.status().callgraph_published)
+        {
+            assert!(Instant::now() < deadline, "the checkout never published");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        manager.read_dead_code_from_data_layer(&root, &checkout);
+        let (snapshot, verdict, _) = read(&manager).expect("the ready data layer answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
         assert_eq!(
-            crate::root_cache::writer_lease_acquisition_count_for_test(
-                crate::root_cache::RootCacheDomain::Callgraph,
-                &project_key,
-                &root,
-            ) - lease_count_before,
+            snapshot.files,
+            (0..3)
+                .map(|index| root.join(format!("mod{index}.ts")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            data_layer_snapshot_exports(&snapshot, &root).len(),
             3,
-            "only the three observer publications may acquire a writer lease; tier2 must stay read-only"
+            "{snapshot:?}"
         );
+
+        // A checkout of another folder never answers for a root.
+        let other = InspectManager::new();
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let elsewhere = canonicalize_for_snapshot(elsewhere.path());
+        other.read_dead_code_from_data_layer(&elsewhere, &checkout);
+        assert!(matches!(
+            other.build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+                &views_snapshot_job(&elsewhere, &inspect_dir),
+                false,
+                false,
+                &[],
+            ),
+            Err(CallGraphStoreError::Building)
+        ));
+
+        // An edit the data layer has not resolved yet: dead code waits for
+        // the call graph to resolve it, and never answers from the older
+        // publication.
+        let edited = root.join("mod0.ts");
+        std::fs::write(&edited, "export function g0() { return 0; }\n").expect("edit");
+        checkout.note_paths(std::slice::from_ref(&edited));
+        let (snapshot, verdict, _) = read(&manager).expect("the refreshed data layer answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
+        let exports = format!("{:?}", data_layer_snapshot_exports(&snapshot, &root));
+        assert!(exports.contains("\"g0\""), "{exports}");
     }
 
     #[test]
-    fn direct_callgraph_snapshot_does_not_cold_rebuild_when_store_needs_rebuild() {
-        let dir = write_ts_project(3);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&files).expect("cold build store");
-        let sqlite_path = store.sqlite_path().to_path_buf();
-        drop(store);
+    fn dead_code_follows_a_refreshed_data_layer_call_graph_as_a_cold_build_would() {
+        fn published(root: &Path, storage: &Path) -> Arc<crate::data_layer::runtime::DataCheckout> {
+            let checkout =
+                crate::data_layer::runtime::DataCheckout::open(root, storage, None).expect("bind");
+            // A first build publishes the text index before the call graph.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !checkout
+                .view()
+                .is_some_and(|view| view.status().callgraph_published)
+            {
+                assert!(Instant::now() < deadline, "the checkout never published");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            checkout
+        }
+        fn parts(snapshot: &CallgraphSnapshot) -> [String; 6] {
+            [
+                format!("{:#?}", snapshot.files),
+                format!("{:#?}", snapshot.exported_symbols),
+                format!("{:#?}", snapshot.outbound_calls),
+                format!("{:#?}", snapshot.entry_points),
+                format!("{:#?}", snapshot.entry_point_symbols),
+                format!("{:#?}", snapshot.go_initializers),
+            ]
+        }
+        let dead = |job: &InspectJob, snapshot: &Arc<CallgraphSnapshot>| {
+            let mut job = job.clone();
+            job.callgraph_snapshot = Some(Arc::clone(snapshot));
+            let aggregate = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+                .outcome
+                .expect("dead-code scan")
+                .aggregate;
+            let items = aggregate["items"]
+                .as_array()
+                .expect("dead-code items")
+                .iter()
+                .map(|item| format!("{}::{}", item["file"], item["symbol"]))
+                .collect::<Vec<_>>();
+            (items, aggregate)
+        };
 
-        // A different root that still exists on disk. It lives in its own
-        // temp dir: a sibling of the project temp dir would outlive the test.
-        let previous_root_parent = tempfile::tempdir().expect("previous root parent");
-        let still_existing_previous_root = std::fs::canonicalize(previous_root_parent.path())
-            .expect("canonical previous root parent")
-            .join("previous-root-still-exists");
-        std::fs::create_dir_all(&still_existing_previous_root).expect("create previous root");
-        let conn = rusqlite::Connection::open(&sqlite_path).expect("open store sqlite");
-        conn.execute(
-            "UPDATE backend_file_state SET workspace_root = ?1",
-            rusqlite::params![still_existing_previous_root.display().to_string()],
+        let dir = tempfile::tempdir().expect("project");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(
+            root.join("src/foo.ts"),
+            "export function used() {}\nexport function spare() {}\n",
         )
-        .expect("force root repair rebuild state");
-        drop(conn);
+        .expect("foo");
+        let main = root.join("src/main.ts");
+        std::fs::write(
+            &main,
+            "import { used } from './foo';\nexport function main() {\n  used();\n}\n",
+        )
+        .expect("main");
+        let storage = tempfile::tempdir().expect("storage");
+        let checkout = published(&root, storage.path());
+        let manager = InspectManager::new();
+        manager.read_dead_code_from_data_layer(&root, &checkout);
+        let mut job = views_snapshot_job(&root, &storage.path().join("inspect"));
+        job.scope_files = vec![root.join("src/foo.ts"), main.clone()];
+        let read = |manager: &InspectManager| {
+            manager
+                .build_tier2_callgraph_snapshot_with_refresh_and_verdict(&job, false, false, &[])
+                .expect("snapshot readiness")
+        };
 
-        let snapshot =
-            build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true), false)
-                .expect("readonly snapshot should avoid cold-rebuilding the store");
+        let (before, verdict, _) = read(&manager).expect("the published graph answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
+        assert_eq!(dead(&job, &before).0, [r#""src/foo.ts"::"spare""#]);
 
-        assert_eq!(snapshot.files.len(), 3);
-        let conn = rusqlite::Connection::open(&sqlite_path).expect("reopen store sqlite");
-        let stored_root: String = conn
-            .query_row(
-                "SELECT workspace_root FROM backend_file_state LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read stored root");
+        // `spare` gains the only caller `used` had.
+        std::fs::write(
+            &main,
+            "import { spare } from './foo';\nexport function main() {\n  spare();\n}\n",
+        )
+        .expect("edit main");
+        checkout.note_paths(std::slice::from_ref(&main));
+        // Dead code waits for the call graph to resolve the edit.
+        let (refreshed, verdict, _) = read(&manager).expect("the refreshed graph answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
         assert_eq!(
-            stored_root,
-            still_existing_previous_root.display().to_string(),
-            "direct inspect must not cold-rebuild or re-root a read-only snapshot"
+            checkout.view().expect("view").status().callgraph,
+            crate::data_layer::checkout::PlaneStatus::Ready
         );
-    }
+        let (items, aggregate) = dead(&job, &refreshed);
+        assert_eq!(items, [r#""src/foo.ts"::"used""#]);
 
-    #[test]
-    fn callgraph_snapshot_reads_ready_callgraph_store() {
-        let dir = write_ts_project(3);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&files).expect("cold build store");
-
-        let snapshot =
-            build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true), false)
-                .expect("ready store snapshot");
-
-        assert_eq!(snapshot.files.len(), 3);
-        assert_eq!(snapshot.exported_symbols.len(), 3);
+        // The same answer as a cold build of the edited checkout.
+        let cold_storage = tempfile::tempdir().expect("cold storage");
+        let cold_view = published(&root, cold_storage.path())
+            .view()
+            .expect("cold view");
+        let cold = cold_view
+            .dead_code_snapshot_shared()
+            .expect("cold snapshot");
+        assert_eq!(parts(&refreshed), parts(&cold));
+        // Every call row too, though dead code reads them file by file.
+        let rows = |view: &crate::data_layer::checkout::CheckoutView| {
+            parts(&view.rows_dead_code_snapshot().expect("every call row"))
+        };
+        assert_eq!(rows(&checkout.view().expect("view")), rows(&cold_view));
+        assert_eq!(aggregate, dead(&job, &cold).1);
     }
 
     // Unix-only: the unresolvable path relies on `..` after a regular file,
     // which Windows folds lexically into a resolvable path.
-    #[cfg(unix)]
-    #[test]
-    fn path_identity_mismatch_is_a_named_dead_code_terminal_gap() {
-        let dir = write_ts_project(1);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let source = root.join("mod0.ts");
-        let foreign_dir = tempfile::tempdir().expect("foreign tempdir");
-        let not_a_dir = foreign_dir.path().join("plain-file");
-        std::fs::write(&not_a_dir, "not a directory\n").expect("write plain file");
-        // A location that cannot be resolved, unlike a real out-of-root file
-        // (those are skipped per refresh and never recorded).
-        let foreign = not_a_dir.join("..").join("foreign.ts");
-        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
-        store.cold_build(&[source]).expect("cold build store");
-        let error = store
-            .refresh_files(&[foreign.clone()])
-            .expect_err("an unresolvable path cannot be assigned a store-relative key");
-        assert!(matches!(
-            error,
-            CallGraphStoreError::PathIdentityMismatch { .. }
-        ));
-        drop(store);
-
-        let job = snapshot_job(&root, &inspect_dir, true);
-        let reason = callgraph_path_identity_gap(&job)
-            .unwrap()
-            .expect("durable path identity gap");
-        assert!(reason.contains("callgraph_path_identity_mismatch"));
-        assert!(reason.contains(&foreign.display().to_string()));
-        let aggregate =
-            crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_with_reason(
-                1,
-                Some(&reason),
-            );
-        assert_eq!(
-            aggregate["notes"],
-            serde_json::json!(["callgraph_unavailable", "callgraph_path_identity_mismatch"])
-        );
-        assert_eq!(aggregate["callgraph_unavailable_reason"], reason);
-    }
-
-    #[test]
-    fn stale_callgraph_store_refreshes_inline_when_refresh_worker_does_not_run() {
-        let dir = write_ts_project(2);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&files).expect("cold build store");
-        store
-            .mark_files_stale(&files)
-            .expect("mark published store stale");
-        drop(store);
-
-        let job = snapshot_job(&root, &inspect_dir, true);
-        let manager = InspectManager::new();
-        assert!(
-            !manager.callgraph_ready_for_snapshot(&InspectSnapshot::new(
-                root.clone(),
-                inspect_dir.clone(),
-                Arc::clone(&job.config),
-                Arc::clone(&job.symbol_cache),
-            )),
-            "a store with leftover stale rows must not look callgraph-ready"
-        );
-
-        let snapshot = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("dead_code must refresh stale rows inline when the refresh worker never ran");
-        assert_eq!(snapshot.files.len(), 2);
-
-        let ready = InspectSnapshot::new(
-            root,
-            inspect_dir,
-            Arc::clone(&job.config),
-            Arc::clone(&job.symbol_cache),
-        );
-        assert!(
-            manager.callgraph_ready_for_snapshot(&ready),
-            "after the inline refresh, callgraph_ready must agree with a successful projection"
-        );
-    }
-
-    #[test]
-    fn callgraph_ready_and_builder_projection_agree_on_stale_rows() {
-        let dir = write_ts_project(1);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&files).expect("cold build store");
-        let sqlite_path = store.sqlite_path().to_path_buf();
-        drop(store);
-
-        let job = snapshot_job(&root, &inspect_dir, true);
-        let snapshot = InspectSnapshot::new(
-            root.clone(),
-            inspect_dir.clone(),
-            Arc::clone(&job.config),
-            Arc::clone(&job.symbol_cache),
-        );
-        let manager = InspectManager::new();
-        assert!(
-            manager.callgraph_ready_for_snapshot(&snapshot),
-            "a fresh store must be ready for both the phase check and projection"
-        );
-        project_dead_code_snapshot(&sqlite_path).expect("fresh store should project");
-
-        let store = CallGraphStore::open_ready_no_rebuild(
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir"),
-            root.clone(),
-        )
-        .expect("reopen writer")
-        .expect("ready writer");
-        store.mark_files_stale(&files).expect("mark stale");
-        drop(store);
-
-        assert!(
-            !manager.callgraph_ready_for_snapshot(&snapshot),
-            "callgraph_ready must use the same stale-row predicate as dead_code projection"
-        );
-        let error =
-            project_dead_code_snapshot(&sqlite_path).expect_err("stale rows must block projection");
-        match error {
-            CallGraphStoreError::Unavailable(message) => {
-                assert_eq!(message, "callgraph has stale files pending refresh")
-            }
-            other => panic!("expected Unavailable, got {other:?}"),
-        }
-    }
 
     #[test]
     fn failed_builder_attempt_history_uses_locked_refusal_detail() {
@@ -10255,380 +8376,6 @@ export function bannerUnused() {}
     }
 
     #[test]
-    fn generation_keyed_projection_cache_reuses_unchanged_snapshot() {
-        let (_dir, _root, _inspect_dir, job) = published_projection_fixture();
-        let manager = InspectManager::new();
-        let (projections, _observer_reset) = count_projections();
-
-        let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("first projection");
-        let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("cached projection");
-
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "an unchanged generation and write revision must reuse the projected Arc"
-        );
-        assert_eq!(
-            projections.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "two dead-code scans without a callgraph mutation must project once"
-        );
-        let memory = manager.callgraph_projection_estimated_memory();
-        assert_eq!(
-            memory.counts["callgraph_projection_snapshots"], 1,
-            "the resident projection must be attributed to the root"
-        );
-        assert!(
-            memory.estimated_bytes.unwrap_or_default() > 0,
-            "a populated projection must report an estimated residency"
-        );
-    }
-
-    #[test]
-    fn stale_store_never_reuses_an_equal_revision_projection() {
-        let (_dir, root, inspect_dir, job) = published_projection_fixture();
-        let manager = InspectManager::new();
-        manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("initial projection");
-        let writer = CallGraphStore::open_ready_no_rebuild(
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir"),
-            root.clone(),
-        )
-        .expect("open writer")
-        .expect("ready writer");
-        writer
-            .mark_files_stale(&[root.join("src/target.ts")])
-            .expect("mark target stale");
-        drop(writer);
-
-        assert!(
-            manager
-                .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-                .is_none(),
-            "a stale marker must block a cache hit even though it does not advance the graph revision"
-        );
-    }
-
-    fn assert_fresh_refresh_reuses_projection(job: InspectJob, target: PathBuf) {
-        let manager = InspectManager::new();
-        let (projections, _observer_reset) = count_projections();
-        let started = Instant::now();
-        let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("initial projection");
-        let cold_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&job.inspect_dir, &job.project_root)
-                .expect("copied graph directory");
-        let writer = CallGraphStore::open_ready_no_rebuild(callgraph_dir, job.project_root.clone())
-            .expect("open writer")
-            .expect("ready graph");
-        let revision_before = writer
-            .projection_write_revision()
-            .expect("initial revision");
-        let started = Instant::now();
-        let (_, profile) = writer
-            .refresh_files_profiled(&[target])
-            .expect("already-fresh refresh");
-        let revision_after = writer
-            .projection_write_revision()
-            .expect("revision after refresh");
-        drop(writer);
-        let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("projection after fresh refresh");
-        eprintln!("fresh_refresh_projection initial_ms={cold_ms:.3} refresh_and_snapshot_ms={:.3} index_loads={} projections={} outbound_rows={}",
-            started.elapsed().as_secs_f64() * 1_000.0,
-            profile.index_loads, projections.load(std::sync::atomic::Ordering::SeqCst),
-            first.outbound_calls.len());
-        assert_eq!(
-            profile.index_loads, 0,
-            "a fresh refresh must not load the corpus resolver index"
-        );
-        assert_eq!(
-            revision_after, revision_before,
-            "no written rows means no projection invalidation"
-        );
-        assert_eq!(
-            projections.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "a duplicate refresh must not re-project the corpus"
-        );
-        assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    #[test]
-    fn projection_cache_reuses_snapshot_after_already_fresh_refresh() {
-        let (_dir, root, _inspect_dir, job) = published_projection_fixture();
-        assert_fresh_refresh_reuses_projection(job, root.join("src/target.ts"));
-    }
-
-    #[test]
-    fn projection_cache_invalidates_after_deleting_a_file_without_dependents() {
-        let (_dir, root, inspect_dir, job) = published_projection_fixture();
-        let manager = InspectManager::new();
-        let (projections, _observer_reset) = count_projections();
-        let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("initial projection");
-        // Snapshot paths are verbatim-stripped by the projection's normalizer;
-        // mirror it (as the other projection tests do) so the expectation
-        // matches on Windows, where the canonical root is verbatim.
-        let target = canonicalize_for_snapshot(&root.join("src/main.ts"));
-        assert!(first.files.contains(&target));
-        let graph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap();
-        let writer = CallGraphStore::open_ready_no_rebuild(graph_dir, root.clone())
-            .expect("open writer")
-            .expect("ready graph");
-        std::fs::remove_file(&target).expect("remove unreferenced entry file");
-        let (stats, profile) = writer
-            .refresh_files_profiled(std::slice::from_ref(&target))
-            .expect("refresh deletion");
-        assert_eq!(stats.deleted_files, vec!["src/main.ts"]);
-        assert_eq!(
-            profile.index_loads, 0,
-            "deletion without surviving callers needs no resolver"
-        );
-        drop(writer);
-        let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("projection after deletion");
-        assert!(!second.files.contains(&target));
-        assert_eq!(
-            projections.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "row deletion must invalidate even when no resolver was loaded"
-        );
-    }
-
-    #[test]
-    #[ignore = "offline probe requires a normalized production graph copy below target"]
-    fn profile_fresh_refresh_projection_on_store_copy() {
-        let project = Path::new(crate::test_support::manifest_dir())
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .canonicalize()
-            .expect("checkout root");
-        let storage = PathBuf::from(
-            std::env::var_os("AFT_CPU_HUNT_STORAGE_COPY")
-                .expect("set AFT_CPU_HUNT_STORAGE_COPY to an offline copied storage root"),
-        )
-        .canonicalize()
-        .expect("copied storage");
-        assert!(
-            storage.starts_with(project.join("target")),
-            "never probe a live artifact"
-        );
-        let target = project.join("crates/aft/tests/engine_comparator_test.rs");
-        let inspect_dir = storage.join("inspect");
-        let key = crate::search_index::artifact_cache_key(&project);
-        crate::root_cache::configure_artifact_access(&project, &key, false);
-        let graph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &project).unwrap();
-        let writer = CallGraphStore::open_ready_no_rebuild(graph_dir, project.clone())
-            .expect("open copied graph")
-            .expect("copied graph ready");
-        writer
-            .refresh_files(std::slice::from_ref(&target))
-            .expect("normalize copied freshness");
-        drop(writer);
-        let mut job = snapshot_job(&project, &inspect_dir, true);
-        job.callgraph_writer = false;
-        assert_fresh_refresh_reuses_projection(job, target);
-    }
-
-    #[test]
-    fn projection_cache_invalidates_on_in_place_refresh_for_readonly_scans() {
-        let (_dir, root, inspect_dir, job) = published_projection_fixture();
-        let unrelated = root.join("src/unrelated.ts");
-        write_projection_cache_file(&unrelated, &"unrelated();\n".repeat(100));
-        let store = CallGraphStore::open_ready_no_rebuild(
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap(),
-            root.clone(),
-        )
-        .unwrap()
-        .unwrap();
-        store.refresh_files(&[unrelated]).unwrap();
-        drop(store);
-        let manager = InspectManager::new();
-        let (projections, _observer_reset) = count_projections();
-        let target = root.join("src/target.ts");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
-
-        let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("initial projection");
-        let writer = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root.clone())
-            .expect("open writer")
-            .expect("ready writer");
-        let revision_before = writer
-            .projection_write_revision()
-            .expect("read initial revision")
-            .expect("new stores write a projection revision");
-        write_projection_cache_file(&target, "export function secondTarget() {}\n");
-        writer
-            .refresh_files(&[target])
-            .expect("refresh changed target");
-        let revision_after = writer
-            .projection_write_revision()
-            .expect("read refreshed revision")
-            .expect("refreshed stores retain a projection revision");
-        assert!(
-            revision_after > revision_before,
-            "the in-place refresh must advance the durable cache identity"
-        );
-        drop(writer);
-
-        crate::callgraph_store::take_projection_work();
-        let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("refreshed readonly projection");
-        let (full_projections, outbound_rows_read) = crate::callgraph_store::take_projection_work();
-        eprintln!("incremental_work full_projections={full_projections} outbound_rows_read={outbound_rows_read}");
-        assert_eq!(full_projections, 0);
-        assert_eq!(outbound_rows_read, 1);
-        assert!(
-            !first
-                .exported_symbols
-                .iter()
-                .any(|export| export.symbol == "secondTarget"),
-            "the initial snapshot must not already contain the refreshed export"
-        );
-        assert!(
-            second
-                .exported_symbols
-                .iter()
-                .any(|export| export.symbol == "secondTarget"),
-            "the readonly scan must expose graph data from the refreshed store"
-        );
-        assert_eq!(
-            projections.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "an in-place refresh must force the next scan to re-project"
-        );
-    }
-
-    #[test]
-    fn projection_cache_invalidates_when_cold_build_publishes_new_generation() {
-        let (_dir, root, inspect_dir, job) = published_projection_fixture();
-        let manager = InspectManager::new();
-        let (projections, _observer_reset) = count_projections();
-        let target = root.join("src/target.ts");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
-
-        let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("initial projection");
-        let before = CallGraphStore::open_readonly(callgraph_dir.clone(), root.clone())
-            .expect("open initial reader")
-            .expect("initial reader");
-        let revision_before = before
-            .projection_write_revision()
-            .expect("read initial revision")
-            .expect("new stores write a projection revision");
-        drop(before);
-        write_projection_cache_file(&target, "export function coldBuildTarget() {}\n");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        let (published, _) =
-            CallGraphStore::cold_build_with_lease(callgraph_dir, root.clone(), &files)
-                .expect("publish replacement generation");
-        let revision_after = published
-            .projection_write_revision()
-            .expect("read replacement revision")
-            .expect("replacement stores write a projection revision");
-        assert_eq!(
-            revision_after, revision_before,
-            "cold builds begin with the same revision, so this assertion exercises the generation half of the cache identity"
-        );
-        drop(published);
-
-        let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("replacement projection");
-        assert!(
-            !first
-                .exported_symbols
-                .iter()
-                .any(|export| export.symbol == "coldBuildTarget"),
-            "the initial snapshot must not already contain the replacement export"
-        );
-        assert!(
-            second
-                .exported_symbols
-                .iter()
-                .any(|export| export.symbol == "coldBuildTarget"),
-            "the next scan must expose the generation published by the cold build"
-        );
-        assert_eq!(
-            projections.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "a new pointer generation must force the next scan to re-project"
-        );
-    }
-
-    #[test]
-    fn idle_eviction_drops_generation_keyed_projection_cache() {
-        let (_dir, _root, _inspect_dir, job) = published_projection_fixture();
-        let manager = InspectManager::new();
-        let (projections, _observer_reset) = count_projections();
-
-        let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("initial projection");
-        manager.evict_idle_caches();
-        assert_eq!(
-            manager.callgraph_projection_estimated_memory().counts
-                ["callgraph_projection_snapshots"],
-            0,
-            "idle artifact eviction must release the root projection slot"
-        );
-        let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
-            .expect("reloaded projection");
-
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "eviction must drop the previous projection Arc"
-        );
-        assert_eq!(
-            projections.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "the next scan after idle eviction must reload the projection"
-        );
-    }
-
-    #[test]
-    fn callgraph_snapshot_uses_ready_root_keyed_store() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let dir = write_ts_project(3);
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let storage_dir = root.join(".aft-cache");
-        let inspect_dir = storage_dir
-            .join("inspect")
-            .join(crate::path_identity::project_scope_key(&root));
-        let warm_callgraph_dir = storage_dir
-            .join("callgraph")
-            .join(artifact_cache_key_for_test(&root));
-        let store = CallGraphStore::open(warm_callgraph_dir, root.clone()).expect("open store");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&files).expect("cold build store");
-
-        let snapshot =
-            build_tier2_callgraph_snapshot(&snapshot_job(&root, &inspect_dir, true), false)
-                .expect("ready sibling store snapshot");
-
-        assert_eq!(snapshot.files.len(), 3);
-        assert_eq!(snapshot.exported_symbols.len(), 3);
-    }
-
-    #[test]
     fn dead_code_forced_deletion_refreshes_callgraph_store_before_rollup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
@@ -10652,14 +8399,9 @@ export function bannerUnused() {}
         );
 
         let inspect_dir = root.join(".aft-cache").join("opencode").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
-        let project_files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&project_files).expect("cold build store");
-        drop(store);
+        let manager = InspectManager::new();
+        let storage = tempfile::tempdir().expect("storage");
+        let checkout = bind_published_call_graph(&manager, &root, storage.path());
 
         let config = Arc::new(crate::config::Config {
             project_root: Some(root.clone()),
@@ -10677,7 +8419,6 @@ export function bannerUnused() {}
             Arc::clone(&config),
             Arc::clone(&symbol_cache),
         );
-        let manager = InspectManager::new();
         let initial_job =
             manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
         let initial = manager
@@ -10696,6 +8437,8 @@ export function bannerUnused() {}
 
         let deleted = root.join("src/dead.ts");
         std::fs::remove_file(&deleted).expect("delete dead fixture");
+        // The watcher hands the deletion to the root's index-store checkout.
+        checkout.note_paths(std::slice::from_ref(&deleted));
         let delete_job = manager.tier2_reuse_job(snapshot, InspectCategory::DeadCode, None);
         let refreshed = manager
             .tier2_run_with_reuse_job_result_with_options(
@@ -10725,27 +8468,22 @@ export function bannerUnused() {}
             !aggregate_has_file_symbol(&refreshed, "src/dead.ts", "plantedDead"),
             "delete refresh should remove the planted dead export: {refreshed:#}"
         );
+    }
 
-        let store = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root)
-            .expect("open refreshed store")
-            .expect("refreshed store is ready");
-        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
-        assert!(
-            projected
-                .files
-                .iter()
-                .all(|file| !file.ends_with("src/dead.ts")),
-            "watcher deletion should be applied to the persisted callgraph store: {:#?}",
-            projected.files
-        );
+    /// The folders and index-store checkout an edge-case fixture keeps alive
+    /// for the test; the checkout is dropped before its storage folder.
+    struct EdgeCaseFixture {
+        checkout: Arc<crate::data_layer::runtime::DataCheckout>,
+        _storage: tempfile::TempDir,
+        _project: tempfile::TempDir,
     }
 
     /// A Rust binary crate with one live and one dead function, plus `extra`
-    /// edge-case files, with a ready call-graph store. Returns the manager,
-    /// snapshot and a job for one dead-code pass.
+    /// edge-case files, with a published index-store call graph. Returns the
+    /// manager, snapshot and a job for one dead-code pass.
     fn dead_code_edge_case_fixture(
         extra: &[(&str, &str)],
-    ) -> (tempfile::TempDir, PathBuf, InspectManager, InspectSnapshot) {
+    ) -> (EdgeCaseFixture, PathBuf, InspectManager, InspectSnapshot) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
         write_fixture_file(
@@ -10771,14 +8509,9 @@ export function bannerUnused() {}
         }
 
         let inspect_dir = root.join(".aft-cache").join("opencode").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
-        let project_files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        store.cold_build(&project_files).expect("cold build store");
-        drop(store);
+        let manager = InspectManager::new();
+        let storage = tempfile::tempdir().expect("storage");
+        let checkout = bind_published_call_graph(&manager, &root, storage.path());
 
         let config = Arc::new(crate::config::Config {
             project_root: Some(root.clone()),
@@ -10795,7 +8528,12 @@ export function bannerUnused() {}
             config,
             Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
         );
-        (dir, root, InspectManager::new(), snapshot)
+        let fixture = EdgeCaseFixture {
+            checkout,
+            _storage: storage,
+            _project: dir,
+        };
+        (fixture, root, manager, snapshot)
     }
 
     fn seed_dead_code_fact_cache(
@@ -10886,19 +8624,18 @@ export function bannerUnused() {}
         );
     }
 
-    fn assert_cached_dead_code_gap(payload: &Value, file: &str) {
-        assert_eq!(payload["complete"], false, "{payload:#}");
-        assert_eq!(
-            payload["parse_errors"],
-            json!([{
-                "file": file,
-                "message": "cached dead-code contribution could not be decoded",
-            }])
+    /// Dead code over the index store never reads the inspect cache's
+    /// per-file facts, so damage to them leaves its answer complete.
+    fn assert_no_dead_code_gap(payload: &Value) {
+        assert_eq!(payload["complete"], true, "{payload:#}");
+        assert!(
+            payload["parse_errors"].as_array().is_none_or(Vec::is_empty),
+            "{payload:#}"
         );
     }
 
     #[test]
-    fn dead_code_cache_gap_before_rollup_survives_project_reuse() {
+    fn damaged_cached_dead_code_rows_before_a_rollup_leave_it_complete() {
         for corruption in ["missing exports", "invalid exports"] {
             let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
             let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
@@ -10912,7 +8649,7 @@ export function bannerUnused() {}
                 .outcome
                 .expect("initial project rollup")
                 .aggregate;
-            assert_cached_dead_code_gap(&first, "src/main.rs");
+            assert_no_dead_code_gap(&first);
             assert!(aggregate_has_file_symbol(
                 &first,
                 "src/dead.rs",
@@ -10935,25 +8672,25 @@ export function bannerUnused() {}
                 (0, 0, 0),
                 "reuse must not decode contribution bodies"
             );
-            assert_cached_dead_code_gap(&reused.aggregate, "src/main.rs");
+            assert_no_dead_code_gap(&reused.aggregate);
             assert_eq!(reused.aggregate, first);
 
-            // Fresh describes source freshness, not analysis completeness. Both
-            // writer and read-only project lookups must retain the saved gap.
+            // Both writer and read-only project lookups return the saved
+            // answer.
             let scope = JobScope::for_project(root);
             for outcome in [
                 manager.tier2_read_cached(snapshot.clone(), job.category, scope.clone()),
                 manager.tier2_read_cached_readonly(snapshot.clone(), job.category, scope),
             ] {
                 let payload = fresh_payload(outcome);
-                assert_cached_dead_code_gap(&payload, "src/main.rs");
+                assert_no_dead_code_gap(&payload);
                 assert_eq!(payload, first);
             }
         }
     }
 
     #[test]
-    fn dead_code_cache_gap_after_rollup_waits_until_recompute() {
+    fn damaged_cached_dead_code_rows_after_a_rollup_leave_the_recompute_complete() {
         for corruption in ["missing exports", "invalid exports"] {
             let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
             let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
@@ -10998,7 +8735,8 @@ export function bannerUnused() {}
             );
 
             // A manifest change invalidates the aggregate key without reparsing
-            // the unchanged Rust file, so the next rollup must read its bad row.
+            // the unchanged Rust file. The next rollup works dead code out
+            // from the index store's facts, never from its bad row.
             let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
             write_fixture_file(
                 &root,
@@ -11037,8 +8775,9 @@ export function bannerUnused() {}
                 !scanned.contains(&canonicalize_for_snapshot(&root.join("src/dead.rs"))),
                 "the corrupted row must not be repaired by rescanning its unchanged source"
             );
-            assert_cached_dead_code_gap(&recomputed.aggregate, "src/dead.rs");
-            assert!(!aggregate_has_file_symbol(
+            assert_no_dead_code_gap(&recomputed.aggregate);
+            assert_eq!(recomputed.aggregate, first);
+            assert!(aggregate_has_file_symbol(
                 &recomputed.aggregate,
                 "src/dead.rs",
                 "planted_dead"
@@ -11178,18 +8917,18 @@ export function bannerUnused() {}
     /// pass completes instead of failing until some later pass.
     #[test]
     fn missing_dead_code_facts_are_filled_before_rollup() {
-        let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[("src/empty.rs", "")]);
+        let (fixture, root, manager, snapshot) =
+            dead_code_edge_case_fixture(&[("src/empty.rs", "")]);
         let mut job = manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
         job.scope_files = scope_files(&root, &JobScope::for_project(root.clone()));
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&snapshot.inspect_dir, &root).expect("store dir");
-        let store = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root.clone())
-            .expect("open store")
-            .expect("store is ready");
         job.callgraph_snapshot = Some(Arc::new(
-            project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot"),
+            fixture
+                .checkout
+                .view()
+                .expect("published call graph")
+                .dead_code_snapshot()
+                .expect("project snapshot"),
         ));
-        drop(store);
         let cache = manager
             .cache_for_snapshot(&snapshot)
             .expect("inspect cache");
@@ -11484,10 +9223,8 @@ export const shared = 1;
 mod dead_code_projection_tests {
     use super::*;
     use crate::callgraph::walk_project_files;
-    use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore};
     use crate::config::Config;
-    use crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR;
-    use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
+
     use crate::parser::SymbolCache;
     use filetime::FileTime;
     use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
@@ -11501,15 +9238,27 @@ mod dead_code_projection_tests {
         write_projection_fixture(dir.path());
         let root = canonical_root(dir.path());
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let callgraph_dir =
-            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
         let files = project_files(&root);
-        store.cold_build(&files).expect("cold build store");
-        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
-        drop(store);
+        // Dead code reads its call graph from the root's index-store checkout.
+        let storage = tempfile::tempdir().expect("storage");
+        let checkout = crate::data_layer::runtime::DataCheckout::open(&root, storage.path(), None)
+            .expect("bind the checkout");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !checkout
+            .view()
+            .is_some_and(|view| view.status().callgraph_published)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the checkout never published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let projected = checkout
+            .view()
+            .expect("view")
+            .dead_code_snapshot()
+            .expect("project snapshot");
 
         let config = Arc::new(Config {
             project_root: Some(root.clone()),
@@ -11555,6 +9304,21 @@ mod dead_code_projection_tests {
         );
 
         let manager = InspectManager::new();
+        manager.read_dead_code_from_data_layer(&root, &checkout);
+        // The scoped answer of a manager that has cached no rollup yet.
+        let uncached = |cache: &InspectCache| {
+            let fresh = InspectManager::new();
+            fresh.read_dead_code_from_data_layer(&root, &checkout);
+            scoped_tier2_payload_from_contributions(
+                Some(&fresh),
+                &snapshot,
+                InspectCategory::DeadCode,
+                cache,
+                success.aggregate.clone(),
+                &scope,
+            )
+            .unwrap()
+        };
         let ready_payload = scoped_tier2_payload_from_contributions(
             Some(&manager),
             &snapshot,
@@ -11584,18 +9348,11 @@ mod dead_code_projection_tests {
             )
             .expect("scoped payload")
         };
-        let first_state = manager.previous_dead_code_rollup_state(&root).unwrap();
         assert_eq!(read(), ready_payload);
-        assert!(
-            Arc::ptr_eq(
-                &first_state,
-                &manager.previous_dead_code_rollup_state(&root).unwrap()
-            ),
-            "unchanged scoped reads must reuse the existing rollup"
-        );
 
-        // Refreshing analysis facts need not change the source hash. The stored
-        // contribution bytes must participate in the reuse decision too.
+        // Refreshed cached contributions with the same source hash leave the
+        // answer alone: scoped dead code is built from the index store's
+        // facts, not from cached contributions.
         let mut refreshed = success.contributions.clone();
         refreshed[0].contribution["refresh_marker"] = json!(true);
         cache
@@ -11607,14 +9364,6 @@ mod dead_code_projection_tests {
             )
             .unwrap();
         assert_eq!(read(), ready_payload);
-        assert!(
-            !Arc::ptr_eq(
-                &first_state,
-                &manager.previous_dead_code_rollup_state(&root).unwrap()
-            ),
-            "changed facts with the same source hash must invalidate reuse"
-        );
-        let first_state = manager.previous_dead_code_rollup_state(&root).unwrap();
 
         let live_file = root.join("src").join("live.ts");
         let live_relative = live_file.strip_prefix(&root).expect("relative live file");
@@ -11635,59 +9384,29 @@ mod dead_code_projection_tests {
             "deleting the live file must remove exactly one contribution row"
         );
         let changed_contributions = read();
-        assert!(
-            !Arc::ptr_eq(
-                &first_state,
-                &manager.previous_dead_code_rollup_state(&root).unwrap()
-            ),
-            "contribution changes must invalidate rollup reuse"
-        );
-        assert_eq!(
-            changed_contributions,
-            scoped_tier2_payload_from_contributions(
-                None,
-                &snapshot,
-                InspectCategory::DeadCode,
-                &cache,
-                success.aggregate.clone(),
-                &scope,
-            )
-            .unwrap()
-        );
+        assert_eq!(changed_contributions, uncached(&cache));
 
-        let before_graph_change = manager.previous_dead_code_rollup_state(&root).unwrap();
         write_file(
             &root.join("src/main.ts"),
             "import { knownDead } from './dead';\nexport function main() { knownDead(); }\n",
         );
-        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).unwrap();
-        store.refresh_files(&[root.join("src/main.ts")]).unwrap();
-        drop(store);
+        // The watcher hands the edit to the root's index-store checkout.
+        checkout.note_paths(&[root.join("src/main.ts")]);
         let changed_graph = read();
-        assert!(
-            !Arc::ptr_eq(
-                &before_graph_change,
-                &manager.previous_dead_code_rollup_state(&root).unwrap()
-            ),
-            "graph revisions must invalidate rollup reuse even with identical contributions"
+        assert_eq!(changed_graph, uncached(&cache));
+        // With the call graph switched off there is no graph to read: the
+        // rollup must say so instead of treating an empty graph as truth.
+        let mut graph_off = snapshot.config.as_ref().clone();
+        graph_off.indexes.callgraph = false;
+        let graph_off_snapshot = InspectSnapshot::new(
+            root.clone(),
+            snapshot.inspect_dir.clone(),
+            Arc::new(graph_off),
+            Arc::clone(&snapshot.symbol_cache),
         );
-        assert_eq!(
-            changed_graph,
-            scoped_tier2_payload_from_contributions(
-                None,
-                &snapshot,
-                InspectCategory::DeadCode,
-                &cache,
-                success.aggregate.clone(),
-                &scope,
-            )
-            .unwrap()
-        );
-
-        std::fs::remove_dir_all(&callgraph_dir).expect("remove ready callgraph store");
         let unavailable_payload = scoped_tier2_payload_from_contributions(
             Some(&manager),
-            &snapshot,
+            &graph_off_snapshot,
             InspectCategory::DeadCode,
             &cache,
             success.aggregate,
@@ -11699,69 +9418,9 @@ mod dead_code_projection_tests {
                 .get("callgraph_available")
                 .and_then(Value::as_bool),
             Some(false),
-            "missing store must report callgraph_unavailable instead of fabricating an empty graph: {unavailable_payload:#}"
+            "a switched-off call graph must report callgraph_unavailable instead of fabricating an empty graph: {unavailable_payload:#}"
         );
         assert_live_item(&unavailable_payload, "src/live.ts", "knownLive");
-    }
-    #[derive(Debug, PartialEq, Eq)]
-    struct ComparableSnapshot {
-        files: BTreeSet<PathBuf>,
-        exported_symbols: BTreeSet<(PathBuf, String, String, u32)>,
-        outbound_calls: BTreeSet<(PathBuf, String, String, u32)>,
-        entry_points: BTreeSet<PathBuf>,
-        entry_point_symbols: BTreeMap<PathBuf, BTreeSet<String>>,
-    }
-
-    #[test]
-    fn dead_code_projection_contains_expected_fixture_surface() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_projection_fixture(dir.path());
-        let root = canonical_root(dir.path());
-        let projected = store_projected_snapshot(&root, ".store-dead-code-surface");
-
-        assert_projection_fixture_coverage(&root, &projected);
-    }
-
-    #[test]
-    fn dead_code_projection_incremental_scenario_matrix_matches_cold_rebuild() {
-        run_projection_scenario("rename", setup_projection_rename, edit_projection_rename);
-        run_projection_scenario("delete", setup_projection_delete, edit_projection_delete);
-        run_projection_scenario("new-file", setup_projection_delete, |root| {
-            let path = root.join("new.ts");
-            write_file(
-                &path,
-                "import { foo } from './foo'; export function added() { foo(); }\n",
-            );
-            vec![path]
-        });
-        run_projection_scenario(
-            "barrel delete",
-            setup_projection_barrel,
-            edit_projection_barrel_delete,
-        );
-        run_projection_scenario(
-            "dispatch edit",
-            setup_projection_dispatch,
-            edit_projection_dispatch,
-        );
-        run_projection_scenario(
-            "body-only edit",
-            setup_projection_body_only,
-            edit_projection_body_only,
-        );
-        run_projection_scenario(
-            "Go initializer target edit",
-            |root| {
-                write_file(&root.join("go.mod"), "module example.com/app\n");
-                write_file(&root.join("main.go"), "package main\nimport _ \"example.com/app/lib\"\nfunc main() { control() }\nfunc control() {}\n");
-                write_file(&root.join("lib/lib.go"), "package lib\nvar Boot = Used()\nfunc Used() int { return 1 }\nfunc Spare() int { return 2 }\n");
-            },
-            |root| {
-                let file = root.join("lib/lib.go");
-                write_file(&file, "package lib\nvar Changed = Spare()\nfunc Used() int { return 1 }\nfunc Spare() int { return 2 }\n");
-                vec![file]
-            },
-        );
     }
 
     #[test]
@@ -11770,13 +9429,18 @@ mod dead_code_projection_tests {
         write_projection_fixture(dir.path());
         let root = canonical_root(dir.path());
         let files = project_files(&root);
-        let projected = store_projected_snapshot(&root, ".store-dead-code-e2e");
+        let projected = fixture_callgraph_snapshot(&root);
 
         let projected_aggregate = dead_code_aggregate(&root, files, projected);
         assert_dead_item(&projected_aggregate, "src/dead.ts", "knownDead");
         assert_live_item(&projected_aggregate, "src/live.ts", "knownLive");
-        assert_live_item(&projected_aggregate, "src/render.ts", "render");
-        assert_live_item(&projected_aggregate, "src/other_render.ts", "render");
+        // `service.render()` has a known receiver, the object literal
+        // `service`, so the call reaches only that literal's `render`. The
+        // index store resolves it exactly and adds no name-based dispatch
+        // rescue, so the two exported `render` functions, which nothing
+        // calls, are reported dead.
+        assert_dead_item(&projected_aggregate, "src/render.ts", "render");
+        assert_dead_item(&projected_aggregate, "src/other_render.ts", "render");
     }
 
     #[test]
@@ -11785,25 +9449,7 @@ mod dead_code_projection_tests {
         write_rust_attribute_entry_fixture(dir.path());
         let root = canonical_root(dir.path());
         let files = project_files(&root);
-        let store = CallGraphStore::open(root.join(".store-tauri-commands"), root.clone())
-            .expect("open store");
-        store.cold_build(&files).expect("cold build store");
-        let command = store
-            .node_for(Path::new("src/commands.rs"), "get_primers")
-            .expect("command node");
-        assert!(
-            command.is_entry_point,
-            "attribute-rooted commands must be labeled as callgraph entry points"
-        );
-        let private_command = store
-            .node_for(Path::new("src/commands.rs"), "private_command")
-            .expect("private command node");
-        assert!(
-            private_command.is_entry_point,
-            "private attribute-rooted commands must also be callgraph entry points"
-        );
-
-        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        let projected = fixture_callgraph_snapshot(&root);
         let aggregate = dead_code_aggregate(&root, files, projected);
         assert_live_item(&aggregate, "src/commands.rs", "get_primers");
         assert_live_item(&aggregate, "src/db.rs", "helper");
@@ -11816,58 +9462,38 @@ mod dead_code_projection_tests {
     }
 
     #[test]
-    fn dead_code_projection_rust_attribute_roots_are_cold_deterministic() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_rust_attribute_entry_fixture(dir.path());
-        let root = canonical_root(dir.path());
-        let first = store_projected_snapshot(&root, ".store-tauri-cold-a");
-        let second = store_projected_snapshot(&root, ".store-tauri-cold-b");
-
-        assert_snapshot_parts_eq("rust attribute roots cold", &first, &second);
-    }
-
-    #[test]
     fn dead_code_projection_rust_attribute_roots_survive_unrelated_incremental_edit() {
+        use crate::data_layer::runtime::{DataCheckout, Fresh};
         let dir = tempfile::tempdir().expect("tempdir");
         write_rust_attribute_entry_fixture(dir.path());
         let root = canonical_root(dir.path());
-        let files_before = project_files(&root);
-        let incremental_store =
-            CallGraphStore::open(root.join(".store-tauri-incremental"), root.clone())
-                .expect("open incremental store");
-        incremental_store
-            .cold_build(&files_before)
-            .expect("initial cold build");
-
+        let storage = tempfile::tempdir().expect("storage");
+        let checkout = DataCheckout::open_planes(
+            &root,
+            storage.path(),
+            None,
+            crate::data_layer::checkout::Planes {
+                text: false,
+                callgraph: true,
+            },
+        )
+        .expect("bind checkout");
+        assert!(matches!(
+            checkout.fresh_view(Duration::from_secs(60)),
+            Fresh::Ready(_)
+        ));
+        let changed = root.join("src/unrelated.rs");
         write_file(
-            &root.join("src/unrelated.rs"),
-            r#"// unrelated edit should not refresh command attribute facts
-pub fn unrelated() -> u32 { 2 }
-"#,
+            &changed,
+            "// unrelated edit\npub fn unrelated() -> u32 { 2 }\n",
         );
-        let stats = incremental_store
-            .refresh_files(&[root.join("src/unrelated.rs")])
-            .expect("refresh unrelated file");
-        assert_eq!(stats.refreshed_own_files, 1);
-        assert_eq!(stats.changed_files, vec!["src/unrelated.rs".to_string()]);
-        assert!(
-            !stats
-                .surface_changed
-                .iter()
-                .any(|file| file == "src/commands.rs"),
-            "unrelated edit must not refresh the command module: {stats:#?}"
-        );
-        let incremental = project_dead_code_snapshot(incremental_store.sqlite_path())
-            .expect("project incremental snapshot");
-
-        let cold_store = CallGraphStore::open(root.join(".store-tauri-cold"), root.clone())
-            .expect("open cold store");
-        cold_store
-            .cold_build(&project_files(&root))
-            .expect("cold rebuild");
-        let cold = project_dead_code_snapshot(cold_store.sqlite_path()).expect("project cold");
-        assert_snapshot_parts_eq("rust attribute roots unrelated edit", &cold, &incremental);
-
+        checkout.note_paths(&[changed]);
+        let view = match checkout.fresh_view(Duration::from_secs(60)) {
+            Fresh::Ready(view) => view,
+            Fresh::Building => panic!("edited call graph did not publish"),
+            Fresh::Failed(reason) => panic!("edited call graph failed: {reason}"),
+        };
+        let incremental = view.dead_code_snapshot().expect("snapshot");
         let aggregate = dead_code_aggregate(&root, project_files(&root), incremental);
         assert_live_item(&aggregate, "src/commands.rs", "get_primers");
         assert_live_item(&aggregate, "src/db.rs", "helper");
@@ -11875,511 +9501,8 @@ pub fn unrelated() -> u32 { 2 }
         assert_dead_item(&aggregate, "src/commands.rs", "planted_dead");
     }
 
-    fn assert_projection_fixture_coverage(root: &Path, snapshot: &CallgraphSnapshot) {
-        let comparable = comparable_snapshot(snapshot);
-        assert!(
-            comparable
-                .files
-                .iter()
-                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("ts")),
-            "fixture must include TypeScript files: {:#?}",
-            comparable.files
-        );
-        assert!(
-            comparable
-                .files
-                .iter()
-                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("js")),
-            "fixture must include JavaScript files: {:#?}",
-            comparable.files
-        );
-        assert!(
-            comparable
-                .files
-                .iter()
-                .any(|file| file.extension().and_then(|ext| ext.to_str()) == Some("rs")),
-            "fixture must include Rust files: {:#?}",
-            comparable.files
-        );
-
-        let main_file = canonicalize_for_snapshot(&root.join("src/main.ts"));
-        let private_dispatch_target = format!("{}::dispatch", main_file.display());
-        assert!(
-            comparable
-                .outbound_calls
-                .iter()
-                .any(
-                    |(caller_file, caller_symbol, target, _)| caller_file == &main_file
-                        && caller_symbol == "main"
-                        && target == &private_dispatch_target
-                ),
-            "fixture must cover same-file private fallback target {private_dispatch_target}: {:#?}",
-            comparable.outbound_calls
-        );
-        assert!(
-            comparable
-                .outbound_calls
-                .iter()
-                .any(|(_, _, target, _)| target.contains(DISPATCHED_CALLEE_SEPARATOR)),
-            "fixture must cover method-dispatch suffixes: {:#?}",
-            comparable.outbound_calls
-        );
-        assert!(
-            comparable
-                .exported_symbols
-                .iter()
-                .any(|(_, symbol, kind, _)| symbol == "runDefault"
-                    && kind == DEFAULT_EXPORT_MARKER_KIND),
-            "fixture must cover default-export marker rows: {:#?}",
-            comparable.exported_symbols
-        );
-    }
-
-    fn run_projection_scenario(name: &str, setup: fn(&Path), edit: fn(&Path) -> Vec<PathBuf>) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        setup(dir.path());
-        let root = canonical_root(dir.path());
-        let files_before = project_files(&root);
-        let incremental_store = CallGraphStore::open(
-            root.join(format!(".store-dead-code-projection-{name}-incremental")),
-            root.clone(),
-        )
-        .expect("open incremental store");
-        incremental_store
-            .cold_build(&files_before)
-            .expect("initial cold build");
-
-        let (revision, previous) =
-            project_dead_code_snapshot_with_revision(incremental_store.sqlite_path())
-                .expect("initial projection");
-        let changed = edit(&root);
-        incremental_store
-            .refresh_files(&changed)
-            .expect("refresh changed files");
-        let (_, incremental, verdict) =
-            crate::callgraph_store::project_dead_code_snapshot_incremental(
-                incremental_store.sqlite_path(),
-                Some((revision.unwrap(), &previous)),
-            )
-            .expect("project incremental snapshot");
-        assert_eq!(
-            verdict.reason, None,
-            "{name}: a spliced projection carries no full-projection reason"
-        );
-        assert_eq!(
-            verdict.kind,
-            ProjectionKind::Spliced,
-            "{name}: a clean journal bridge must splice the previous snapshot"
-        );
-        let full =
-            project_dead_code_snapshot(incremental_store.sqlite_path()).expect("full projection");
-        let files = project_files(&root);
-        assert_eq!(
-            serde_json::to_vec(&dead_code_aggregate(
-                &root,
-                files.clone(),
-                incremental.clone()
-            ))
-            .unwrap(),
-            serde_json::to_vec(&dead_code_aggregate(&root, files, full)).unwrap(),
-            "{name}: incremental and full projection aggregates must be byte-identical",
-        );
-
-        let cold_store = CallGraphStore::open(
-            root.join(format!(".store-dead-code-projection-{name}-cold")),
-            root.clone(),
-        )
-        .expect("open cold store");
-        cold_store
-            .cold_build(&project_files(&root))
-            .expect("cold rebuild");
-        let cold =
-            project_dead_code_snapshot(cold_store.sqlite_path()).expect("project cold snapshot");
-
-        assert_snapshot_parts_eq(name, &cold, &incremental);
-    }
-
-    /// Store-backed dead_code benchmark. Measures, on a real checkout, the
-    /// persisted-store cold build, the warm SQLite projection cost, and the
-    /// remaining `run_dead_code_scan` cost (per-file reexport/type-ref reparse +
-    /// BFS roll-up). Production Tier-2 reads a warm store; cold_build is included
-    /// here only to make end-to-end store cost visible.
-    /// Ignored by default; run with:
-    ///   AFT_BENCH_REPO=/path/to/large/repo cargo test -p agent-file-tools --lib \
-    ///     -- --ignored --nocapture --test-threads=1 dead_code_decision_b_benchmark
-    #[test]
-    #[ignore = "manual benchmark; needs AFT_BENCH_REPO pointing at a large checkout"]
-    fn dead_code_decision_b_benchmark() {
-        let Ok(repo) = std::env::var("AFT_BENCH_REPO") else {
-            eprintln!("AFT_BENCH_REPO unset; skipping");
-            return;
-        };
-        // Each phase flushes immediately so a file-redirected run shows live progress.
-        macro_rules! mark {
-            ($($a:tt)*) => {{ eprintln!($($a)*); let _ = std::io::Write::flush(&mut std::io::stderr()); }};
-        }
-        let root = canonical_root(Path::new(&repo));
-        let files = project_files(&root);
-        mark!(
-            "\n=== Store-backed dead_code benchmark ===\nrepo: {}\nsource files (walk_project_files): {}\nstarted store cold_build...",
-            root.display(),
-            files.len()
-        );
-
-        // Store cold_build + projection. Production warm runs skip cold_build and
-        // pay only the projection below.
-        let store_dir = root.join(".aft-bench-store");
-        let _ = std::fs::remove_dir_all(&store_dir);
-        let store = CallGraphStore::open(store_dir.clone(), root.clone()).expect("open store");
-        let t = Instant::now();
-        let cold_stats = store.cold_build(&files).expect("store cold build");
-        let store_build_ms = t.elapsed().as_millis();
-        let t = Instant::now();
-        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("projection");
-        let proj_ms = t.elapsed().as_millis();
-        mark!(
-            "store cold_build: {} ms ({:?}) + projection: {} ms = {} ms  (exports={}, outbound={})\nstarted scan...",
-            store_build_ms, cold_stats, proj_ms, store_build_ms + proj_ms,
-            projected.exported_symbols.len(), projected.outbound_calls.len()
-        );
-
-        // Remaining scanner cost: run_dead_code_scan given a ready snapshot.
-        let t = Instant::now();
-        let _result = dead_code_aggregate(&root, files.clone(), projected.clone());
-        let scan_ms = t.elapsed().as_millis();
-        mark!("run_dead_code_scan (cold contributions): {} ms", scan_ms);
-
-        mark!(
-            "\nSUMMARY  files={}  store_cold_plus_projection={}ms  projection={}ms  scan_cold={}ms  total={}ms",
-            files.len(),
-            store_build_ms + proj_ms,
-            proj_ms,
-            scan_ms,
-            store_build_ms + proj_ms + scan_ms
-        );
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
-    #[cfg(unix)]
-    fn projection_bench_cpu_ms() -> f64 {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        // getrusage initializes the output only on success.
-        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-        assert_eq!(result, 0);
-        let usage = unsafe { usage.assume_init() };
-        (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64 * 1000.0
-            + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1000.0
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "offline projection/rollup benchmark copies a production generation"]
-    fn profile_incremental_projection_on_store_copy() {
-        use rusqlite::{backup::Backup, Connection, OpenFlags};
-        let workspace_root = Path::new(crate::test_support::manifest_dir())
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .canonicalize()
-            .unwrap();
-        let root = std::env::var_os("AFT_PROJECTION_BENCH_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| workspace_root.clone())
-            .canonicalize()
-            .unwrap();
-        assert!(
-            root == workspace_root || root.starts_with(workspace_root.join("target")),
-            "benchmark roots must be this checkout or a disposable copy below target"
-        );
-        let source_dir = PathBuf::from(
-            std::env::var_os("AFT_CALLGRAPH_REFRESH_STORE")
-                .expect("set AFT_CALLGRAPH_REFRESH_STORE to the source root-key directory"),
-        );
-        let pointer = std::fs::read_dir(&source_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "current"))
-            .expect("source generation pointer");
-        let source_path = source_dir.join(std::fs::read_to_string(pointer).unwrap().trim());
-        let temp = tempfile::tempdir_in(workspace_root.join("target")).unwrap();
-        let store_dir = temp.path().join("store");
-        std::fs::create_dir_all(&store_dir).unwrap();
-        let key = crate::search_index::artifact_cache_key(&root);
-        let db = store_dir.join(format!("{key}.sqlite"));
-        {
-            let source =
-                Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-            let mut destination = Connection::open(&db).unwrap();
-            Backup::new(&source, &mut destination)
-                .unwrap()
-                .run_to_completion(256, Duration::from_millis(5), None)
-                .unwrap();
-            destination
-                .execute(
-                    "UPDATE backend_file_state SET workspace_root = ?1",
-                    [root.display().to_string()],
-                )
-                .unwrap();
-        }
-        let store = CallGraphStore::open(store_dir, root.clone()).unwrap();
-        // Only disposable checkout sources and the SQLite backup may be mutated.
-        // The source generation is always opened read-only.
-        let changed_count = std::env::var("AFT_PROJECTION_BENCH_CHANGED_FILES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1);
-        let changed_paths = std::env::var_os("AFT_PROJECTION_BENCH_CHANGED_PATHS");
-        let changed = if let Some(changed_paths) = changed_paths.as_ref() {
-            std::fs::read_to_string(changed_paths)
-                .unwrap()
-                .lines()
-                .filter(|line| !line.is_empty())
-                .take(changed_count)
-                .map(|relative| root.join(relative))
-                .collect::<Vec<_>>()
-        } else {
-            (0..changed_count)
-                .map(|index| temp.path().join(format!("probe-{index}.rs")))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            changed.len(),
-            changed_count,
-            "changed-path corpus is too small"
-        );
-        if changed_paths.is_none() {
-            for path in &changed {
-                write_file(path, "pub fn projection_probe() {}\n");
-            }
-            store.refresh_files(&changed).unwrap();
-        }
-        let (revision, previous) =
-            project_dead_code_snapshot_with_revision(store.sqlite_path()).unwrap();
-        let mut refresh_ms = 0.0;
-        if std::env::var_os("AFT_PROJECTION_BENCH_JOURNAL_ONLY").is_some() {
-            let next = revision.unwrap() + 1;
-            let callers = changed
-                .iter()
-                .map(|path| {
-                    path.strip_prefix(&root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                })
-                .collect::<BTreeSet<_>>();
-            let payload = serde_json::to_string(&(next, callers)).unwrap();
-            let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(k, v) VALUES('projection_write_revision', ?1)",
-                [next.to_string()],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-                rusqlite::params![format!("projection_delta_{}", next % 64), payload],
-            )
-            .unwrap();
-        } else {
-            if changed_paths.is_none() {
-                for path in &changed {
-                    write_file(
-                        path,
-                        "pub fn projection_probe() { projection_probe_target(); }\npub fn projection_probe_target() {}\n",
-                    );
-                }
-            }
-            let refresh_started = Instant::now();
-            store.refresh_files(&changed).unwrap();
-            refresh_ms = refresh_started.elapsed().as_secs_f64() * 1000.0;
-            if let Some(journal_paths) = std::env::var_os("AFT_PROJECTION_BENCH_JOURNAL_PATHS") {
-                let current = store.projection_write_revision().unwrap().unwrap();
-                let callers = std::fs::read_to_string(journal_paths)
-                    .unwrap()
-                    .lines()
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_owned)
-                    .collect::<BTreeSet<_>>();
-                let payload = serde_json::to_string(&(current, callers)).unwrap();
-                let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-                    rusqlite::params![format!("projection_delta_{}", current % 64), payload],
-                )
-                .unwrap();
-            }
-        }
-        let snapshot_replay_ms = refresh_ms;
-        let cpu = projection_bench_cpu_ms();
-        let started = Instant::now();
-        let full = project_dead_code_snapshot(store.sqlite_path()).unwrap();
-        let full_elapsed = started.elapsed();
-        let full_ms = full_elapsed.as_secs_f64() * 1000.0;
-        let full_cpu = projection_bench_cpu_ms() - cpu;
-        crate::callgraph_store::take_projection_work();
-        let cpu = projection_bench_cpu_ms();
-        let started = Instant::now();
-        let (_, incremental, verdict) =
-            crate::callgraph_store::project_dead_code_snapshot_incremental(
-                store.sqlite_path(),
-                Some((revision.unwrap(), &previous)),
-            )
-            .unwrap();
-        let delta_elapsed = started.elapsed();
-        let delta_ms = delta_elapsed.as_secs_f64() * 1000.0;
-        let delta_cpu = projection_bench_cpu_ms() - cpu;
-        let work = crate::callgraph_store::take_projection_work();
-        if std::env::var_os("AFT_PROJECTION_BENCH_PROJECTION_ONLY").is_some() {
-            let mut costs = ProjectionCostEstimates::default();
-            costs.observe(
-                ProjectionVerdict {
-                    kind: ProjectionKind::Full,
-                    reason: Some("cold"),
-                    journal_bytes: 0,
-                    changed_files: 0,
-                },
-                full_elapsed,
-            );
-            costs.observe(verdict, delta_elapsed);
-            let (_, _, predicted, _) = project_dead_code_snapshot_incremental_with_costs(
-                store.sqlite_path(),
-                Some((revision.unwrap(), &previous)),
-                costs,
-            )
-            .unwrap();
-            eprintln!(
-                "projection_crossover changed_files={} refresh_ms={refresh_ms:.3} snapshot_replay_ms={:.3} full_ms={full_ms:.3} full_cpu_ms={full_cpu:.3} splice_ms={delta_ms:.3} splice_cpu_ms={delta_cpu:.3} measured={:?} predicted={:?} predicted_reason={:?} outbound_rows_read={}",
-                verdict.changed_files, snapshot_replay_ms + delta_ms, verdict.kind, predicted.kind, predicted.reason, work.1
-            );
-            return;
-        }
-        let mut job = InspectJob {
-            job_id: 87,
-            key: JobKey::for_project_category(InspectCategory::DeadCode),
-            category: InspectCategory::DeadCode,
-            scope_files: full.files.clone(),
-            project_root: root.clone(),
-            inspect_dir: temp.path().join("inspect"),
-            config: Arc::new(Config {
-                project_root: Some(root.clone()),
-                ..Config::default()
-            }),
-            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
-            inspect_writer: true,
-            callgraph_writer: false,
-            callgraph_snapshot: Some(Arc::new(full)),
-        };
-        let contribution_load_started = Instant::now();
-        let copied_inspect = std::env::var_os("AFT_PROJECTION_BENCH_INSPECT_STORE");
-        let contributions = if let Some(source_path) = copied_inspect.as_ref() {
-            let project_key = crate::path_identity::project_scope_key(&root);
-            let project_inspect_dir = job.inspect_dir.join(&project_key);
-            std::fs::create_dir_all(&project_inspect_dir).unwrap();
-            let inspect_db = project_inspect_dir.join(format!("{project_key}.sqlite"));
-            {
-                let source =
-                    Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                        .unwrap();
-                let mut destination = Connection::open(&inspect_db).unwrap();
-                Backup::new(&source, &mut destination)
-                    .unwrap()
-                    .run_to_completion(256, Duration::from_millis(5), None)
-                    .unwrap();
-                for table in ["tier2_contributions", "tier2_aggregates", "tier2_meta"] {
-                    destination
-                        .execute(
-                            &format!("UPDATE {table} SET project_key = ?1"),
-                            [&project_key],
-                        )
-                        .unwrap();
-                }
-            }
-            let cache = InspectCache::open(job.inspect_dir.clone(), root.clone()).unwrap();
-            load_contributions(&cache, &job).unwrap()
-        } else {
-            crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
-                .outcome
-                .unwrap()
-                .contributions
-        };
-        let contribution_load_ms = contribution_load_started.elapsed().as_secs_f64() * 1000.0;
-        let public_api_files = crate::inspect::scanners::dead_code::collect_public_api_files(&root);
-        let roles = crate::inspect::entry_points::resolve_project_roles(&root);
-        let cpu = projection_bench_cpu_ms();
-        let started = Instant::now();
-        let (full_aggregate, rollup_state, _) =
-            crate::inspect::scanners::dead_code::aggregate_dead_code_contributions_incremental(
-                &root,
-                job.callgraph_snapshot.as_deref().unwrap(),
-                &contributions,
-                &public_api_files,
-                &roles,
-                None,
-                Some("store-copy-benchmark"),
-                None,
-                &BTreeSet::new(),
-            );
-        let full_rollup_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let full_rollup_cpu = projection_bench_cpu_ms() - cpu;
-        job.callgraph_snapshot = Some(Arc::new(incremental));
-        let changed_relative = changed
-            .iter()
-            .map(|path| {
-                path.strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
-            .collect::<BTreeSet<_>>();
-        let cpu = projection_bench_cpu_ms();
-        let started = Instant::now();
-        let (delta_aggregate, _, rollup_verdict) =
-            crate::inspect::scanners::dead_code::aggregate_dead_code_contributions_incremental(
-                &root,
-                job.callgraph_snapshot.as_deref().unwrap(),
-                &contributions,
-                &public_api_files,
-                &roles,
-                None,
-                Some("store-copy-benchmark"),
-                Some(&rollup_state),
-                &changed_relative,
-            );
-        let delta_rollup_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let delta_rollup_cpu = projection_bench_cpu_ms() - cpu;
-        assert_eq!(
-            rollup_verdict.kind,
-            crate::inspect::scanners::dead_code::RollupKind::Incremental
-        );
-        assert_eq!(
-            serde_json::to_vec(&full_aggregate).unwrap(),
-            serde_json::to_vec(&delta_aggregate).unwrap()
-        );
-        let manager = InspectManager::new();
-        manager.cache_callgraph_projection(
-            CallgraphProjectionIdentity {
-                project_root: root,
-                generation: None,
-                legacy_sqlite_path: Some(db),
-                write_revision: store.projection_write_revision().unwrap().unwrap(),
-            },
-            job.callgraph_snapshot.clone().unwrap(),
-        );
-        eprintln!("projection_bench changed_files={changed_count} rows={} contributions={} contribution_source={} contribution_load_ms={contribution_load_ms:.3}; refresh_ms={refresh_ms:.3} snapshot_replay_ms={:.3}; before snapshot={full_ms:.3} cpu={full_cpu:.3} rollup={full_rollup_ms:.3} rollup_cpu={full_rollup_cpu:.3}; after snapshot={delta_ms:.3} cpu={delta_cpu:.3} rollup={delta_rollup_ms:.3} rollup_cpu={delta_rollup_cpu:.3}; full_projections={} outbound_rows_read={}", previous.outbound_calls.len(), contributions.len(), if copied_inspect.is_some() { "inspect_copy" } else { "source_scan" }, snapshot_replay_ms + delta_ms, work.0, work.1);
-        eprintln!(
-            "projection_bench callgraph_memory={:?}",
-            manager.callgraph_projection_estimated_memory()
-        );
-    }
-
-    fn store_projected_snapshot(root: &Path, store_name: &str) -> CallgraphSnapshot {
-        let store =
-            CallGraphStore::open(root.join(store_name), root.to_path_buf()).expect("open store");
-        store
-            .cold_build(&project_files(root))
-            .expect("store cold build");
-        project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot")
+    fn fixture_callgraph_snapshot(root: &Path) -> CallgraphSnapshot {
+        crate::callgraph_store::dead_code_projection::snapshot_for_test(root)
     }
 
     fn dead_code_aggregate(
@@ -12407,51 +9530,6 @@ pub fn unrelated() -> u32 { 2 }
             .outcome
             .expect("dead_code scan succeeds")
             .aggregate
-    }
-
-    fn assert_snapshot_parts_eq(
-        label: &str,
-        expected: &CallgraphSnapshot,
-        actual: &CallgraphSnapshot,
-    ) {
-        let expected = comparable_snapshot(expected);
-        let actual = comparable_snapshot(actual);
-        assert_eq!(
-            actual, expected,
-            "{label} store-projected snapshot must match cold store snapshot"
-        );
-    }
-
-    fn comparable_snapshot(snapshot: &CallgraphSnapshot) -> ComparableSnapshot {
-        ComparableSnapshot {
-            files: snapshot.files.iter().cloned().collect(),
-            exported_symbols: snapshot
-                .exported_symbols
-                .iter()
-                .map(|export| {
-                    (
-                        export.file.clone(),
-                        export.symbol.clone(),
-                        export.kind.clone(),
-                        export.line,
-                    )
-                })
-                .collect(),
-            outbound_calls: snapshot
-                .expanded_outbound_calls()
-                .iter()
-                .map(|call| {
-                    (
-                        call.caller_file.clone(),
-                        call.caller_symbol.clone(),
-                        call.target.clone(),
-                        call.line,
-                    )
-                })
-                .collect(),
-            entry_points: snapshot.entry_points.clone(),
-            entry_point_symbols: snapshot.entry_point_symbols.clone(),
-        }
     }
 
     fn assert_dead_item(aggregate: &Value, file: &str, symbol: &str) {
@@ -12497,10 +9575,6 @@ pub fn unrelated() -> u32 { 2 }
     fn bump_mtime(path: &Path) {
         let secs = NEXT_MTIME.fetch_add(1, AtomicOrdering::SeqCst);
         filetime::set_file_mtime(path, FileTime::from_unix_time(secs, 0)).expect("bump mtime");
-    }
-
-    fn remove_file(path: &Path) {
-        std::fs::remove_file(path).expect("remove fixture");
     }
 
     fn write_projection_fixture(root: &Path) {
@@ -12660,120 +9734,6 @@ pub fn false_helper() -> String { "dead".to_string() }
         );
     }
 
-    fn setup_projection_rename(root: &Path) {
-        write_file(
-            &root.join("a.ts"),
-            r#"export function outer() {
-  inner();
-}
-
-export function inner() {}
-"#,
-        );
-    }
-
-    fn edit_projection_rename(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("a.ts");
-        write_file(
-            &path,
-            r#"export function outer() {
-  renamed();
-}
-
-export function renamed() {}
-"#,
-        );
-        vec![path]
-    }
-
-    fn setup_projection_delete(root: &Path) {
-        write_file(&root.join("other.ts"), "export function foo() {}\n");
-        write_file(
-            &root.join("main.ts"),
-            r#"import { foo } from "./foo";
-export function main() { foo(); }
-"#,
-        );
-        write_file(&root.join("foo.ts"), "export function foo() {}\n");
-    }
-
-    fn edit_projection_delete(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("foo.ts");
-        remove_file(&path);
-        vec![path]
-    }
-
-    fn setup_projection_barrel(root: &Path) {
-        write_file(
-            &root.join("main.ts"),
-            r#"import { foo } from "./barrel";
-export function main() { foo(); }
-"#,
-        );
-        write_file(&root.join("barrel.ts"), "export { foo } from \"./foo\";\n");
-        write_file(&root.join("foo.ts"), "export function foo() {}\n");
-    }
-
-    fn edit_projection_barrel_delete(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("barrel.ts");
-        remove_file(&path);
-        vec![path]
-    }
-
-    fn setup_projection_dispatch(root: &Path) {
-        write_file(
-            &root.join("main.ts"),
-            r#"export function main() {
-  const service = { render() {}, paint() {} };
-  service.render();
-}
-"#,
-        );
-        write_file(&root.join("render.ts"), "export function render() {}\n");
-        write_file(&root.join("paint.ts"), "export function paint() {}\n");
-    }
-
-    fn edit_projection_dispatch(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("main.ts");
-        write_file(
-            &path,
-            r#"export function main() {
-  const service = { render() {}, paint() {} };
-  service.paint();
-}
-"#,
-        );
-        vec![path]
-    }
-
-    fn setup_projection_body_only(root: &Path) {
-        write_file(
-            &root.join("main.ts"),
-            r#"import { foo } from "./foo";
-export function main() { foo(); }
-"#,
-        );
-        write_file(
-            &root.join("foo.ts"),
-            r#"export function foo() {
-  return 1;
-}
-"#,
-        );
-    }
-
-    fn edit_projection_body_only(root: &Path) -> Vec<PathBuf> {
-        let path = root.join("foo.ts");
-        write_file(
-            &path,
-            r#"export function foo() {
-  return 2;
-}
-"#,
-        );
-        vec![path]
-    }
-
     #[test]
     fn forced_paths_downgrade_only_when_strict_hash_matches_cached_fact() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -12826,147 +9786,11 @@ export function main() { foo(); }
     }
 
     #[test]
-    fn cached_projection_retains_root_cost_estimates_across_revisions() {
-        let manager = InspectManager::new();
-        let root = PathBuf::from("/cost-root");
-        let identity = CallgraphProjectionIdentity {
-            project_root: root.clone(),
-            generation: Some("generation".to_string()),
-            legacy_sqlite_path: None,
-            write_revision: 1,
-        };
-        let snapshot = Arc::new(CallgraphSnapshot {
-            generated_at: None,
-            files: Vec::new(),
-            exported_symbols: Vec::new(),
-            outbound_calls: Vec::new(),
-            go_initializers: Vec::new(),
-            entry_points: BTreeSet::new(),
-            entry_point_symbols: BTreeMap::new(),
-        });
-        manager.cache_callgraph_projection(identity.clone(), Arc::clone(&snapshot));
-        manager.observe_callgraph_projection_cost(
-            &root,
-            ProjectionVerdict {
-                kind: ProjectionKind::Full,
-                reason: Some("cold"),
-                journal_bytes: 0,
-                changed_files: 0,
-            },
-            Duration::from_nanos(100),
-        );
-        manager.observe_callgraph_projection_cost(
-            &root,
-            ProjectionVerdict {
-                kind: ProjectionKind::Spliced,
-                reason: None,
-                journal_bytes: 20,
-                changed_files: 4,
-            },
-            Duration::from_nanos(120),
-        );
-        let mut next_identity = identity;
-        next_identity.write_revision = 2;
-        manager.cache_callgraph_projection(next_identity.clone(), snapshot);
-
-        assert!(
-            manager
-                .callgraph_projection_costs(&next_identity)
-                .splice_is_costlier(4),
-            "cost estimates must survive replacing a root snapshot at a new revision"
-        );
-    }
-
-    #[test]
-    fn fleet_budget_drops_oldest_whole_root_snapshot() {
-        fn slot(root: &str) -> Arc<ProjectionSlot> {
-            Arc::new(Mutex::new(Some(CachedCallgraphProjection {
-                identity: CallgraphProjectionIdentity {
-                    project_root: PathBuf::from(root),
-                    generation: Some("generation".to_string()),
-                    legacy_sqlite_path: None,
-                    write_revision: 1,
-                },
-                snapshot: Arc::new(CallgraphSnapshot {
-                    generated_at: None,
-                    files: Vec::new(),
-                    exported_symbols: Vec::new(),
-                    outbound_calls: Vec::new(),
-                    go_initializers: Vec::new(),
-                    entry_points: BTreeSet::new(),
-                    entry_point_symbols: BTreeMap::new(),
-                }),
-                estimated_bytes: 600 * 1024 * 1024,
-                costs: ProjectionCostEstimates::default(),
-                rollup: None,
-            })))
-        }
-
-        let first = slot("/first");
-        let second = slot("/second");
-        let third = slot("/third");
-        let mut fleet = ProjectionFleet::default();
-        fleet.admit(
-            PathBuf::from("/first"),
-            Arc::downgrade(&first),
-            400 * 1024 * 1024,
-            DEAD_CODE_SNAPSHOT_FLEET_BUDGET,
-        );
-        fleet.admit(
-            PathBuf::from("/second"),
-            Arc::downgrade(&second),
-            400 * 1024 * 1024,
-            DEAD_CODE_SNAPSHOT_FLEET_BUDGET,
-        );
-        fleet.touch(Path::new("/first"));
-        fleet.admit(
-            PathBuf::from("/third"),
-            Arc::downgrade(&third),
-            400 * 1024 * 1024,
-            DEAD_CODE_SNAPSHOT_FLEET_BUDGET,
-        );
-
-        assert!(first.lock().unwrap().is_some());
-        assert!(second.lock().unwrap().is_none());
-        assert!(third.lock().unwrap().is_some());
-        assert_eq!(
-            fleet.census(),
-            DeadCodeSnapshotCensus {
-                roots: 2,
-                bytes: 800 * 1024 * 1024,
-                drops: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn audit05_oversized_projection_preserves_other_roots() {
-        let first: Arc<ProjectionSlot> = Arc::new(Mutex::new(None));
-        let oversized: Arc<ProjectionSlot> = Arc::new(Mutex::new(None));
-        let mut fleet = ProjectionFleet::default();
-        fleet.admit(PathBuf::from("first"), Arc::downgrade(&first), 40, 100);
-        fleet.admit(
-            PathBuf::from("oversized"),
-            Arc::downgrade(&oversized),
-            101,
-            100,
-        );
-        assert!(fleet.entries.contains_key(Path::new("first")));
-        assert!(!fleet.entries.contains_key(Path::new("oversized")));
-        assert_eq!(fleet.bytes, 40);
-        assert_eq!(fleet.drops, 1);
-    }
-
-    #[test]
     fn projection_estimator_and_verdict_report_only_projection_work() {
         let phases = Tier2PhaseTimings {
             snapshot: Duration::from_millis(2_620),
             projection_cost: Duration::from_millis(187),
             rollup: Duration::from_millis(3_186),
-            rollup_verdict: Some(crate::inspect::scanners::dead_code::RollupVerdict {
-                kind: crate::inspect::scanners::dead_code::RollupKind::Incremental,
-                reason: None,
-            }),
             projection: Some(ProjectionVerdict {
                 kind: ProjectionKind::Spliced,
                 reason: None,
@@ -12982,72 +9806,8 @@ export function main() { foo(); }
         );
         let line = phases.render(InspectCategory::DeadCode, Path::new("/root"), "test-key");
         assert!(line.contains("snapshot=2620ms projection_ms=187"));
-        assert!(line.contains("rollup_ms=3186 rollup="));
+        assert!(line.contains("rollup_ms=3186 projection="));
         assert!(line.contains("projection=spliced journal_bytes=2397 changed_files=46"));
-    }
-
-    #[test]
-    fn rollup_cost_cannot_poison_projection_crossover() {
-        let manager = InspectManager::new();
-        let root = PathBuf::from("/projection-only-cost-root");
-        let identity = CallgraphProjectionIdentity {
-            project_root: root.clone(),
-            generation: Some("generation".to_string()),
-            legacy_sqlite_path: None,
-            write_revision: 1,
-        };
-        manager.cache_callgraph_projection(
-            identity.clone(),
-            Arc::new(CallgraphSnapshot {
-                generated_at: None,
-                files: Vec::new(),
-                exported_symbols: Vec::new(),
-                outbound_calls: Vec::new(),
-                go_initializers: Vec::new(),
-                entry_points: BTreeSet::new(),
-                entry_point_symbols: BTreeMap::new(),
-            }),
-        );
-        for (verdict, projection_ms, rollup_ms) in [
-            (
-                ProjectionVerdict {
-                    kind: ProjectionKind::Full,
-                    reason: Some("cold"),
-                    journal_bytes: 0,
-                    changed_files: 0,
-                },
-                100,
-                1_000,
-            ),
-            (
-                ProjectionVerdict {
-                    kind: ProjectionKind::Spliced,
-                    reason: None,
-                    journal_bytes: 200,
-                    changed_files: 4,
-                },
-                40,
-                2_000,
-            ),
-        ] {
-            let phases = Tier2PhaseTimings {
-                projection_cost: Duration::from_millis(projection_ms),
-                rollup: Duration::from_millis(rollup_ms),
-                ..Tier2PhaseTimings::default()
-            };
-            manager.observe_callgraph_projection_cost(
-                &root,
-                verdict,
-                projection_estimator_duration(&phases),
-            );
-        }
-
-        assert!(
-            !manager
-                .callgraph_projection_costs(&identity)
-                .splice_is_costlier(5),
-            "rollup work must not force a full snapshot projection"
-        );
     }
 
     #[test]
@@ -13076,21 +9836,6 @@ export function main() { foo(); }
 
     #[test]
     fn perf_tier2_phases_line_renders_each_projection_verdict() {
-        assert_eq!(
-            render_rollup_suffix(crate::inspect::scanners::dead_code::RollupVerdict {
-                kind: crate::inspect::scanners::dead_code::RollupKind::Incremental,
-                reason: None,
-            }),
-            " rollup=incremental"
-        );
-        assert_eq!(
-            render_rollup_suffix(crate::inspect::scanners::dead_code::RollupVerdict {
-                kind: crate::inspect::scanners::dead_code::RollupKind::Full,
-                reason: Some("journal_gap"),
-            }),
-            " rollup=full reason=journal_gap"
-        );
-
         let spliced = render_projection_suffix(ProjectionVerdict {
             kind: ProjectionKind::Spliced,
             reason: None,
@@ -13144,92 +9889,6 @@ export function main() { foo(); }
         assert_eq!(
             reused, " projection=reused journal_bytes=0 changed_files=0",
             "a cache hit is not a full projection and must not read as one"
-        );
-    }
-
-    #[test]
-    fn spill_backed_171_file_delta_splices_where_old_bound_was_full() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_projection_fixture(dir.path());
-        let root = canonical_root(dir.path());
-        let store =
-            CallGraphStore::open(root.join(".store-spill"), root.clone()).expect("open store");
-        store
-            .cold_build(&project_files(&root))
-            .expect("cold build fixture");
-        let (revision, previous) = project_dead_code_snapshot_with_revision(store.sqlite_path())
-            .expect("initial projection");
-        let revision = revision.expect("new stores write a projection revision");
-        let next = revision + 1;
-        let callers = (0..171)
-            .map(|index| format!("src/{index:03}-{}.ts", "x".repeat(1_600)))
-            .collect::<BTreeSet<_>>();
-        let payload = serde_json::to_string(&(next, &callers)).expect("serialize caller batch");
-        assert!(
-            payload.len() > MAX_DELTA_BYTES,
-            "fixture must exceed the former absolute journal bound"
-        );
-
-        let conn = rusqlite::Connection::open(store.sqlite_path()).expect("open write conn");
-        conn.execute(
-            "INSERT INTO meta(k, v) VALUES('projection_write_revision', '1')
-             ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
-            [],
-        )
-        .expect("advance write revision");
-        let journal_key = format!("projection_delta_{}", next % 64);
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-            rusqlite::params![journal_key, format!("oversize:{next}")],
-        )
-        .expect("plant legacy oversize marker");
-
-        let (_, _, old_verdict) = crate::callgraph_store::project_dead_code_snapshot_incremental(
-            store.sqlite_path(),
-            Some((revision, &previous)),
-        )
-        .expect("project legacy oversize marker");
-        assert_eq!(old_verdict.kind, ProjectionKind::Full);
-        assert_eq!(old_verdict.reason, Some("journal_gap"));
-        assert_eq!(
-            render_projection_suffix(old_verdict),
-            " projection=full reason=journal_gap journal_bytes=0 changed_files=0"
-        );
-
-        conn.execute_batch(
-            "CREATE TABLE projection_delta_spill (
-                 revision INTEGER PRIMARY KEY,
-                 payload TEXT NOT NULL
-             )",
-        )
-        .expect("create spill table");
-        conn.execute(
-            "INSERT INTO projection_delta_spill(revision, payload) VALUES(?1, ?2)",
-            rusqlite::params![next, payload],
-        )
-        .expect("store spill payload");
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-            rusqlite::params![journal_key, format!("spill:{next}")],
-        )
-        .expect("replace legacy marker with spill marker");
-        drop(conn);
-
-        let (_, _, verdict) = crate::callgraph_store::project_dead_code_snapshot_incremental(
-            store.sqlite_path(),
-            Some((revision, &previous)),
-        )
-        .expect("project spill-backed delta");
-        assert_eq!(verdict.kind, ProjectionKind::Spliced);
-        assert_eq!(verdict.reason, None);
-        assert_eq!(verdict.changed_files, 171);
-        assert_eq!(verdict.journal_bytes, payload.len() as u64);
-        assert_eq!(
-            render_projection_suffix(verdict),
-            format!(
-                " projection=spliced journal_bytes={} changed_files=171",
-                payload.len()
-            )
         );
     }
 }
@@ -13351,7 +10010,7 @@ mod tier2_unreadable_source_tests {
             b"export const label = \"\xb9\xe6\xce\";\n",
         )
         .expect("bad ts");
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let snapshot = InspectSnapshot::new_with_capabilities(
             root.clone(),
@@ -13365,25 +10024,6 @@ mod tier2_unreadable_source_tests {
             true,
         );
         (dir, root, snapshot)
-    }
-
-    /// Block until `limiter` has a free slot, then hand it straight back. A
-    /// probe permit can only be taken once every earlier permit has been fully
-    /// returned, so this proves no background worker still holds or is still
-    /// releasing one. The deadline only guards against a hang.
-    fn wait_until_cold_build_slot_is_free(limiter: &Arc<cold_build_limiter::ColdBuildLimiter>) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(probe) = limiter.try_acquire() {
-                drop(probe);
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "an earlier worker never returned its cold-build permit"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 
     fn aggregate(
@@ -13482,164 +10122,6 @@ mod tier2_unreadable_source_tests {
     }
 
     #[test]
-    fn failure_pause_skips_only_input_determined_failures() {
-        let failed = |message: &str| JobOutcome::Failed {
-            message: message.to_string(),
-        };
-        assert!(failure_pauses_automatic_retries(&failed(
-            "complexity incremental scan failed: read failed for /p/a.ts: Permission denied"
-        )));
-        assert!(failure_pauses_automatic_retries(&failed(
-            "tier2 pass timed out after 600000ms and was cancelled"
-        )));
-        for transient in [
-            "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed",
-            "callgraph_unavailable",
-            "tier2 pass cancelled before incremental scan",
-            "explicit inspect Tier-2 cold-build admission was cancelled",
-            "serial Tier-2 run stopped after the limiter slot deadline",
-            "tier2 reuse worker exited without publishing a result",
-        ] {
-            assert!(
-                !failure_pauses_automatic_retries(&failed(transient)),
-                "{transient}"
-            );
-        }
-        assert!(!failure_pauses_automatic_retries(&JobOutcome::Fresh {
-            payload: json!({ "callgraph_available": false }),
-        }));
-    }
-
-    #[test]
-    fn writer_lease_timeout_completion_waits_for_resource_not_input_change() {
-        let (_dir, root, snapshot) = fixture();
-        let category = InspectCategory::Complexity;
-        let project_key = crate::path_identity::project_scope_key(&root);
-        let project_dir = snapshot.inspect_dir.join(project_key);
-        std::fs::create_dir_all(&project_dir).expect("inspect directory");
-        let held = crate::fs_lock::try_acquire(
-            &crate::root_cache::writer_lease_path(&project_dir),
-            Duration::ZERO,
-        )
-        .expect("independent live writer lease");
-        let manager = Arc::new(InspectManager::new());
-        let limiter = cold_build_limiter::test_limiter(1);
-        manager.set_cold_build_limiter(Arc::clone(&limiter));
-        let first =
-            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
-        assert_eq!(first.newly_queued_categories, vec![category]);
-        let (flights, timeout) = manager
-            .in_flight_changed
-            .wait_timeout_while(
-                manager.in_flight.lock().unwrap(),
-                Duration::from_secs(30),
-                |flights| !flights.is_empty(),
-            )
-            .unwrap();
-        assert!(!timeout.timed_out(), "lease attempt did not complete");
-        assert!(flights.is_empty());
-        drop(flights);
-        assert_eq!(manager.reuse_completion_count(), 1);
-        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
-        assert!(
-            held.verify_writer_epoch().expect("lease verification"),
-            "never steal a live lease"
-        );
-        assert!(
-            manager.tier2_retry_pause(category).is_none(),
-            "lease timeout must not record an input-failure pause: {:?}",
-            manager.tier2_retry_pause(category),
-        );
-        let wait = manager
-            .tier2_resource_wait(category)
-            .expect("resource wait recorded");
-        assert_eq!(manager.try_tier2_retry_pauses(), Some(Vec::new()));
-        assert_eq!(
-            manager.tier2_builder_state(category),
-            InspectBuilderState::WaitingForCacheWriterLease
-        );
-        let detail = manager.tier2_builder_state_detail(category);
-        assert!(
-            detail.contains("waiting for the inspect cache writer lease"),
-            "{detail}"
-        );
-        assert!(!detail.contains("failed"), "{detail}");
-        let key = JobKey::for_project_category(category);
-        let retry_at = manager
-            .try_tier2_resource_retry_at(&snapshot.config)
-            .unwrap()
-            .unwrap();
-        assert!(retry_at > Instant::now());
-        assert!(retry_at <= Instant::now() + Duration::from_secs(30));
-        assert_eq!(
-            wait.retry_at_ms,
-            manager.builder_states.lock().unwrap()[&key]
-                .resource_retry_at
-                .unwrap()
-                .1
-        );
-        let blocked =
-            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
-        assert!(blocked.newly_queued_categories.is_empty(), "{blocked:?}");
-        assert!(blocked.retry_paused.is_empty(), "{blocked:?}");
-        assert_eq!(blocked.resource_waits, vec![wait]);
-        assert!(manager
-            .submit_tier2_run_with_reuse_background(snapshot.clone(), category)
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            manager.automatic_tier2_schedule_count_for_test(),
-            1,
-            "no immediate automatic retry"
-        );
-
-        drop(held);
-        // This checks resource retry state, not native notification latency.
-        // Advance both retry clocks without manufacturing an input change.
-        manager.expire_tier2_resource_waits_for_test();
-        for (retry_at, _) in manager.cache_writer_waits.lock().unwrap().values_mut() {
-            *retry_at = Instant::now();
-        }
-        assert!(
-            manager.tier2_resource_wait(category).is_none(),
-            "the controlled resource deadline must permit retry"
-        );
-        // The serial worker publishes its completion (removing the category
-        // from `in_flight`) before it drops its cold-build limiter permit. While
-        // that permit is being torn down, a same-root admission is refused and
-        // the category is deferred instead of queued. Wait until the earlier
-        // worker has returned its slot, so the admission below tests only the
-        // released lease and the due retry.
-        wait_until_cold_build_slot_is_free(&limiter);
-        let resumed =
-            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
-        assert_eq!(
-            resumed.newly_queued_categories,
-            vec![category],
-            "{resumed:?}"
-        );
-        let (flights, timeout) = manager
-            .in_flight_changed
-            .wait_timeout_while(
-                manager.in_flight.lock().unwrap(),
-                Duration::from_secs(30),
-                |flights| !flights.is_empty(),
-            )
-            .unwrap();
-        assert!(!timeout.timed_out(), "retry did not complete");
-        drop(flights);
-        assert_eq!(manager.reuse_completion_count(), 2);
-        assert_eq!(manager.successful_reuse_completion_count(), 1);
-        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
-        assert!(manager.tier2_resource_wait(category).is_none());
-        assert_eq!(
-            manager.try_tier2_resource_retry_at(&snapshot.config),
-            Some(None)
-        );
-        assert!(manager.tier2_retry_pause(category).is_none());
-    }
-
-    #[test]
     fn writer_lease_release_native_watch_acknowledges_retry() {
         let (_dir, root, snapshot) = fixture();
         let project_dir = snapshot
@@ -13663,7 +10145,10 @@ mod tier2_unreadable_source_tests {
         let key = JobKey::for_project_category(category);
         manager.record_flight_start(&key);
         manager.record_builder_attempt_outcome(&key, &JobOutcome::Failed { message: error });
-        assert!(manager.tier2_resource_wait(category).is_some());
+        assert_eq!(
+            manager.tier2_builder_state(category),
+            InspectBuilderState::WaitingForCacheWriterLease
+        );
         let mut active = false;
         loop {
             match received
@@ -13692,8 +10177,9 @@ mod tier2_unreadable_source_tests {
                 CacheWriterWatchObservation::Subscribed => {}
             }
         }
-        assert!(
-            manager.tier2_resource_wait(category).is_some(),
+        assert_eq!(
+            manager.tier2_builder_state(category),
+            InspectBuilderState::WaitingForCacheWriterLease,
             "activity must not release a live holder"
         );
         drop(held);
@@ -13720,274 +10206,6 @@ mod tier2_unreadable_source_tests {
                 _ => {}
             }
         }
-        assert!(
-            manager.tier2_resource_wait(category).is_none(),
-            "the acknowledged callback must make the retry due"
-        );
-        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn cache_writer_wait_backoff_doubles_caps_and_resets() {
-        let (_dir, root, _snapshot) = fixture();
-        let manager = InspectManager::new();
-        let key = JobKey::for_project_category(InspectCategory::Complexity);
-        let timeout = JobOutcome::Failed {
-            message: "writer_lease_timeout: inspect writer lease deadline elapsed".into(),
-        };
-        for seconds in [30, 60, 120, 240, 480, 960, 1800, 1800] {
-            manager.record_flight_start(&key);
-            manager.record_builder_attempt_outcome(&key, &timeout);
-            let states = manager.builder_states.lock().unwrap();
-            let retry_at = states[&key].resource_retry_at.unwrap().0;
-            let remaining = retry_at.saturating_duration_since(Instant::now());
-            assert!(remaining <= Duration::from_secs(seconds), "{remaining:?}");
-            assert!(
-                remaining > Duration::from_secs(seconds - 1),
-                "{remaining:?}"
-            );
-        }
-        assert!(
-            manager.note_tier2_input_paths_changed(Some(&root), [root.join("source.ts").as_path()])
-        );
-        manager.record_flight_start(&key);
-        manager.record_builder_attempt_outcome(&key, &timeout);
-        let after_input = manager.builder_states.lock().unwrap()[&key]
-            .resource_retry_at
-            .unwrap()
-            .0;
-        assert!(after_input <= Instant::now() + Duration::from_secs(30));
-        manager.record_builder_attempt_outcome(&key, &JobOutcome::Fresh { payload: json!({}) });
-        manager.record_flight_start(&key);
-        manager.record_builder_attempt_outcome(&key, &timeout);
-        let after_success = manager.builder_states.lock().unwrap()[&key]
-            .resource_retry_at
-            .unwrap()
-            .0;
-        assert!(after_success <= Instant::now() + Duration::from_secs(30));
-    }
-
-    #[test]
-    fn repeated_lease_waits_are_bounded_and_explicit_inspect_bypasses_them() {
-        let (_dir, root, snapshot) = fixture();
-        let manager = Arc::new(InspectManager::new());
-        manager.set_cold_build_limiter(cold_build_limiter::test_limiter(1));
-        let category = InspectCategory::Complexity;
-        let key = JobKey::for_project_category(category);
-        let lease_timeout = JobOutcome::Failed {
-            message: "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed".into(),
-        };
-        for _ in 0..8 {
-            manager
-                .in_flight
-                .lock()
-                .unwrap()
-                .entry(key.clone())
-                .or_default();
-            manager.record_flight_start(&key);
-            manager.finish_tier2_flight(&key, lease_timeout.clone());
-            let states = manager.builder_states.lock().unwrap();
-            let entry = &states[&key];
-            let retry_at = entry.resource_retry_at.unwrap().0;
-            assert!(retry_at > Instant::now());
-            assert!(retry_at <= Instant::now() + Duration::from_secs(30 * 60));
-            assert!(entry.retry_paused_until.is_none());
-            assert!(entry.last_failure.is_none());
-        }
-        manager.clear_tier2_retry_pauses();
-        assert!(
-            manager.tier2_resource_wait(category).is_some(),
-            "input resets do not release a lease"
-        );
-        let mut disabled = (*snapshot.config).clone();
-        disabled.inspect.enabled = false;
-        assert_eq!(manager.try_tier2_resource_retry_at(&disabled), Some(None));
-        let explicit = manager.tier2_run_with_reuse_blocking(
-            snapshot.clone(),
-            category,
-            JobScope::for_project(root),
-        );
-        assert!(matches!(explicit, JobOutcome::Fresh { .. }), "{explicit:?}");
-        assert!(manager.tier2_resource_wait(category).is_none());
-        assert_eq!(
-            manager.try_tier2_resource_retry_at(&snapshot.config),
-            Some(None)
-        );
-    }
-
-    #[test]
-    fn completion_preserves_input_failure_pause_and_transient_controls() {
-        let manager = InspectManager::new();
-        let category = InspectCategory::Complexity;
-        let key = JobKey::for_project_category(category);
-        let complete = |outcome| {
-            manager
-                .in_flight
-                .lock()
-                .unwrap()
-                .entry(key.clone())
-                .or_default();
-            manager.record_flight_start(&key);
-            manager.finish_tier2_flight(&key, outcome);
-        };
-        complete(JobOutcome::Failed {
-            message: "failed to read source input: Permission denied".into(),
-        });
-        assert!(
-            manager.tier2_retry_pause(category).is_some(),
-            "genuine input failures still pause"
-        );
-        assert!(manager.tier2_resource_wait(category).is_none());
-        for outcome in [
-            JobOutcome::Failed {
-                message: "admission was cancelled".into(),
-            },
-            JobOutcome::Failed {
-                message: "tier2 pass cancelled before incremental scan".into(),
-            },
-            JobOutcome::Failed {
-                message: "callgraph_unavailable".into(),
-            },
-            JobOutcome::Fresh {
-                payload: json!({"callgraph_available": false}),
-            },
-        ] {
-            complete(outcome.clone());
-            assert!(manager.tier2_retry_pause(category).is_none(), "{outcome:?}");
-            assert!(
-                manager.tier2_resource_wait(category).is_none(),
-                "{outcome:?}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_build_is_not_rerun_by_automatic_refresh_until_its_pause_ends() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (_dir, root, snapshot) = fixture();
-        // A source the scanner cannot read keeps failing the build (that
-        // contract is unchanged); it stands in for any failure that a rerun
-        // on the same inputs would only repeat.
-        let locked = root.join("src/locked.ts");
-        std::fs::write(&locked, "export const locked = 1;\n").expect("locked");
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
-            .expect("chmod 000");
-        if std::fs::read(&locked).is_ok() {
-            // Running as a user that ignores file modes; nothing can fail.
-            return;
-        }
-        let manager = Arc::new(InspectManager::new());
-        manager.set_cold_build_limiter(cold_build_limiter::test_limiter(1));
-        let wait_idle = |manager: &InspectManager| {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while manager.tier2_any_in_flight() {
-                assert!(Instant::now() < deadline, "background build did not finish");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-
-        let first = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::Complexity],
-        );
-        assert_eq!(
-            first.newly_queued_categories,
-            vec![InspectCategory::Complexity]
-        );
-        wait_idle(&manager);
-        assert_eq!(manager.reuse_start_count_for_test(), 1);
-        let pause = manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .expect("a failed build pauses automatic retries");
-        assert!(pause.reason.contains("failed"), "{pause:?}");
-        assert_eq!(pause.identical_failures, 1);
-        assert!(manager
-            .tier2_builder_state_detail(InspectCategory::Complexity)
-            .contains("automatic retries paused until"));
-        assert_eq!(
-            manager.try_tier2_retry_pauses(),
-            Some(vec![pause.clone()]),
-            "health lists the paused category with its failure reason"
-        );
-
-        // The next automatic refresh, inputs unchanged, does not rerun it.
-        let second = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::Complexity],
-        );
-        assert!(second.newly_queued_categories.is_empty(), "{second:?}");
-        assert_eq!(second.retry_paused, vec![pause.clone()]);
-        wait_idle(&manager);
-        assert_eq!(
-            manager.reuse_start_count_for_test(),
-            1,
-            "a paused category must not start another build"
-        );
-
-        // Changes the scope walk can never include leave the pause in place.
-        let out_of_scope = [
-            root.join("node_modules/dep/index.ts"),
-            root.join(".git/index"),
-            root.join("notes.unknown-ext"),
-            PathBuf::from("/elsewhere/outside/src/lib.ts"),
-        ];
-        assert!(!manager.note_tier2_input_paths_changed(
-            Some(&root),
-            out_of_scope.iter().map(PathBuf::as_path),
-        ));
-        let third = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::Complexity],
-        );
-        assert!(third.newly_queued_categories.is_empty(), "{third:?}");
-        assert_eq!(third.retry_paused, vec![pause.clone()]);
-        assert_eq!(manager.reuse_start_count_for_test(), 1);
-
-        // A change to an in-scope file ends the pause: the very next automatic
-        // refresh rebuilds without waiting it out.
-        assert!(manager
-            .note_tier2_input_paths_changed(Some(&root), [root.join("src/good.ts").as_path()],));
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_none());
-        let fourth = manager.submit_tier2_run_with_reuse_serial_background(
-            snapshot.clone(),
-            vec![InspectCategory::Complexity],
-        );
-        assert_eq!(
-            fourth.newly_queued_categories,
-            vec![InspectCategory::Complexity]
-        );
-        wait_idle(&manager);
-        assert_eq!(manager.reuse_start_count_for_test(), 2);
-        // The cause was not fixed, so it fails again with the same reason and
-        // the pause doubles.
-        let repeat = manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .expect("the repeated failure pauses again");
-        assert_eq!(repeat.identical_failures, 2);
-        assert!(repeat.retry_at_ms >= pause.retry_at_ms + 10 * 60 * 1_000);
-
-        // The explicit `aft_inspect` path (the blocking run the inspect command
-        // uses) is not held back by the pause, even with no change observed,
-        // and its success clears the pause.
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
-            .expect("chmod 644");
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_some());
-        let explicit = manager.tier2_run_with_reuse_blocking(
-            snapshot,
-            InspectCategory::Complexity,
-            JobScope::for_project(root),
-        );
-        assert!(explicit.payload().is_some(), "{explicit:?}");
-        assert_eq!(manager.reuse_start_count_for_test(), 3);
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_none());
     }
 
     #[test]
@@ -14013,41 +10231,5 @@ mod tier2_unreadable_source_tests {
         assert!(published);
         assert!(waiters.is_some());
         assert!(!manager.tier2_any_in_flight());
-    }
-
-    #[test]
-    fn input_change_during_a_failing_attempt_does_not_pause_it() {
-        let manager = InspectManager::new();
-        let root = PathBuf::from("/project");
-        let key = JobKey::for_project_category(InspectCategory::Complexity);
-        let failed = JobOutcome::Failed {
-            message: "complexity incremental scan failed: read failed for /project/a.ts"
-                .to_string(),
-        };
-        let attempt = |change: Option<&str>| {
-            manager
-                .in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(key.clone())
-                .or_default();
-            manager.record_flight_start(&key);
-            if let Some(change) = change {
-                assert!(manager.note_tier2_input_paths_changed(Some(&root), [Path::new(change)],));
-            }
-            manager.finish_tier2_flight(&key, failed.clone());
-        };
-
-        // The build may not have seen a fix made while it ran, so its failure
-        // must not hold the next automatic refresh back.
-        attempt(Some("/project/src/a.ts"));
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_none());
-
-        attempt(None);
-        assert!(manager
-            .tier2_retry_pause(InspectCategory::Complexity)
-            .is_some());
     }
 }

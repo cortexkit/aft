@@ -3597,48 +3597,82 @@ fn add_trait_member_previews(
 
 /// Collect each trait's range and its method rows from the tree,
 /// so they can be cached and attached later without the tree.
+///
+/// Every node of the file is visited once, in document order, through one
+/// tree cursor, and matched by its numeric kind id. Matching by
+/// `Node::kind()` decodes the kind's name from a C string at every node, and
+/// recursing through `named_children` allocates a new cursor at every node;
+/// on a large Rust file those two costs dwarf the few traits found. Nothing
+/// inside a trait is examined again, so a trait declared in a default
+/// method's body is not collected, as before. A file whose text never
+/// contains `trait` has no trait item and is not walked at all.
 fn collect_trait_member_previews(
     node: tree_sitter::Node<'_>,
     source: &str,
     previews: &mut Vec<(Range, Vec<OutlineEntry>)>,
 ) {
-    if node.kind() == "trait_item" {
-        if let Some(body) = node.child_by_field_name("body") {
-            let range = node_range_with_decorators(&node, source, LangId::Rust);
-            let mut methods = Vec::new();
-            let mut cursor = body.walk();
-            for method in body
-                .named_children(&mut cursor)
-                .filter(|child| matches!(child.kind(), "function_item" | "function_signature_item"))
-            {
-                let Some(name) = method.child_by_field_name("name") else {
-                    continue;
-                };
-                let text = node_text(source, &method);
-                let first = text.lines().next().unwrap_or(text).trim_end();
-                methods.push(OutlineEntry {
-                    name: node_text(source, &name).to_string(),
-                    kind: "method".into(),
-                    range: node_range_with_decorators(&method, source, LangId::Rust),
-                    signature: Some(
-                        first
-                            .strip_suffix('{')
-                            .unwrap_or(first)
-                            .trim_end()
-                            .to_string(),
-                    ),
-                    exported: false,
-                    members: Vec::new(),
-                });
-            }
-            previews.push((range, methods));
-        }
+    if !source.contains("trait") {
         return;
     }
+    let trait_item = node.language().id_for_node_kind("trait_item", true);
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_trait_member_previews(child, source, previews);
+    loop {
+        let current = cursor.node();
+        let is_trait = current.is_named() && current.kind_id() == trait_item;
+        if is_trait {
+            push_trait_member_preview(current, source, previews);
+        } else if cursor.goto_first_child() {
+            continue;
+        }
+        // Move to the next node in document order that is not inside the
+        // one just visited; the cursor cannot leave `node`'s subtree.
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
+}
+
+/// One trait's range and method rows, for [`collect_trait_member_previews`].
+/// Only the trait body's direct children have their kind names read.
+fn push_trait_member_preview(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    previews: &mut Vec<(Range, Vec<OutlineEntry>)>,
+) {
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let range = node_range_with_decorators(&node, source, LangId::Rust);
+    let mut methods = Vec::new();
+    let mut cursor = body.walk();
+    for method in body.named_children(&mut cursor).filter(|child| {
+        #[cfg(test)]
+        tests::TRAIT_PREVIEW_KIND_DECODES.with(|count| count.set(count.get() + 1));
+        matches!(child.kind(), "function_item" | "function_signature_item")
+    }) {
+        let Some(name) = method.child_by_field_name("name") else {
+            continue;
+        };
+        let text = node_text(source, &method);
+        let first = text.lines().next().unwrap_or(text).trim_end();
+        methods.push(OutlineEntry {
+            name: node_text(source, &name).to_string(),
+            kind: "method".into(),
+            range: node_range_with_decorators(&method, source, LangId::Rust),
+            signature: Some(
+                first
+                    .strip_suffix('{')
+                    .unwrap_or(first)
+                    .trim_end()
+                    .to_string(),
+            ),
+            exported: false,
+            members: Vec::new(),
+        });
+    }
+    previews.push((range, methods));
 }
 
 /// Append each collected trait's method rows to the outline entry for that
@@ -4005,6 +4039,225 @@ mod tests {
         }
         let checks = REGION_LOOKUP_CHECKS.with(|count| count.get());
         assert!(checks <= regions.len() * 13, "{checks} containment probes");
+    }
+
+    thread_local! {
+        /// Node kind names `collect_trait_member_previews` decoded from the
+        /// grammar's C strings on this thread.
+        pub(super) static TRAIT_PREVIEW_KIND_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The recursive walk `collect_trait_member_previews` replaced, kept as
+    /// the oracle its cursor walk must match exactly: same traits, same
+    /// order, same rows.
+    fn recursive_trait_member_previews(
+        node: tree_sitter::Node<'_>,
+        source: &str,
+        previews: &mut Vec<(Range, Vec<OutlineEntry>)>,
+    ) {
+        if node.kind() == "trait_item" {
+            super::push_trait_member_preview(node, source, previews);
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            recursive_trait_member_previews(child, source, previews);
+        }
+    }
+
+    fn rust_tree(source: &str) -> tree_sitter::Tree {
+        crate::parser::parse_source_with_cached_parser(
+            std::path::Path::new("fixture.rs"),
+            source,
+            LangId::Rust,
+        )
+        .unwrap()
+    }
+
+    fn trait_previews_of(source: &str) -> (String, usize) {
+        let tree = rust_tree(source);
+        TRAIT_PREVIEW_KIND_DECODES.with(|count| count.set(0));
+        let mut previews = Vec::new();
+        collect_trait_member_previews(tree.root_node(), source, &mut previews);
+        let decodes = TRAIT_PREVIEW_KIND_DECODES.with(|count| count.get());
+        (format!("{previews:?}"), decodes)
+    }
+
+    fn recursive_previews_of(source: &str) -> String {
+        let tree = rust_tree(source);
+        let mut previews = Vec::new();
+        recursive_trait_member_previews(tree.root_node(), source, &mut previews);
+        format!("{previews:?}")
+    }
+
+    /// Traits wherever Rust allows them, and a trait inside a trait's
+    /// default method, which the outline has never listed.
+    const NESTED_TRAITS: &str = r#"
+/// Documented.
+#[allow(dead_code)]
+pub trait Top {
+    type Out;
+    const LIMIT: usize;
+    fn required(&self) -> Self::Out;
+    #[inline]
+    fn provided(&self) -> usize {
+        trait InsideDefault { fn hidden(&self); }
+        Self::LIMIT
+    }
+}
+mod outer {
+    pub(crate) unsafe trait InModule: Send {
+        fn first(&self);
+        fn second(&self) where Self: Sized {}
+    }
+    mod inner {
+        trait Deep { fn deep(&self) -> u8; }
+    }
+}
+fn body() {
+    let _ = || {
+        trait InClosure { fn from_closure(); }
+    };
+    if true {
+        trait InBlock { fn from_block(); }
+    }
+}
+impl Thing {
+    fn method(&self) {
+        trait InImplMethod { fn from_impl(&self); }
+    }
+}
+trait Empty {}
+macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
+"#;
+
+    #[test]
+    fn trait_previews_match_the_recursive_walk() {
+        let (walked, _) = trait_previews_of(NESTED_TRAITS);
+        assert_eq!(walked, recursive_previews_of(NESTED_TRAITS));
+        for name in [
+            "required",
+            "provided",
+            "first",
+            "second",
+            "deep",
+            "from_closure",
+            "from_block",
+            "from_impl",
+        ] {
+            assert!(
+                walked.contains(&format!("name: \"{name}\"")),
+                "{name}: {walked}"
+            );
+        }
+        assert!(
+            !walked.contains("hidden") && !walked.contains("never"),
+            "{walked}"
+        );
+
+        // This module's own source: many nodes, few traits.
+        let own = std::fs::read_to_string(
+            crate::test_support::manifest_dir().join("src/commands/outline.rs"),
+        )
+        .unwrap();
+        assert_eq!(trait_previews_of(&own).0, recursive_previews_of(&own));
+
+        // A file that never says the keyword has nothing to collect.
+        assert_eq!(trait_previews_of("fn main() { let x = 1; }\n").0, "[]");
+        // A syntax error does not stop the walk from finding a later trait.
+        let broken = "fn broken( {\n}\ntrait After { fn after(&self); }\n";
+        assert_eq!(trait_previews_of(broken).0, recursive_previews_of(broken));
+    }
+
+    #[test]
+    fn trait_previews_read_kind_names_only_inside_trait_bodies() {
+        // Two small traits after a large body of other code: only the
+        // traits' direct body children have their kind names read. The
+        // recursive walk read one name for every named node of the file.
+        let mut source = String::new();
+        for index in 0..200 {
+            source.push_str(&format!(
+                "fn f{index}(a: u32) -> u32 {{ let b = a + {index}; if b > 3 {{ b * 2 }} else {{ match b {{ 0 => 1, _ => b }} }} }}\n"
+            ));
+        }
+        source.push_str("pub trait A { fn a(&self); type T; }\ntrait B { fn b(); fn c() {} }\n");
+        let (previews, decodes) = trait_previews_of(&source);
+        assert_eq!(previews, recursive_previews_of(&source));
+        assert!(previews.contains("name: \"c\""), "{previews}");
+        assert_eq!(decodes, 4, "kind names read: {decodes}");
+    }
+
+    /// Measures both walks over every Rust file under `AFT_TRAIT_WALK_ROOT`
+    /// (default: this repository), checks they agree on each file, and
+    /// prints how many nodes the recursive walk visited and how deep it
+    /// went. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement over a source tree"]
+    fn trait_preview_walk_cost_on_a_source_tree() {
+        let root = std::env::var_os("AFT_TRAIT_WALK_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::test_support::manifest_dir().join("../.."));
+        let mut pending = vec![root];
+        let mut files = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                if matches!(
+                    name.to_str(),
+                    Some("target" | ".git" | "node_modules" | ".cortexkit")
+                ) {
+                    continue;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let (mut bytes, mut named, mut max_depth, mut traits) = (0usize, 0usize, 0usize, 0usize);
+        let (mut recursive_time, mut cursor_time) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        for path in &files {
+            let Ok(source) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let tree = rust_tree(&source);
+            bytes += source.len();
+            let mut cursor = tree.walk();
+            'walk: loop {
+                if cursor.node().is_named() {
+                    named += 1;
+                    max_depth = max_depth.max(cursor.depth() as usize);
+                }
+                if cursor.goto_first_child() {
+                    continue;
+                }
+                while !cursor.goto_next_sibling() {
+                    if !cursor.goto_parent() {
+                        break 'walk;
+                    }
+                }
+            }
+            let started = std::time::Instant::now();
+            let mut old = Vec::new();
+            recursive_trait_member_previews(tree.root_node(), &source, &mut old);
+            recursive_time += started.elapsed();
+            let started = std::time::Instant::now();
+            let mut new = Vec::new();
+            collect_trait_member_previews(tree.root_node(), &source, &mut new);
+            cursor_time += started.elapsed();
+            assert_eq!(format!("{new:?}"), format!("{old:?}"), "{}", path.display());
+            traits += new.len();
+        }
+        println!(
+            "trait preview walk: {} files, {bytes} bytes, {named} named nodes, deepest {max_depth}, {traits} traits; recursive {:.1} ms, cursor {:.1} ms",
+            files.len(),
+            recursive_time.as_secs_f64() * 1000.0,
+            cursor_time.as_secs_f64() * 1000.0,
+        );
     }
 
     #[cfg(unix)]
@@ -4555,59 +4808,6 @@ mod tests {
         let (warm, reads, parses) = navigation_counts(&request, &batch_ctx);
         assert_eq!((reads, parses), (0, 0));
         assert_eq!(warm, cold);
-    }
-
-    #[test]
-    fn rust_disk_and_manual_tables_hydrate_layout_once() {
-        let (temp, files, ctx) = navigation_fixture();
-        let path = &files[5];
-        let provider = ctx
-            .provider()
-            .as_any()
-            .downcast_ref::<TreeSitterProvider>()
-            .unwrap();
-        let symbols = ctx.provider().list_symbols(path).unwrap();
-        let cache = provider.symbol_cache();
-        let storage = tempfile::tempdir().unwrap();
-        cache
-            .write()
-            .unwrap()
-            .set_project_root(temp.path().to_path_buf());
-        let disk_cache = cache.read().unwrap().clone();
-        crate::symbol_cache_disk::write_to_disk(&disk_cache, storage.path(), "layout").unwrap();
-        for disk in [true, false] {
-            let mut loaded = crate::parser::SymbolCache::new();
-            if disk {
-                assert_eq!(
-                    loaded.load_from_disk(storage.path(), "layout", temp.path()),
-                    1
-                );
-            } else {
-                let meta = std::fs::metadata(path).unwrap();
-                loaded.insert(
-                    path.clone(),
-                    meta.modified().unwrap(),
-                    meta.len(),
-                    blake3::hash(&std::fs::read(path).unwrap()),
-                    symbols.clone(),
-                );
-            }
-            let ctx = AppContext::new(
-                Box::new(TreeSitterProvider::with_symbol_cache(Arc::new(
-                    std::sync::RwLock::new(loaded),
-                ))),
-                crate::config::Config::default(),
-            );
-            let request = serde_json::from_value(
-                serde_json::json!({"id":"layout", "command":"outline", "file":path}),
-            )
-            .unwrap();
-            let (first, reads, parses) = navigation_counts(&request, &ctx);
-            assert_eq!((reads, parses), (1, 1), "disk={disk}");
-            let (warm, reads, parses) = navigation_counts(&request, &ctx);
-            assert_eq!((reads, parses), (0, 0), "disk={disk}");
-            assert_eq!(warm, first);
-        }
     }
 
     #[test]

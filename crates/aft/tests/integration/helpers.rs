@@ -210,6 +210,71 @@ pub fn callgraph_when_ready(
     }
 }
 
+/// Wait until the configured root's index-store checkout has published its
+/// call graph. Dead code answers nothing, fresh or cached, before that graph
+/// exists, so a test that expects a dead-code count right after configure
+/// waits here first.
+///
+/// `status` never binds a checkout (binding starts a build), so a `callers`
+/// request for `symbol` in `file` binds it first. Any answer other than
+/// "still building" is fine there, including an unknown symbol: the request
+/// only has to reach the call graph. The wait then reads the call-graph
+/// plane from `status` until it reports ready.
+#[allow(dead_code)] // Shared with watcher_integration, which has no inspect tests.
+pub fn wait_for_published_call_graph(aft: &mut AftProcess, file: &std::path::Path, symbol: &str) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let request = serde_json::json!({
+        "id": "bind-call-graph",
+        "command": "callers",
+        "file": file,
+        "symbol": symbol,
+    })
+    .to_string();
+    let bound = aft.send(&request);
+    assert!(
+        bound["code"] == "callgraph_building"
+            || !bound["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("callgraph")),
+        "the call graph is not available: {bound:?}"
+    );
+    loop {
+        let status = aft.send(r#"{"id":"call-graph-ready","command":"status"}"#);
+        if status["callgraph_store"]["status"] == "ready" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the call graph never published: {:?}",
+            status["callgraph_store"]
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// [`wait_for_published_call_graph`] for an in-process context: binds the
+/// root's index-store checkout and waits until its call graph is published.
+#[allow(dead_code)] // Shared with watcher_integration, which has no inspect tests.
+pub fn wait_for_published_call_graph_in(ctx: &aft::context::AppContext) {
+    use aft::data_layer::surfaces::{warm, WarmState};
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match warm(ctx).1 {
+            WarmState::Ready => return,
+            WarmState::Failed(reason) => panic!("the call graph failed to build: {reason}"),
+            WarmState::Pending(state) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the call graph never published: {state}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 /// Observe readiness without delivering the result to a protocol session.
 /// A terminal bash_status reply consumes a completion, so replay/reminder
 /// fixtures must instead read the task's atomically published metadata.

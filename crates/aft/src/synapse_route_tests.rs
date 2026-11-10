@@ -371,62 +371,6 @@ fn synapse_shared_route_keeps_lane_pauses_on_the_requesting_root() {
 }
 
 #[test]
-fn transient_retry_time_extends_only_the_pause_it_waits_on() {
-    use pause_test_support::*;
-    crate::semantic_index::with_lane_pause_clock(START, |clock| {
-        // No hint: both roots record identical pauses that end at once.
-        let reply = serde_json::json!({"result": {"error": {
-            "class": "transient", "code": "model_loading", "message": "loading",
-        }}});
-        with_fake_synapse_refusing(
-            clock,
-            START + 1,
-            move |_| reply.clone(),
-            |first_config, _| {
-                let mut second_config = first_config.clone();
-                let first_root = first_config.route_project_root.clone().unwrap();
-                let second_root = first_root.join("second-root");
-                second_config.route_project_root = Some(second_root.clone());
-                let mut first = SynapseEmbeddingClient::from_config(&first_config).unwrap();
-                let mut second = SynapseEmbeddingClient::from_config(&second_config).unwrap();
-                let Err(SynapseEmbeddingError::LanePaused(first_pause)) =
-                    first.embed_query("first", Duration::from_secs(1))
-                else {
-                    panic!("the first root was not paused");
-                };
-                assert!(matches!(
-                    second.embed_query("second", Duration::from_secs(1)),
-                    Err(SynapseEmbeddingError::LanePaused(_))
-                ));
-                let until = |root: &Path| lane_pause_for_root(root).map(|p| p.paused_until_ms);
-
-                // The first root's worker will retry after a 15 s backoff.
-                note_pause_retry_at(&first_pause, START + 15_000);
-                assert_eq!(until(&first_root), Some(START + 15_000));
-                assert_eq!(
-                    until(&second_root),
-                    None,
-                    "another root's identical pause took this root's retry time"
-                );
-
-                // A newer refusal replaces the first root's pause; a late note
-                // for the older pause must not extend its replacement.
-                assert!(matches!(
-                    first.embed_query("again", Duration::from_secs(1)),
-                    Err(SynapseEmbeddingError::LanePaused(_))
-                ));
-                note_pause_retry_at(&first_pause, START + 30_000);
-                assert_eq!(
-                    until(&first_root),
-                    None,
-                    "an older pause's retry time extended its replacement"
-                );
-            },
-        );
-    });
-}
-
-#[test]
 fn synapse_shared_reset_reconnects_once_without_serializing_callers() {
     const CALLERS: usize = 8;
     let daemon = Daemon::start(CALLERS, true);

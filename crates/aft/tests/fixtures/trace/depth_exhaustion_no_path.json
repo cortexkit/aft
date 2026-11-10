@@ -4,7 +4,6 @@
   "paths": [],
   "total_paths": 0,
   "total_paths_is_lower_bound": false,
-  "entry_points_found": 0,
   "max_depth_reached": true,
   "truncated_paths": 0,
   "paths_list_envelope": {

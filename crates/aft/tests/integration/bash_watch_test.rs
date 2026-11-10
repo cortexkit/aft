@@ -15,7 +15,7 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
             "harness": "opencode",
             "project_root": dir.path(),
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),
@@ -37,7 +37,7 @@ fn configure_background_with_storage(
             "project_root": project_root,
             "storage_dir": storage_dir,
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),
@@ -632,7 +632,7 @@ fn watch_and_status_survive_another_harness_configuring_the_root() {
             "harness": "pi",
             "project_root": dir.path(),
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),

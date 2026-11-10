@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/data_layer/tools/search/meaning.rs",
+    "benchmarks/aft-search/compare_data_layer.py"
+  ],
+  "slices": [
+    "data-layer-search-meaning-lane"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/ and crates/aft/src/semantic_index.rs. aft_search's semantic lane (query-only and split searches, the split admission cosines and the recall audit) reads its vectors through one interface (data_layer::tools::search::MeaningIndex), and its readiness and status through DataSemantic. With AFT_DATA_LAYER=0, DataSemantic is never present, so every call reads today's SemanticIndex and status exactly as before. The regex route asks the data layer's text plane for candidates only when no index of today's is ready (a repository outside the root answered from its data-layer checkout); a root whose index of today's is ready, as in every benchmark replay, answers as before. A path at another repository, and a parent folder's children, answer from their data-layer checkouts when one is published; the benchmark families query neither. Ranked rows must stay byte-identical to the committed reference; benchmarks/aft-search/compare_data_layer.py replays the concept, exact and real-query families with the data layer and with today's route and compares every reply."
+}

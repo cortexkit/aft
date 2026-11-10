@@ -1,8 +1,9 @@
 // resolveBashConfig — v0.27.2 bash graduation contract.
 //
-// Locks the precedence rules between the new top-level `bash` surface
-// (boolean OR object) and the legacy `experimental.bash.*` block, plus
-// the all-on default that fills in when neither is set.
+// Locks the resolution of the top-level `bash` surface (boolean OR
+// object), plus the all-on default that fills in when it is not set. The
+// retired `experimental.bash` block is refused or rewritten before this
+// resolver sees a config.
 
 import { describe, expect, test } from "bun:test";
 import type { AftConfig } from "../config.js";
@@ -92,68 +93,6 @@ describe("resolveBashConfig", () => {
     });
   });
 
-  // ---- Top-level wins over legacy --------------------------------------
-
-  test("top-level bash: true wins over legacy experimental.bash.rewrite: false", () => {
-    const r = resolveBashConfig(cfg({ bash: true, experimental: { bash: { rewrite: false } } }));
-    expect(r).toMatchObject({ enabled: true, rewrite: true, compress: true, background: true });
-  });
-
-  test("top-level bash: false wins over legacy background: true", () => {
-    const r = resolveBashConfig(cfg({ bash: false, experimental: { bash: { background: true } } }));
-    expect(r.enabled).toBe(false);
-    expect(r.background).toBe(false);
-  });
-
-  // ---- Legacy fallback (no top-level) ----------------------------------
-
-  test("legacy experimental.bash.rewrite=true only → enabled; rewrite on, others off (opt-in semantics preserved)", () => {
-    const r = resolveBashConfig(cfg({ experimental: { bash: { rewrite: true } } }));
-    expect(r).toMatchObject({
-      enabled: true,
-      rewrite: true,
-      compress: false,
-      background: false,
-    });
-  });
-
-  test("legacy experimental.bash.compress=true only → enabled; compress on, others off", () => {
-    const r = resolveBashConfig(cfg({ experimental: { bash: { compress: true } } }));
-    expect(r).toMatchObject({
-      enabled: true,
-      rewrite: false,
-      compress: true,
-      background: false,
-    });
-  });
-
-  test("legacy background=true only → enabled; only background on", () => {
-    const r = resolveBashConfig(cfg({ experimental: { bash: { background: true } } }));
-    expect(r).toMatchObject({
-      enabled: true,
-      rewrite: false,
-      compress: false,
-      background: true,
-    });
-  });
-
-  test("legacy experimental.bash with all explicit false keeps sub-features off but the runtime gate on", () => {
-    // The explicit legacy opt-out still switches every sub-feature off. The
-    // runtime gate is now only `bash: false` / `bash.enabled: false`;
-    // registration is controlled by disabled_tools.
-    const r = resolveBashConfig(
-      cfg({ experimental: { bash: { rewrite: false, compress: false, background: false } } }),
-    );
-    expect(r).toMatchObject({ enabled: true, rewrite: false, compress: false, background: false });
-  });
-
-  test("empty legacy experimental.bash: {} → falls through to the default (no explicit opt-in)", () => {
-    // An empty experimental block has no feature flag at all, so we don't
-    // treat it as an explicit opt-out. Surface default kicks in instead.
-    const r = resolveBashConfig(cfg({ experimental: { bash: {} } }));
-    expect(r.enabled).toBe(true);
-  });
-
   // ---- Defaults and the runtime gate ------------------------------------
 
   test("bash.enabled:false turns the runtime gate off and keeps sub-feature defaults", () => {
@@ -164,7 +103,7 @@ describe("resolveBashConfig", () => {
     expect(resolveBashConfig(cfg({ bash: {} })).enabled).toBe(true);
   });
 
-  test("no top-level, no legacy → all on", () => {
+  test("no top-level bash → all on", () => {
     const r = resolveBashConfig(cfg({}));
     expect(r.enabled).toBe(true);
     expect(r.rewrite).toBe(true);
@@ -205,26 +144,5 @@ describe("resolveBashConfig", () => {
     );
     expect(r.long_running_reminder_enabled).toBe(false);
     expect(r.long_running_reminder_interval_ms).toBe(5000);
-  });
-
-  test("long_running_reminder_* on legacy carries through when top-level absent", () => {
-    const r = resolveBashConfig(
-      cfg({
-        experimental: {
-          bash: { rewrite: true, long_running_reminder_interval_ms: 2500 },
-        },
-      }),
-    );
-    expect(r.long_running_reminder_interval_ms).toBe(2500);
-  });
-
-  test("top-level reminder wins over legacy reminder when both set", () => {
-    const r = resolveBashConfig(
-      cfg({
-        bash: { long_running_reminder_interval_ms: 1000 },
-        experimental: { bash: { long_running_reminder_interval_ms: 2000 } },
-      }),
-    );
-    expect(r.long_running_reminder_interval_ms).toBe(1000);
   });
 });

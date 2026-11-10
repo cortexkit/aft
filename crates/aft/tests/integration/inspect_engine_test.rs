@@ -264,18 +264,21 @@ fn inspect_engine_deduplicates_in_flight_waiters() {
     let snapshot = snapshot(&root, &inspect_dir);
     let scope = JobScope::for_project(root.clone());
 
+    // Sharing one in-flight job does not depend on the category. Duplicates
+    // is used because dead code answers nothing until a call graph is
+    // published, and this stub manager has no call graph.
     let first_manager = Arc::clone(&manager);
     let first_snapshot = snapshot.clone();
     let first_scope = scope.clone();
     let first = thread::spawn(move || {
-        first_manager.submit_category(first_snapshot, InspectCategory::DeadCode, first_scope)
+        first_manager.submit_category(first_snapshot, InspectCategory::Duplicates, first_scope)
     });
 
     wait_for_worker_count(worker_count.as_ref(), 1, WORKER_START_LIVENESS);
 
     let second_manager = Arc::clone(&manager);
     let second = thread::spawn(move || {
-        second_manager.submit_category(snapshot, InspectCategory::DeadCode, scope)
+        second_manager.submit_category(snapshot, InspectCategory::Duplicates, scope)
     });
 
     let first = first.join().expect("first waiter");
@@ -537,7 +540,7 @@ fn inspect_engine_drain_routes_idle_scan_to_cache() {
 
 #[test]
 fn inspect_engine_command_returns_lane_a_shape() {
-    let (_temp_dir, root, _file) = fixture_project();
+    let (_temp_dir, root, file) = fixture_project();
     let mut aft = AftProcess::spawn();
     let configure = aft.send(
         &json!({
@@ -555,6 +558,9 @@ fn inspect_engine_command_returns_lane_a_shape() {
         configure["success"], true,
         "configure should succeed: {configure:?}"
     );
+    // Dead code answers only once the root's call graph is published; until
+    // then the inspect reply is partial, not fresh.
+    super::helpers::wait_for_published_call_graph(&mut aft, &file, "alive");
 
     let response = aft.send(
         &json!({

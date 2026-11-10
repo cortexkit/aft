@@ -1175,15 +1175,22 @@ export function smallCaller{idx:02}(): number {{
         crate::helpers::json_string(&target_path.display())
     ));
     assert_eq!(trace["success"], true, "trace_to should succeed: {trace:?}");
+    // Every caller is a root (20 public API functions, 5 tests); the
+    // target is not, since they call it.
     assert_eq!(
-        trace["total_paths"], 26,
-        "trace summary count should include hidden tests and the target self-path"
+        trace["total_paths"], 25,
+        "trace summary count should include hidden tests"
+    );
+    assert_eq!(
+        trace["root_counts"],
+        serde_json::json!({"public_api": 20}),
+        "hidden test roots are not counted: {trace:?}"
     );
     let trace_summary = trace["hub_summary"]["message"]
         .as_str()
         .expect("trace summary");
     assert!(
-        trace_summary.contains("Next: 26 paths (5 in tests, hidden — pass includeTests)"),
+        trace_summary.contains("Next: 25 paths (5 in tests, hidden — pass includeTests)"),
         "trace summary should state hidden tests and honest total: {trace_summary}"
     );
     let paths = trace["paths"].as_array().expect("trace paths");
@@ -2146,9 +2153,15 @@ fn callgraph_trace_to_single_path() {
     assert_eq!(hops[0]["line"], 3, "entry point line should be 1-based");
     assert_eq!(last["line"], 5, "target line should be 1-based");
 
-    // Verify diagnostic fields exist
+    // TypeScript has no starting function: the exported `main` nothing
+    // calls is public API. The exported functions on the way stay in the
+    // path, marked exported.
+    assert_eq!(main_path.unwrap()["root"], "public_api");
+    assert!(hops[1..]
+        .iter()
+        .all(|hop| hop["exported"] == true || hop["symbol"] == "checkFormat"));
     assert!(resp["total_paths"].as_u64().unwrap() >= 1);
-    assert!(resp["entry_points_found"].as_u64().unwrap() >= 1);
+    assert!(resp["root_counts"]["public_api"].as_u64().unwrap() >= 1);
 
     aft.shutdown();
 }
@@ -2184,11 +2197,16 @@ fn callgraph_trace_to_multi_path() {
         total_paths
     );
 
-    let entry_points_found = resp["entry_points_found"].as_u64().unwrap();
+    let roots_found = resp["root_counts"]
+        .as_object()
+        .expect("root counts")
+        .values()
+        .map(|count| count.as_u64().unwrap())
+        .sum::<u64>();
     assert!(
-        entry_points_found >= 2,
-        "validate should have multiple distinct entry points, got {}",
-        entry_points_found
+        roots_found >= 2,
+        "validate should have multiple distinct roots, got {}",
+        roots_found
     );
 
     let paths = resp["paths"].as_array().expect("paths should be array");
@@ -2259,9 +2277,10 @@ fn callgraph_trace_to_no_entry_points() {
         assert!(has_main, "any path for main should include main");
     }
 
-    // Diagnostic fields should be present and valid
-    assert!(resp.get("total_paths").is_some());
-    assert!(resp.get("entry_points_found").is_some());
+    // Nothing calls main, so main itself is the one root: a path of one hop.
+    assert_eq!(resp["total_paths"], 1);
+    assert_eq!(paths[0]["root"], "public_api");
+    assert_eq!(resp["root_counts"], serde_json::json!({"public_api": 1}));
     assert!(resp.get("truncated_paths").is_some());
 
     aft.shutdown();
@@ -2430,27 +2449,32 @@ fn callgraph_impact_multi_caller() {
             caller
         );
         assert!(
-            caller.get("is_entry_point").is_some(),
-            "caller should have is_entry_point: {:?}",
-            caller
-        );
-        assert!(
             caller.get("parameters").is_some(),
             "caller should have parameters: {:?}",
             caller
         );
     }
 
-    // At least one caller should have is_entry_point set
-    // (testValidation starts with "test", processData is called by main which is an entry point)
-    // With depth 5, we get transitive callers — main should be an entry point
-    let has_entry_point = callers
-        .iter()
-        .any(|c| c["is_entry_point"].as_bool() == Some(true));
-    assert!(
-        has_entry_point,
-        "at least one caller should be an entry point, callers: {:?}",
+    // The roots among the callers carry their kind: nothing calls `main`,
+    // `handleRequest` or `runCheck` (exported) or `testValidation` (not
+    // exported); `processData` has callers, so it is no root.
+    let root_of = |symbol: &str| {
         callers
+            .iter()
+            .find(|caller| caller["caller_symbol"] == symbol)
+            .unwrap_or_else(|| panic!("{symbol} is an affected caller: {callers:?}"))
+            .get("root")
+            .cloned()
+    };
+    assert_eq!(root_of("main"), Some(serde_json::json!("public_api")));
+    assert_eq!(
+        root_of("testValidation"),
+        Some(serde_json::json!("no_caller_found"))
+    );
+    assert_eq!(root_of("processData"), None);
+    assert_eq!(
+        resp["root_counts"],
+        serde_json::json!({"public_api": 3, "no_caller_found": 1})
     );
 
     // Target signature should be present

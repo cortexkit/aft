@@ -15,7 +15,7 @@
  *   - INCLUDES every field that can legitimately differ per project:
  *     format_on_edit, formatter_timeout_secs, validate_on_edit, formatter,
  *     checker, restrict_to_project_root, indexes, callgraph_chunk_size,
- *     experimental.bash.*, experimental.lsp_ty, lsp (project-safe subset),
+ *     bash.*, experimental.lsp_ty, lsp (project-safe subset),
  *   - Always forwards the resolved `disabled_tools` and `indexes`; a config
  *     without a resolved disabled list is refused rather than defaulted.
  *   - EXCLUDES global per-process state injected at plugin init:
@@ -63,10 +63,8 @@ describe("resolveProjectOverridesForConfigure", () => {
       indexes: { trigram: true, semantic: true, callgraph: false },
       callgraph_chunk_size: 3,
       github: { shim: true, read: false, write: true },
-      experimental: {
-        bash: { rewrite: true, compress: true, background: false },
-        lsp_ty: true,
-      },
+      bash: { rewrite: true, compress: true, background: false },
+      experimental: { lsp_ty: true },
       semantic: { backend: "fastembed", timeout_ms: 25000 },
     });
 
@@ -106,12 +104,10 @@ describe("resolveProjectOverridesForConfigure", () => {
     // resolveProjectOverridesForConfigure flattens it to the Rust wire format.
     const merged = {
       ...RESOLVED,
-      experimental: {
-        bash: {
-          rewrite: true, // inherited from user
-          compress: true, // inherited from user
-          background: false, // project override
-        },
+      bash: {
+        rewrite: true, // inherited from user
+        compress: true, // inherited from user
+        background: false, // project override
       },
     };
     const overrides = resolveProjectOverridesForConfigure(merged);

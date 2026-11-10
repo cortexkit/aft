@@ -40,7 +40,7 @@ export interface AftTuiPrefs {
   rememberCollapsed: boolean;
   collapsed: boolean | null;
   /**
-   * Whether OpenCode 2 shows AFT's health line (`AFT E0 W0 | D0 U0 C0 | T0`)
+   * Whether OpenCode 2 shows AFT's health line (`AFT E0 W0 | T0`)
    * in the prompt footer. Off hides it entirely; the sidebar and the status
    * dialog are unaffected.
    */

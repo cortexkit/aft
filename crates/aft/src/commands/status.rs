@@ -4,58 +4,8 @@ use crate::context::AppContext;
 use crate::context::SemanticIndexStatus;
 use crate::db::compression_events::CompressionAggregate;
 use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
-use crate::views::semantic_runtime::CoordinationState;
 
 // Operator-only copy: never use these lines as fill errors or agent reply reasons.
-const PENDING_REASON: &str =
-    "Waiting for another AFT process that is embedding the same new code; results will follow.";
-const ERROR_REASON: &str = "Can't coordinate embedding with other AFT processes";
-
-fn coordination_detail(detail: &str) -> String {
-    let redacted = crate::log_redact::aft_redactor(detail);
-    let single_line = redacted
-        .chars()
-        .map(|ch| {
-            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect::<String>();
-    single_line.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn project_semantic_coordination(info: &mut serde_json::Value, state: CoordinationState) {
-    match state {
-        CoordinationState::Contended => {
-            info["pending_reason"] = serde_json::json!(PENDING_REASON);
-        }
-        CoordinationState::BaseBusy { owner_pid, attempt } => {
-            info["pending_reason"] = serde_json::json!(PENDING_REASON);
-            info["pending_owner"] = serde_json::json!({
-                "kind": "base_claim", "pid": owner_pid, "attempt": attempt,
-            });
-        }
-        CoordinationState::Error { failure, retry_in } => {
-            let detail = coordination_detail(&failure.detail);
-            let line = match retry_in {
-                Some(wait) => format!(
-                    "{ERROR_REASON}: {detail}. Retrying in {}.",
-                    crate::lsp::manager::format_retry_delay(wait)
-                ),
-                None => format!("{ERROR_REASON}: {detail}. No retry is scheduled."),
-            };
-            info["pending_reason"] = serde_json::json!(line);
-            info["coordination_error"] = serde_json::json!({
-                "state": "error", "kind": failure.kind_label(), "reason": ERROR_REASON,
-                "detail": detail, "retryable": failure.retryable,
-                "retry_scheduled": retry_in.is_some(),
-                "retry_in_ms": retry_in.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
-            });
-        }
-    }
-}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CompressionStats {
@@ -202,31 +152,11 @@ impl AppContext {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = self.config();
 
-        // Search index status. Status is a control-path snapshot, so lock
-        // pressure is represented directly instead of delaying the caller.
-        let search_index_info = match self.search_index().try_read() {
-            Ok(index) => match index.as_ref() {
-                Some(idx) if idx.ready => {
-                    let file_count = idx.file_count();
-                    let trigram_count = idx.trigram_count();
-                    serde_json::json!({
-                        "status": "ready",
-                        "files": file_count,
-                        "trigrams": trigram_count,
-                    })
-                }
-                Some(_) => serde_json::json!({ "status": "building" }),
-                None => {
-                    let status = if config.indexes.trigram {
-                        "loading"
-                    } else {
-                        "disabled"
-                    };
-                    serde_json::json!({ "status": status })
-                }
-            },
-            Err(_) => serde_json::json!({ "status": "busy" }),
-        };
+        // The text index's status comes from the index store's report below;
+        // until a checkout is probed it reads as loading, or disabled.
+        let search_index_info = serde_json::json!({
+            "status": if config.indexes.trigram { "loading" } else { "disabled" },
+        });
 
         let semantic_status = self
             .semantic_index_status()
@@ -373,7 +303,7 @@ impl AppContext {
         } else {
             search_index_info
         };
-        let mut semantic_index_info = if self.root_too_broad() {
+        let semantic_index_info = if self.root_too_broad() {
             safety_disabled_info()
         } else if config.indexes.semantic {
             refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
@@ -381,34 +311,13 @@ impl AppContext {
             semantic_index_info
         };
 
-        if config.views.enabled && config.indexes.semantic {
-            if let Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Ready(
-                runtime,
-            ))) = self.checkout_semantic().try_state()
-            {
-                if let Some(coordination) = runtime.coordination_state() {
-                    // Existing semantic vectors remain queryable; expose coordination
-                    // diagnostics only in operator status output.
-                    project_semantic_coordination(&mut semantic_index_info, coordination);
-                }
-            }
-        }
-
-        // Disk cache sizes — scoped to the **current project** only.
-        //
-        // Both trigram (`<storage_dir>/index/<key>/`) and semantic
-        // (`<storage_dir>/semantic/<key>/`) caches are partitioned per project by
-        // `project_cache_key(project_root)`. Earlier this function reported the
-        // recursive size of the entire `index/` and `semantic/` directories,
-        // which summed disk usage across **every** project the user had ever
-        // opened. The TUI sidebar surfaced that total as if it were the current
-        // project's footprint, which was misleading (e.g. a 4.8 MB project with
-        // 9 sibling projects appeared to use 16+ GB).
-        //
-        // We now resolve the per-project key from `config.project_root` and
-        // size only that project's slice. When the project key can't be
-        // resolved (no project_root), fall back to zeros — the cross-project
-        // total is never the right answer to display per-session.
+        // Disk sizes. The trigram and semantic indexes used to live in
+        // `<cache_dir>/index/<key>/` and `<cache_dir>/semantic/<key>/`; from
+        // 0.64 every index lives in the index store, whose size the data layer
+        // adds as `data_store_bytes` (see `data_layer::surfaces::apply_to_status`).
+        // The old folders are never read and `aft cache prune-legacy` deletes
+        // them, so status no longer sizes them. The two byte fields stay, at 0,
+        // because plugins and the status push contract read them.
         let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
         let cache_dir = config.cache_storage_dir();
         let disk_info = match (&cache_dir, &config.project_root) {
@@ -417,29 +326,14 @@ impl AppContext {
                     .canonical_cache_root_opt()
                     .unwrap_or_else(|| root.clone());
                 // Passive read only: status must never trigger a key
-                // derivation (git probe). Artifact-backed features derive and
-                // memoize the key at configure; when none are enabled there is
-                // no per-project artifact slice to size.
-                match self.cached_artifact_cache_key(&key_root) {
-                    Some(key) => {
-                        let trigram_size = dir_size(&dir.join("index").join(&key));
-                        let semantic_size = dir_size(&dir.join("semantic").join(&key));
-                        serde_json::json!({
-                            "storage_dir": storage_dir,
-                            "cache_dir": dir.display().to_string(),
-                            "project_cache_key": key,
-                            "trigram_disk_bytes": trigram_size,
-                            "semantic_disk_bytes": semantic_size,
-                        })
-                    }
-                    None => serde_json::json!({
-                        "storage_dir": storage_dir,
-                        "cache_dir": dir.display().to_string(),
-                        "project_cache_key": null,
-                        "trigram_disk_bytes": 0,
-                        "semantic_disk_bytes": 0,
-                    }),
-                }
+                // derivation (git probe).
+                serde_json::json!({
+                    "storage_dir": storage_dir,
+                    "cache_dir": dir.display().to_string(),
+                    "project_cache_key": self.cached_artifact_cache_key(&key_root),
+                    "trigram_disk_bytes": 0,
+                    "semantic_disk_bytes": 0,
+                })
             }
             (Some(dir), None) => serde_json::json!({
                 "storage_dir": storage_dir,
@@ -512,6 +406,15 @@ impl AppContext {
         } else {
             Vec::new()
         };
+        // With the data layer on, its family store refuses a file a newer
+        // build wrote as today's stores refuse theirs, and is listed the
+        // same way, after them. Push projection adds it itself, with this
+        // project's other refusals.
+        let data_store_report = crate::data_layer::surfaces::report(self);
+        let data_store_refusal = data_store_report
+            .as_ref()
+            .and_then(|report| report.refusal.as_ref())
+            .filter(|_| kind == StatusSnapshotKind::Explicit);
         for refusal in &storage_refusals {
             // A single unreadable task does not disable bash for any other
             // task or session. Health still lists it by path below; a floor
@@ -522,6 +425,12 @@ impl AppContext {
                 continue;
             }
             let reason = refusal.reason();
+            if !degraded_reasons.contains(&reason) {
+                degraded_reasons.push(reason);
+            }
+        }
+        if data_store_refusal.is_some() {
+            let reason = crate::data_layer::surfaces::refusal_reason();
             if !degraded_reasons.contains(&reason) {
                 degraded_reasons.push(reason);
             }
@@ -538,6 +447,7 @@ impl AppContext {
                     "message": refusal.to_string(),
                 })
             })
+            .chain(data_store_refusal.map(crate::data_layer::surfaces::refusal_json))
             .collect::<Vec<_>>();
         // Git being off is a machine-wide, per-process fact rather than a
         // property of this root, so it is added here instead of being
@@ -547,34 +457,29 @@ impl AppContext {
                 .push(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
         }
         let degraded = !degraded_reasons.is_empty();
-        let artifact_owner = self
-            .artifact_owner_status()
-            .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
-            .unwrap_or(serde_json::Value::Null);
+        // Index artifacts have no per-checkout owner: every checkout of a
+        // repository writes the one index store.
+        let artifact_owner = serde_json::Value::Null;
 
-        // Agent status-bar counts (the `[AFT E· W· | D· U· C· | T·]` glance).
+        // Agent status-bar counts (the `[AFT E· W· | T·]` glance).
         // Surfaced for the TUI sidebar so users see the same code-health view
-        // agents get. `None` until the Tier-2 cache is populated at least once
-        // (so we never render fabricated zeros) — emitted as JSON null then,
-        // and the sidebar hides the section.
+        // agents get. `None` until every count has a value at least once (so
+        // we never render fabricated zeros) — emitted as JSON null then, and
+        // the sidebar hides the section.
         let status_bar = match status_bar_values.legacy_projection() {
             Some(counts) => serde_json::json!({
                 "errors": counts.errors,
                 "warnings": counts.warnings,
-                "dead_code": counts.dead_code,
-                "unused_exports": counts.unused_exports,
-                "duplicates": counts.duplicates,
                 "todos": counts.todos,
-                "tier2_stale": counts.tier2_stale,
             }),
             None => serde_json::Value::Null,
         };
         // Per-category companion to `status_bar`: always an object once a
         // snapshot exists, with each count either a number or null when its
-        // producer has not supplied a trustworthy value (for example dead-code
-        // while the callgraph store is unavailable). `status_bar` stays null in
-        // that case for consumers that need the full set; renderers use this
-        // field to show what is known instead of claiming startup forever.
+        // producer has not supplied a trustworthy value. `status_bar` stays
+        // null in that case for consumers that need the full set; renderers
+        // use this field to show what is known instead of claiming startup
+        // forever.
         // Errors and warnings only exist once a language server has reported.
         // With no server running (all disabled, none installed, or no file
         // touched that one serves) nothing will ever report, and a bare null
@@ -599,11 +504,7 @@ impl AppContext {
             "warnings": status_bar_values.warnings,
             "diagnostics": diagnostics_state,
             "diagnostics_gaps": diagnostics_gaps,
-            "dead_code": status_bar_values.dead_code,
-            "unused_exports": status_bar_values.unused_exports,
-            "duplicates": status_bar_values.duplicates,
             "todos": status_bar_values.todos,
-            "tier2_stale": status_bar_values.tier2_stale,
         });
         if !disabled_categories.is_empty() {
             status_bar_values["disabled_categories"] = serde_json::json!(disabled_categories);
@@ -642,7 +543,7 @@ impl AppContext {
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,
-            "callgraph_refresh": config.project_root.as_deref().map(crate::callgraph_store::callgraph_refresh_status),
+            "callgraph_refresh": serde_json::Value::Null,
             "status_bar": status_bar,
             "status_bar_values": status_bar_values,
             "disk": disk_info,
@@ -663,9 +564,11 @@ impl AppContext {
                 "checkpoints": session_checkpoints,
             },
         });
-        if config.views.enabled {
-            payload["views"] = serde_json::to_value(self.view_health_snapshot())
-                .unwrap_or(serde_json::Value::Null);
+
+        // With the data layer on, its planes replace today's stores for text
+        // and the call graph on every status surface.
+        if let Some(report) = &data_store_report {
+            crate::data_layer::surfaces::apply_to_status(&mut payload, report);
         }
         if kind == StatusSnapshotKind::Push {
             // Read only this root's LSP applicability rather than cloning
@@ -685,15 +588,6 @@ impl AppContext {
             let memory_root = self
                 .canonical_cache_root_opt()
                 .or_else(|| config.project_root.clone());
-            let callgraph_write_metrics = memory_root
-                .as_deref()
-                .and_then(|root| self.cached_artifact_cache_key(root))
-                .map(|project_key| {
-                    crate::callgraph_store::callgraph_write_metrics_for_project(&project_key)
-                })
-                .unwrap_or_default();
-            let callgraph_write_metrics_total =
-                crate::callgraph_store::callgraph_write_metrics_total();
             // The allocator observation is cached; attribution still walks roots.
             payload["memory"] = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
                 .unwrap_or(serde_json::Value::Null);
@@ -705,8 +599,6 @@ impl AppContext {
             payload["children"] = serde_json::json!(lifecycle.children);
             payload["fds"] = serde_json::json!(lifecycle.fds);
             payload["storage_refusals"] = serde_json::json!(storage_refusals);
-            payload["storage_retention"] =
-                serde_json::json!(crate::storage_retention::snapshot(&self.cache_dir()));
             payload["git"] = crate::developer_tools::git_status_json();
             let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
                 crate::backup::backup_skipped_totals();
@@ -715,21 +607,11 @@ impl AppContext {
             payload["backup_skipped_temp_path_total"] =
                 serde_json::json!(backup_skipped_temp_path_total);
             let runtime = &mut payload["runtime"];
-            runtime["callgraph_commits_60s_total"] =
-                serde_json::json!(callgraph_write_metrics_total.commits_60s);
-            runtime["callgraph_pages_or_bytes_written_60s_total"] =
-                serde_json::json!(callgraph_write_metrics_total.pages_or_bytes_written_60s);
+            runtime["callgraph_commits_60s_total"] = serde_json::json!(0);
+            runtime["callgraph_pages_or_bytes_written_60s_total"] = serde_json::json!(0);
             #[cfg(unix)]
             {
                 runtime["bash_spawn"] = crate::posix_spawn::health();
-            }
-            if callgraph_write_metrics.commits_60s > 0 {
-                runtime["callgraph_commits_60s"] =
-                    serde_json::json!(callgraph_write_metrics.commits_60s);
-            }
-            if callgraph_write_metrics.pages_or_bytes_written_60s > 0 {
-                runtime["callgraph_pages_or_bytes_written_60s"] =
-                    serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
             }
         }
         payload
@@ -776,143 +658,8 @@ impl AppContext {
     }
 }
 
-/// Recursively compute the total size of a directory.
-fn dir_size(path: &std::path::Path) -> u64 {
-    if !path.exists() {
-        return 0;
-    }
-    dir_size_recursive(path)
-}
-
-fn dir_size_recursive(path: &std::path::Path) -> u64 {
-    let mut total = 0u64;
-    let entries = match std::fs::read_dir(path) {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-    for entry in entries.flatten() {
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if ft.is_file() {
-            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-        } else if ft.is_dir() {
-            total += dir_size_recursive(&entry.path());
-        }
-        crate::run_tool_call::progress::report();
-    }
-    total
-}
-
 #[cfg(test)]
 mod tests {
-    fn coordination_error_status(
-        retryable: bool,
-        retry_in: Option<std::time::Duration>,
-        detail: &str,
-    ) -> serde_json::Value {
-        let mut info = json!({"status": "ready"});
-        super::project_semantic_coordination(
-            &mut info,
-            super::CoordinationState::Error {
-                failure: crate::views::semantic::LeaseError {
-                    kind: crate::views::semantic::LeaseErrorKind::Storage(
-                        std::io::ErrorKind::PermissionDenied,
-                    ),
-                    detail: detail.into(),
-                    retryable,
-                },
-                retry_in,
-            },
-        );
-        info
-    }
-
-    #[test]
-    fn semantic_batch_lease_operator_pending_text_is_exact_for_both_owners() {
-        for state in [
-            super::CoordinationState::Contended,
-            super::CoordinationState::BaseBusy {
-                owner_pid: 42,
-                attempt: 3,
-            },
-        ] {
-            let mut info = json!({"status": "ready"});
-            super::project_semantic_coordination(&mut info, state);
-            assert_eq!(info["pending_reason"], "Waiting for another AFT process that is embedding the same new code; results will follow.");
-            assert_eq!(info["status"], "ready");
-            assert!(info.get("coordination_error").is_none());
-        }
-    }
-
-    #[test]
-    fn semantic_batch_lease_operator_retry_text_and_wait_are_exact() {
-        for (seconds, expected) in [
-            (4, "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 4s."),
-            (80, "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 1m 20s."),
-        ] {
-            let info = coordination_error_status(true, Some(std::time::Duration::from_secs(seconds)), "permission denied");
-            assert_eq!(info["pending_reason"], expected);
-            assert_eq!(info["status"], "ready");
-            assert_eq!(info["coordination_error"]["retry_scheduled"], true);
-            assert_eq!(info["coordination_error"]["retry_in_ms"], seconds * 1_000);
-            assert_eq!(info["coordination_error"]["retryable"], true);
-            assert_eq!(info["coordination_error"]["detail"], "permission denied");
-        }
-    }
-
-    #[test]
-    fn semantic_batch_lease_operator_no_retry_text_is_exact_after_refusal_or_exhaustion() {
-        for retryable in [false, true] {
-            let info = coordination_error_status(retryable, None, "permission denied");
-            assert_eq!(info["pending_reason"], "Can't coordinate embedding with other AFT processes: permission denied. No retry is scheduled.");
-            assert_eq!(info["coordination_error"]["retry_scheduled"], false);
-            assert_eq!(
-                info["coordination_error"]["retry_in_ms"],
-                serde_json::Value::Null
-            );
-            assert_eq!(info["coordination_error"]["retryable"], retryable);
-        }
-    }
-
-    #[test]
-    fn semantic_batch_lease_operator_detail_is_single_line_and_secret_free() {
-        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        let detail = format!(
-            "lease refused\nAuthorization: Bearer {secret}\r\towner unavailable\u{2028}\u{2029}"
-        );
-        let info = coordination_error_status(false, None, &detail);
-        let rendered = info["coordination_error"]["detail"].as_str().unwrap();
-        assert!(!rendered.contains(secret));
-        assert!(!rendered
-            .chars()
-            .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')));
-        assert!(!info["pending_reason"].as_str().unwrap().contains(secret));
-    }
-
-    #[test]
-    fn semantic_batch_lease_disabled_status_never_probes_view_slot() {
-        for (views, semantic) in [(false, true), (true, false), (false, false), (true, true)] {
-            let dir = tempfile::tempdir().unwrap();
-            let mut config = Config::default();
-            config.project_root = Some(dir.path().to_path_buf());
-            config.storage_dir = Some(dir.path().join("storage"));
-            config.views.enabled = views;
-            config.indexes.semantic = semantic;
-            let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
-            crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.set(0));
-            let response = handle_status(&request(), &ctx);
-            let probes =
-                crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.get());
-            assert!(response.success);
-            if views && semantic {
-                assert!(probes > 0, "enabled status must exercise the probe counter");
-            } else {
-                assert_eq!(probes, 0, "disabled status touched the semantic slot (views={views}, semantic={semantic})");
-            }
-        }
-    }
 
     use super::handle_status;
     use crate::config::Config;
@@ -1230,11 +977,13 @@ mod tests {
     }
 
     /// A project with no source files still finishes its semantic build: the
-    /// index holds zero entries and a small persisted file. That is ready with
-    /// a real disk size, not an index still loading. A build that is genuinely
-    /// still running for the same project keeps reporting `loading`.
+    /// index holds zero entries. That is ready, not an index still loading. A
+    /// build that is genuinely still running for the same project keeps
+    /// reporting `loading`. The old `semantic/<key>/` file it persists is not
+    /// sized: from 0.64 status never reads the old index folders, which
+    /// `aft cache prune-legacy` deletes.
     #[test]
-    fn status_reports_an_empty_finished_semantic_index_as_ready_with_its_disk_size() {
+    fn status_reports_an_empty_finished_semantic_index_as_ready_without_sizing_old_folders() {
         let project = tempfile::tempdir().expect("project dir");
         let storage = tempfile::tempdir().expect("storage dir");
         let root = std::fs::canonicalize(project.path()).expect("canonical project");
@@ -1259,11 +1008,12 @@ mod tests {
         let ready = ctx.build_status_snapshot();
         assert_eq!(ready["semantic_index"]["status"], "ready");
         assert_eq!(ready["semantic_index"]["entries"], 0);
-        assert!(
-            ready["disk"]["semantic_disk_bytes"].as_u64().unwrap_or(0) > 0,
-            "a persisted empty index has a real size: {}",
+        assert_eq!(
+            ready["disk"]["semantic_disk_bytes"], 0,
+            "status sized the old semantic/ folder: {}",
             ready["disk"]
         );
+        assert_eq!(ready["disk"]["project_cache_key"], key.as_str());
 
         *ctx.semantic_index_status().write().unwrap() =
             crate::context::SemanticIndexStatus::Building {
@@ -1282,21 +1032,21 @@ mod tests {
     fn status_status_bar_is_null_until_every_independent_producer_is_populated() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let response = handle_status(&request(), &ctx);
-        // No Tier-2 scan has run yet, so the status-bar glance must be null
+        // No TODO scan has run yet, so the status-bar glance must be null
         // (never fabricated zeros). The key is always present so the TS
         // coercion can distinguish "field absent" from "not populated".
         assert!(response.data.get("status_bar").is_some());
         assert!(response.data["status_bar"].is_null());
 
-        // Tier-2 counts are only one input to the status bar. Keep `status_bar`
+        // The TODO count is only one input to the status bar. Keep `status_bar`
         // null until diagnostics and all other required inputs have reported.
-        ctx.update_status_bar_tier2(Some(3), Some(2), Some(1), Some(5), false);
+        ctx.update_status_bar_todos(Some(5));
         let response = handle_status(&request(), &ctx);
         assert!(response.data["status_bar"].is_null());
     }
 
-    // One unavailable producer (dead-code while the callgraph store is out)
-    // keeps `status_bar` null, so renderers need the per-category values to
+    // One unavailable producer (diagnostics with no language server) keeps
+    // `status_bar` null, so renderers need the per-category values to
     // show what is known instead of reporting startup indefinitely.
     #[test]
     fn status_bar_values_report_each_category_independently() {
@@ -1305,7 +1055,7 @@ mod tests {
         // snapshot exists. This fixture runs no server discovery, so record
         // that no language server applies to the project.
         ctx.lsp().store_project_applicability(Default::default());
-        ctx.update_status_bar_tier2(None, Some(2), Some(1), Some(5), false);
+        ctx.update_status_bar_todos(Some(5));
         let response = handle_status(&request(), &ctx);
 
         assert!(response.data["status_bar"].is_null());
@@ -1316,11 +1066,7 @@ mod tests {
                 "warnings": null,
                 "diagnostics": "no_language_server",
                 "diagnostics_gaps": [],
-                "dead_code": null,
-                "unused_exports": 2,
-                "duplicates": 1,
                 "todos": 5,
-                "tier2_stale": false,
             })
         );
     }
@@ -1334,7 +1080,7 @@ mod tests {
         // Server discovery has run and found no language server for this
         // project. Before discovery has run, the counts would read "pending".
         ctx.lsp().store_project_applicability(Default::default());
-        ctx.update_status_bar_tier2(Some(1), Some(1), Some(0), Some(0), false);
+        ctx.update_status_bar_todos(Some(0));
         let response = handle_status(&request(), &ctx);
 
         let values = &response.data["status_bar_values"];

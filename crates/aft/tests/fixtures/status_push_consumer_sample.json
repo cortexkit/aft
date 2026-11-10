@@ -11,8 +11,8 @@
   "lsp_servers":5,"symbol_cache":{"local_entries":18000,"warm_entries":2000},"storage_dir":"/storage","checkpoints_total":24,
   "session":{"id":"session-a","tracked_files":6,"checkpoints":2},
   "compression":{"project":{"events":100,"original_tokens":10000,"compressed_tokens":2000,"savings_tokens":8000},"session":{"events":5,"original_tokens":500,"compressed_tokens":100,"savings_tokens":400}},
-  "status_bar":{"disabled_categories":[],"errors":1,"warnings":2,"dead_code":3,"unused_exports":4,"duplicates":5,"todos":6,"diagnostics":"pending","diagnostics_gaps":[{"language":"rust","producer":"rust-analyzer","root":"/project"}],"tier2_stale":true},
-  "status_bar_values":{"disabled_categories":[],"errors":1,"warnings":2,"dead_code":3,"unused_exports":4,"duplicates":5,"todos":6,"diagnostics":"pending","diagnostics_gaps":[{"language":"rust","producer":"rust-analyzer","root":"/project"}],"tier2_stale":true},
+  "status_bar":{"disabled_categories":[],"errors":1,"warnings":2,"todos":6,"diagnostics":"pending","diagnostics_gaps":[{"language":"rust","producer":"rust-analyzer","root":"/project"}]},
+  "status_bar_values":{"disabled_categories":[],"errors":1,"warnings":2,"todos":6,"diagnostics":"pending","diagnostics_gaps":[{"language":"rust","producer":"rust-analyzer","root":"/project"}]},
   "lsp":{"applicability_by_root":{"/another-project":{"hits":99}}},
   "memory":{"roots":{"/another-project":{"attributed_bytes":999}}},"sqlite":{"open_connections":999},"threads":{"total":999},"children":{"detached_total":999},"fds":{"open":999}
 }

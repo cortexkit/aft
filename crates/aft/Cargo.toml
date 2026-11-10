@@ -13,7 +13,10 @@ rust-version.workspace = true
 # crates.io refuses uploads over 10 MiB. Integration suites and their fixtures
 # are only needed in this repository, so they stay out of the published crate;
 # the release workflow's packaging check guards the limit.
-exclude = ["tests/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
+# Examples are measurement probes and gates for this repository, and their data
+# packs alone exceed crates.io's 10 MiB crate limit, so they stay out of the
+# published crate.
+exclude = ["tests/", "examples/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
 # Aggregate integration suites avoid linking one executable per source file.
 # Explicit targets leave fixture/descriptor paths stable without autodiscovery.
 autotests = false
@@ -96,12 +99,6 @@ path = "tests/daemon_malloc_small_growth_repro.rs"
 name = "applicability_cost"
 path = "tests/applicability_cost.rs"
 
-# The cold trigram build's peak heap is counted process-wide by its own
-# allocator, so it needs a binary of its own.
-[[test]]
-name = "search_index_build_memory"
-path = "tests/search_index_build_memory.rs"
-
 [lints.rust]
 # The ignored navigation profile is enabled explicitly for manual measurements.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
@@ -120,6 +117,7 @@ secret-test-fake = []
 semantic-chunk-census = []
 
 [dependencies]
+aft-store = { path = "../aft-store", version = "0.63.4" }
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }

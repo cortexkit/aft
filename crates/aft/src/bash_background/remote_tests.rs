@@ -2,6 +2,9 @@ use super::*;
 use crate::bash_background::persistence::{read_task, write_task};
 use crate::exec_remote::wire_tests::{daemon, id, Script};
 
+#[path = "bookkeeping_probe.rs"]
+mod bookkeeping_probe;
+
 #[test]
 fn remote_admission_progress_lines_are_exact_and_detail_is_plain_text() {
     use exec::types::{Progress, ProgressPhase};
@@ -2061,6 +2064,31 @@ impl Drop for UncapturedTerminalBeforeRenderForTest {
 pub(crate) fn uncaptured_terminal_before_render_for_test(
     refused: bool,
 ) -> UncapturedTerminalBeforeRenderForTest {
+    let verdict = if refused {
+        Verdict::RunLocally {
+            reason: RefusalReason::Unreachable,
+            refusal_detail: None,
+        }
+    } else {
+        Verdict::Signalled { signal: 9 }
+    };
+    uncaptured_verdict_before_render_for_test(
+        verdict,
+        refused.then(|| "runon refused: remote refused: unreachable; command was not run".into()),
+    )
+}
+
+pub(crate) fn uncaptured_unknown_before_render_for_test() -> UncapturedTerminalBeforeRenderForTest {
+    uncaptured_verdict_before_render_for_test(
+        Verdict::OutcomeUnknown,
+        Some("remote route interrupted before acceptance".into()),
+    )
+}
+
+fn uncaptured_verdict_before_render_for_test(
+    verdict: Verdict,
+    error: Option<String>,
+) -> UncapturedTerminalBeforeRenderForTest {
     let dir = tempfile::tempdir().unwrap();
     let (registry, task_id, _) =
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
@@ -2089,21 +2117,7 @@ pub(crate) fn uncaptured_terminal_before_render_for_test(
         let registry = registry.clone();
         let task = task.clone();
         std::thread::spawn(move || {
-            let verdict = if refused {
-                Verdict::RunLocally {
-                    reason: RefusalReason::Unreachable,
-                    refusal_detail: None,
-                }
-            } else {
-                Verdict::Signalled { signal: 9 }
-            };
-            registry.remote_terminal(
-                &task,
-                verdict,
-                refused.then(|| {
-                    "runon refused: remote refused: unreachable; command was not run".into()
-                }),
-            );
+            registry.remote_terminal(&task, verdict, error);
         })
     };
     let fixture = UncapturedTerminalBeforeRenderForTest {
@@ -2422,6 +2436,13 @@ async fn exec_remote_bash_reattach_budget_cancel_observes_real_terminal() {
         .iter()
         .position(|(_, b)| b["method"] == "exec.cancel")
         .unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.cancel")
+            .count(),
+        1,
+        "terminal recovery must not resend an acknowledged job cancel"
+    );
     let attach = log
         .iter()
         .position(|(_, b)| b["method"] == "exec.attach")
@@ -4691,8 +4712,13 @@ fn exec_remote_bash_state_transitions_are_durable() {
         RemotePhase::of(&remote),
         RemotePhase::Queued { position: 7 }
     );
-    assert!(work_counts::get().syncs >= 2);
-    assert!(work_counts::get().renames >= 1);
+    // One record write: the new record file and its directory are synced.
+    assert_eq!(
+        work_counts::get().syncs,
+        2,
+        "the job id and the execution note are saved in one record write"
+    );
+    assert_eq!(work_counts::get().renames, 1);
 
     work_counts::reset();
     // An older runner's first output is a running transition, not just progress.
@@ -16351,4 +16377,205 @@ async fn runon_return_cap_second_refusal_is_not_keyed_recovery() {
     assert!(!reply.success, "{reply:?}");
     assert_eq!(exec_runs(&daemon).len(), 2);
     assert!(!dir.path().join("dist/hello.txt").exists());
+}
+
+/// Requests the daemon received to list its catalog.
+fn catalog_lists(daemon: &crate::exec_remote::wire_tests::Daemon) -> usize {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["op"] == "catalog.list")
+        .count()
+}
+
+/// Task record writes and daemon catalog lists so far, for one task.
+fn monitor_counts(
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+    task_id: &str,
+) -> (usize, usize) {
+    (
+        crate::bash_background::persistence::record_writes::get(task_id),
+        catalog_lists(daemon),
+    )
+}
+
+/// An accepted build-server job that is queued, then running, then quiet
+/// writes its task record and lists the daemon catalog only when its state
+/// changes: the worker's 50 ms polls in between cost neither.
+#[tokio::test]
+async fn runon_monitor_polls_without_a_change_write_nothing_and_list_no_catalog() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::GatedStages { position: 2 },
+        &[
+            "exec-remote/v1",
+            exec::types::SUBMISSION_KEY_CAPABILITY,
+            exec::types::PROGRESS_CAPABILITY,
+        ],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        crate::bash_background::RemoteLaunch {
+            explicit_runon: true,
+            ..launch(daemon.connection.clone())
+        },
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    wait_for("the runner must accept the job", || {
+        registry
+            .remote_progress(&task_id, "session")
+            .filter(|progress| progress.phase == RemotePhase::Queued { position: 2 })
+    })
+    .await;
+    let launch = monitor_counts(&daemon, &task_id);
+    // Many polls of a queued job with nothing new from the runner.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let queued = monitor_counts(&daemon, &task_id);
+    daemon.output_gate.notify_one();
+    wait_for("the first output must mark the job running", || {
+        registry
+            .remote_progress(&task_id, "session")
+            .filter(|progress| progress.phase == RemotePhase::Running)
+    })
+    .await;
+    let started = monitor_counts(&daemon, &task_id);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let running = monitor_counts(&daemon, &task_id);
+    daemon.completion_gate.notify_one();
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    eprintln!(
+        "monitor counts (record writes, catalog lists): launch {launch:?}, queued {queued:?}, started {started:?}, running {running:?}"
+    );
+    assert_eq!(queued, launch, "a queued job's polls changed nothing");
+    assert_eq!(
+        running, started,
+        "a quiet running job's polls changed nothing"
+    );
+    // Launching resolves the executor, then reads its capabilities once for
+    // every check the submission makes.
+    assert_eq!(launch.1, 2, "catalog lists at launch");
+}
+
+/// A running job that streams output steadily saves its output cursor at
+/// most once per checkpoint interval and never lists the catalog.
+#[tokio::test]
+async fn runon_monitor_steady_output_writes_only_checkpoints_and_lists_no_catalog() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Continuous,
+        &[
+            "exec-remote/v1",
+            exec::types::SUBMISSION_KEY_CAPABILITY,
+            exec::types::PROGRESS_CAPABILITY,
+        ],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        crate::bash_background::RemoteLaunch {
+            explicit_runon: true,
+            ..launch(daemon.connection.clone())
+        },
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    let task = registry.task(&task_id).unwrap();
+    wait_for("the job must start streaming output", || {
+        registry
+            .remote_progress(&task_id, "session")
+            .filter(|progress| progress.phase == RemotePhase::Running)
+    })
+    .await;
+    let started = monitor_counts(&daemon, &task_id);
+    let bytes = fs::metadata(&task.paths.stdout).unwrap().len();
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    let streamed = monitor_counts(&daemon, &task_id);
+    let streamed_bytes = fs::metadata(&task.paths.stdout).unwrap().len() - bytes;
+    assert!(registry.record_remote_cancel(&task).unwrap());
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::Killed
+    );
+    eprintln!(
+        "steady output counts (record writes, catalog lists): started {started:?}, after 3 s {streamed:?}, {streamed_bytes} output bytes"
+    );
+    assert!(
+        streamed_bytes > 100,
+        "the runner kept streaming: {streamed_bytes}"
+    );
+    assert_eq!(streamed.1, started.1, "streaming output lists no catalog");
+    assert!(
+        streamed.0 - started.0 <= 1,
+        "at most one output checkpoint in 3 s: {started:?} -> {streamed:?}"
+    );
+}
+
+/// A draining wait polls once a second and only the elapsed time in its note
+/// changes. The record is saved when the wait begins and then at most once
+/// per `DRAINING_NOTE_SAVE_INTERVAL_MS`, while the note shown in this process
+/// still moves every second.
+#[tokio::test]
+async fn runon_draining_wait_saves_its_record_at_a_coarse_step() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(60_000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        crate::bash_background::RemoteLaunch {
+            explicit_runon: true,
+            ..launch(daemon.connection.clone())
+        },
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    let first = clock.now();
+    clock.expect_sleep(first, first + 1000).await;
+    let wait_began = crate::bash_background::persistence::record_writes::get(&task_id);
+    // A simulated minute of the wait: 59 more one-second passes.
+    for second in 1..60 {
+        clock.advance(1000);
+        clock
+            .expect_sleep(first + second * 1000, first + (second + 1) * 1000)
+            .await;
+    }
+    let waited = crate::bash_background::persistence::record_writes::get(&task_id);
+    let waiting = registry.observed_status(&task_id, "session", 8192).unwrap();
+    assert!(
+        waiting
+            .output_preview
+            .contains("draining for maintenance; retrying (attempt 2, 59s of 10m used)"),
+        "the note shown here still moves every second: {waiting:?}"
+    );
+    clock.advance(1000);
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    eprintln!(
+        "draining wait: {} record writes over 59 one-second passes",
+        waited - wait_began
+    );
+    assert!(
+        waited - wait_began <= 59 / (DRAINING_NOTE_SAVE_INTERVAL_MS / 1000) as usize,
+        "59 one-second passes saved the record {} times",
+        waited - wait_began
+    );
 }

@@ -1,1 +1,0 @@
-- Rolled-back edits clean up only their own operation backups, summarize exhausted cleanup in one warning, and retry leftover cleanup on a later backup pass.

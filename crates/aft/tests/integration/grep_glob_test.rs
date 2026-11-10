@@ -838,49 +838,6 @@ fn em_dash_patterns_match_the_same_lines_on_indexed_and_fallback_grep() {
     assert!(indexed_aft.shutdown().success());
 }
 
-/// While the trigram index is still building, grep answers from a walk. The
-/// reply must say the walk read every file, so a zero is trustworthy; a bare
-/// "[index: building]" next to the count would leave that unknown. The debug
-/// hook holds the first index build open long enough to observe that state.
-#[cfg(debug_assertions)]
-#[test]
-fn grep_while_index_builds_says_the_walk_searched_every_file() {
-    let project = setup_project(&[
-        (
-            ".fixture-id",
-            "grep_while_index_builds_says_the_walk_searched_every_file\n",
-        ),
-        ("src/a.rs", "fn a() {}\n"),
-        ("src/b.rs", "fn b() {}\n"),
-    ]);
-    let mut aft = AftProcess::spawn_with_env(&[(
-        "AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS",
-        std::ffi::OsStr::new("5000"),
-    )]);
-    configure_with_index(&mut aft, project.path());
-
-    let response = send(
-        &mut aft,
-        json!({
-            "id": "grep-while-building",
-            "command": "grep",
-            "pattern": "definitely_absent_token",
-        }),
-    );
-    assert_eq!(response["success"], true, "{response:?}");
-    assert_eq!(response["index_status"], "Building", "{response:?}");
-    let text = response["text"].as_str().expect("grep text");
-    // The fixture marker file is searched too, so three files in all.
-    assert_eq!(
-        text, "Found 0 matches in 0 files [index: building; searched all 3 files directly]",
-        "{response:?}"
-    );
-    assert_eq!(response["complete"], true, "{response:?}");
-    assert_eq!(response["files_read_directly"], 3, "{response:?}");
-
-    assert!(aft.shutdown().success());
-}
-
 #[test]
 fn grep_treats_leading_dash_pattern_as_literal() {
     let project = setup_project(&[("notes.txt", "-foo\nbar\n")]);

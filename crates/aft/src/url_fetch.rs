@@ -328,12 +328,23 @@ pub fn fetch_url_to_cache(
 ) -> Result<PathBuf, UrlFetchError> {
     let key = FailureKey::new(storage_dir, url, options.allow_private);
     let result = download_to_cache(url, storage_dir, options, &key);
+    record_fetch(&result);
     match &result {
         Ok(_) => forget_failure(&key),
         Err(error) if error.worth_remembering() => remember_failure(key, error),
         Err(_) => {}
     }
     result
+}
+
+/// Count one document asked for in the call's fetch times, with its error.
+fn record_fetch<T>(result: &Result<T, UrlFetchError>) {
+    timing::record(|times| {
+        times.fetches += 1;
+        if let Err(error) = result {
+            times.error = Some((error.code(), error.phase()));
+        }
+    });
 }
 
 /// How long a remembered failure stands in for a new fetch of its URL.
@@ -612,9 +623,11 @@ fn download_to_cache(
             url: fetch_url.clone(),
         };
         let Some(cached) = bounded_cache_check(failure_key, check, cache_check_deadline())? else {
+            timing::record(|times| times.remembered_failures += 1);
             return Err(remembered);
         };
         validate_public_url(&fetch_url, &options, &deadline, &approved)?;
+        timing::record(|times| times.cache_hits += 1);
         return Ok(cached);
     }
 
@@ -631,6 +644,7 @@ fn download_to_cache(
     // that the call which filled the cache allowed.
     validate_public_url(&fetch_url, &options, &deadline, &approved)?;
     if let Some(cached) = cached {
+        timing::record(|times| times.cache_hits += 1);
         return Ok(cached);
     }
 
@@ -731,6 +745,7 @@ pub fn cached_url_document(
         return Ok(None);
     };
     validate_public_url(&fetch_url, options, &deadline, &ApprovedHosts::default())?;
+    timing::record(|times| times.cache_hits += 1);
     Ok(Some(cached))
 }
 
@@ -935,15 +950,18 @@ pub fn fetch_url_with_secrets(
     secrets: &SecretFetch<'_>,
 ) -> Result<PathBuf, UrlFetchError> {
     let key_sent = std::cell::Cell::new(false);
-    fetch_with_secrets(logical_url, document_dir, options, secrets, &key_sent).map_err(|error| {
-        // A refusal written as "nothing was sent" is reworded once a request
-        // carrying the key has gone out.
-        if key_sent.get() {
-            error.after_secret_sent()
-        } else {
-            error
-        }
-    })
+    let result = fetch_with_secrets(logical_url, document_dir, options, secrets, &key_sent)
+        .map_err(|error| {
+            // A refusal written as "nothing was sent" is reworded once a request
+            // carrying the key has gone out.
+            if key_sent.get() {
+                error.after_secret_sent()
+            } else {
+                error
+            }
+        });
+    record_fetch(&result);
+    result
 }
 
 /// [`fetch_url_with_secrets`], recording in `key_sent` when a request that
@@ -1026,6 +1044,7 @@ fn fetch_with_secrets(
         )?;
         current = next;
         hop += 1;
+        timing::record(|times| times.redirects += 1);
     };
 
     let status = response.status();
@@ -1928,6 +1947,7 @@ fn fetch_with_redirects(
                 current_url.as_str()
             ))
         })?;
+        timing::record(|times| times.redirects += 1);
     }
 
     Err(UrlFetchError::new(format!(
@@ -1962,6 +1982,27 @@ fn send_with_transient_retries(
 /// [`send_failure`] with the held keys, and the request asks for an unencoded
 /// response so the body can be scrubbed byte for byte.
 fn send_request(
+    client: &Client,
+    target: &Url,
+    secret: Option<(&str, &HeldKeys)>,
+    deadline: &FetchDeadline,
+    progress: &ConnectProgress,
+) -> Result<HttpResponse, UrlFetchError> {
+    let started = Instant::now();
+    let (attempts_before, connect_before) = progress.totals();
+    let result = send_request_attempts(client, target, secret, deadline, progress);
+    let elapsed = started.elapsed();
+    let (attempts, connect) = progress.totals();
+    timing::record(|times| {
+        times.first_byte += elapsed;
+        times.connect += connect.saturating_sub(connect_before);
+        times.retries += (attempts - attempts_before).saturating_sub(1) as u32;
+    });
+    result
+}
+
+/// [`send_request`]'s attempts, without its timing.
+fn send_request_attempts(
     client: &Client,
     target: &Url,
     secret: Option<(&str, &HeldKeys)>,
@@ -2162,6 +2203,9 @@ struct AttemptProgress {
     attempt: u64,
     lookup_pending: bool,
     connect_pending: bool,
+    /// Time spent setting up connections, summed over every attempt of the
+    /// fetch, including attempts a timeout abandoned.
+    connect_time: Duration,
 }
 
 impl ConnectProgress {
@@ -2194,6 +2238,16 @@ impl ConnectProgress {
 
     fn connect_pending(&self) -> bool {
         self.state().connect_pending
+    }
+
+    fn add_connect_time(&self, elapsed: Duration) {
+        self.state().connect_time += elapsed;
+    }
+
+    /// Attempts begun and connection setup time so far, for the fetch times.
+    fn totals(&self) -> (u64, Duration) {
+        let state = self.state();
+        (state.attempt, state.connect_time)
     }
 
     /// Returns the attempt the lookup belongs to.
@@ -2268,6 +2322,12 @@ where
         let delay = self.delay;
         let connecting = self.inner.call(target);
         Box::pin(async move {
+            // Records on drop too, so a connect a timeout abandons still
+            // counts the time it took.
+            let _timer = ConnectTimer {
+                progress: Arc::clone(&progress),
+                started: Instant::now(),
+            };
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -2277,6 +2337,19 @@ where
             }
             connection
         })
+    }
+}
+
+/// Adds the time since `started` to the fetch's connection setup time when
+/// dropped.
+struct ConnectTimer {
+    progress: Arc<ConnectProgress>,
+    started: Instant,
+}
+
+impl Drop for ConnectTimer {
+    fn drop(&mut self) {
+        self.progress.add_connect_time(self.started.elapsed());
     }
 }
 
@@ -2351,6 +2424,20 @@ fn lookup_host(host: &str, lookup_override: Option<&HostLookup>) -> io::Result<V
 /// A host name is resolved under the fetch deadline and its approved
 /// addresses are recorded in `approved` for the resolver.
 fn validate_public_url(
+    url: &Url,
+    options: &UrlFetchOptions,
+    deadline: &FetchDeadline,
+    approved: &ApprovedHosts,
+) -> Result<(), UrlFetchError> {
+    let started = Instant::now();
+    let result = check_public_url(url, options, deadline, approved);
+    let elapsed = started.elapsed();
+    timing::record(|times| times.lookup += elapsed);
+    result
+}
+
+/// [`validate_public_url`] without its timing.
+fn check_public_url(
     url: &Url,
     options: &UrlFetchOptions,
     deadline: &FetchDeadline,
@@ -2633,6 +2720,15 @@ fn resolve_extension_from_content_type(content_type: &str) -> Option<&'static st
 }
 
 fn convert_html_body_to_markdown(body: &[u8], url: &str) -> Result<Vec<u8>, UrlFetchError> {
+    let started = Instant::now();
+    let result = html_body_to_markdown(body, url);
+    let elapsed = started.elapsed();
+    timing::record(|times| times.convert += elapsed);
+    result
+}
+
+/// [`convert_html_body_to_markdown`] without its timing.
+fn html_body_to_markdown(body: &[u8], url: &str) -> Result<Vec<u8>, UrlFetchError> {
     let html = String::from_utf8_lossy(body);
     let mut markdown = html_to_markdown_converter()
         .convert(&html)
@@ -3020,6 +3116,25 @@ fn read_response_body_with(
         }
     });
 
+    /// Records the body's read time and the bytes received when dropped, so
+    /// every way out of the read loop counts.
+    struct BodyTimer {
+        started: Instant,
+        bytes: u64,
+    }
+    impl Drop for BodyTimer {
+        fn drop(&mut self) {
+            let (elapsed, bytes) = (self.started.elapsed(), self.bytes);
+            timing::record(|times| {
+                times.body += elapsed;
+                times.body_bytes += bytes;
+            });
+        }
+    }
+    let mut timer = BodyTimer {
+        started: Instant::now(),
+        bytes: 0,
+    };
     let mut chunks = Vec::new();
     let mut total = 0u64;
     let slow_body_error = || {
@@ -3039,6 +3154,7 @@ fn read_response_body_with(
                 let remaining = (MAX_RESPONSE_BYTES - total) as usize;
                 chunks.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 total += chunk.len() as u64;
+                timer.bytes = total;
                 if total > MAX_RESPONSE_BYTES {
                     return Ok((chunks, true));
                 }
@@ -3183,6 +3299,153 @@ fn reqwest_error_detail(error: &reqwest::Error) -> String {
         return format!("{source}");
     }
     error.to_string()
+}
+
+/// Where the time of one tool call's URL fetches went, for the daemon's
+/// slow-call log line.
+///
+/// A fetch spends almost all of its time off the calling thread: the HTTP
+/// client runs the connection and the body read on its own runtime, and name
+/// lookups run on helper threads. So a slow URL outline shows a long `exec`
+/// with almost no CPU, the same as a call blocked on a lock. These counters
+/// say which part of the fetch the time went to.
+///
+/// Collection is per thread and only while a [`FetchTimesScope`] is open on
+/// that thread; anywhere else every recorder costs one thread-local read and
+/// records nothing. Only what the calling thread waited for is recorded, so
+/// the totals stay within the call's own wall time (connection setup is the
+/// exception: it is measured where it runs and is part of `first_byte`).
+pub mod timing {
+    use std::cell::RefCell;
+    use std::fmt::Write as _;
+    use std::time::Duration;
+
+    use super::FetchPhase;
+
+    /// Every URL fetch one call made, summed.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct UrlFetchTimes {
+        /// Documents asked for: downloads, cache hits and failures answered
+        /// from memory.
+        pub fetches: u32,
+        /// Served from the URL cache with no request sent.
+        pub cache_hits: u32,
+        /// Answered with a failure remembered from an earlier fetch of the
+        /// same URL, with no request sent.
+        pub remembered_failures: u32,
+        /// The private-address check's host name lookups, which run before
+        /// each request (and before a cache hit is served).
+        pub lookup: Duration,
+        /// Connection setup (TCP and TLS) inside the HTTP client, summed over
+        /// attempts. Part of `first_byte`.
+        pub connect: Duration,
+        /// From sending each request until its response headers arrived,
+        /// including connection setup, the server's own time to answer, and
+        /// any retry backoff; summed over redirect hops.
+        pub first_byte: Duration,
+        /// Reading response bodies.
+        pub body: Duration,
+        /// Body bytes received.
+        pub body_bytes: u64,
+        /// Converting HTML pages to Markdown, on the calling thread.
+        pub convert: Duration,
+        /// Redirects followed.
+        pub redirects: u32,
+        /// Requests sent again after a transient connection failure.
+        pub retries: u32,
+        /// The last failed fetch's error code and, for a timeout, its phase.
+        pub error: Option<(&'static str, Option<FetchPhase>)>,
+    }
+
+    impl UrlFetchTimes {
+        /// `url_fetch=fetches:1,cache_hits:0,remembered:0,lookup:2.10,
+        /// connect:40.00,first_byte:5800.00,body:300.00,bytes:51234,
+        /// convert:4.00,redirects:0,retries:0` (milliseconds for times), then
+        /// `,error:<code>[/<phase>]` when a fetch failed. One field with no
+        /// spaces and no URL: the host is already in the call's target kind.
+        pub fn render(&self) -> String {
+            let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+            let mut out = format!(
+                "url_fetch=fetches:{},cache_hits:{},remembered:{},lookup:{:.2},connect:{:.2},first_byte:{:.2},body:{:.2},bytes:{},convert:{:.2},redirects:{},retries:{}",
+                self.fetches,
+                self.cache_hits,
+                self.remembered_failures,
+                ms(self.lookup),
+                ms(self.connect),
+                ms(self.first_byte),
+                ms(self.body),
+                self.body_bytes,
+                ms(self.convert),
+                self.redirects,
+                self.retries,
+            );
+            if let Some((code, phase)) = self.error {
+                let _ = write!(out, ",error:{code}");
+                if let Some(phase) = phase {
+                    let _ = write!(out, "/{}", phase.as_str());
+                }
+            }
+            out
+        }
+    }
+
+    thread_local! {
+        static COLLECTOR: RefCell<Option<UrlFetchTimes>> = const { RefCell::new(None) };
+    }
+
+    /// An open collection on this thread; see [`begin`].
+    #[must_use = "a scope collects nothing once dropped"]
+    pub struct FetchTimesScope {
+        /// This scope opened the collection. A scope opened while another
+        /// was open leaves the outer one collecting and reports nothing.
+        owns: bool,
+    }
+
+    /// Start collecting this thread's URL fetch times.
+    pub fn begin() -> FetchTimesScope {
+        let owns = COLLECTOR.with(|collector| {
+            let mut collector = collector.borrow_mut();
+            if collector.is_some() {
+                return false;
+            }
+            *collector = Some(UrlFetchTimes::default());
+            true
+        });
+        FetchTimesScope { owns }
+    }
+
+    impl FetchTimesScope {
+        /// Stop collecting. `None` when no fetch ran, or for a scope nested
+        /// inside another.
+        pub fn finish(mut self) -> Option<UrlFetchTimes> {
+            if !self.owns {
+                return None;
+            }
+            self.owns = false;
+            COLLECTOR
+                .with(|collector| collector.replace(None))
+                .filter(|times| times.fetches > 0)
+        }
+    }
+
+    impl Drop for FetchTimesScope {
+        fn drop(&mut self) {
+            // An early return or a panic still closes the collection, so the
+            // next call on this thread starts clean.
+            if self.owns {
+                COLLECTOR.with(|collector| collector.replace(None));
+            }
+        }
+    }
+
+    /// Apply `update` to the open collection, if there is one.
+    pub(super) fn record(update: impl FnOnce(&mut UrlFetchTimes)) {
+        COLLECTOR.with(|collector| {
+            if let Some(times) = collector.borrow_mut().as_mut() {
+                update(times);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3674,3 +3937,170 @@ mod tests {
 #[cfg(test)]
 #[path = "url_fetch_deadline_tests.rs"]
 mod deadline_tests;
+
+/// The fetch times the slow-call line reports, measured against local
+/// servers that are slow in a known phase.
+#[cfg(test)]
+mod fetch_times_tests {
+    use super::timing::{self, UrlFetchTimes};
+    use super::*;
+    use std::net::TcpListener;
+
+    const DOCUMENT: &[u8] = b"# Guide\n\n## Install\n\nRun the installer.\n";
+
+    /// Answers every connection: reads the request head, waits
+    /// `before_headers`, sends the response headers, waits `before_body`,
+    /// then sends [`DOCUMENT`] and closes.
+    fn slow_server(before_headers: Duration, before_body: Duration) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut head = Vec::new();
+                    let mut buffer = [0u8; 1024];
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buffer[..n]),
+                        }
+                    }
+                    thread::sleep(before_headers);
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        DOCUMENT.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                    thread::sleep(before_body);
+                    let _ = stream.write_all(DOCUMENT);
+                });
+            }
+        });
+        address
+    }
+
+    fn local() -> UrlFetchOptions {
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        }
+    }
+
+    /// One fetch under a call budget, inside a fetch-times scope.
+    fn timed_fetch(
+        budget: Duration,
+        url: &str,
+        storage: &Path,
+    ) -> (Result<PathBuf, UrlFetchError>, UrlFetchTimes) {
+        let _call = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(budget)));
+        let scope = timing::begin();
+        let result = fetch_url_to_cache(url, storage, local());
+        let times = scope.finish().expect("the fetch was counted");
+        (result, times)
+    }
+
+    #[test]
+    fn url_fetch_times_split_a_slow_download_and_count_a_cache_hit() {
+        let storage = tempfile::tempdir().unwrap();
+        let address = slow_server(Duration::from_millis(300), Duration::from_millis(200));
+        let url = format!("http://127.0.0.1:{}/guide.md", address.port());
+
+        let (result, times) = timed_fetch(Duration::from_secs(10), &url, storage.path());
+        result.expect("the slow server answers within the deadline");
+        assert_eq!(times.fetches, 1, "{times:?}");
+        assert_eq!(times.cache_hits, 0, "{times:?}");
+        assert_eq!(times.remembered_failures, 0, "{times:?}");
+        assert_eq!((times.redirects, times.retries), (0, 0), "{times:?}");
+        assert_eq!(times.error, None, "{times:?}");
+        // The server held the headers 300 ms after it read the request, and
+        // the body another 200 ms after the headers.
+        assert!(times.first_byte >= Duration::from_millis(300), "{times:?}");
+        assert!(times.connect <= times.first_byte, "{times:?}");
+        assert!(times.body >= Duration::from_millis(150), "{times:?}");
+        assert_eq!(times.body_bytes, DOCUMENT.len() as u64, "{times:?}");
+        let rendered = times.render();
+        assert!(
+            rendered.starts_with("url_fetch=fetches:1,cache_hits:0,remembered:0,"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("guide"), "{rendered}");
+        assert!(!rendered.contains(' '), "{rendered}");
+
+        // The same URL again is served from the cache: no request, no body.
+        let (result, times) = timed_fetch(Duration::from_secs(10), &url, storage.path());
+        result.expect("the cached copy is served");
+        assert_eq!((times.fetches, times.cache_hits), (1, 1), "{times:?}");
+        assert_eq!(times.first_byte, Duration::ZERO, "{times:?}");
+        assert_eq!(times.body_bytes, 0, "{times:?}");
+    }
+
+    #[test]
+    fn url_fetch_times_name_a_timeout_and_its_phase() {
+        let storage = tempfile::tempdir().unwrap();
+        let address = slow_server(Duration::from_secs(60), Duration::ZERO);
+        let url = format!("http://127.0.0.1:{}/silent.md", address.port());
+        // A 5 s call budget leaves the fetch a 2 s deadline (see
+        // `FetchDeadline::for_current_call`).
+        let (result, times) = timed_fetch(Duration::from_secs(5), &url, storage.path());
+        let error = result.expect_err("a server that never answers fails");
+        assert_eq!(error.code(), "url_fetch_timeout", "{error}");
+        assert_eq!(
+            times.error,
+            Some(("url_fetch_timeout", Some(FetchPhase::Headers))),
+            "{times:?}"
+        );
+        assert!(
+            times.first_byte >= Duration::from_millis(1_500),
+            "{times:?}"
+        );
+        assert_eq!(times.body_bytes, 0, "{times:?}");
+        assert!(
+            times.render().ends_with(",error:url_fetch_timeout/headers"),
+            "{}",
+            times.render()
+        );
+    }
+
+    #[test]
+    fn url_fetch_times_collect_only_inside_the_outermost_scope() {
+        timing::record(|times| times.fetches += 1);
+        assert_eq!(timing::begin().finish(), None, "nothing ran in this scope");
+
+        let outer = timing::begin();
+        let inner = timing::begin();
+        timing::record(|times| times.fetches += 1);
+        assert_eq!(inner.finish(), None);
+        timing::record(|times| times.fetches += 1);
+        assert_eq!(outer.finish().map(|times| times.fetches), Some(2));
+
+        drop(timing::begin());
+        timing::record(|times| times.fetches += 1);
+        assert_eq!(timing::begin().finish(), None, "a dropped scope closed");
+    }
+
+    #[test]
+    fn url_fetch_times_render_every_field_in_milliseconds() {
+        let times = UrlFetchTimes {
+            fetches: 2,
+            cache_hits: 1,
+            remembered_failures: 0,
+            lookup: Duration::from_micros(2_100),
+            connect: Duration::from_millis(40),
+            first_byte: Duration::from_micros(5_800_004),
+            body: Duration::from_millis(300),
+            body_bytes: 51_234,
+            convert: Duration::from_millis(4),
+            redirects: 1,
+            retries: 0,
+            error: Some(("url_fetch_failed", None)),
+        };
+        assert_eq!(
+            times.render(),
+            "url_fetch=fetches:2,cache_hits:1,remembered:0,lookup:2.10,connect:40.00,first_byte:5800.00,body:300.00,bytes:51234,convert:4.00,redirects:1,retries:0,error:url_fetch_failed"
+        );
+    }
+}

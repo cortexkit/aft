@@ -1,5 +1,42 @@
 //! Grant operations and launch validation use daemon-attested route ancestry.
 use super::*;
+
+pub(super) mod sweep;
+
+/// Records where an already-approved folder answer came from, for the
+/// permissions page; it never changes the decision. A worker's ask is
+/// answered either by the person or by its head (the agent that launched the
+/// worker), passing on access the head itself has. When the head's own
+/// default policy allows the path, the source is `head_policy`. When the
+/// head's authority is a saved grant that a person gave the head, it is
+/// `head_grant`. Anything else is `unknown`.
+pub(super) fn answer_source(
+    conn: &rusqlite::Connection,
+    identity: &RouteIdentity,
+    by_user: bool,
+    head: Option<&AccessPolicy>,
+    grant: &AccessGrant,
+) -> rusqlite::Result<Option<crate::db::access_grant_rows::GrantSource>> {
+    use crate::db::access_grant_rows::GrantSource;
+    if by_user {
+        return Ok(Some(GrantSource::Person));
+    }
+    if let Some(head) = head {
+        let mut policy_only = head.clone();
+        policy_only.grants.clear();
+        if policy_only.head_policy(grant) == crate::access_policy::HeadPolicy::Allow {
+            return Ok(Some(GrantSource::HeadPolicy));
+        }
+    }
+    if let Some(key) = consent_head(conn, identity)? {
+        if store::person_grant_covers(conn, &key, grant)? {
+            return Ok(Some(GrantSource::HeadGrant));
+        }
+    }
+    // Unknown lineage is different from a pre-schema-28 row: a new answer
+    // still has an exact grant time, even when its head's authority is older.
+    Ok(Some(GrantSource::Unknown))
+}
 use crate::access_policy::{
     policy_path, AccessGrant, AccessOperation, AccessPolicy, GrantKind, HeadPolicy,
 };

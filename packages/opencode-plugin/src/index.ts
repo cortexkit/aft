@@ -79,6 +79,7 @@ import {
 import { AftRpcServer } from "./shared/rpc-server.js";
 import { releaseSessionState } from "./shared/session-cleanup.js";
 import {
+  clearSessionDirectory,
   closeDeletedSessionRoutes,
   getSessionDirectory,
   getSessionDirectoryCached,
@@ -89,7 +90,6 @@ import { coerceAftStatus, formatStatusMarkdown, NOT_STARTED_STATUS_TEXT } from "
 import { registerShutdownCleanup, schedulePassiveTimer } from "./shutdown-hooks.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { buildAftToolDefinitions, openCodeHashlineEffective } from "./tool-registration.js";
-import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
 import type { PluginContext } from "./types.js";
 import { appendHintsToSystem, buildHintsForRegisteredTools } from "./workflow-hints.js";
 
@@ -555,13 +555,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // and (together with bridge.ts signal handling) we want the shutdown path we
   // control, not implicit process-group death. Instance disposal runs only this
   // registration; process-exit handlers retain the global drain.
-  let clearInspectTier2Idle = () => {};
   let clearAnnouncementTimer = () => {};
   const shutdownCleanup = registerShutdownCleanup(async (reason) => {
     cancelPendingWakesForContext(ctx);
     autoUpdateAbort.abort();
     liveConfigReload.stop();
-    clearInspectTier2Idle();
     clearAnnouncementTimer();
     for (const unsubscribe of statusUnsubscribes) {
       try {
@@ -841,23 +839,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     log(`Workflow hints injected (${hintsBlock.length} chars)`);
   }
 
-  const inspectTier2Idle = createInspectTier2IdleScheduler({
-    isEnabled: () => registeredTools.has("aft_inspect"),
-    idleMinutes: () => ctx.config.inspect?.tier2_idle_minutes,
-    warn,
-    run: async (sessionID: string): Promise<void> => {
-      const sessionDir =
-        (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
-      if (!isProjectEnabled(sessionDir)) return;
-      const bridge = ctx.pool.getActiveBridgeForRoot(sessionDir) ?? ctx.pool.getBridge(sessionDir);
-      const response = await bridge.send("inspect_tier2_run", { session_id: sessionID });
-      if (response.success === false) {
-        warn((response.message as string) || "inspect_tier2_run failed");
-      }
-    },
-  });
-  clearInspectTier2Idle = () => inspectTier2Idle.clearAll();
-
   return {
     tool: allTools,
     "experimental.chat.system.transform": async (
@@ -888,6 +869,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       const eventType = eventInput.event.type;
       observeOpenCodeBgNotificationEvent(eventInput.event);
       const sessionID = extractSessionID(eventInput.event.properties);
+      if (eventType === "session.moved" && sessionID) {
+        clearSessionDirectory(sessionID);
+        return;
+      }
       if (eventType === "session.created" && sessionID) {
         const sessionDir =
           (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
@@ -899,7 +884,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // sessions, while in-flight bash aborts now use bash_abort_inflight.
       if (eventType === "session.deleted" && sessionID) {
         releaseSessionState(sessionID);
-        inspectTier2Idle.clear(sessionID);
         // Release this session's transport routes (subc: tool + bg_events;
         // standalone: no-op). Best-effort — never block the event hook.
         void closeDeletedSessionRoutes(pool, sessionID, input.worktree ?? input.directory).catch(
@@ -909,7 +893,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       }
       if (eventType !== "session.idle") return;
       if (!sessionID) return;
-      inspectTier2Idle.schedule(sessionID);
       // Use the session's stored directory rather than the plugin-init cwd:
       // OpenCode passes process.cwd() in `input.directory`, which can be wrong
       // for `-s` resumes from another folder.
@@ -988,7 +971,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       output.args = prepareOpenCodeArguments(toolInput.tool, output.args, {
         hashlineEffective: ctx.hashlineEffective,
       });
-      if (toolInput.sessionID) inspectTier2Idle.clear(toolInput.sessionID);
     },
     "command.execute.before": async (
       commandInput: { command: string; sessionID: string },

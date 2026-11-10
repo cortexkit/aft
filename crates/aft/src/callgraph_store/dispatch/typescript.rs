@@ -3,6 +3,9 @@
 //! return are treated as referring to one of these identities. Callback
 //! arguments are not guessed by name.
 use super::*;
+// The object indexes are only looked up, never iterated in an order that
+// shows in the output, so a fast hash serves them.
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(super) fn supported(language: &str) -> bool {
     matches!(language, "typescript" | "tsx" | "javascript")
@@ -13,10 +16,11 @@ pub(super) fn object_identity(object: Node<'_>) -> String {
     format!("@object:{}:{}", position.row, position.column)
 }
 
-pub(super) fn complete_symbols(
-    nodes: &[Node<'_>],
+pub(super) fn complete_symbols<'tree>(
+    nodes: &[Node<'tree>],
     source: &str,
     symbols: &mut Vec<crate::symbols::Symbol>,
+    nav: impl Nav<'tree>,
 ) {
     use crate::symbols::{Symbol, SymbolKind};
     let mut identities = HashMap::new();
@@ -41,16 +45,19 @@ pub(super) fn complete_symbols(
         .collect::<HashMap<_, _>>();
     for &node in nodes {
         if !matches!(
-            node.kind(),
+            nav.kind(node),
             "method_definition" | "arrow_function" | "function_expression" | "generator_function"
         ) {
             continue;
         }
-        let Some((object, name)) = object_member(node, source) else {
+        let Some((object, name)) = object_member(node, source, nav) else {
             continue;
         };
         let owner = object_identity(object);
-        let definition = node.parent().filter(|p| p.kind() == "pair").unwrap_or(node);
+        let definition = nav
+            .parent(node)
+            .filter(|p| nav.kind(*p) == "pair")
+            .unwrap_or(node);
         let mut declarations = vec![(name.clone(), definition, SymbolKind::Method)];
         if let Some(alias) = field(node, &["name"]).filter(|_| node.kind() != "method_definition") {
             if text(alias, source) != name {
@@ -94,10 +101,11 @@ pub(super) fn complete_symbols(
             symbols.push(Symbol {
                 name,
                 kind,
-                range: crate::parser::node_range_with_decorators(
+                range: crate::parser::node_range_with_decorators_with(
                     &definition,
                     source,
                     LangId::TypeScript,
+                    nav,
                 ),
                 signature: Some(signature),
                 scope_chain: vec![owner.clone()],
@@ -125,72 +133,80 @@ fn unwrap(mut node: Node<'_>) -> Node<'_> {
     }
 }
 
-pub(super) fn object_member<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a>, String)> {
-    let (object, key) = if node.kind() == "method_definition" {
+pub(super) fn object_member<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    nav: impl Nav<'tree>,
+) -> Option<(Node<'tree>, String)> {
+    let kind = nav.kind(node);
+    let (object, key) = if kind == "method_definition" {
         if node
             .children(&mut node.walk())
             .any(|n| matches!(n.kind(), "get" | "set"))
         {
             return None;
         }
-        (node.parent()?, field(node, &["name"])?)
+        (nav.parent(node)?, field(node, &["name"])?)
     } else if matches!(
-        node.kind(),
+        kind,
         "arrow_function" | "function_expression" | "generator_function"
     ) {
-        let pair = node.parent().filter(|p| p.kind() == "pair")?;
+        let pair = nav.parent(node).filter(|p| nav.kind(*p) == "pair")?;
         if field(pair, &["value"])? != node {
             return None;
         }
-        (pair.parent()?, field(pair, &["key"])?)
+        (nav.parent(pair)?, field(pair, &["key"])?)
     } else {
         return None;
     };
-    if object.kind() != "object" || !matches!(key.kind(), "property_identifier" | "identifier") {
+    if nav.kind(object) != "object" || !matches!(key.kind(), "property_identifier" | "identifier") {
         return None;
     }
     Some((object, text(key, source).to_string()))
 }
 
-pub(super) struct Objects<'nodes, 'tree, 'source> {
+pub(super) struct Objects<'nodes, 'tree, 'source, N> {
     nodes: &'nodes [Node<'tree>],
     source: &'source str,
-    returns: HashMap<String, String>,
-    imports: HashSet<String>,
+    nav: N,
+    returns: FxHashMap<String, String>,
+    imports: FxHashSet<String>,
     import_node: Option<Node<'tree>>,
-    bindings: HashMap<(usize, &'source str), Option<Node<'tree>>>,
-    writes: HashMap<&'source str, Vec<(usize, usize)>>,
-    aliases: HashSet<&'source str>,
-    return_statements: HashMap<usize, Vec<Node<'tree>>>,
-    returned_literals: HashMap<usize, Node<'tree>>,
-    members: HashMap<(usize, &'source str), usize>,
-    unsafe_objects: HashSet<usize>,
-    generics: HashSet<&'source str>,
+    bindings: FxHashMap<(usize, &'source str), Option<Node<'tree>>>,
+    writes: FxHashMap<&'source str, Vec<(usize, usize)>>,
+    aliases: FxHashSet<&'source str>,
+    return_statements: FxHashMap<usize, Vec<Node<'tree>>>,
+    returned_literals: FxHashMap<usize, Node<'tree>>,
+    members: FxHashMap<(usize, &'source str), usize>,
+    unsafe_objects: FxHashSet<usize>,
+    generics: FxHashSet<&'source str>,
     object_methods: Vec<MethodHint>,
-    needed_objects: HashSet<usize>,
-    identifier_scopes: HashMap<usize, usize>,
-    scope_parents: HashMap<usize, Option<usize>>,
-    function_owners: HashMap<usize, Option<usize>>,
-    write_scopes: HashMap<usize, (usize, usize)>,
-    selected_bindings: std::cell::RefCell<HashMap<(usize, &'source str), Option<Node<'tree>>>>,
+    needed_objects: FxHashSet<usize>,
+    identifier_scopes: FxHashMap<usize, usize>,
+    scope_parents: FxHashMap<usize, Option<usize>>,
+    function_owners: FxHashMap<usize, Option<usize>>,
+    write_scopes: FxHashMap<usize, (usize, usize)>,
+    selected_bindings: std::cell::RefCell<FxHashMap<(usize, &'source str), Option<Node<'tree>>>>,
     nominal: bool,
 }
 
-impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
+impl<'nodes, 'tree, 'source, N: Nav<'tree>> Objects<'nodes, 'tree, 'source, N> {
     pub(super) fn new(
         nodes: &'nodes [Node<'tree>],
         source: &'source str,
         parse: &ParseBlob,
+        nav: N,
     ) -> Self {
-        Self::with_nominal(nodes, source, parse, true)
+        Self::with_nominal(nodes, source, parse, true, nav)
     }
 
     pub(super) fn new_objects_only(
         nodes: &'nodes [Node<'tree>],
         source: &'source str,
         parse: &ParseBlob,
+        nav: N,
     ) -> Self {
-        Self::with_nominal(nodes, source, parse, false)
+        Self::with_nominal(nodes, source, parse, false, nav)
     }
 
     fn with_nominal(
@@ -198,28 +214,29 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         source: &'source str,
         parse: &ParseBlob,
         nominal: bool,
+        nav: N,
     ) -> Self {
-        let mut profile =
-            crate::views::materialization::profile::StageTimer::new("typescript_index");
+        let mut profile = crate::stage_timer::StageTimer::new("typescript_index");
         let mut result = Self {
             nodes,
             source,
-            returns: HashMap::new(),
+            nav,
+            returns: FxHashMap::default(),
             import_node: None,
-            bindings: HashMap::new(),
-            writes: HashMap::new(),
-            aliases: HashSet::new(),
-            return_statements: HashMap::new(),
-            returned_literals: HashMap::new(),
-            members: HashMap::new(),
-            unsafe_objects: HashSet::new(),
-            generics: HashSet::new(),
+            bindings: FxHashMap::default(),
+            writes: FxHashMap::default(),
+            aliases: FxHashSet::default(),
+            return_statements: FxHashMap::default(),
+            returned_literals: FxHashMap::default(),
+            members: FxHashMap::default(),
+            unsafe_objects: FxHashSet::default(),
+            generics: FxHashSet::default(),
             object_methods: Vec::new(),
-            needed_objects: HashSet::new(),
-            identifier_scopes: HashMap::new(),
-            scope_parents: HashMap::new(),
-            function_owners: HashMap::new(),
-            write_scopes: HashMap::new(),
+            needed_objects: FxHashSet::default(),
+            identifier_scopes: FxHashMap::default(),
+            scope_parents: FxHashMap::default(),
+            function_owners: FxHashMap::default(),
+            write_scopes: FxHashMap::default(),
             selected_bindings: Default::default(),
             nominal,
             imports: parse
@@ -252,8 +269,8 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         }
         let mut ambiguous = HashSet::new();
         let mut seen = HashSet::new();
-        for node in nodes.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
-            if let Some((object, name)) = object_member(*node, source) {
+        for node in nodes.iter().filter(|n| FUNCTIONS.contains(&nav.kind(**n))) {
+            if let Some((object, name)) = object_member(*node, source, nav) {
                 if result.unambiguous_member(object, &name) {
                     if let Some(symbol) = members.get(&(
                         node.end_position().row as u32,
@@ -300,7 +317,9 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             .retain(|symbol, _| !ambiguous.contains(symbol));
         let owners = nodes
             .iter()
-            .filter(|node| node.kind() == "object" && result.needed_objects.contains(&node.id()))
+            .filter(|node| {
+                nav.kind(**node) == "object" && result.needed_objects.contains(&node.id())
+            })
             .map(|node| object_identity(*node))
             .collect::<HashSet<_>>();
         profile.finish(
@@ -322,14 +341,15 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             if !self.needed_objects.insert(object.id()) {
                 return;
             }
+            let nav = self.nav;
             let mut expression = object;
-            while let Some(parent) = expression.parent().filter(|p| unwrap(*p) == object) {
+            while let Some(parent) = nav.parent(expression).filter(|p| unwrap(*p) == object) {
                 expression = parent;
             }
-            let Some(pair) = expression.parent().filter(|p| p.kind() == "pair") else {
+            let Some(pair) = nav.parent(expression).filter(|p| nav.kind(*p) == "pair") else {
                 return;
             };
-            let Some(parent) = pair.parent().filter(|p| p.kind() == "object") else {
+            let Some(parent) = nav.parent(pair).filter(|p| nav.kind(*p) == "object") else {
                 return;
             };
             object = parent;
@@ -368,8 +388,9 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
     fn index_nodes(&mut self) {
         let mut scopes = Vec::<Node<'tree>>::new();
         let mut functions = Vec::<Node<'tree>>::new();
+        let nav = self.nav;
         for &node in self.nodes {
-            let kind = node.kind();
+            let kind = nav.kind(node);
             let is_function = FUNCTIONS.contains(&kind);
             let is_scope = matches!(
                 kind,
@@ -465,9 +486,9 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             ) {
                 let function_scoped = kind == "for_in_statement"
                     || kind == "variable_declarator"
-                        && node
-                            .parent()
-                            .is_some_and(|parent| parent.kind() == "variable_declaration");
+                        && nav
+                            .parent(node)
+                            .is_some_and(|parent| nav.kind(parent) == "variable_declaration");
                 let owner = if kind == "catch_clause" {
                     Some(node)
                 } else if function_scoped {
@@ -556,7 +577,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         let body = field(function, &["body"])?;
         let expression = if body.kind() == "statement_block" {
             let returns = self.return_statements.get(&function.id())?;
-            if returns.len() != 1 || returns[0].parent() != Some(body) {
+            if returns.len() != 1 || self.nav.parent(returns[0]) != Some(body) {
                 return None;
             }
             returns[0].named_child(0)?
@@ -576,7 +597,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         for &object in self
             .nodes
             .iter()
-            .filter(|n| n.kind() == "object" && self.needed_objects.contains(&n.id()))
+            .filter(|n| self.nav.kind(**n) == "object" && self.needed_objects.contains(&n.id()))
         {
             facts.types.push(TypeHint {
                 name: object_identity(object),

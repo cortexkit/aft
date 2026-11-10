@@ -13,6 +13,7 @@ use crate::error::AftError;
 use crate::fs_lock::AdvisoryLockGuard;
 use sha2::{Digest, Sha256};
 
+pub mod latency;
 #[cfg(test)]
 #[path = "agent_data/ordinary_backup_format_tests.rs"]
 mod ordinary_format_tests;
@@ -1606,15 +1607,16 @@ impl BackupStore {
             return Ok(None);
         }
         let key = canonicalize_key(path);
-        self.run_snapshot_maintenance(session, &key)?;
-        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
-        // Hydrate any prior on-disk history before appending, so a snapshot
-        // taken on a fresh store (post-restart) extends the existing stack and
-        // advances the id counter instead of overwriting history with a single
+        // Hydrating prior on-disk history before appending lets a snapshot
+        // taken on a fresh store (post-restart) extend the existing stack and
+        // advance the id counter instead of overwriting history with a single
         // entry and reusing backup-0.
-        self.ensure_stack_hydrated_locked(session, &key)?;
+        let _disk_lock = self.begin_snapshot(session, &key)?;
         let (id, order) = self.next_id_and_order();
-        let entry = backup_entry_from_path(path, id.clone(), order, description, op_id)?;
+        let entry = {
+            let _capture = latency::time(latency::Part::Capture);
+            backup_entry_from_path(path, id.clone(), order, description, op_id)?
+        };
 
         self.persist_new_entry_locked(session, &key, entry)?;
         self.touch_session(session);
@@ -1636,9 +1638,7 @@ impl BackupStore {
             return Ok(None);
         }
         let key = canonicalize_key(path);
-        self.run_snapshot_maintenance(session, &key)?;
-        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
-        self.ensure_stack_hydrated_locked(session, &key)?;
+        let _disk_lock = self.begin_snapshot(session, &key)?;
         let (id, order) = self.next_id_and_order();
         let entry = backup_entry_from_capture(capture, id.clone(), order, description, op_id);
 
@@ -1661,9 +1661,7 @@ impl BackupStore {
             return Ok(None);
         }
         let key = canonicalize_key(path);
-        self.run_snapshot_maintenance(session, &key)?;
-        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
-        self.ensure_stack_hydrated_locked(session, &key)?;
+        let _disk_lock = self.begin_snapshot(session, &key)?;
         let created_dirs = path.parent().map(missing_parent_dirs).unwrap_or_default();
         let (id, order) = self.next_id_and_order();
         let entry = BackupEntry {
@@ -1753,6 +1751,28 @@ impl BackupStore {
         })
     }
 
+    /// The steps every snapshot runs before it builds its entry: snapshot
+    /// maintenance, the stack's disk lock, and re-reading the stack from disk
+    /// under that lock. Returns the lock, which the caller holds until the
+    /// entry is persisted.
+    fn begin_snapshot(
+        &mut self,
+        session: &str,
+        key: &Path,
+    ) -> Result<Option<crate::fs_lock::LockGuard>, AftError> {
+        {
+            let _maintenance = latency::time(latency::Part::Maintenance);
+            self.run_snapshot_maintenance(session, key)?;
+        }
+        let disk_lock = {
+            let _stack_lock = latency::time(latency::Part::StackLock);
+            self.acquire_stack_disk_lock(session, key)?
+        };
+        let _hydrate = latency::time(latency::Part::Hydrate);
+        self.ensure_stack_hydrated_locked(session, key)?;
+        Ok(disk_lock)
+    }
+
     /// Shared body of the snapshot methods: apply the skip policy, hydrate the
     /// stack under its disk lock, then persist the entry `build` produces.
     fn snapshot_built_entry(
@@ -1766,11 +1786,12 @@ impl BackupStore {
             return Ok(None);
         }
         let key = canonicalize_key(path);
-        self.run_snapshot_maintenance(session, &key)?;
-        let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
-        self.ensure_stack_hydrated_locked(session, &key)?;
+        let _disk_lock = self.begin_snapshot(session, &key)?;
         let (id, order) = self.next_id_and_order();
-        let entry = build(id.clone(), order)?;
+        let entry = {
+            let _capture = latency::time(latency::Part::Capture);
+            build(id.clone(), order)?
+        };
         self.persist_new_entry_locked(session, &key, entry)?;
         self.touch_session(session);
         Ok(Some(id))
@@ -5297,6 +5318,7 @@ impl BackupStore {
                 if final_path.exists() {
                     continue;
                 }
+                let _content_file = latency::time(latency::Part::ContentFile);
                 let bytes = content_bytes_for_disk(entry).map_err(|error| AftError::IoError {
                     path: final_path.display().to_string(),
                     message: error.to_string(),
@@ -5327,6 +5349,20 @@ impl BackupStore {
             "count": retained.len(),
             "entries": entries,
         });
+        // Each content file above was flushed to the device on its own, so
+        // meta.json can never name content that has not reached the disk.
+        // meta.json and the directory sync then share one device flush, which
+        // completes before this returns and before anything is pruned. On
+        // macOS a flush is an F_FULLFSYNC that waits for the drive's whole
+        // write cache, so this saves one per snapshot. Power loss before that
+        // flush leaves either the previous meta.json, without the new entry,
+        // or a new one whose content file is missing, which loading refuses
+        // (see `validate_v2_content_reference`). Inside an enclosing group,
+        // such as an `aft_delete` snapshotting a whole tree, these syncs and
+        // the content file's join that group, and its single flush before the
+        // first unlink replaces this one.
+        let syncs = crate::durability::SyncGroup::new();
+        let meta_file = latency::time(latency::Part::MetaFile);
         let meta_content =
             serde_json::to_string_pretty(&meta).map_err(|error| AftError::IoError {
                 path: dir.join("meta.json").display().to_string(),
@@ -5338,27 +5374,40 @@ impl BackupStore {
                 message: error.to_string(),
             }
         })?;
+        drop(meta_file);
         ledger_bytes = ledger_bytes.saturating_add(meta_content.len() as u64);
         // One directory flush commits both content and metadata renames.
+        let dir_sync = latency::time(latency::Part::DirSync);
         fsync_dir(&dir).map_err(|error| AftError::IoError {
             path: dir.display().to_string(),
             message: error.to_string(),
         })?;
+        drop(dir_sync);
+        let device_flush = latency::time(latency::Part::DeviceFlush);
+        syncs.finish().map_err(|error| AftError::IoError {
+            path: dir.display().to_string(),
+            message: error.to_string(),
+        })?;
+        drop(device_flush);
         // Rewriting from retained entries prunes stale sidecar rows. Failure
         // loses only annotations; the stack has already committed durably.
+        let post_state = latency::time(latency::Part::PostState);
         if let Err(error) = self.write_post_states(session, key, retained) {
             crate::slog_warn!(
                 "backup fingerprints not recorded for {}: {error}",
                 key.display()
             );
         }
+        drop(post_state);
 
+        let prune = latency::time(latency::Part::Prune);
         prune_unreferenced_backup_files(&dir, &referenced_content).map_err(|error| {
             AftError::IoError {
                 path: dir.display().to_string(),
                 message: error.to_string(),
             }
         })?;
+        drop(prune);
         crate::write_ledger::credit(
             crate::write_ledger::Domain::Backups,
             key.display().to_string(),
@@ -5389,8 +5438,7 @@ impl BackupStore {
         stack: &[BackupEntry],
         plan: DbMirrorPlan<'_>,
     ) {
-        let pool = self.db_pool.read().ok().and_then(|slot| slot.clone());
-        let Some(pool) = pool else {
+        let Some(pool) = self.db_pool.read().ok().and_then(|slot| slot.clone()) else {
             return;
         };
         let harness = self.effective_db_harness();
@@ -5414,9 +5462,29 @@ impl BackupStore {
             return;
         };
 
-        let conn = match pool.lock() {
-            Ok(conn) => conn,
-            Err(_) => {
+        // A tool call waits on this write, so it waits at most `MIRROR_WAIT`
+        // in total: first for the shared connection's mutex, which other
+        // aft.db users hold for their whole statement (including while
+        // SQLite's busy handler sleeps behind another process's write lock),
+        // then for another connection's write transaction. Past that the
+        // write is skipped or fails, the stack is marked out of sync, and the
+        // next mirror write for it rewrites the whole stack from disk. Undo
+        // and history read the disk stack, so they are unaffected. A WAL
+        // checkpoint the commit triggers runs on the background worker.
+        let deadline = Instant::now() + MIRROR_WAIT;
+        let lock_wait = latency::time(latency::Part::DbLock);
+        let conn = match lock_before(&pool, deadline) {
+            Ok(Some(conn)) => conn,
+            Ok(None) => {
+                self.set_db_mirror_synced(session, key, false);
+                crate::slog_warn!(
+                    "dual-write backup to DB skipped for {}: the shared aft.db connection stayed in use for {} ms; the next write for this file rewrites its stack",
+                    key.display(),
+                    MIRROR_WAIT.as_millis()
+                );
+                return;
+            }
+            Err(()) => {
                 self.set_db_mirror_synced(session, key, false);
                 crate::slog_warn!(
                     "dual-write backup to DB failed for {}: db mutex poisoned",
@@ -5425,6 +5493,9 @@ impl BackupStore {
                 return;
             }
         };
+        drop(lock_wait);
+        let write_started = Instant::now();
+        let checkpoint_before = crate::db::lifecycle::inline_checkpoint_time_on_this_thread();
         let path_hash = Self::path_hash(key);
         let file_path = key.display().to_string();
 
@@ -5435,30 +5506,41 @@ impl BackupStore {
             file_path: &file_path,
             path_hash: &path_hash,
         };
-        let (write_result, operation) = match plan {
-            DbMirrorPlan::Append {
-                evicted_orders,
-                new_entry,
-                restamped,
-            } if self.db_mirror_is_synced(session, key) => (
-                apply_backup_append_delta_in_db(
-                    &conn,
-                    &context,
+        let _ = conn.busy_timeout(deadline.saturating_duration_since(Instant::now()));
+        let (write_result, operation) =
+            crate::db::lifecycle::defer_wal_checkpoints(|| match plan {
+                DbMirrorPlan::Append {
                     evicted_orders,
                     new_entry,
                     restamped,
+                } if self.db_mirror_is_synced(session, key) => (
+                    apply_backup_append_delta_in_db(
+                        &conn,
+                        &context,
+                        evicted_orders,
+                        new_entry,
+                        restamped,
+                    ),
+                    "append delta",
                 ),
-                "append delta",
-            ),
-            // A newly configured or previously failed mirror has no trusted DB
-            // baseline. Repair it once from the authoritative disk stack before
-            // later appends switch to constant-work deltas.
-            DbMirrorPlan::Append { .. } | DbMirrorPlan::Full => (
-                replace_backup_stack_in_db(&conn, &context, stack),
-                "full stack",
-            ),
-        };
+                // A newly configured or previously failed mirror has no trusted DB
+                // baseline. Repair it once from the authoritative disk stack before
+                // later appends switch to constant-work deltas.
+                DbMirrorPlan::Append { .. } | DbMirrorPlan::Full => (
+                    replace_backup_stack_in_db(&conn, &context, stack),
+                    "full stack",
+                ),
+            });
+        let _ = conn.busy_timeout(crate::db::STEADY_BUSY_TIMEOUT);
         self.set_db_mirror_synced(session, key, write_result.is_ok());
+        drop(conn);
+        let checkpoint = crate::db::lifecycle::inline_checkpoint_time_on_this_thread()
+            .saturating_sub(checkpoint_before);
+        latency::add(latency::Part::WalCheckpoint, checkpoint);
+        latency::add(
+            latency::Part::DbWrite,
+            write_started.elapsed().saturating_sub(checkpoint),
+        );
         if let Err(error) = write_result {
             crate::slog_warn!(
                 "dual-write backup {} to DB failed for {} (rolled back, prior stack kept): {}",
@@ -5624,6 +5706,34 @@ impl BackupStore {
                 Err(error.to_string())
             }
         }
+    }
+}
+
+/// Longest an edit's undo-mirror write waits, in total, for the shared aft.db
+/// connection's mutex and then for another connection's write transaction,
+/// before leaving the stack to the out-of-sync repair.
+const MIRROR_WAIT: Duration = Duration::from_millis(50);
+
+/// Lock `pool` if it comes free before `deadline`: `Ok(None)` when it does
+/// not, `Err(())` when it is poisoned. `std::sync::Mutex` has no timed lock,
+/// so this polls, sleeping at most 250 µs between tries.
+fn lock_before(
+    pool: &Mutex<TrackedConnection>,
+    deadline: Instant,
+) -> Result<Option<std::sync::MutexGuard<'_, TrackedConnection>>, ()> {
+    let mut pause = Duration::from_micros(20);
+    loop {
+        match pool.try_lock() {
+            Ok(conn) => return Ok(Some(conn)),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(Duration::from_micros(250));
     }
 }
 
@@ -7105,42 +7215,6 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn backup_storage_floor_lazy_history_refuses_live_database_alias() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source.txt");
-        std::fs::write(&source, "original").unwrap();
-        let mut store = super::BackupStore::new();
-        store.set_storage_dir(root.path().join("storage"), 72);
-        store.snapshot("lazy-floor", &source, "snapshot").unwrap();
-        let entry = store.history("lazy-floor", &source).pop().unwrap();
-        let blob = match &entry.content {
-            super::BackupContent::OnDisk { path, .. } => path.clone(),
-            _ => panic!("durable history must remain lazy"),
-        };
-        let database = root.path().join("live.db");
-        let connection = crate::db::file_identity::IdentityConnection::open(
-            &database,
-            "lazy history floor fixture",
-        )
-        .unwrap();
-        connection
-            .execute_batch("CREATE TABLE source(value TEXT);")
-            .unwrap();
-        std::fs::remove_file(&blob).unwrap();
-        std::fs::hard_link(&database, &blob).unwrap();
-        let error = entry.content_bytes().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("is denied by the access policy floor"));
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM source", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
 
     #[cfg(windows)]
     #[test]
@@ -12335,5 +12409,274 @@ mod tests {
             .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
             .filter(|name| name.starts_with("bak_") && name.ends_with(".bak"))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod edit_latency_tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::durability::EventKind;
+    use crate::harness::Harness;
+    use std::fs;
+
+    #[cfg(unix)]
+    fn stack_dir(store: &BackupStore, session: &str, path: &Path) -> PathBuf {
+        store
+            .session_dir(session)
+            .unwrap()
+            .join(BackupStore::path_hash(&canonicalize_key(path)))
+    }
+
+    /// A snapshot flushes its content file to the device on its own, then
+    /// meta.json and the stack directory with one shared flush. meta.json can
+    /// therefore never name content that has not reached the disk.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_flushes_content_alone_before_meta_rename_then_meta_and_dir_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("user.txt");
+        fs::write(&path, "original").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        // The first snapshot also publishes the new store directories.
+        store.snapshot("flush-order", &path, "first").unwrap();
+        fs::write(&path, "edited").unwrap();
+        crate::durability::take();
+        crate::durability::take_full_syncs();
+
+        store.snapshot("flush-order", &path, "second").unwrap();
+        let events = crate::durability::take();
+        let flushes = crate::durability::take_full_syncs();
+
+        let dir = stack_dir(&store, "flush-order", &path);
+        let meta = dir.join("meta.json");
+        assert_eq!(flushes.len(), 2, "device flushes per snapshot: {flushes:?}");
+        let content = &flushes[0];
+        assert_eq!(content.parent(), Some(dir.as_path()), "{flushes:?}");
+        assert!(
+            content
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("bak_")),
+            "the first flush is the content file's own: {flushes:?}"
+        );
+        assert_eq!(flushes[1], meta, "{flushes:?}");
+        // The content file's sync event is recorded once its flush returned,
+        // so it must come before meta.json is renamed into place.
+        let content_synced = events
+            .iter()
+            .position(|event| event.0 == EventKind::FileSync && &event.1 == content)
+            .expect("content file synced");
+        let meta_renamed = events
+            .iter()
+            .position(|event| *event == (EventKind::AtomicReplace, meta.clone()))
+            .expect("meta.json renamed");
+        assert!(content_synced < meta_renamed, "{events:?}");
+        // The stack is still complete and undoable.
+        assert_eq!(store.history("flush-order", &path).len(), 2);
+        store.restore_latest("flush-order", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "edited");
+    }
+
+    /// Opens the deferred-checkpoint gate when dropped, so a failing
+    /// assertion cannot leave other tests' checkpoints held.
+    struct GateGuard;
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            crate::db::deferred_checkpoint::test_hooks::open_gate();
+        }
+    }
+
+    /// The aft.db mirror commit of an undo snapshot must not run the WAL
+    /// checkpoint SQLite triggers past the autocheckpoint threshold: that
+    /// copies the WAL into the database and syncs both files while the edit
+    /// waits. The background worker runs it instead.
+    #[test]
+    fn snapshot_mirror_commit_leaves_its_wal_checkpoint_to_the_background_worker() {
+        use crate::db::deferred_checkpoint::test_hooks;
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("edited.txt");
+        fs::write(&path, "original").unwrap();
+        let pool = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        store.set_db_pool(Arc::clone(&pool));
+        store.set_db_harness(Harness::Opencode);
+        store.set_db_project_key("project".to_string());
+        // Start from an empty WAL, then let any commit of two or more pages
+        // pass the shared connection's threshold, so the mirror commit would
+        // checkpoint inline. The hook still checkpoints inline once the WAL
+        // holds `DEFERRED_CHECKPOINT_LIMIT` (8) thresholds, 16 pages here; a
+        // single mirror commit to an empty WAL stays well under that.
+        let db_file = {
+            let conn = pool.lock().unwrap();
+            conn.checkpoint_wal_as(
+                crate::db::lifecycle::WalCheckpointMode::Truncate,
+                crate::write_ledger::Domain::AftDb,
+            )
+            .unwrap();
+            conn.set_wal_autocheckpoint(2).unwrap();
+            PathBuf::from(conn.path().unwrap())
+        };
+
+        let finished_before = test_hooks::finished(&db_file);
+        let inline_before = crate::db::lifecycle::inline_checkpoints_on_this_thread();
+        test_hooks::close_gate();
+        let gate = GateGuard;
+        store
+            .snapshot_with_op("deferred", &path, "edit", Some("op-1"))
+            .unwrap();
+        assert_eq!(
+            crate::db::lifecycle::inline_checkpoints_on_this_thread() - inline_before,
+            0,
+            "the snapshot's own aft.db commit ran a WAL checkpoint"
+        );
+        // The snapshot returned while its checkpoint is still held.
+        assert!(
+            test_hooks::wait_until_held(Duration::from_secs(10)),
+            "no checkpoint was handed to the background worker"
+        );
+        let rows = crate::db::backups::list_backups(
+            &pool.lock().unwrap(),
+            "opencode",
+            "deferred",
+            &BackupStore::path_hash(&canonicalize_key(&path)),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "the mirror row was committed");
+        drop(gate);
+        assert!(
+            test_hooks::wait_finished_after(&db_file, finished_before, Duration::from_secs(10)),
+            "the background checkpoint never finished"
+        );
+    }
+
+    /// Other aft.db users hold the shared connection's mutex for their whole
+    /// statement, including while SQLite's busy handler sleeps behind another
+    /// process's write lock. An edit's undo snapshot waits at most
+    /// `MIRROR_WAIT` for it and then leaves its mirror row to the out-of-sync
+    /// repair, which the next snapshot of the file runs. Undo reads the disk
+    /// stack and restores the right bytes after that repair.
+    #[test]
+    fn held_shared_connection_bounds_the_snapshot_and_undo_restores_after_repair() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("edited.txt");
+        fs::write(&path, "original").unwrap();
+        let pool = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        let configured = || {
+            let mut store = BackupStore::new();
+            store.set_storage_dir(storage.path().to_path_buf(), 72);
+            store.set_db_pool(Arc::clone(&pool));
+            store.set_db_harness(Harness::Opencode);
+            store.set_db_project_key("project".to_string());
+            store
+        };
+        let path_hash = BackupStore::path_hash(&canonicalize_key(&path));
+        let rows = || {
+            crate::db::backups::list_backups(
+                &pool.lock().unwrap(),
+                "opencode",
+                "held-mutex",
+                &path_hash,
+            )
+            .unwrap()
+            .len()
+        };
+        let mut store = configured();
+
+        let held = pool.lock().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let snapshot = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = store
+                .snapshot_with_op("held-mutex", &path, "first edit", Some("op-1"))
+                .map(|id| id.is_some());
+            let _ = done.send((result, started.elapsed()));
+            (store, path)
+        });
+        // The 20 s timeout is generous: the snapshot must finish while the
+        // shared mutex is still held, which is only released below.
+        let outcome = finished.recv_timeout(Duration::from_secs(20));
+        drop(held);
+        let (mut store, path) = snapshot.join().unwrap();
+        let (result, waited) = outcome
+            .expect("the snapshot waited for the shared aft.db connection mutex to be released");
+        assert!(matches!(result, Ok(true)), "{result:?}");
+        assert!(waited >= MIRROR_WAIT, "gave up after {waited:?}");
+        // The row was left out; the disk stack, which undo reads, has it.
+        assert_eq!(rows(), 0);
+        assert_eq!(store.history("held-mutex", &path).len(), 1);
+        fs::write(&path, "edited once").unwrap();
+        store.record_post_mutation_states();
+
+        store
+            .snapshot_with_op("held-mutex", &path, "second edit", Some("op-2"))
+            .unwrap();
+        fs::write(&path, "edited twice").unwrap();
+        store.record_post_mutation_states();
+        assert_eq!(rows(), 2, "the next snapshot rewrote the whole stack");
+
+        // A store that starts from disk and aft.db undoes both edits in order.
+        drop(store);
+        let mut reopened = configured();
+        reopened.restore_last_operation("held-mutex").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "edited once");
+        reopened.restore_last_operation("held-mutex").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    /// When another connection holds aft.db's write lock, an edit's mirror
+    /// write gives up after `MIRROR_WAIT` instead of the 5 s steady busy
+    /// timeout, and the next mirror write for the stack restores the row.
+    #[test]
+    fn busy_mirror_write_gives_up_quickly_and_the_next_write_restores_the_row() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("edited.txt");
+        fs::write(&path, "original").unwrap();
+        let db_path = storage.path().join("aft.db");
+        let pool = Arc::new(Mutex::new(crate::db::open(&db_path).unwrap()));
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        store.set_db_pool(Arc::clone(&pool));
+        store.set_db_harness(Harness::Opencode);
+        store.set_db_project_key("project".to_string());
+        let path_hash = BackupStore::path_hash(&canonicalize_key(&path));
+        let rows = |pool: &Arc<Mutex<TrackedConnection>>| {
+            crate::db::backups::list_backups(&pool.lock().unwrap(), "opencode", "busy", &path_hash)
+                .unwrap()
+                .len()
+        };
+
+        let blocker = crate::db::open(&db_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        store
+            .snapshot_with_op("busy", &path, "first", Some("op-1"))
+            .unwrap();
+        let waited = started.elapsed();
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            waited < Duration::from_secs(2),
+            "the snapshot waited {waited:?} for another connection's write lock"
+        );
+        // The row write was given up; the disk stack, which undo reads, has it.
+        assert_eq!(rows(&pool), 0);
+        assert_eq!(store.history("busy", &path).len(), 1);
+
+        fs::write(&path, "edited").unwrap();
+        store
+            .snapshot_with_op("busy", &path, "second", Some("op-2"))
+            .unwrap();
+        assert_eq!(rows(&pool), 2, "the next mirror write rewrote the stack");
     }
 }

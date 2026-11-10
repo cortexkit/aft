@@ -42,6 +42,11 @@ pub const MIN_BASH_WORKER_WAIT_MAX_MS: u64 = 60_000;
 pub const DEFAULT_IDLE_ROOT_TTL_MINUTES: u32 = 30;
 pub const MIN_IDLE_ROOT_TTL_MINUTES: u32 = 5;
 pub const MAX_IDLE_ROOT_TTL_MINUTES: u32 = 30;
+/// Hours without use after which a checkout's in-memory index state is
+/// dropped (`idle.checkout_hours`).
+pub const DEFAULT_IDLE_CHECKOUT_HOURS: u32 = 168;
+pub const MIN_IDLE_CHECKOUT_HOURS: u32 = 1;
+pub const MAX_IDLE_CHECKOUT_HOURS: u32 = 24 * 365;
 /// Language-server idle window, in minutes. Independent of artifact eviction.
 pub const DEFAULT_LSP_IDLE_MINUTES: u32 = 60;
 pub const MIN_LSP_IDLE_MINUTES: u32 = 5;
@@ -156,20 +161,24 @@ pub(crate) fn open_config_file(path: &std::path::Path) -> std::io::Result<std::f
     options.open(path)
 }
 
-/// Idle reclamation window for unbound-root artifacts.
+/// Idle reclamation windows.
 ///
 /// `root_ttl_minutes` controls when an unbound root's indexes are evicted.
-/// Reclaimed indexes rebuild on the next request.
+/// Reclaimed indexes rebuild on the next request. `checkout_hours` controls
+/// when a checkout that has not been used for that long counts as idle and
+/// drops its in-memory index state; it replaces `views.idle_checkout_hours`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IdleConfig {
     pub root_ttl_minutes: u32,
+    pub checkout_hours: u32,
 }
 
 impl Default for IdleConfig {
     fn default() -> Self {
         Self {
             root_ttl_minutes: DEFAULT_IDLE_ROOT_TTL_MINUTES,
+            checkout_hours: DEFAULT_IDLE_CHECKOUT_HOURS,
         }
     }
 }
@@ -610,10 +619,15 @@ pub fn normalize_git_co_author(value: &str) -> Option<String> {
 
 pub const DEFAULT_VIEWS_CALLGRAPH_COPIES: u32 = 4;
 pub const MAX_VIEWS_CALLGRAPH_COPIES: u32 = 256;
-pub const DEFAULT_VIEWS_IDLE_CHECKOUT_HOURS: u32 = 168;
-pub const MAX_VIEWS_IDLE_CHECKOUT_HOURS: u32 = 24 * 365;
 
 /// Content-addressed index view assembly.
+///
+/// Both keys are removed from the documented configuration: the per-repository
+/// data store replaces views, so they no longer have anything to choose. A
+/// config file that sets them gets a removal notice (see
+/// [`crate::feature_config::REMOVED_DATA_LAYER_PATHS`]), and `doctor --fix`
+/// deletes them. Until the views code is deleted, the values a file supplies
+/// still reach these fields, so the views route keeps working for its tests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ViewsConfig {
@@ -624,9 +638,6 @@ pub struct ViewsConfig {
     /// graph and its answers say which of its files differ. 0 makes every
     /// other checkout read the main checkout's graph.
     pub callgraph_copies: u32,
-    /// Hours without use after which a checkout's view counts as idle and
-    /// can be evicted.
-    pub idle_checkout_hours: u32,
 }
 
 impl Default for ViewsConfig {
@@ -634,12 +645,17 @@ impl Default for ViewsConfig {
         Self {
             enabled: false,
             callgraph_copies: DEFAULT_VIEWS_CALLGRAPH_COPIES,
-            idle_checkout_hours: DEFAULT_VIEWS_IDLE_CHECKOUT_HOURS,
         }
     }
 }
 
 /// Borrow-only checkout behavior that never writes shared on-disk artifacts.
+///
+/// `worktree.ram_overlay` is removed from the documented configuration like
+/// the `views` keys above: with one data store per repository every checkout
+/// has its own state, so there is no borrowed snapshot to patch. Until the
+/// code that serves a worktree from another checkout's indexes is deleted, a
+/// value a file supplies still reaches it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorktreeConfig {
@@ -720,7 +736,7 @@ impl Config {
     /// Optional artifact location for APIs that keep disk persistence opt-in.
     pub fn cache_storage_dir(&self) -> Option<PathBuf> {
         (self.cache_dir.is_some() || self.storage_dir.is_some())
-            .then(|| crate::root_cache::cache_root(self))
+            .then(|| crate::cache_location::cache_root(self))
     }
     pub fn semantic_backend_label(&self) -> &'static str {
         self.semantic.backend.as_str()
@@ -972,10 +988,10 @@ pub struct Config {
     #[serde(skip_deserializing)]
     pub cache_epoch: u64,
     #[serde(skip)]
-    pub cache_lease: Option<std::sync::Arc<crate::root_cache::CacheLease>>,
+    pub cache_lease: Option<std::sync::Arc<crate::cache_location::CacheLease>>,
     /// A trusted process lease, never accepted from configuration or tool input.
     #[serde(skip)]
-    pub storage_lease: Option<std::sync::Arc<crate::root_cache::ProcessStorageLease>>,
+    pub storage_lease: Option<std::sync::Arc<crate::cache_location::ProcessStorageLease>>,
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
     /// Legacy serialized setting (default: 1); validation does not consume it.
@@ -1063,7 +1079,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub inspect: InspectConfig,
     pub backup: BackupConfig,
-    /// Linked-worktree RAM overlay. Default off; see [`WorktreeConfig`].
+    /// Linked-worktree RAM overlay. Default on; see [`WorktreeConfig`].
     pub worktree: WorktreeConfig,
     /// Resolved GitHub integration gates. User configuration only.
     pub github: GithubConfig,

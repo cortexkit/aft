@@ -639,13 +639,6 @@ impl PinnedDir {
         Ok(())
     }
 
-    pub(crate) fn repair_write_durable(&self, name: &OsStr, contents: &[u8]) -> io::Result<()> {
-        let mut file = self.repair_create_file(name)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        self.repair_sync()
-    }
-
     pub(crate) fn repair_descendant(&self, relative: &Path, create: bool) -> io::Result<Self> {
         let mut directory = self.repair_clone()?;
         let mut budget = RepairBudget::new();
@@ -920,29 +913,6 @@ impl PinnedDir {
         Ok(())
     }
 
-    /// Remove only the opened child, never resolve a replaced root pathname.
-    /// Progress survives an error so repair can report partially removed data.
-    pub(crate) fn repair_remove_child(
-        &self,
-        name: &OsStr,
-        expected: (u64, u64),
-        protected: &[(u64, u64)],
-        removed: &mut usize,
-    ) -> io::Result<()> {
-        let mut warnings = Vec::new();
-        let result = self.repair_remove_child_with_warnings(
-            name,
-            expected,
-            protected,
-            removed,
-            &mut warnings,
-        );
-        for warning in warnings {
-            crate::slog_warn!("{warning}");
-        }
-        result
-    }
-
     pub(crate) fn repair_remove_child_with_warnings(
         &self,
         name: &OsStr,
@@ -972,27 +942,6 @@ impl PinnedDir {
     ) -> io::Result<()> {
         self.repair_remove_child_with_policy(
             name, expected, protected, false, removed, warnings, budget,
-        )
-    }
-
-    /// Remove a tree too large to validate in one walk before deleting it.
-    /// The removal applies the validation rules as it goes: it stays on one
-    /// filesystem, skips protected directories, and stops with
-    /// [`NonRegularEntryRetained`] at the first symlink or special file
-    /// instead of unlinking it. A stop (that one, or the budget running out)
-    /// keeps everything not yet removed, and `removed` counts what was, so a
-    /// later call continues where this one stopped rather than starting over.
-    pub(crate) fn repair_remove_regular_child_with_budget(
-        &self,
-        name: &OsStr,
-        expected: (u64, u64),
-        protected: &[(u64, u64)],
-        removed: &mut usize,
-        warnings: &mut Vec<String>,
-        budget: &mut RepairBudget,
-    ) -> io::Result<()> {
-        self.repair_remove_child_with_policy(
-            name, expected, protected, true, removed, warnings, budget,
         )
     }
 
@@ -1577,49 +1526,6 @@ impl PinnedDir {
         Ok(())
     }
 
-    /// Type and write access of the entry `name`, read without following a
-    /// symlink.
-    pub(crate) fn repair_entry_status(&self, name: &OsStr) -> io::Result<RepairEntryStatus> {
-        #[cfg(unix)]
-        {
-            let c_name = os_cstring(name)?;
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if unsafe {
-                libc::fstatat(
-                    self.file.as_raw_fd(),
-                    c_name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            let stat = unsafe { stat.assume_init() };
-            Ok(RepairEntryStatus::unix(stat.st_mode as u32, stat.st_uid))
-        }
-        #[cfg(windows)]
-        {
-            self.ensure_current_identity()?;
-            Ok(RepairEntryStatus::windows(&fs::symlink_metadata(
-                self.path.join(name),
-            )?))
-        }
-    }
-
-    /// [`Self::repair_entry_status`] for this opened directory itself.
-    pub(crate) fn repair_status(&self) -> io::Result<RepairEntryStatus> {
-        let metadata = self.file.metadata()?;
-        #[cfg(unix)]
-        {
-            Ok(RepairEntryStatus::unix(metadata.mode(), metadata.uid()))
-        }
-        #[cfg(windows)]
-        {
-            Ok(RepairEntryStatus::windows(&metadata))
-        }
-    }
-
     /// Give the owner read, write and search permission on this opened
     /// directory so its entries can be listed and unlinked. Only a directory
     /// owned by the current user is changed; for any other the later unlink
@@ -2014,6 +1920,10 @@ pub struct PersistedTask {
     /// and clears this. Persisted so the notice survives an AFT restart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancelled_call_unannounced: bool,
+    /// The saved folder grants this command's sandbox allowed, so revoking
+    /// one can stop it. Persisted so a restarted AFT still knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) folder_grants: Option<super::registry::folder_grants::TaskFolderGrants>,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -2108,6 +2018,7 @@ impl PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
+            folder_grants: super::registry::folder_grants::for_spawn(),
         };
         crate::gh_shim_ticket::capture_spawn(&metadata);
         metadata
@@ -2279,6 +2190,7 @@ impl From<BashTaskRow> for PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
+            folder_grants: None,
         }
     }
 }
@@ -2297,10 +2209,28 @@ fn status_name(status: &BgTaskStatus) -> &'static str {
 }
 
 fn capture_output_bytes(mode: &BgMode, paths: &TaskPaths) -> Option<i64> {
+    // Both streams belong to one verified layout. Resolving each artifact
+    // separately rereads and reparses the same task record for every DB row.
+    let resolved = retry_artifact_read(|| {
+        let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
+        if resolved.paths.layout != paths.layout {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "background task layout identity changed",
+            ));
+        }
+        Ok(resolved)
+    })
+    .ok()?;
     let len = |artifact| {
-        open_task_artifact(paths, artifact)
-            .ok()
-            .and_then(|file| file.len().ok())
+        retry_artifact_read(|| {
+            let file = resolved
+                .dirs
+                .io
+                .open_file(&resolved.paths.artifact_name(artifact), false)?;
+            ValidatedArtifact::new(file)?.len()
+        })
+        .ok()
     };
     match mode {
         BgMode::Pipes => match (len(TaskArtifact::Stdout), len(TaskArtifact::Stderr)) {
@@ -2977,14 +2907,23 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-    // The version is read before the full shape, so metadata written by a
-    // newer build is refused by name (and kept out of quarantine) instead of
-    // failing as an unparseable task.
+    // Ordinary records need only the typed decode, not an allocated Value
+    // tree followed by the same parse again. On decode failure, still check
+    // the version before returning that error: future formats may have a
+    // different shape and must be refused, not quarantined as corrupt tasks.
     #[cfg(test)]
     work_counts::record_parse();
-    let version = serde_json::from_str::<serde_json::Value>(&content)
-        .ok()
-        .and_then(|value| value.get("schema_version")?.as_u64());
+    let decoded = serde_json::from_str::<PersistedTask>(&content);
+    let version = match &decoded {
+        Ok(task) => Some(u64::from(task.schema_version)),
+        Err(_) => {
+            #[cfg(test)]
+            work_counts::record_parse();
+            serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|value| value.get("schema_version")?.as_u64())
+        }
+    };
     crate::persisted_format::gate(
         crate::persisted_format::PersistedStore::BashTask,
         path,
@@ -2992,10 +2931,7 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
         version,
     )
     .map_err(crate::persisted_format::UnsupportedPersistedFormat::into_io_error)?;
-    #[cfg(test)]
-    work_counts::record_parse();
-    let task: PersistedTask = serde_json::from_str(&content)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let task = decoded.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !matches!(task.schema_version, 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3094,6 +3030,8 @@ fn write_task_in_dir(
     sync: ReplaceSync,
 ) -> io::Result<()> {
     crate::production_storage::refuse_write(&dir.path().join(name))?;
+    #[cfg(test)]
+    record_writes::record(&task.task_id);
     #[cfg(test)]
     TASK_IO_FAULT.with(|slot| {
         if matches!(slot.get(), Some(TaskIoFault::RecordWriteNotFound)) {
@@ -3910,33 +3848,12 @@ impl Iterator for DirectoryEntries {
 }
 
 impl RepairBudget {
-    pub(crate) fn limited(&self, entries: usize) -> Self {
-        Self {
-            remaining: self.remaining.min(entries),
-            deadline: self.deadline,
-            cancelled: self.cancelled.clone(),
-        }
-    }
-    pub(crate) fn with_entries(entries: usize) -> Self {
-        let mut budget = Self::new();
-        budget.remaining = entries;
-        budget
-    }
     pub(crate) fn new() -> Self {
         Self {
             remaining: 1_000_000,
             deadline: std::time::Instant::now() + Duration::from_secs(60),
             cancelled: None,
         }
-    }
-    pub(crate) fn until(
-        deadline: std::time::Instant,
-        cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
-    ) -> Self {
-        let mut budget = Self::new();
-        budget.deadline = budget.deadline.min(deadline);
-        budget.cancelled = Some(cancelled);
-        budget
     }
     pub(crate) fn enter(&self, depth: usize) -> io::Result<()> {
         if self.cancelled.as_ref().is_some_and(|cancelled| cancelled()) {
@@ -3980,15 +3897,6 @@ impl std::fmt::Display for RepairLimitExceeded {
 
 impl std::error::Error for RepairLimitExceeded {}
 
-/// Whether a repair walk stopped because its budget ran out or its caller
-/// cancelled it, rather than because of what it found on disk.
-pub(crate) fn is_repair_budget_stop(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::Interrupted
-        || error
-            .get_ref()
-            .is_some_and(|inner| inner.is::<RepairLimitExceeded>())
-}
-
 /// A tree removed without validating it first met an entry that is neither a
 /// directory nor a regular file (a symlink, socket or device node). It is
 /// kept, untouched, together with everything not yet removed.
@@ -4005,39 +3913,6 @@ impl std::fmt::Display for NonRegularEntryRetained {
 }
 
 impl std::error::Error for NonRegularEntryRetained {}
-
-/// What a no-follow stat says about one entry.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RepairEntryStatus {
-    pub(crate) is_dir: bool,
-    pub(crate) is_file: bool,
-    /// Owned by the current user, and neither its group nor other users may
-    /// write it. Windows storage directories are per-user, so there this only
-    /// requires the entry not to be a reparse point.
-    pub(crate) private: bool,
-}
-
-impl RepairEntryStatus {
-    #[cfg(unix)]
-    fn unix(mode: u32, uid: u32) -> Self {
-        let kind = mode & libc::S_IFMT as u32;
-        Self {
-            is_dir: kind == libc::S_IFDIR as u32,
-            is_file: kind == libc::S_IFREG as u32,
-            private: uid == unsafe { libc::geteuid() } && mode & 0o022 == 0,
-        }
-    }
-
-    #[cfg(windows)]
-    fn windows(metadata: &fs::Metadata) -> Self {
-        let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-        Self {
-            is_dir: !reparse && metadata.is_dir(),
-            is_file: !reparse && metadata.is_file(),
-            private: !reparse,
-        }
-    }
-}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn repair_errno_location() -> *mut libc::c_int {
@@ -4086,86 +3961,6 @@ fn repair_census_propagates_late_readdir_failure() {
             .raw_os_error(),
         Some(libc::EIO)
     );
-}
-
-#[test]
-fn identity_census_stops_processing_leaves_at_deadline() {
-    let temp = tempfile::tempdir().unwrap();
-    for entry in 0..100 {
-        fs::write(
-            temp.path().join(format!("artifact-{entry}")),
-            b"task output",
-        )
-        .unwrap();
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    REPAIR_CENSUS_AFTER_NAMES.with(|hook| {
-        *hook.borrow_mut() = Some(Box::new(move |_| {
-            std::thread::sleep(
-                deadline.saturating_duration_since(std::time::Instant::now())
-                    + Duration::from_millis(1),
-            );
-        }));
-    });
-    let mut budget = RepairBudget::until(deadline, std::sync::Arc::new(|| false));
-    let mut examined = IdentityCensus::default();
-    let result = PinnedDir::open(temp.path()).unwrap().directory_identities(
-        &mut Vec::new(),
-        &mut budget,
-        &mut examined,
-    );
-    REPAIR_CENSUS_AFTER_NAMES.with(|hook| hook.borrow_mut().take());
-    assert!(is_repair_budget_stop(
-        &result.expect_err("expired leaf walk must stop")
-    ));
-    assert_eq!(
-        examined.entries, 1,
-        "the iterator must stop at the deadline"
-    );
-}
-
-#[test]
-fn identity_census_is_read_only_and_bounded() {
-    let temp = tempfile::tempdir().unwrap();
-    let child = temp.path().join("task");
-    fs::create_dir(&child).unwrap();
-    let artifact = child.join("task.json");
-    fs::write(&artifact, b"finished task").unwrap();
-    let original_permissions = fs::metadata(&child).unwrap().permissions();
-    let mut read_only = original_permissions.clone();
-    read_only.set_readonly(true);
-    fs::set_permissions(&child, read_only.clone()).unwrap();
-    let before = fs::metadata(&child).unwrap().modified().unwrap();
-    let artifact_before = fs::metadata(&artifact).unwrap().modified().unwrap();
-    let pinned = PinnedDir::open(temp.path()).unwrap();
-    work_counts::reset();
-    let mut identities = Vec::new();
-    let mut examined = IdentityCensus::default();
-    pinned
-        .directory_identities(&mut identities, &mut RepairBudget::new(), &mut examined)
-        .unwrap();
-    assert_eq!(examined.directories, 2);
-    assert_eq!(examined.entries, 2);
-    assert_eq!(fs::read(&artifact).unwrap(), b"finished task");
-    assert_eq!(fs::metadata(&child).unwrap().modified().unwrap(), before);
-    assert_eq!(fs::metadata(&child).unwrap().permissions(), read_only);
-    assert_eq!(
-        fs::metadata(&artifact).unwrap().modified().unwrap(),
-        artifact_before
-    );
-    assert_eq!(work_counts::get().syncs, 0);
-    assert_eq!(work_counts::get().renames, 0);
-    assert_eq!(fs::read_dir(&child).unwrap().count(), 1);
-    let error = pinned
-        .directory_identities(
-            &mut Vec::new(),
-            &mut RepairBudget::with_entries(1),
-            &mut IdentityCensus::default(),
-        )
-        .expect_err("a partial census must not authorize deletion");
-    assert!(is_repair_budget_stop(&error));
-    assert!(artifact.exists());
-    fs::set_permissions(&child, original_permissions).unwrap();
 }
 
 /// Live storage creates and removes files all the time (atomic-write
@@ -4385,19 +4180,6 @@ fn repair_traversal_refuses_expired_deadline() {
         .enter(0)
         .expect_err("an expired walk must fail closed");
     assert!(error.to_string().contains("traversal limit"), "{error}");
-}
-
-/// Running out of time or entries is progress a later pass continues; a tree
-/// nested too deeply is equally deep next pass, so it must not look the same.
-#[test]
-fn repair_depth_limit_is_not_a_budget_stop() {
-    let budget = RepairBudget::new();
-    let deep = budget.enter(65).expect_err("depth 65 must be refused");
-    assert!(!is_repair_budget_stop(&deep), "{deep}");
-    assert!(deep.to_string().contains("nested directories"), "{deep}");
-    let mut expired = RepairBudget::new();
-    expired.deadline = std::time::Instant::now();
-    assert!(is_repair_budget_stop(&expired.enter(0).unwrap_err()));
 }
 
 impl RepairPolicy<'_> {
@@ -5068,6 +4850,41 @@ pub fn open_control_file(task: &ResolvedTask, name: &str) -> io::Result<File> {
 #[cfg(test)]
 #[path = "metadata_persistence_test.rs"]
 mod metadata_persistence_tests;
+
+/// Task record writes per task id, counted across threads. A remote task's
+/// record is written by its worker thread, which the thread-local
+/// [`work_counts`] of the test thread never sees.
+#[cfg(test)]
+pub(crate) mod record_writes {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn counts() -> &'static Mutex<HashMap<String, usize>> {
+        static COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+        COUNTS.get_or_init(Default::default)
+    }
+
+    pub(crate) fn record(task_id: &str) {
+        *counts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(task_id.to_owned())
+            .or_default() += 1;
+    }
+
+    /// Record writes started for `task_id`, including writes whose content
+    /// was unchanged (those still sync the record).
+    // Read only by the Unix-only remote task tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn get(task_id: &str) -> usize {
+        counts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(task_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod work_counts {
@@ -7193,7 +7010,8 @@ mod tests {
         let counts = work_counts::get();
         eprintln!("artifact open work: {counts:?}");
         assert_eq!(counts.metadata_reads, 1);
-        assert_eq!(counts.parses, 2);
+        // Pin the read cost: version validation shares the typed task decode.
+        assert_eq!(counts.parses, 1);
         #[cfg(unix)]
         assert_eq!(counts.opens, 7);
     }
@@ -7261,7 +7079,8 @@ mod tests {
         let counts = work_counts::get();
         eprintln!("missing marker work: {counts:?}");
         assert_eq!(counts.metadata_reads, 1);
-        assert_eq!(counts.parses, 2);
+        // A missing marker still needs only one typed metadata decode.
+        assert_eq!(counts.parses, 1);
     }
 
     #[cfg(unix)]

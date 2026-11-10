@@ -298,16 +298,19 @@ fn audit_authorizing_head_end_stops_run_proxy() {
 }
 
 #[test]
-fn audit_relaxed_secret_plan_refuses() {
-    isolated("audit_relaxed_secret_plan_refuses", || {
+fn audit_resolved_relaxed_secret_plan_refuses() {
+    isolated("audit_resolved_relaxed_secret_plan_refuses", || {
         let f = Fixture::new();
         f.ctx.update_config(|c| {
             c.sandbox.profile.head = crate::config::SandboxMode::Relaxed;
             c.sandbox.profile.worker = crate::config::SandboxMode::Relaxed;
         });
-        let reply = f.launch("echo '{{ck-secret:test}}'", false, json!({}));
+        let reply =
+            crate::sandbox_spawn::with_spawn_plan_for_test(SpawnPlan::RelaxedUnenforced, || {
+                f.launch("echo '{{ck-secret:test}}'", false, json!({}))
+            });
         assert_eq!(code(&reply), Some("secrets_sandbox_required"));
-        assert_eq!(reply.data["message"], SANDBOX_REQUIRED);
+        assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but the resolved plan has no strict native launcher. No command was started.");
         assert_eq!(f.vault.resolves.load(Ordering::SeqCst), 0);
     });
 }
@@ -318,7 +321,15 @@ fn authorized(f: &Fixture) -> Launch {
             authorize(
                 "audit",
                 &["test".into()],
-                preflight(&f.ctx, "secret-bash", false, true).unwrap(),
+                preflight(
+                    &f.ctx,
+                    "secret-bash",
+                    false,
+                    true,
+                    crate::sandbox_spawn::SandboxRequirement::for_command("{{ck-secret:test}}")
+                        .unwrap(),
+                )
+                .unwrap(),
                 &HashMap::new(),
             )
             .unwrap_or_else(|r| panic!("{r:?}"))

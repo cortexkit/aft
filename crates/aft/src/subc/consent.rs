@@ -2168,8 +2168,7 @@ fn probe_directory_scope_with(
     {
         return Err("directory does not exist");
     }
-    let (volume, _) =
-        crate::storage_retention::volume_anchor(parent).ok_or("volume identity unknown")?;
+    let (volume, _) = crate::volume::volume_anchor(parent).ok_or("volume identity unknown")?;
     let volume = crate::access_policy::policy_path(&volume);
     let root = parent.ancestors().last().unwrap_or(parent);
     if !directory_scope_is_narrow(parent, &home, &volume) {
@@ -3199,10 +3198,24 @@ fn apply_allow(
                     return Ok(Applied::NotClaimed);
                 };
                 if scope {
-                    crate::db::access_grants::insert(
+                    // The card whose answer saved this grant, so the
+                    // permissions page can name it.
+                    let card_ref = audit
+                        .as_ref()
+                        .and_then(|record| record.elicitation_id.as_deref());
+                    let source = access_grants::answer_source(
+                        conn,
+                        identity,
+                        by_user,
+                        head.as_ref(),
+                        grant.file().expect("only file scopes persist"),
+                    )?;
+                    crate::db::access_grants::insert_with_source(
                         conn,
                         &access_grants::policy_scope_key(identity),
                         grant.file().expect("only file scopes persist"),
+                        card_ref,
+                        source,
                     )?;
                     if let Some(record) = audit {
                         log_consent(

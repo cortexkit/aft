@@ -101,28 +101,6 @@ impl LanePause {
     }
 }
 
-/// Record that a background retry for `pause` will not run before
-/// `retry_at_ms`, so status shows when the wait really ends. A warm-up or
-/// other transient refusal may carry no hint (or a hint shorter than the
-/// worker's backoff); the daemon's own end time of an announced lane pause is
-/// left as it is. Only the recorded pause the worker waits on is extended:
-/// another root's identical pause, or a newer refusal that replaced this one,
-/// keeps its own end time.
-pub(crate) fn note_pause_retry_at(pause: &LanePause, retry_at_ms: u64) {
-    if pause.cause == PauseCause::LanePaused || pause.record_id == 0 {
-        return;
-    }
-    let mut pauses = lane_pauses()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(recorded) = pauses
-        .values_mut()
-        .find(|recorded| recorded.record_id == pause.record_id)
-    {
-        recorded.paused_until_ms = recorded.paused_until_ms.max(retry_at_ms);
-    }
-}
-
 fn next_pause_record_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -351,22 +329,6 @@ pub enum SynapseEmbeddingError {
     NoProgress(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SemanticBuildFailureClass {
-    ModelLoading,
-    Failure,
-}
-
-/// Classify the daemon's model-loading response after it crosses the existing
-/// string-based semantic-index build boundary.
-pub(crate) fn classify_semantic_build_failure(error: &str) -> SemanticBuildFailureClass {
-    if error.starts_with("synapse_daemon_unavailable: model_loading:") {
-        SemanticBuildFailureClass::ModelLoading
-    } else {
-        SemanticBuildFailureClass::Failure
-    }
-}
-
 impl fmt::Display for SynapseEmbeddingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -441,49 +403,6 @@ pub(crate) mod pause_test_support {
     pub(crate) const START: u64 = 100_000;
     pub(crate) const PAUSE_MS: u64 = 45 * 60 * 1_000;
     pub(crate) type Requests = Arc<Mutex<Vec<(u64, Value)>>>;
-
-    /// Records an announced pause for `root` as a refused embedding request
-    /// would, without a fake daemon.
-    pub(crate) fn record_pause_for_root(root: &Path) {
-        lane_pauses()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                root.to_path_buf(),
-                LanePause {
-                    lane_id: MODEL.into(),
-                    fingerprint: Some("pinned".into()),
-                    retry_after_ms: Some(PAUSE_MS),
-                    paused_until_ms: START + PAUSE_MS,
-                    reason: "scheduled maintenance".into(),
-                    cause: Default::default(),
-                    safe_to_retry_same_request: true,
-                    record_id: 0,
-                },
-            );
-    }
-
-    /// Records, as a refused embedding request would, that the model of
-    /// `root` is compiling a new input shape until `ready_at` on the test
-    /// clock.
-    pub(crate) fn record_warm_up_for_root(root: &Path, ready_at: u64) {
-        lane_pauses()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                root.to_path_buf(),
-                LanePause {
-                    lane_id: MODEL.into(),
-                    fingerprint: Some("pinned".into()),
-                    retry_after_ms: Some(ready_at - START),
-                    paused_until_ms: ready_at,
-                    reason: "shape_compiling: compiling".into(),
-                    cause: PauseCause::WarmingUp,
-                    safe_to_retry_same_request: true,
-                    record_id: 0,
-                },
-            );
-    }
 
     pub(crate) fn pause_reply(retry_after_ms: Value) -> Value {
         json!({"error": {"code": "lane_paused", "transient": true,
@@ -2113,27 +2032,6 @@ mod tests {
             classify_attempt_failure(QUERY_OPERATION, &error, deadline),
             SynapseEmbeddingError::DaemonUnavailable(_)
         ));
-    }
-
-    #[test]
-    fn model_loading_synapse_failure_is_classified_as_waiting_only_for_its_cause() {
-        assert_eq!(
-            super::classify_semantic_build_failure(
-                "synapse_daemon_unavailable: model_loading: catalog lane 'qwen3-embedding-0.6b-ane' is loading"
-            ),
-            super::SemanticBuildFailureClass::ModelLoading
-        );
-        for error in [
-            "synapse_daemon_unavailable: connection refused",
-            "synapse_daemon_unavailable: module unavailable",
-            "synapse_missing_model: model unset",
-        ] {
-            assert_eq!(
-                super::classify_semantic_build_failure(error),
-                super::SemanticBuildFailureClass::Failure,
-                "{error} must remain a real failure"
-            );
-        }
     }
 
     #[test]

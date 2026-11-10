@@ -502,7 +502,7 @@ fn status_bar_counts_filter_build_excluded_files() {
     open_with_lsp(&ctx, &excluded_tsx, "export const w = 1;\n");
 
     // Seed Tier-2 so the bar surfaces at all (it is gated on Tier-2 presence).
-    ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
+    ctx.update_status_bar_todos(Some(0));
 
     let counts = ctx
         .status_bar_counts()
@@ -544,7 +544,7 @@ fn status_bar_counts_invalidate_on_tsconfig_clear() {
         &excluded_test,
         &fs::read_to_string(&excluded_test).unwrap(),
     );
-    ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
+    ctx.update_status_bar_todos(Some(0));
 
     // Excluded file is filtered out -> 0 errors.
     assert_eq!(ctx.status_bar_counts().expect("surfaces").errors, 0);

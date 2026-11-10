@@ -52,7 +52,7 @@ fn configure_background_for_harness(
             "project_root": project,
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
             "max_background_bash_tasks": 32,
         })
@@ -70,7 +70,7 @@ fn configure_background_without_storage(aft: &mut AftProcess, project: &Path, se
             "harness": "opencode",
             "project_root": project,
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
             "max_background_bash_tasks": 32,
         })
@@ -3303,7 +3303,7 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
                 "project_root": project.path(),
                 "storage_dir": storage.path(),
                 "config": user_config(serde_json::json!({
-                    "experimental": { "bash": { "background": true } }
+                    "bash": { "rewrite": false, "compress": false, "background": true }
                 })),
                 "max_background_bash_tasks": 32,
             })

@@ -12,13 +12,7 @@ use super::*;
 use crate::context::pending_restore_work;
 use std::collections::BTreeSet;
 
-type PendingSnapshot = (
-    BTreeSet<PathBuf>,
-    BTreeSet<PathBuf>,
-    BTreeSet<PathBuf>,
-    BTreeSet<PathBuf>,
-    bool,
-);
+type PendingSnapshot = (BTreeSet<PathBuf>, BTreeSet<PathBuf>, bool);
 
 /// A small deterministic generator, so a failing sequence replays from its
 /// seed.
@@ -59,13 +53,7 @@ fn relative_snapshot(root: &Path, snapshot: PendingSnapshot) -> PendingSnapshot 
             })
             .collect::<BTreeSet<_>>()
     };
-    (
-        strip(snapshot.0),
-        strip(snapshot.1),
-        strip(snapshot.2),
-        strip(snapshot.3),
-        snapshot.4,
-    )
+    (strip(snapshot.0), strip(snapshot.1), snapshot.2)
 }
 
 /// Unbound, quiesced, TTL-aged roots, each registered with one executor and
@@ -104,7 +92,7 @@ impl BlockedUnboundRoots {
     }
 
     /// Replace every root's pending sets with `per_set` paths in each of the
-    /// search, callgraph, Tier-2 and semantic sets. The paths share the root
+    /// Tier-2 and semantic sets. The paths share the root
     /// prefix and nest a few directories deep, as watcher events do, so
     /// ordering them compares several leading components first.
     fn fill_pending(&self, per_set: usize) {
@@ -119,8 +107,6 @@ impl BlockedUnboundRoots {
                     ))
                 })
             };
-            ctx.add_pending_search_index_paths(paths());
-            ctx.add_pending_callgraph_store_paths(paths());
             ctx.add_pending_tier2_paths(paths());
             ctx.add_pending_semantic_index_paths(paths());
         }
@@ -185,7 +171,7 @@ fn idle_reap_sweep_cost_at_170_roots() {
         samples.sort();
         println!(
             "idle reap sweep: roots={ROOTS} pending_paths_per_root={} median={:?} min={:?} max={:?}",
-            per_set * 4,
+            per_set * 2,
             samples[SWEEPS / 2],
             samples[0],
             samples[SWEEPS - 1],
@@ -233,92 +219,9 @@ fn reap_sweep_restore_work_does_not_grow_with_roots_or_pending_paths() {
         // Control: the path-by-path re-insertion does grow with both, so the
         // counter above would have seen it.
         pending_restore_work::with_legacy_restore(|| fixture.sweep(&metrics));
-        assert_eq!(pending_restore_work::take_merged(), roots * per_set * 4);
+        // Two pending sets per root: Tier-2 and semantic.
+        assert_eq!(pending_restore_work::take_merged(), roots * per_set * 2);
         assert_eq!(fixture.pending_snapshots(), before);
-    }
-}
-
-/// Restoring a taken pending state, with or without paths recorded while it
-/// was out, leaves exactly the sets the path-by-path re-insertion leaves.
-#[test]
-fn restoring_taken_pending_state_matches_path_by_path_reinsertion() {
-    let new_ctx = test_ctx();
-    let legacy_ctx = test_ctx();
-    let random_paths = |rng: &mut Rng, max: u64| {
-        (0..rng.below(max + 1))
-            .map(|_| {
-                PathBuf::from(format!(
-                    "/work/project/src/dir_{}/file_{}.rs",
-                    rng.below(6),
-                    rng.below(48)
-                ))
-            })
-            .collect::<Vec<_>>()
-    };
-    for seed in 1..=96 {
-        let mut rng = Rng::new(seed);
-        let base: [Vec<PathBuf>; 4] = std::array::from_fn(|_| random_paths(&mut rng, 40));
-        let base_corpus = rng.chance(50);
-        let concurrent: [Vec<PathBuf>; 4] = std::array::from_fn(|set| {
-            // Seeds where nothing arrives while the state is out exercise the
-            // whole-set move; the rest exercise the merge.
-            if seed % 3 == 0 || set == rng.below(4) as usize {
-                Vec::new()
-            } else {
-                random_paths(&mut rng, 20)
-            }
-        });
-        let concurrent_corpus = rng.chance(30);
-        let blocking_restore = rng.chance(50);
-        let nothing_concurrent = concurrent.iter().all(Vec::is_empty);
-
-        let mut snapshots = Vec::new();
-        for (ctx, legacy) in [(&new_ctx, false), (&legacy_ctx, true)] {
-            ctx.clear_pending_index_updates();
-            let fill = |paths: &[Vec<PathBuf>; 4], corpus: bool| {
-                ctx.add_pending_search_index_paths(paths[0].clone());
-                ctx.add_pending_callgraph_store_paths(paths[1].clone());
-                ctx.add_pending_tier2_paths(paths[2].clone());
-                ctx.add_pending_semantic_index_paths(paths[3].clone());
-                if corpus {
-                    ctx.mark_pending_semantic_corpus_refresh();
-                }
-            };
-            fill(&base, base_corpus);
-            let taken = ctx
-                .try_take_pending_reconciliation_state()
-                .expect("uncontended take");
-            fill(&concurrent, concurrent_corpus);
-            pending_restore_work::take_merged();
-            let restore = || {
-                if blocking_restore {
-                    ctx.restore_pending_reconciliation_state(taken);
-                } else {
-                    ctx.restore_pending_reconciliation_state_without_waiting(taken);
-                }
-            };
-            if legacy {
-                pending_restore_work::with_legacy_restore(restore);
-            } else {
-                restore();
-                if nothing_concurrent {
-                    assert_eq!(pending_restore_work::take_merged(), 0, "seed {seed}");
-                }
-            }
-            snapshots.push(ctx.pending_reconciliation_snapshot_for_test());
-        }
-        assert_eq!(snapshots[0], snapshots[1], "seed {seed}");
-        let expected_search = base[0]
-            .iter()
-            .chain(&concurrent[0])
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(snapshots[0].0, expected_search, "seed {seed}");
-        assert_eq!(
-            snapshots[0].4,
-            base_corpus || concurrent_corpus,
-            "seed {seed}"
-        );
     }
 }
 
@@ -404,10 +307,8 @@ impl ReapWorld {
             .iter()
             .map(|relative| self.roots[index].as_path().join(relative))
             .collect::<Vec<_>>();
-        match set {
-            0 => ctx.add_pending_search_index_paths(paths),
-            1 => ctx.add_pending_callgraph_store_paths(paths),
-            2 => ctx.add_pending_tier2_paths(paths),
+        match set % 2 {
+            0 => ctx.add_pending_tier2_paths(paths),
             _ => ctx.add_pending_semantic_index_paths(paths),
         }
         if corpus {

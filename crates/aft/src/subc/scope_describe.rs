@@ -180,7 +180,10 @@ where
         }));
     }
     let worker = tokio::spawn(async move {
+        let mut grant_sweep =
+            Box::pin(access_grants::sweep::run(control.clone(), executor.clone()));
         if !control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP) {
+            grant_sweep.await;
             return;
         }
         let mut queued = HashMap::new();
@@ -248,6 +251,7 @@ where
                 .min()
                 .map_or(next_scan, |due| due.min(next_scan));
             tokio::select! {
+                () = &mut grant_sweep => unreachable!("saved grant sweep runs until cancelled"),
                 Some(stamp)=observations.recv()=>{
                     if let Some(service)=&speech { if confirmed.insert(stamp_key(&stamp)) {
                         accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);

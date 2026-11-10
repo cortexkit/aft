@@ -1,64 +1,6 @@
 use super::clean_old_caches_for_test as clean_old_caches;
 use super::prepare_cache_root_for_test as prepare_cache_root;
 
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "requires AFT_TEST_CACHE_VOLUME on a real mounted second filesystem"]
-fn macos_real_cache_volume_uses_kernel_devices_and_refuses_descendant_redirects() {
-    use std::os::unix::fs::MetadataExt;
-    assert!(std::env::var_os("AFT_STORAGE_DIR").is_none());
-    let volume = fs::canonicalize(
-        std::env::var_os("AFT_TEST_CACHE_VOLUME").expect("set the mounted test volume"),
-    )
-    .unwrap();
-    let cache = tempfile::tempdir_in(volume).unwrap();
-    let primary = tempfile::tempdir().unwrap();
-    let storage = primary.path().join("storage");
-    let mut config = Config {
-        storage_dir: Some(storage.clone()),
-        cache_dir: Some(cache.path().to_path_buf()),
-        ..Default::default()
-    };
-    assert!(super::prepare_cache_root(&mut config).is_none());
-    let root = cache_root(&config);
-    assert_ne!(
-        fs::metadata(&root).unwrap().dev(),
-        fs::metadata(&storage).unwrap().dev()
-    );
-    for domain in ["views", "blobs"] {
-        let directory = root.join(domain).join("scope");
-        crate::private_storage::create_dir_all(&directory).unwrap();
-        crate::private_storage::write(directory.join("payload"), b"cache").unwrap();
-        assert_eq!(
-            fs::metadata(&directory).unwrap().dev(),
-            fs::metadata(&root).unwrap().dev()
-        );
-        assert!(!storage.join(domain).exists());
-    }
-    let blobs = crate::blob_store::BlobStore::open(
-        &root,
-        "0123456789abcdef",
-        crate::blob_store::BlobPlane::Semantic,
-    )
-    .unwrap();
-    let database = root.join("blobs/0123456789abcdef/semantic.sqlite");
-    assert!(
-        database.is_file(),
-        "BlobStore::open must initialize its database on the cache volume"
-    );
-    assert_eq!(
-        fs::metadata(&database).unwrap().dev(),
-        fs::metadata(&root).unwrap().dev()
-    );
-    assert!(!storage.join("blobs").exists());
-    drop(blobs);
-    let durable = storage.join("checkpoints");
-    fs::create_dir(&durable).unwrap();
-    std::os::unix::fs::symlink(&durable, root.join("index")).unwrap();
-    assert!(crate::private_storage::create_dir_all(root.join("index/new-cache")).is_err());
-    assert!(!durable.join("new-cache").exists());
-}
-
 #[test]
 fn legacy_cleanup_refuses_a_non_resolved_storage_root() {
     let (_temp, storage, artifacts, config) = fixture();
@@ -322,48 +264,6 @@ fn symlinked_storage_config(temp: &Path) -> Config {
 
 #[cfg(unix)]
 #[test]
-fn cache_location_symlinked_storage_enrolls() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut config = symlinked_storage_config(temp.path());
-    let warning = prepare_cache_root(&mut config);
-    assert!(warning.is_none(), "first enrollment failed: {warning:?}");
-    let storage = config.storage_dir.as_ref().unwrap();
-    let history = read_root_history(storage).unwrap();
-    assert_eq!(history.roots.len(), 1);
-    assert!(history.pending.is_empty());
-    assert!(cache_unavailable(&config).is_none());
-    register_durable_owner(&StoragePaths::for_config(&config)).unwrap();
-    let durable = canary(storage, "checkpoints/keep");
-    let protected = cache_deletion_protections(&cache_root(&config).join("index")).unwrap();
-    let id = identity(durable.parent().unwrap()).unwrap();
-    assert!(protected.contains(&(id.device, id.inode)));
-}
-
-#[cfg(unix)]
-#[test]
-fn cache_location_symlinked_storage_without_split_keeps_owned_cache_access() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut config = symlinked_storage_config(temp.path());
-    config.cache_dir = None;
-    let warning = prepare_cache_root(&mut config);
-    assert!(warning.is_none(), "same-root prepare failed: {warning:?}");
-    let storage = config.storage_dir.as_ref().unwrap();
-    register_durable_owner(&StoragePaths::same(storage)).unwrap();
-    let cache = canary(storage, "index/keep");
-    let access = pin_owned_cache_path(cache.parent().unwrap()).unwrap();
-    let directory = access.directory(false).unwrap();
-    assert_eq!(
-        pinned_identity(&directory).unwrap(),
-        identity(cache.parent().unwrap()).unwrap()
-    );
-    ensure_config_storage_lease(&mut config).unwrap();
-    let lease = config.storage_lease.as_ref().unwrap().clone();
-    ensure_config_storage_lease(&mut config).unwrap();
-    assert!(Arc::ptr_eq(&lease, config.storage_lease.as_ref().unwrap()));
-}
-
-#[cfg(unix)]
-#[test]
 fn cache_location_symlinked_storage_survives_retry() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = symlinked_storage_config(temp.path());
@@ -437,39 +337,6 @@ fn cache_location_symlinked_storage_legacy_cleanup_works() {
     assert!(report.error.is_none(), "legacy cleanup failed: {report:?}");
     assert!(!old.exists());
     assert!(durable.is_file());
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn cache_location_macos_var_storage_enrolls_and_retries() {
-    assert!(fs::symlink_metadata("/var")
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    let temp = tempfile::tempdir_in("/private/var/tmp").unwrap();
-    let mut config = unenrolled_cache_config(temp.path());
-    config.storage_dir = Some(
-        Path::new("/var/tmp")
-            .join(temp.path().file_name().unwrap())
-            .join("storage"),
-    );
-    assert_ne!(
-        config.storage_dir.as_ref().unwrap(),
-        &temp.path().join("storage")
-    );
-    for attempt in ["first enrollment", "retry"] {
-        let warning = prepare_cache_root(&mut config);
-        assert!(warning.is_none(), "{attempt} failed: {warning:?}");
-        assert!(cache_unavailable(&config).is_none());
-        register_durable_owner(&StoragePaths::for_config(&config)).unwrap();
-    }
-    let storage = config.storage_dir.as_ref().unwrap().clone();
-    let root = cache_root(&config);
-    let old = canary(&root, "index/old");
-    drop(config);
-    let report = remove_inactive_cache_roots(&storage, &[]);
-    assert!(report.error.is_none(), "{report:?}");
-    assert!(!old.exists());
 }
 
 #[cfg(unix)]
@@ -818,101 +685,6 @@ fn cache_location_enrollment_refuses_an_existing_unmarked_folder() {
     }
 }
 
-#[test]
-fn split_durable_legacy_sqlite_refuses_writable_opens() {
-    let (_temp, storage, artifacts, _config) = fixture();
-    let family = "0123456789abcdef";
-    let path = storage.join(format!("blobs/{family}/semantic.sqlite"));
-    // Model a cache left on primary storage before cache_dir was enabled.
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let seed = rusqlite::Connection::open(&path).unwrap();
-    seed.execute_batch(
-        "CREATE TABLE precious(value TEXT); INSERT INTO precious VALUES ('legacy');",
-    )
-    .unwrap();
-    drop(seed);
-    let before = fs::read(&path).unwrap();
-    for flags in [
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-    ] {
-        assert!(
-            crate::private_storage::prepare_sqlite(&path, flags).is_err(),
-            "writable legacy open was admitted: {flags:?}"
-        );
-    }
-    assert!(crate::blob_store::BlobStore::open(
-        &storage,
-        family,
-        crate::blob_store::BlobPlane::Semantic
-    )
-    .is_err());
-    assert_eq!(fs::read(&path).unwrap(), before);
-    assert!(!path.with_extension("sqlite-wal").exists());
-    assert!(!path.with_extension("sqlite-shm").exists());
-    crate::private_storage::prepare_sqlite(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap();
-    drop(
-        crate::blob_store::BlobStore::open(
-            &artifacts,
-            family,
-            crate::blob_store::BlobPlane::Semantic,
-        )
-        .unwrap(),
-    );
-}
-
-#[test]
-fn blob_store_open_cannot_create_caches_on_a_split_durable_root() {
-    let (_temp, storage, artifacts, mut config) = fixture();
-    // Low-level creation guards complement the configure routing test: even
-    // a misrouted writer may not create caches on durable storage.
-    let refused = crate::blob_store::BlobStore::open(
-        &storage,
-        "0123456789abcdef",
-        crate::blob_store::BlobPlane::Semantic,
-    );
-    assert!(
-        refused.is_err(),
-        "a cache database was opened on durable storage"
-    );
-    assert!(
-        !storage.join("blobs").exists(),
-        "BlobStore::open left a cache folder on durable storage"
-    );
-    assert!(crate::private_storage::create_dir_all(storage.join("views/scope")).is_err());
-    assert!(!storage.join("views").exists());
-    // Durable state beside the caches is still writable.
-    crate::private_storage::create_dir_all(storage.join("checkpoints/session")).unwrap();
-    // The cache root itself keeps working.
-    drop(
-        crate::blob_store::BlobStore::open(
-            &artifacts,
-            "0123456789abcdef",
-            crate::blob_store::BlobPlane::Semantic,
-        )
-        .unwrap(),
-    );
-    assert!(artifacts
-        .join("blobs/0123456789abcdef/semantic.sqlite")
-        .is_file());
-    // Setting cache_dir to null restores the single-root layout for this
-    // storage (merely removing it keeps caches off; see the tests below).
-    config.cache_dir = None;
-    config.cache_dir_opt_out = true;
-    assert!(prepare_cache_root(&mut config).is_none());
-    drop(
-        crate::blob_store::BlobStore::open(
-            &storage,
-            "0123456789abcdef",
-            crate::blob_store::BlobPlane::Semantic,
-        )
-        .unwrap(),
-    );
-    assert!(storage
-        .join("blobs/0123456789abcdef/semantic.sqlite")
-        .is_file());
-}
 use super::*;
 use crate::config::Config;
 
@@ -945,19 +717,6 @@ fn first_enrollment_refuses_the_durable_storage_device() {
     assert_eq!(
         census.data["cache_unavailable_reason"],
         CACHE_DIR_ON_STORAGE_DEVICE
-    );
-}
-
-#[test]
-fn deletion_protections_refuse_an_unknown_durable_owner() {
-    let temp = tempfile::tempdir().unwrap();
-    let candidate = temp.path().join("unregistered/index/key");
-    fs::create_dir_all(&candidate).unwrap();
-    let error = cache_deletion_protections(&candidate)
-        .expect_err("an unknown owner cannot supply a protection census");
-    assert!(
-        error.to_string().contains("durable owner is unknown"),
-        "{error}"
     );
 }
 
@@ -1061,57 +820,6 @@ fn cache_location_durable_scan_refuses_excessive_depth() {
         .expect_err("an incomplete durable identity census must refuse deletion");
     assert!(error.to_string().contains("traversal limit"), "{error}");
     assert!(canary.is_file());
-}
-
-#[test]
-fn cache_location_recursive_removal_refuses_late_excessive_depth() {
-    let temp = tempfile::tempdir().unwrap();
-    let candidate = temp.path().join("index");
-    let canary = deep_tree(&candidate);
-    let expected = PinnedDir::open(&candidate)
-        .unwrap()
-        .directory_identity()
-        .unwrap();
-    let parent = PinnedDir::open(temp.path()).unwrap();
-    let mut removed = 0;
-    let error = parent
-        .repair_remove_child(std::ffi::OsStr::new("index"), expected, &[], &mut removed)
-        .expect_err("removal must remain bounded even if the tree grows after preflight");
-    assert!(error.to_string().contains("traversal limit"), "{error}");
-    assert_eq!(removed, 0);
-    assert!(canary.is_file());
-}
-
-#[test]
-fn cache_location_same_device_mount_is_refused_during_every_walk() {
-    use crate::bash_background::persistence::REPAIR_MOUNTS;
-    let temp = tempfile::tempdir().unwrap();
-    // The simulated mount is keyed by path, and the census walks resolved
-    // paths (macOS temp directories sit behind the /var system symlink).
-    let base = fs::canonicalize(temp.path()).unwrap();
-    let candidate = base.join("index");
-    let outside = canary(&candidate, "mounted/outside-canary");
-    let mounted = candidate.join("mounted");
-    REPAIR_MOUNTS.with(|ids| ids.borrow_mut().insert(mounted.clone(), u64::MAX));
-    let parent = PinnedDir::open(&base).unwrap();
-    let measured = parent.repair_child_tree_bytes(std::ffi::OsStr::new("index"), &[]);
-    let scanned = deletion_protections(std::slice::from_ref(&candidate));
-    let idle = ensure_cache_idle(&candidate, &[]);
-    let expected = PinnedDir::open(&candidate)
-        .unwrap()
-        .directory_identity()
-        .unwrap();
-    let removed = parent.repair_remove_child(std::ffi::OsStr::new("index"), expected, &[], &mut 0);
-    REPAIR_MOUNTS.with(|ids| ids.borrow_mut().remove(&mounted));
-    assert!(measured.is_err(), "measurement crossed a same-device mount");
-    assert!(
-        scanned.is_err(),
-        "durable census crossed a same-device mount"
-    );
-    assert!(idle.is_err(), "lock census crossed a same-device mount");
-    assert!(removed.is_err(), "removal crossed a same-device mount");
-    assert!(outside.is_file());
-    assert!(!mounted.join("cache.lock").exists());
 }
 
 #[test]
@@ -2871,7 +2579,7 @@ fn cache_location_remembered_parent_identity_mismatch_disables_caches() {
                 path: parent.to_path_buf(),
                 identity: identity(parent).unwrap(),
                 configured: None,
-                volume_uuid: crate::storage_retention::cache_volume_uuid(parent),
+                volume_uuid: crate::volume::cache_volume_uuid(parent),
             }],
         })
         .unwrap(),

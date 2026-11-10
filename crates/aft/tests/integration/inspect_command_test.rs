@@ -5,18 +5,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::cache_freshness;
-use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{
-    handle_inspect, handle_inspect_tier2_run, handle_inspect_tool_call,
-    handle_inspect_warm_for_test,
+    handle_inspect, handle_inspect_tool_call, handle_inspect_warm_for_test,
 };
 use aft::commands::tool_call::handle_with_dispatch;
 use aft::config::Config;
-use aft::context::{AppContext, CallgraphStoreAccess};
+use aft::context::AppContext;
 use aft::inspect::{
     inspect_phase_log_for_request, FileContribution, InspectCache, InspectCategory, InspectManager,
-    InspectPhaseId, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
+    InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
 use aft::lsp::client::LspEvent;
 use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
@@ -203,6 +201,16 @@ fn configured_restricted_context(root: &Path) -> AppContext {
 }
 
 fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> AppContext {
+    configured_context_with_diagnostics_timeout_and_callgraph(root, timeout_ms, false)
+}
+
+/// [`configured_context_with_diagnostics_timeout`], with the call-graph
+/// index switched by `callgraph`: TODO counts read its records.
+fn configured_context_with_diagnostics_timeout_and_callgraph(
+    root: &Path,
+    timeout_ms: u64,
+    callgraph: bool,
+) -> AppContext {
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -221,7 +229,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+            "indexes": { "trigram": false, "semantic": false, "callgraph": callgraph },
             "inspect": { "diagnostics_timeout_ms": timeout_ms }
         })),
     }));
@@ -282,77 +290,6 @@ fn scoped_inspect_cold_checkout_phase_timings() {
             phase.duration_ms(),
             phase.terminal_error
         );
-    }
-}
-
-fn drain_callgraph_store_for_test(ctx: &AppContext) {
-    let (latest, disconnected) = {
-        let rx_ref = ctx.callgraph_store_rx().lock();
-        let Some(rx) = rx_ref.as_ref() else {
-            return;
-        };
-        let mut latest = None;
-        let mut disconnected = false;
-        loop {
-            match rx.try_recv() {
-                Ok(store) => latest = Some(store),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        (latest, disconnected)
-    };
-
-    if let Some(store) = latest {
-        drop(store);
-        if let Some(project_root) = ctx.callgraph_project_root() {
-            let store = CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root)
-                .expect("open read-only callgraph store")
-                .expect("ready callgraph store");
-            *ctx.callgraph_store()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(std::sync::Arc::new(store));
-        }
-        *ctx.callgraph_store_rx().lock() = None;
-    } else if disconnected {
-        *ctx.callgraph_store_rx().lock() = None;
-    }
-}
-
-fn ensure_callgraph_store_ready(ctx: &AppContext) {
-    // Generous hang-catch deadline: this only guards against a wedged cold
-    // build, it is NOT a correctness assertion (those come after readiness).
-    // The callgraph cold build is a heavy tree-sitter parse that can take far
-    // longer than the happy-path <1s on a loaded Windows CI runner during a
-    // release with parallel jobs — 10s flaked there. 90s matches the
-    // callgraph_test.rs precedent.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(_) => return,
-            CallgraphStoreAccess::Building => {
-                drain_callgraph_store_for_test(ctx);
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for callgraph store cold build"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
-            CallgraphStoreAccess::Suspended(suspension) => {
-                panic!("callgraph store unexpectedly suspended in test: {suspension:?}")
-            }
-            CallgraphStoreAccess::Off => panic!("callgraph index unexpectedly off in test"),
-            CallgraphStoreAccess::Unavailable => {
-                panic!("callgraph store unexpectedly unavailable in test")
-            }
-            CallgraphStoreAccess::Error(error) => {
-                panic!("callgraph store failed in test: {error}")
-            }
-        }
     }
 }
 
@@ -438,82 +375,6 @@ fn inspect_warm_event_driven(ctx: &AppContext, payload: Value) -> Value {
     serde_json::to_value(response).expect("event-driven warm inspect response serializes")
 }
 
-fn enqueue_tier2_run(ctx: &AppContext, categories: &[&str]) -> Value {
-    let response = handle_inspect_tier2_run(
-        &request(json!({
-            "id": "tier2-run",
-            "command": "inspect_tier2_run",
-            "categories": categories,
-        })),
-        ctx,
-    );
-    let value = serde_json::to_value(response).expect("tier2_run response serializes");
-    assert_eq!(value["success"], true, "tier2_run failed: {value:#}");
-    value
-}
-
-fn tier2_run(ctx: &AppContext, categories: &[&str]) {
-    if categories.contains(&"dead_code") {
-        ensure_callgraph_store_ready(ctx);
-    }
-    let submission = enqueue_tier2_run(ctx, categories);
-    let in_flight = submission["in_flight_categories"]
-        .as_array()
-        .unwrap_or_else(|| panic!("Tier-2 submission has no in-flight list: {submission:#}"));
-    for category in categories {
-        assert!(
-            in_flight.iter().any(|queued| queued == category),
-            "Tier-2 submission did not queue {category}: {submission:#}"
-        );
-    }
-    assert!(
-        submission["errors"].as_array().is_some_and(Vec::is_empty),
-        "Tier-2 submission failed: {submission:#}"
-    );
-    wait_for_tier2(ctx, categories);
-}
-
-fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) {
-    let manager = ctx.inspect_manager();
-    // The in-flight registry is installed before the worker starts and removed
-    // only after its terminal outcome is published. Wait on that lifecycle
-    // event instead of using an unrelated inspect request's one-second Tier-1
-    // soft deadline as a proxy for Tier-2 completion.
-    let hang_deadline = Instant::now() + Duration::from_secs(90);
-    while manager.tier2_any_in_flight() {
-        assert!(
-            Instant::now() < hang_deadline,
-            "timed out waiting for Tier-2 completion event for {categories:?}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    let config = ctx.config();
-    let root = config
-        .project_root
-        .clone()
-        .expect("configured project root");
-    let snapshot = InspectSnapshot::new_with_capabilities(
-        root.clone(),
-        ctx.inspect_dir(),
-        config,
-        ctx.symbol_cache(),
-        ctx.inspect_writer(),
-        ctx.callgraph_writer(),
-    );
-    let scope = JobScope::for_project(root);
-    for category in categories {
-        let category = category
-            .parse::<InspectCategory>()
-            .unwrap_or_else(|error| panic!("invalid Tier-2 category {category}: {error}"));
-        let outcome = manager.tier2_read_cached(snapshot.clone(), category, scope.clone());
-        assert!(
-            matches!(outcome, JobOutcome::Fresh { .. }),
-            "completed Tier-2 category {category} must be fresh: {outcome:?}"
-        );
-    }
-}
-
 fn assert_summary_count(response: &Value, category: &str, count: u64) {
     let summary = response["summary"][category]
         .as_object()
@@ -562,7 +423,8 @@ fn inspect_command_metrics_summary_uses_production_dispatch() {
         "src/lib.rs",
         "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { alpha() }\n",
     );
-    let ctx = configured_context(&root);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     let response = inspect(
         &ctx,
@@ -612,7 +474,6 @@ fn inspect_command_tier1_reuses_file_memo_for_unchanged_files() {
     assert_eq!(first["success"], true, "inspect failed: {first:#}");
 
     aft::inspect::scanners::metrics::reset_file_read_count_for_debug(&root);
-    aft::inspect::scanners::todos::reset_file_read_count_for_debug(&root);
 
     let second = inspect(
         &ctx,
@@ -627,11 +488,6 @@ fn inspect_command_tier1_reuses_file_memo_for_unchanged_files() {
         aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
         0,
         "warm metrics scan should reuse unchanged per-file memo entries: {second:#}"
-    );
-    assert_eq!(
-        aft::inspect::scanners::todos::file_read_count_for_debug(&root),
-        0,
-        "warm todos scan should reuse unchanged per-file memo entries: {second:#}"
     );
     assert_eq!(first["summary"]["metrics"], second["summary"]["metrics"]);
     assert_eq!(first["summary"]["todos"], second["summary"]["todos"]);
@@ -651,7 +507,8 @@ fn inspect_command_tier1_changed_file_invalidates_only_that_file() {
         "src/changed.ts",
         "export function changed() { return 2; }\n",
     );
-    let ctx = configured_context(&root);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     let first = inspect(
         &ctx,
@@ -664,13 +521,20 @@ fn inspect_command_tier1_changed_file_invalidates_only_that_file() {
     assert_eq!(first["summary"]["todos"]["count"], 1);
 
     aft::inspect::scanners::metrics::reset_file_read_count_for_debug(&root);
-    aft::inspect::scanners::todos::reset_file_read_count_for_debug(&root);
 
-    write_file(
-        &root,
-        "src/changed.ts",
-        "// TODO: newly counted after memo invalidation\nexport function changed() { return 2; }\n",
+    // Through the edit tool, which the index store hears, as it hears the
+    // watcher.
+    let edit = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "inspect-tier1-change",
+            "command": "edit_match",
+            "file": root.join("src/changed.ts").display().to_string(),
+            "match": "export function changed()",
+            "replacement": "// TODO: newly counted after memo invalidation\nexport function changed()",
+        })),
+        &ctx,
     );
+    assert!(edit.success, "{edit:?}");
 
     let second = inspect(
         &ctx,
@@ -689,230 +553,6 @@ fn inspect_command_tier1_changed_file_invalidates_only_that_file() {
         aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
         1,
         "metrics should rescan only the changed file: {second:#}"
-    );
-    assert_eq!(
-        aft::inspect::scanners::todos::file_read_count_for_debug(&root),
-        1,
-        "todos should rescan only the changed file: {second:#}"
-    );
-}
-
-#[test]
-fn inspect_command_dead_code_uses_callgraph_snapshot_and_details() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/index.ts",
-        "import { used } from './lib';\nused();\n",
-    );
-    write_file(
-        &root,
-        "src/lib.ts",
-        "export function used() { return 1; }\nexport function unused() { return 2; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    // aft_inspect never scans Tier 2 categories synchronously. Tier 2 scans run
-    // via aft_inspect_tier2_run on session.idle in production. Simulate that
-    // here so the cached aggregate is populated before the read-only inspect
-    // call.
-    tier2_run(&ctx, &["dead_code"]);
-
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-code",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let count = response["summary"]["dead_code"]["count"]
-        .as_u64()
-        .expect("dead_code count");
-    assert!(
-        count > 0,
-        "dead_code should report fixture's intentionally dead export: {response:#}"
-    );
-
-    let details = response["details"]["dead_code"]
-        .as_array()
-        .expect("dead_code details array");
-    assert!(
-        details.iter().any(|item| item["symbol"] == "unused"),
-        "dead_code details should include unused export: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_partial_parse_keeps_dead_findings_and_names_the_parse_reason() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "package.json", r#"{"main":"src/index.ts"}"#);
-    write_file(&root, "src/index.ts", "console.log('entry');\n");
-    write_file(&root, "src/dead.ts", "export function trulyDead() {}\n");
-    write_file(&root, "src/broken.ts", "export function broken( {\n");
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    ensure_callgraph_store_ready(&ctx);
-    let response = inspect(
-        &ctx,
-        json!({"id": "partial-parse", "command": "inspect", "sections": ["dead_code", "unused_exports"]}),
-    );
-
-    assert_eq!(response["success"], true, "{response:#}");
-    for category in ["dead_code", "unused_exports"] {
-        let summary = &response["summary"][category];
-        assert_eq!(summary["complete"], false, "{response:#}");
-        assert_eq!(summary["count"], 1, "{response:#}");
-        assert!(
-            response["details"][category]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| { item["file"] == "src/dead.ts" && item["symbol"] == "trulyDead" }),
-            "{response:#}"
-        );
-        let error = summary["parse_errors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|error| error["file"] == "src/broken.ts")
-            .expect("broken file named");
-        let reason = error["message"].as_str().expect("parse reason");
-        assert!(!reason.is_empty());
-        let text = response["text"].as_str().unwrap();
-        assert!(
-            text.contains(&format!("src/broken.ts ({reason})")),
-            "parse reason missing: {text}"
-        );
-    }
-    let counts = ctx.status_bar_count_values();
-    assert_eq!(counts.dead_code, Some(1));
-    assert_eq!(counts.unused_exports, Some(1));
-    assert!(
-        counts.tier2_stale,
-        "partial counts must use the existing ~ marker"
-    );
-}
-
-#[test]
-fn inspect_partial_parse_reports_symbols_used_only_from_broken_files_with_caveat() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "package.json", r#"{"main":"src/index.ts"}"#);
-    write_file(&root, "src/index.ts", "console.log('entry');\n");
-    write_file(
-        &root,
-        "src/nearby.ts",
-        "export function onlyBrokenUser() {}\n",
-    );
-    write_file(&root, "src/broken.ts", "import { onlyBrokenUser } from './nearby';\nonlyBrokenUser();\nexport function broken( {\n");
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    ensure_callgraph_store_ready(&ctx);
-    let response = inspect(
-        &ctx,
-        json!({"id": "partial-parse-reference", "command": "inspect", "sections": ["dead_code", "unused_exports"]}),
-    );
-    assert_eq!(response["success"], true, "{response:#}");
-    for category in ["dead_code", "unused_exports"] {
-        assert_eq!(
-            response["summary"][category]["complete"], false,
-            "{response:#}"
-        );
-        assert!(
-            response["details"][category]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| {
-                    item["file"] == "src/nearby.ts" && item["symbol"] == "onlyBrokenUser"
-                }),
-            "{response:#}"
-        );
-    }
-    assert!(
-        response["text"].as_str().unwrap().contains(
-            "A symbol used only from files that could not be parsed may appear in this list."
-        ),
-        "caveat missing: {response:#}"
-    );
-}
-
-#[test]
-fn borrow_only_dead_code_is_a_named_gap_never_a_zero() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/index.ts",
-        "import { used } from './lib';\nused();\n",
-    );
-    write_file(
-        &root,
-        "src/lib.ts",
-        "export function used() { return 1; }\nexport function unused() { return 2; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    // A borrow-only root (a worktree) keeps its own inspect store but may only
-    // read, never build, the shared call graph; no main-checkout store exists.
-    ctx.set_cache_writer_capabilities(false, true);
-    // An earlier count (from before the root became borrow-only) must not
-    // survive as if it were current.
-    ctx.update_status_bar_tier2(Some(7), None, None, None, false);
-    assert_eq!(ctx.status_bar_count_values().dead_code, Some(7));
-
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-borrow-only",
-            "command": "inspect",
-            "sections": ["dead_code", "unused_exports", "duplicates"],
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let dead_code = &response["summary"]["dead_code"];
-    assert_eq!(dead_code["unavailable"], true, "{response:#}");
-    assert_eq!(dead_code["complete"], false, "{response:#}");
-    assert!(
-        dead_code.get("count").is_none() && dead_code.get("by_language").is_none(),
-        "an unavailable analysis must carry no count: {response:#}"
-    );
-    assert_eq!(
-        dead_code["gaps"][0]["reason"],
-        "dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout",
-        "{response:#}"
-    );
-    let text = response["text"].as_str().unwrap_or_default();
-    assert!(
-        text.contains("dead code: unavailable in this worktree (call graph is borrow-only)"),
-        "the named gap must be rendered: {text}"
-    );
-    assert!(
-        !text.lines().any(|line| line.starts_with("Dead code: ")),
-        "no dead-code count may be rendered: {text}"
-    );
-    assert_eq!(
-        ctx.status_bar_count_values().dead_code,
-        None,
-        "the status bar must show dead code as unknown, not the earlier count"
-    );
-    // The background refresh path reads counts from the inspect store; it must
-    // not bring the old number back either.
-    aft::runtime_drain::drain_inspect_events(&ctx);
-    ctx.update_status_bar_tier2(None, None, None, None, false);
-    // A `None` count renders as `D?` in the agent bar (see
-    // response_finalize::agent_bar_marks_missing_categories_instead_of_zeroing_them).
-    assert_eq!(ctx.status_bar_count_values().dead_code, None);
-
-    // These analyses need no call graph and are computed locally even in a
-    // borrow-only root, so they do report real numbers.
-    assert_eq!(
-        response["summary"]["unused_exports"]["count"], 1,
-        "{response:#}"
-    );
-    assert!(
-        response["summary"]["duplicates"]["count"].is_u64(),
-        "{response:#}"
     );
 }
 
@@ -941,47 +581,6 @@ fn inspect_command_tier2_cold_direct_computes_before_deadline() {
     assert_summary_count(&response, "unused_exports", 2);
     assert_summary_count(&response, "duplicates", 0);
     assert_summary_count(&response, "cycles", 0);
-}
-
-#[test]
-fn inspect_tier2_run_returns_promptly_with_background_in_flight() {
-    let (_temp_dir, root) = fixture_project();
-    for index in 0..40 {
-        write_file(
-            &root,
-            &format!("src/file_{index:03}.ts"),
-            &format!(
-                "export function unused_{index}() {{ return {index}; }}
-"
-            ),
-        );
-    }
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    ensure_callgraph_store_ready(&ctx);
-
-    let response = enqueue_tier2_run(&ctx, &["dead_code"]);
-
-    // Queue/in-flight state is the load-resistant promptness contract: if the
-    // command scanned inline, the category would not still be marked in flight.
-    // A wall-clock bound here flaked under shared CPU contention.
-    assert!(
-        response["queued_categories"]
-            .as_array()
-            .expect("queued_categories array")
-            .iter()
-            .any(|category| category.as_str() == Some("dead_code")),
-        "dead_code should be queued: {response:#}"
-    );
-    assert!(
-        response["in_flight_categories"]
-            .as_array()
-            .expect("in_flight_categories array")
-            .iter()
-            .any(|category| category.as_str() == Some("dead_code")),
-        "dead_code should be marked in-flight: {response:#}"
-    );
-
-    wait_for_tier2(&ctx, &["dead_code"]);
 }
 
 fn duplicate_fixture_source() -> &'static str {
@@ -1030,11 +629,6 @@ fn dead_code_tier2_snapshot(project_root: &Path, inspect_dir: &Path) -> InspectS
     )
 }
 
-fn artifact_cache_key_for_test(project_root: &std::path::Path) -> String {
-    let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    aft::search_index::artifact_cache_key(project_root)
-}
-
 #[test]
 fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
     let (_temp_dir, root) = fixture_project();
@@ -1044,16 +638,9 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
         "export function unused() { return 1; }\n",
     );
     let inspect_dir = root.join(".aft-cache").join("inspect");
-    let project_key = artifact_cache_key_for_test(&root);
-    let callgraph_dir = inspect_dir
-        .parent()
-        .expect("storage dir")
-        .join("callgraph")
-        .join(&project_key);
-    aft::root_cache::configure_artifact_access(&root, &project_key, false);
-    let _not_ready_store =
-        CallGraphStore::open(callgraph_dir, root.clone()).expect("open non-ready callgraph store");
 
+    // This manager was never handed an index-store checkout for the root, so
+    // the call graph dead code reads is not ready: it reports it as building.
     let manager = InspectManager::new();
     let success = manager
         .tier2_run_with_reuse_result(
@@ -1062,45 +649,19 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
             None,
         )
         .outcome
-        .expect("dead_code unavailable aggregate succeeds");
+        .expect("dead_code pending aggregate succeeds");
 
     assert!(
         success.contributions.is_empty(),
-        "unavailable callgraph must not fabricate per-file dead_code contributions"
+        "a call graph that is not ready must not fabricate per-file dead_code contributions"
     );
-    assert_eq!(success.aggregate["callgraph_available"], false);
-    assert_eq!(success.aggregate["notes"], json!(["callgraph_unavailable"]));
+    assert_eq!(success.aggregate["status"], "pending");
+    assert_eq!(success.aggregate["reason"], "callgraph_building");
+    assert_eq!(success.aggregate["complete"], false);
     assert!(
         success.aggregate.get("count").is_none(),
-        "unavailable callgraph must not be represented as zero dead code"
+        "a call graph that is not ready must not be represented as zero dead code"
     );
-}
-
-#[test]
-fn inspect_dead_code_fresh_result_has_no_unavailable_status() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/main.ts",
-        "export function live() { return 1; }\n",
-    );
-    // A fresh dead-code result needs a usable callgraph; with the callgraph
-    // index off the analysis is reported unavailable instead.
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    ensure_callgraph_store_ready(&ctx);
-
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-code-fresh",
-            "command": "inspect",
-            "sections": ["dead_code"],
-        }),
-    );
-
-    assert_eq!(response["success"], true, "response: {response:#}");
-    assert!(response["summary"]["dead_code"].get("status").is_none());
-    assert!(response["summary"]["dead_code"].get("stale").is_none());
 }
 
 fn run_duplicates_reuse(
@@ -1212,60 +773,6 @@ fn inspect_command_tier2_quick_reuse_skips_rescan_for_unchanged_file_set() {
 }
 
 #[test]
-fn inspect_command_computed_tier2_zero_count_stays_count_zero() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/unique.ts",
-        "export function unique(input: number) { return input + 1; }\n",
-    );
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["duplicates"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-duplicates-zero",
-            "command": "inspect",
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_summary_count(&response, "duplicates", 0);
-    assert_eq!(
-        response["summary"]["duplicates"]["total_groups"].as_u64(),
-        Some(0),
-        "computed zero duplicate summary should keep total_groups=0: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_command_tier2_warm_cache_hit_is_not_stale() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "src/foo.ts", duplicate_fixture_source());
-    write_file(&root, "src/bar.ts", duplicate_fixture_source());
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["duplicates"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-duplicates-warm-cache",
-            "command": "inspect",
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert!(
-        response["summary"]["duplicates"]["total_groups"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0,
-        "duplicates aggregate should be available from cache: {response:#}"
-    );
-}
-
-#[test]
 fn inspect_command_tier2_changed_file_returns_fresh_without_scheduler_wait() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "src/foo.ts", duplicate_fixture_source());
@@ -1310,55 +817,6 @@ fn inspect_command_tier2_changed_file_returns_fresh_without_scheduler_wait() {
     assert!(
         top.iter().any(|item| item["symbol"] == "changed"),
         "direct inspect should reflect the edited file in Tier-2 output: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_blocking_reuse_attaches_to_in_flight_background_category() {
-    let _env_lock = env_serial_lock();
-    let (_temp_dir, root) = fixture_project();
-    let _wait_for_attach_root = EnvVarGuard::set(
-        "AFT_TEST_TIER2_REUSE_WAIT_FOR_WAITER_ROOT",
-        &root.to_string_lossy(),
-    );
-    write_file(&root, "src/foo.ts", duplicate_fixture_source());
-    write_file(&root, "src/bar.ts", duplicate_fixture_source());
-    let ctx = configured_context(&root);
-    let manager = ctx.inspect_manager();
-    let snapshot = InspectSnapshot::new(
-        root.clone(),
-        ctx.inspect_dir(),
-        ctx.config(),
-        ctx.symbol_cache(),
-    );
-
-    let starts_before_submit = manager.reuse_start_count_for_test();
-    manager
-        .submit_tier2_run_with_reuse_background(snapshot.clone(), InspectCategory::Duplicates)
-        .expect("queue background duplicate scan");
-    let start_deadline = Instant::now() + Duration::from_secs(20);
-    while manager.reuse_start_count_for_test() == starts_before_submit {
-        assert!(
-            Instant::now() < start_deadline,
-            "background duplicate scan never started"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    let outcome = manager.tier2_run_with_reuse_blocking(
-        snapshot,
-        InspectCategory::Duplicates,
-        aft::inspect::JobScope::for_project(root),
-    );
-
-    assert!(
-        matches!(outcome, JobOutcome::Fresh { .. }),
-        "blocking inspect should attach to and receive the background result: {outcome:?}"
-    );
-    assert_eq!(
-        manager.reuse_completion_count(),
-        1,
-        "blocking inspect must not start a competing same-category reuse scan"
     );
 }
 
@@ -1682,10 +1140,6 @@ fn scoped_inspect_inventory_skips_unrequested_scanners() {
             aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
             0
         );
-        assert_eq!(
-            aft::inspect::scanners::todos::file_read_count_for_debug(&root),
-            0
-        );
         assert_eq!(response.data["scope_files"], 1, "{response:?}");
         for category in ["metrics", "todos", "diagnostics"] {
             assert_eq!(
@@ -1800,170 +1254,6 @@ fn scoped_inspect_inventory_paths_agree_with_ignored_subfolders() {
             "{nonblocking:?}"
         );
     }
-}
-
-#[test]
-fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
-    let _env_lock = env_serial_lock();
-    let (temp, owner) = fixture_project();
-    write_file(
-        &owner,
-        "main.ts",
-        "import { used } from './target';\nused();\n",
-    );
-    write_file(&owner, "target.ts", "export function used() {}\n");
-    write_file(
-        &owner,
-        "a_outside.ts",
-        &(0..110)
-            .map(|i| format!("export function outside_{i}() {{}}\n"))
-            .collect::<String>(),
-    );
-    let git = |root: &Path, args: &[&str]| {
-        let output = std::process::Command::new("git")
-            .current_dir(root)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git {args:?}: {output:?}");
-    };
-    git(&owner, &["init", "--quiet"]);
-    git(&owner, &["add", "."]);
-    git(
-        &owner,
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "--quiet",
-            "-m",
-            "fixture",
-        ],
-    );
-    let linked = temp.path().join("linked");
-    git(
-        &owner,
-        &["worktree", "add", "--detach", linked.to_str().unwrap()],
-    );
-    write_file(
-        &linked,
-        "target.ts",
-        "export function used() {}\nexport function checkoutOnlyDead() {}\n",
-    );
-    let storage = temp.path().join("storage");
-    let ctx = AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        Config {
-            storage_dir: Some(storage.clone()),
-            ..Config::default()
-        },
-    )
-    .with_test_checkpoint_store();
-    ctx.isolate_cold_build_limiter_for_test(2);
-    let configured = handle_configure(
-        &request(json!({
-            "id": "configure-view", "command": "configure", "harness": "opencode",
-            "project_root": linked, "storage_dir": storage,
-            "config": crate::helpers::user_config(json!({
-                "indexes": { "trigram": false, "semantic": false, "callgraph": true },
-                "views": {"enabled": true}
-            }))
-        })),
-        &ctx,
-    );
-    assert!(configured.success, "{configured:?}");
-    assert!(
-        !ctx.callgraph_writer(),
-        "worktree must remain borrow-only for legacy artifacts"
-    );
-    let publish = aft::views::assembly::AssemblyRequest {
-        storage,
-        project_root: linked.clone(),
-        family: aft::search_index::artifact_cache_key(&linked),
-        scope: aft::path_identity::project_scope_key(&linked),
-        desired_head: aft::views::assembly::head_tree_fingerprint(
-            &aft::alias::head_tree_entries(&linked).unwrap(),
-        ),
-        changed_paths: Default::default(),
-        semantic_keys: Default::default(),
-        require_semantic: false,
-        allow_blob_put: true,
-        callgraph: true,
-    };
-    aft::views::assembly::publish_checkout(&publish).unwrap();
-    configure_fake_scope_lsp(&ctx);
-    let response = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "worktree-dead", "command": "inspect", "scope": "target.ts",
-            "sections": ["dead_code", "unused_exports"]
-        }),
-    );
-    assert_eq!(response["success"], true, "{response:#}");
-    assert!(
-        response["summary"]["dead_code"]
-            .get("unavailable")
-            .is_none(),
-        "{response:#}"
-    );
-    assert!(
-        response["wait_stamp"]["phases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|phase| phase["id"] == "callgraph_ready"),
-        "{response:#}"
-    );
-    assert!(
-        dead_code_items(&response)
-            .iter()
-            .any(|(_, symbol)| symbol == "checkoutOnlyDead"),
-        "{response:#}"
-    );
-    assert!(
-        !dead_code_items(&response)
-            .iter()
-            .any(|(_, symbol)| symbol == "used"),
-        "{response:#}"
-    );
-    assert!(
-        unused_export_items(&response)
-            .iter()
-            .any(|(_, symbol)| symbol == "checkoutOnlyDead"),
-        "{response:#}"
-    );
-    assert!(!fs::read_to_string(owner.join("target.ts"))
-        .unwrap()
-        .contains("checkoutOnlyDead"));
-    // An edit after the view was bound is reflected at once: the checkout
-    // view is verified against the tree for every request, so an older view
-    // is never passed off as this checkout.
-    write_file(
-        &linked,
-        "target.ts",
-        "export function used() {}\nexport function nextDead() {}\n",
-    );
-    let current = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "worktree-view-current", "command": "inspect", "scope": "target.ts", "sections": "dead_code"
-        }),
-    );
-    assert!(
-        current["summary"]["dead_code"].get("unavailable").is_none(),
-        "{current:#}"
-    );
-    let items = dead_code_items(&current);
-    assert!(
-        items.iter().any(|(_, symbol)| symbol == "nextDead"),
-        "{current:#}"
-    );
-    assert!(
-        !items.iter().any(|(_, symbol)| symbol == "checkoutOnlyDead"),
-        "{current:#}"
-    );
 }
 
 #[test]
@@ -2150,91 +1440,6 @@ fn inspect_command_direct_forced_path_catches_mtime_preserved_same_size_edit() {
 }
 
 #[test]
-fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/index.ts",
-        "import { used } from './lib';\nused();\n",
-    );
-    let lib = write_file(
-        &root,
-        "src/lib.ts",
-        "export function used() { return 1; }\nexport function unused() { return 2; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code"]);
-    let before = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-code-before-hash-miss",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 10,
-        }),
-    );
-    assert_eq!(before["success"], true, "inspect failed: {before:#}");
-    let before_count = before["summary"]["dead_code"]["count"]
-        .as_u64()
-        .expect("dead_code count");
-    assert!(
-        before_count > 0,
-        "dead_code should have cached results: {before:#}"
-    );
-    assert!(
-        dead_code_items(&before).contains(&("src/lib.ts".to_string(), "unused".to_string())),
-        "dead_code fixture should report the intentionally unused export: {before:#}"
-    );
-
-    write_file(
-        &root,
-        "src/lib.ts",
-        "export function used() { return 10; }\nexport function unused() { return 20; }\n",
-    );
-
-    // Simulate the restarted-process hash-miss case: a changed source file has
-    // fresh per-file contribution metadata in SQLite, while the aggregate row is
-    // still the previous contribution_set_hash. Old behavior returned Pending
-    // here because get_aggregated() misses the exact hash and ignored the
-    // persisted aggregate row.
-    let cache = InspectCache::open(ctx.inspect_dir(), root.clone()).expect("open inspect cache");
-    let changed_freshness = cache_freshness::collect(&lib).expect("collect changed freshness");
-    cache
-        .update_content_fresh_metadata(
-            InspectCategory::DeadCode,
-            Path::new("src").join("lib.ts").as_path(),
-            &changed_freshness,
-        )
-        .expect("update contribution metadata to force aggregate hash miss");
-    assert!(
-        cache
-            .get_aggregated(&JobKey::for_project_category(InspectCategory::DeadCode))
-            .expect("hash-aware aggregate lookup")
-            .is_none(),
-        "test setup must force the exact-hash aggregate lookup to miss"
-    );
-
-    let restarted_ctx = configured_context_with_callgraph_store(&root, true);
-    let after = inspect(
-        &restarted_ctx,
-        json!({
-            "id": "inspect-dead-code-after-restart-hash-miss",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(after["success"], true, "inspect failed: {after:#}");
-    assert_summary_count(&after, "dead_code", before_count);
-    assert!(
-        dead_code_items(&after).contains(&("src/lib.ts".to_string(), "unused".to_string())),
-        "fresh hash-miss response should retain the expected unused export: {after:#}"
-    );
-}
-
-#[test]
 fn inspect_command_tier2_aggregate_hash_mismatch_is_cache_miss() {
     let (_temp_dir, root) = fixture_project();
     let file = write_file(&root, "src/foo.ts", duplicate_fixture_source());
@@ -2293,674 +1498,6 @@ fn inspect_command_tier2_aggregate_hash_mismatch_is_cache_miss() {
             .expect("hash-aware sqlite aggregate read")
             .is_none(),
         "persisted aggregate must miss when its stored contribution_set_hash is stale"
-    );
-}
-
-fn dead_code_items(response: &Value) -> Vec<(String, String)> {
-    response["details"]["dead_code"]
-        .as_array()
-        .expect("dead_code details array")
-        .iter()
-        .map(|item| {
-            (
-                item["file"].as_str().expect("dead file").to_string(),
-                item["symbol"].as_str().expect("dead symbol").to_string(),
-            )
-        })
-        .collect()
-}
-
-fn unused_export_items(response: &Value) -> Vec<(String, String)> {
-    response["details"]["unused_exports"]
-        .as_array()
-        .expect("unused_exports details array")
-        .iter()
-        .map(|item| {
-            (
-                item["file"]
-                    .as_str()
-                    .expect("unused export file")
-                    .to_string(),
-                item["symbol"]
-                    .as_str()
-                    .expect("unused export symbol")
-                    .to_string(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn inspect_command_oxc_unused_exports_workspace_reports_dead_export_despite_dynamic_import() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "package.json",
-        r#"{"private":true,"workspaces":["packages/*"]}"#,
-    );
-    write_file(
-        &root,
-        "packages/lib/package.json",
-        r#"{"name":"@scope/lib","exports":"./src/index.ts"}"#,
-    );
-    write_file(
-        &root,
-        "packages/lib/src/index.ts",
-        "export { consumed } from './api';\n",
-    );
-    write_file(
-        &root,
-        "packages/lib/src/api.ts",
-        "export function consumed() { return 1; }\nexport function genuinelyDead() { return 2; }\n",
-    );
-    write_file(&root, "packages/app/package.json", r#"{"name":"app"}"#);
-    write_file(
-        &root,
-        "packages/app/src/consumer.ts",
-        "import { consumed } from '@scope/lib';\nconsole.log(consumed());\n",
-    );
-    write_file(
-        &root,
-        "packages/app/src/dynamic.ts",
-        "const name = './optional-plugin';\nexport async function loadOptional() { return import(name); }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["unused_exports"]);
-
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-unused-oxc-workspace",
-            "command": "inspect",
-            "sections": "unused_exports",
-            "topK": 20,
-        }),
-    );
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let items = unused_export_items(&response);
-
-    assert!(
-        !items.contains(&(
-            "packages/lib/src/api.ts".to_string(),
-            "consumed".to_string()
-        )),
-        "barrel-export imported through a workspace package should be live: {response:#}",
-    );
-    assert!(
-        items.contains(&(
-            "packages/lib/src/api.ts".to_string(),
-            "genuinelyDead".to_string()
-        )),
-        "genuinely dead export should still be reported: {response:#}",
-    );
-    let dead_item = response["details"]["unused_exports"]
-        .as_array()
-        .expect("unused export details")
-        .iter()
-        .find(|item| item["file"] == "packages/lib/src/api.ts" && item["symbol"] == "genuinelyDead")
-        .expect("dead export detail");
-    assert_eq!(dead_item["provenance"], "oxc");
-}
-
-#[test]
-fn inspect_command_oxc_dead_code_keeps_same_file_schema_composition_live() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/index.ts",
-        "import { UserSchema } from './schema';\nconsole.log(UserSchema);\n",
-    );
-    write_file(
-        &root,
-        "src/schema.ts",
-        "const z = { object: () => ({ extend: () => ({}) }) };\nexport const BaseSchema = z.object({});\nexport const UserSchema = BaseSchema.extend({});\nexport const TrulyDeadSchema = z.object({});\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code"]);
-
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-oxc-same-file",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 20,
-        }),
-    );
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let items = dead_code_items(&response);
-
-    assert!(
-        !items.contains(&("src/schema.ts".to_string(), "BaseSchema".to_string())),
-        "schema composed via same-file value reference should not be dead: {response:#}",
-    );
-    assert!(
-        items.contains(&("src/schema.ts".to_string(), "TrulyDeadSchema".to_string())),
-        "genuinely dead schema export should still be reported: {response:#}",
-    );
-}
-
-#[test]
-fn inspect_command_dead_code_uses_cargo_manifest_targets_not_nested_main_files() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "Cargo.toml",
-        r#"[package]
-name = "fixture"
-version = "0.1.0"
-edition = "2021"
-autobins = false
-
-[[bin]]
-name = "fixture-cli"
-path = "src/bin/app.rs"
-"#,
-    );
-    write_file(
-        &root,
-        "src/bin/app.rs",
-        "pub fn declared_bin_entry() -> u32 { 1 }\npub fn unused_bin_helper() -> u32 { 0 }\nfn main() { declared_bin_entry(); }\n",
-    );
-    write_file(
-        &root,
-        "tools/main.rs",
-        "pub fn nested_only() -> u32 { 2 }\npub fn nested_main() -> u32 { nested_only() }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-code-cargo-manifest-entry-points",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let items = dead_code_items(&response);
-    assert!(
-        items.contains(&("tools/main.rs".to_string(), "nested_only".to_string())),
-        "nested main.rs must not be treated as a Cargo entry point: {response:#}"
-    );
-    assert!(
-        !items.contains(&(
-            "src/bin/app.rs".to_string(),
-            "declared_bin_entry".to_string()
-        )),
-        "declared Cargo bin export called from main should be live: {response:#}"
-    );
-    assert!(
-        items.contains(&(
-            "src/bin/app.rs".to_string(),
-            "unused_bin_helper".to_string()
-        )),
-        "binary exports are not public API and should remain eligible: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_command_unused_exports_uses_package_exports_as_public_api_but_not_bin() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "package.json",
-        r#"{
-  "name": "fixture",
-  "exports": {
-    ".": "./src/index.ts",
-    "./feature": { "import": "./src/feature.ts" }
-  },
-  "bin": { "fixture": "./src/cli.ts" }
-}
-"#,
-    );
-    write_file(
-        &root,
-        "src/index.ts",
-        "export function publicApi() { return 1; }\n",
-    );
-    write_file(
-        &root,
-        "src/feature.ts",
-        "export function publicFeature() { return 2; }\n",
-    );
-    write_file(
-        &root,
-        "src/cli.ts",
-        "export function cliEntry() { return 3; }\n",
-    );
-    write_file(
-        &root,
-        "src/internal.ts",
-        "export function nonPublicUncalled() { return 4; }\n",
-    );
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["unused_exports"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-unused-exports-package-public-api",
-            "command": "inspect",
-            "sections": "unused_exports",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(
-        unused_export_items(&response),
-        vec![
-            ("src/cli.ts".to_string(), "cliEntry".to_string()),
-            (
-                "src/internal.ts".to_string(),
-                "nonPublicUncalled".to_string()
-            ),
-        ],
-        "package exports should be public API while bin/non-public exports are reported: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_command_dead_code_and_unused_exports_share_workspace_public_api_resolution() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "package.json",
-        r#"{"private":true,"workspaces":["apps/*"]}"#,
-    );
-    write_file(
-        &root,
-        "apps/service/package.json",
-        r#"{"name":"service","exports":"./src/index.ts"}"#,
-    );
-    write_file(
-        &root,
-        "apps/service/src/index.ts",
-        "export function serviceApi() { return 1; }\n",
-    );
-    write_file(
-        &root,
-        "apps/service/src/internal.ts",
-        "export function serviceInternal() { return 2; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code", "unused_exports"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-shared-public-api-resolution",
-            "command": "inspect",
-            "sections": ["dead_code", "unused_exports"],
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(
-        dead_code_items(&response),
-        vec![(
-            "apps/service/src/internal.ts".to_string(),
-            "serviceInternal".to_string()
-        )],
-        "dead_code should use the workspace package public API: {response:#}"
-    );
-    assert_eq!(
-        unused_export_items(&response),
-        vec![(
-            "apps/service/src/internal.ts".to_string(),
-            "serviceInternal".to_string()
-        )],
-        "unused_exports should match dead_code without a packages/* assumption: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_command_manifestless_projects_keep_conventional_entry_point_fallback() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/index.ts",
-        "export function fallbackPublicApi() { return 1; }\n",
-    );
-    write_file(
-        &root,
-        "src/internal.ts",
-        "export function fallbackInternal() { return 2; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code", "unused_exports"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-manifestless-entry-point-fallback",
-            "command": "inspect",
-            "sections": ["dead_code", "unused_exports"],
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(
-        dead_code_items(&response),
-        vec![(
-            "src/internal.ts".to_string(),
-            "fallbackInternal".to_string()
-        )],
-        "manifest-less conventional index.ts should remain an entry/public API file: {response:#}"
-    );
-    assert_eq!(
-        unused_export_items(&response),
-        vec![(
-            "src/internal.ts".to_string(),
-            "fallbackInternal".to_string()
-        )],
-        "manifest-less fallback should be shared by unused_exports: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_command_manifest_without_declared_entries_uses_conventional_fallback() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "package.json", r#"{"private":true}"#);
-    write_file(
-        &root,
-        "src/index.ts",
-        "export function fallbackPublicApi() { return 1; }\n",
-    );
-    write_file(
-        &root,
-        "src/internal.ts",
-        "export function fallbackInternal() { return 2; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code", "unused_exports"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-manifest-no-entry-fallback",
-            "command": "inspect",
-            "sections": ["dead_code", "unused_exports"],
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(
-        dead_code_items(&response),
-        vec![(
-            "src/internal.ts".to_string(),
-            "fallbackInternal".to_string()
-        )],
-        "manifest presence without declared roots should still use conventional index.ts fallback for dead_code: {response:#}"
-    );
-    assert_eq!(
-        unused_export_items(&response),
-        vec![(
-            "src/internal.ts".to_string(),
-            "fallbackInternal".to_string()
-        )],
-        "manifest presence without declared roots should still use conventional index.ts fallback for unused_exports: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_command_manifest_edit_invalidates_unused_exports_aggregate() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "package.json", r#"{"main":"./src/index.ts"}"#);
-    write_file(
-        &root,
-        "src/index.ts",
-        "export function indexApi() { return 1; }\n",
-    );
-    write_file(
-        &root,
-        "src/public.ts",
-        "export function publicApi() { return 2; }\n",
-    );
-    write_file(
-        &root,
-        "src/internal.ts",
-        "export function internalOnly() { return 3; }\n",
-    );
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["unused_exports"]);
-    let before = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-unused-exports-before-manifest-edit",
-            "command": "inspect",
-            "sections": "unused_exports",
-            "topK": 10,
-        }),
-    );
-    assert_eq!(before["success"], true, "inspect failed: {before:#}");
-    assert_eq!(
-        unused_export_items(&before),
-        vec![
-            ("src/internal.ts".to_string(), "internalOnly".to_string()),
-            ("src/public.ts".to_string(), "publicApi".to_string()),
-        ],
-        "initial package main should suppress only index.ts: {before:#}"
-    );
-
-    write_file(&root, "package.json", r#"{"main":"./src/public.ts"}"#);
-    tier2_run(&ctx, &["unused_exports"]);
-    let after = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-unused-exports-after-manifest-edit",
-            "command": "inspect",
-            "sections": "unused_exports",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(after["success"], true, "inspect failed: {after:#}");
-    assert_eq!(
-        unused_export_items(&after),
-        vec![
-            ("src/index.ts".to_string(), "indexApi".to_string()),
-            ("src/internal.ts".to_string(), "internalOnly".to_string()),
-        ],
-        "manifest edit should change the contribution_set_hash and force aggregate recompute: {after:#}"
-    );
-}
-
-#[test]
-fn inspect_command_dead_code_keeps_same_name_exports_distinct_after_tier2_run() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/main.ts",
-        "import { foo } from './alive';\nexport function main() { return foo(); }\n",
-    );
-    write_file(
-        &root,
-        "src/alive.ts",
-        "export function foo() { return 1; }\n",
-    );
-    write_file(
-        &root,
-        "src/dead.ts",
-        "export function foo() { return 2; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-code-same-name",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(response["summary"]["dead_code"]["count"], 1);
-    assert_eq!(
-        dead_code_items(&response),
-        vec![("src/dead.ts".to_string(), "foo".to_string())]
-    );
-}
-
-#[test]
-fn inspect_command_dead_code_does_not_headline_product_referenced_cycle_after_tier2_run() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/a.ts",
-        "import { b } from './b';\nexport function a() { return b(); }\n",
-    );
-    write_file(
-        &root,
-        "src/b.ts",
-        "import { a } from './a';\nexport function b() { return a(); }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-code-cycle",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(response["summary"]["dead_code"]["count"], 0);
-    assert_eq!(dead_code_items(&response), Vec::<(String, String)>::new());
-    assert_eq!(response["summary"]["dead_code"]["test_only_count"], 0);
-}
-
-#[test]
-fn inspect_command_cycles_render_chain_and_import_edges_after_tier2_run() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/a.ts",
-        "import { b } from './b';\nexport const a = b;\n",
-    );
-    write_file(
-        &root,
-        "src/b.ts",
-        "import { a } from './a';\nexport const b = a;\n",
-    );
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["cycles"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-cycles",
-            "command": "inspect",
-            "sections": "cycles",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_summary_count(&response, "cycles", 1);
-    assert_eq!(response["summary"]["cycles"]["largest"], 2);
-    let details = response["details"]["cycles"]
-        .as_array()
-        .expect("cycles details");
-    assert_eq!(
-        details.len(),
-        1,
-        "cycle should be reported once: {response:#}"
-    );
-    assert_eq!(
-        details[0]["cycle"].as_str(),
-        Some("src/a.ts -> src/b.ts -> src/a.ts")
-    );
-    let text = response["text"].as_str().expect("inspect text");
-    assert!(
-        text.contains("Import cycles: 1 import cycle (largest: 2 files)"),
-        "cycles summary line missing: {text}"
-    );
-    assert!(
-        text.contains("src/a.ts -> src/b.ts via import::Named './b' line 1"),
-        "cycle import edge missing: {text}"
-    );
-}
-
-#[test]
-fn inspect_command_dead_code_keeps_multi_hop_entry_reachability_after_tier2_run() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "src/main.ts",
-        "import { b } from './b';\nexport function main() { return b(); }\n",
-    );
-    write_file(
-        &root,
-        "src/b.ts",
-        "import { c } from './c';\nexport function b() { return c(); }\n",
-    );
-    write_file(&root, "src/c.ts", "export function c() { return 3; }\n");
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-code-multihop",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(response["summary"]["dead_code"]["count"], 0);
-    assert!(
-        dead_code_items(&response).is_empty(),
-        "response: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_command_dead_code_resolves_extensionless_package_module_entry_after_tier2_run() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "package.json", "{\"module\":\"src/index\"}\n");
-    write_file(
-        &root,
-        "src/index.mts",
-        "export function publicApi() { return 1; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-
-    tier2_run(&ctx, &["dead_code"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-dead-code-package-entry",
-            "command": "inspect",
-            "sections": "dead_code",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(
-        response["summary"]["dead_code"]["count"], 0,
-        "extensionless package module entry should be public API: {response:#}"
     );
 }
 
@@ -3066,453 +1603,6 @@ fn inspect_tool_call_refuses_mixed_scope_array_with_missing_element() {
             .as_str()
             .is_some_and(|message| message.contains("crates/missing/src")),
         "response: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_tool_call_multiple_roots_reports_combined_corpus_and_duplicates() {
-    let (_temp_dir, root) = fixture_project();
-    for file in ["left.ts", "right.ts"] {
-        write_file(
-            &root,
-            &format!("crates/alpha/src/{file}"),
-            duplicate_fixture_source(),
-        );
-        write_file(
-            &root,
-            &format!("crates/beta/src/{file}"),
-            alternate_duplicate_fixture_source(),
-        );
-    }
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    ensure_callgraph_store_ready(&ctx);
-    configure_fake_scope_lsp(&ctx);
-    tier2_run(
-        &ctx,
-        &[
-            "dead_code",
-            "unused_exports",
-            "duplicates",
-            "cycles",
-            "complexity",
-        ],
-    );
-
-    let call = |id: &str, scope: Value| {
-        inspect_tool_call(
-            &ctx,
-            json!({
-                "id": id,
-                "command": "inspect",
-                "scope": scope,
-                "sections": ["duplicates"],
-            }),
-        )
-    };
-    let alpha = call("inspect-alpha-scope", json!("crates/alpha/src"));
-    let beta = call("inspect-beta-scope", json!("crates/beta/src"));
-    let combined = call(
-        "inspect-combined-scope",
-        json!(["crates/alpha/src", "crates/beta/src"]),
-    );
-
-    for response in [&alpha, &beta, &combined] {
-        assert_eq!(response["success"], true, "response: {response:#}");
-    }
-    assert_eq!(
-        combined["scope_roots"],
-        json!(["crates/alpha/src", "crates/beta/src"])
-    );
-    assert_eq!(combined["scope_files"], 4);
-    assert!(
-        combined["text"]
-            .as_str()
-            .is_some_and(|text| text.lines().any(|line| line == "scope: 2 roots, 4 files")),
-        "response: {combined:#}"
-    );
-    let alpha_count = alpha["summary"]["duplicates"]["count"]
-        .as_u64()
-        .expect("alpha duplicate count");
-    let beta_count = beta["summary"]["duplicates"]["count"]
-        .as_u64()
-        .expect("beta duplicate count");
-    assert!(alpha_count > 0, "response: {alpha:#}");
-    assert!(beta_count > 0, "response: {beta:#}");
-    assert_eq!(
-        combined["summary"]["duplicates"]["count"],
-        alpha_count + beta_count,
-        "disjoint scoped duplicate counts should add: {combined:#}"
-    );
-}
-
-#[test]
-fn inspect_tool_call_empty_analyzed_scope_uses_zero_denominator() {
-    let (_temp_dir, root) = fixture_project();
-    fs::create_dir_all(root.join("docs")).expect("docs-only scope root");
-    write_file(&root, "src/main.ts", "export const outsideScope = 1;\n");
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    ensure_callgraph_store_ready(&ctx);
-    tier2_run(
-        &ctx,
-        &[
-            "dead_code",
-            "unused_exports",
-            "duplicates",
-            "cycles",
-            "complexity",
-        ],
-    );
-
-    let response = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "inspect-empty-corpus-scope",
-            "command": "inspect",
-            "scope": "docs",
-            "sections": ["duplicates"],
-        }),
-    );
-
-    assert_eq!(response["success"], true, "response: {response:#}");
-    assert_eq!(response["scope_roots"], json!(["docs"]));
-    assert_eq!(response["scope_files"], 0);
-    assert_eq!(response["no_files_matched_scope"], true);
-    assert_eq!(response["summary"]["duplicates"]["total_analyzed_lines"], 0);
-    let text = response["text"].as_str().expect("rendered inspect text");
-    assert!(
-        text.starts_with("FRESH\nscope: 1 root, 0 files (no analyzed files under this scope)\n"),
-        "response: {response:#}"
-    );
-    assert!(
-        text.contains(
-            "Duplicates: 0 duplicated lines (0.0% of 0 analyzed lines) across 0 files, 0 groups"
-        ),
-        "response: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_command_duplicates_summary_count_uses_production_payload() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "src/foo.ts", duplicate_fixture_source());
-    write_file(&root, "src/bar.ts", duplicate_fixture_source());
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["duplicates"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-duplicates-count",
-            "command": "inspect",
-            "sections": "duplicates",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let count = response["summary"]["duplicates"]["count"]
-        .as_u64()
-        .expect("duplicates count");
-    let total_groups = response["summary"]["duplicates"]["total_groups"]
-        .as_u64()
-        .expect("duplicates total_groups");
-    assert!(
-        count > 0,
-        "duplicates count should be non-zero: {response:#}"
-    );
-    assert_eq!(
-        count, total_groups,
-        "summary should mirror scanner contract: {response:#}"
-    );
-    assert!(
-        !response["details"]["duplicates"]
-            .as_array()
-            .expect("duplicates details")
-            .is_empty(),
-        "duplicates details should include groups: {response:#}"
-    );
-}
-
-#[test]
-#[ignore = "requires the deferred inspect slice's authoritative scoped LSP completion"]
-fn inspect_command_duplicates_file_scope_matches_occurrence_labels() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "src/scoped/foo.ts", duplicate_fixture_source());
-    write_file(&root, "src/scoped/baz.ts", duplicate_fixture_source());
-    write_file(&root, "src/outside/bar.ts", duplicate_fixture_source());
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["duplicates"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-duplicates-scoped",
-            "command": "inspect",
-            "sections": "duplicates",
-            "scope": "src/scoped",
-            "topK": 10,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let count = response["summary"]["duplicates"]["count"]
-        .as_u64()
-        .expect("duplicates count");
-    assert!(
-        count > 0,
-        "scoped duplicates should retain groups duplicated within scope: {response:#}"
-    );
-    let details = response["details"]["duplicates"]
-        .as_array()
-        .expect("duplicates details");
-    assert!(
-        !details.is_empty(),
-        "expected scoped duplicate details: {response:#}"
-    );
-    for group in details {
-        let files = group["files"].as_array().expect("group files");
-        assert!(
-            files.len() >= 2,
-            "duplicate groups with fewer than two in-scope files should be dropped: {response:#}"
-        );
-        assert!(
-            files
-                .iter()
-                .filter_map(Value::as_str)
-                .all(|file| file.starts_with("src/scoped/")),
-            "scoped duplicate groups must prune out-of-scope files: {response:#}"
-        );
-    }
-}
-
-#[test]
-#[ignore = "requires the deferred inspect slice's authoritative scoped LSP completion"]
-fn inspect_command_unused_exports_scope_filters_full_contributions_before_cap() {
-    let (_temp_dir, root) = fixture_project();
-    for index in 0..120 {
-        write_file(
-            &root,
-            &format!("aaa_global/file_{index:03}.ts"),
-            &format!("export function global_{index:03}() {{ return {index}; }}\n"),
-        );
-    }
-    for index in 0..3 {
-        write_file(
-            &root,
-            &format!("zzz_scoped/file_{index:03}.ts"),
-            &format!("export function scoped_{index:03}() {{ return {index}; }}\n"),
-        );
-    }
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["unused_exports"]);
-    let scoped = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-unused-exports-scoped-after-cap",
-            "command": "inspect",
-            "sections": "unused_exports",
-            "scope": "zzz_scoped",
-            "topK": 100,
-        }),
-    );
-
-    assert_eq!(scoped["success"], true, "inspect failed: {scoped:#}");
-    assert_eq!(
-        scoped["summary"]["unused_exports"]["count"], 3,
-        "scoped count should come from full contributions, not the capped project aggregate: {scoped:#}"
-    );
-    let scoped_details = scoped["details"]["unused_exports"]
-        .as_array()
-        .expect("unused_exports details");
-    assert_eq!(
-        scoped_details.len(),
-        3,
-        "scoped details should include all scoped items beyond the project cap: {scoped:#}"
-    );
-    assert!(
-        scoped_details.iter().all(|item| item["file"]
-            .as_str()
-            .is_some_and(|file| file.starts_with("zzz_scoped/"))),
-        "scoped details should only include scoped files: {scoped:#}"
-    );
-
-    let project = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-unused-exports-project-cap",
-            "command": "inspect",
-            "sections": "unused_exports",
-            "topK": 100,
-        }),
-    );
-
-    assert_eq!(project["success"], true, "inspect failed: {project:#}");
-    assert_eq!(
-        project["summary"]["unused_exports"]["count"], 123,
-        "project-wide count should keep the full aggregate count: {project:#}"
-    );
-    let project_details = project["details"]["unused_exports"]
-        .as_array()
-        .expect("unused_exports details");
-    assert_eq!(
-        project_details.len(),
-        100,
-        "project-wide details should still be capped at 100: {project:#}"
-    );
-    assert!(
-        project_details
-            .iter()
-            .all(|item| item["file"].as_str().is_some_and(|file| file.starts_with("aaa_global/"))),
-        "project-wide cap should be applied before later zzz_scoped files appear in details: {project:#}"
-    );
-}
-
-#[test]
-#[ignore = "requires the deferred inspect slice's authoritative scoped LSP completion"]
-fn inspect_command_duplicates_scope_filters_full_contributions_before_cap() {
-    let (_temp_dir, root) = fixture_project();
-    // Distinct per-file markers so the whole-file (program) node is not itself a
-    // cross-file duplicate (which would correctly subsume the 130 inner groups);
-    // the 130 functions remain byte-identical across files and so stay duplicated.
-    write_file(
-        &root,
-        "aaa_global/left.ts",
-        &many_duplicate_groups_source(2),
-    );
-    write_file(
-        &root,
-        "aaa_global/right.ts",
-        &many_duplicate_groups_source(3),
-    );
-    write_file(
-        &root,
-        "zzz_scoped/left.ts",
-        &many_duplicate_groups_source(4),
-    );
-    write_file(
-        &root,
-        "zzz_scoped/right.ts",
-        &many_duplicate_groups_source(5),
-    );
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["duplicates"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-duplicates-scoped-after-cap",
-            "command": "inspect",
-            "sections": "duplicates",
-            "scope": "zzz_scoped",
-            "topK": 100,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let count = response["summary"]["duplicates"]["count"]
-        .as_u64()
-        .expect("duplicates count");
-    assert!(
-        count > 100,
-        "scoped duplicate count should come from full contributions, not the capped project aggregate: {response:#}"
-    );
-    let details = response["details"]["duplicates"]
-        .as_array()
-        .expect("duplicates details");
-    assert_eq!(
-        details.len(),
-        100,
-        "scoped duplicate details should be capped after filtering the full rollup: {response:#}"
-    );
-    assert!(
-        details.iter().all(|group| group["files"]
-            .as_array()
-            .expect("group files")
-            .iter()
-            .filter_map(Value::as_str)
-            .all(|file| file.starts_with("zzz_scoped/"))),
-        "scoped duplicate details should only include scoped files: {response:#}"
-    );
-}
-
-/// 130 literal-distinct functions shared across files (the real cross-file
-/// duplicate groups) plus a trailing marker function whose statement count is
-/// unique per `unique_stmts`. The unique marker makes each file's top-level
-/// (program) node structurally distinct, so the WHOLE FILE is not itself a
-/// cross-file duplicate that would (correctly) subsume the 130 inner groups
-/// under the nested-overlap collapse. Each caller passes a distinct
-/// `unique_stmts` so every file's program node appears exactly once.
-fn many_duplicate_groups_source(unique_stmts: usize) -> String {
-    let mut source = String::new();
-    for index in 0..130 {
-        source.push_str(&format!(
-            r#"export function duplicate_group_{index:03}(input: number) {{
-  const first = input + {index};
-  const second = first * {};
-  const third = second - {};
-  const label = "group_{index:03}";
-  if (third > {}) {{
-    return label + third.toString();
-  }}
-  return label + first.toString();
-}}
-"#,
-            index + 3,
-            index + 7,
-            index + 11
-        ));
-    }
-    source.push_str("function file_unique_marker() {\n");
-    for n in 0..unique_stmts {
-        source.push_str(&format!("  const marker_{n} = {n} * 2 + 1;\n"));
-    }
-    source.push_str("  return 0;\n}\n");
-    source
-}
-
-#[test]
-fn inspect_command_duplicates_project_wide_cap_preserves_total_groups() {
-    let (_temp_dir, root) = fixture_project();
-    // Distinct per-file markers (see scope test): keep the 130 functions
-    // duplicated across files without the whole file becoming one big duplicate.
-    write_file(&root, "src/left.ts", &many_duplicate_groups_source(2));
-    write_file(&root, "src/right.ts", &many_duplicate_groups_source(3));
-    let ctx = configured_context(&root);
-
-    tier2_run(&ctx, &["duplicates"]);
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-duplicates-project-cap",
-            "command": "inspect",
-            "sections": "duplicates",
-            "topK": 100,
-        }),
-    );
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    let count = response["summary"]["duplicates"]["count"]
-        .as_u64()
-        .expect("duplicates count");
-    let total_groups = response["summary"]["duplicates"]["total_groups"]
-        .as_u64()
-        .expect("duplicates total_groups");
-    assert!(
-        count > 100,
-        "fixture should produce more groups than the drill-down cap: {response:#}"
-    );
-    assert_eq!(
-        total_groups, count,
-        "project-wide total_groups should retain the full group count: {response:#}"
-    );
-    assert_eq!(
-        response["details"]["duplicates"]
-            .as_array()
-            .expect("duplicates details")
-            .len(),
-        100,
-        "project-wide duplicate details should still be capped at 100: {response:#}"
     );
 }
 
@@ -3669,30 +1759,6 @@ fn open_with_server_status_mode(ctx: &AppContext, file: &Path, mode: &str) {
         .expect("start fake rust-analyzer");
 }
 
-fn wait_for_inspect_phase_start(request_id: &str, phase: InspectPhaseId) {
-    let hang_deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(snapshot) = inspect_phase_log_for_request(request_id) {
-            if let Some(record) = snapshot
-                .records
-                .iter()
-                .find(|record| record.entry.id == phase)
-            {
-                assert!(
-                    !record.is_completed() && record.terminal_error().is_none(),
-                    "inspect phase {phase:?} terminated before its release event: {snapshot:?}"
-                );
-                return;
-            }
-        }
-        assert!(
-            Instant::now() < hang_deadline,
-            "timed out waiting for inspect phase {phase:?} to start for {request_id}"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn wait_for_lsp_report_state(ctx: &AppContext, file: &Path, provisional: bool) {
     // Report state is authoritative; this deadline only catches a wedged server.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -3713,88 +1779,6 @@ fn wait_for_lsp_report_state(ctx: &AppContext, file: &Path, provisional: bool) {
         );
         thread::sleep(Duration::from_millis(20));
     }
-}
-
-#[test]
-fn rust_quiescence_promotes_latest_publish_for_warm_inspect_and_status_bar() {
-    const REQUEST_ID: &str = "inspect-diagnostics-after-settle";
-
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-settle\"\n");
-    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
-    let ctx = Arc::new(configured_context_with_callgraph_store(&root, true));
-    tier2_run(
-        &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
-    );
-    configure_fake_rust_lsp(&ctx);
-    ctx.lsp()
-        .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "publish_then_quiescent");
-
-    let inspect_ctx = Arc::clone(&ctx);
-    let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
-    let inspector = thread::spawn(move || {
-        let response = serde_json::to_value(handle_inspect_tool_call(
-            &request(json!({
-                "id": REQUEST_ID,
-                "command": "inspect",
-                "sections": ["diagnostics"],
-                "topK": 10,
-            })),
-            &inspect_ctx,
-        ))
-        .expect("inspect response serializes");
-        response_tx
-            .send(response)
-            .expect("publish blocking inspect response");
-    });
-
-    wait_for_inspect_phase_start(REQUEST_ID, InspectPhaseId::LspQuiescence);
-    // didOpen is the deterministic release event: the fake producer publishes
-    // diagnostics and then declares quiescence in that message's handler.
-    let config = ctx.config();
-    ctx.lsp()
-        .notify_file_changed(&file, "fn main() {}\n", &config)
-        .expect("release the warming producer with didOpen");
-
-    let response = response_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("inspect did not observe the quiescence publish before the outer hang catch");
-    inspector.join().expect("blocking inspect thread completes");
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(response["inspect_terminal"], "fresh");
-
-    let phase_log = inspect_phase_log_for_request(REQUEST_ID).expect("retained inspect phase log");
-    let quiescence = phase_log
-        .records
-        .iter()
-        .find(|record| record.entry.id == InspectPhaseId::LspQuiescence)
-        .expect("LSP quiescence phase record");
-    assert!(
-        quiescence.is_completed() && quiescence.terminal_error().is_none(),
-        "the producer quiescence event must complete successfully: {phase_log:?}"
-    );
-
-    let summary = response["summary"]["diagnostics"]
-        .as_object()
-        .expect("diagnostics summary");
-    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(1));
-    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(1));
-    assert!(
-        !summary.contains_key("status"),
-        "quiescent diagnostics must be complete: {response:#}"
-    );
-    assert_eq!(
-        response["details"]["diagnostics"]
-            .as_array()
-            .expect("diagnostics details")
-            .len(),
-        2
-    );
-
-    ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
-    let counts = ctx.status_bar_counts().expect("status bar populated");
-    assert_eq!((counts.errors, counts.warnings), (1, 1));
 }
 
 #[test]
@@ -4246,34 +2230,6 @@ fn active_server_kinds(ctx: &AppContext) -> Vec<ServerKind> {
         .collect()
 }
 
-/// A context whose Tier-2 aggregates are already built, so an unscoped inspect
-/// returns a fresh payload with a diagnostics summary instead of refusing
-/// while the callgraph is still building.
-fn tier2_ready_context(root: &Path) -> AppContext {
-    let ctx = configured_context_with_callgraph_store(root, true);
-    ensure_callgraph_store_ready(&ctx);
-    tier2_run(
-        &ctx,
-        &[
-            "dead_code",
-            "unused_exports",
-            "duplicates",
-            "cycles",
-            "complexity",
-        ],
-    );
-    ctx
-}
-
-fn not_applicable_producers(response: &Value) -> Vec<String> {
-    response["summary"]["diagnostics"]["not_applicable"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry["producer"].as_str().map(str::to_owned))
-        .collect()
-}
-
 fn failed_producers(response: &Value) -> Vec<String> {
     response["gaps"]
         .as_array()
@@ -4291,7 +2247,8 @@ fn failed_producers(response: &Value) -> Vec<String> {
 fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "src/main.rs", "fn main() {}\n// TODO: tidy\n");
-    let ctx = configured_context(&root);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_callgraph_store(&root, true);
 
     let response = serde_json::to_value(handle_with_dispatch(
         &request(json!({
@@ -4523,21 +2480,6 @@ fn inspect_outside(ctx: &AppContext, payload: Value) -> Value {
 /// [`inspect_outside`].
 fn inspect_tool_call_outside(ctx: &AppContext, payload: Value) -> Value {
     inspect_as_opencode(ctx, payload, inspect_tool_call)
-}
-
-/// [`scoped_diagnostics_inspect`] for a scope outside the project, dispatched
-/// as in [`inspect_outside`].
-fn scoped_diagnostics_inspect_outside(ctx: &AppContext, id: &str, scope: &str) -> Value {
-    inspect_tool_call_outside(
-        ctx,
-        json!({
-            "id": id,
-            "command": "inspect",
-            "scope": scope,
-            "sections": "diagnostics",
-            "topK": 20,
-        }),
-    )
 }
 
 #[cfg(unix)]
@@ -5445,25 +3387,6 @@ fn scoped_python_progress_excluded_file_without_new_run_settles() {
     .unwrap();
     std::fs::write(dir.path().join("excluded.py"), "value: int = 'wrong'\n").unwrap();
     assert_short_run_complete(&ctx, "excluded.py");
-}
-
-#[test]
-fn scoped_python_progress_nonsource_file_without_new_run_settles() {
-    let (dir, ctx) = python_short_run_fixture();
-    ctx.update_config(|config| {
-        config.lsp_servers.push(aft::config::UserServerDef {
-            id: "python".into(),
-            extensions: vec!["py".into(), "txt".into()],
-            binary: String::new(),
-            args: Vec::new(),
-            root_markers: vec!["pyproject.toml".into()],
-            env: Default::default(),
-            initialization_options: None,
-            disabled: false,
-        })
-    });
-    std::fs::write(dir.path().join("notes.txt"), "plain text\n").unwrap();
-    assert_short_run_complete(&ctx, "notes.txt");
 }
 
 #[test]
@@ -6455,111 +4378,6 @@ fn scoped_rust_inspect_omits_the_note_of_a_typescript_server_started_earlier() {
     );
 }
 
-/// With no file TypeScript handles anywhere in the project, `package.json`
-/// alone never starts it: a scoped Rust inspect starts only rust-analyzer, and
-/// an unscoped inspect names TypeScript as not applicable instead of starting
-/// it, failing it, or saying nothing.
-#[test]
-fn package_json_without_typescript_files_never_starts_typescript() {
-    let (_temp_dir, root) = wrangler_rust_fixture();
-    // Each inspect gets its own context so the live-server roster after it
-    // reflects that call alone.
-    let ctx = tier2_ready_context(&root);
-    configure_fake_rust_and_typescript_lsp(&ctx);
-    let unscoped = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "inspect-unscoped-wrangler",
-            "command": "inspect",
-        }),
-    );
-    assert_eq!(unscoped["success"], true, "response: {unscoped:#}");
-    assert_eq!(
-        active_server_kinds(&ctx),
-        vec![ServerKind::Rust],
-        "response: {unscoped:#}"
-    );
-    assert_eq!(
-        not_applicable_producers(&unscoped),
-        vec!["typescript".to_string()],
-        "response: {unscoped:#}"
-    );
-    assert!(
-        failed_producers(&unscoped).is_empty(),
-        "not applicable is not a failure: {unscoped:#}"
-    );
-    let text = unscoped["text"].as_str().expect("inspect text");
-    assert!(
-        text.contains("diagnostics: producer typescript not applicable (package.json found"),
-        "text: {text}"
-    );
-
-    let ctx = configured_context(&root);
-    configure_fake_rust_and_typescript_lsp(&ctx);
-    let scoped = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "inspect-scoped-rust-wrangler",
-            "sections": ["diagnostics"],
-            "command": "inspect",
-            "scope": "src/lib.rs",
-        }),
-    );
-    assert_eq!(
-        active_server_kinds(&ctx),
-        vec![ServerKind::Rust],
-        "response: {scoped:#}"
-    );
-}
-
-/// Positive control for the two tests above: once the project has a
-/// TypeScript file, TypeScript is selected exactly as before, both for an
-/// unscoped inspect and for a scope naming that file.
-#[test]
-fn a_typescript_file_still_starts_typescript() {
-    let (_temp_dir, root) = wrangler_rust_fixture();
-    write_file(&root, "worker/index.ts", "export const answer = 42;\n");
-    let ctx = configured_context(&root);
-    configure_fake_rust_and_typescript_lsp(&ctx);
-
-    let scoped = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "inspect-scoped-typescript",
-            "sections": ["diagnostics"],
-            "command": "inspect",
-            "scope": "worker/index.ts",
-        }),
-    );
-    assert_eq!(
-        active_server_kinds(&ctx),
-        vec![ServerKind::TypeScript],
-        "response: {scoped:#}"
-    );
-
-    let ctx = tier2_ready_context(&root);
-    configure_fake_rust_and_typescript_lsp(&ctx);
-    let unscoped = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "inspect-unscoped-typescript",
-            "command": "inspect",
-        }),
-    );
-    assert_eq!(unscoped["success"], true, "response: {unscoped:#}");
-    let mut kinds = active_server_kinds(&ctx);
-    kinds.sort_by(|left, right| left.id_str().cmp(right.id_str()));
-    assert_eq!(
-        kinds,
-        vec![ServerKind::Rust, ServerKind::TypeScript],
-        "response: {unscoped:#}"
-    );
-    assert!(
-        not_applicable_producers(&unscoped).is_empty(),
-        "response: {unscoped:#}"
-    );
-}
-
 /// A scoped call over a warm root returns only scope-matching findings, and
 /// the same findings appear in the unscoped call.
 #[test]
@@ -6914,50 +4732,6 @@ fn scoped_diagnostics_external_biome_workspace_counts_json_with_authoritative_re
 }
 
 #[test]
-fn scoped_diagnostics_outside_project_root_report_error_or_named_gap() {
-    let (_temp, root) = fixture_project();
-    let (_external, external_root, file) = external_typescript_fixture();
-    let ctx = configured_context(&root);
-    configure_fake_rust_and_typescript_lsp(&ctx);
-
-    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
-        scoped_diagnostics_inspect_outside(&ctx, "inspect-outside-error", file.to_str().unwrap())
-    });
-    assert_eq!(response["success"], true, "{response:#}");
-    assert_eq!(
-        response["summary"]["diagnostics"]["errors"], 1,
-        "{response:#}"
-    );
-    assert_eq!(response["scope_files"], 1, "{response:#}");
-    assert_eq!(
-        response["summary"]["diagnostics"]["coverage"]["authoritative"], 1,
-        "{response:#}"
-    );
-    assert!(
-        response["details"]["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["file"] == diagnostic_path(&file)),
-        "{response:#}"
-    );
-    assert!(
-        response["text"]
-            .as_str()
-            .unwrap()
-            .contains("scope: 1 root, 1 file"),
-        "{response:#}"
-    );
-    assert!(
-        ctx.lsp()
-            .active_server_keys()
-            .iter()
-            .any(|key| key.kind == ServerKind::TypeScript && key.root == external_root),
-        "external workspace must own its server"
-    );
-}
-
-#[test]
 fn scoped_diagnostics_outside_project_root_unreported_is_named_gap() {
     let (_temp, root) = fixture_project();
     let (_external, external_root, file) = external_typescript_fixture();
@@ -7068,39 +4842,6 @@ fn scoped_diagnostics_mixed_inside_and_outside_project_root() {
 }
 
 #[test]
-fn scoped_diagnostics_outside_project_root_without_producer_is_named_gap() {
-    let (_temp, root) = fixture_project();
-    let (_external, external_root) = fixture_project();
-    let file = write_file(&external_root, "unknown.aft-unknown", "not checked\n");
-    let file = crate::helpers::canonicalize_like_product(&file);
-    let ctx = configured_context(&root);
-    let response = scoped_diagnostics_inspect_outside(
-        &ctx,
-        "inspect-outside-no-producer",
-        file.to_str().unwrap(),
-    );
-    assert_eq!(response["success"], true, "{response:#}");
-    assert_eq!(response["complete"], false, "{response:#}");
-    assert_eq!(response["scope_files"], 1, "{response:#}");
-    assert!(
-        response["summary"]["diagnostics"]["errors"].is_null(),
-        "{response:#}"
-    );
-    assert!(
-        response["gaps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|gap| gap["file"] == diagnostic_path(&file)
-                && gap["reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.contains("outside_project_root_unverified")
-                        && reason.contains("no LSP producer"))),
-        "{response:#}"
-    );
-}
-
-#[test]
 fn scoped_diagnostics_outside_project_root_excluded_by_tsconfig_is_named_gap() {
     let (_temp, root) = fixture_project();
     let (_external, external_root, file) = external_typescript_fixture();
@@ -7137,73 +4878,6 @@ fn scoped_diagnostics_outside_project_root_excluded_by_tsconfig_is_named_gap() {
                         && reason.contains("tsconfig"))),
         "{response:#}"
     );
-}
-
-#[test]
-fn scoped_typescript_sync_excluded_external_file_is_not_requested() {
-    let (_temp, root) = fixture_project();
-    let (_external, external_root, excluded) = external_typescript_fixture();
-    write_file(
-        &external_root,
-        "tsconfig.json",
-        "{\"include\":[\"included.ts\"]}\n",
-    );
-    let included = write_file(&external_root, "included.ts", "export const ok = 1;\n");
-    let log = root.join("typescript-sync-requests.jsonl");
-    let ctx = configured_context(&root);
-    configure_fake_rust_and_typescript_lsp(&ctx);
-    ctx.lsp()
-        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "categories");
-    ctx.lsp()
-        .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC_LOG", log.to_str().unwrap());
-    // The external root is outside the project, so the inspect is dispatched
-    // the way an OpenCode host's request is; without a host route the engine
-    // refuses outside paths before TypeScript is ever involved.
-    let response =
-        scoped_diagnostics_inspect_outside(&ctx, "ts-sync-excluded", excluded.to_str().unwrap());
-    assert_eq!(response["complete"], false, "{response:#}");
-    assert_eq!(response["scope_files"], 1, "{response:#}");
-    assert_eq!(
-        response["summary"]["diagnostics"]["coverage"]["authoritative"], 0,
-        "{response:#}"
-    );
-    assert!(
-        diagnostic_messages_for(&response, &diagnostic_path(&excluded)).is_empty(),
-        "{response:#}"
-    );
-    assert!(
-        response["gaps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|gap| gap["file"] == diagnostic_path(&excluded)
-                && gap["reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.contains("tsconfig"))),
-        "{response:#}"
-    );
-    assert!(
-        !log.exists(),
-        "an excluded file must not trigger synchronous requests"
-    );
-
-    // An included file exercises the same logger and successful server replies,
-    // so an empty excluded-file log cannot pass because logging was disconnected.
-    let included_response =
-        scoped_diagnostics_inspect_outside(&ctx, "ts-sync-included", included.to_str().unwrap());
-    assert_eq!(
-        included_response["summary"]["diagnostics"]["errors"], 1,
-        "{included_response:#}"
-    );
-    let requests = fs::read_to_string(log)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(requests.len(), 3);
-    assert!(requests
-        .iter()
-        .all(|request| request["arguments"][1]["file"] == file_uri(&included)));
 }
 
 /// Serve TypeScript under `package_root` the way TypeScript 7 is served: a
@@ -7396,108 +5070,6 @@ fn edit_match_as_opencode(ctx: &AppContext, id: &str, file: &Path, from: &str, t
     assert!(response.success, "{response:?}");
 }
 
-/// Fail when `response` certifies diagnostics for `file` that do not describe
-/// its current text. A stale result marked incomplete is acceptable; one
-/// counted as authoritative is not.
-fn assert_not_certified_stale(response: &Value, file: &Path, expected_errors: u64) {
-    let messages = diagnostic_messages_for(response, &diagnostic_path(file));
-    let reported = messages
-        .iter()
-        .filter(|message| message.as_str() == CONTENT_PULL_ERROR)
-        .count() as u64;
-    if response["complete"] == false {
-        assert!(
-            uncovered_files(response)
-                .iter()
-                .any(|(gap, _)| gap == &diagnostic_path(file)),
-            "an incomplete result must name the file it could not certify: {response:#}"
-        );
-        return;
-    }
-    assert_eq!(
-        reported, expected_errors,
-        "diagnostics certified as authoritative must describe the file's current text: {response:#}"
-    );
-}
-
-/// A scoped inspect of a file outside the project pulled its
-/// diagnostics (and closed the document again); an AFT edit then fixed the
-/// error and reopened the document in the server. The pulled report stays in
-/// the store as current, and the next inspect reads an already-open document's
-/// stored report instead of asking again, so it certifies the fixed error as
-/// authoritative.
-#[test]
-fn scoped_inspect_outside_project_drops_an_error_fixed_by_an_aft_edit() {
-    let (_temp, root) = fixture_project();
-    let (_external, external_root, file) = external_typescript_fixture();
-    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
-    let native = install_content_pull_native_typescript(&external_root);
-    let ctx = configured_context(&root);
-    configure_content_pull_typescript_lsp(&ctx, native.clone());
-
-    let before = crate::helpers::inspect_retrying_cold_deadline(|| {
-        scoped_diagnostics_inspect_outside(&ctx, "fixed-outside-before", file.to_str().unwrap())
-    });
-    assert_eq!(before["complete"], true, "{before:#}");
-    assert_eq!(
-        diagnostic_messages_for(&before, &diagnostic_path(&file)),
-        vec![CONTENT_PULL_ERROR.to_string()],
-        "control: the first inspect reports the error: {before:#}"
-    );
-    assert!(
-        ctx.lsp()
-            .active_server_keys()
-            .iter()
-            .any(|key| key.kind == native),
-        "control: the native TypeScript server analyzed the file"
-    );
-
-    edit_match_as_opencode(&ctx, "fixed-outside-edit", &file, "BROKEN", "5");
-    let after =
-        scoped_diagnostics_inspect_outside(&ctx, "fixed-outside-after", file.to_str().unwrap());
-    assert_not_certified_stale(&after, &file, 0);
-}
-
-/// After the AFT edit left the document open, the file is changed again by a
-/// plain disk write (as a shell append would), which nothing reports to the
-/// server, so its analysis still describes the earlier text.
-#[test]
-fn scoped_inspect_outside_project_sees_a_disk_write_after_an_aft_edit() {
-    let (_temp, root) = fixture_project();
-    let (_external, external_root, file) = external_typescript_fixture();
-    fs::write(&file, "export const n: number = 5;\n").unwrap();
-    let native = install_content_pull_native_typescript(&external_root);
-    let ctx = configured_context(&root);
-    configure_content_pull_typescript_lsp(&ctx, native.clone());
-
-    let before = crate::helpers::inspect_retrying_cold_deadline(|| {
-        scoped_diagnostics_inspect_outside(&ctx, "append-outside-before", file.to_str().unwrap())
-    });
-    assert_eq!(before["complete"], true, "{before:#}");
-    assert!(
-        diagnostic_messages_for(&before, &diagnostic_path(&file)).is_empty(),
-        "control: the clean file is reported clean: {before:#}"
-    );
-    assert!(
-        ctx.lsp()
-            .active_server_keys()
-            .iter()
-            .any(|key| key.kind == native),
-        "control: the native TypeScript server analyzed the file"
-    );
-    edit_match_as_opencode(&ctx, "append-outside-edit", &file, "= 5", "= 6");
-    let edited =
-        scoped_diagnostics_inspect_outside(&ctx, "append-outside-edited", file.to_str().unwrap());
-    assert_not_certified_stale(&edited, &file, 0);
-
-    let mut appended = fs::read_to_string(&file).unwrap();
-    appended.push_str("export const m: number = BROKEN;\n");
-    fs::write(&file, appended).unwrap();
-    let after =
-        scoped_diagnostics_inspect_outside(&ctx, "append-outside-after", file.to_str().unwrap());
-    assert_not_certified_stale(&after, &file, 1);
-}
-
 /// The same sequence as the out-of-project edit, inside the project. In a
 /// running session the project watcher sees AFT's own write and marks the old
 /// analysis stale, which hides the defect; without that event (these tests run
@@ -7546,136 +5118,6 @@ fn scoped_inspect_inside_project_drops_an_error_fixed_by_an_aft_edit_without_a_w
             "diagnostics certified as authoritative must describe the file's current text: {after:#}"
         );
     }
-}
-
-/// After an AFT edit left the document open, the file changed on disk to
-/// bytes that are not UTF-8 text, so AFT cannot send the server the current
-/// text. The server's analysis describes the older text, so the file must be
-/// reported unknown, with the reason, never certified.
-#[test]
-fn scoped_inspect_reports_a_file_unknown_when_its_changed_text_cannot_be_sent() {
-    let (_temp, root) = fixture_project();
-    let (_external, external_root, file) = external_typescript_fixture();
-    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
-    let native = install_content_pull_native_typescript(&external_root);
-    let ctx = configured_context(&root);
-    configure_content_pull_typescript_lsp(&ctx, native.clone());
-
-    let before =
-        scoped_diagnostics_inspect_outside(&ctx, "unsendable-before", file.to_str().unwrap());
-    assert_eq!(
-        diagnostic_messages_for(&before, &diagnostic_path(&file)),
-        vec![CONTENT_PULL_ERROR.to_string()],
-        "control: the first inspect reports the error: {before:#}"
-    );
-    assert!(
-        ctx.lsp()
-            .active_server_keys()
-            .iter()
-            .any(|key| key.kind == native),
-        "control: the native TypeScript server analyzed the file"
-    );
-    edit_match_as_opencode(&ctx, "unsendable-edit", &file, "BROKEN", "5");
-    let edited =
-        scoped_diagnostics_inspect_outside(&ctx, "unsendable-edited", file.to_str().unwrap());
-    assert_eq!(edited["complete"], true, "control: {edited:#}");
-    assert!(
-        diagnostic_messages_for(&edited, &diagnostic_path(&file)).is_empty(),
-        "control: the fixed file is reported clean: {edited:#}"
-    );
-
-    fs::write(&file, b"export const n: number = BROKEN;\n// \xff\xfe\n").unwrap();
-    let after =
-        scoped_diagnostics_inspect_outside(&ctx, "unsendable-after", file.to_str().unwrap());
-    assert_eq!(after["complete"], false, "{after:#}");
-    let gaps = uncovered_files(&after);
-    // The full agent-visible reason, pinned word for word: the wording was
-    // approved as written, so any change to it must show up here.
-    assert!(
-        gaps.iter().any(|(gap, reason)| gap == &diagnostic_path(&file)
-            && reason
-                == "changed on disk since the server last analyzed it, and AFT could not send it the current text; retry aft_inspect"),
-        "the file must be named unknown with the reason: {after:#}"
-    );
-    assert!(
-        diagnostic_messages_for(&after, &diagnostic_path(&file)).is_empty(),
-        "no analysis of the older text may be reported: {after:#}"
-    );
-}
-
-/// A server that answers pulls and clears a closed document's diagnostics
-/// with an empty, unversioned `publishDiagnostics` sent the clear late: after
-/// an AFT edit had already reopened the document. That push says nothing
-/// about the open text (which still has the error), so a scoped inspect must
-/// ask the server again rather than certify the file clean from it.
-#[test]
-fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
-    let (_temp, root) = fixture_project();
-    let (_external, external_root, file) = external_typescript_fixture();
-    fs::write(
-        &file,
-        "export const n: number = BROKEN;\nexport const other = 1;\n",
-    )
-    .unwrap();
-    let native = install_content_pull_native_typescript(&external_root);
-    let ctx = configured_context(&root);
-    configure_content_pull_typescript_lsp(&ctx, native.clone());
-    ctx.lsp()
-        .set_extra_env("AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE", "1");
-    ctx.lsp()
-        .set_extra_env("AFT_FAKE_LSP_CLOSE_DELAY_MS", "500");
-
-    let before =
-        scoped_diagnostics_inspect_outside(&ctx, "late-clear-before", file.to_str().unwrap());
-    assert_eq!(
-        diagnostic_messages_for(&before, &diagnostic_path(&file)),
-        vec![CONTENT_PULL_ERROR.to_string()],
-        "control: the first inspect reports the error: {before:#}"
-    );
-    assert!(
-        ctx.lsp()
-            .active_server_keys()
-            .iter()
-            .any(|key| key.kind == native),
-        "control: the native TypeScript server analyzed the file"
-    );
-    // An edit that keeps the error reopens the document before the server's
-    // delayed reply to the inspect's close arrives.
-    edit_match_as_opencode(&ctx, "late-clear-edit", &file, "other = 1", "other = 2");
-
-    // Control: the late clearing push reached the store, but without a
-    // document version it cannot certify the reopened file's content.
-    let canonical = crate::helpers::canonicalize_like_product(&file);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut lsp = ctx.lsp();
-        lsp.drain_events();
-        let landed = lsp
-            .diagnostics_store_for_test()
-            .entries_for_file(&canonical)
-            .into_iter()
-            .any(|(key, entry)| {
-                key.kind == native
-                    && entry.stale
-                    && !entry.from_document_pull
-                    && entry.diagnostics.is_empty()
-            });
-        drop(lsp);
-        if landed {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "control: the late clearing push never reached the store"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    assert!(!ctx.lsp().has_authoritative_report_for_file(&file));
-
-    let after =
-        scoped_diagnostics_inspect_outside(&ctx, "late-clear-after", file.to_str().unwrap());
-    assert_not_certified_stale(&after, &file, 1);
 }
 
 /// The reporter's scenario: the server reported on file Y only, so a scoped
@@ -7827,86 +5269,6 @@ fn scoped_diagnostics_render_clean_empty_for_covered_file_without_findings() {
     );
 }
 
-/// A blocking inspect facing a warming producer must wait for the producer to
-/// settle instead of rendering the warming store: the payload asserted below
-/// can only be built from a publish that arrives after the call started.
-#[test]
-fn blocking_inspect_waits_for_a_warming_producer_to_settle() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "Cargo.toml",
-        "[package]\nname = \"diag-blocking-wait\"\n",
-    );
-    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
-    // Blocking tool calls run every active category, so the Tier-2
-    // prerequisites (callgraph store, aggregates) must be ready first.
-    let ctx = Arc::new(configured_context_with_callgraph_store(&root, true));
-    tier2_run(
-        &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
-    );
-    configure_fake_rust_lsp(&ctx);
-    // Warming mode: didOpen publishes provisional diagnostics, and only a
-    // later didChange declares quiescence and publishes the settled set.
-    ctx.lsp().set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "1");
-    let config = ctx.config().clone();
-    ctx.lsp()
-        .notify_file_changed(&file, "fn main() {}\n", &config)
-        .expect("open document");
-    wait_for_lsp_report_state(&ctx, &file, true);
-
-    // Start inspect first, then release the producer only after its quiescence
-    // phase is observably waiting. This makes the post-start publish ordering
-    // deterministic without charging a fixed sleep to correctness.
-    const REQUEST_ID: &str = "inspect-blocking-wait";
-    let inspect_ctx = Arc::clone(&ctx);
-    let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
-    let inspector = thread::spawn(move || {
-        let response = serde_json::to_value(handle_inspect_tool_call(
-            &request(json!({
-                "id": REQUEST_ID,
-                "command": "inspect",
-            })),
-            &inspect_ctx,
-        ))
-        .expect("inspect response serializes");
-        response_tx
-            .send(response)
-            .expect("publish blocking inspect response");
-    });
-
-    wait_for_inspect_phase_start(REQUEST_ID, InspectPhaseId::LspQuiescence);
-    assert!(
-        matches!(
-            response_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ),
-        "blocking inspect returned before producer settlement"
-    );
-    ctx.lsp()
-        .notify_file_changed(&file, "fn main() { let _settled = 1; }\n", &config)
-        .expect("settle the producer via an edit");
-    let response = response_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("inspect did not settle before the outer hang catch");
-    inspector.join().expect("blocking inspector completes");
-
-    assert_eq!(response["success"], true, "response: {response:#}");
-    assert_eq!(response["inspect_terminal"], "fresh");
-    // Event-ordering proof that the wait blocked: this message exists only
-    // after the post-start publish was drained.
-    let details = response["details"]["diagnostics"]
-        .as_array()
-        .expect("diagnostics details");
-    assert!(
-        details
-            .iter()
-            .any(|item| item["message"] == "test diagnostic after change"),
-        "the settled publish must be part of the payload: {response:#}"
-    );
-}
-
 /// A producer that never settles leaves a named gap without hiding other categories.
 #[test]
 fn blocking_inspect_returns_before_the_configured_request_deadline() {
@@ -7982,76 +5344,6 @@ fn blocking_inspect_indexing_gap_names_elapsed_wait_and_retry() {
     let reason = gap["reason"].as_str().unwrap();
     assert!(reason.contains("still indexing after"), "{reason}");
     assert!(reason.contains("retry aft_inspect"), "{reason}");
-}
-
-/// This fake neither begins a compiler check nor publishes diagnostics.
-/// Quiescence alone is not evidence of a completed clean Rust check.
-#[test]
-fn blocking_inspect_names_a_quiescent_rust_producer_before_any_check_begins() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "Cargo.toml",
-        "[package]\nname = \"diag-blocking-quiesce-empty\"\n",
-    );
-    write_file(&root, "src/main.rs", "fn main() {}\n");
-    // Blocking tool calls run every active category, so the Tier-2
-    // prerequisites (callgraph store, aggregates) must be ready first.
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    tier2_run(
-        &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
-    );
-    configure_fake_rust_lsp(&ctx);
-    // Default fake rust-analyzer declares quiescence on `initialized` and
-    // only publishes on didOpen. Blocking inspect starts producers without
-    // opening documents, so the store stays empty after settlement.
-
-    let response = serde_json::to_value(handle_inspect_tool_call(
-        &request(json!({
-            "id": "inspect-blocking-quiesce-empty",
-            "command": "inspect",
-        })),
-        &ctx,
-    ))
-    .expect("inspect response serializes");
-
-    assert_eq!(response["success"], true, "response: {response:#}");
-    // The request completed, but Rust diagnostics are unknown, so the terminal
-    // is partial (a completed result that names the unknown producer) rather
-    // than fresh.
-    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
-    assert!(
-        response["partial_reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("rust")),
-        "{response:#}"
-    );
-    let phases = response["wait_stamp"]["phases"]
-        .as_array()
-        .unwrap_or_else(|| panic!("wait_stamp.phases missing: {response:#}"));
-    assert!(
-        phases.iter().any(|phase| phase["id"] == "lsp_quiescence"),
-        "quiescence must complete before the completed terminal: {response:#}"
-    );
-    assert!(
-        phases
-            .iter()
-            .any(|phase| { phase["id"] == "callgraph_ready" && phase["category"] == "dead_code" }),
-        "fresh dead_code must record the ready callgraph phase: {response:#}"
-    );
-    assert!(
-        phases.iter().any(|phase| phase["id"] == "tier2_rescan"),
-        "fresh Tier-2 work must appear in the completed phases: {response:#}"
-    );
-    let summary = response["summary"]["diagnostics"]
-        .as_object()
-        .expect("diagnostics summary");
-    assert!(summary["errors"].is_null(), "{response:#}");
-    assert!(summary["warnings"].is_null(), "{response:#}");
-    assert_eq!(summary["complete"], false, "{response:#}");
-    assert_eq!(summary["gaps"][0]["producer"], "rust", "{response:#}");
-    assert!(summary["by_producer"]["rust"]["errors"].is_null());
 }
 
 #[test]
@@ -8196,7 +5488,7 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     })
     .unwrap();
     collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
-    ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
+    ctx.update_status_bar_todos(Some(14));
 
     for sections in [json!(["dead_code"]), json!("todos")] {
         let params = json!({
@@ -8241,11 +5533,7 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
             .unwrap()
             .iter()
             .all(|phase| !matches!(phase["id"].as_str(), Some("lsp_start" | "lsp_quiescence"))));
-        let bar = ctx.status_bar_count_values();
-        assert_eq!(
-            (bar.dead_code, bar.unused_exports, bar.duplicates, bar.todos),
-            (Some(11), Some(12), Some(13), Some(14))
-        );
+        assert_eq!(ctx.status_bar_count_values().todos, Some(14));
     }
 
     // Omitted sections: the scoped request reports diagnostics and waits for
@@ -8269,10 +5557,9 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
         "omitted sections must wait for diagnostics producers: {:#}",
         response.data["wait_stamp"]
     );
-    let bar = ctx.status_bar_count_values();
     assert_eq!(
-        (bar.dead_code, bar.unused_exports, bar.duplicates, bar.todos),
-        (Some(11), Some(12), Some(13), Some(14)),
+        ctx.status_bar_count_values().todos,
+        Some(14),
         "a scoped request must not overwrite project totals"
     );
 }
@@ -8364,20 +5651,12 @@ fn inspect_offset_pages_all_150_unused_exports() {
     };
     let first = page(0);
     assert_eq!(first["success"], true, "{first:#}");
-    let bar = ctx.status_bar_count_values();
-    for (category, count) in [
-        ("dead_code", bar.dead_code),
-        ("unused_exports", bar.unused_exports),
-        ("duplicates", bar.duplicates),
-        ("todos", bar.todos),
-    ] {
-        assert_eq!(
-            count,
-            first["summary"][category]["count"]
-                .as_u64()
-                .map(|n| n as usize)
-        );
-    }
+    assert_eq!(
+        ctx.status_bar_count_values().todos,
+        first["summary"]["todos"]["count"]
+            .as_u64()
+            .map(|n| n as usize)
+    );
     assert!(first["text"]
         .as_str()
         .unwrap()
@@ -8443,7 +5722,6 @@ fn inspect_offset_pages_all_150_unused_exports() {
         scoped["details"]["unused_exports"],
         second_details["unused_exports"]
     );
-    assert_eq!(ctx.status_bar_count_values().unused_exports, Some(150));
 }
 
 #[test]
@@ -8452,7 +5730,9 @@ fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed(
     write_file(&root, "service.py", "def spare():\n    return 1\n");
     write_file(&root, "README.md", "documentation\n");
     let ctx = configured_context_with_callgraph_store(&root, true);
-    ctx.update_status_bar_tier2(Some(99), Some(0), Some(0), Some(0), false);
+    // Dead code answers only once the root's call graph is published; until
+    // then it reports pending, with no gaps.
+    crate::helpers::wait_for_published_call_graph_in(&ctx);
     let response = inspect(
         &ctx,
         json!({"id":"python-only", "command":"inspect", "sections":["dead_code"]}),
@@ -8468,9 +5748,17 @@ fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed(
         .any(|gap| gap["kind"] == "language_unsupported"
             && gap["language"] == "python"
             && gap["files"] == 1));
-    assert_eq!(ctx.status_bar_count_values().dead_code, None);
 
-    write_file(&root, "main.ts", "console.log('supported');\n");
+    // Inspect lists files from the root's index store, which learns of a file
+    // written outside AFT from the project watcher; this context runs none,
+    // so feed the event the watcher would report.
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+    let main = write_file(&root, "main.ts", "console.log('supported');\n");
+    watcher_tx
+        .send(aft::watcher_filter::WatcherDispatchEvent::Paths(vec![main]))
+        .expect("send watcher event");
+    aft::runtime_drain::drain_watcher_events(&ctx);
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({"id":"python-mixed", "command":"inspect", "sections":["dead_code"]})),
         &ctx,
@@ -8479,10 +5767,6 @@ fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed(
     let summary = &response["summary"]["dead_code"];
     assert!(summary["count"].is_u64(), "{response:#}");
     assert_eq!(summary["complete"], false);
-    assert_eq!(
-        ctx.status_bar_count_values().dead_code,
-        summary["count"].as_u64().map(|count| count as usize)
-    );
     assert!(response["text"].as_str().unwrap().contains("python"));
 }
 
@@ -8545,7 +5829,7 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
     );
     assert!(warming.accepted_snapshots.is_empty());
     assert_eq!(warming.pending_servers.len(), expected.len());
-    ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
+    ctx.update_status_bar_todos(Some(14));
     assert!(ctx.lsp().has_diagnostic_report_for_file(&pre_opened));
     assert!(
         ctx.status_bar_count_values().errors.is_none(),
@@ -8585,20 +5869,7 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
     );
     assert!(response.success, "{response:?}");
     let after = ctx.status_bar_count_values();
-    assert_eq!(
-        (
-            after.dead_code,
-            after.unused_exports,
-            after.duplicates,
-            after.todos
-        ),
-        (
-            before.dead_code,
-            before.unused_exports,
-            before.duplicates,
-            before.todos
-        )
-    );
+    assert_eq!(after.todos, before.todos);
     assert_eq!(after.diagnostics, before.diagnostics);
     assert_eq!(after.diagnostics_gaps, before.diagnostics_gaps);
     assert!(
@@ -9064,348 +6335,6 @@ fn inspect_command_diagnostics_details_honor_top_k() {
             .len(),
         3,
         "diagnostics details should honor topK: {response:#}"
-    );
-}
-
-#[test]
-fn inspect_failed_producer_reason_names_exit_code_and_first_stderr_line() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "Cargo.toml",
-        "[package]\nname = \"inspect-exit\"\nversion = \"0.1.0\"\n",
-    );
-    write_file(&root, "src/lib.rs", "pub fn rust_value() -> u8 { 1 }\n");
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    tier2_run(
-        &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
-    );
-
-    let mut lsp = ctx.lsp();
-    lsp.override_binary(ServerKind::Rust, fake_server_path());
-    lsp.set_extra_env("AFT_FAKE_LSP_INIT_EXIT_CODE", "3");
-    // Many stderr lines: the inspect reason must quote the first one and
-    // stay short instead of inlining the whole tail.
-    let mut stderr = vec!["error: rust-analyzer could not load the workspace".to_string()];
-    stderr.extend((0..40).map(|index| format!("stderr filler line {index:02}")));
-    lsp.set_extra_env("AFT_FAKE_LSP_INIT_EXIT_STDERR", &stderr.join("|"));
-    drop(lsp);
-
-    let response = serde_json::to_value(handle_inspect_tool_call(
-        &request(json!({
-            "id": "inspect-producer-exit",
-            "sections": ["diagnostics"],
-            "command": "inspect",
-            "scope": "src/lib.rs",
-        })),
-        &ctx,
-    ))
-    .expect("inspect response serializes");
-
-    let text = response["text"].as_str().expect("rendered text");
-    assert!(text.starts_with("PARTIAL — diagnostics unknown:"), "{text}");
-    assert!(!text.contains("0 errors"), "{text}");
-    assert!(text.contains("rust"), "{text}");
-    assert!(response["summary"]["diagnostics"]["errors"].is_null());
-    assert!(response["summary"]["diagnostics"]["warnings"].is_null());
-    let counts = ctx.status_bar_count_values();
-    assert_eq!((counts.errors, counts.warnings), (None, None));
-
-    let rust_gap = response["gaps"]
-        .as_array()
-        .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
-        .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
-    let reason = rust_gap["reason"].as_str().expect("gap reason");
-    assert!(
-        reason.contains("server crashed during initialize (exit 3 after "),
-        "reason must name the exit code: {reason}"
-    );
-    assert!(
-        reason.contains("error: rust-analyzer could not load the workspace"),
-        "reason must quote the first stderr line: {reason}"
-    );
-    assert!(
-        !reason.contains("stderr filler line 39"),
-        "reason must not inline the whole stderr tail: {reason}"
-    );
-    assert!(
-        !reason.contains('\n') && reason.len() <= 600,
-        "reason must stay a bounded single line ({} bytes): {reason:?}",
-        reason.len()
-    );
-}
-
-#[test]
-fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
-    // A fresh worktree of a JavaScript project: package.json but no
-    // node_modules, so the TypeScript server binary cannot be resolved.
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "web/package.json", "{\"name\":\"rollup-web\"}\n");
-    // Keep package.json itself out of the scoped candidates: it is a JSON
-    // file with a producer of its own and would add a second cause.
-    write_file(&root, ".aftignore", "package.json\n");
-    for index in 0..7 {
-        write_file(
-            &root,
-            &format!("web/src/file_{index}.ts"),
-            &format!("export const value{index} = {index};\n"),
-        );
-    }
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    tier2_run(
-        &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
-    );
-    {
-        let mut lsp = ctx.lsp();
-        lsp.override_binary(
-            ServerKind::TypeScript,
-            PathBuf::from("/definitely/missing/typescript-language-server"),
-        );
-        // Keep the other JavaScript-family servers out of the picture so the
-        // test does not depend on what is installed on this machine.
-        lsp.override_binary(
-            ServerKind::Biome,
-            PathBuf::from("/definitely/missing/biome"),
-        );
-    }
-
-    let response = serde_json::to_value(handle_inspect_tool_call(
-        &request(json!({
-            "id": "inspect-uncovered-rollup",
-            "sections": ["diagnostics"],
-            "command": "inspect",
-            "scope": "web",
-            "topK": 3,
-        })),
-        &ctx,
-    ))
-    .expect("inspect response serializes");
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(response["complete"], false);
-    let text = response["text"].as_str().expect("rendered text");
-    let group_lines = text
-        .lines()
-        .filter(|line| line.starts_with("PARTIAL — diagnostics unknown:"))
-        .collect::<Vec<_>>();
-    assert_eq!(group_lines.len(), 1, "one line per cause: {text}");
-    assert!(
-        group_lines[0].starts_with("PARTIAL — diagnostics unknown: typescript @ web: "),
-        "{text}"
-    );
-    // The status header carries the install remedy exactly once.
-    let remedy = "no node_modules in web: the project's dependencies are not installed; \
-                  run your package manager's install";
-    assert_eq!(
-        text.matches(remedy).count(),
-        1,
-        "the cause must name the install remedy exactly once: {text}"
-    );
-    assert!(
-        text.lines().any(|line| line
-            .starts_with("PARTIAL — diagnostics unknown: typescript @ web: ")
-            && line.contains(remedy)),
-        "the producer line must carry the install remedy: {text}"
-    );
-    assert!(
-        group_lines[0].ends_with("(7 files); retry aft_inspect."),
-        "{text}"
-    );
-    let listed = text
-        .lines()
-        .filter(|line| line.starts_with("  web/src/file_") && line.ends_with(".ts"))
-        .count();
-    assert_eq!(listed, 3, "at most topK paths: {text}");
-    assert!(
-        text.contains("shown 3 of 7 items (cap) · narrow: topK, scope, sections"),
-        "{text}"
-    );
-
-    // Every file keeps its structured gap row for machine consumers.
-    let uncovered = response["gaps"]
-        .as_array()
-        .expect("gaps")
-        .iter()
-        .filter(|gap| gap["kind"] == "uncovered_file")
-        .collect::<Vec<_>>();
-    assert_eq!(uncovered.len(), 7, "{response:#}");
-    assert!(uncovered
-        .iter()
-        .all(|gap| gap["cause"]["producer"] == "typescript" && gap["cause"]["root"] == "web"));
-}
-
-#[test]
-fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "Cargo.toml",
-        "[package]\nname = \"inspect-gap\"\nversion = \"0.1.0\"\n",
-    );
-    write_file(&root, "src/lib.rs", "pub fn rust_value() -> u8 { 1 }\n");
-    write_file(
-        &root,
-        "web/package.json",
-        "{\"name\":\"inspect-gap-web\"}\n",
-    );
-    write_file(&root, ".aftignore", "package.json\n");
-    write_file(
-        &root,
-        "web/src/app.ts",
-        "export function tsValue(): number { return 1; }\n",
-    );
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    tier2_run(
-        &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
-    );
-
-    let rust_root_uri = file_uri(&root);
-    let mut lsp = ctx.lsp();
-    lsp.override_binary(ServerKind::Rust, fake_server_path());
-    lsp.override_binary(ServerKind::TypeScript, fake_server_path());
-    lsp.set_extra_env("AFT_FAKE_LSP_PULL", "1");
-    lsp.set_extra_env("AFT_FAKE_LSP_INIT_CRASH_ROOT_URI", &rust_root_uri);
-    drop(lsp);
-
-    // A blocking scoped inspect reads the live report of a document that is
-    // already open instead of asking the server again, so the TypeScript
-    // findings warmed through the normal edit path are the ones it reports.
-    let app_ts = root.join("web/src/app.ts");
-    open_with_lsp(
-        &ctx,
-        &app_ts,
-        "export function tsValue(): number { return 1; }\n",
-    );
-
-    let before_failure = ctx.status_bar_count_values();
-    // TypeScript's report alone cannot certify project totals while the
-    // expected Rust producer has not supplied authoritative diagnostics.
-    assert_eq!(
-        (before_failure.errors, before_failure.warnings),
-        (None, None)
-    );
-
-    let response = serde_json::to_value(handle_inspect_tool_call(
-        &request(json!({
-            "id": "inspect-producer-gap",
-            "sections": ["diagnostics"],
-            "command": "inspect",
-            "scope": ["src/lib.rs", "web/src/app.ts"],
-        })),
-        &ctx,
-    ))
-    .expect("inspect response serializes");
-
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    // The Rust producer failed, so the completed result is partial and its
-    // reason names rust.
-    assert_eq!(response["inspect_terminal"], "partial");
-    assert!(
-        response["partial_reason"]
-            .as_str()
-            .is_some_and(
-                |reason| reason.starts_with("diagnostics unknown: rust-analyzer @ .:")
-                    && reason.ends_with("retry aft_inspect.")
-            ),
-        "{response:#}"
-    );
-    assert_eq!(response["complete"], false);
-    assert!(
-        response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"]
-            .as_u64()
-            .is_some_and(|errors| errors > 0),
-        "the working TypeScript producer's diagnostics should survive: {response:#}"
-    );
-    let rust_gap = response["gaps"]
-        .as_array()
-        .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
-        .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
-    let text = response["text"].as_str().expect("rendered text");
-    assert!(text.starts_with("PARTIAL — diagnostics unknown:"), "{text}");
-    assert!(!text.contains("diagnostics: 0 errors"), "{text}");
-    assert!(text.contains("from typescript"), "{text}");
-    assert!(text.contains("test diagnostic error"), "{text}");
-    assert!(text.contains("rust"), "{text}");
-    assert!(response["summary"]["diagnostics"]["errors"].is_null());
-    let counts = ctx.status_bar_count_values();
-    assert_eq!((counts.errors, counts.warnings), (None, None));
-    assert_eq!(rust_gap["kind"], "failed_producer");
-    assert_eq!(rust_gap["categories"], json!(["diagnostics"]));
-    assert!(
-        rust_gap["reason"]
-            .as_str()
-            .is_some_and(|reason| !reason.is_empty()),
-        "failed producer reason missing: {response:#}"
-    );
-}
-
-#[test]
-fn scoped_rust_inspect_preserves_stale_cargo_lock() {
-    let available = std::process::Command::new("rust-analyzer")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if !available {
-        eprintln!("SKIP scoped_rust_inspect_preserves_stale_cargo_lock: rust-analyzer is not installed (or rustup component unavailable)");
-        return;
-    }
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "Cargo.toml", "[package]\nname = \"lock-reader\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlocal-dep = { path = \"dep\" }\n");
-    write_file(
-        &root,
-        "src/lib.rs",
-        "pub fn value() -> u8 { local_dep::value() }\n",
-    );
-    let manifest = write_file(
-        &root,
-        "dep/Cargo.toml",
-        "[package]\nname = \"local-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    );
-    write_file(&root, "dep/src/lib.rs", "pub fn value() -> u8 { 1 }\n");
-    let generated = std::process::Command::new("cargo")
-        .args(["generate-lockfile", "--offline"])
-        .current_dir(&root)
-        .output()
-        .expect("cargo is required for Rust integration tests");
-    assert!(generated.status.success(), "{generated:?}");
-    let before = fs::read(root.join("Cargo.lock")).unwrap();
-    fs::write(
-        manifest,
-        "[package]\nname = \"local-dep\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    ensure_callgraph_store_ready(&ctx);
-    let response = serde_json::to_value(handle_inspect_tool_call(
-        &request(json!({
-            "id": "inspect-stale-lock",
-            "command": "inspect",
-            "scope": "src",
-            "sections": ["diagnostics"],
-        })),
-        &ctx,
-    ))
-    .unwrap();
-    assert_eq!(
-        fs::read(root.join("Cargo.lock")).unwrap(),
-        before,
-        "Rust-scoped inspect rewrote the stale Cargo.lock"
-    );
-    assert_eq!(ctx.lsp().active_server_keys().len(), 1, "{response:#}");
-    assert_eq!(response["complete"], false, "{response:#}");
-    let gap = response["gaps"]
-        .as_array()
-        .and_then(|gaps| {
-            gaps.iter()
-                .find(|gap| gap["kind"] == "failed_producer" && gap["producer"] == "rust")
-        })
-        .unwrap_or_else(|| panic!("missing rust-analyzer failure: {response:#}"));
-    assert!(
-        gap["reason"].as_str().unwrap().contains("--locked"),
-        "metadata failure must explain why diagnostics are unavailable: {response:#}"
     );
 }
 
@@ -10771,164 +7700,13 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
         .contains_key("rust"));
 }
 
-/// With no opened files, a clean compiler check may publish no reports.
-/// Its matching check-begin and check-end events still certify zero crate errors.
-#[test]
-fn unscoped_rust_inspect_certifies_a_clean_check_without_reports_with_real_rust_analyzer() {
-    if !crate::helpers::real_rust_analyzer_available(
-        "unscoped_rust_inspect_certifies_a_clean_check_without_reports_with_real_rust_analyzer",
-    ) {
-        return;
-    }
-    let (_temp_dir, root, _lib) = single_crate_fixture("unscoped-real-clean");
-    generate_fixture_lockfile(&root);
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    tier2_run(
-        &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
-    );
-    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
-        inspect_tool_call(
-            &ctx,
-            json!({
-                "id": "unscoped-real-clean", "command": "inspect", "sections": "diagnostics"
-            }),
-        )
-    });
-    eprintln!("real Rust clean unscoped: {response:#}");
-    assert!(
-        !ctx.lsp().has_any_diagnostic_reports(),
-        "the clean zero-report authority path must execute"
-    );
-    assert_eq!(
-        response["summary"]["diagnostics"]["errors"], 0,
-        "{response:#}"
-    );
-    assert_eq!(
-        response["summary"]["diagnostics"]["by_producer"]["rust"]["errors"], 0,
-        "{response:#}"
-    );
-    assert_ne!(
-        response["summary"]["diagnostics"]["complete"], false,
-        "{response:#}"
-    );
-    assert_ne!(response["complete"], false, "{response:#}");
-}
-
-/// Unscoped inspect must collect a compiler error without relying on didOpen
-/// diagnostics for the broken source file.
-#[test]
-fn unscoped_rust_inspect_reports_a_compile_error_with_real_rust_analyzer() {
-    if !crate::helpers::real_rust_analyzer_available(
-        "unscoped_rust_inspect_reports_a_compile_error_with_real_rust_analyzer",
-    ) {
-        return;
-    }
-    let (_temp_dir, root, lib) = single_crate_fixture("unscoped-real-error");
-    fs::write(
-        &lib,
-        "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) { (v, v) }\n",
-    )
-    .unwrap();
-    generate_fixture_lockfile(&root);
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    tier2_run(
-        &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
-    );
-    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
-        inspect_tool_call(
-            &ctx,
-            json!({
-                "id": "unscoped-real-error", "command": "inspect", "sections": "diagnostics"
-            }),
-        )
-    });
-    eprintln!("real Rust compile error unscoped: {response:#}");
-    assert_eq!(
-        response["summary"]["diagnostics"]["errors"], 1,
-        "{response:#}"
-    );
-    assert!(
-        diagnostic_sources_for(&response, "src/lib.rs")
-            .iter()
-            // Explicit inspect labels its compiler reports separately from LSP reports.
-            .any(|(source, message)| {
-                (source == "rustc" || source == "cargo check (aft_inspect)")
-                    && message.contains("moved value")
-            }),
-        "{response:#}"
-    );
-}
-
-fn generate_fixture_lockfile(root: &Path) {
-    let generated = std::process::Command::new("cargo")
-        .args(["generate-lockfile", "--offline"])
-        .current_dir(root)
-        .output()
-        .expect("cargo is required for real Rust fixtures");
-    assert!(generated.status.success(), "{generated:?}");
-}
-
-#[test]
-fn rust_analyzer_warning_keeps_diagnostics_and_reports_note() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-warning\"\n");
-    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
-    let ctx = configured_context_with_callgraph_store(&root, true);
-    ensure_callgraph_store_ready(&ctx);
-    configure_fake_rust_lsp(&ctx);
-    ctx.lsp()
-        .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "warning");
-    open_with_lsp(&ctx, &file, "fn main() {}\n");
-
-    let response = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "inspect-analyzer-warning",
-            "command": "inspect",
-            "scope": "src/main.rs",
-            "sections": ["diagnostics"],
-        }),
-    );
-    assert_eq!(response["success"], true, "{response:#}");
-    // Scoped inspects report Tier-2 categories as not computed, so only the
-    // diagnostics category is expected to be complete here.
-    assert!(
-        response["summary"]["diagnostics"].get("complete").is_none(),
-        "a rust-analyzer warning must not make diagnostics incomplete: {response:#}"
-    );
-    assert_eq!(
-        response["summary"]["diagnostics"]["errors"], 1,
-        "{response:#}"
-    );
-    assert_eq!(
-        response["summary"]["diagnostics"]["warnings"], 1,
-        "{response:#}"
-    );
-    assert_eq!(
-        response["details"]["diagnostics"].as_array().unwrap().len(),
-        2,
-        "{response:#}"
-    );
-    let note = "rust-analyzer warning: proc-macro server failed to start";
-    assert_eq!(
-        response["summary"]["diagnostics"]["notes"],
-        json!([note]),
-        "{response:#}"
-    );
-    assert!(
-        response["text"].as_str().unwrap().contains(note),
-        "{response:#}"
-    );
-}
-
 #[test]
 fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"partial-diag\"\n");
     let file = write_file(&root, "src/main.rs", "// TODO: finish\nfn main() {}\n");
-    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_diagnostics_timeout_and_callgraph(&root, 10_000, true);
     open_with_server_status_mode(&ctx, &file, "1");
     wait_for_lsp_report_state(&ctx, &file, true);
     let response = serde_json::to_value(handle_inspect_tool_call(
@@ -10960,4 +7738,95 @@ fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
     );
     assert!(response["summary"]["diagnostics"]["errors"].is_null());
     assert_eq!(ctx.status_bar_count_values().errors, None);
+}
+
+/// Configure and edits refresh only the status bar's TODO count in the
+/// background. Dead code, unused exports, duplicates, cycles and complexity
+/// run only inside an `aft_inspect` call, so no automatic refresh starts one.
+#[test]
+fn configure_and_edits_start_no_whole_repository_analysis() {
+    use aft::inspect::tier2_scheduler::{
+        TIER2_REFRESH_COLD_CACHE_DELAY, TIER2_REFRESH_DEBOUNCE, TIER2_REFRESH_MIN_INTERVAL,
+    };
+    use aft::inspect::Tier2TriggerReason;
+
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    write_file(
+        &root,
+        "src/todo.ts",
+        "// TODO: one\nexport const todo = 1;\n",
+    );
+    // The TODO count reads the call-graph index's records.
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    // As the standalone loop does after a configure: the index store binds
+    // the root and builds.
+    aft::runtime_drain::standalone_root_configured(&ctx);
+    let manager = ctx.inspect_manager();
+    let no_whole_repository_work = |phase: &str| {
+        // A started analysis registers before it runs, so polling for a
+        // while catches one however quickly it would finish.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            assert_eq!(
+                manager.reuse_start_count_for_test(),
+                0,
+                "{phase} started a whole-repository analysis"
+            );
+            assert!(
+                !manager.tier2_any_in_flight(),
+                "{phase} queued a whole-repository analysis"
+            );
+            aft::runtime_drain::drain_inspect_events(&ctx);
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    // The first refresh after configure: the warm-up that used to run every
+    // whole-repository analysis now refreshes the TODO count alone.
+    let configured_at = Instant::now()
+        .checked_sub(TIER2_REFRESH_COLD_CACHE_DELAY + Duration::from_secs(1))
+        .expect("monotonic clock is older than the cold-cache delay");
+    ctx.reset_tier2_refresh_scheduler_at(configured_at);
+    let now = Instant::now();
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(now, 0),
+        Some(Tier2TriggerReason::ConfigureWarm)
+    );
+    no_whole_repository_work("configure warm-up");
+    // The background count waits for the index store's first build.
+    let todos_become = |expected: usize| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ctx.status_bar_count_values().todos != Some(expected) && Instant::now() < deadline {
+            aft::runtime_drain::drain_inspect_events(&ctx);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(ctx.status_bar_count_values().todos, Some(expected));
+    };
+    todos_become(1);
+
+    // An edit, through the edit tool the index store hears, then the quiet
+    // window after it.
+    let edit = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "configure-and-edits-change",
+            "command": "edit_match",
+            "file": root.join("src/todo.ts").display().to_string(),
+            "match": "// TODO: one\n",
+            "replacement": "// TODO: one\n// TODO: two\n",
+        })),
+        &ctx,
+    );
+    assert!(edit.success, "{edit:?}");
+    ctx.add_pending_tier2_paths([root.join("src/todo.ts")]);
+    let edited_at = now + TIER2_REFRESH_MIN_INTERVAL;
+    assert_eq!(ctx.tick_tier2_refresh_scheduler_at(edited_at, 1), None);
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(edited_at + TIER2_REFRESH_DEBOUNCE, 0),
+        Some(Tier2TriggerReason::Debounce)
+    );
+    no_whole_repository_work("edit refresh");
+    todos_become(2);
+    assert_eq!(manager.reuse_completion_count(), 0);
 }

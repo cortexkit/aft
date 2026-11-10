@@ -47,7 +47,9 @@ use std::time::{Duration, Instant};
 
 use crate::context::AppContext;
 use crate::protocol::RawRequest;
-use crate::search_index::{PROVISIONAL_IDENTITY_EXHAUSTED_REASON, PROVISIONAL_IDENTITY_REASON};
+use crate::root_identity::key::{
+    PROVISIONAL_IDENTITY_EXHAUSTED_REASON, PROVISIONAL_IDENTITY_REASON,
+};
 
 /// Delay before the first retry after the bind.
 const FIRST_DELAY: Duration = Duration::from_millis(250);

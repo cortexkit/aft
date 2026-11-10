@@ -48,7 +48,6 @@ describe("OpenCode 1 and 2 status push compatibility", () => {
       "dead_code",
       "todos",
     ]);
-    expect(formatAftStatusSegment(status)).toContain("D○");
     expect(formatAftStatusSegment(status)).toContain("T○");
     expect(snapshot).toMatchObject({
       storage_refusals_total: 19,

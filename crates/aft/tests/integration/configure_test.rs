@@ -605,13 +605,11 @@ fn configure_does_not_warn_for_file_discovered_non_auto_installable_lsp() {
 
     let (shutdown, stderr) = aft.stderr_output();
     assert!(shutdown.success());
+    // The phases every shutdown logs; the index store adds no flush phase
+    // of its own.
     for phase in [
         "begin graceful_stdin=true",
         "pending_responses_drained",
-        "search_index_flush_start",
-        "search_index_flush_done",
-        "callgraph_refresh_flush_start",
-        "callgraph_refresh_flush_done",
         "runtime_cleanup_start",
         "runtime_cleanup_done",
         "complete",

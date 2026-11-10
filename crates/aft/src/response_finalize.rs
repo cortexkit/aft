@@ -786,24 +786,19 @@ pub fn attach_bg_completions(
 }
 
 fn aft_status_segment(counts: &crate::context::StatusBarCounts) -> String {
-    let stale_mark = if counts.tier2_stale { "~" } else { "" };
     // Self-labeled per the fleet status-line format ruling (2026-08-17): the
     // holder composes segments label-free and joins module boundaries with a
     // bullet, so each publisher's text must carry its own leading label.
     format!(
-        "AFT E{} W{} | {}D{} U{} C{} | T{}",
-        counts.errors,
-        counts.warnings,
-        stale_mark,
-        counts.dead_code,
-        counts.unused_exports,
-        counts.duplicates,
-        counts.todos
+        "AFT E{} W{} | T{}",
+        counts.errors, counts.warnings, counts.todos
     )
 }
 
 /// Renders the agent-facing bar from the omission-preserving values. A category with no
 /// trustworthy value yet shows `?` (as the OpenCode footer does) rather than a clean `0`.
+/// The bar has no dead-code, unused-export or duplicate counts: those analyses run only
+/// when an agent calls `aft_inspect`, so a background count would be stale after any edit.
 fn agent_status_bar(values: &crate::context::StatusBarCountValues) -> String {
     let count = |value: Option<usize>, category: &str| -> String {
         if values.disabled_categories.contains(&category) {
@@ -812,15 +807,10 @@ fn agent_status_bar(values: &crate::context::StatusBarCountValues) -> String {
             value.map_or_else(|| "?".to_string(), |value| value.to_string())
         }
     };
-    let stale_mark = if values.tier2_stale { "~" } else { "" };
     format!(
-        "[AFT E{} W{} | {}D{} U{} C{} | T{}]",
+        "[AFT E{} W{} | T{}]",
         count(values.errors, "diagnostics"),
         count(values.warnings, "diagnostics"),
-        stale_mark,
-        count(values.dead_code, "dead_code"),
-        count(values.unused_exports, "unused_exports"),
-        count(values.duplicates, "duplicates"),
         count(values.todos, "todos")
     )
 }
@@ -922,16 +912,9 @@ fn status_bar_line(
         } => {}
     }
     let values = counts.or_else(|| ctx.try_status_bar_count_values())?;
-    let nothing_known = [
-        values.errors,
-        values.warnings,
-        values.dead_code,
-        values.unused_exports,
-        values.duplicates,
-        values.todos,
-    ]
-    .iter()
-    .all(Option::is_none);
+    let nothing_known = [values.errors, values.warnings, values.todos]
+        .iter()
+        .all(Option::is_none);
     if nothing_known || !ctx.should_emit_status_bar_for_session(session_id, &values) {
         return None;
     }
@@ -951,7 +934,6 @@ fn finalize_prefix(
     acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
     // Dispatch attaches these before tool text is rendered. Direct protocol
     // callers also need them; attachment is idempotent for the pinned outcome.
-    attach_checkout_query_gaps(response, ctx);
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
@@ -1114,16 +1096,27 @@ mod tests {
     fn agent_bar_marks_missing_categories_instead_of_zeroing_them() {
         let values = StatusBarCountValues {
             errors: None,
-            warnings: None,
-            dead_code: Some(21),
-            unused_exports: Some(0),
-            duplicates: Some(13),
+            warnings: Some(0),
             todos: None,
-            tier2_stale: true,
             disabled_categories: Vec::new(),
             ..Default::default()
         };
-        assert_eq!(agent_status_bar(&values), "[AFT E? W? | ~D21 U0 C13 | T?]");
+        assert_eq!(agent_status_bar(&values), "[AFT E? W0 | T?]");
+    }
+
+    /// The whole-repository analyses run only inside `aft_inspect`, so the bar
+    /// carries no dead-code, unused-export or duplicate segment and no `~`
+    /// staleness marker for them, even when a category is switched off.
+    #[test]
+    fn agent_bar_has_no_whole_repository_segment() {
+        let values = StatusBarCountValues {
+            errors: Some(1),
+            warnings: Some(2),
+            todos: Some(3),
+            disabled_categories: vec!["dead_code", "duplicates"],
+            ..Default::default()
+        };
+        assert_eq!(agent_status_bar(&values), "[AFT E1 W2 | T3]");
     }
 
     fn standalone_ctx() -> AppContext {
@@ -1141,7 +1134,7 @@ mod tests {
     #[test]
     fn bar_is_appended_to_text_only_on_change_and_never_to_textless_responses() {
         let ctx = standalone_ctx();
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(4));
 
         let mut textless = Response::success("plumbing", serde_json::json!({}));
         finalize_response_with_bg_completions(&mut textless, &ctx, "s", "read", false);
@@ -1154,14 +1147,14 @@ mod tests {
         let mut first = String::from("file contents");
         let mut response = Response::success("first", serde_json::json!({}));
         finalize_tool_response(&mut response, &mut first, &ctx, "s", "read", false);
-        assert_eq!(first, "file contents\n\n[AFT E? W? | D1 U2 C3 | T4]");
+        assert_eq!(first, "file contents\n\n[AFT E? W? | T4]");
 
         let mut unchanged = String::from("file contents");
         finalize_tool_response(&mut response, &mut unchanged, &ctx, "s", "read", false);
         assert_eq!(unchanged, "file contents");
 
         let mut excluded = String::from("drained");
-        ctx.update_status_bar_tier2(Some(9), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(9));
         finalize_tool_response(
             &mut response,
             &mut excluded,
@@ -1175,16 +1168,13 @@ mod tests {
         let mut standalone =
             Response::success("standalone", serde_json::json!({ "text": "listing\n" }));
         finalize_response_with_bg_completions(&mut standalone, &ctx, "s", "glob", false);
-        assert_eq!(
-            standalone.data["text"],
-            "listing\n\n[AFT E? W? | D9 U2 C3 | T4]"
-        );
+        assert_eq!(standalone.data["text"], "listing\n\n[AFT E? W? | T9]");
     }
 
     #[test]
     fn status_bar_deduplicates_per_session() {
         let ctx = standalone_ctx();
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(4));
         for session in ["first", "second"] {
             let mut response = Response::success("bar", serde_json::json!({}));
             let mut text = "contents".to_string();
@@ -1199,7 +1189,7 @@ mod tests {
     #[test]
     fn fleet_and_agent_bar_share_one_count_sample() {
         let ctx = standalone_ctx();
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(4));
         let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
         ctx.install_fleet_status_client(Some(client));
         crate::context::STATUS_COUNT_PROBES.with(|count| count.set(0));
@@ -1220,7 +1210,7 @@ mod tests {
     #[test]
     fn cross_root_marker_suppresses_the_bar_and_is_stripped() {
         let ctx = standalone_ctx();
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.update_status_bar_todos(Some(4));
         let mut response = Response::success(
             "search",
             serde_json::json!({ "text": "hits", "_aft_suppress_status_bar": true }),
@@ -1239,7 +1229,7 @@ mod tests {
             },
         );
         ctx.set_harness(Harness::Opencode);
-        ctx.update_status_bar_tier2(Some(21), Some(12), Some(13), Some(14), false);
+        ctx.update_status_bar_todos(Some(14));
         let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
         ctx.install_fleet_status_client(Some(client));
         let mut response = Response::success("status", serde_json::json!({}));
@@ -1265,15 +1255,11 @@ mod tests {
         let counts = StatusBarCounts {
             errors: 2,
             warnings: 5,
-            dead_code: 331,
-            unused_exports: 221,
-            duplicates: 1159,
             todos: 8,
-            tier2_stale: false,
         };
         assert_eq!(
             format!("[{}]", aft_status_segment(&counts)),
-            "[AFT E2 W5 | D331 U221 C1159 | T8]"
+            "[AFT E2 W5 | T8]"
         );
     }
 
@@ -1299,42 +1285,6 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].response.id, "inspect-shutdown");
         assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn published_segment_stale_marker_bytes_are_self_labeled() {
-        let counts = StatusBarCounts {
-            dead_code: 10,
-            tier2_stale: true,
-            ..StatusBarCounts::default()
-        };
-        assert_eq!(
-            format!("[{}]", aft_status_segment(&counts)),
-            "[AFT E0 W0 | ~D10 U0 C0 | T0]"
-        );
-    }
-}
-
-/// Applies the request's pinned post-wait gaps without reading newer runtime state.
-pub fn attach_checkout_query_gaps(response: &mut Response, ctx: &AppContext) {
-    let Some(crate::views::contracts::WaitOutcome::TimedOut { unreflected, .. }) =
-        ctx.checkout_query_outcome()
-    else {
-        return;
-    };
-    if let Some(data) = response.data.as_object_mut() {
-        data.insert("complete".into(), Value::Bool(false));
-        let gaps = data
-            .entry("gaps")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Some(gaps) = gaps.as_array_mut() {
-            for path in unreflected {
-                let gap = serde_json::json!({"kind":"view_pending", "path":path, "reason":"callgraph changes not yet installed"});
-                if !gaps.contains(&gap) {
-                    gaps.push(gap);
-                }
-            }
-        }
     }
 }
 
@@ -1408,9 +1358,7 @@ pub fn query_pending(
     let pending = ctx.pending_changes_for_query(callgraph_command);
     (
         watcher_command && pending.watcher,
-        Some(pending.callgraph).filter(|changes| {
-            callgraph_command && (!changes.is_empty() || changes.observe_reconciles())
-        }),
+        Some(pending.callgraph).filter(|changes| callgraph_command && !changes.is_empty()),
     )
 }
 
@@ -1435,7 +1383,7 @@ pub fn attach_callgraph_pending_gaps(
     if !response.success {
         return;
     }
-    let pending = pending.resolved();
+    let pending = pending.clone();
     if pending.is_empty() {
         return;
     }
@@ -1572,109 +1520,6 @@ pub(crate) fn append_watcher_query_notice(text: &mut String, response: &Response
 }
 
 #[cfg(test)]
-mod checkout_transport_tests {
-    use super::*;
-    use crate::views::contracts::{QueryWait, ViewAccess, WaitOutcome};
-    use crate::views::manifest_v2::{ManifestHeader, ManifestV2, Producers};
-    use crate::views::snapshot::{LiveDelta, OpenGeneration};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    struct Timeout {
-        snapshot: crate::views::snapshot::Snapshot,
-    }
-    impl QueryWait for Timeout {
-        fn wait_for(
-            &self,
-            _: &ViewAccess,
-            _: crate::blob_store::v2::FamilyPlane,
-            budget: Duration,
-        ) -> WaitOutcome {
-            assert_eq!(budget, crate::views::contracts::CALLGRAPH_QUERY_WAIT);
-            WaitOutcome::TimedOut {
-                snapshot: self.snapshot.clone(),
-                unreflected: vec!["unreflected.rs".into()],
-            }
-        }
-    }
-    fn context(storage: &std::path::Path) -> AppContext {
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config::default(),
-        );
-        ctx.set_heavy_root_work_allowed(true);
-        let owner = crate::views::registry::FamilyRegistry::open(storage, "family")
-            .unwrap()
-            .register_view_with_storage(storage, "local", storage)
-            .unwrap();
-        let manifest = ManifestV2::new(ManifestHeader {
-            producers: Producers {
-                trigram: "test".into(),
-                semantic: None,
-                callgraph: crate::views::callgraph::PRODUCER.into(),
-            },
-            head_tree: None,
-            ignore_fingerprint: None,
-            segment: None,
-        });
-        let snapshot =
-            LiveDelta::new(Arc::new(OpenGeneration::new("test", manifest, None))).snapshot();
-        ctx.install_checkout_query_runtime(Arc::new(
-            crate::views::query_wait::CheckoutQueryRuntime {
-                access: ViewAccess::Owner(owner),
-                waiter: Arc::new(Timeout { snapshot }),
-                callgraph: Arc::new(crate::views::callgraph::CallgraphPlane::default()),
-            },
-        ));
-        ctx
-    }
-    #[test]
-    fn default_config_keeps_legacy_query_runtime_unmodified() {
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config::default(),
-        );
-        assert!(!ctx.checkout_query_runtime_active());
-        let _pin = ctx.pin_config();
-        let _ = ctx.callgraph_store_for_ops();
-        assert!(ctx.checkout_query_outcome().is_none());
-        let mut response = Response::success("legacy", serde_json::json!({"complete":true}));
-        super::attach_checkout_query_gaps(&mut response, &ctx);
-        assert_eq!(response.data, serde_json::json!({"complete":true}));
-    }
-
-    #[test]
-    fn standalone_ndjson_finalization_preserves_pinned_timeout_named_files() {
-        let storage = tempfile::tempdir().unwrap();
-        let ctx = context(storage.path());
-        let _pin = ctx.pin_config();
-        let _ = ctx.callgraph_store_for_ops();
-        let _ = ctx.callgraph_store_for_ops();
-        let mut response = Response::success("ndjson", serde_json::json!({"complete":true}));
-        finalize_response_with_bg_completions(&mut response, &ctx, "session", "callers", false);
-        let wire = serde_json::to_string(&response).unwrap();
-        assert_eq!(response.data["complete"], false);
-        assert!(wire.contains("unreflected.rs"));
-        assert_eq!(response.data["gaps"].as_array().unwrap().len(), 1);
-    }
-    #[test]
-    fn subc_tool_call_finalization_preserves_pinned_timeout_named_files() {
-        let storage = tempfile::tempdir().unwrap();
-        let ctx = context(storage.path());
-        let _pin = ctx.pin_config();
-        let _ = ctx.callgraph_store_for_ops();
-        let mut response = Response::success(
-            "tool",
-            serde_json::json!({"complete":true, "text":"callgraph"}),
-        );
-        let mut text = String::from("callgraph");
-        finalize_tool_response(&mut response, &mut text, &ctx, "session", "callers", false);
-        assert_eq!(response.data["complete"], false);
-        assert_eq!(response.data["gaps"][0]["path"], "unreflected.rs");
-    }
-}
-
-#[cfg(test)]
 mod callgraph_pending_tests {
     use super::*;
     use crate::context::CallgraphUnappliedChanges;
@@ -1685,7 +1530,6 @@ mod callgraph_pending_tests {
             view_paths: view.iter().map(|path| path.to_string()).collect(),
             whole_checkout,
             whole_store: false,
-            reconcile_query: None,
         }
     }
 

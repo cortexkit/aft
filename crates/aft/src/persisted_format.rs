@@ -97,21 +97,26 @@ impl PersistedStore {
     }
 
     /// Highest format version of this store that this build reads.
+    ///
+    /// The search index, semantic index, call-graph store, symbol cache,
+    /// artifact owner manifest and views stores are retired: the index store
+    /// under `data/` replaced them, and this build never opens their files.
+    /// Each keeps the last version an AFT build wrote, so the placement
+    /// check, which refuses a build that does not know a store a reader floor
+    /// names, still passes a build that never reads them.
     pub fn supported(self) -> u32 {
         match self {
             PersistedStore::AftDb => crate::db::CURRENT_SCHEMA_VERSION,
-            PersistedStore::SearchIndex => crate::search_index::INDEX_FORMAT_VERSION,
-            PersistedStore::SemanticIndex => crate::semantic_index::SEMANTIC_BASE_FORMAT_VERSION,
-            PersistedStore::SemanticSegment => {
-                crate::semantic_index::SEMANTIC_SEGMENT_FORMAT_VERSION
-            }
-            PersistedStore::CallgraphStore => crate::callgraph_store::STORE_FORMAT_VERSION,
-            PersistedStore::SymbolCache => crate::symbol_cache_disk::FORMAT_VERSION,
-            PersistedStore::SymbolExtraction => crate::symbol_cache_disk::SCHEMA_VERSION,
-            PersistedStore::ArtifactOwner => crate::artifact_owner::SCHEMA_VERSION,
+            PersistedStore::SearchIndex => 4,
+            PersistedStore::SemanticIndex => 8,
+            PersistedStore::SemanticSegment => 1,
+            PersistedStore::CallgraphStore => 3,
+            PersistedStore::SymbolCache => 3,
+            PersistedStore::SymbolExtraction => 6,
+            PersistedStore::ArtifactOwner => 1,
             PersistedStore::BackupMeta => crate::backup::SCHEMA_VERSION,
             PersistedStore::BashTask => crate::bash_background::persistence::SCHEMA_VERSION,
-            PersistedStore::ViewsV3Registry => crate::blob_store::v3::REGISTRY_VERIFICATION_VERSION,
+            PersistedStore::ViewsV3Registry => 3,
             PersistedStore::ViewsV3Store => 1,
         }
     }
@@ -1022,24 +1027,6 @@ pub fn gate(
             Ok(())
         }
     }
-}
-
-/// Peek the version headers of one project's shared artifacts (search,
-/// semantic, symbol cache, callgraph, ownership manifest) and record a named
-/// refusal for each one written in a newer format. Reads headers only; never
-/// changes anything. Absent artifacts are skipped.
-pub fn preflight_project_artifacts(storage_root: &Path, artifacts: &Path, project_key: &str) {
-    register_storage_root(storage_root);
-    let _ = crate::search_index::SearchIndex::check_disk_cache_format(
-        &artifacts.join("index").join(project_key),
-    );
-    let _ = crate::semantic_index::SemanticIndex::check_disk_format(artifacts, project_key);
-    let _ = crate::symbol_cache_disk::check_disk_format(artifacts, project_key);
-    let _ = crate::callgraph_store::check_published_format(
-        &artifacts.join("callgraph").join(project_key),
-        project_key,
-    );
-    let _ = crate::artifact_owner::check_manifest_format(storage_root, project_key);
 }
 
 /// Highest format version of every store this build reads, as printed by

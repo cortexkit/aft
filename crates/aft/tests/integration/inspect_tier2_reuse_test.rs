@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(debug_assertions)]
 use aft::cache_freshness;
-use aft::callgraph_store::CallGraphStore;
 use aft::config::Config;
 use aft::inspect::{
     InspectCache, InspectCategory, InspectManager, InspectScanSuccess, InspectSnapshot,
@@ -111,61 +110,84 @@ fn relative_paths(project_root: &Path, files: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-fn project_source_files(project_root: &Path) -> Vec<PathBuf> {
-    fn visit(dir: &Path, files: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("."))
-            {
-                continue;
+/// A project's call graph as the index store publishes it, bound through a
+/// context whose inspect manager reads it for dead code. Keep it alive while
+/// the manager is used: the manager only holds the checkout weakly.
+struct DeadCodeGraph {
+    ctx: aft::context::AppContext,
+    _storage: tempfile::TempDir,
+}
+
+impl DeadCodeGraph {
+    fn manager(&self) -> Arc<InspectManager> {
+        self.ctx.inspect_manager()
+    }
+}
+
+/// Binds a fresh index-store checkout of `project_root` in its own storage
+/// folder, so its call graph is built from the files on disk now, and waits
+/// until that graph is published. One `inspect` request then hands the
+/// checkout to the context's inspect manager, as every `inspect` does.
+fn dead_code_graph(project_root: &Path) -> DeadCodeGraph {
+    crate::helpers::disable_in_process_file_watcher();
+    let storage = tempfile::tempdir().expect("storage dir");
+    let ctx = aft::context::AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        }),
+    )
+    .with_test_checkpoint_store();
+    let request = |value: Value| -> aft::protocol::RawRequest {
+        serde_json::from_value(value).expect("request parses")
+    };
+    let configure = aft::commands::configure::handle_configure(
+        &request(serde_json::json!({
+            "id": "configure",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project_root,
+            "storage_dir": storage.path(),
+            "config": crate::helpers::user_config(serde_json::json!({
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
+            })),
+        })),
+        &ctx,
+    );
+    assert!(configure.success, "configure failed: {:?}", configure.data);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match aft::data_layer::surfaces::warm(&ctx).1 {
+            aft::data_layer::surfaces::WarmState::Ready => break,
+            aft::data_layer::surfaces::WarmState::Failed(reason) => {
+                panic!("the call graph failed to build: {reason}")
             }
-            if path.is_dir() {
-                visit(&path, files);
-            } else if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| {
-                    matches!(
-                        ext,
-                        "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs" | "rs"
-                    )
-                })
-            {
-                files.push(path);
+            aft::data_layer::surfaces::WarmState::Pending(state) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the call graph never published: {state}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
     }
-
-    let mut files = Vec::new();
-    visit(project_root, &mut files);
-    files.sort();
-    files
-}
-
-fn artifact_cache_key_for_test(project_root: &Path) -> String {
-    let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    aft::search_index::artifact_cache_key(project_root)
-}
-
-fn rebuild_dead_code_callgraph_store(project_root: &Path, inspect_dir: &Path) {
-    let project_key = artifact_cache_key_for_test(project_root);
-    let store_dir = inspect_dir
-        .parent()
-        .expect("inspect dir has parent")
-        .join("callgraph")
-        .join(&project_key);
-    aft::root_cache::configure_artifact_access(project_root, &project_key, false);
-    let store = CallGraphStore::open(store_dir, project_root.to_path_buf()).expect("open store");
-    let files = project_source_files(project_root);
-    store
-        .cold_build(&files)
-        .expect("cold build callgraph store");
+    // The reply itself is not this helper's concern: without a language
+    // server its diagnostics never complete. Before it looks at diagnostics,
+    // the request hands the root's index-store checkout to the context's
+    // inspect manager, which then reads dead code from its call graph.
+    let _ = aft::commands::inspect::handle_inspect_warm_for_test(
+        &request(serde_json::json!({
+            "id": "bind-dead-code",
+            "command": "inspect",
+            "sections": ["dead_code"],
+        })),
+        &ctx,
+    );
+    DeadCodeGraph {
+        ctx,
+        _storage: storage,
+    }
 }
 
 fn contribution_payloads(
@@ -222,6 +244,9 @@ fn blocking_dead_code_builds_a_cold_callgraph_snapshot() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("blocking-dead-code");
     fs::create_dir_all(&root).expect("create project");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(&root, "package.json", r#"{"main":"src/main.ts"}"#);
     write_file(
         &root,
@@ -229,10 +254,11 @@ fn blocking_dead_code_builds_a_cold_callgraph_snapshot() {
         "export function entry(): void {}\nexport function plantedDead(): void {}\n",
     );
     let inspect_dir = temp_dir.path().join("cache/inspect");
-    let project_key = artifact_cache_key_for_test(&root);
-    aft::root_cache::configure_artifact_access(&root, &project_key, false);
-    let manager = Arc::new(InspectManager::new());
+    let graph = dead_code_graph(&root);
+    let manager = graph.manager();
 
+    // Nothing is cached in this inspect folder: the blocking run scans every
+    // file and answers from the published call graph.
     let outcome = manager.tier2_run_with_reuse_blocking_fresh(
         snapshot(&root, &inspect_dir),
         InspectCategory::DeadCode,
@@ -312,6 +338,9 @@ export function privateHelper() { return 0; }
             .path()
             .join(format!("framework-route-{}", case.name));
         fs::create_dir_all(&root).expect("create project");
+        // The index store binds the canonical root without the Windows `\\?\`
+        // prefix; on macOS a temp folder is under /var, a link to /private/var.
+        let root = crate::helpers::canonicalize_like_product(&root);
         write_file(&root, "package.json", case.package_json);
         write_file(&root, case.route_file, case.route_source);
         let service_file = Path::new(case.route_file)
@@ -327,8 +356,8 @@ export function privateHelper() { return 0; }
         );
 
         let inspect_dir = temp_dir.path().join(format!("inspect-{}", case.name));
-        rebuild_dead_code_callgraph_store(&root, &inspect_dir);
-        let manager = InspectManager::new();
+        let graph_manager = dead_code_graph(&root);
+        let manager = graph_manager.manager();
         let (success, _elapsed) = run_reuse_category(
             &manager,
             snapshot(&root, &inspect_dir),
@@ -487,6 +516,9 @@ export function deadSibling() { return 0; }
             .path()
             .join(format!("nestjs-decorator-{}", case.name));
         fs::create_dir_all(&root).expect("create project");
+        // The index store binds the canonical root without the Windows `\\?\`
+        // prefix; on macOS a temp folder is under /var, a link to /private/var.
+        let root = crate::helpers::canonicalize_like_product(&root);
         write_file(&root, "package.json", case.package_json);
         let controller_file = "src/app.controller.ts";
         write_file(&root, controller_file, case.controller_source);
@@ -495,8 +527,8 @@ export function deadSibling() { return 0; }
         }
 
         let inspect_dir = temp_dir.path().join(format!("inspect-{}", case.name));
-        rebuild_dead_code_callgraph_store(&root, &inspect_dir);
-        let manager = InspectManager::new();
+        let graph_manager = dead_code_graph(&root);
+        let manager = graph_manager.manager();
         let (success, _elapsed) = run_reuse_category(
             &manager,
             snapshot(&root, &inspect_dir),
@@ -1482,11 +1514,14 @@ fn assert_dead_code_incremental_matches_cold<S, E>(
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join(format!("dead-code-project-{name}"));
     fs::create_dir_all(&root).expect("create project");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     setup(&root);
 
     let warm_inspect_dir = temp_dir.path().join(format!("warm-{name}/inspect"));
-    rebuild_dead_code_callgraph_store(&root, &warm_inspect_dir);
-    let warm_manager = InspectManager::new();
+    let graph_warm_manager = dead_code_graph(&root);
+    let warm_manager = graph_warm_manager.manager();
     let (first, _first_elapsed) = run_reuse_category(
         &warm_manager,
         snapshot(&root, &warm_inspect_dir),
@@ -1502,7 +1537,10 @@ fn assert_dead_code_incremental_matches_cold<S, E>(
     );
 
     edit(&root);
-    rebuild_dead_code_callgraph_store(&root, &warm_inspect_dir);
+    // A fresh checkout builds the call graph of the edited files; the warm
+    // inspect cache on disk is what this pass reuses.
+    let graph_warm_manager = dead_code_graph(&root);
+    let warm_manager = graph_warm_manager.manager();
 
     let (warm, _warm_elapsed) = run_reuse_category(
         &warm_manager,
@@ -1510,8 +1548,8 @@ fn assert_dead_code_incremental_matches_cold<S, E>(
         InspectCategory::DeadCode,
     );
     let cold_inspect_dir = temp_dir.path().join(format!("cold-{name}/inspect"));
-    rebuild_dead_code_callgraph_store(&root, &cold_inspect_dir);
-    let cold_manager = InspectManager::new();
+    let graph_cold_manager = dead_code_graph(&root);
+    let cold_manager = graph_cold_manager.manager();
     let (cold, _cold_elapsed) = run_reuse_category(
         &cold_manager,
         snapshot(&root, &cold_inspect_dir),
@@ -1981,6 +2019,9 @@ fn inspect_dead_code_twice_cold_is_deterministic() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("dead-code-twice-cold");
     fs::create_dir_all(&root).expect("create project");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(root.as_path(), "package.json", r#"{"main":"src/main.ts"}"#);
     write_file(
         root.as_path(),
@@ -1994,8 +2035,8 @@ fn inspect_dead_code_twice_cold_is_deterministic() {
     );
 
     let inspect_a = temp_dir.path().join("dead-cold-a/inspect");
-    rebuild_dead_code_callgraph_store(&root, &inspect_a);
-    let manager_a = InspectManager::new();
+    let graph_manager_a = dead_code_graph(&root);
+    let manager_a = graph_manager_a.manager();
     let (cold_a, _elapsed_a) = run_reuse_category(
         &manager_a,
         snapshot(&root, &inspect_a),
@@ -2003,8 +2044,8 @@ fn inspect_dead_code_twice_cold_is_deterministic() {
     );
 
     let inspect_b = temp_dir.path().join("dead-cold-b/inspect");
-    rebuild_dead_code_callgraph_store(&root, &inspect_b);
-    let manager_b = InspectManager::new();
+    let graph_manager_b = dead_code_graph(&root);
+    let manager_b = graph_manager_b.manager();
     let (cold_b, _elapsed_b) = run_reuse_category(
         &manager_b,
         snapshot(&root, &inspect_b),
@@ -2027,6 +2068,9 @@ fn inspect_dead_code_rust_macro_token_refs_twice_cold_is_deterministic() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("dead-code-rust-macro-twice-cold");
     fs::create_dir_all(&root).expect("create project");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(
         root.as_path(),
         "Cargo.toml",
@@ -2040,8 +2084,8 @@ fn inspect_dead_code_rust_macro_token_refs_twice_cold_is_deterministic() {
     );
 
     let inspect_a = temp_dir.path().join("rust-macro-cold-a/inspect");
-    rebuild_dead_code_callgraph_store(&root, &inspect_a);
-    let manager_a = InspectManager::new();
+    let graph_manager_a = dead_code_graph(&root);
+    let manager_a = graph_manager_a.manager();
     let (cold_a, _elapsed_a) = run_reuse_category(
         &manager_a,
         snapshot(&root, &inspect_a),
@@ -2049,8 +2093,8 @@ fn inspect_dead_code_rust_macro_token_refs_twice_cold_is_deterministic() {
     );
 
     let inspect_b = temp_dir.path().join("rust-macro-cold-b/inspect");
-    rebuild_dead_code_callgraph_store(&root, &inspect_b);
-    let manager_b = InspectManager::new();
+    let graph_manager_b = dead_code_graph(&root);
+    let manager_b = graph_manager_b.manager();
     let (cold_b, _elapsed_b) = run_reuse_category(
         &manager_b,
         snapshot(&root, &inspect_b),
@@ -2084,6 +2128,9 @@ fn inspect_dead_code_framework_routes_twice_cold_is_deterministic() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("dead-code-route-twice-cold");
     fs::create_dir_all(&root).expect("create project");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(
         &root,
         "package.json",
@@ -2101,8 +2148,8 @@ fn inspect_dead_code_framework_routes_twice_cold_is_deterministic() {
     );
 
     let inspect_a = temp_dir.path().join("route-cold-a/inspect");
-    rebuild_dead_code_callgraph_store(&root, &inspect_a);
-    let manager_a = InspectManager::new();
+    let graph_manager_a = dead_code_graph(&root);
+    let manager_a = graph_manager_a.manager();
     let (cold_a, _elapsed_a) = run_reuse_category(
         &manager_a,
         snapshot(&root, &inspect_a),
@@ -2110,8 +2157,8 @@ fn inspect_dead_code_framework_routes_twice_cold_is_deterministic() {
     );
 
     let inspect_b = temp_dir.path().join("route-cold-b/inspect");
-    rebuild_dead_code_callgraph_store(&root, &inspect_b);
-    let manager_b = InspectManager::new();
+    let graph_manager_b = dead_code_graph(&root);
+    let manager_b = graph_manager_b.manager();
     let (cold_b, _elapsed_b) = run_reuse_category(
         &manager_b,
         snapshot(&root, &inspect_b),
@@ -2134,6 +2181,9 @@ fn inspect_dead_code_nestjs_decorators_twice_cold_is_deterministic() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let root = temp_dir.path().join("dead-code-nestjs-twice-cold");
     fs::create_dir_all(&root).expect("create project");
+    // The index store binds the canonical root without the Windows `\\?\`
+    // prefix; on macOS a temp folder is under /var, a link to /private/var.
+    let root = crate::helpers::canonicalize_like_product(&root);
     write_file(
         &root,
         "package.json",
@@ -2157,8 +2207,8 @@ export function privateHelper() {}
     );
 
     let inspect_a = temp_dir.path().join("nestjs-cold-a/inspect");
-    rebuild_dead_code_callgraph_store(&root, &inspect_a);
-    let manager_a = InspectManager::new();
+    let graph_manager_a = dead_code_graph(&root);
+    let manager_a = graph_manager_a.manager();
     let (cold_a, _elapsed_a) = run_reuse_category(
         &manager_a,
         snapshot(&root, &inspect_a),
@@ -2166,8 +2216,8 @@ export function privateHelper() {}
     );
 
     let inspect_b = temp_dir.path().join("nestjs-cold-b/inspect");
-    rebuild_dead_code_callgraph_store(&root, &inspect_b);
-    let manager_b = InspectManager::new();
+    let graph_manager_b = dead_code_graph(&root);
+    let manager_b = graph_manager_b.manager();
     let (cold_b, _elapsed_b) = run_reuse_category(
         &manager_b,
         snapshot(&root, &inspect_b),

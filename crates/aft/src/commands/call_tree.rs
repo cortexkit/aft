@@ -1,24 +1,14 @@
 use std::path::Path;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::{
-    call_tree_result, index_refusal_response, note_callgraph_served, serialized_response,
-    store_error_response,
+    call_tree_result, note_callgraph_served, serialized_response, store_error_response,
 };
-use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `call_tree` request.
 pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_call_tree(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Graph,
-        BorrowedOp::CallTree,
-    );
-    response
+    answer_call_tree(req, ctx)
 }
 
 fn answer_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -79,36 +69,28 @@ fn answer_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let store = match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Error(error) => {
-            return store_error_response(&req.id, "call_tree", error)
-        }
-        other => return index_refusal_response(&req.id, "call_tree", ctx, &other),
-    };
-
-    if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
+    let (snapshot, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
         &req.id,
         "call_tree",
         ctx,
-        &store,
-        &file_path,
+        &[file_path.as_path()],
     ) {
-        return response;
-    }
-
-    // Retain the pinned reader while a separate transaction builds the answer.
-    let snapshot = match store.read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => return store_error_response(&req.id, "call_tree", error),
+        Ok(graph) => graph,
+        Err(response) => return response,
     };
-    match call_tree_result(
+    let outcome = call_tree_result(
         &snapshot,
         &file_path,
         symbol,
         depth,
         include_tests_param(req),
-    ) {
+    );
+    if let Some(response) =
+        crate::data_layer::tools::callgraph::failed_reads(&req.id, "call_tree", data_view.as_ref())
+    {
+        return response;
+    }
+    match outcome {
         Ok(tree) => {
             note_callgraph_served(ctx, "call_tree", 0, "ok");
             serialized_response(&req.id, "call_tree", &tree)

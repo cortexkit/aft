@@ -22,11 +22,15 @@ fn sandbox_profile_cutover_matches_doctor_and_preserves_explicit_roles() {
                 .unwrap()
                 .changed
         );
+        // The rewrite keeps the profile the old key stood for.
+        let mut translated: Map<String, Value> =
+            serde_json::from_str(&crate::jsonc::strip_jsonc(&source)).unwrap();
+        feature_config::translate_document(&mut translated, feature_config::DocumentTier::User);
         let before = resolve_config_for_harness(
             &[ConfigTier {
                 tier: "user".into(),
                 source: "user".into(),
-                doc: source,
+                doc: Value::Object(translated).to_string(),
             }],
             None,
         );
@@ -106,7 +110,20 @@ fn doctor_fix_removes_retired_hang_threshold() {
     );
 }
 
+/// The resolved values a document stands for. The retired names it uses are
+/// first translated the way `doctor --fix` reads them: ordinary loading
+/// refuses the names retired in 0.62 or earlier, so the translation is the
+/// meaning a fix must keep.
 fn resolved(doc: &str, tier: &str, harness: Option<&Harness>) -> Value {
+    let mut translated: Map<String, Value> =
+        serde_json::from_str(&crate::jsonc::strip_jsonc(doc)).unwrap();
+    let document_tier = if tier == "user" {
+        feature_config::DocumentTier::User
+    } else {
+        feature_config::DocumentTier::Project
+    };
+    feature_config::translate_document(&mut translated, document_tier);
+    let doc = Value::Object(translated).to_string();
     let mut tiers = Vec::new();
     if tier == "project" {
         tiers.push(ConfigTier {
@@ -328,7 +345,9 @@ fn project_fixes_never_materialize_the_default_disables() {
         let migration = migrate_config_text(doc, FixTier::Project).unwrap();
         let value: Value = serde_json::from_str(&migration.text).unwrap();
         assert_eq!(value["disabled_tools"], want, "{doc}");
-        for text in [doc, migration.text.as_str()] {
+        // The original file names retired keys that loading refuses; the
+        // rewritten file is the one that loads.
+        for text in [migration.text.as_str()] {
             let tiers = [
                 ConfigTier {
                     tier: "user".to_string(),
@@ -460,7 +479,13 @@ fn experimental_keys_doctor_preserves_opt_in_defaults_and_precedence() {
             assert!(!migrate_config_text(&migration.text, tier).unwrap().changed);
         }
         let tuning_only = r#"{"experimental":{"bash":{"long_running_reminder_enabled":false}}}"#;
-        assert!(!migrate_config_text(tuning_only, tier).unwrap().changed);
+        // A block with only reminder settings moves to top-level `bash`
+        // without feature flags, so they keep their defaults.
+        let migration = assert_fix_preserves_intent(tuning_only, tier);
+        assert_eq!(
+            serde_json::from_str::<Value>(&migration.text).unwrap(),
+            json!({"bash": {"long_running_reminder_enabled": false}})
+        );
     }
 }
 
@@ -505,6 +530,11 @@ fn experimental_keys_auto_migrate_user_once_via_doctor_mapping() {
 const RETIRED_USER_FILE: &str =
     "{\n  // my settings\n  \"search_index\": false,\n  \"hoist_builtin_tools\": false\n}\n";
 
+/// A user file whose only retired key is still translated in memory, so a
+/// failed rewrite is reported with a notice rather than refused.
+const TRANSLATED_USER_FILE: &str =
+    "{\n  // my settings\n  \"views\": {\"idle_checkout_hours\": 72}\n}\n";
+
 #[test]
 fn migration_keeps_backup_and_reports_applied_after_directory_sync_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -543,7 +573,7 @@ fn migration_keeps_backup_and_reports_applied_after_directory_sync_error() {
 fn migration_pre_rename_error_preserves_original_and_removes_backup() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
-    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    std::fs::write(&path, TRANSLATED_USER_FILE).unwrap();
     let outcome = auto_migrate_user_config_with_writer(&path, |_, _| {
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -552,7 +582,10 @@ fn migration_pre_rename_error_preserves_original_and_removes_backup() {
     })
     .expect("reported failure");
     assert!(matches!(outcome, UserConfigMigration::NotMigrated { .. }));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        TRANSLATED_USER_FILE
+    );
     assert!(backups(dir.path()).is_empty());
 }
 
@@ -673,15 +706,21 @@ fn concurrent_auto_migrations_converge() {
 }
 
 /// A read-only user file is never rewritten; the caller translates it in
-/// memory and the notice says why the file was left alone.
+/// memory and the notice says why the file was left alone. When the file
+/// names a key retired in 0.62 or earlier, loading refuses it instead, and
+/// that refusal is the only message.
 #[test]
 fn a_read_only_user_file_is_left_alone_with_a_notice() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
-    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
-    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-    permissions.set_readonly(true);
-    std::fs::set_permissions(&path, permissions).unwrap();
+    std::fs::write(&path, TRANSLATED_USER_FILE).unwrap();
+    let set_readonly = |readonly: bool| {
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(readonly);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    };
+    set_readonly(true);
 
     let outcome = auto_migrate_user_config(&path).expect("reported");
     let UserConfigMigration::NotMigrated { reason, notice, .. } = &outcome else {
@@ -693,25 +732,40 @@ fn a_read_only_user_file_is_left_alone_with_a_notice() {
         "{notice}"
     );
     assert!(notice.contains("doctor --fix"), "{notice}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        TRANSLATED_USER_FILE
+    );
     assert!(backups(dir.path()).is_empty());
 
     // Loading the same text still resolves, translated in memory.
-    let result = resolve_config_for_harness(
-        &[ConfigTier {
-            tier: "user".to_string(),
-            source: path.display().to_string(),
-            doc: RETIRED_USER_FILE.to_string(),
-        }],
-        None,
-    );
+    let load = |doc: &str| {
+        resolve_config_for_harness(
+            &[ConfigTier {
+                tier: "user".to_string(),
+                source: path.display().to_string(),
+                doc: doc.to_string(),
+            }],
+            None,
+        )
+    };
+    let result = load(TRANSLATED_USER_FILE);
     assert!(result.errors.is_empty(), "{:?}", result.errors);
-    assert!(!result.config.indexes.trigram);
+    assert_eq!(result.config.idle.checkout_hours, 72);
 
-    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    permissions.set_readonly(false);
-    std::fs::set_permissions(&path, permissions).unwrap();
+    set_readonly(false);
+    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    set_readonly(true);
+    assert_eq!(auto_migrate_user_config(&path), None);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+    assert_eq!(
+        load(RETIRED_USER_FILE).errors,
+        [
+            "removed_config_key:hoist_builtin_tools; run npx @cortexkit/aft doctor --fix",
+            "removed_config_key:search_index; run npx @cortexkit/aft doctor --fix",
+        ]
+    );
+    set_readonly(false);
 }
 
 #[test]
@@ -792,7 +846,7 @@ fn a_debug_build_never_rewrites_a_user_file_in_the_account_config_dir() {
     let config_dir = fixture.path().join("account/.config/cortexkit");
     std::fs::create_dir_all(&config_dir).unwrap();
     let path = config_dir.join("aft.jsonc");
-    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    std::fs::write(&path, TRANSLATED_USER_FILE).unwrap();
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
 
     let outcome = crate::production_storage::with_test_account(&config_dir, false, || {
@@ -811,7 +865,10 @@ fn a_debug_build_never_rewrites_a_user_file_in_the_account_config_dir() {
         notice.contains("applied their current equivalents"),
         "{notice}"
     );
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        TRANSLATED_USER_FILE
+    );
     assert_eq!(
         std::fs::metadata(&path).unwrap().modified().unwrap(),
         modified
@@ -873,4 +930,91 @@ fn doctor_fix_removes_opencode_prompt_transport_keys() {
             loaded.errors
         );
     }
+}
+
+const DATA_LAYER_FILE: &str = "{\n  // index settings\n  \"views\": {\"enabled\": true, \"callgraph_copies\": 2, \"idle_checkout_hours\": 9000},\n  \"worktree\": {\"ram_overlay\": false},\n  \"idle\": {\"root_ttl_minutes\": 20},\n  \"harnesses\": {\"pi\": {\"views\": {\"idle_checkout_hours\": 12, \"enabled\": false}, \"edit_mode\": \"hashline\"}}\n}\n";
+
+/// `doctor --fix` rewrites `views.idle_checkout_hours` to `idle.checkout_hours`
+/// (clamped like the load-time translation) and deletes the removed
+/// data-layer keys, leaving a file that uses none of them.
+#[test]
+fn doctor_fix_moves_idle_checkout_hours_and_deletes_removed_data_layer_keys() {
+    for tier in [FixTier::User, FixTier::Project] {
+        let migration = migrate_config_text(DATA_LAYER_FILE, tier).unwrap();
+        assert!(migration.changed);
+        assert!(migration.text.contains("// index settings"));
+        let value: Value =
+            serde_json::from_str(&crate::jsonc::strip_jsonc(&migration.text)).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "idle": {"root_ttl_minutes": 20, "checkout_hours": 8760},
+                "harnesses": {"pi": {"edit_mode": "hashline", "idle": {"checkout_hours": 12}}}
+            }),
+            "{}",
+            migration.text
+        );
+        assert!(!migrate_config_text(&migration.text, tier).unwrap().changed);
+        let mut fixed = value.as_object().unwrap().clone();
+        let check =
+            feature_config::translate_document(&mut fixed, feature_config::DocumentTier::Project);
+        assert!(!check.legacy_input, "{:?}", check.retired_keys);
+        assert!(check.removed_keys.is_empty(), "{:?}", check.removed_keys);
+    }
+    // An explicit idle.checkout_hours wins over the retired key.
+    let migration = migrate_config_text(
+        r#"{"views":{"idle_checkout_hours":2},"idle":{"checkout_hours":5}}"#,
+        FixTier::Project,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&migration.text).unwrap(),
+        json!({"idle": {"checkout_hours": 5}})
+    );
+    // A file whose only change is a removed key is still rewritten by doctor.
+    let migration =
+        migrate_config_text(r#"{"worktree":{"ram_overlay":true}}"#, FixTier::User).unwrap();
+    assert!(migration.changed);
+    assert_eq!(
+        serde_json::from_str::<Value>(&migration.text).unwrap(),
+        json!({})
+    );
+}
+
+/// The automatic rewrite of the user file moves `views.idle_checkout_hours`
+/// but keeps the removed keys (their values still take effect until the code
+/// that reads them is deleted), and its notice names only the key it moved.
+/// A file whose only old keys are removed keys is not rewritten at all.
+#[test]
+fn automatic_user_rewrite_moves_idle_checkout_hours_but_keeps_removed_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, DATA_LAYER_FILE).unwrap();
+    let outcome = auto_migrate_user_config(&path).expect("views.idle_checkout_hours migrates");
+    let UserConfigMigration::Migrated { notice, .. } = outcome else {
+        panic!("expected a rewrite, got {outcome:?}");
+    };
+    let text = std::fs::read_to_string(&path).unwrap();
+    let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&text)).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "views": {"enabled": true, "callgraph_copies": 2},
+            "worktree": {"ram_overlay": false},
+            "idle": {"root_ttl_minutes": 20, "checkout_hours": 8760},
+            "harnesses": {"pi": {"views": {"enabled": false}, "edit_mode": "hashline", "idle": {"checkout_hours": 12}}}
+        }),
+        "{text}"
+    );
+    assert!(notice.contains("views.idle_checkout_hours"), "{notice}");
+    assert!(!notice.contains("views.enabled"), "{notice}");
+    assert!(!notice.contains("ram_overlay"), "{notice}");
+    assert_eq!(auto_migrate_user_config(&path), None);
+
+    let removed_only = dir.path().join("removed.jsonc");
+    let input = r#"{"views":{"enabled":true},"worktree":{"ram_overlay":false}}"#;
+    std::fs::write(&removed_only, input).unwrap();
+    assert_eq!(auto_migrate_user_config(&removed_only), None);
+    assert_eq!(std::fs::read_to_string(&removed_only).unwrap(), input);
+    assert!(backups(dir.path()).len() == 1, "{:?}", backups(dir.path()));
 }

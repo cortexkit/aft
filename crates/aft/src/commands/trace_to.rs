@@ -3,25 +3,15 @@ use std::path::Path;
 #[path = "../list_surfaces/trace.rs"]
 pub mod trace;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::{
-    index_refusal_response, note_callgraph_served, serialized_value, store_error_response,
-    trace_to_result,
+    note_callgraph_served, serialized_value, store_error_response, trace_to_result,
 };
-use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to` request.
 pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_trace_to(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Graph,
-        BorrowedOp::TraceTo,
-    );
-    response
+    answer_trace_to(req, ctx)
 }
 
 fn answer_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -82,32 +72,28 @@ fn answer_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let store = match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Error(error) => {
-            return store_error_response(&req.id, "trace_to", error)
-        }
-        other => return index_refusal_response(&req.id, "trace_to", ctx, &other),
-    };
-
-    if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
-        &req.id, "trace_to", ctx, &store, &file_path,
+    let (snapshot, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
+        &req.id,
+        "trace_to",
+        ctx,
+        &[file_path.as_path()],
     ) {
-        return response;
-    }
-
-    // The pinned reader remains in scope until the snapshot answer is built.
-    let snapshot = match store.read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => return store_error_response(&req.id, "trace_to", error),
+        Ok(graph) => graph,
+        Err(response) => return response,
     };
-    match trace_to_result(
+    let outcome = trace_to_result(
         &snapshot,
         &file_path,
         symbol,
         depth,
         include_tests_param(req),
-    ) {
+    );
+    if let Some(response) =
+        crate::data_layer::tools::callgraph::failed_reads(&req.id, "trace_to", data_view.as_ref())
+    {
+        return response;
+    }
+    match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to", 0, "ok");
             let envelope = trace::build_trace_to_envelope(

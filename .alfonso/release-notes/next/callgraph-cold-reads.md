@@ -1,1 +1,0 @@
-- The call graph builds with less disk reading: each source file is read once to check it, not twice, and unchanged files aren't reread on later checks.

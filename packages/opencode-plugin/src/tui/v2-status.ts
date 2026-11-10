@@ -27,8 +27,9 @@ function diagnosticsPart(bar: StatusBar): string {
  * The V2 footer segment. "AFT starting…" is only true before the bridge has
  * delivered a real snapshot. After that the footer shows every health category
  * that has a value and `?` for any that does not, because a producer that is
- * unavailable (for example dead-code when the callgraph store cannot be used)
- * can leave the complete `status_bar` missing for the whole session.
+ * unavailable (for example no language server) can leave the complete
+ * `status_bar` missing for the whole session. Dead code, unused exports and
+ * duplicates are not shown: they are computed only by aft_inspect.
  */
 export function formatAftStatusSegment(status: AftStatusSnapshot | null): string {
   // The config error state never produces a real snapshot; say so instead of
@@ -36,12 +37,7 @@ export function formatAftStatusSegment(status: AftStatusSnapshot | null): string
   if (status?.config_error) return "AFT config error";
   if (!status || status.cache_role === "not_initialized") return "AFT starting…";
   const bar: StatusBar = status.status_bar ?? status.status_bar_values ?? {};
-  const stale = bar.tier2_stale ? "~" : "";
-  return (
-    `AFT ${diagnosticsPart(bar)} | ` +
-    `${stale}D${count(bar.dead_code, bar.disabled_categories?.includes("dead_code"))} U${count(bar.unused_exports, bar.disabled_categories?.includes("unused_exports"))} ` +
-    `C${count(bar.duplicates, bar.disabled_categories?.includes("duplicates"))} | T${count(bar.todos, bar.disabled_categories?.includes("todos"))}`
-  );
+  return `AFT ${diagnosticsPart(bar)} | T${count(bar.todos, bar.disabled_categories?.includes("todos"))}`;
 }
 
 export type AftSidebarSummary = {
@@ -53,12 +49,7 @@ export type AftSidebarSummary = {
 };
 function healthSummary(bar: StatusBar | undefined): string {
   if (!bar) return "health pending";
-  const stale = bar.tier2_stale ? "~" : "";
-  return (
-    `${diagnosticsPart(bar)} ` +
-    `${stale}D${count(bar.dead_code, bar.disabled_categories?.includes("dead_code"))} U${count(bar.unused_exports, bar.disabled_categories?.includes("unused_exports"))} ` +
-    `C${count(bar.duplicates, bar.disabled_categories?.includes("duplicates"))} T${count(bar.todos, bar.disabled_categories?.includes("todos"))}`
-  );
+  return `${diagnosticsPart(bar)} T${count(bar.todos, bar.disabled_categories?.includes("todos"))}`;
 }
 
 /**

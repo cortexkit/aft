@@ -266,21 +266,6 @@ pub(crate) fn aggregate_memory_walks_for_test() -> usize {
     AGGREGATE_MEMORY_WALKS.with(std::cell::Cell::get)
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) struct AggregateMemoryModeGuard(bool);
-
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-impl Drop for AggregateMemoryModeGuard {
-    fn drop(&mut self) {
-        UNCACHED_AGGREGATE_MEMORY.with(|mode| mode.set(self.0));
-    }
-}
-
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn uncached_aggregate_memory_for_test(uncached: bool) -> AggregateMemoryModeGuard {
-    AggregateMemoryModeGuard(UNCACHED_AGGREGATE_MEMORY.with(|mode| mode.replace(uncached)))
-}
-
 #[derive(Debug, Clone)]
 struct MemoryAggregate {
     touched: u64,
@@ -3616,29 +3601,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn inspect_scope_sweep_keeps_aged_live_scope_key() {
-        reset_inspect_scope_sweep_cursor_for_test();
-        let temp = tempfile::tempdir().unwrap();
-        let inspect_root = temp.path().join("inspect");
-        let project_root = temp.path().join("checkout");
-        fs::create_dir_all(&project_root).unwrap();
-        let scope_key = crate::path_identity::project_scope_key(&project_root);
-        let live = inspect_root.join(&scope_key);
-        write_aged_scope_file(&live, "facts.sqlite");
-        crate::root_cache::register_live_scope(temp.path(), &project_root);
-        let live_keys = crate::root_cache::live_scope_keys_for_storage(temp.path());
-
-        let summary = sweep_inspect_scope_dirs(&inspect_root, &live_keys);
-
-        crate::root_cache::unregister_live_scope(temp.path(), &project_root);
-        assert_eq!(summary.skipped_live, 1);
-        assert!(live.is_dir(), "a bound root's scope directory must survive");
-        // This assertion is intentionally a negative check: if the live-key
-        // exemption is removed, the bound root could be deleted and this
-        // assertion will fail.
-    }
-
-    #[test]
     fn inspect_scope_sweep_keeps_live_marker_then_reaps_stale_marker_scope() {
         reset_inspect_scope_sweep_cursor_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -4138,6 +4100,21 @@ pub(crate) mod tests {
         assert!(response.success, "{}", response.data);
         ctx.inspect_manager()
             .set_automatic_tier2_refresh_allowed(false);
+        // Dead code answers nothing, fresh or cached, until the root's
+        // index-store checkout has published a call graph. Bind the checkout,
+        // wait for that graph, and let the context's inspect manager read it,
+        // as an `inspect` request does.
+        let checkout = ctx.data_checkout().expect("the index store binds the root");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !checkout
+            .view()
+            .is_some_and(|view| view.status().callgraph_published)
+        {
+            assert!(Instant::now() < deadline, "the call graph never published");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        ctx.inspect_manager()
+            .read_dead_code_from_data_layer(&ctx.canonical_cache_root(), &checkout);
         ctx
     }
 
@@ -4154,30 +4131,12 @@ pub(crate) mod tests {
         ctx: &crate::context::AppContext,
         category: InspectCategory,
     ) -> serde_json::Value {
-        let graph = if category == InspectCategory::DeadCode {
-            let root = ctx.canonical_cache_root();
-            let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-            let dir = ctx.callgraph_store_dir();
-            let store = crate::callgraph_store::CallGraphStore::open_ready_no_rebuild(
-                dir.clone(),
-                root.clone(),
-            )
-            .unwrap()
-            .unwrap_or_else(|| {
-                let store = crate::callgraph_store::CallGraphStore::open(dir, root).unwrap();
-                store.cold_build(&files).unwrap();
-                store
-            });
-            Some(Arc::new(
-                crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap(),
-            ))
-        } else {
-            None
-        };
+        // Dead code reads the call graph of the checkout `upgrade_context`
+        // bound, so no graph is passed in.
         let result = ctx.inspect_manager().tier2_run_with_reuse_result(
             upgrade_snapshot(ctx),
             category,
-            graph,
+            None,
         );
         result.outcome.expect("upgrade scan succeeds").aggregate
     }

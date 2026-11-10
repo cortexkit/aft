@@ -54,7 +54,6 @@ const RECLAIM_TOKEN_MALFORMED_STALE_AGE: Duration = Duration::from_secs(60);
 const RECLAIM_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEAD_RECLAIM_INITIAL_BACKOFF_MS: u64 = 250;
 const DEAD_RECLAIM_MAX_BACKOFF_MS: u64 = 5_000;
-const RECLAIM_TOKEN_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A heartbeat normally keeps one descriptor per lease open between beats
 /// instead of opening and closing the file on every beat. Closing a lease
@@ -81,22 +80,9 @@ struct LeaseSlot {
 // `<storage>/<domain>/<key>/<lock>`. Add a domain here when a new persistent
 // artifact lock is introduced. BackupStore's deeper `.locks` shape is handled
 // separately so maintenance never walks backup entry histories.
-const RECLAIM_TOKEN_SWEEP_DOMAINS: &[&str] = &[
-    "index",       // Search-index cache locks.
-    "callgraph",   // Callgraph root-cache writer leases.
-    "inspect",     // Inspect root-cache writer leases.
-    "semantic",    // Semantic-index cache locks.
-    "symbols",     // On-disk symbol-cache locks.
-    "checkpoints", // Checkpoint-store mutation locks.
-    ".aft",        // Storage-migration locks.
-];
-const RECLAIM_TOKEN_SWEEP_MAX_DOMAIN_DEPTH: usize = 2;
 // compress::trust owns this one lock directly under the storage root.
-const ROOT_RECLAIM_TOKEN_PATHS: &[&str] = &[".trusted-filter-projects.json.lock.reclaim"];
 // BackupStore scopes locks below each harness and session. Prefixes cover the
 // client-specific MCP and fingerprint-specific federated harness directories.
-const FIXED_BACKUP_HARNESS_DIRS: &[&str] = &["opencode", "pi", "runner"];
-const BACKUP_HARNESS_DIR_PREFIXES: &[&str] = &["mcp--", "fed--"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReclaimTokenState {
@@ -168,7 +154,6 @@ impl LiveOwnerLog {
 
 static RECLAIM_BLOCK_LOGS: OnceLock<Mutex<HashMap<PathBuf, ReclaimBlockLogRecord>>> =
     OnceLock::new();
-static RECLAIM_TOKEN_SWEEP_LAST_RUN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 /// True for OS errors that mean "another actor is touching this exact lock path
 /// right now", as opposed to a real, persistent failure. On Windows a contended
@@ -194,19 +179,12 @@ fn is_transient_create_contention(error: &io::Error) -> bool {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum MalformedOwnerPolicy {
-    RecoverAfterGrace,
-    FailClosed,
-}
-
-#[derive(Clone, Copy, Debug)]
 struct LockConfig {
     heartbeat_interval_ms: u64,
     heartbeat_refresh_interval_ms: u64,
     stale_heartbeat_ms: u64,
     live_owner_warn_ms: u64,
     poll_interval_ms: u64,
-    malformed_owner: MalformedOwnerPolicy,
 }
 
 impl LockConfig {
@@ -232,7 +210,6 @@ impl Default for LockConfig {
             stale_heartbeat_ms: STALE_HEARTBEAT_MS,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: POLL_INTERVAL_MS,
-            malformed_owner: MalformedOwnerPolicy::RecoverAfterGrace,
         }
     }
 }
@@ -297,22 +274,6 @@ pub(crate) fn try_acquire_until(path: &Path, deadline: Instant) -> Result<LockGu
 /// the existing guarded reclaim path is tried.
 pub fn try_acquire_once(path: &Path) -> Result<LockGuard, AcquireError> {
     try_acquire(path, Duration::ZERO)
-}
-
-/// Select malformed-owner recovery per lease. Paid external work must not infer
-/// that an owner exited from damaged metadata, even after a stable grace read.
-pub(crate) fn try_acquire_once_with_policy(
-    path: &Path,
-    malformed_owner: MalformedOwnerPolicy,
-) -> Result<LockGuard, AcquireError> {
-    acquire_with_config(
-        path,
-        Some(Duration::ZERO),
-        LockConfig {
-            malformed_owner,
-            ..LockConfig::default()
-        },
-    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -692,10 +653,6 @@ fn acquire_with_deadline(
                     }
                     Err(ReadLockError::Io(error)) => return Err(error.into()),
                     Err(ReadLockError::Malformed(_)) => {}
-                }
-                if matches!(config.malformed_owner, MalformedOwnerPolicy::FailClosed) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                        format!("filesystem lease owner metadata is malformed; cannot prove the owner exited: {error}")).into());
                 }
                 slog_warn!(
                     "removing malformed filesystem lock at {}: {}",
@@ -1993,135 +1950,6 @@ fn remove_malformed_reclaim_token(token_path: &Path) -> io::Result<bool> {
     }
 }
 
-/// Remove abandoned reclaim tokens from the bounded set of storage domains that
-/// own persistent artifact locks, under every root in `roots`. A lock's token
-/// sits beside the lock, so with `storage.cache_dir` set the cache-domain
-/// tokens live under the cache root and the durable-state tokens under the
-/// storage root; one pass covers both. The first maintenance pass in a
-/// process runs; later passes are suppressed for 24 hours.
-pub(crate) fn sweep_stale_reclaim_tokens(roots: &[&Path]) -> io::Result<Option<usize>> {
-    let last_run = RECLAIM_TOKEN_SWEEP_LAST_RUN.get_or_init(|| Mutex::new(None));
-    sweep_stale_reclaim_tokens_at(roots, Instant::now(), last_run)
-}
-
-fn sweep_stale_reclaim_tokens_at(
-    roots: &[&Path],
-    now: Instant,
-    last_run: &Mutex<Option<Instant>>,
-) -> io::Result<Option<usize>> {
-    {
-        let mut last_run = last_run
-            .lock()
-            .map_err(|_| io::Error::other("reclaim-token sweep cadence mutex poisoned"))?;
-        if last_run
-            .is_some_and(|last| now.saturating_duration_since(last) < RECLAIM_TOKEN_SWEEP_INTERVAL)
-        {
-            return Ok(None);
-        }
-        *last_run = Some(now);
-    }
-
-    let mut removed = 0_usize;
-    for root in roots {
-        for relative in ROOT_RECLAIM_TOKEN_PATHS {
-            removed =
-                removed.saturating_add(remove_stale_reclaim_token(&root.join(relative))? as usize);
-        }
-        for domain in RECLAIM_TOKEN_SWEEP_DOMAINS {
-            removed = removed.saturating_add(sweep_reclaim_token_domain(&root.join(domain))?);
-        }
-        removed = removed.saturating_add(sweep_backup_reclaim_tokens(root)?);
-    }
-    Ok(Some(removed))
-}
-
-fn sweep_backup_reclaim_tokens(root: &Path) -> io::Result<usize> {
-    let harnesses = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    let mut removed = 0_usize;
-    for harness in harnesses {
-        let harness = harness?;
-        if !harness.file_type()?.is_dir() || !is_backup_harness_dir(&harness.file_name()) {
-            continue;
-        }
-        let sessions = match fs::read_dir(harness.path().join("backups")) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for session in sessions {
-            let session = session?;
-            if !session.file_type()?.is_dir() {
-                continue;
-            }
-            let lock_entries = match fs::read_dir(session.path().join(".locks")) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            for lock_entry in lock_entries {
-                let lock_entry = lock_entry?;
-                if lock_entry.file_type()?.is_file() && is_reclaim_token_path(&lock_entry.path()) {
-                    removed = removed
-                        .saturating_add(remove_stale_reclaim_token(&lock_entry.path())? as usize);
-                }
-            }
-        }
-    }
-    Ok(removed)
-}
-
-fn is_backup_harness_dir(name: &std::ffi::OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    FIXED_BACKUP_HARNESS_DIRS.contains(&name)
-        || BACKUP_HARNESS_DIR_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-}
-
-fn sweep_reclaim_token_domain(domain_root: &Path) -> io::Result<usize> {
-    let mut directories = vec![(domain_root.to_path_buf(), 0_usize)];
-    let mut removed = 0_usize;
-    while let Some((directory, depth)) = directories.pop() {
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let path = entry.path();
-            if file_type.is_dir() && depth < RECLAIM_TOKEN_SWEEP_MAX_DOMAIN_DEPTH {
-                directories.push((path, depth + 1));
-            } else if file_type.is_file() && is_reclaim_token_path(&path) {
-                removed = removed.saturating_add(remove_stale_reclaim_token(&path)? as usize);
-            }
-        }
-    }
-    Ok(removed)
-}
-
-fn remove_stale_reclaim_token(path: &Path) -> io::Result<bool> {
-    let removed = match inspect_reclaim_token(path)? {
-        ExistingReclaimToken::StaleValid(owner) => remove_lock_if_owned(path, &owner)?,
-        ExistingReclaimToken::StaleMalformed => remove_malformed_reclaim_token(path)?,
-        ExistingReclaimToken::Held(_) | ExistingReclaimToken::Missing => false,
-    };
-    Ok(removed)
-}
-
-fn is_reclaim_token_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with('.') && name.ends_with(".reclaim"))
-}
-
 fn reclaim_token_path(lock_path: &Path) -> PathBuf {
     let file_name = lock_path
         .file_name()
@@ -2361,15 +2189,6 @@ pub(crate) fn sleep_until_retry(
     }
     thread::sleep(sleep_for);
     Ok(())
-}
-
-pub(crate) fn sync_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if crate::durability::sync_dir(parent).is_ok() {
-            #[cfg(unix)]
-            io_ledger::record(|ledger| ledger.dir_syncs += 1);
-        }
-    }
 }
 
 /// Per-thread counters of successful acquisitions and lease I/O: file fsyncs,
@@ -2693,7 +2512,7 @@ pub(crate) fn speech_process_identity(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     let boot = identity.boot_id?;
     #[cfg(target_os = "macos")]
-    let boot = crate::storage_retention::boot_id()?;
+    let boot = crate::volume::boot_id()?;
     #[cfg(windows)]
     let boot = speech_windows_boot_id()?;
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -3166,7 +2985,6 @@ mod tests {
             stale_heartbeat_ms: 2_000,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: 10,
-            malformed_owner: MalformedOwnerPolicy::RecoverAfterGrace,
         }
     }
 
@@ -4063,107 +3881,6 @@ mod tests {
         );
         assert_eq!(dead_reclaim_backoff_ms(0, 100), 250);
         assert_eq!(dead_reclaim_backoff_ms(20, 100), 5_000);
-    }
-
-    #[test]
-    fn maintenance_sweep_is_bounded_to_known_lock_domains() {
-        let root = tempfile::tempdir().expect("temporary storage root");
-        let cache_dir = root.path().join("index").join("project");
-        fs::create_dir_all(&cache_dir).expect("create nested cache");
-        let dead = synthetic_metadata(999_999_999, current_hostname(), now_ms());
-        let dead_token = write_reclaim_token(&cache_dir.join("cache.lock"), &dead);
-        let live = current_process_metadata();
-        let live_token = write_reclaim_token(&cache_dir.join("live.lock"), &live);
-        let backup_session = root.path().join("opencode/backups/session");
-        let backup_entry = backup_session.join("path_hash");
-        let backup_locks = backup_session.join(".locks");
-        fs::create_dir_all(&backup_entry).expect("create backup entry tree");
-        fs::create_dir_all(&backup_locks).expect("create backup lock directory");
-        let unrelated_token = write_reclaim_token(&backup_entry.join("foo.lock"), &dead);
-        let backup_token = write_reclaim_token(&backup_locks.join("x.lock"), &dead);
-        let cadence = Mutex::new(None);
-
-        let removed = sweep_stale_reclaim_tokens_at(&[root.path()], Instant::now(), &cadence)
-            .expect("sweep tokens");
-
-        assert_eq!(removed, Some(2));
-        assert!(!dead_token.exists());
-        assert!(
-            !backup_token.exists(),
-            "BackupStore lock tokens must be swept"
-        );
-        assert_eq!(read_lock_metadata(&live_token).expect("live token"), live);
-        assert!(
-            unrelated_token.exists(),
-            "maintenance must not descend into backup entry trees"
-        );
-    }
-
-    /// With `storage.cache_dir` set, cache-domain locks (and so their reclaim
-    /// tokens) are under the cache root while durable-state locks stay under
-    /// the storage root. One pass must sweep both roots.
-    #[test]
-    fn maintenance_sweep_covers_the_cache_root_and_the_durable_root() {
-        let durable = tempfile::tempdir().expect("temporary durable root");
-        let cache = tempfile::tempdir().expect("temporary cache root");
-        let dead = synthetic_metadata(999_999_999, current_hostname(), now_ms());
-        let index_dir = cache.path().join("index").join("project");
-        fs::create_dir_all(&index_dir).expect("create cache index");
-        let cache_token = write_reclaim_token(&index_dir.join("cache.lock"), &dead);
-        let checkpoints = durable.path().join("checkpoints").join("project");
-        fs::create_dir_all(&checkpoints).expect("create checkpoints");
-        let durable_token = write_reclaim_token(&checkpoints.join("store.lock"), &dead);
-        let cadence = Mutex::new(None);
-
-        let removed = sweep_stale_reclaim_tokens_at(
-            &[cache.path(), durable.path()],
-            Instant::now(),
-            &cadence,
-        )
-        .expect("sweep tokens");
-
-        assert_eq!(removed, Some(2));
-        assert!(!cache_token.exists(), "cache-root token kept");
-        assert!(!durable_token.exists(), "durable-root token kept");
-    }
-
-    #[test]
-    fn maintenance_sweep_runs_first_then_obeys_daily_cadence() {
-        let root = tempfile::tempdir().expect("temporary storage root");
-        let cache_dir = root.path().join("index").join("project");
-        fs::create_dir_all(&cache_dir).expect("create index cache");
-        let dead = synthetic_metadata(999_999_999, current_hostname(), now_ms());
-        let first_token = write_reclaim_token(&cache_dir.join("cache.lock"), &dead);
-        let cadence = Mutex::new(None);
-        let start = Instant::now();
-
-        assert_eq!(
-            sweep_stale_reclaim_tokens_at(&[root.path()], start, &cadence).expect("first sweep"),
-            Some(1)
-        );
-        assert!(!first_token.exists());
-
-        let second_token = write_reclaim_token(&cache_dir.join("cache.lock"), &dead);
-        assert_eq!(
-            sweep_stale_reclaim_tokens_at(
-                &[root.path()],
-                start + Duration::from_secs(60),
-                &cadence,
-            )
-            .expect("suppressed sweep"),
-            None
-        );
-        assert!(second_token.exists());
-        assert_eq!(
-            sweep_stale_reclaim_tokens_at(
-                &[root.path()],
-                start + RECLAIM_TOKEN_SWEEP_INTERVAL + Duration::from_secs(1),
-                &cadence,
-            )
-            .expect("next-day sweep"),
-            Some(1)
-        );
-        assert!(!second_token.exists());
     }
 
     #[test]

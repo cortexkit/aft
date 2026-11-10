@@ -571,6 +571,7 @@ pub enum RefusalCode {
     SeamSchemaMismatch,
     UnboundIdentity,
     BypassAuditUnavailable,
+    BypassBotCredentials,
     NoRealGh,
     GovernanceUnavailable,
     SeamUnavailable,
@@ -586,7 +587,7 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::WorkerNativeGh,
         Self::WorkerWriteRefused,
         Self::Unclassified,
@@ -597,6 +598,7 @@ impl RefusalCode {
         Self::SeamSchemaMismatch,
         Self::UnboundIdentity,
         Self::BypassAuditUnavailable,
+        Self::BypassBotCredentials,
         Self::NoRealGh,
         Self::GovernanceUnavailable,
         Self::SeamUnavailable,
@@ -623,6 +625,7 @@ impl RefusalCode {
             Self::SeamSchemaMismatch => "gh_shim_seam_schema_mismatch",
             Self::UnboundIdentity => "gh_shim_unbound_identity",
             Self::BypassAuditUnavailable => "gh_shim_bypass_audit_unavailable",
+            Self::BypassBotCredentials => "gh_shim_bypass_bot_credentials",
             Self::NoRealGh => "gh_shim_no_real_gh",
             Self::GovernanceUnavailable => "gh_shim_governance_unavailable",
             Self::SeamUnavailable => "gh_shim_seam_unavailable",
@@ -889,6 +892,23 @@ fn run_with(
         {
             return status;
         }
+        // Check operator bypasses before discovery can report governed routing as
+        // unavailable and hide the credential-specific refusal.
+        if operator_bypass_requested()
+            && !shim_disabled_by_operator()
+            && match classify(args, manifest, current_platform()) {
+                Classification::Admin { .. } => true,
+                Classification::Governed { tuple, .. } => {
+                    tuple == "pr enqueue"
+                        || is_reviewed_operator_label_tuple(manifest.manifest_version, &tuple)
+                }
+                _ => false,
+            }
+        {
+            if let Some(status) = refuse_bypass_bot_credentials(&manifest.detectors) {
+                return status;
+            }
+        }
         // The operator's token works on every repository, bound or not, and
         // an agent holding it could reach GitHub around the shim, so this
         // check comes before any target is resolved.
@@ -899,6 +919,7 @@ fn run_with(
                 args,
                 &command,
                 credential_use,
+                &manifest.detectors,
                 &paths,
                 now,
                 delegate,
@@ -907,7 +928,14 @@ fn run_with(
         if let Some(write) = unbound_write(args, manifest, current_platform(), &target, &cwd)
             .filter(|_| !shim_disabled_by_operator())
         {
-            return dispatch_unbound_write(args, &write, &paths, now, delegate);
+            return dispatch_unbound_write(
+                args,
+                &write,
+                &manifest.detectors,
+                &paths,
+                now,
+                delegate,
+            );
         }
     }
     let determination = determine_rung(&paths, &target, &cwd, now);
@@ -1109,6 +1137,7 @@ where
                     args,
                     &tuple,
                     manifest.manifest_version,
+                    &manifest.detectors,
                     paths,
                     now,
                     delegate_to_upstream,
@@ -1122,6 +1151,7 @@ where
                     args,
                     &tuple,
                     repository.as_deref(),
+                    &manifest.detectors,
                     paths,
                     now,
                     delegate_to_upstream,
@@ -1146,6 +1176,7 @@ where
                     args,
                     "pr merge",
                     repository.as_deref(),
+                    &manifest.detectors,
                     paths,
                     now,
                     delegate_to_upstream,
@@ -1166,6 +1197,7 @@ where
                     args,
                     &tuple,
                     target,
+                    &manifest.detectors,
                     paths,
                     now,
                     delegate_to_upstream,
@@ -1220,6 +1252,18 @@ fn operator_bypass_requested() -> bool {
     std::env::var_os("GH_SHIM_BYPASS").as_deref() == Some(OsStr::new("operator"))
 }
 
+fn refuse_bypass_bot_credentials(detectors: &Detectors) -> Option<i32> {
+    find_ambient_agent_credential(detectors).map(|credential| {
+        refuse(
+            RefusalCode::BypassBotCredentials,
+            &format!(
+                "{}; operator commands must run from a shell without bot credentials",
+                credential.presence()
+            ),
+        )
+    })
+}
+
 /// Run an admin-tier operator row (`pr edit`, `label create`).
 ///
 /// These verbs have no bot-speech route, so without the bypass they refuse as
@@ -1229,6 +1273,7 @@ fn dispatch_operator_row_admin<F>(
     args: &[OsString],
     tuple: &str,
     manifest_version: u64,
+    detectors: &Detectors,
     paths: &StatePaths,
     now: u64,
     delegate_to_upstream: F,
@@ -1253,11 +1298,14 @@ where
             args,
             tuple,
             LabelTarget::PullRequest,
+            detectors,
             paths,
             now,
             delegate_to_upstream,
         ),
-        _ => dispatch_operator_label_create(args, tuple, paths, now, delegate_to_upstream),
+        _ => {
+            dispatch_operator_label_create(args, tuple, detectors, paths, now, delegate_to_upstream)
+        }
     }
 }
 
@@ -1271,6 +1319,7 @@ where
 fn dispatch_operator_label_create<F>(
     args: &[OsString],
     tuple: &str,
+    detectors: &Detectors,
     paths: &StatePaths,
     now: u64,
     delegate_to_upstream: F,
@@ -1278,6 +1327,9 @@ fn dispatch_operator_label_create<F>(
 where
     F: FnOnce(&[OsString]) -> i32,
 {
+    if let Some(status) = refuse_bypass_bot_credentials(detectors) {
+        return status;
+    }
     let create = match parse_operator_label_create(args) {
         Ok(create) => create,
         Err(error) => return refuse_governed_canonicalization(&error),
@@ -1311,6 +1363,7 @@ fn dispatch_operator_label_edit<F>(
     args: &[OsString],
     tuple: &str,
     target: LabelTarget,
+    detectors: &Detectors,
     paths: &StatePaths,
     now: u64,
     delegate_to_upstream: F,
@@ -1318,6 +1371,9 @@ fn dispatch_operator_label_edit<F>(
 where
     F: FnOnce(&[OsString]) -> i32,
 {
+    if let Some(status) = refuse_bypass_bot_credentials(detectors) {
+        return status;
+    }
     let edit = match parse_operator_label_edit(args, target) {
         Ok(edit) => edit,
         Err(error) => return refuse_governed_canonicalization(&error),
@@ -1442,6 +1498,7 @@ fn unbound_write(
 fn dispatch_unbound_write<F>(
     args: &[OsString],
     write: &UnboundWrite,
+    detectors: &Detectors,
     paths: &StatePaths,
     now: u64,
     delegate_to_upstream: F,
@@ -1459,6 +1516,7 @@ where
         args,
         &write.command,
         write.target.audit_repository(),
+        detectors,
         paths,
         now,
         delegate_to_upstream,
@@ -1469,6 +1527,7 @@ fn dispatch_audited_bypass<F>(
     args: &[OsString],
     tuple: &str,
     repository: Option<&str>,
+    detectors: &Detectors,
     paths: &StatePaths,
     now: u64,
     delegate_to_upstream: F,
@@ -1476,6 +1535,9 @@ fn dispatch_audited_bypass<F>(
 where
     F: FnOnce(&[OsString]) -> i32,
 {
+    if let Some(status) = refuse_bypass_bot_credentials(detectors) {
+        return status;
+    }
     let audit = if tuple == "repo rename" {
         match rename_guard::check(args, repository) {
             Ok(check) => {
@@ -1642,6 +1704,7 @@ fn dispatch_operator_credentials<F>(
     args: &[OsString],
     command: &str,
     credential_use: CredentialUse,
+    detectors: &Detectors,
     paths: &StatePaths,
     now: u64,
     delegate_to_upstream: F,
@@ -1654,6 +1717,9 @@ where
             RefusalCode::OperatorCredentials,
             &operator_credentials_refusal_text(command, credential_use),
         );
+    }
+    if let Some(status) = refuse_bypass_bot_credentials(detectors) {
+        return status;
     }
     if let Err(error) = append_bypass_audit(paths, command, None, now) {
         return refuse(
@@ -2484,20 +2550,6 @@ fn read_last_probe(paths: &StatePaths) -> Option<LastProbeReport> {
     serde_json::from_slice(&fs::read(&paths.last_probe).ok()?).ok()
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn write_storage_permission_fixture(root: &Path) {
-    let paths = StatePaths::from_root(root.to_path_buf());
-    write_last_probe_silently(
-        &paths,
-        &LastProbeReport {
-            stage: "connect".to_string(),
-            elapsed_ms: 1,
-            outcome: "ok".to_string(),
-        },
-    );
-    assert!(paths.last_probe.is_file());
-}
-
 /// Resolve the one process-state directory used by every gh-shim reader and
 /// writer. The dedicated absolute override is for embedding callers and tests;
 /// otherwise the ladder is XDG state-home, then `$HOME/.local/state`.
@@ -2983,7 +3035,7 @@ fn determine_rung_for_target(
                     determination
                         .record
                         .inputs
-                        .insert("agent_credentials_present".to_string(), source);
+                        .insert("agent_credentials_present".to_string(), source.diagnostic());
                     determination
                         .record
                         .inputs
@@ -3689,10 +3741,56 @@ struct Detectors {
     credential_env_names: Vec<String>,
 }
 
-fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
+enum AmbientAgentCredential {
+    Environment(String),
+    WrapperConfigDirectory(PathBuf),
+    GhConfigDirectory(PathBuf),
+}
+
+impl AmbientAgentCredential {
+    fn diagnostic(&self) -> String {
+        match self {
+            Self::Environment(name) => format!("env:{name}"),
+            Self::WrapperConfigDirectory(path) | Self::GhConfigDirectory(path) => {
+                format!("path:{}", path.display())
+            }
+        }
+    }
+
+    fn presence(&self) -> String {
+        match self {
+            Self::Environment(name) => format!("{name} is present"),
+            Self::GhConfigDirectory(_) => "GH_CONFIG_DIR points to bot credentials".to_string(),
+            Self::WrapperConfigDirectory(path) => {
+                format!("bot credential directory {} is present", path.display())
+            }
+        }
+    }
+}
+
+fn find_ambient_agent_credential(detectors: &Detectors) -> Option<AmbientAgentCredential> {
     for name in &detectors.credential_env_names {
         if std::env::var_os(name).is_some() {
-            return Some(format!("env:{name}"));
+            return Some(AmbientAgentCredential::Environment(name.clone()));
+        }
+    }
+
+    // Prefer the variable's name when the configured directory is also covered
+    // by a wrapper-dir glob, so a refusal tells the caller which variable to remove.
+    if let Some(configured) =
+        crate::environment::non_empty_os_var("GH_CONFIG_DIR").map(PathBuf::from)
+    {
+        if configured.is_dir()
+            && configured.file_name().is_some_and(|name| {
+                detectors.wrapper_config_dirs.iter().any(|pattern| {
+                    Path::new(pattern).file_name().is_some_and(|glob_name| {
+                        glob::Pattern::new(&glob_name.to_string_lossy())
+                            .is_ok_and(|p| p.matches(&name.to_string_lossy()))
+                    })
+                })
+            })
+        {
+            return Some(AmbientAgentCredential::GhConfigDirectory(configured));
         }
     }
 
@@ -3707,28 +3805,12 @@ fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
         };
         for path in paths {
             if path.is_dir() {
-                return Some(format!("path:{}", path.display()));
+                return Some(AmbientAgentCredential::WrapperConfigDirectory(path));
             }
         }
     }
 
-    // `GH_CONFIG_DIR` is only inspected as a metadata path. The basename is
-    // compared to the manifest's declared wrapper-dir glob, so the operator's
-    // normal gh configuration remains outside this detector inventory.
-    let configured = crate::environment::non_empty_os_var("GH_CONFIG_DIR").map(PathBuf::from)?;
-    if !configured.is_dir() {
-        return None;
-    }
-    let name = configured.file_name()?.to_string_lossy();
-    detectors
-        .wrapper_config_dirs
-        .iter()
-        .any(|pattern| {
-            Path::new(pattern).file_name().is_some_and(|glob_name| {
-                glob::Pattern::new(&glob_name.to_string_lossy()).is_ok_and(|p| p.matches(&name))
-            })
-        })
-        .then(|| format!("path:{}", configured.display()))
+    None
 }
 
 /// Expand a manifest `wrapper_config_dirs` pattern against the process env.
@@ -8402,6 +8484,10 @@ mod v22_tests;
 mod v23_tests;
 
 #[cfg(test)]
+#[path = "gh_shim/bypass_bot_credentials_tests.rs"]
+mod bypass_bot_credentials_tests;
+
+#[cfg(test)]
 // Release-profile test builds carry no dev key in the trust set, so the tests
 // that verify under it are `cfg(debug_assertions)` and the helpers only they
 // use read as dead there; the module compiles in both profiles.
@@ -8455,7 +8541,7 @@ mod tests {
             );
             assert_eq!(configured_connection_file(), Some(connection_path));
             assert_eq!(read_user_config_doc(), Some(doc));
-            assert!(crate::views::parent::discover(&profile, 1).is_none());
+            assert!(crate::data_layer::parent_session::discover(&profile, 1).is_none());
 
             // With neither home available, do not read a config relative to cwd.
             std::env::set_var("USERPROFILE", "");
@@ -8523,13 +8609,13 @@ mod tests {
     const BRANCH_PROTECTION_PATH_GLOB: &str = "/repos/*/*/branches/*/protection";
     const BRANCH_PROTECTION_API_TUPLE: &str = "api:PUT:/repos/*/*/branches/*/protection";
 
-    struct ScopedTestEnvVar {
+    pub(super) struct ScopedTestEnvVar {
         key: &'static str,
         previous: Option<OsString>,
     }
 
     impl ScopedTestEnvVar {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
+        pub(super) fn set(key: &'static str, value: Option<&str>) -> Self {
             let previous = std::env::var_os(key);
             match value {
                 Some(value) => unsafe { std::env::set_var(key, value) },
@@ -8697,7 +8783,7 @@ mod tests {
         fs::write(&paths.manifest, envelope_json.as_bytes()).expect("manifest cache");
     }
 
-    fn test_rung_provenance() -> RungRecordProvenance {
+    pub(super) fn test_rung_provenance() -> RungRecordProvenance {
         RungRecordProvenance {
             image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
             version: "0.53.0-test".to_string(),
@@ -9534,23 +9620,35 @@ mod tests {
         {
             let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
             assert_eq!(
-                dispatch_unbound_write(&args, &write, &paths, TEST_NOW, |_| panic!(
-                    "unbound cancel without bypass reached upstream"
-                )),
+                dispatch_unbound_write(
+                    &args,
+                    &write,
+                    &manifest.detectors,
+                    &paths,
+                    TEST_NOW,
+                    |_| panic!("unbound cancel without bypass reached upstream")
+                ),
                 REFUSAL_EXIT_STATUS
             );
             assert!(!paths.bypass_audit.exists());
         }
         let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
         assert_eq!(
-            dispatch_unbound_write(&args, &write, &paths, TEST_NOW, |forwarded| {
-                assert_eq!(forwarded, args);
-                let records = read_bypass_audit(&paths).0.unwrap();
-                assert_eq!(records.len(), 1);
-                assert_eq!(records[0]["tuple"], "run cancel");
-                assert_eq!(records[0]["repository"], "unbound/example");
-                73
-            }),
+            dispatch_unbound_write(
+                &args,
+                &write,
+                &manifest.detectors,
+                &paths,
+                TEST_NOW,
+                |forwarded| {
+                    assert_eq!(forwarded, args);
+                    let records = read_bypass_audit(&paths).0.unwrap();
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0]["tuple"], "run cancel");
+                    assert_eq!(records[0]["repository"], "unbound/example");
+                    73
+                }
+            ),
             73
         );
     }
@@ -11571,7 +11669,7 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 22);
+        assert_eq!(RefusalCode::ALL.len(), 23);
         assert_eq!(
             RefusalCode::WorkerWriteRefused.as_str(),
             crate::gh_shim_speech::WORKER_WRITE_CODE
@@ -14622,6 +14720,7 @@ INHERITED FLAGS
         use std::cell::Cell;
 
         let _env_lock = crate::test_env::process_env_lock();
+        let manifest = fixture_manifest();
         let directory = tempfile::tempdir().expect("create unbound write state directory");
         let paths = StatePaths::from_root(directory.path().to_path_buf());
         let args = os_args(&["repo", "create", "cortexkit/common-auth", "--private"]);
@@ -14635,9 +14734,14 @@ INHERITED FLAGS
 
         {
             let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
-            let status = dispatch_unbound_write(&args, &write, &paths, TEST_NOW, |_| {
-                panic!("an unbound write ran without the operator bypass")
-            });
+            let status = dispatch_unbound_write(
+                &args,
+                &write,
+                &manifest.detectors,
+                &paths,
+                TEST_NOW,
+                |_| panic!("an unbound write ran without the operator bypass"),
+            );
             assert_eq!(status, REFUSAL_EXIT_STATUS);
             assert!(!paths.bypass_audit.exists());
         }
@@ -14645,13 +14749,20 @@ INHERITED FLAGS
         let delegated = Cell::new(0);
         {
             let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
-            let status = dispatch_unbound_write(&args, &write, &paths, TEST_NOW, |ran| {
-                assert_eq!(ran, args);
-                // The audit line is durable before upstream `gh` is spawned.
-                assert!(paths.bypass_audit.exists());
-                delegated.set(delegated.get() + 1);
-                73
-            });
+            let status = dispatch_unbound_write(
+                &args,
+                &write,
+                &manifest.detectors,
+                &paths,
+                TEST_NOW,
+                |ran| {
+                    assert_eq!(ran, args);
+                    // The audit line is durable before upstream `gh` is spawned.
+                    assert!(paths.bypass_audit.exists());
+                    delegated.set(delegated.get() + 1);
+                    73
+                },
+            );
             assert_eq!(status, 73);
         }
         assert_eq!(delegated.get(), 1);

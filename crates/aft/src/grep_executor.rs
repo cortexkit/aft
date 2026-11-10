@@ -16,9 +16,9 @@ use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
     build_path_filters, decompose_grep_pattern, resolve_search_scope,
-    sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, try_read_with_budget,
-    GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, GrepScanOrder, IndexStatus,
-    PathFilters, RegexQuery, WalkBound, INTERACTIVE_ARTIFACT_READ_BUDGET,
+    sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, GrepMatch, GrepPathExclusion,
+    GrepQueryPhaseTimings, GrepResult, GrepScanOrder, IndexStatus, PathFilters, RegexQuery,
+    WalkBound,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -42,12 +42,6 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn note_fallback_walk_for_test() {
     FALLBACK_WALKS.with(|walks| walks.set(walks.get() + 1));
-}
-
-/// Fallback filesystem walks started on this thread so far.
-#[cfg(test)]
-pub(crate) fn fallback_walks_for_test() -> usize {
-    FALLBACK_WALKS.with(std::cell::Cell::get)
 }
 
 fn fallback_walk_limit() -> usize {
@@ -793,9 +787,6 @@ fn execute_root_profiled(
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary detection still applies.
     if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-        if root.use_index && !crate::context::confinement::active() {
-            crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
-        }
         let index_status = if root.use_index && !crate::context::confinement::active() {
             current_index_status(ctx)
         } else {
@@ -844,114 +835,39 @@ fn execute_root_profiled(
         );
     }
 
-    let snapshot_started = Instant::now();
-    let ignored_target = root.ignored_target;
-    let mut snapshot_timed_out = false;
-    let mut import_building = false;
-    let view_snapshot = (root.use_index && !ignored_target)
-        .then(|| ctx.lexical_view_snapshot("grep"))
-        .flatten();
-    let indexed_snapshot = if let Some(snapshot) = view_snapshot {
-        match snapshot {
-            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => Some(snapshot),
-            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
-                import_building = true;
-                None
-            }
-            Err(error) => {
-                return (
-                    failed_index_grep(std::io::Error::other(
-                        crate::context::view_load_failure_message(error),
-                    )),
-                    GrepExecutionPhaseTimings::default(),
-                )
+    if root.use_index && !root.ignored_target {
+        if let Some(view) = crate::data_layer::tools::grep::ready_view(ctx) {
+            if let Some(answer) = execute_root_from_view(
+                ctx,
+                view,
+                pattern,
+                query,
+                root,
+                params,
+                filters,
+                max_results,
+                project_root,
+                order,
+            ) {
+                return answer;
             }
         }
-    } else {
-        match try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
-            Some(search_index) => match search_index.as_ref() {
-                Some(index) if index.ready && root.use_index && !ignored_target => {
-                    Some(index.snapshot())
-                }
-                _ => None,
-            },
-            None => {
-                snapshot_timed_out = true;
-                None
-            }
-        }
-    };
-    let snapshot_acquire = snapshot_started.elapsed();
-    let mut index_lacks_scope = ignored_target;
-    if let Some(snapshot) = indexed_snapshot {
-        let scope_started = Instant::now();
-        let indexed_scope_has_files = snapshot.has_file_in_scope(&root.search_root);
-        let scope_elapsed = scope_started.elapsed();
-        // A project-wide search always answers from the index, even when it
-        // holds no files (everything ignored, or an empty project): that is a
-        // real, complete answer, not a missing scope.
-        if indexed_scope_has_files || is_same_directory(&root.search_root, project_root) {
-            let (result, mut query_timings) = match snapshot
-                .search_grep_profiled_with_filters_and_query_in_order(
-                    pattern,
-                    query,
-                    filters,
-                    &root.search_root,
-                    max_results,
-                    params.path_exclusion,
-                    order,
-                ) {
-                Ok(result) => result,
-                Err(error) => {
-                    return (
-                        failed_index_grep(error),
-                        GrepExecutionPhaseTimings::default(),
-                    )
-                }
-            };
-            query_timings.post_filter += scope_elapsed;
-            return (
-                result,
-                GrepExecutionPhaseTimings {
-                    snapshot_acquire,
-                    query_decomposition: Duration::ZERO,
-                    query: query_timings,
-                    indexed_scope_has_files: Some(
-                        snapshot.has_file_in_scope_with_filters(&root.search_root, filters),
-                    ),
-                    walk_counts: None,
-                },
-            );
-        }
-        // The index holds no file under this explicitly named subdirectory. That is the case when the
-        // caller named a directory an ignore rule keeps out of the index (a
-        // gitignored `node_modules/pkg`, for example) or a symlinked directory
-        // the index walk never follows. Answering from the index would report
-        // zero matches for a directory that may be full of files, so walk it
-        // instead. This follows ripgrep: the walk never applies ignore rules to
-        // the named root itself, only to entries nested inside it. The walk
-        // keeps its usual file-count and time bounds.
-        index_lacks_scope = true;
     }
 
-    if root.use_index && !index_lacks_scope && !import_building {
-        crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
-    }
+    let snapshot_started = Instant::now();
+    let ignored_target = root.ignored_target;
+    let snapshot_acquire = snapshot_started.elapsed();
+    let index_lacks_scope = ignored_target;
+
     // A walk that replaces a ready index reports `Fallback`, so the response
     // discloses that these results came from the filesystem, not the index.
     let index_status = if root.use_index && !index_lacks_scope {
-        if import_building {
-            IndexStatus::Building
-        } else if snapshot_timed_out {
-            IndexStatus::Fallback
-        } else {
-            current_index_status(ctx)
-        }
+        current_index_status(ctx)
     } else {
         IndexStatus::Fallback
     };
     let mut counts = ScopeFileCounts::default();
-    let mut result = fallback_grep_counted(
+    let result = fallback_grep_counted(
         project_root,
         &root.search_root,
         &root.filter_root,
@@ -964,11 +880,6 @@ fn execute_root_profiled(
         ignored_target,
         order,
     );
-    if import_building {
-        result
-            .index_read_gaps
-            .push("legacy text and symbol import building".into());
-    }
     (
         result,
         GrepExecutionPhaseTimings {
@@ -977,6 +888,97 @@ fn execute_root_profiled(
             ..GrepExecutionPhaseTimings::default()
         },
     )
+}
+
+/// [`execute_root_profiled`] answered from the data layer's view of the
+/// checkout: the view names the candidate files, and today's indexed search
+/// reads, matches, filters and orders them. `None` when the root is outside
+/// the view's checkout, so today's path answers instead.
+#[allow(clippy::too_many_arguments)]
+fn execute_root_from_view(
+    ctx: &AppContext,
+    view: crate::data_layer::checkout::CheckoutView,
+    pattern: &CompiledPattern,
+    query: &RegexQuery,
+    root: &ResolvedRoot,
+    params: &GrepParams,
+    filters: &PathFilters,
+    max_results: usize,
+    project_root: &Path,
+    order: GrepScanOrder,
+) -> Option<(GrepResult, GrepExecutionPhaseTimings)> {
+    let snapshot_started = Instant::now();
+    let scope = crate::data_layer::tools::grep::ViewScope::of(view, &root.search_root)?;
+    if !scope.is_whole_checkout() && !scope.has_files() {
+        // The checkout holds no file under this explicitly named directory,
+        // so walk it, as below when today's index lacks the directory.
+        let mut counts = ScopeFileCounts::default();
+        let result = fallback_grep_counted(
+            project_root,
+            &root.search_root,
+            &root.filter_root,
+            pattern,
+            filters,
+            max_results,
+            IndexStatus::Fallback,
+            params.path_exclusion,
+            &mut counts,
+            false,
+            order,
+        );
+        return Some((
+            result,
+            GrepExecutionPhaseTimings {
+                snapshot_acquire: snapshot_started.elapsed(),
+                walk_counts: Some(counts),
+                ..GrepExecutionPhaseTimings::default()
+            },
+        ));
+    }
+    let snapshot = match scope.candidates(pattern) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // A view that cannot be read fails the call with its cause; no
+            // walk answers in its place.
+            let error = error.to_string();
+            ctx.note_view_load_failure("trigram", &error);
+            return Some((
+                failed_index_grep(std::io::Error::other(
+                    crate::context::view_load_failure_message(error),
+                )),
+                GrepExecutionPhaseTimings::default(),
+            ));
+        }
+    };
+    let snapshot_acquire = snapshot_started.elapsed();
+    let (result, query_timings) = match snapshot
+        .search_grep_profiled_with_filters_and_query_in_order(
+            pattern,
+            query,
+            filters,
+            &root.search_root,
+            max_results,
+            params.path_exclusion,
+            order,
+        ) {
+        Ok(result) => result,
+        Err(error) => {
+            return Some((
+                failed_index_grep(error),
+                GrepExecutionPhaseTimings::default(),
+            ))
+        }
+    };
+    Some((
+        result,
+        GrepExecutionPhaseTimings {
+            snapshot_acquire,
+            query_decomposition: Duration::ZERO,
+            query: query_timings,
+            indexed_scope_has_files: Some(scope.has_files_matching(filters)),
+            walk_counts: None,
+        },
+    ))
 }
 
 /// True when both paths name the same directory, comparing the given forms
@@ -2599,26 +2601,17 @@ pub(crate) fn ripgrep_glob(
     Some(outcome)
 }
 
+/// How the checkout's text index stands for a reply that did not come from
+/// it: `Building` while its first publication is on the way, `Ready` once it
+/// serves (a walk then replaced it for this call), `Fallback` otherwise.
 fn current_index_status(ctx: &AppContext) -> IndexStatus {
     if ctx.cache_unavailable_reason().is_some() {
         return IndexStatus::Fallback;
     }
-    let Some(search_index) =
-        try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-    else {
-        return IndexStatus::Fallback;
-    };
-    if search_index.as_ref().is_some_and(|index| index.ready) {
-        return IndexStatus::Ready;
-    }
-
-    let build_in_progress =
-        try_read_with_budget(ctx.search_index_rx(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-            .is_some_and(|search_index_rx| search_index_rx.is_some());
-    if build_in_progress || search_index.is_some() {
-        IndexStatus::Building
-    } else {
-        IndexStatus::Fallback
+    match crate::data_layer::surfaces::report(ctx).map(|report| report.text.status) {
+        Some(crate::data_layer::surfaces::READY) => IndexStatus::Ready,
+        Some(crate::data_layer::surfaces::BUILDING) => IndexStatus::Building,
+        _ => IndexStatus::Fallback,
     }
 }
 
@@ -2940,6 +2933,8 @@ mod tests {
         assert!(merged.truncated);
     }
 
+    /// 100 directories of 100 files, each file holding one `needle`, and a
+    /// context for it with no index of any kind, so grep walks the folder.
     fn grep_io_fixture() -> (tempfile::TempDir, AppContext) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -2954,7 +2949,6 @@ mod tests {
                 .unwrap();
             }
         }
-        let index = crate::search_index::SearchIndex::build_with_limit(&root, 1024 * 1024);
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
@@ -2962,19 +2956,53 @@ mod tests {
                 ..crate::config::Config::default()
             },
         );
-        *ctx.search_index().write().unwrap() = Some(index);
         (dir, ctx)
+    }
+
+    /// A context for the fixture at `root` whose checkout is bound in the
+    /// data layer and has published its text index, so grep takes its
+    /// candidates from the data layer's view. The call graph is switched off:
+    /// grep never reads it, and building it for 10,000 files is slow.
+    fn grep_io_data_layer_context(root: &Path, storage: &Path) -> AppContext {
+        let mut config = crate::config::Config {
+            project_root: Some(root.to_path_buf()),
+            storage_dir: Some(storage.to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        config.indexes.callgraph = false;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        let deadline = Instant::now() + Duration::from_secs(600);
+        while crate::data_layer::tools::grep::ready_view(&ctx).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the data layer never published the fixture's text index"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        ctx
+    }
+
+    /// The grep measurement on a data-layer context, checking that the data
+    /// layer answered: a walk of the fixture reports `Fallback`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn measured_data_layer_grep(ctx: &AppContext) -> (Duration, usize, usize) {
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(60));
+        let (measurement, index_status) = measured_grep_with_status(ctx, budget);
+        assert_eq!(index_status, "Ready", "the data layer did not answer");
+        measurement
     }
 
     fn measured_grep(ctx: &AppContext) -> (Duration, usize, usize) {
         let budget = crate::bounded_io::Budget::after(Duration::from_secs(60));
-        measured_grep_with_budget(ctx, budget)
+        measured_grep_with_status(ctx, budget).0
     }
 
-    fn measured_grep_with_budget(
+    /// The measurement and the reply's `index_status`.
+    fn measured_grep_with_status(
         ctx: &AppContext,
         budget: crate::bounded_io::Budget,
-    ) -> (Duration, usize, usize) {
+    ) -> ((Duration, usize, usize), serde_json::Value) {
         let request = crate::protocol::RawRequest {
             id: "grep-io-measurement".into(),
             command: "grep".into(),
@@ -2994,22 +3022,26 @@ mod tests {
         );
         assert_eq!(response.data["total_matches"], 10_000);
         let (spawns, round_trips) = budget.measurements();
-        (elapsed, spawns, round_trips)
+        (
+            (elapsed, spawns, round_trips),
+            response.data["index_status"].clone(),
+        )
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ten_thousand_file_grep_uses_directory_probes_not_per_file_helpers() {
         let (_fixture, ctx) = grep_io_fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let indexed = grep_io_data_layer_context(&project_root(&ctx), storage.path());
         let pool = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
-        let (_, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
+        let (_, spawns, round_trips) = pool.install(|| measured_data_layer_grep(&indexed));
         assert!(spawns > 0, "cold first-access probes must be counted");
         assert!(spawns <= 132 && round_trips <= 132, "100 directories plus fixed root work, not 10000 files: spawns={spawns} round_trips={round_trips}");
-        *ctx.search_index().write().unwrap() = None;
         let (_, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
         assert!(spawns > 0);
         assert!(spawns <= 132 && round_trips <= 132, "the fallback walk must reuse its bounded helper: spawns={spawns} round_trips={round_trips}");
@@ -3035,7 +3067,6 @@ mod tests {
     #[test]
     fn ten_thousand_file_grep_sorts_matches_without_per_directory_respawns() {
         let (_fixture, ctx) = grep_io_fixture();
-        *ctx.search_index().write().unwrap() = None;
         let (_, spawns, round_trips) =
             std::thread::scope(|scope| scope.spawn(|| measured_grep(&ctx)).join().unwrap());
         assert!(spawns > 0);
@@ -3053,17 +3084,16 @@ mod tests {
         const ROOT_ACCESS_CAP: Duration = Duration::from_secs(12);
         const QUEUE_HOLD: Duration = Duration::from_secs(8);
         const RUNNING_HOLD: Duration = Duration::from_secs(6);
-        let (_fixture, ctx) = grep_io_fixture();
-        let root = project_root(&ctx);
+        let (_fixture, walked) = grep_io_fixture();
+        let root = project_root(&walked);
+        let storage = tempfile::tempdir().unwrap();
+        let data_layer = grep_io_data_layer_context(&root, storage.path());
         let pool = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
-        for indexed in [true, false] {
-            if !indexed {
-                *ctx.search_index().write().unwrap() = None;
-            }
+        for (indexed, ctx) in [(true, &data_layer), (false, &walked)] {
             let queued = crate::bounded_io::stall_helper(&root);
             let running = crate::bounded_io::stall_running_helper(&root);
             let budget = crate::bounded_io::Budget::after(Duration::from_secs(60))
@@ -3074,7 +3104,7 @@ mod tests {
                 let pool = &pool;
                 let ctx = &ctx;
                 let caller = scope.spawn(move || {
-                    let result = pool.install(|| measured_grep_with_budget(ctx, budget));
+                    let result = pool.install(|| measured_grep_with_status(ctx, budget));
                     let _ = done_tx.send(());
                     result
                 });
@@ -3090,7 +3120,10 @@ mod tests {
                 let started = running.reached.recv_timeout(Duration::from_secs(30));
                 let before_release = done_rx.recv_timeout(RUNNING_HOLD);
                 drop(running);
-                let (_, spawns, round_trips) = caller.join().unwrap();
+                let ((_, spawns, round_trips), index_status) = caller.join().unwrap();
+                if indexed {
+                    assert_eq!(index_status, "Ready", "the data layer did not answer");
+                }
                 assert_eq!(cold_measurements.1, 1);
                 assert!(before_start.is_err());
                 started.expect("the fixture-root metadata helper must start");
@@ -3109,19 +3142,18 @@ mod tests {
     #[test]
     #[ignore = "manual five-run 10000-file grep wall-time and helper-count measurement"]
     fn grep_io_10k_measurement() {
-        let (_fixture, ctx) = grep_io_fixture();
+        let (_fixture, walked) = grep_io_fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let data_layer = grep_io_data_layer_context(&project_root(&walked), storage.path());
         let pool = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
             .num_threads(4)
             .build()
             .unwrap();
-        for indexed in [true, false] {
-            if !indexed {
-                *ctx.search_index().write().unwrap() = None;
-            }
+        for (indexed, ctx) in [(true, &data_layer), (false, &walked)] {
             let mut samples = Vec::new();
             for run in 0..5 {
-                let (elapsed, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
+                let (elapsed, spawns, round_trips) = pool.install(|| measured_grep(ctx));
                 println!("grep_io_10k mode={} run={} elapsed_ms={:.3} thread_spawns={} helper_round_trips={}",
                     if indexed { "indexed" } else { "fallback" }, run + 1, elapsed.as_secs_f64() * 1000.0, spawns, round_trips);
                 samples.push(elapsed);
@@ -4125,113 +4157,6 @@ mod tests {
             crate::pattern_compile::CompileResult::Ok(compiled) => compiled,
             other => panic!("compile regex {pattern:?}: {other:?}"),
         }
-    }
-
-    fn grep_result_bytes(result: &GrepResult) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "matches": result.matches.iter().map(|matched| serde_json::json!({
-                "file": matched.file,
-                "line": matched.line,
-                "column": matched.column,
-                "line_text": matched.line_text,
-                "match_text": matched.match_text,
-            })).collect::<Vec<_>>(),
-            "total_matches": result.total_matches,
-            "files_searched": result.files_searched,
-            "files_with_matches": result.files_with_matches,
-            "index_status": result.index_status.as_str(),
-            "truncated": result.truncated,
-            "fully_degraded": result.fully_degraded,
-            "engine_capped": result.engine_capped,
-            "walk_truncated": result.walk_truncated,
-        }))
-        .expect("serialize grep result projection")
-    }
-
-    #[test]
-    fn multi_root_shared_query_matches_per_root_query_bytes() {
-        let project = tempfile::tempdir().expect("project");
-        let root_names = ["api", "cli", "daemon", "worker"];
-        let roots = root_names
-            .iter()
-            .map(|name| {
-                let root = project.path().join(name);
-                std::fs::create_dir_all(&root).expect("create root");
-                std::fs::write(
-                    root.join("service.rs"),
-                    "fn needle_alpha_12() {}\nfn needle_beta_34() {}\n",
-                )
-                .expect("write fixture");
-                std::fs::canonicalize(root).expect("canonicalize root")
-            })
-            .collect::<Vec<_>>();
-        let pattern = compiled_regex(r"needle_(?:alpha|beta)_\d+");
-        let filters = PathFilters::default();
-        let params = GrepParams {
-            include: Vec::new(),
-            exclude: Vec::new(),
-            max_results: 100,
-            path_exclusion: None,
-        };
-        let scope = GrepScope {
-            roots: roots
-                .iter()
-                .map(|root| ResolvedRoot {
-                    search_root: root.clone(),
-                    filter_root: project.path().to_path_buf(),
-                    use_index: true,
-                    is_external: false,
-                    ignored_target: false,
-                    authorized_task_artifact: false,
-                })
-                .collect(),
-            multi_root: true,
-            per_root_max: 200,
-        };
-        let index =
-            crate::search_index::SearchIndex::build_with_limit_serial(project.path(), 1_048_576);
-        let snapshot = index.snapshot();
-        let expected = merge_grep_results(
-            scope
-                .roots
-                .iter()
-                .map(|root| {
-                    snapshot
-                        .search_grep_profiled_with_filters(
-                            &pattern,
-                            &filters,
-                            &root.search_root,
-                            scope.per_root_max,
-                            None,
-                        )
-                        .unwrap()
-                        .0
-                })
-                .collect(),
-            project.path(),
-            params.max_results,
-        );
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(project.path().to_path_buf()),
-                ..crate::config::Config::default()
-            },
-        );
-        *ctx.search_index().write().expect("lock search index") = Some(index);
-
-        let (actual, phases) =
-            execute_profiled_with_filters(&ctx, &pattern, &scope, &params, &filters);
-
-        assert_eq!(
-            grep_result_bytes(&actual),
-            grep_result_bytes(&expected),
-            "shared query search must preserve the legacy per-root result bytes"
-        );
-        assert!(
-            !phases.query_decomposition.is_zero(),
-            "the indexed request must record its one-time query decomposition"
-        );
     }
 
     /// Manual release-mode probe for a warm indexed TypeScript corpus searched across four roots.

@@ -101,7 +101,7 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     crate::private_storage::tighten_open_dir(&storage, &run);
     cleanup(&run)?;
     let pid = std::process::id();
-    let start = crate::root_cache::process_start_time_ms(pid)
+    let start = crate::process_identity::process_start_time_ms(pid)
         .ok_or_else(|| io::Error::other("cannot determine executable pin owner start time"))?;
     let directory = run.join(format!("aft-pinned-{pid}-{start}"));
     crate::private_storage::create_dir(&directory)?;
@@ -147,7 +147,7 @@ fn cleanup(run: &Path) -> io::Result<()> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let alive = match crate::root_cache::process_start_time_ms(pid) {
+        let alive = match crate::process_identity::process_start_time_ms(pid) {
             Some(actual) => actual == start,
             // An inaccessible start time is not proof of death.
             None => crate::fs_lock::process_alive(pid),
@@ -635,7 +635,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let run = storage.path();
         let pid = std::process::id();
-        let start = crate::root_cache::process_start_time_ms(pid).unwrap();
+        let start = crate::process_identity::process_start_time_ms(pid).unwrap();
         let live = run.join(format!("aft-pinned-{pid}-{start}"));
         let reused = run.join(format!("aft-pinned-{pid}-{}", start - 1));
         let unrelated = run.join("operator-state");
@@ -658,7 +658,7 @@ mod tests {
             .unwrap();
         let storage = tempfile::tempdir().unwrap();
         let pid = child.id();
-        let start = crate::root_cache::process_start_time_ms(pid).unwrap();
+        let start = crate::process_identity::process_start_time_ms(pid).unwrap();
         let directory = storage.path().join(format!("aft-pinned-{pid}-{start}"));
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(directory.join("aft"), b"live image").unwrap();
@@ -680,7 +680,7 @@ mod tests {
     fn pinned_executable_cleanup_lease_overrides_mismatched_process_clock() {
         let storage = tempfile::tempdir().unwrap();
         let pid = std::process::id();
-        let start = crate::root_cache::process_start_time_ms(pid).unwrap();
+        let start = crate::process_identity::process_start_time_ms(pid).unwrap();
         let directory = storage
             .path()
             .join(format!("aft-pinned-{pid}-{}", start - 1));

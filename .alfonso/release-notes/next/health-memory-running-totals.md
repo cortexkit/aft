@@ -1,1 +1,0 @@
-- The health report no longer re-walks every cached symbol, language-server diagnostic and document on each tick to estimate memory; it keeps running totals, which cuts background CPU on machines with many open projects.

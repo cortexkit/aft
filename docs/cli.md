@@ -11,6 +11,7 @@ The unified `@cortexkit/aft` CLI works across every supported harness:
 | `npx @cortexkit/aft@latest doctor --clear` | Interactive cache cleanup — pick which caches to clear (plugin packages, binary, LSP, semantic) |
 | `npx @cortexkit/aft@latest doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
 | `npx @cortexkit/aft@latest backups purge --path <p> [--session <id>] [--yes]` | Remove undo backups early for a file or directory, a session, or both (dry run unless `--yes`) |
+| `npx @cortexkit/aft@latest cache prune-legacy [--yes]` | Delete the index folders AFT used before 0.64 (dry run unless `--yes`) |
 
 Add `--harness opencode` or `--harness pi` to any command to target one harness explicitly.
 
@@ -144,4 +145,53 @@ examined: 2 namespace(s) [opencode, pi], 9 session dir(s), 12410 disk stack(s), 
 matched: 12124 stack(s), 12124 entries, 24248 file(s), 3214567890 byte(s), 12124 database row(s), 1 session(s) [ses_abc]
 sample paths:
   /Users/me/projects/engram/keystore/a.key
+```
+
+**`cache prune-legacy`** — Deletes the index folders AFT used before version 0.64. From
+0.64, AFT keeps all its indexes in the `data/` folder of its storage folder and never reads
+the old ones, which can take hundreds of gigabytes. AFT does not delete them on its own in
+this release. The native binary runs the same command as `aft cache prune-legacy`.
+
+```
+aft cache prune-legacy [--yes]
+```
+
+- It looks in the AFT storage folder (`AFT_STORAGE_DIR`, or `~/.local/share/cortexkit/aft`)
+  and, when `storage.cache_dir` is set, in the `aft` folder inside that cache folder. The
+  storage folder must hold `aft.db` or AFT's owner marker, and the cache folder must be
+  registered to that storage folder; otherwise it is left alone.
+- It deletes `views/`, `blobs/`, `callgraph/`, `index/`, `symbols/`, `artifact-owners/`,
+  `migration/`, `semantic-batch-leases-v1/`, every old index inside `semantic/` (each
+  per-project folder there except `semantic/models/`), and the `callgraph/` folder inside each
+  harness folder (`opencode/`, `pi/`, ...). It never deletes `data/`, `semantic/models/` (the
+  embedding and reranker models AFT downloaded), `inspect/`, `retention/`, `root-identities/`,
+  `cache-keys.json`, `aft.db`, your settings, your backups or anything else in a harness folder.
+- Without `--yes` it is a dry run: it lists each folder with its size and the total, and deletes
+  nothing. A size that says "at least" comes from a walk that stopped early on a very large
+  folder.
+- With `--yes` it first moves each folder into a `.prune-legacy-<time>` folder beside it, on the
+  same disk, and then deletes that folder. A folder that cannot be moved (on Windows, a file in
+  it may be open) is skipped and listed with the reason. A symbolic link, a mount point or a
+  folder on another disk is never followed or deleted. If a run stops early, the next run
+  deletes the `.prune-legacy-*` folders it left behind.
+- AFT can keep running while the command runs. If a repository's meaning search has not finished
+  its first fill, deleting the old indexes in `semantic/` means its remaining chunks are embedded
+  again instead of reused.
+
+Exit codes: 0 done, 1 error, 2 wrong arguments, 3 refused (not an AFT storage folder, or another
+cleanup is running), 5 a folder was skipped.
+
+```
+$ aft cache prune-legacy
+Old index folders in /Users/me/.local/share/cortexkit/aft:
+  blobs/  at least 129.0 GB
+  callgraph/  19.2 GB
+  index/  7.1 GB
+  opencode/callgraph/  310.4 MB
+  semantic/ (all but semantic/models/)  8.5 GB
+  symbols/  1.0 GB
+  views/  30.3 GB
+If a repository's meaning search has not finished its first fill, deleting the old indexes in semantic/ means its remaining chunks are embedded again instead of reused.
+Total: at least 195.4 GB in 7 folders.
+This was a dry run. Nothing was deleted. Run `aft cache prune-legacy --yes` to delete these folders.
 ```

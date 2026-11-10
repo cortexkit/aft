@@ -57,8 +57,7 @@ describe("coerceAftStatus", () => {
     expect(status.status_bar_values?.disabled_categories).toEqual(["dead_code", "todos"]);
     expect(formatStatusDialogMessage(status)).toContain("dead code: ○ off");
     expect(formatStatusDialogMessage(status)).toContain("todos: ○ off");
-    expect(formatAftStatusSegment(status)).toContain("D○");
-    expect(formatAftStatusSegment(status)).toContain("T○");
+    expect(formatAftStatusSegment(status)).toBe("AFT E? W? | T○");
   });
   test("adds backend and model when provided", () => {
     const status = coerceAftStatus(baseResponse as unknown as Record<string, unknown>);
@@ -84,6 +83,7 @@ describe("coerceAftStatus", () => {
   test("parses status_bar when present", () => {
     const status = coerceAftStatus({
       ...baseResponse,
+      cache_role: "main",
       status_bar: {
         errors: 7,
         warnings: 13,
@@ -95,9 +95,11 @@ describe("coerceAftStatus", () => {
       },
     } as unknown as Record<string, unknown>);
 
-    expect(status.status_bar?.errors).toBe(7);
-    expect(status.status_bar?.duplicates).toBe(1167);
-    expect(status.status_bar?.tier2_stale).toBe(true);
+    // Dead code, unused exports and duplicates are computed only by
+    // aft_inspect; a snapshot from an older daemon that still carries them
+    // does not bring them into the status bar.
+    expect(status.status_bar).toEqual({ errors: 7, warnings: 13, todos: 5 });
+    expect(formatAftStatusSegment(status)).toBe("AFT E7 W13 | T5");
   });
 
   test("home-root degradation renders as disabled heavy indexes", () => {
@@ -157,8 +159,6 @@ describe("coerceAftStatus", () => {
     expect(status.status_bar).toBeUndefined();
     expect(status.status_bar_values).toEqual({
       errors: 0,
-      unused_exports: 3,
-      duplicates: 2,
       todos: 1,
     });
   });

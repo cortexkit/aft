@@ -17,6 +17,7 @@ import {
   type HarnessFactory,
   type PreparedBinary,
   prepareBinary,
+  searchWhenIndexReady,
 } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
@@ -142,9 +143,11 @@ export function runReadOnlySpineToolcallSuite(
       const h = await harness();
       const tools = semanticTools(createPluginContext(h));
 
-      const output = await tools.aft_search.execute(
-        { query: "tool_call_search_marker", hint: "literal", topK: 5 },
-        createToolContext(h),
+      const output = await searchWhenIndexReady(() =>
+        tools.aft_search.execute(
+          { query: "tool_call_search_marker", hint: "literal", topK: 5 },
+          createToolContext(h),
+        ),
       );
 
       expect(output).toContain("tool_call_search_marker");

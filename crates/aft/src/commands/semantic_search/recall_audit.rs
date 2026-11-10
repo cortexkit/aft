@@ -34,7 +34,7 @@ use super::blocks::CanonicalList;
 use super::comparator::CandidateResult;
 use super::evidence_descriptor::EvidenceTier;
 use super::extensions::LanePlan;
-use crate::search_index::SearchIndexSnapshot;
+use crate::data_layer::tools::search::TextIndex;
 use crate::semantic_index::SemanticResult;
 
 pub(super) const ENV_ENABLE: &str = "AFT_SEARCH_RECALL_AUDIT";
@@ -124,7 +124,7 @@ impl AuditChunk {
 pub(super) struct EngineAuditInput<'a> {
     pub project_root: &'a Path,
     pub plan: &'a LanePlan<'a>,
-    pub snapshot: &'a SearchIndexSnapshot,
+    pub index: TextIndex<'a>,
     pub query_trigrams: &'a [u32],
     pub candidate_filter: &'a dyn Fn(&Path) -> bool,
     pub lexical_order: Vec<PathBuf>,
@@ -246,7 +246,7 @@ pub(super) fn engine_audit(input: EngineAuditInput<'_>) -> Value {
                     let candidates = target_candidates(root, target);
                     let index_state = candidates
                         .iter()
-                        .map(|path| input.snapshot.audit_index_state(path))
+                        .map(|path| input.index.audit_index_state(path))
                         .find(|state| *state != "absent")
                         .unwrap_or("absent");
                     let lexical_rank = candidates
@@ -286,9 +286,8 @@ fn unpooled_lexical_ranks(
         }
     }
     Ok(input
-        .snapshot
+        .index
         .lexical_rank_at_depth(&unique, Some(input.candidate_filter), usize::MAX)?
-        .files
         .into_iter()
         .enumerate()
         .map(|(position, (path, _))| (path, position + 1))

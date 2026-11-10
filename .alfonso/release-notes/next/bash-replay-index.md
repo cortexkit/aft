@@ -1,1 +1,0 @@
-- Reconnecting to a project no longer reads the record of every finished shell command that project ever ran; only commands that are still running or whose completion was not yet delivered are looked up.

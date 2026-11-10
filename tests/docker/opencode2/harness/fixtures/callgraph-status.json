@@ -1,0 +1,29 @@
+{
+  "ready": {
+    "id": "status-ready",
+    "success": true,
+    "project_root": "/fixture/project",
+    "canonical_root": "/fixture/project",
+    "callgraph_store": { "status": "ready", "pending_edits": 2, "unparsed_files": 1 }
+  },
+  "building": {
+    "id": "status-building",
+    "success": true,
+    "project_root": "/fixture/project",
+    "canonical_root": "/fixture/project",
+    "callgraph_store": { "status": "building", "pending_edits": 0, "unparsed_files": 0 }
+  },
+  "unavailable": {
+    "id": "status-unavailable",
+    "success": true,
+    "project_root": "/fixture/project",
+    "canonical_root": "/fixture/project",
+    "callgraph_store": {
+      "status": "unavailable",
+      "reason": "build_failed",
+      "error": "fixture build failed",
+      "pending_edits": 0,
+      "unparsed_files": 0
+    }
+  }
+}

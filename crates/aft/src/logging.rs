@@ -84,10 +84,6 @@ pub(crate) enum IndexEventKind {
     #[allow(dead_code)]
     BuildCancelled,
     BuildFailed,
-    BuildSuspended,
-    BreakerAdmitted,
-    BreakerReset,
-    ArtifactLoaded,
     FirstQuery,
 }
 
@@ -100,10 +96,6 @@ impl IndexEventKind {
             Self::BuildSuperseded => "build_superseded",
             Self::BuildCancelled => "build_cancelled",
             Self::BuildFailed => "build_failed",
-            Self::BuildSuspended => "build_suspended",
-            Self::BreakerAdmitted => "breaker_admitted",
-            Self::BreakerReset => "breaker_reset",
-            Self::ArtifactLoaded => "artifact_loaded",
             Self::FirstQuery => "first_query",
         }
     }
@@ -111,11 +103,7 @@ impl IndexEventKind {
     fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::BuildReady
-                | Self::BuildSuperseded
-                | Self::BuildCancelled
-                | Self::BuildFailed
-                | Self::BuildSuspended
+            Self::BuildReady | Self::BuildSuperseded | Self::BuildCancelled | Self::BuildFailed
         )
     }
 }
@@ -618,48 +606,6 @@ pub(crate) fn log_current_index_event(kind: IndexEventKind, extra: &[(&'static s
         event.extra.push((key, value.clone()));
     }
     log_index_event(event);
-}
-
-/// Most recent build-start sequence observed for one root and index plane.
-pub(crate) fn index_build_start_sequence(plane: IndexPlane, root: &Path) -> u64 {
-    INDEX_BUILD_START_SIGNALS
-        .lock()
-        .ok()
-        .and_then(|signals| {
-            signals
-                .last_by_root_plane
-                .get(&root_plane_key(root, plane))
-                .copied()
-        })
-        .unwrap_or(0)
-}
-
-/// Send a one-shot signal once the current or next build starts for this root and plane.
-pub(crate) fn signal_after_index_build_start(
-    plane: IndexPlane,
-    root: &Path,
-    baseline: u64,
-    sender: crossbeam_channel::Sender<()>,
-) {
-    let Ok(mut signals) = INDEX_BUILD_START_SIGNALS.lock() else {
-        let _ = sender.send(());
-        return;
-    };
-    let key = root_plane_key(root, plane);
-    if signals.in_flight_by_root_plane.contains_key(&key)
-        || signals
-            .last_by_root_plane
-            .get(&key)
-            .is_some_and(|sequence| *sequence > baseline)
-    {
-        let _ = sender.send(());
-    } else {
-        signals
-            .waiters
-            .entry(key)
-            .or_default()
-            .push((baseline, sender));
-    }
 }
 
 /// Release start waiters when a build attempt ends before emitting `build_started`.
@@ -1884,15 +1830,6 @@ fn open_private_log_file(path: &Path, truncate: bool) -> io::Result<File> {
     options.open(path)
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn write_storage_permission_fixture(dir: &Path) {
-    create_private_log_dir(dir).unwrap();
-    open_private_log_file(&dir.join("test.log"), false)
-        .unwrap()
-        .write_all(b"private log\n")
-        .unwrap();
-}
-
 /// Drop group/other permission bits from `path` when the current user owns it.
 /// Best effort: a path owned by someone else (a shared storage root) or one
 /// that cannot be changed is left as it is rather than failing log setup.
@@ -2141,7 +2078,7 @@ fn pid_started_after_last_write(pid: u32, modified: Option<SystemTime>) -> bool 
     else {
         return false;
     };
-    crate::root_cache::process_start_time_ms(pid)
+    crate::process_identity::process_start_time_ms(pid)
         .is_some_and(|started_ms| started_ms > modified_ms.saturating_add(PID_REUSE_TOLERANCE_MS))
 }
 
@@ -3857,7 +3794,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         assert!(is_process_alive(1));
         assert!(
-            crate::root_cache::process_start_time_ms(1).is_some(),
+            crate::process_identity::process_start_time_ms(1).is_some(),
             "pid 1's start time must be readable from an unprivileged process"
         );
         let recycled = temp.path().join("aft-1.log");
@@ -4372,44 +4309,9 @@ mod tests {
     }
 
     #[test]
-    fn callgraph_cold_build_emits_started_progress_ready() {
-        let (_temp, root) = tiny_project("cg", "lib.rs", "pub fn marker() {}\n");
-        let key = crate::search_index::artifact_cache_key(&root);
-        let callgraph_dir = _temp.path().join("callgraph").join(&key);
-        crate::root_cache::configure_artifact_access(&root, &key, false);
-        let source = root.join("lib.rs");
-        let (built, lines) = capture_index_events(|| {
-            crate::callgraph_store::CallGraphStore::cold_build_with_lease(
-                callgraph_dir,
-                root.clone(),
-                std::slice::from_ref(&source),
-            )
-        });
-        built.expect("callgraph cold build");
-        assert_lifecycle_sequence(
-            &lines,
-            "callgraph",
-            &normalize_index_root(&root),
-            &key,
-            true,
-        );
-    }
-
-    #[test]
-    fn search_cold_build_emits_started_progress_ready() {
-        let (_temp, root) = tiny_project("search", "file.txt", "alpha token\n");
-        let key = crate::search_index::artifact_cache_key(&root);
-        let (index, lines) = capture_index_events(|| {
-            crate::search_index::SearchIndex::build_with_limit(&root, 1_000_000)
-        });
-        assert!(index.ready);
-        assert_lifecycle_sequence(&lines, "search", &normalize_index_root(&root), &key, true);
-    }
-
-    #[test]
     fn semantic_cold_build_emits_started_progress_ready() {
         let (_temp, root) = tiny_project("sem", "lib.rs", "pub fn hello() {}\n");
-        let key = crate::search_index::artifact_cache_key(&root);
+        let key = crate::root_identity::key::artifact_cache_key(&root);
         let files = vec![root.join("lib.rs")];
         let mut embed = |texts: Vec<String>| {
             Ok(texts
@@ -4427,7 +4329,7 @@ mod tests {
     #[test]
     fn tier2_category_emits_started_ready() {
         let (_temp, root) = tiny_project("t2", "mod0.ts", "export function f0() { return 0; }\n");
-        let key = crate::search_index::artifact_cache_key(&root);
+        let key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &key, false);
         let inspect_dir = _temp.path().join("inspect");
         let manager = std::sync::Arc::new(crate::inspect::InspectManager::new());
@@ -4456,70 +4358,5 @@ mod tests {
             }),
             "tier2 must not emit synthetic build_progress: {lines:?}"
         );
-    }
-
-    #[test]
-    fn superseded_cold_build_keeps_build_id_and_skips_ready() {
-        let (_temp, root) = tiny_project("sup", "lib.rs", "pub fn marker() {}\n");
-        let key = crate::search_index::artifact_cache_key(&root);
-        let callgraph_dir = _temp.path().join("callgraph").join(&key);
-        crate::root_cache::configure_artifact_access(&root, &key, false);
-        let source = root.join("lib.rs");
-        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
-        let stale_epoch = epoch.current();
-        epoch.next();
-        let (failed, lines) = capture_index_events(|| {
-            crate::callgraph_store::with_publish_epoch(epoch, stale_epoch, || {
-                crate::callgraph_store::CallGraphStore::cold_build_with_lease(
-                    callgraph_dir,
-                    root.clone(),
-                    std::slice::from_ref(&source),
-                )
-            })
-        });
-        assert!(matches!(
-            failed,
-            Err(crate::callgraph_store::CallGraphStoreError::Superseded)
-        ));
-        let root_s = normalize_index_root(&root);
-        let events: Vec<_> = lines
-            .iter()
-            .filter(|line| event_matches(line, "callgraph", &root_s, &key))
-            .cloned()
-            .collect();
-        assert_index_event_grammar(&events);
-        let kinds: Vec<_> = events
-            .iter()
-            .filter_map(|line| index_event_fields(line).get("kind").cloned())
-            .collect();
-        assert!(
-            kinds.contains(&"build_started".to_string()),
-            "{kinds:?} {events:?}"
-        );
-        assert!(
-            kinds.contains(&"build_superseded".to_string()),
-            "{kinds:?} {events:?}"
-        );
-        assert!(
-            !kinds.contains(&"build_ready".to_string()),
-            "superseded build must not emit build_ready: {kinds:?}"
-        );
-        let started_id = events
-            .iter()
-            .find(|line| line.contains("kind=build_started"))
-            .and_then(|line| index_event_fields(line).get("build_id").cloned());
-        let superseded_id = events
-            .iter()
-            .find(|line| line.contains("kind=build_superseded"))
-            .and_then(|line| index_event_fields(line).get("build_id").cloned());
-        assert_eq!(started_id, superseded_id);
-        for line in &events {
-            let fields = index_event_fields(line);
-            assert_eq!(
-                fields.get("root").map(String::as_str),
-                Some(root_s.as_str())
-            );
-            assert_eq!(fields.get("key").map(String::as_str), Some(key.as_str()));
-        }
     }
 }

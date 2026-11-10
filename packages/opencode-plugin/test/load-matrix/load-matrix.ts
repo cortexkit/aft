@@ -11,13 +11,19 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync, readFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, realpathSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CANONICAL_TOOLS } from "@cortexkit/aft-bridge";
+import { OpenCode, type PluginInfo } from "@opencode/client";
+import {
+  discover as discoverService,
+  headers as serviceHeaders,
+  stop as stopService,
+} from "@opencode/client/service";
 import ts from "typescript";
 import {
   prepareSubcLane,
@@ -586,7 +592,7 @@ async function writeV2HostConfig(
   targets: string[],
   aftConfig: Record<string, unknown>,
   pluginKey: "plugin" | "plugins" = "plugin",
-): Promise<void> {
+): Promise<number> {
   const configDir = join(isolation.env.XDG_CONFIG_HOME ?? "", "opencode");
   await mkdir(configDir, { recursive: true });
   // A throwaway HOME and four XDG roots are not enough to isolate a V2 TUI
@@ -596,16 +602,19 @@ async function writeV2HostConfig(
   // operator's own editor, land on one port and the loser either fails to
   // start or silently attaches to the winner's service and its database.
   // Reserving a free port per row in the service config, which does live under
-  // the isolated config root, is what keeps the runs apart.
+  // the isolated config root, is what keeps the runs apart. The port is
+  // returned so the row can tell its own service apart when it stops it.
+  const port = await freeLoopbackPort();
   await writeFile(
     join(configDir, "service.json"),
-    `${JSON.stringify({ hostname: "127.0.0.1", port: await freeLoopbackPort() }, null, 2)}\n`,
+    `${JSON.stringify({ hostname: "127.0.0.1", port }, null, 2)}\n`,
   );
   await writeFile(
     join(configDir, "opencode.json"),
     `${JSON.stringify({ [pluginKey]: targets }, null, 2)}\n`,
   );
   await writeAftConfig(isolation, aftConfig);
+  return port;
 }
 
 // Wraps the packaged TUI entry so a run can tell three states apart that the
@@ -810,11 +819,154 @@ export default {
 
 const v2TuiSetupOutcome =
   /message="plugin operation (?:completed|failed)"[^\n]*stage=setup[^\n]*plugin=aft-opencode/;
-// Reconciliation 1 runs before the configured plugins are known and 2 is the
-// pass that loads them, so a third completed pass means the host settled --
-// including the case where it silently skipped the target and AFT never
-// appears in the log at all.
-const v2TuiSettled = /message="plugin reconciliation completed"[^\n]*\bid=3\b/;
+const v2TuiSetupFailed =
+  /message="plugin operation failed"[^\n]*stage=setup[^\n]*plugin=aft-opencode/;
+/**
+ * How long the late-service row holds up the service's load of AFT. The TUI
+ * runs its first reconciliations about a second after the service starts
+ * loading plugins, so this leaves a wide margin for a slow runner.
+ */
+const lateServiceLoadMs = 8_000;
+
+/**
+ * What a TUI row's background service says about the row's plugin target.
+ *
+ * A V2 TUI never reads the `plugin` entry of the host config itself. It takes
+ * its external plugins from the service's plugin list -- the entries the
+ * service reports active, with a TUI feature, from a package or a local path
+ * -- which it fetches when it connects and again on every `plugin.updated`
+ * event, and it reconciles its own plugins whenever that list changes. The
+ * service loads plugins in the background, so the target can first reach the
+ * TUI in any of its reconciliations: CI runs have seen anything from the
+ * first to the fourth. Counting the TUI's reconciliations therefore says nothing about
+ * whether the target has arrived; the service's own verdict does.
+ */
+type ServicePluginVerdict =
+  /** No ready service at the row's registration, or its plugin list request failed. */
+  | { kind: "unreachable"; detail: string }
+  /** The service answered, and its list holds no plugin for the target yet. */
+  | { kind: "unlisted"; listed: string[] }
+  | { kind: "listed"; plugin: PluginInfo };
+
+function serviceRegistration(isolation: HostIsolation): string {
+  return join(isolation.env.XDG_STATE_HOME ?? "", "opencode", "service.json");
+}
+
+/** The target a TUI derives from a service plugin entry, the same way the TUI does. */
+function tuiTargetOf(plugin: PluginInfo): string | undefined {
+  if (plugin.source.type === "package") return plugin.source.target;
+  if (plugin.source.type === "local") return dirname(plugin.source.path);
+  return undefined;
+}
+
+/** Whether the TUI takes this service entry into its own plugins at all. */
+function tuiReceives(plugin: PluginInfo): boolean {
+  return (
+    plugin.state.status === "active" &&
+    plugin.features.tui === true &&
+    tuiTargetOf(plugin) !== undefined
+  );
+}
+
+async function readServicePlugin(
+  isolation: HostIsolation,
+  packageRoot: string,
+): Promise<ServicePluginVerdict> {
+  const ask = async (): Promise<ServicePluginVerdict> => {
+    const endpoint = await discoverService({ file: serviceRegistration(isolation) });
+    if (!endpoint) return { kind: "unreachable", detail: "no ready service is registered" };
+    const client = OpenCode.make({ baseUrl: endpoint.url, headers: serviceHeaders(endpoint) });
+    const listed = await client.plugin.list(
+      { location: { directory: isolation.project } },
+      { signal: AbortSignal.timeout(5_000) },
+    );
+    const roots = new Set([packageRoot, realpathSync(packageRoot)]);
+    const plugin = listed.data.find((entry) => roots.has(tuiTargetOf(entry) ?? ""));
+    if (plugin) return { kind: "listed", plugin };
+    return {
+      kind: "unlisted",
+      listed: listed.data.map((entry) => entry.id ?? tuiTargetOf(entry) ?? entry.source.type),
+    };
+  };
+  // Bounded as a whole, so a service that stops answering mid-request cannot
+  // hold up the row that is waiting on this answer.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<ServicePluginVerdict>((resolve) => {
+    timer = setTimeout(
+      () => resolve({ kind: "unreachable", detail: "no answer within 8s" }),
+      8_000,
+    );
+  });
+  try {
+    return await Promise.race([
+      ask().catch(
+        (error): ServicePluginVerdict => ({ kind: "unreachable", detail: String(error) }),
+      ),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function describeServicePlugin(verdict: ServicePluginVerdict): string {
+  switch (verdict.kind) {
+    case "unreachable":
+      return `the service did not answer (${verdict.detail})`;
+    case "unlisted":
+      return `the service lists no plugin for the target (it lists: ${verdict.listed.join(", ") || "nothing"})`;
+    case "listed": {
+      const { plugin } = verdict;
+      const state =
+        plugin.state.status === "failed" ? `failed: ${plugin.state.error}` : plugin.state.status;
+      const features = Object.keys(plugin.features).join(",") || "none";
+      return `the service lists ${plugin.id ?? "an unnamed plugin"} as ${state}, with features ${features}`;
+    }
+  }
+}
+
+/**
+ * Stops the background service a TUI row's host started.
+ *
+ * The TUI starts that service as a separate process and does not take it down
+ * when the TUI itself is stopped, so without this every TUI row would leave a
+ * service running, watching the row's directories, for the rest of the run
+ * and beyond it. The service is found through the registration it writes
+ * under the row's isolated state root, and stopped only when that
+ * registration names the port the row reserved in its isolated config root.
+ * Anything else registered there is not a service this row started, so it is
+ * left alone and reported instead.
+ */
+async function stopRowService(
+  isolation: HostIsolation,
+  reservedPort: number,
+  hostLog: string,
+): Promise<void> {
+  const registration = serviceRegistration(isolation);
+  // A host stopped while its service was still starting may stop before the
+  // service has written its registration; give the service time to write it.
+  const started = hostLog.includes('message="background service starting"');
+  const deadline = Date.now() + 10_000;
+  while (started && !existsSync(registration) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (!existsSync(registration)) {
+    if (!started) return;
+    throw new Error(
+      `the host started a background service that never registered at ${registration}, so it could not be stopped`,
+    );
+  }
+  const info = JSON.parse(await readFile(registration, "utf8")) as { url?: string; pid?: number };
+  const registeredPort = info.url ? Number(new URL(info.url).port) : Number.NaN;
+  if (registeredPort !== reservedPort) {
+    throw new Error(
+      `the service registered at ${registration} listens on ${info.url ?? "no url"}, not on the port ${reservedPort} this row reserved, so it was left running (pid ${info.pid})`,
+    );
+  }
+  // The host's own stop: SIGTERM to the registered process, SIGKILL if it is
+  // still running after the host's grace period, then the registration goes.
+  await stopService({ file: registration });
+}
 
 /**
  * The status snapshot the sidebar probe below renders.
@@ -861,11 +1013,7 @@ const sidebarProbeStatus = {
   status_bar: {
     errors: 2,
     warnings: 3,
-    dead_code: 4,
-    unused_exports: 5,
-    duplicates: 6,
     todos: 7,
-    tier2_stale: false,
   },
   message: "",
 };
@@ -890,9 +1038,6 @@ const sidebarSections = [
   "Entries",
   "Errors",
   "Warnings",
-  "Dead Code",
-  "Unused Exports",
-  "Duplicates",
   "TODOs",
   "Session",
   "Project",
@@ -1221,26 +1366,29 @@ async function runV2TuiHost(input: {
   /**
    * Stop condition for rows whose subject is written by an observer plugin.
    *
-   * The default stop signals fire as soon as the host has settled its plugin
-   * passes, which is earlier than an observer that has to wait for another
-   * plugin's registration; such a row supplies its own signal instead.
+   * Without it a row ends when AFT's own entry has rendered the `app` slot,
+   * or, for an entry the run does not instrument, when the host reports
+   * AFT's setup. An observer that has to wait for another plugin's
+   * registration supplies its own signal instead.
    */
   ready?: (events: string) => boolean;
-}): Promise<{ transcript: string; events: string }> {
+}): Promise<{ transcript: string; events: string; servicePlugin: ServicePluginVerdict }> {
   const { v2 } = await ensureHostInstalls();
   const isolation = await makeIsolation(input.label);
   const marker = join(isolation.root, "tui-entry.log");
   isolation.env.AFT_LOAD_MATRIX_MARKER = marker;
   Object.assign(isolation.env, input.env ?? {});
-  await writeV2HostConfig(
+  const reservedPort = await writeV2HostConfig(
     isolation,
     [...(input.pluginsBefore ?? []), input.packageRoot],
     // Deliberately use retired enabled:false: 0.59 rejects the config before this loader probe can start AFT.
     input.aftConfig ?? { enabled: false },
     input.pluginKey,
   );
+  const timeoutMs = input.timeoutMs ?? 120_000;
+  let servicePlugin: ServicePluginVerdict = { kind: "unreachable", detail: "not asked yet" };
 
-  const result = await withOperatorCanary(input.label, async () => {
+  const hostRun = await withOperatorCanary(input.label, async () => {
     let stderr = "";
     // Only stderr is captured: `--print-logs` writes the plugin log there,
     // while stdout is the terminal repaint stream and grows without bound.
@@ -1253,19 +1401,42 @@ async function runV2TuiHost(input: {
     child.stderr?.on("data", (chunk) => {
       stderr += String(chunk);
     });
-    const deadline = Date.now() + (input.timeoutMs ?? 120_000);
-    const done = (): boolean => {
+    const deadline = Date.now() + timeoutMs;
+    const reached = (): boolean => {
+      // The TUI mounts only what its service hands it, so once the service
+      // lists the target in a form the TUI does not take -- failed, or without
+      // a TUI feature -- nothing this row could wait for can still happen.
+      if (servicePlugin.kind === "listed" && !tuiReceives(servicePlugin.plugin)) return true;
       const observed = existsSync(marker) ? readFileSync(marker, "utf8") : "";
       if (input.ready) return input.ready(observed);
-      if (observed.includes("slot-rendered:app")) return true;
-      // A row that does not instrument the entry has no marker to wait on, so
-      // the host's own setup verdict is the stop signal.
-      if (observed === "" && v2TuiSetupOutcome.test(stderr)) return true;
-      return v2TuiSettled.test(stderr);
+      if (observed.includes("slot-rendered:app") || observed.includes("slot-render-failed:")) {
+        return true;
+      }
+      // An entry the run does not instrument writes no marker, so the host's
+      // own setup verdict ends the row. An instrumented entry goes on to render
+      // its slot after setup, unless setup failed.
+      return observed === "" ? v2TuiSetupOutcome.test(stderr) : v2TuiSetupFailed.test(stderr);
     };
-    while (!done() && child.exitCode === null && Date.now() < deadline) {
+    // Asked in the background, at most one question at a time, so a slow
+    // service never delays the checks on the marker and the host log.
+    let asking: Promise<void> | undefined;
+    let askedAt = 0;
+    while (!reached() && child.exitCode === null && Date.now() < deadline) {
+      if (asking === undefined && Date.now() - askedAt >= 500) {
+        askedAt = Date.now();
+        asking = readServicePlugin(isolation, input.packageRoot).then((verdict) => {
+          servicePlugin = verdict;
+          asking = undefined;
+        });
+      }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    await asking;
+    // One last answer while the host is still up, so the verdict printed
+    // below is the service's state at the end of the row.
+    servicePlugin = await readServicePlugin(isolation, input.packageRoot);
+    const outcome = reached();
+    const exitCode = child.exitCode;
     child.kill("SIGTERM");
     await new Promise<void>((resolve) => {
       if (child.exitCode !== null) return resolve();
@@ -1275,17 +1446,33 @@ async function runV2TuiHost(input: {
         resolve();
       }, 2_000).unref();
     });
-    return stderr;
+    const stopFailure = await stopRowService(isolation, reservedPort, stderr).then(
+      () => undefined,
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    return { stderr, outcome, exitCode, stopFailure };
   });
 
   const events = existsSync(marker) ? await readFile(marker, "utf8") : "";
-  const transcript = result
+  const transcript = hostRun.stderr
     .split(/\r?\n/)
     .filter((line) => line.includes("component=plugin") || line.includes("Keymap"))
     .join("\n");
+  const verdict = describeServicePlugin(servicePlugin);
   console.log(`[${input.label}-transcript]\n${transcript}`);
   console.log(`[${input.label}-events]\n${events.trim()}`);
-  return { transcript: result, events };
+  console.log(`[${input.label}-service-plugin]\n${verdict}`);
+  if (hostRun.stopFailure !== undefined) {
+    throw new Error(`[${input.label}] ${hostRun.stopFailure}`);
+  }
+  if (!hostRun.outcome) {
+    throw new Error(
+      hostRun.exitCode === null
+        ? `[${input.label}] the TUI host reached no outcome within ${timeoutMs}ms; at the end ${verdict}`
+        : `[${input.label}] the TUI host exited with code ${hostRun.exitCode} before reaching an outcome; at the end ${verdict}`,
+    );
+  }
+  return { transcript: hostRun.stderr, events, servicePlugin };
 }
 
 type SidebarProbeRow = {
@@ -2643,6 +2830,23 @@ export default { id: original.id, effect };
     expect(result.status).toBe(0);
   }, 300_000);
 
+  test("GA host relative reads follow a session moved to another repository", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const liveDbBefore = await snapshotPath(operatorDb, false);
+    const result = await withOperatorCanary("v2-session-move", () =>
+      run("bun", ["test", "src/__tests__/e2e/v2-session-move.test.ts"], pluginRoot, {
+        env: { ...process.env, AFT_V2_HOST_BINARY: v2Binary(v2) },
+        timeoutMs: 210_000,
+      }),
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`;
+    console.log(`[v2-session-move-host-transcript]\n${transcript}`);
+    expect(transcript).toContain("1 pass");
+    expect(transcript).toContain("0 fail");
+    expect(result.status).toBe(0);
+    expect(await snapshotPath(operatorDb, false)).toEqual(liveDbBefore);
+  }, 240_000);
+
   test("GA host admits background completions as synthetic steering input", async () => {
     const { v2 } = await ensureHostInstalls();
     const result = await withOperatorCanary("v2-synthetic-completion", () =>
@@ -2729,6 +2933,51 @@ export default { id: original.id, effect };
     // The status command is owned by the component rendered into `app`, so a
     // completed render of that slot is what proves `keymap.layer` succeeded
     // where the host allows it.
+    expect(events).toContain("slot-rendered:app\n");
+    expect(events).not.toContain("slot-render-failed:");
+  }, 240_000);
+
+  // How many reconciliations the TUI runs before AFT reaches it depends only
+  // on how quickly the background service loads AFT (see
+  // `ServicePluginVerdict`). This row makes that load slow on purpose, so the
+  // TUI's first reconciliations all run without AFT, and checks that the run
+  // still waits for AFT's TUI to mount rather than reading those passes as a
+  // host that skipped it.
+  test("GA TUI host mounts the sidebar when the service lists AFT after the TUI's first reconciliations", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v2, "v2-tui-late-service");
+    await writeFile(join(packageRoot, "tui.js"), v2TuiObserverEntry);
+    // The service loads this file as the plugin's server entry. Its top-level
+    // await holds the module's evaluation, and so the service's load of AFT,
+    // for the delay; the TUI starts reconciling well inside it.
+    await writeFile(
+      join(packageRoot, "server.js"),
+      [
+        `await new Promise((resolve) => setTimeout(resolve, ${lateServiceLoadMs}));`,
+        'export * from "./dist/entry/server.js";',
+        'export { default } from "./dist/entry/server.js";',
+        "",
+      ].join("\n"),
+    );
+
+    const { transcript, events, servicePlugin } = await runV2TuiHost({
+      label: "v2-tui-late-service",
+      packageRoot,
+    });
+
+    expect(describeServicePlugin(servicePlugin)).toMatch(/ as active, with features \S*tui/);
+    // The delay has to have kept AFT out of the TUI's first three
+    // reconciliations, the passes a stop condition that counts reconciliations
+    // would end on; otherwise this row did not exercise a late arrival at all.
+    const firstRead = transcript
+      .split(/\r?\n/)
+      .find((line) => line.includes("stage=read") && line.includes(`target=${packageRoot} `));
+    expect(firstRead).toBeDefined();
+    expect(Number(firstRead?.match(/\breconciliation=(\d+)\b/)?.[1])).toBeGreaterThan(3);
+
+    expect(transcript).not.toMatch(/message="plugin operation failed"[^\n]*plugin=aft-opencode/);
+    expect(events).toContain("tui-setup-start\n");
+    expect(events).toContain("tui-setup-complete\n");
     expect(events).toContain("slot-rendered:app\n");
     expect(events).not.toContain("slot-render-failed:");
   }, 240_000);
@@ -3179,11 +3428,13 @@ export default entry;
       "v2-node",
       "v2-lifecycle",
       "v2-permission-prompt",
+      "v2-session-move",
       "v2-synthetic-completion",
       "v2-completion-detach",
       "v2-host-tool-names",
       "v2-subc-tool-names",
       "v2-tui-keymap",
+      "v2-tui-late-service",
       "v2-theme-capture",
       "v2-tui-light-theme",
       "v2-tui-badge-light",

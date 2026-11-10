@@ -1,13 +1,12 @@
 use std::fs;
 
-use aft::callgraph_store::CallGraphStore;
 use aft::commands::callgraph_store_adapter::callgraph_surface::{
     build_callgraph_envelope, cap_items, hub_selector_activated, CALLERS_LIST_ID, CALLGRAPH_NARROW,
     CALLGRAPH_SURFACES, HUB_SUMMARY_LIMIT, HUB_SUMMARY_THRESHOLD, SITES_LIST_ID, TREE_LIST_ID,
 };
 use aft::commands::callgraph_store_adapter::{
-    self, StoreCallTreeNode, StoreCallerEntry, StoreCallerGroup, StoreCallersResult,
-    StoreHubSummary, StoreImpactCaller, StoreImpactResult,
+    StoreCallTreeNode, StoreCallerEntry, StoreCallerGroup, StoreCallersResult, StoreHubSummary,
+    StoreImpactCaller, StoreImpactResult,
 };
 use aft::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::find_surface;
@@ -15,7 +14,6 @@ use aft::ndjson_text::build_ndjson_text;
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext};
 use serde_json::{json, Value};
-use tempfile::tempdir;
 
 fn load_golden(name: &str) -> String {
     let manifest_dir = crate::test_helpers::manifest_dir();
@@ -77,7 +75,8 @@ fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> St
             caller_file: "src/app.ts".to_string(),
             line: i as u32,
             signature: None,
-            is_entry_point: false,
+            root: None,
+            attribute: None,
             call_expression: None,
             parameters: Vec::new(),
             approximate: None,
@@ -121,6 +120,7 @@ fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> St
         hidden_test_callers: 0,
         affected_files: 1,
         callers: visible_callers,
+        root_counts: Default::default(),
         hub_summary,
         depth_limited,
         truncated,
@@ -935,170 +935,4 @@ fn test_transport_parity_across_all_callgraph_fixtures() {
     let subc_cal_ex = format_subc("callers", &val_cal_ex);
     let ndjson_cal_ex = format_ndjson(&subc_cal_ex, &val_cal_ex, CALLERS_LIST_ID);
     assert_eq!(subc_cal_ex.trim(), ndjson_cal_ex.trim());
-}
-
-fn create_synthesized_store_with_callers(
-    num_callers: usize,
-) -> (tempfile::TempDir, CallGraphStore, std::path::PathBuf) {
-    let dir = tempdir().expect("temp dir");
-    let root = dir.path().to_path_buf();
-    let src_dir = root.join("src");
-    fs::create_dir_all(&src_dir).expect("create src dir");
-
-    let target_file = src_dir.join("target.ts");
-    fs::write(
-        &target_file,
-        "export function target(): number { return 1; }\n",
-    )
-    .expect("write target");
-
-    let mut files = vec![target_file.clone()];
-    for i in 1..=num_callers {
-        let caller_file = src_dir.join(format!("caller{:02}.ts", i));
-        fs::write(
-            &caller_file,
-            format!(
-                "import {{ target }} from './target';\nexport function caller{:02}() {{ return target(); }}\n",
-                i
-            ),
-        )
-        .expect("write caller");
-        files.push(caller_file);
-    }
-
-    let store_dir = root.join(".callgraph-store");
-    let store = CallGraphStore::open(store_dir, root.clone()).expect("open store");
-    store.cold_build(&files).expect("cold build");
-    (dir, store, target_file)
-}
-
-fn create_synthesized_store_with_chain() -> (
-    tempfile::TempDir,
-    CallGraphStore,
-    std::path::PathBuf,
-    std::path::PathBuf,
-) {
-    let dir = tempdir().expect("temp dir");
-    let root = dir.path().to_path_buf();
-    let leaf_file = root.join("leaf.ts");
-    fs::write(
-        &leaf_file,
-        "export function leaf(value: string): string { return value; }\n",
-    )
-    .expect("write leaf");
-    let middle_file = root.join("middle.ts");
-    fs::write(
-        &middle_file,
-        "import { leaf } from './leaf';\n\
-         export function middle(value: string): string { return leaf(value); }\n",
-    )
-    .expect("write middle");
-    let root_file = root.join("root.ts");
-    fs::write(
-        &root_file,
-        "import { middle } from './middle';\n\
-         export function root(value: string): string { return middle(value); }\n",
-    )
-    .expect("write root");
-    let entry_file = root.join("entry.ts");
-    fs::write(
-        &entry_file,
-        "import { root } from './root';\n\
-         export function entry(): string { return root('fixture'); }\n",
-    )
-    .expect("write entry");
-
-    let store =
-        CallGraphStore::open(root.join(".callgraph-store"), root.clone()).expect("open store");
-    store
-        .cold_build(&[
-            leaf_file.clone(),
-            middle_file,
-            root_file.clone(),
-            entry_file,
-        ])
-        .expect("cold build");
-    (dir, store, leaf_file, root_file)
-}
-
-#[test]
-fn real_store_depth_boundaries_count_omitted_callgraph_rows() {
-    let (_dir, store, leaf_file, root_file) = create_synthesized_store_with_chain();
-
-    let callers = callgraph_store_adapter::callers_result(&store, &leaf_file, "leaf", 1, true)
-        .expect("callers result");
-    let callers_envelope = callers
-        .callers_list_envelope
-        .expect("callers depth boundary must emit an envelope");
-    assert_eq!(callers_envelope.shown, 1);
-    assert_eq!(callers_envelope.total, Total::AtLeast(1));
-    assert_eq!(callers_envelope.reason, Some(Reason::Depth));
-
-    let impact = callgraph_store_adapter::impact_result(&store, &leaf_file, "leaf", 1, true)
-        .expect("impact result");
-    let impact_envelope = impact
-        .sites_list_envelope
-        .expect("impact depth boundary must emit an envelope");
-    assert_eq!(impact_envelope.shown, 1);
-    assert_eq!(impact_envelope.total, Total::AtLeast(1));
-    assert_eq!(impact_envelope.reason, Some(Reason::Depth));
-
-    let tree = callgraph_store_adapter::call_tree_result(&store, &root_file, "root", 1, true)
-        .expect("call tree result");
-    let tree_envelope = tree
-        .tree_list_envelope
-        .expect("call tree depth boundary must emit an envelope");
-    assert_eq!(tree_envelope.shown, 1);
-    assert_eq!(tree_envelope.total, Total::AtLeast(1));
-    assert_eq!(tree_envelope.reason, Some(Reason::Depth));
-}
-
-#[test]
-fn test_producer_level_store_hub_capping_and_constants_linkage() {
-    // Producer-level test on a real CallGraphStore:
-    // 1. 20 callers through real adapter: hub selector NOT activated, full row set, no envelope
-    let (_dir20, store20, target_file20) = create_synthesized_store_with_callers(20);
-    let callers20 =
-        callgraph_store_adapter::callers_result(&store20, &target_file20, "target", 1, true)
-            .expect("callers result 20");
-    assert_eq!(callers20.total_callers, 20);
-    assert_eq!(callers20.callers.len(), 20);
-    assert!(callers20.callers_list_envelope.is_none());
-
-    let impact20 =
-        callgraph_store_adapter::impact_result(&store20, &target_file20, "target", 1, true)
-            .expect("impact result 20");
-    assert_eq!(impact20.total_affected, 20);
-    assert_eq!(impact20.callers.len(), 20);
-    assert!(impact20.sites_list_envelope.is_none());
-
-    // 2. 21 callers through real adapter: hub selector ACTIVATED, shown 15, cap envelope
-    let (_dir21, store21, target_file21) = create_synthesized_store_with_callers(21);
-    let callers21 =
-        callgraph_store_adapter::callers_result(&store21, &target_file21, "target", 1, true)
-            .expect("callers result 21");
-    assert_eq!(callers21.total_callers, 21);
-    assert_eq!(callers21.callers.len(), HUB_SUMMARY_LIMIT);
-    let env_callers21 = callers21
-        .callers_list_envelope
-        .as_ref()
-        .expect("21 callers must emit cap envelope through real adapter");
-    assert_eq!(env_callers21.shown, HUB_SUMMARY_LIMIT);
-    assert_eq!(env_callers21.total, Total::Exact(21));
-    assert_eq!(env_callers21.reason, Some(Reason::Cap));
-    assert_eq!(env_callers21.unit, Unit::Items);
-
-    let impact21 =
-        callgraph_store_adapter::impact_result(&store21, &target_file21, "target", 1, true)
-            .expect("impact result 21");
-    assert_eq!(impact21.total_affected, 21);
-    assert_eq!(impact21.callers.len(), HUB_SUMMARY_LIMIT);
-    let env_impact21 = impact21
-        .sites_list_envelope
-        .as_ref()
-        .expect("21 sites must emit cap envelope through real adapter");
-    assert_eq!(env_impact21.shown, HUB_SUMMARY_LIMIT);
-    assert_eq!(env_impact21.total, Total::Exact(21));
-    assert_eq!(env_impact21.reason, Some(Reason::Cap));
-    assert_eq!(env_impact21.unit, Unit::Sites);
 }

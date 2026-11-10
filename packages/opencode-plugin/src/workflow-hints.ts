@@ -128,12 +128,12 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // the authority (the project checker is).
   if (hasInspect) {
     sections.push(
-      "**Codebase health & diagnostics**: AFT does not surface compile/type errors automatically after edits — pull them with `aft_inspect`. Run it after a batch of edits and before you run tests or commit, when starting in unfamiliar code, or before a refactor/review. One call summarizes diagnostics (compile/type errors), TODOs, metrics, dead code, unused exports, and duplicates; pass `sections` for focused drill-down and `scope` to actively pull diagnostics for a specific file or directory. Its diagnostics are a fast checkpoint, not the authority — a clean `tsc` / `cargo check` / `pyright` run is the real gate. Treat stale_categories/pending_categories as stale or incomplete cache state. AFT schedules a Tier-2 refresh after its next idle or inspect-triggered background run; use one later normal aft_inspect after that refresh, not a polling loop.",
+      "**Codebase health & diagnostics**: AFT does not surface compile/type errors automatically after edits — pull them with `aft_inspect`. Run it after a batch of edits and before you run tests or commit, when starting in unfamiliar code, or before a refactor/review. One call summarizes diagnostics (compile/type errors), TODOs, metrics, dead code, unused exports, and duplicates; pass `sections` for focused drill-down and `scope` to actively pull diagnostics for a specific file or directory. Its diagnostics are a fast checkpoint, not the authority — a clean `tsc` / `cargo check` / `pyright` run is the real gate. Dead code, unused exports, duplicates, cycles and complexity are computed only when you call aft_inspect, and the call waits until they are current; nothing refreshes them in the background, so run it again after further edits instead of polling.",
     );
     // Status-bar legend — taught once here so the per-call bar is just compact
     // values (~18 tokens). The bar is appended to tool results on change.
     sections.push(
-      "**AFT status bar**: tool results may end with a one-line health bar `[AFT E<errors> W<warnings> | D<dead-code> U<unused-exports> C<clone/dup-groups> | T<todos>]` — an IDE-style glance that appears when a count changes. `E`/`W` are live LSP diagnostics for files touched this session (your universal compile-error signal across every language with an LSP). A `~` before `D` means the dead-code/unused/dup counts predate your latest edit — run `aft_inspect` for current numbers and detail. A `?` in place of a number means that count has no value yet (not zero). When `E>0`, you likely just introduced errors; investigate before moving on.",
+      "**AFT status bar**: tool results may end with a one-line health bar `[AFT E<errors> W<warnings> | T<todos>]` — an IDE-style glance that appears when a count changes. `E`/`W` are live LSP diagnostics for files touched this session (your universal compile-error signal across every language with an LSP). Dead code, unused exports and duplicates are not on the bar; run `aft_inspect` for them. A `?` in place of a number means that count has no value yet (not zero). When `E>0`, you likely just introduced errors; investigate before moving on.",
     );
   }
 
@@ -144,7 +144,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
         "Use `aft_callgraph` for code-relationship questions instead of grep + read chains:",
         "- `callers` — find all call sites before changing a function signature",
         "- `impact` — blast radius (which functions/files will need updates)",
-        "- `trace_to` — how execution reaches this code from entry points (routes, exports, main)",
+        "- `trace_to` — how execution reaches this code; each path runs back to a root labelled main, test, attribute, public API, or no caller found",
         "- `trace_to_symbol` — shortest call path from one symbol to another",
         "- `trace_data` — follow a value through assignments and parameters across files",
       ].join("\n"),

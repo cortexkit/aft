@@ -1,1 +1,0 @@
-- `aft_search` uses about 10% less CPU per query, with identical results.

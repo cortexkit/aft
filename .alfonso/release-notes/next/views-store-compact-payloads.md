@@ -1,1 +1,0 @@
-- With views on, each call-graph database is about 45% smaller (1.97 GB to 1.05 GB for AFT's own repository) and builds about 10% faster, with identical answers.

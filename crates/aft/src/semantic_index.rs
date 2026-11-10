@@ -267,7 +267,6 @@ pub(crate) fn unix_millis_now() -> u64 {
 }
 
 thread_local! {
-    static LANE_PAUSE_RETRY_POLICY: std::cell::RefCell<Option<PauseRetryPolicy>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static LANE_PAUSE_TEST_CLOCK: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
@@ -301,19 +300,6 @@ fn checkpoint_work(allocations: usize, inserts: usize, clones: usize) {
     let _ = (allocations, inserts, clones);
 }
 
-#[cfg(test)]
-pub(crate) fn with_checkpoint_work<T>(run: impl FnOnce() -> T) -> (T, CheckpointWork) {
-    struct Restore(CheckpointWork);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CHECKPOINT_WORK.with(|work| work.set(self.0));
-        }
-    }
-    let _restore = Restore(CHECKPOINT_WORK.with(|work| work.replace(CheckpointWork::default())));
-    let value = run();
-    (value, CHECKPOINT_WORK.with(std::cell::Cell::get))
-}
-
 /// Created only when Synapse refuses an embedding request with `lane_paused`.
 /// The interrupted collector or embed loop transfers its source chunks and
 /// finished vectors here before returning, without retaining admission permits,
@@ -324,9 +310,6 @@ struct PreparedPauseJob {
     cold: Option<ColdPauseCheckpoint>,
     reuse: Option<ReusePauseCheckpoint>,
     file_chunks: HashMap<FileCheckpointKey, (IndexedFileMetadata, Vec<SemanticChunk>)>,
-    view_chunks: HashMap<ViewCheckpointKey, Option<Vec<SemanticChunk>>>,
-    view: Option<ViewPauseCheckpoint>,
-    producer: Option<SemanticIndexFingerprint>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -340,14 +323,6 @@ struct ColdCheckpointIdentity {
 struct FileCheckpointKey {
     root: PathBuf,
     file: PathBuf,
-    caps: EmbedTextCaps,
-}
-
-#[derive(PartialEq, Eq, Hash)]
-struct ViewCheckpointKey {
-    root: PathBuf,
-    file: PathBuf,
-    content: crate::blob_store::v2::ContentHash,
     caps: EmbedTextCaps,
 }
 
@@ -441,35 +416,6 @@ impl ReusePauseCheckpoint {
     }
 }
 
-struct ViewPauseCheckpoint {
-    runs: Vec<Vec<EmbeddingEntry>>,
-    refused_files: Vec<usize>,
-    pending: Vec<(usize, SemanticChunk)>,
-    next_chunk: usize,
-    dimension: Option<usize>,
-}
-
-struct PreparedPauseJobScope(bool);
-
-impl PreparedPauseJobScope {
-    fn new() -> Self {
-        Self(PAUSE_JOB_DEPTH.with(|depth| {
-            let nested = depth.get() != 0;
-            depth.set(depth.get() + 1);
-            nested
-        }))
-    }
-}
-
-impl Drop for PreparedPauseJobScope {
-    fn drop(&mut self) {
-        PAUSE_JOB_DEPTH.with(|depth| depth.set(depth.get() - 1));
-        if !self.0 {
-            PREPARED_PAUSE_JOB.with(|slot| slot.take());
-        }
-    }
-}
-
 fn prepared_pause_job() -> Option<std::rc::Rc<std::cell::RefCell<PreparedPauseJob>>> {
     PREPARED_PAUSE_JOB.with(|slot| slot.borrow().clone())
 }
@@ -488,34 +434,6 @@ fn observe_lane_pause(error: &str) -> Option<std::rc::Rc<std::cell::RefCell<Prep
         })
         .clone()
     }))
-}
-
-pub(crate) fn pause_job_producer(producer: &SemanticIndexFingerprint) {
-    if let Some(job) = prepared_pause_job() {
-        let mut job = job.borrow_mut();
-        if job.producer.as_ref().is_some_and(|old| old != producer) {
-            *job = PreparedPauseJob::default();
-        }
-        if job.producer.as_ref() != Some(producer) {
-            checkpoint_work(0, 1, 1);
-            job.producer = Some(producer.clone());
-        }
-    }
-}
-
-pub(crate) fn pause_job_files(
-    root: &Path,
-    walk: impl FnOnce() -> Result<Vec<PathBuf>, usize>,
-) -> Result<Vec<PathBuf>, usize> {
-    let job = prepared_pause_job();
-    if let Some(files) = job
-        .as_ref()
-        .and_then(|job| job.borrow().files.get(root).cloned())
-    {
-        checkpoint_work(0, 0, 1);
-        return Ok(files);
-    }
-    walk()
 }
 
 fn retain_cold_identity(root: &Path, files: &[PathBuf], caps: EmbedTextCaps, error: &str) {
@@ -580,121 +498,6 @@ fn retain_reuse_files(
     }
 }
 
-pub(crate) fn retain_view_pause_chunks(
-    root: &Path,
-    caps: EmbedTextCaps,
-    files: impl Iterator<Item = (PathBuf, crate::blob_store::v2::ContentHash)>,
-    error: &str,
-) {
-    let Some(job) = observe_lane_pause(error) else {
-        return;
-    };
-    let mut job = job.borrow_mut();
-    let Some(state) = &job.view else {
-        return;
-    };
-    let mut chunks = vec![Vec::new(); state.runs.len()];
-    for (file, chunk) in &state.pending {
-        checkpoint_work(0, 0, 1);
-        chunks[*file].push(chunk.clone());
-    }
-    for ((file, content), chunks) in files.zip(chunks) {
-        checkpoint_work(0, 1, 0);
-        job.view_chunks.insert(
-            ViewCheckpointKey {
-                root: root.to_path_buf(),
-                file,
-                content,
-                caps,
-            },
-            Some(chunks),
-        );
-    }
-}
-
-pub(crate) fn retain_unattempted_view_chunks(
-    root: &Path,
-    caps: EmbedTextCaps,
-    files: impl Iterator<
-        Item = (
-            PathBuf,
-            crate::blob_store::v2::ContentHash,
-            Vec<SemanticChunk>,
-        ),
-    >,
-    error: &str,
-) {
-    let Some(job) = observe_lane_pause(error) else {
-        return;
-    };
-    let mut job = job.borrow_mut();
-    for (file, content, chunks) in files {
-        checkpoint_work(0, 1, 0);
-        job.view_chunks.insert(
-            ViewCheckpointKey {
-                root: root.to_path_buf(),
-                file,
-                content,
-                caps,
-            },
-            Some(chunks),
-        );
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lane_pause_chunk_calls() -> usize {
-    LANE_PAUSE_CHUNK_CALLS.with(std::cell::Cell::get)
-}
-
-struct PauseRetryPolicy {
-    initial: Duration,
-    max: Duration,
-    current: Box<dyn Fn() -> bool>,
-    // Keep in-flight indexing alive through short route reconnects. Consult this
-    // stricter predicate only after the backend returned `lane_paused`: no embed
-    // request is running during that wait, so route loss can cancel it immediately.
-    pause_current: Option<std::rc::Rc<dyn Fn() -> bool>>,
-}
-
-pub(crate) struct PauseRetryScope(Option<PauseRetryPolicy>);
-
-impl PauseRetryScope {
-    pub(crate) fn new(
-        initial: Duration,
-        max: Duration,
-        current: impl Fn() -> bool + 'static,
-    ) -> Self {
-        Self(LANE_PAUSE_RETRY_POLICY.with(|policy| {
-            let pause_current = policy
-                .borrow()
-                .as_ref()
-                .and_then(|policy| policy.pause_current.clone());
-            policy.replace(Some(PauseRetryPolicy {
-                initial,
-                max,
-                current: Box::new(current),
-                pause_current,
-            }))
-        }))
-    }
-
-    pub(crate) fn with_pause_current(self, current: impl Fn() -> bool + 'static) -> Self {
-        LANE_PAUSE_RETRY_POLICY.with(|policy| {
-            if let Some(policy) = policy.borrow_mut().as_mut() {
-                policy.pause_current = Some(std::rc::Rc::new(current));
-            }
-        });
-        self
-    }
-}
-
-impl Drop for PauseRetryScope {
-    fn drop(&mut self) {
-        LANE_PAUSE_RETRY_POLICY.with(|policy| policy.replace(self.0.take()));
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn with_lane_pause_clock<T>(
     start_ms: u64,
@@ -710,130 +513,6 @@ pub(crate) fn with_lane_pause_clock<T>(
     let _restore =
         Restore(LANE_PAUSE_TEST_CLOCK.with(|current| current.replace(Some(clock.clone()))));
     run(clock)
-}
-
-#[cfg(test)]
-pub(crate) fn with_lane_pause_wait_hook<T>(
-    hook: impl FnMut(Duration) + 'static,
-    run: impl FnOnce() -> T,
-) -> T {
-    struct Restore(Option<Box<dyn FnMut(Duration)>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            LANE_PAUSE_WAIT_HOOK.with(|slot| slot.replace(self.0.take()));
-        }
-    }
-    let _restore = Restore(LANE_PAUSE_WAIT_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
-    run()
-}
-
-fn pause_job_is_current(local: &mut impl FnMut() -> bool, paused: bool) -> bool {
-    !crate::executor::current_job_cancelled()
-        && local()
-        && LANE_PAUSE_RETRY_POLICY.with(|policy| {
-            policy.borrow().as_ref().is_some_and(|policy| {
-                (policy.current)()
-                    && (!paused
-                        || policy
-                            .pause_current
-                            .as_ref()
-                            .is_none_or(|current| current()))
-            })
-        })
-}
-
-fn wait_lane_pause(delay: Duration, local: &mut impl FnMut() -> bool) -> Result<(), String> {
-    let deadline = Instant::now() + delay;
-    loop {
-        if !pause_job_is_current(local, true) {
-            return Err("semantic lane superseded".into());
-        }
-        #[cfg(test)]
-        if LANE_PAUSE_WAIT_HOOK.with(|slot| {
-            if let Some(hook) = slot.borrow_mut().as_mut() {
-                hook(delay);
-                true
-            } else {
-                false
-            }
-        }) {
-            return if pause_job_is_current(local, true) {
-                Ok(())
-            } else {
-                Err("semantic lane superseded".into())
-            };
-        }
-        #[cfg(test)]
-        if LANE_PAUSE_TEST_CLOCK.with(|clock| {
-            if let Some(clock) = clock.borrow().as_ref() {
-                clock.fetch_add(
-                    delay.as_millis() as u64,
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-                true
-            } else {
-                false
-            }
-        }) {
-            return Ok(());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(());
-        }
-        std::thread::sleep(remaining.min(Duration::from_secs(1)));
-    }
-}
-
-/// Retry a whole attempt on a dedicated semantic thread, after its resources
-/// have gone out of scope. Only owned data checkpoints survive between attempts.
-/// Executor jobs and callers without an explicit cancellation policy never sleep.
-pub(crate) fn retry_lane_pause<T>(attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
-    retry_lane_pause_while(attempt, &mut || true)
-}
-
-pub(crate) fn retry_lane_pause_while<T>(
-    mut attempt: impl FnMut() -> Result<T, String>,
-    current: &mut impl FnMut() -> bool,
-) -> Result<T, String> {
-    let _refusal_run = EmbeddingRefusalRunScope::new();
-    let _prepared = PreparedPauseJobScope::new();
-    let may_wait = LANE_PAUSE_RETRY_POLICY.with(|policy| policy.borrow().is_some())
-        && crate::executor::current_job_cancellation().is_none()
-        && !crate::executor::current_thread_is_executor_worker();
-    let (mut backoff, max) = LANE_PAUSE_RETRY_POLICY.with(|policy| {
-        policy
-            .borrow()
-            .as_ref()
-            .map(|policy| (policy.initial, policy.max))
-            .unwrap_or((Duration::from_secs(15), Duration::from_secs(60)))
-    });
-    let mut paused = false;
-    loop {
-        if may_wait && !pause_job_is_current(current, paused) {
-            return Err("semantic lane superseded".into());
-        }
-        match attempt() {
-            Err(error) => {
-                let Some(pause) = crate::synapse_embed::LanePause::from_error(&error) else {
-                    return Err(error);
-                };
-                observe_lane_pause(&error);
-                paused = true;
-                if !may_wait {
-                    return Err(error);
-                }
-                let delay = pause.retry_delay(backoff);
-                crate::synapse_embed::note_pause_retry_at(
-                    &pause,
-                    unix_millis_now().saturating_add(delay.as_millis() as u64),
-                );
-                wait_lane_pause(delay, current)?;
-                backoff = (backoff * 2).min(max);
-            }
-            success => return success,
-        }
-    }
 }
 
 /// Delay before the cold semantic build retries an unreachable embedding backend.
@@ -874,36 +553,6 @@ fn record_embedding_backend_build_failure(project_root: &Path, error: &str) {
     entry.probe_only = false;
     entry.next_retry_ms = now_ms.saturating_add(build_backend_retry_delay_ms(entry.failures));
     entry.failures = entry.failures.saturating_add(1);
-}
-
-/// The retry loop owns the sleep, so it stamps the deadline it will actually
-/// sleep to. The builder's own record (above) runs first with its schedule
-/// position; this overrides it with the loop's, which is the one that matters
-/// when the two counters differ (a loop inherits an entry from a superseded
-/// loop, or a builder outside the loop recorded the failure).
-pub(crate) fn record_embedding_backend_retry_deadline(
-    project_root: &Path,
-    error: &str,
-    backoff: std::time::Duration,
-) {
-    let now_ms = unix_millis_now();
-    let clean = strip_transient_embedding_marker(error);
-    let backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
-    let mut registry = embedding_backend_build_health_registry()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = registry
-        .entry(project_root.to_path_buf())
-        .or_insert_with(|| EmbeddingBackendBuildHealth {
-            last_error: clean.clone(),
-            since_ms: now_ms,
-            next_retry_ms: now_ms,
-            failures: 0,
-            probe_only: false,
-        });
-    entry.last_error = clean;
-    entry.probe_only = false;
-    entry.next_retry_ms = now_ms.saturating_add(backoff_ms);
 }
 
 /// Status stage reported while the first reachability probe of a remote
@@ -1169,6 +818,13 @@ fn probe_remote_backend(base_url: &str) -> Result<(), String> {
     }))
 }
 
+/// Records that a fill of the data layer's meaning plane for the root at
+/// `project_root` could not reach the embedding backend, as a cold build's
+/// failure is recorded, so status and aft_search name the outage.
+pub(crate) fn note_embedding_backend_build_failure(project_root: &Path, error: &str) {
+    record_embedding_backend_build_failure(project_root, error);
+}
+
 /// Called on every exit path of a cold-build retry loop so a parked status
 /// never outlives the loop that would have retried it.
 pub(crate) fn clear_embedding_backend_retry_status(project_root: &Path) {
@@ -1270,7 +926,7 @@ fn begin_semantic_index_build_with_key(
     }
     let key = project_key
         .map(str::to_owned)
-        .unwrap_or_else(|| crate::search_index::artifact_cache_key_for_build(project_root));
+        .unwrap_or_else(|| crate::root_identity::key::artifact_cache_key_for_build(project_root));
     let scope = crate::logging::IndexBuildScope::new(
         crate::logging::IndexPlane::Semantic,
         project_root,
@@ -1664,6 +1320,26 @@ fn take_http_build_metadata() -> Option<Vec<BuildEmbeddingRowMetadata>> {
     LAST_HTTP_BUILD_METADATA.with(|slot| slot.borrow_mut().take())
 }
 
+/// Makes the batch an embedding function is answering report `texts` the
+/// way an HTTP backend does, with `skipped` naming why a text was refused
+/// (its row then carries an empty vector). For tests of callers of
+/// [`execute_build_embedding_batch`].
+#[cfg(test)]
+pub(crate) fn report_build_rows_for_test(
+    texts: &[String],
+    skipped: impl Fn(&str) -> Option<String>,
+) {
+    set_http_build_metadata(
+        texts
+            .iter()
+            .map(|text| BuildEmbeddingRowMetadata {
+                embedded_text: text.clone(),
+                skipped_reason: skipped(text),
+            })
+            .collect(),
+    );
+}
+
 /// Test-only probe counter for the managed-ONNX resolver (see
 /// `find_managed_onnx_runtime`). Counts storage-tree reads so a negative-control
 /// test can assert a pre-set ORT_DYLIB_PATH short-circuits the resolver.
@@ -1722,8 +1398,6 @@ struct BuildRequestBudget {
 #[derive(Debug, Clone, Copy)]
 enum EmbeddingRequestPolicy {
     Build(BuildRequestBudget),
-    /// The view worker owns retry backoff; an identity probe sends one request.
-    Probe(Duration),
     Query(QueryBudget),
 }
 
@@ -1731,14 +1405,13 @@ impl EmbeddingRequestPolicy {
     fn max_attempts(self) -> usize {
         match self {
             Self::Build(_) => EMBEDDING_REQUEST_MAX_ATTEMPTS,
-            Self::Probe(_) | Self::Query(_) => 1,
+            Self::Query(_) => 1,
         }
     }
 
     fn request_timeout(self) -> Duration {
         match self {
             Self::Build(budget) => Duration::from_millis(budget.deadline_ms),
-            Self::Probe(timeout) => timeout,
             Self::Query(budget) => Duration::from_millis(budget.timeout_ms),
         }
     }
@@ -1807,9 +1480,6 @@ fn default_chunking_version() -> u32 {
     2
 }
 
-/// Per-file key revision for capped summaries; it does not change model identity.
-pub(crate) const FILE_SUMMARY_BUDGET_KEY_FORMAT: u32 = 1;
-
 /// Artifact metadata is separate from model identity, which is also used by
 /// view producers and chunk-vector keys.
 #[derive(Serialize, Deserialize)]
@@ -1853,6 +1523,7 @@ impl SemanticIndexFingerprint {
         serde_json::to_string(self).unwrap_or_else(|_| String::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn for_config_dimension(config: &SemanticBackendConfig, dimension: usize) -> Self {
         Self::from_config(config, dimension)
     }
@@ -2057,6 +1728,12 @@ struct LocalQueryEmbedRequest {
 struct LocalQueryEmbedWorker {
     requests: crossbeam_channel::Sender<LocalQueryEmbedRequest>,
     busy: Arc<AtomicBool>,
+    /// Held by a query from its submission until its reply or its timeout.
+    /// Query embeddings run outside the context's model mutex, so this is
+    /// what still makes a second query wait for the worker instead of being
+    /// refused as busy while an earlier inference it could have waited for
+    /// finishes.
+    submissions: Mutex<()>,
 }
 
 impl LocalQueryEmbedWorker {
@@ -2089,7 +1766,11 @@ impl LocalQueryEmbedWorker {
                 }
             })
             .map_err(|error| format!("failed to start local query embed worker: {error}"))?;
-        Ok(Self { requests, busy })
+        Ok(Self {
+            requests,
+            busy,
+            submissions: Mutex::new(()),
+        })
     }
 
     fn try_submit(
@@ -2123,7 +1804,7 @@ impl LocalQueryEmbedWorker {
 
 struct LocalEmbeddingEngine {
     model: SharedLocalEmbeddingProvider,
-    query_worker: LocalQueryEmbedWorker,
+    query_worker: Arc<LocalQueryEmbedWorker>,
 }
 
 impl LocalEmbeddingEngine {
@@ -2136,11 +1817,61 @@ impl LocalEmbeddingEngine {
         let query_model = query_model
             .map(|provider| Arc::new(Mutex::new(provider)))
             .unwrap_or_else(|| Arc::clone(&model));
-        let query_worker = LocalQueryEmbedWorker::start(query_model, query_cache)?;
+        let query_worker = Arc::new(LocalQueryEmbedWorker::start(query_model, query_cache)?);
         Ok(Self {
             model,
             query_worker,
         })
+    }
+}
+
+/// Query texts some request is embedding right now, so a second request for
+/// the same text waits for that embedding and then reads it from the query
+/// cache instead of asking the backend again. Requests for other texts do not
+/// wait here.
+#[derive(Default)]
+struct QueryEmbedFlights {
+    in_flight: Mutex<HashSet<String>>,
+    finished: std::sync::Condvar,
+}
+
+impl QueryEmbedFlights {
+    /// Waits while another request embeds `text`, then marks it as this
+    /// request's until the returned guard drops. A request that finds the
+    /// earlier one failed tries itself, as it did when the context's model
+    /// mutex serialized every query.
+    fn lead(self: &Arc<Self>, text: &str) -> QueryEmbedFlight {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while in_flight.contains(text) {
+            in_flight = self
+                .finished
+                .wait(in_flight)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        in_flight.insert(text.to_string());
+        QueryEmbedFlight {
+            flights: Arc::clone(self),
+            text: text.to_string(),
+        }
+    }
+}
+
+struct QueryEmbedFlight {
+    flights: Arc<QueryEmbedFlights>,
+    text: String,
+}
+
+impl Drop for QueryEmbedFlight {
+    fn drop(&mut self) {
+        self.flights
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.text);
+        self.flights.finished.notify_all();
     }
 }
 
@@ -2221,7 +1952,44 @@ enum SemanticEmbeddingEngine {
         model: String,
         base_url: String,
     },
-    Synapse(SynapseEmbeddingClient),
+    /// Shared with the query handles [`SemanticEmbeddingModel::share_for_query`]
+    /// makes. The client keeps circuit-breaker state across calls, so its
+    /// calls take turns on this mutex.
+    Synapse(Arc<Mutex<SynapseEmbeddingClient>>),
+}
+
+impl SemanticEmbeddingEngine {
+    /// The same backend for a query handle: the local query worker, the
+    /// Synapse client and the HTTP connection pool are shared, not rebuilt.
+    fn share(&self) -> Self {
+        match self {
+            Self::Local(engine) => Self::Local(LocalEmbeddingEngine {
+                model: Arc::clone(&engine.model),
+                query_worker: Arc::clone(&engine.query_worker),
+            }),
+            Self::OpenAiCompatible {
+                client,
+                model,
+                base_url,
+                api_key,
+            } => Self::OpenAiCompatible {
+                client: client.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+                api_key: api_key.clone(),
+            },
+            Self::Ollama {
+                client,
+                model,
+                base_url,
+            } => Self::Ollama {
+                client: client.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+            },
+            Self::Synapse(client) => Self::Synapse(Arc::clone(client)),
+        }
+    }
 }
 
 pub struct SemanticEmbeddingModel {
@@ -2236,7 +2004,8 @@ pub struct SemanticEmbeddingModel {
     dimension: Option<usize>,
     engine: SemanticEmbeddingEngine,
     query_embedding_cache: Arc<Mutex<QueryEmbeddingCache>>,
-    local_query_last_ok_log: Option<Instant>,
+    query_flights: Arc<QueryEmbedFlights>,
+    local_query_last_ok_log: Arc<Mutex<Option<Instant>>>,
     query_instruction: Option<String>,
     query_instruction_logged: bool,
     query_instruction_root: Option<PathBuf>,
@@ -3132,9 +2901,7 @@ where
         let request = make_request().timeout(policy.request_timeout());
 
         let exchange = match policy {
-            EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => {
-                execute_embedding_exchange(request)
-            }
+            EmbeddingRequestPolicy::Build(_) => execute_embedding_exchange(request),
             EmbeddingRequestPolicy::Query(_) => execute_query_embedding_exchange(request)?,
         };
         let (status, raw) = match exchange {
@@ -3362,12 +3129,18 @@ impl SemanticEmbeddingModel {
                     base_url,
                 }
             }
-            SemanticBackend::Synapse => SemanticEmbeddingEngine::Synapse(
+            SemanticBackend::Synapse => SemanticEmbeddingEngine::Synapse(Arc::new(Mutex::new(
                 SynapseEmbeddingClient::from_config(config).map_err(|error| error.to_string())?,
-            ),
+            ))),
         };
         let max_batch_size = match &engine {
-            SemanticEmbeddingEngine::Synapse(client) => client.metadata().recommended_rows,
+            SemanticEmbeddingEngine::Synapse(client) => {
+                client
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .metadata()
+                    .recommended_rows
+            }
             _ => max_batch_size,
         };
 
@@ -3383,7 +3156,8 @@ impl SemanticEmbeddingModel {
             dimension: None,
             engine,
             query_embedding_cache,
-            local_query_last_ok_log: None,
+            query_flights: Arc::default(),
+            local_query_last_ok_log: Arc::default(),
             query_instruction: config.resolved_query_instruction().map(str::to_string),
             query_instruction_logged: false,
             query_instruction_root: config.route_project_root.clone(),
@@ -3412,7 +3186,8 @@ impl SemanticEmbeddingModel {
             dimension: None,
             engine,
             query_embedding_cache,
-            local_query_last_ok_log: None,
+            query_flights: Arc::default(),
+            local_query_last_ok_log: Arc::default(),
             query_instruction: None,
             query_instruction_logged: false,
             query_instruction_root: Some(project_root),
@@ -3446,27 +3221,15 @@ impl SemanticEmbeddingModel {
         let dimension = self.dimension()?;
         let mut fingerprint = SemanticIndexFingerprint::from_config(config, dimension);
         if let SemanticEmbeddingEngine::Synapse(client) = &self.engine {
+            let client = client
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let identity = client.identity();
             fingerprint.synapse_fingerprint = Some(identity.fingerprint.clone());
             fingerprint.synapse_table_epoch = Some(identity.table_epoch);
             fingerprint.synapse_equivalent_to = identity.equivalent_to.clone();
         }
         Ok(fingerprint)
-    }
-
-    /// Resolve a view's producer with one HTTP probe, leaving retry scheduling
-    /// to the checkout worker rather than multiplying requests inside each retry.
-    pub(crate) fn fingerprint_for_view(
-        &mut self,
-        config: &SemanticBackendConfig,
-    ) -> Result<SemanticIndexFingerprint, String> {
-        if self.dimension.is_none() && self.uses_http_embedding_backend() {
-            self.embed_texts(
-                vec!["semantic index fingerprint probe".to_string()],
-                EmbeddingRequestPolicy::Probe(Duration::from_millis(self.timeout_ms)),
-            )?;
-        }
-        self.fingerprint(config)
     }
 
     fn uses_http_embedding_backend(&self) -> bool {
@@ -3783,6 +3546,8 @@ impl SemanticEmbeddingModel {
                         .ok_or_else(|| "embedding backend returned no vectors".to_string())?
                 }
                 SemanticEmbeddingEngine::Synapse(client) => client
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .probe_dimension(Duration::from_millis(self.timeout_ms))
                     .map_err(|error| error.to_string())?,
                 SemanticEmbeddingEngine::OpenAiCompatible { .. }
@@ -3816,11 +3581,58 @@ impl SemanticEmbeddingModel {
         }
     }
 
-    pub fn embed_query_cached(
-        &mut self,
-        query: &str,
-        budget: QueryBudget,
-    ) -> Result<Vec<f32>, String> {
+    /// A handle that embeds queries with this model's backend, query cache and
+    /// in-flight queries, so a caller can let go of the mutex that holds this
+    /// model before the backend round trip. A query whose vector is cached
+    /// then never waits behind another query's round trip.
+    ///
+    /// The handle shares what must stay single: the query cache, the
+    /// texts being embedded, the local query worker (whose calls still take
+    /// turns) and the Synapse client (whose calls take turns on its mutex).
+    /// An HTTP backend's calls run side by side, each with its own budget.
+    /// What a query learns about the backend (its dimension) stays on the
+    /// handle until [`Self::adopt_query_dimension`] copies it back.
+    pub(crate) fn share_for_query(&mut self) -> Self {
+        self.log_query_instruction_once();
+        Self {
+            backend: self.backend,
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            timeout_ms: self.timeout_ms,
+            max_batch_size: self.max_batch_size,
+            adaptive_build_batch_size: self.adaptive_build_batch_size,
+            successful_build_batches_at_size: self.successful_build_batches_at_size,
+            per_item_ema_ms: self.per_item_ema_ms,
+            dimension: self.dimension,
+            engine: self.engine.share(),
+            query_embedding_cache: Arc::clone(&self.query_embedding_cache),
+            query_flights: Arc::clone(&self.query_flights),
+            local_query_last_ok_log: Arc::clone(&self.local_query_last_ok_log),
+            query_instruction: self.query_instruction.clone(),
+            query_instruction_logged: true,
+            query_instruction_root: self.query_instruction_root.clone(),
+        }
+    }
+
+    /// The embedding dimension this model has learned from its backend so
+    /// far, without asking it.
+    pub(crate) fn known_dimension(&self) -> Option<usize> {
+        self.dimension
+    }
+
+    /// Copies the dimension a query on a handle from
+    /// [`Self::share_for_query`] learned back onto this model, so it need not
+    /// ask the backend for it again (see [`Self::dimension`]). A handle of
+    /// another model changes nothing.
+    pub(crate) fn adopt_query_dimension(&mut self, handle: &Self) {
+        if Arc::ptr_eq(&self.query_embedding_cache, &handle.query_embedding_cache)
+            && handle.dimension.is_some()
+        {
+            self.dimension = handle.dimension;
+        }
+    }
+
+    fn log_query_instruction_once(&mut self) {
         if !self.query_instruction_logged {
             let root = self
                 .query_instruction_root
@@ -3842,7 +3654,18 @@ impl SemanticEmbeddingModel {
             }
             self.query_instruction_logged = true;
         }
+    }
+
+    pub fn embed_query_cached(
+        &mut self,
+        query: &str,
+        budget: QueryBudget,
+    ) -> Result<Vec<f32>, String> {
+        self.log_query_instruction_once();
         let query_text = query_embedding_text(query, self.query_instruction.as_deref());
+        // Another request embedding the same text finishes first; this one
+        // then finds its vector in the query cache.
+        let _flight = self.query_flights.lead(&query_text);
         self.embed_rows_resilient(
             vec![query_text],
             Some(EmbeddingRequestPolicy::Query(budget)),
@@ -3871,16 +3694,20 @@ impl SemanticEmbeddingModel {
             );
         }
         let should_log = if outcome == "ok" {
-            self.local_query_last_ok_log
-                .is_none_or(|last| last.elapsed() >= QUERY_EMBED_OK_LOG_INTERVAL)
+            let mut last_ok_log = self
+                .local_query_last_ok_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = last_ok_log.is_none_or(|last| last.elapsed() >= QUERY_EMBED_OK_LOG_INTERVAL);
+            if due {
+                *last_ok_log = Some(Instant::now());
+            }
+            due
         } else {
             true
         };
         if !should_log {
             return;
-        }
-        if outcome == "ok" {
-            self.local_query_last_ok_log = Some(Instant::now());
         }
         slog_info!(
             "semantic query embed: backend=fastembed model={} elapsed_ms={} budget_ms={} outcome={}",
@@ -3897,13 +3724,20 @@ impl SemanticEmbeddingModel {
         cache_key: String,
         budget: QueryBudget,
     ) -> Result<Vec<Vec<f32>>, String> {
-        let started = Instant::now();
-        let receiver = match &self.engine {
-            SemanticEmbeddingEngine::Local(engine) => {
-                engine.query_worker.try_submit(texts, cache_key)
-            }
+        let worker = match &self.engine {
+            SemanticEmbeddingEngine::Local(engine) => Arc::clone(&engine.query_worker),
             _ => unreachable!("local query path requires the local embedding engine"),
         };
+        // Queries take turns from submission to reply, as they did under the
+        // context's model mutex. A query that gave up on its reply releases
+        // its turn while the worker may still be busy with that inference;
+        // the next query is then refused as busy below.
+        let _turn = worker
+            .submissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = Instant::now();
+        let receiver = worker.try_submit(texts, cache_key);
         let Some(receiver) = receiver else {
             self.log_local_query_embed(started.elapsed(), budget, "busy");
             return Err(format!(
@@ -3938,7 +3772,7 @@ impl SemanticEmbeddingModel {
         policy: EmbeddingRequestPolicy,
     ) -> Result<Vec<Vec<f32>>, String> {
         let query_cache_key = match policy {
-            EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => None,
+            EmbeddingRequestPolicy::Build(_) => None,
             EmbeddingRequestPolicy::Query(_) => texts.first().cloned(),
         };
         let cached_vectors = query_cache_key.as_ref().and_then(|query| {
@@ -3967,15 +3801,18 @@ impl SemanticEmbeddingModel {
                 EmbeddingRequestPolicy::Query(budget)
                     if matches!(&self.engine, SemanticEmbeddingEngine::Local(_)) =>
                 {
-                    Some(
-                        self.embed_local_query(
-                            texts.clone(),
-                            query_cache_key
-                                .clone()
-                                .expect("query policy has a cache key"),
-                            budget,
-                        ),
-                    )
+                    Some(crate::commands::semantic_search::waits::timed(
+                        crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
+                        || {
+                            self.embed_local_query(
+                                texts.clone(),
+                                query_cache_key
+                                    .clone()
+                                    .expect("query policy has a cache key"),
+                                budget,
+                            )
+                        },
+                    ))
                 }
                 _ => None,
             }
@@ -4008,6 +3845,11 @@ impl SemanticEmbeddingModel {
             return result;
         }
 
+        // A query that missed the cache waits here for its remote backend
+        // (Synapse or HTTP) or the in-process model.
+        let backend_wait = crate::commands::semantic_search::waits::time(
+            crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
+        );
         let result = (|| match &mut self.engine {
             SemanticEmbeddingEngine::Local(engine) => engine
                 .model
@@ -4161,8 +4003,11 @@ impl SemanticEmbeddingModel {
                 Ok(vectors)
             }
             SemanticEmbeddingEngine::Synapse(client) => {
+                let mut client = client
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let vectors = match policy {
-                    EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => client
+                    EmbeddingRequestPolicy::Build(_) => client
                         .embed_batch(&texts)
                         .map_err(|error| error.to_string())?,
                     EmbeddingRequestPolicy::Query(budget) => {
@@ -4174,10 +4019,12 @@ impl SemanticEmbeddingModel {
                             .map_err(|error| error.to_string())?
                     }
                 };
+                drop(client);
                 self.dimension = vectors.first().map(Vec::len);
                 Ok(vectors)
             }
         })();
+        drop(backend_wait);
 
         record_embedding_call(
             self.backend,
@@ -4949,10 +4796,6 @@ pub struct EmbeddingEntry {
 }
 
 impl EmbeddingEntry {
-    pub(crate) fn file(&self) -> &Path {
-        &self.chunk.file
-    }
-
     fn new(chunk: SemanticChunk, vector: impl Into<Arc<[f32]>>) -> Self {
         let vector = vector.into();
         let norm = vector_norm(&vector);
@@ -5090,40 +4933,9 @@ fn take_test_skipped_row_warnings() -> Vec<String> {
 #[derive(Debug, Default)]
 pub struct SemanticVectors {
     entries: Vec<EmbeddingEntry>,
-    pub(crate) provider_refused_chunks: usize,
 }
 
 impl SemanticVectors {
-    /// A run of `chunks` distinct chunks of `file`, each with its own
-    /// `dimension`-float vector, for tests that need resident vectors without
-    /// running an embedding model.
-    #[cfg(test)]
-    pub(crate) fn synthetic_for_test(file: &Path, chunks: usize, dimension: usize) -> Self {
-        Self {
-            provider_refused_chunks: 0,
-            entries: (0..chunks)
-                .map(|ordinal| {
-                    EmbeddingEntry::new(
-                        SemanticChunk {
-                            file: file.to_path_buf(),
-                            name: format!("symbol_{ordinal}"),
-                            qualified_name: None,
-                            kind: SymbolKind::Function,
-                            start_line: ordinal as u32,
-                            end_line: ordinal as u32 + 1,
-                            exported: false,
-                            embed_text: String::new(),
-                            snippet: String::new(),
-                        },
-                        (0..dimension)
-                            .map(|position| (ordinal * dimension + position) as f32 + 1.0)
-                            .collect::<Vec<f32>>(),
-                    )
-                })
-                .collect(),
-        }
-    }
-
     /// Number of embedded chunks in this run.
     pub fn chunk_count(&self) -> usize {
         self.entries.len()
@@ -5165,13 +4977,6 @@ impl SemanticVectors {
     pub fn vectors(&self) -> impl Iterator<Item = &Arc<[f32]>> {
         self.entries.iter().map(|entry| &entry.vector)
     }
-
-    /// Each chunk's vector, for swapping in an equal vector held elsewhere.
-    /// Replacing a vector with one of different floats would leave the cached
-    /// norm stale, so callers may only substitute bit-identical vectors.
-    pub(crate) fn vectors_mut(&mut self) -> impl Iterator<Item = &mut Arc<[f32]>> {
-        self.entries.iter_mut().map(|entry| &mut entry.vector)
-    }
 }
 
 /// Bytes of floats in one vector allocation.
@@ -5193,14 +4998,8 @@ struct SharedSemanticBase {
     entry_files: HashSet<PathBuf>,
     file_mtimes: HashMap<PathBuf, SystemTime>,
     file_sizes: HashMap<PathBuf, u64>,
-    any_missing_sizes: bool,
     file_hashes: HashMap<PathBuf, blake3::Hash>,
-    dimension: usize,
-    fingerprint: Option<SemanticIndexFingerprint>,
-    summary_budget_limited: bool,
     deferred_files: HashSet<PathBuf>,
-    skipped_rows: SkippedEmbeddingRows,
-    persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -5227,14 +5026,6 @@ fn shared_semantic_bases() -> &'static Mutex<SharedSemanticBaseRegistry> {
 fn frozen_owner_semantic_bases() -> &'static Mutex<Vec<Weak<SharedSemanticBase>>> {
     static FROZEN: OnceLock<Mutex<Vec<Weak<SharedSemanticBase>>>> = OnceLock::new();
     FROZEN.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn note_frozen_owner_semantic_base(base: &Arc<SharedSemanticBase>) {
-    let mut frozen = frozen_owner_semantic_bases()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    frozen.retain(|base| base.strong_count() > 0);
-    frozen.push(Arc::downgrade(base));
 }
 
 /// Every live shared base, each exactly once: the bases borrowed loads
@@ -5387,37 +5178,6 @@ pub(crate) fn shared_semantic_bases_memory() -> crate::memory::MemoryEstimate {
             "hits",
             SHARED_SEMANTIC_BASE_HITS.load(Ordering::Relaxed) as u64,
         )
-}
-
-fn borrowed_artifact_identity(data_path: &Path) -> Result<(String, blake3::Hash), String> {
-    let mut file = fs::File::open(data_path).map_err(|error| error.to_string())?;
-    let mut hasher = blake3::Hasher::new();
-    hasher
-        .update_reader(&mut file)
-        .map_err(|error| error.to_string())?;
-    let artifact_content_hash = hasher.finalize();
-
-    let mut header = BufReader::new(fs::File::open(data_path).map_err(|error| error.to_string())?);
-    let mut fixed = [0u8; HEADER_BYTES_V2];
-    header
-        .read_exact(&mut fixed)
-        .map_err(|error| error.to_string())?;
-    if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&fixed[0]) {
-        return Err(format!(
-            "unsupported semantic artifact version {}",
-            fixed[0]
-        ));
-    }
-    let fingerprint_len = u32::from_le_bytes(fixed[9..13].try_into().unwrap()) as usize;
-    if fingerprint_len == 0 || fingerprint_len > 64 * 1024 {
-        return Err("semantic artifact fingerprint is missing or oversized".to_string());
-    }
-    let mut fingerprint = vec![0u8; fingerprint_len];
-    header
-        .read_exact(&mut fingerprint)
-        .map_err(|error| error.to_string())?;
-    let fingerprint = String::from_utf8(fingerprint).map_err(|error| error.to_string())?;
-    Ok((fingerprint, artifact_content_hash))
 }
 
 /// Whether `path` on disk still holds the content recorded in `recorded`, so
@@ -5644,86 +5404,6 @@ struct ReusableEmbedding {
 
 type ChunkReuseMap = HashMap<PathBuf, HashMap<blake3::Hash, Vec<ReusableEmbedding>>>;
 
-const SEMANTIC_BLOB_PAYLOAD_VERSION: u8 = 1;
-
-fn extend_reuse_map_from_semantic_blob(
-    reuse_map: &mut ChunkReuseMap,
-    file: &Path,
-    payload: &[u8],
-    expected_fingerprint: &str,
-    expected_dimension: usize,
-) -> Result<(), String> {
-    let mut reader = CountingReader::with_bytes_read(Cursor::new(payload), 0);
-    let version = read_u8_stream(&mut reader, "missing semantic blob version")?;
-    if version != SEMANTIC_BLOB_PAYLOAD_VERSION {
-        return Err(format!("unsupported semantic blob version {version}"));
-    }
-    for (label, expected) in [
-        ("chunker", crate::blob_store::SEMANTIC_PRODUCER_VERSION),
-        ("template", crate::blob_store::SEMANTIC_PRODUCER_VERSION),
-        ("model", expected_fingerprint),
-    ] {
-        let actual = read_string_stream(&mut reader, Some(payload.len()))?;
-        if actual != expected {
-            return Err(format!("semantic blob {label} fingerprint mismatch"));
-        }
-    }
-    let entry_count = read_u32_stream(&mut reader)? as usize;
-    if entry_count > MAX_ENTRIES {
-        return Err(format!("too many semantic blob entries {entry_count}"));
-    }
-    let vector_bytes = expected_dimension
-        .checked_mul(F32_BYTES)
-        .ok_or_else(|| "semantic blob vector length overflow".to_string())?;
-    for _ in 0..entry_count {
-        let _name = read_string_stream(&mut reader, Some(payload.len()))?;
-        let _qualified_name = read_string_stream(&mut reader, Some(payload.len()))?;
-        let _kind = read_u8_stream(&mut reader, "missing semantic blob symbol kind")?;
-        let _start_line = read_u32_stream(&mut reader)?;
-        let _end_line = read_u32_stream(&mut reader)?;
-        let _exported = read_u8_stream(&mut reader, "missing semantic blob export flag")?;
-        let _snippet = read_string_stream(&mut reader, Some(payload.len()))?;
-        let embed_text = read_string_stream(&mut reader, Some(payload.len()))?;
-        let raw_vector = read_blob_bytes(&mut reader, payload.len())?;
-        if raw_vector.len() != vector_bytes {
-            return Err(format!(
-                "semantic blob vector has {} bytes, expected {vector_bytes}",
-                raw_vector.len()
-            ));
-        }
-        let vector = raw_vector
-            .chunks_exact(F32_BYTES)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte float")))
-            .collect::<Vec<_>>();
-        reuse_map
-            .entry(file.to_path_buf())
-            .or_default()
-            .entry(blake3::hash(embed_text.as_bytes()))
-            .or_default()
-            .push(ReusableEmbedding {
-                embed_text,
-                vector: vector.into(),
-            });
-    }
-    if reader.bytes_read() != payload.len() {
-        return Err("trailing bytes after semantic blob payload".to_string());
-    }
-    Ok(())
-}
-
-fn read_blob_bytes<R: Read>(
-    reader: &mut CountingReader<R>,
-    total_len: usize,
-) -> Result<Vec<u8>, String> {
-    let len = read_u32_stream(reader)? as usize;
-    if reader.bytes_read().saturating_add(len) > total_len {
-        return Err("unexpected end of semantic blob bytes".to_string());
-    }
-    let mut bytes = vec![0; len];
-    read_exact_stream(reader, &mut bytes, "unexpected end of semantic blob bytes")?;
-    Ok(bytes)
-}
-
 /// Search result from a semantic query
 #[derive(Debug, Clone)]
 pub struct SemanticResult {
@@ -5739,15 +5419,6 @@ pub struct SemanticResult {
     pub rank_score: f32,
     pub cap_protected: bool,
     pub source: &'static str,
-}
-
-fn relativize_semantic_map<T>(
-    project_root: &Path,
-    map: HashMap<PathBuf, T>,
-) -> Option<HashMap<PathBuf, T>> {
-    map.into_iter()
-        .map(|(path, value)| cache_relative_path(project_root, &path).map(|path| (path, value)))
-        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5915,247 +5586,6 @@ fn semantic_changed_paths(previous: &SemanticIndex, current: &SemanticIndex) -> 
 }
 
 impl SemanticIndex {
-    fn from_shared_base(project_root: PathBuf, shared_base: Arc<SharedSemanticBase>) -> Self {
-        debug_assert!(project_root.is_absolute());
-        Self {
-            entries: Vec::new(),
-            file_mtimes: HashMap::new(),
-            file_sizes: HashMap::new(),
-            any_missing_sizes: shared_base.any_missing_sizes,
-            file_hashes: HashMap::new(),
-            dimension: shared_base.dimension,
-            fingerprint: shared_base.fingerprint.clone(),
-            summary_budget_limited: shared_base.summary_budget_limited,
-            project_root: project_root.clone(),
-            deferred_files: shared_base
-                .deferred_files
-                .iter()
-                .map(|path| project_root.join(path))
-                .collect(),
-            // A new root has no saved-index baseline of its own. On its first
-            // write, it compares the saved index contents with current entries;
-            // borrowers do not inherit the owner's pending dirty-path set.
-            dirty_paths: Arc::new(Mutex::new(None)),
-            persistence: Arc::new(Mutex::new(
-                *shared_base
-                    .persistence
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )),
-            last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-            skipped_rows: SkippedEmbeddingRows {
-                total: shared_base.skipped_rows.total,
-                refused: shared_base
-                    .skipped_rows
-                    .refused
-                    .iter()
-                    .map(|(path, count)| (project_root.join(path), *count))
-                    .collect(),
-                context_exceeded: shared_base
-                    .skipped_rows
-                    .context_exceeded
-                    .iter()
-                    .map(|(path, count)| (project_root.join(path), *count))
-                    .collect(),
-            },
-            shared_base: Some(Arc::clone(&shared_base)),
-            tombstones: HashSet::new(),
-            view_runs: Vec::new(),
-            #[cfg(test)]
-            removal_retain_passes: 0,
-        }
-    }
-
-    /// Freeze before starting a worker so the serving index and refresh clone
-    /// never acquire independent copies of the unchanged corpus.
-    pub(crate) fn fork_for_refresh(&mut self) -> Self {
-        if self.shared_base.is_none() && self.paths_are_shareable() {
-            let root = self.project_root.clone();
-            let private = std::mem::replace(self, Self::new(root.clone(), self.dimension));
-            let dirty_paths = Arc::clone(&private.dirty_paths);
-            let persistence = Arc::clone(&private.persistence);
-            match private.into_shared_base() {
-                Ok(base) => {
-                    let base = Arc::new(base);
-                    note_frozen_owner_semantic_base(&base);
-                    *self = Self::from_shared_base(root, base);
-                    self.dirty_paths = dirty_paths;
-                    self.persistence = persistence;
-                }
-                Err(private) => *self = private,
-            }
-        }
-        let mut worker = self.clone();
-        worker.dirty_paths = Arc::new(Mutex::new(self.dirty_paths_snapshot()));
-        worker.persistence = Arc::new(Mutex::new(self.persistence_snapshot()));
-        worker
-    }
-
-    pub(crate) fn adopt_frozen_base_for_root(
-        &mut self,
-        project_root: &Path,
-        config: &SemanticBackendConfig,
-    ) -> Option<Self> {
-        let expected = SemanticIndexFingerprint::for_config_dimension(config, self.dimension());
-        if !self
-            .fingerprint()
-            .is_some_and(|fingerprint| fingerprint.matches(&expected))
-        {
-            return None;
-        }
-
-        if let Some(base) = self.shared_base.as_ref() {
-            if !base
-                .fingerprint
-                .as_ref()
-                .is_some_and(|fingerprint| fingerprint.matches(&expected))
-            {
-                return None;
-            }
-            // The donor is the artifact writer, but even its delta belongs to
-            // its checkout. Borrow the immutable seed only; the receiving root
-            // verifies that seed against its own files before publishing it.
-            return Some(Self::from_shared_base(
-                project_root.to_path_buf(),
-                Arc::clone(base),
-            ));
-        }
-
-        if !self.paths_are_shareable() {
-            return None;
-        }
-
-        // Move the resident vectors into one immutable relative-path base rather
-        // than cloning them. The owner and each matching worktree then retain
-        // only an Arc plus their own root for path projection.
-        let owner_root = self.project_root.clone();
-        let placeholder = Self::new(owner_root.clone(), self.dimension());
-        let private = std::mem::replace(self, placeholder);
-        let base = match private.into_shared_base() {
-            Ok(base) => {
-                let base = Arc::new(base);
-                note_frozen_owner_semantic_base(&base);
-                base
-            }
-            Err(private) => {
-                // Unreachable after the shareability check (this index is held
-                // exclusively, so no path can appear between the check and the
-                // move), but a private index is never worth a process: restore
-                // it and decline to share.
-                crate::slog_warn!(
-                    "semantic index for {} could not be frozen into a shared base; keeping it private",
-                    owner_root.display()
-                );
-                *self = private;
-                return None;
-            }
-        };
-        *self = Self::from_shared_base(owner_root, Arc::clone(&base));
-        Some(Self::from_shared_base(project_root.to_path_buf(), base))
-    }
-
-    /// Every path this index carries must be expressible relative to its own
-    /// root before the index can be frozen into a base shared across roots.
-    /// Dirty paths must also stay inside the root: the writer encodes them as
-    /// relative file identities in its replacement segments.
-    fn paths_are_shareable(&self) -> bool {
-        let shareable = |path: &Path| cache_relative_path(&self.project_root, path).is_some();
-        self.entries
-            .iter()
-            .all(|entry| shareable(&entry.chunk.file))
-            && self
-                .file_mtimes
-                .keys()
-                .chain(self.file_sizes.keys())
-                .chain(self.file_hashes.keys())
-                .chain(self.skipped_rows.refused.keys())
-                .chain(self.skipped_rows.context_exceeded.keys())
-                .chain(self.deferred_files.iter())
-                .all(|path| shareable(path))
-            && self
-                .dirty_paths
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_none_or(|paths| paths.iter().all(|path| shareable(path)))
-    }
-
-    fn into_shared_base(mut self) -> Result<SharedSemanticBase, Self> {
-        if self.shared_base.is_some() || !self.paths_are_shareable() {
-            return Err(self);
-        }
-        // Relativize every path before moving anything, so a path outside the
-        // root hands the index back intact instead of leaving a half-moved
-        // one behind. Only the path strings are copied here; the vectors move.
-        let root = self.project_root.clone();
-        let relative = |path: &Path| cache_relative_path(&root, path);
-        let Some(entry_files) = self
-            .entries
-            .iter()
-            .map(|entry| relative(&entry.chunk.file))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Err(self);
-        };
-        let Some(deferred_files) = self
-            .deferred_files
-            .iter()
-            .map(|path| relative(path))
-            .collect::<Option<HashSet<_>>>()
-        else {
-            return Err(self);
-        };
-        let (Some(file_mtimes), Some(file_sizes), Some(file_hashes)) = (
-            relativize_semantic_map(&root, self.file_mtimes.clone()),
-            relativize_semantic_map(&root, self.file_sizes.clone()),
-            relativize_semantic_map(&root, self.file_hashes.clone()),
-        ) else {
-            return Err(self);
-        };
-        for (entry, file) in self.entries.iter_mut().zip(entry_files) {
-            entry.chunk.file = file;
-        }
-        self.skipped_rows.refused = self
-            .skipped_rows
-            .refused
-            .into_iter()
-            .map(|(path, count)| (relative(&path).expect("validated refused path"), count))
-            .collect();
-        self.skipped_rows.context_exceeded = self
-            .skipped_rows
-            .context_exceeded
-            .into_iter()
-            .map(|(path, count)| (relative(&path).expect("validated skipped path"), count))
-            .collect();
-        let persistence = *self
-            .persistence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(SharedSemanticBase {
-            memory_estimate: OnceLock::new(),
-            entry_files: self
-                .entries
-                .iter()
-                .map(|entry| entry.chunk.file.clone())
-                .collect(),
-            entry_count: self.entries.len(),
-            segments: vec![Arc::new(SemanticVectors {
-                provider_refused_chunks: 0,
-                entries: self.entries,
-            })],
-            file_mtimes,
-            file_sizes,
-            any_missing_sizes: self.any_missing_sizes,
-            file_hashes,
-            dimension: self.dimension,
-            fingerprint: self.fingerprint,
-            summary_budget_limited: self.summary_budget_limited,
-            deferred_files,
-            skipped_rows: self.skipped_rows,
-            persistence: Arc::new(Mutex::new(persistence)),
-        })
-    }
-
     /// Absolute path of a root-relative base or view-run chunk path. Tests
     /// count the calls to prove refresh joins only the paths it needs.
     fn join_shared_path(&self, file: &Path) -> PathBuf {
@@ -6243,33 +5673,6 @@ impl SemanticIndex {
             .collect()
     }
 
-    /// Compare a borrowed snapshot with the receiving checkout, including added
-    /// and deleted files. Stat equality across checkouts is not proof of content
-    /// equality, so adoption always verifies recorded hashes.
-    pub(crate) fn borrowed_changed_paths(&self, current_files: &[PathBuf]) -> Vec<PathBuf> {
-        let current = current_files.iter().collect::<HashSet<_>>();
-        let mut paths = self.indexed_paths();
-        paths.extend(self.live_entries().map(|(path, _)| path.into_owned()));
-        paths.extend(
-            self.tombstones
-                .iter()
-                .map(|path| self.project_root.join(path)),
-        );
-        paths.extend(current_files.iter().cloned());
-        paths
-            .into_iter()
-            .filter(|path| {
-                !current.contains(path)
-                    || self.recorded_file_freshness(path).is_none_or(|record| {
-                        !matches!(
-                            cache_freshness::verify_file_strict(path, &record),
-                            FreshnessVerdict::HotFresh | FreshnessVerdict::ContentFresh { .. }
-                        )
-                    })
-            })
-            .collect()
-    }
-
     fn hide_base_files<'a>(&mut self, paths: impl IntoIterator<Item = &'a PathBuf>) {
         // Every caller next edits `entries`; shared runs must be owned first.
         self.materialize_view_runs();
@@ -6343,18 +5746,6 @@ impl SemanticIndex {
         }
     }
 
-    pub(crate) fn refused_rows_for_paths(&self, paths: &[PathBuf]) -> BTreeMap<PathBuf, usize> {
-        paths
-            .iter()
-            .filter_map(|path| {
-                self.skipped_rows
-                    .refused
-                    .get(path)
-                    .map(|count| (path.clone(), *count))
-            })
-            .collect()
-    }
-
     pub fn apply_refused_rows_update(&mut self, refused: BTreeMap<PathBuf, usize>) {
         for (path, count) in refused {
             if let Some(previous) = self.skipped_rows.refused.remove(&path) {
@@ -6363,18 +5754,6 @@ impl SemanticIndex {
             self.skipped_rows.total += count;
             self.skipped_rows.refused.insert(path, count);
         }
-    }
-
-    pub(crate) fn context_skipped_for_paths(&self, paths: &[PathBuf]) -> BTreeMap<PathBuf, usize> {
-        paths
-            .iter()
-            .filter_map(|path| {
-                self.skipped_rows
-                    .context_exceeded
-                    .get(path)
-                    .map(|count| (path.clone(), *count))
-            })
-            .collect()
     }
 
     pub fn apply_context_skips_update(&mut self, skipped: BTreeMap<PathBuf, usize>) {
@@ -6804,47 +6183,6 @@ impl SemanticIndex {
                 });
         });
         reuse_map
-    }
-
-    fn extend_reuse_map_from_blob_store<R>(
-        &self,
-        project_root: &Path,
-        files: impl IntoIterator<Item = PathBuf>,
-        reuse_map: &mut ChunkReuseMap,
-        reuse_blob: &mut R,
-    ) where
-        R: FnMut(&Path) -> Option<Vec<u8>>,
-    {
-        let Some(fingerprint) = self.fingerprint().map(SemanticIndexFingerprint::as_string) else {
-            return;
-        };
-        let mut reused_files = 0usize;
-        for file in files {
-            let Some(payload) = reuse_blob(&file) else {
-                continue;
-            };
-            match extend_reuse_map_from_semantic_blob(
-                reuse_map,
-                &file,
-                &payload,
-                &fingerprint,
-                self.dimension,
-            ) {
-                Ok(()) => reused_files += 1,
-                Err(error) => slog_warn!(
-                    "semantic blob reuse rejected for {}: {}",
-                    file.display(),
-                    error
-                ),
-            }
-        }
-        if reused_files > 0 {
-            slog_info!(
-                "semantic refresh reused content-addressed vectors: root={} files={}",
-                project_root.display(),
-                reused_files
-            );
-        }
     }
 
     fn reusable_vector_for_chunk(
@@ -7278,7 +6616,7 @@ impl SemanticIndex {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
-        let project_key = crate::search_index::artifact_cache_key_for_build(project_root);
+        let project_key = crate::root_identity::key::artifact_cache_key_for_build(project_root);
         Self::build_with_caps_for_key(
             project_root,
             files,
@@ -7575,7 +6913,7 @@ impl SemanticIndex {
         max_batch_size: usize,
         progress: &mut P,
         verify_strategy: cache_freshness::VerifyStrategy,
-        reuse_blob: &mut R,
+        _reuse_blob: &mut R,
         mut recovery_paths: Option<&mut Vec<PathBuf>>,
     ) -> Result<RefreshSummary, String>
     where
@@ -7740,7 +7078,7 @@ impl SemanticIndex {
             });
         }
 
-        let mut reuse_map = self.build_chunk_reuse_map(&changed);
+        let reuse_map = self.build_chunk_reuse_map(&changed);
         let embed_text_caps = self
             .fingerprint
             .as_ref()
@@ -7748,12 +7086,6 @@ impl SemanticIndex {
             .unwrap_or_default();
         let (chunks, fresh_metadata) =
             Self::collect_chunks(project_root, &to_embed, embed_text_caps);
-        self.extend_reuse_map_from_blob_store(
-            project_root,
-            fresh_metadata.keys().cloned(),
-            &mut reuse_map,
-            reuse_blob,
-        );
         let changed_set: HashSet<&Path> = changed.iter().map(PathBuf::as_path).collect();
         let vanished = to_embed
             .iter()
@@ -7946,7 +7278,7 @@ impl SemanticIndex {
         max_batch_size: usize,
         max_files: usize,
         progress: &mut P,
-        reuse_blob: &mut R,
+        _reuse_blob: &mut R,
     ) -> Result<InvalidatedFilesRefresh, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -7984,7 +7316,7 @@ impl SemanticIndex {
         // The watcher path has already invalidated these files in the request
         // thread's live index. Move reusable payloads out while mirroring that
         // removal, so parse/read failures do not resurrect stale entries.
-        let mut reuse_map = self.take_chunk_reuse_map(&requested_paths);
+        let reuse_map = self.take_chunk_reuse_map(&requested_paths);
 
         let existing_paths = requested_paths
             .iter()
@@ -8056,12 +7388,6 @@ impl SemanticIndex {
             }
             fresh_metadata.extend(new_metadata);
         }
-        self.extend_reuse_map_from_blob_store(
-            project_root,
-            fresh_metadata.keys().cloned(),
-            &mut reuse_map,
-            reuse_blob,
-        );
 
         let retained_file_count = self.indexed_file_count();
         let changed_successful_count = existing_paths
@@ -8583,27 +7909,6 @@ impl SemanticIndex {
         self.removal_retain_passes
     }
 
-    #[cfg(test)]
-    pub(crate) fn uses_shared_base_for_test(&self) -> bool {
-        self.shared_base.is_some()
-    }
-
-    /// The replacement runs an index built by `for_view` holds by `Arc` from
-    /// the family arena (its `view_runs`), in the order they are searched.
-    #[cfg(test)]
-    pub(crate) fn view_runs_for_test(&self) -> &[Arc<SemanticVectors>] {
-        &self.view_runs
-    }
-
-    /// Every vector a search would score, as the shared handles themselves,
-    /// so a test can compare allocations with `Arc::ptr_eq`.
-    #[cfg(test)]
-    pub(crate) fn live_vectors_for_test(&self) -> Vec<Arc<[f32]>> {
-        self.live_entries()
-            .map(|(_, entry)| Arc::clone(&entry.vector))
-            .collect()
-    }
-
     /// Every entry as `(absolute file, symbol name, vector)`, sorted, so a test
     /// can check that vectors survived an operation bit-for-bit.
     #[cfg(test)]
@@ -8643,25 +7948,11 @@ impl SemanticIndex {
         self.fingerprint = Some(fingerprint);
     }
 
-    pub(crate) fn set_summary_budget_limited(&mut self, limited: bool) {
-        self.summary_budget_limited = limited;
-    }
-
     fn limited_summary_budget(&self) -> Option<usize> {
         self.fingerprint
             .as_ref()
             .map(|identity| identity.embed_text_caps.total_chars)
             .filter(|budget| *budget < EmbedTextCaps::default().total_chars)
-    }
-
-    pub(crate) fn summaries_need_repair(&self) -> bool {
-        !self.summary_budget_limited && self.limited_summary_budget().is_some()
-    }
-
-    pub(crate) fn note_borrowed_summary_format(&self) {
-        if self.summaries_need_repair() {
-            slog_info!("borrowed semantic cache has legacy small-budget summaries; serving the owner's published artifact until owner repair");
-        }
     }
 
     fn persisted_summary_budget(&self) -> bool {
@@ -8677,85 +7968,6 @@ impl SemanticIndex {
             })
             .ok()
         })
-    }
-
-    /// A cached summary's new input is an exact prefix of its old input. Repair
-    /// that row directly: unchanged symbol vectors do not need parsing or calls
-    /// to the embedding backend. The marker is checked before examining rows.
-    pub(crate) fn repair_legacy_file_summaries<F>(
-        &mut self,
-        embed: &mut F,
-        max_batch_size: usize,
-    ) -> Result<bool, String>
-    where
-        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
-    {
-        if !self.summaries_need_repair() {
-            return Ok(false);
-        }
-        if self.shared_base.is_some() || !self.view_runs.is_empty() {
-            // Refresh workers fork the published cache into a frozen base.
-            // Materialize a private snapshot, never the published vector slots.
-            *self = Self::from_bytes(&self.to_bytes(), &self.project_root)?;
-        }
-        let budget = self
-            .limited_summary_budget()
-            .expect("legacy small-cap identity");
-        let candidates = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(position, entry)| {
-                if entry.chunk.kind != SymbolKind::FileSummary {
-                    return None;
-                }
-                let mut chunk = entry.chunk.clone();
-                chunk.embed_text = truncate_chars(&chunk.embed_text, budget);
-                (chunk.embed_text != entry.chunk.embed_text).then_some((position, chunk))
-            })
-            .collect::<Vec<_>>();
-        let mut replacements = Vec::new();
-        for batch in candidates.chunks(max_batch_size.max(1)) {
-            let texts = batch
-                .iter()
-                .map(|(_, chunk)| chunk.embed_text.clone())
-                .collect();
-            let rows = execute_build_embedding_batch(texts, embed)?;
-            for ((position, chunk), row) in batch.iter().zip(rows) {
-                let BuildEmbeddingRow::Embedded {
-                    embedded_text,
-                    vector,
-                } = row
-                else {
-                    return Err(
-                        "cached file-summary repair was rejected by the embedding backend"
-                            .to_string(),
-                    );
-                };
-                if vector.len() != self.dimension {
-                    return Err(format!(
-                        "file-summary repair dimension mismatch: expected {}, got {}",
-                        self.dimension,
-                        vector.len()
-                    ));
-                }
-                let mut chunk = chunk.clone();
-                chunk.embed_text = embedded_text;
-                replacements.push((*position, EmbeddingEntry::new(chunk, vector)));
-            }
-        }
-        // No entry or marker changes until every replacement has been validated.
-        for (position, entry) in replacements {
-            self.entries[position] = entry;
-        }
-        self.summary_budget_limited = true;
-        self.set_persistence(None);
-        self.mark_all_dirty();
-        slog_info!(
-            "semantic cache repaired {} legacy small-budget file summaries",
-            candidates.len()
-        );
-        Ok(true)
     }
 
     fn scan_artifact_for_append(
@@ -9848,60 +9060,6 @@ impl SemanticIndex {
         }
     }
 
-    pub(crate) fn read_from_disk_with_summary_repair<F>(
-        storage_dir: &Path,
-        project_key: &str,
-        current_canonical_root: &Path,
-        is_worktree_bridge: bool,
-        expected_fingerprint: Option<&str>,
-        embed: &mut F,
-        max_batch_size: usize,
-    ) -> Result<Option<(Self, bool)>, String>
-    where
-        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
-    {
-        let Some(mut index) = Self::read_from_disk(
-            storage_dir,
-            project_key,
-            current_canonical_root,
-            is_worktree_bridge,
-            expected_fingerprint,
-        ) else {
-            return Ok(None);
-        };
-        let repaired = match index.repair_legacy_file_summaries(embed, max_batch_size) {
-            Ok(repaired) => repaired,
-            Err(error)
-                if embedding_failure_is_transient(&error)
-                    || crate::synapse_embed::LanePause::from_error(&error).is_some() =>
-            {
-                slog_warn!(
-                    "summary budget repair deferred; keeping saved semantic vectors: {}",
-                    strip_transient_embedding_marker(&error)
-                );
-                false
-            }
-            Err(error) => return Err(error),
-        };
-        Ok(Some((index, repaired)))
-    }
-
-    /// Refuse, by name, a `semantic.bin` whose base snapshot version byte is
-    /// above [`SEMANTIC_BASE_FORMAT_VERSION`] (or any snapshot while the
-    /// storage root's reader floor is above it). Reads one byte. Delta segments
-    /// carry their own version, checked as they are decoded.
-    pub(crate) fn check_disk_format(
-        storage_dir: &Path,
-        project_key: &str,
-    ) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
-        Self::check_disk_format_at(
-            &storage_dir
-                .join("semantic")
-                .join(project_key)
-                .join("semantic.bin"),
-        )
-    }
-
     fn check_disk_format_at(
         data_path: &Path,
     ) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
@@ -9935,142 +9093,6 @@ impl SemanticIndex {
             }
             _ => Ok(()),
         }
-    }
-
-    pub(crate) fn read_from_disk_borrow_tolerant(
-        storage_dir: &Path,
-        project_key: &str,
-        current_canonical_root: &Path,
-    ) -> Option<Self> {
-        crate::private_storage::tighten_open_dir(
-            storage_dir,
-            &storage_dir.join("semantic").join(project_key),
-        );
-        let load_started = Instant::now();
-        let loaded = Self::read_from_disk_borrow_tolerant_inner(
-            storage_dir,
-            project_key,
-            current_canonical_root,
-        );
-        if let Some(index) = loaded.as_ref() {
-            index.note_borrowed_summary_format();
-        }
-        let outcome = if loaded.is_some() { "ready" } else { "denied" };
-        let build_id = crate::logging::in_flight_build_id(
-            crate::logging::IndexPlane::Semantic,
-            current_canonical_root,
-        )
-        .unwrap_or_else(crate::logging::mint_index_build_id);
-        crate::logging::log_index_event(
-            crate::logging::IndexEvent::new(
-                crate::logging::IndexEventKind::ArtifactLoaded,
-                crate::logging::IndexPlane::Semantic,
-                build_id,
-                current_canonical_root,
-                project_key,
-            )
-            .field("outcome", outcome)
-            .field("borrowed", "true")
-            .field(
-                "elapsed_ms",
-                load_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            ),
-        );
-        crate::logging::note_tool_call_wait(
-            crate::run_tool_call::WaitingOn::ArtifactLoad,
-            None,
-            load_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        );
-        loaded
-    }
-
-    fn read_from_disk_borrow_tolerant_inner(
-        storage_dir: &Path,
-        project_key: &str,
-        current_canonical_root: &Path,
-    ) -> Option<Self> {
-        crate::root_cache::check_cache_access(&storage_dir.join("semantic")).ok()?;
-        let data_path = storage_dir
-            .join("semantic")
-            .join(project_key)
-            .join("semantic.bin");
-        if Self::check_disk_format_at(&data_path).is_err() {
-            return None;
-        }
-        let (fingerprint, artifact_content_hash) = match borrowed_artifact_identity(&data_path) {
-            Ok(identity) => identity,
-            Err(error) => {
-                slog_warn!(
-                    "semantic shared-base identity unavailable ({}); loading a private borrowed copy",
-                    error
-                );
-                return Self::read_from_disk(
-                    storage_dir,
-                    project_key,
-                    current_canonical_root,
-                    true,
-                    None,
-                );
-            }
-        };
-        let key = SharedSemanticBaseKey {
-            artifact_cache_key: project_key.to_string(),
-            fingerprint,
-            artifact_content_hash,
-        };
-
-        {
-            let mut registry = shared_semantic_bases()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.retain(|_, base| base.strong_count() > 0);
-            if let Some(base) = registry.get(&key).and_then(Weak::upgrade) {
-                SHARED_SEMANTIC_BASE_HITS.fetch_add(1, Ordering::Relaxed);
-                return Some(Self::from_shared_base(
-                    current_canonical_root.to_path_buf(),
-                    base,
-                ));
-            }
-        }
-
-        let private = Self::read_from_disk(
-            storage_dir,
-            project_key,
-            current_canonical_root,
-            true,
-            Some(&key.fingerprint),
-        )?;
-        let base = match private.into_shared_base() {
-            Ok(base) => base,
-            Err(private) => return Some(private),
-        };
-        // The writer can replace semantic.bin between hashing and reading it.
-        // Register the loaded rows only if the file's fingerprint and content
-        // hash still match the registry key sampled before the read.
-        if borrowed_artifact_identity(&data_path).ok()
-            != Some((key.fingerprint.clone(), key.artifact_content_hash))
-        {
-            return None;
-        }
-        let base = Arc::new(base);
-
-        let mut registry = shared_semantic_bases()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.retain(|_, base| base.strong_count() > 0);
-        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-            SHARED_SEMANTIC_BASE_HITS.fetch_add(1, Ordering::Relaxed);
-            return Some(Self::from_shared_base(
-                current_canonical_root.to_path_buf(),
-                existing,
-            ));
-        }
-        registry.insert(key, Arc::downgrade(&base));
-        SHARED_SEMANTIC_BASE_LOADS.fetch_add(1, Ordering::Relaxed);
-        Some(Self::from_shared_base(
-            current_canonical_root.to_path_buf(),
-            base,
-        ))
     }
 
     /// Serialize the index to bytes for disk persistence
@@ -11503,251 +10525,7 @@ pub struct ViewPayloadProducer<'a> {
     pub model_fingerprint: &'a str,
 }
 
-/// View payloads use the encoding the legacy importer writes
-/// (`migration::encode_imported_payload`), so imported blobs read the same way.
-const VIEW_PAYLOAD_VERSION: u8 = 1;
-
-fn push_view_field(output: &mut Vec<u8>, bytes: &[u8]) {
-    output.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    output.extend_from_slice(bytes);
-}
-
-fn take_view_slice<'a>(
-    payload: &'a [u8],
-    cursor: &mut usize,
-    length: usize,
-) -> Result<&'a [u8], String> {
-    let end = cursor
-        .checked_add(length)
-        .filter(|end| *end <= payload.len())
-        .ok_or_else(|| "semantic view payload is truncated".to_string())?;
-    let bytes = &payload[*cursor..end];
-    *cursor = end;
-    Ok(bytes)
-}
-
-fn take_view_u32(payload: &[u8], cursor: &mut usize) -> Result<u32, String> {
-    let bytes = take_view_slice(payload, cursor, 4)?;
-    Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
-}
-
-fn take_view_bytes<'a>(payload: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
-    let length = take_view_u32(payload, cursor)? as usize;
-    take_view_slice(payload, cursor, length)
-}
-
-fn take_view_string(payload: &[u8], cursor: &mut usize) -> Result<String, String> {
-    String::from_utf8(take_view_bytes(payload, cursor)?.to_vec())
-        .map_err(|_| "semantic view payload holds invalid UTF-8".to_string())
-}
-
-impl SemanticVectors {
-    /// Encodes this run as the payload stored under its view key.
-    pub(crate) fn encode_view_payload(&self, producer: &ViewPayloadProducer<'_>) -> Vec<u8> {
-        let mut payload = vec![VIEW_PAYLOAD_VERSION];
-        push_view_field(&mut payload, producer.chunker_version.as_bytes());
-        push_view_field(&mut payload, producer.template_version.as_bytes());
-        push_view_field(&mut payload, producer.model_fingerprint.as_bytes());
-        payload.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
-        for entry in &self.entries {
-            let chunk = &entry.chunk;
-            push_view_field(&mut payload, chunk.name.as_bytes());
-            push_view_field(
-                &mut payload,
-                chunk
-                    .qualified_name
-                    .as_deref()
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-            payload.push(symbol_kind_to_u8(&chunk.kind));
-            payload.extend_from_slice(&chunk.start_line.to_le_bytes());
-            payload.extend_from_slice(&chunk.end_line.to_le_bytes());
-            payload.push(u8::from(chunk.exported));
-            push_view_field(&mut payload, chunk.snippet.as_bytes());
-            push_view_field(&mut payload, chunk.embed_text.as_bytes());
-            let vector = entry
-                .vector
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<_>>();
-            push_view_field(&mut payload, &vector);
-        }
-        payload
-    }
-
-    /// Decodes a stored view payload for `rel_path`. A payload stamped by any
-    /// other producer is refused rather than read as current vectors.
-    ///
-    /// The embedded text is not kept in resident file runs. Chunk-vector reuse
-    /// uses separate indexed family rows, keeping the arena close to the vectors.
-    pub(crate) fn decode_view_payload(
-        payload: &[u8],
-        rel_path: &Path,
-        producer: &ViewPayloadProducer<'_>,
-    ) -> Result<Self, String> {
-        Self::decode_view_payload_inner(payload, rel_path, producer, None, false)
-    }
-
-    /// Decodes like [`Self::decode_view_payload`] and also returns the BLAKE3
-    /// digest of each entry's embedded text, in run order. The run itself
-    /// still drops the text; the digests are enough to name the chunk rows
-    /// those texts are stored under.
-    pub(crate) fn decode_view_payload_with_text_digests(
-        payload: &[u8],
-        rel_path: &Path,
-        producer: &ViewPayloadProducer<'_>,
-    ) -> Result<(Self, Vec<blake3::Hash>), String> {
-        let mut digests = Vec::new();
-        let run = Self::decode_view_payload_inner(
-            payload,
-            rel_path,
-            producer,
-            Some(&mut digests),
-            false,
-        )?;
-        Ok((run, digests))
-    }
-
-    /// Retains exact persisted inputs only while repairing an old file run.
-    /// Ordinary loads keep their compact, text-free resident representation.
-    pub(crate) fn decode_view_payload_for_summary_repair(
-        payload: &[u8],
-        rel_path: &Path,
-        producer: &ViewPayloadProducer<'_>,
-    ) -> Result<Self, String> {
-        Self::decode_view_payload_inner(payload, rel_path, producer, None, true)
-    }
-
-    fn decode_view_payload_inner(
-        payload: &[u8],
-        rel_path: &Path,
-        producer: &ViewPayloadProducer<'_>,
-        mut text_digests: Option<&mut Vec<blake3::Hash>>,
-        retain_embed_text: bool,
-    ) -> Result<Self, String> {
-        let mut cursor = 0usize;
-        let version = take_view_slice(payload, &mut cursor, 1)?[0];
-        if version != VIEW_PAYLOAD_VERSION {
-            return Err(format!(
-                "unsupported semantic view payload version {version}"
-            ));
-        }
-        for (field, expected) in [
-            ("chunker", producer.chunker_version),
-            ("template", producer.template_version),
-            ("model", producer.model_fingerprint),
-        ] {
-            if take_view_bytes(payload, &mut cursor)? != expected.as_bytes() {
-                return Err(format!(
-                    "semantic view payload was produced by another {field}"
-                ));
-            }
-        }
-        let count = take_view_u32(payload, &mut cursor)? as usize;
-        let mut entries = Vec::with_capacity(count.min(payload.len()));
-        let mut dimension = None;
-        for _ in 0..count {
-            let name = take_view_string(payload, &mut cursor)?;
-            let qualified_name = take_view_string(payload, &mut cursor)?;
-            let kind = u8_to_symbol_kind(take_view_slice(payload, &mut cursor, 1)?[0])?;
-            let start_line = take_view_u32(payload, &mut cursor)?;
-            let end_line = take_view_u32(payload, &mut cursor)?;
-            let exported = take_view_slice(payload, &mut cursor, 1)?[0] != 0;
-            let snippet = take_view_string(payload, &mut cursor)?;
-            let embed_text = take_view_bytes(payload, &mut cursor)?;
-            if let Some(digests) = text_digests.as_deref_mut() {
-                digests.push(blake3::hash(embed_text));
-            }
-            let vector_bytes = take_view_bytes(payload, &mut cursor)?;
-            if vector_bytes.len() % 4 != 0 {
-                return Err("semantic view vector has an invalid byte length".to_string());
-            }
-            // Collected straight into the shared slice: one allocation per
-            // vector, not a `Vec` that is then copied into an `Arc`.
-            let vector = vector_bytes
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
-                .collect::<Arc<[f32]>>();
-            validate_embedding_dimension(vector.len())?;
-            validate_finite_embedding(&vector)?;
-            match dimension {
-                None => dimension = Some(vector.len()),
-                Some(expected) if expected != vector.len() => {
-                    return Err("semantic view payload mixes vector dimensions".to_string());
-                }
-                Some(_) => {}
-            }
-            entries.push(EmbeddingEntry::new(
-                SemanticChunk {
-                    file: rel_path.to_path_buf(),
-                    name,
-                    qualified_name: (!qualified_name.is_empty()).then_some(qualified_name),
-                    kind,
-                    start_line,
-                    end_line,
-                    exported,
-                    embed_text: if retain_embed_text {
-                        std::str::from_utf8(embed_text)
-                            .map_err(|error| format!("invalid cached embedding text: {error}"))?
-                            .to_string()
-                    } else {
-                        String::new()
-                    },
-                    snippet,
-                },
-                vector,
-            ));
-        }
-        if cursor != payload.len() {
-            return Err("semantic view payload has trailing bytes".to_string());
-        }
-        Ok(Self {
-            entries,
-            provider_refused_chunks: 0,
-        })
-    }
-
-    /// Drops the embedded text after a fill stored this run, so a run a fill
-    /// installs holds exactly what a run decoded from the store holds.
-    pub(crate) fn strip_embed_text(&mut self) {
-        for entry in &mut self.entries {
-            entry.chunk.embed_text = String::new();
-        }
-    }
-
-    /// Each chunk's embedded text and vector, in run order. The text is empty
-    /// once [`Self::strip_embed_text`] ran or the run was decoded.
-    pub(crate) fn embedded_texts_and_vectors(&self) -> impl Iterator<Item = (&str, &Arc<[f32]>)> {
-        self.entries
-            .iter()
-            .map(|entry| (entry.chunk.embed_text.as_str(), &entry.vector))
-    }
-
-    /// The file key already binds these rows to unchanged source bytes. Keep
-    /// their exact metadata and vector slots, replacing only oversized summary
-    /// inputs; equal text in two symbol rows need not have equal float bytes.
-    pub(crate) fn into_summary_repair_chunks(
-        self,
-        caps: EmbedTextCaps,
-    ) -> (Vec<SemanticChunk>, Vec<Option<Arc<[f32]>>>) {
-        let budget = caps.total_chars.min(EmbedTextCaps::default().total_chars);
-        self.entries
-            .into_iter()
-            .map(|entry| {
-                let mut chunk = entry.chunk;
-                if chunk.kind == SymbolKind::FileSummary {
-                    let limited = truncate_chars(&chunk.embed_text, budget);
-                    if limited != chunk.embed_text {
-                        chunk.embed_text = limited;
-                        return (chunk, None);
-                    }
-                }
-                (chunk, Some(entry.vector))
-            })
-            .unzip()
-    }
-}
+impl SemanticVectors {}
 
 /// Chunks one checkout file for a view fill, from the very bytes whose hash
 /// names the work. It mirrors what a full build does for the same file, so a
@@ -11761,17 +10539,6 @@ pub(crate) fn chunk_view_file(
     bytes: &[u8],
     embed_text_caps: EmbedTextCaps,
 ) -> Result<Option<Vec<SemanticChunk>>, String> {
-    if let Some(job) = prepared_pause_job() {
-        let key = ViewCheckpointKey {
-            root: project_root.to_path_buf(),
-            file: rel_path.to_path_buf(),
-            content: crate::blob_store::v2::ContentHash::of(bytes),
-            caps: embed_text_caps,
-        };
-        if let Some(chunks) = job.borrow_mut().view_chunks.remove(&key) {
-            return Ok(chunks);
-        }
-    }
     chunk_view_file_uncached(project_root, rel_path, bytes, embed_text_caps)
 }
 
@@ -11806,148 +10573,6 @@ fn chunk_view_file_uncached(
     Ok(Some(chunks))
 }
 
-/// Embeds several files' chunks in shared batches of `max_batch_size` texts and
-/// returns one run per file, in input order. Rows the backend skips are dropped
-/// exactly as a full build drops them.
-#[cfg(test)]
-pub(crate) fn embed_view_files<F>(
-    files: Vec<Vec<SemanticChunk>>,
-    embed_fn: &mut F,
-    max_batch_size: usize,
-) -> Result<Vec<SemanticVectors>, String>
-where
-    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
-{
-    embed_view_files_with_rows(
-        files,
-        &mut |texts| execute_build_embedding_batch(texts, embed_fn),
-        max_batch_size,
-    )
-}
-
-/// Assembles the same canonical file runs from validated fresh or reused rows.
-#[cfg(test)]
-pub(crate) fn embed_view_files_with_rows<F>(
-    files: Vec<Vec<SemanticChunk>>,
-    rows_fn: &mut F,
-    max_batch_size: usize,
-) -> Result<Vec<SemanticVectors>, String>
-where
-    F: FnMut(Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
-{
-    embed_view_files_with_rows_at_offset(files, &mut |_, texts| rows_fn(texts), max_batch_size)
-}
-
-/// The offset is the checkpoint's flattened chunk cursor, including batches
-/// completed by an earlier attempt. Callers can align their reused-row slots
-/// without consuming the beginning of a resumed file twice.
-pub(crate) fn embed_view_files_with_rows_at_offset<F>(
-    files: Vec<Vec<SemanticChunk>>,
-    rows_fn: &mut F,
-    max_batch_size: usize,
-) -> Result<Vec<SemanticVectors>, String>
-where
-    F: FnMut(usize, Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
-{
-    let _refusal_run = EmbeddingRefusalRunScope::new();
-    let resume = prepared_pause_job()
-        .and_then(|job| job.borrow_mut().view.take())
-        .filter(|state| {
-            state.runs.len() == files.len()
-                && state
-                    .pending
-                    .iter()
-                    .map(|(file, chunk)| (*file, chunk))
-                    .eq(files
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(file, chunks)| chunks.iter().map(move |chunk| (file, chunk))))
-        });
-    let (mut runs, mut refused_files, pending, mut dimension, next_chunk) =
-        if let Some(state) = resume {
-            (
-                state.runs,
-                state.refused_files,
-                state.pending,
-                state.dimension,
-                state.next_chunk,
-            )
-        } else {
-            let refused_files = vec![0usize; files.len()];
-            let runs = files
-                .iter()
-                .map(|chunks| Vec::with_capacity(chunks.len()))
-                .collect::<Vec<Vec<EmbeddingEntry>>>();
-            let pending = files
-                .into_iter()
-                .enumerate()
-                .flat_map(|(file, chunks)| chunks.into_iter().map(move |chunk| (file, chunk)))
-                .collect::<Vec<_>>();
-            (runs, refused_files, pending, None, 0)
-        };
-    let batch_size = max_batch_size.max(1);
-    for batch_start in (next_chunk..pending.len()).step_by(batch_size) {
-        let batch = &pending[batch_start..(batch_start + batch_size).min(pending.len())];
-        let texts = batch
-            .iter()
-            .map(|(_, chunk)| chunk.embed_text.clone())
-            .collect();
-        let rows = match rows_fn(batch_start, texts) {
-            Ok(rows) => rows,
-            Err(error) => {
-                if let Some(job) = observe_lane_pause(&error) {
-                    checkpoint_work(0, 1, 0);
-                    job.borrow_mut().view = Some(ViewPauseCheckpoint {
-                        runs,
-                        refused_files,
-                        pending,
-                        next_chunk: batch_start,
-                        dimension,
-                    });
-                }
-                return Err(error);
-            }
-        };
-        for ((file, chunk), row) in batch.iter().zip(rows) {
-            let mut chunk = chunk.clone();
-            match row {
-                BuildEmbeddingRow::Embedded {
-                    embedded_text,
-                    vector,
-                } => {
-                    match dimension {
-                        None => dimension = Some(vector.len()),
-                        Some(expected) if expected != vector.len() => {
-                            return Err(format!(
-                                "embedding dimension changed during a view fill: expected {expected}, got {}",
-                                vector.len()
-                            ));
-                        }
-                        Some(_) => {}
-                    }
-                    chunk.embed_text = embedded_text;
-                    runs[*file].push(EmbeddingEntry::new(chunk, vector));
-                }
-                BuildEmbeddingRow::Skipped {
-                    embedded_text,
-                    reason,
-                } => {
-                    refused_files[*file] += usize::from(reason == PROVIDER_REFUSAL_REASON);
-                    log_skipped_row_warning(&chunk, &embedded_text, &reason);
-                }
-            }
-        }
-    }
-    Ok(runs
-        .into_iter()
-        .zip(refused_files)
-        .map(|(entries, provider_refused_chunks)| SemanticVectors {
-            entries,
-            provider_refused_chunks,
-        })
-        .collect())
-}
-
 /// The immutable semantic base of one view generation: the arena runs its
 /// manifest names, each holding chunk paths relative to the checkout. It is a
 /// `SharedSemanticBase` whose runs are shared with every other view naming
@@ -11958,35 +10583,6 @@ pub struct ViewSemanticBase {
 }
 
 impl ViewSemanticBase {
-    pub(crate) fn new(runs: Vec<Arc<SemanticVectors>>) -> Self {
-        let dimension = runs
-            .iter()
-            .find_map(|run| run.dimension())
-            .unwrap_or(DEFAULT_DIMENSION);
-        let entry_files = runs
-            .iter()
-            .flat_map(|run| run.entries.iter().map(|entry| entry.chunk.file.clone()))
-            .collect();
-        Self {
-            base: Arc::new(SharedSemanticBase {
-                memory_estimate: OnceLock::new(),
-                entry_count: runs.iter().map(|run| run.entries.len()).sum(),
-                segments: runs,
-                entry_files,
-                file_mtimes: HashMap::new(),
-                file_sizes: HashMap::new(),
-                any_missing_sizes: false,
-                file_hashes: HashMap::new(),
-                dimension,
-                fingerprint: None,
-                deferred_files: HashSet::new(),
-                summary_budget_limited: false,
-                skipped_rows: SkippedEmbeddingRows::default(),
-                persistence: Arc::new(Mutex::new(None)),
-            }),
-        }
-    }
-
     /// Chunks in the base, before any tombstone.
     pub fn chunk_count(&self) -> usize {
         self.base.entry_count
@@ -11995,32 +10591,6 @@ impl ViewSemanticBase {
     /// Runs the base references; each is also held by the family arena.
     pub fn runs(&self) -> &[Arc<SemanticVectors>] {
         &self.base.segments
-    }
-}
-
-impl SemanticIndex {
-    /// Reads a checkout through the overlay: `base` supplies the generation's
-    /// shared runs, `tombstones` (paths relative to `project_root`) hide the
-    /// base files that are superseded, deleted or no longer members, and
-    /// `replacements` are this checkout's own runs. Replacements are held by
-    /// `Arc`, like the base, so the overlay copies no entries: its private
-    /// memory is the tombstones and one handle per replaced file. Paths are
-    /// joined to `project_root` only when a result is built.
-    pub(crate) fn for_view(
-        project_root: PathBuf,
-        base: &ViewSemanticBase,
-        tombstones: HashSet<PathBuf>,
-        replacements: &[Arc<SemanticVectors>],
-    ) -> Self {
-        let mut index = Self::from_shared_base(project_root, Arc::clone(&base.base));
-        index.tombstones = tombstones;
-        index.view_runs = replacements.to_vec();
-        if base.base.entry_count == 0 {
-            if let Some(dimension) = replacements.iter().find_map(|run| run.dimension()) {
-                index.dimension = dimension;
-            }
-        }
-        index
     }
 }
 
@@ -12113,234 +10683,7 @@ fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
 }
 
 #[cfg(test)]
-pub(crate) use tests::saved_pre_budget_summary_fixture;
-
-#[cfg(test)]
 pub(crate) mod tests {
-    #[test]
-    fn v8_refused_chunks_and_header_identity_round_trip_preserves_append_scan() {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = project.path().canonicalize().unwrap();
-        let header = root.join("widget.h");
-        let refused_file = root.join("partial.rs");
-        fs::write(
-            &header,
-            "template <typename T>\nclass Widget {\npublic:\n    T value(T x) {\n        return x;\n    }\n};\n",
-        )
-        .unwrap();
-        write_rust_file(&refused_file, "retained");
-        let mut index = build_test_index(&root, &[header.clone(), refused_file.clone()]);
-        let fingerprint = SemanticIndexFingerprint::for_config_dimension(
-            &SemanticBackendConfig::default(),
-            index.dimension(),
-        );
-        index.set_fingerprint(fingerprint.clone());
-        let refused = BTreeMap::from([(refused_file, 2)]);
-        index.apply_refused_rows_update(refused.clone());
-        assert!(index.write_to_disk(storage.path(), "v8-header-refused"));
-
-        let data_path = storage
-            .path()
-            .join("semantic/v8-header-refused/semantic.bin");
-        let bytes = fs::read(&data_path).unwrap();
-        assert_eq!(bytes[0], SEMANTIC_INDEX_VERSION_V8);
-        let identity_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
-        let identity: serde_json::Value =
-            serde_json::from_slice(&bytes[13..13 + identity_len]).unwrap();
-        assert_eq!(identity["header_languages_resolved"], true);
-
-        let restored = SemanticIndex::read_from_disk(
-            storage.path(),
-            "v8-header-refused",
-            &root,
-            false,
-            Some(&fingerprint.as_string()),
-        )
-        .unwrap();
-        assert_eq!(restored.skipped_rows(), 2);
-        assert_eq!(restored.skipped_rows.refused, refused);
-        // Reading this marker must preserve the recorded freshness of resolved C++ headers.
-        assert!(restored.recorded_file_freshness(&header).is_some());
-        assert_eq!(restored.to_bytes(), bytes);
-
-        let layout = SemanticIndex::scan_artifact_for_append(
-            &data_path,
-            restored.persistence_snapshot().unwrap(),
-            &fingerprint.as_string(),
-            restored.dimension(),
-            false,
-        )
-        .expect("V8 append identity must ignore the stored header migration marker");
-        assert!(layout.bytes_read < bytes.len());
-    }
-
-    #[test]
-    fn h_header_marker_preserves_non_header_incremental_append_scan() {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let file = project.path().join("lib.rs");
-        write_rust_file(&file, "before_change");
-        let mut files = vec![file.clone()];
-        // Keep a one-file update below the background compaction threshold.
-        for ordinal in 1..16 {
-            let stable = project.path().join(format!("stable_{ordinal}.rs"));
-            write_rust_file(&stable, &format!("unchanged_{ordinal}"));
-            files.push(stable);
-        }
-        let mut index = build_test_index(project.path(), &files);
-        let fingerprint = SemanticIndexFingerprint::for_config_dimension(
-            &SemanticBackendConfig::default(),
-            index.dimension(),
-        );
-        index.set_fingerprint(fingerprint.clone());
-        assert!(index.write_to_disk(storage.path(), "header-marker-scan"));
-        let data_path = storage
-            .path()
-            .join("semantic/header-marker-scan/semantic.bin");
-        let before_bytes = fs::metadata(&data_path).unwrap().len() as usize;
-        assert!(
-            index
-                .append_scan_bytes_for_test(storage.path(), "header-marker-scan")
-                .unwrap()
-                < before_bytes
-        );
-        let mut incompatible = fingerprint.clone();
-        incompatible.model.push_str("-different");
-        assert!(SemanticIndex::scan_artifact_for_append(
-            &data_path,
-            index.persistence_snapshot().unwrap(),
-            &incompatible.as_string(),
-            index.dimension(),
-            false
-        )
-        .is_err());
-        assert!(SemanticIndex::scan_artifact_for_append(
-            &data_path,
-            index.persistence_snapshot().unwrap(),
-            &fingerprint.as_string(),
-            index.dimension(),
-            true
-        )
-        .is_err());
-        write_rust_file(&file, "after_change");
-        index
-            .refresh_stale_files(
-                project.path(),
-                &files,
-                &mut test_vector_for_texts,
-                8,
-                &mut |_, _| {},
-            )
-            .unwrap();
-        assert!(index.write_to_disk(storage.path(), "header-marker-scan"));
-        assert!(
-            index.last_append_read_bytes_for_test() < before_bytes,
-            "a non-header refresh must use the bounded append scan, not structural fallback"
-        );
-        assert_eq!(index.persistence_snapshot().unwrap().segment_count, 1);
-        assert!(index
-            .append_scan_bytes_for_test(storage.path(), "header-marker-scan")
-            .is_some());
-    }
-
-    #[test]
-    fn h_header_invalidation_legacy_semantic_reembeds_only_changed_headers_once() {
-        let root = tempfile::tempdir().unwrap();
-        let files = [
-            root.path().join("plain.h"),
-            root.path().join("widget.h"),
-            root.path().join("lib.rs"),
-        ];
-        fs::write(&files[0], "int plain(void);\n").unwrap();
-        fs::write(&files[1], "template <typename T>\nclass Widget {\npublic:\n    T value(T x) {\n        return x;\n    }\n};\n").unwrap();
-        fs::write(&files[2], "pub fn untouched() {\n    let x = 1;\n}\n").unwrap();
-        let mut index = build_test_index(root.path(), &files);
-        index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
-            &SemanticBackendConfig::default(),
-            index.dimension(),
-        ));
-        let fingerprint = index.fingerprint().unwrap().as_string();
-        let preserved = |index: &SemanticIndex| {
-            index
-                .entry_vectors_for_test()
-                .into_iter()
-                .filter(|(file, _, _)| file != &files[1])
-                .map(|(file, name, vector)| ((file, name), vector))
-                .collect::<std::collections::BTreeMap<_, _>>()
-        };
-        let before = preserved(&index);
-        let mut bytes = index.to_bytes();
-        let length = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
-        let mut identity: serde_json::Value =
-            serde_json::from_slice(&bytes[13..13 + length]).unwrap();
-        identity
-            .as_object_mut()
-            .unwrap()
-            .remove("header_languages_resolved");
-        let identity = serde_json::to_vec(&identity).unwrap();
-        bytes.splice(13..13 + length, identity.iter().copied());
-        bytes[9..13].copy_from_slice(&(identity.len() as u32).to_le_bytes());
-        let mut loaded = SemanticIndex::from_bytes(&bytes, root.path()).unwrap();
-        assert_eq!(preserved(&loaded), before);
-        assert_eq!(loaded.fingerprint().unwrap().as_string(), fingerprint);
-        assert!(loaded.recorded_file_freshness(&files[1]).is_none());
-        assert!(loaded.recorded_file_freshness(&files[0]).is_some());
-        let mut embedded = Vec::new();
-        loaded
-            .refresh_stale_files(
-                root.path(),
-                &files,
-                &mut |texts: Vec<String>| {
-                    embedded.extend(texts.clone());
-                    test_vector_for_texts(texts)
-                },
-                8,
-                &mut |_, _| {},
-            )
-            .unwrap();
-        assert!(!embedded.is_empty());
-        assert!(
-            embedded.iter().all(|text| text.contains("widget.h")),
-            "{embedded:?}"
-        );
-        assert_eq!(preserved(&loaded), before);
-        let mut current = SemanticIndex::from_bytes(&loaded.to_bytes(), root.path()).unwrap();
-        assert_eq!(current.fingerprint().unwrap().as_string(), fingerprint);
-        let summary = current
-            .refresh_stale_files(
-                root.path(),
-                &files,
-                &mut |_| panic!("current artifacts must not re-embed"),
-                8,
-                &mut |_, _| {},
-            )
-            .unwrap();
-        assert!(summary.is_noop());
-    }
-
-    #[test]
-    fn h_header_invalidation_keeps_main_semantic_fingerprint() {
-        let config = SemanticBackendConfig {
-            backend: SemanticBackend::OpenAiCompatible,
-            model: "fixture-model".to_string(),
-            base_url: Some("https://example.invalid/v1".to_string()),
-            ..SemanticBackendConfig::default()
-        };
-        let current = SemanticIndexFingerprint::for_config_dimension(&config, 3);
-        let main = SemanticIndexFingerprint {
-            backend: "openai_compatible".to_string(),
-            model: "fixture-model".to_string(),
-            base_url: "https://example.invalid/v1".to_string(),
-            dimension: 3,
-            chunking_version: 2,
-            embed_text_caps: EmbedTextCaps::default(),
-            synapse_fingerprint: None,
-            synapse_table_epoch: None,
-            synapse_equivalent_to: Vec::new(),
-        };
-        assert_eq!(current.as_string().as_bytes(), main.as_string().as_bytes());
-    }
 
     #[test]
     fn h_header_view_chunking_uses_snapshot_language() {
@@ -12361,849 +10704,6 @@ pub(crate) mod tests {
             "{chunks:?}"
         );
         assert!(!chunks.iter().any(|chunk| chunk.name == "old_c_symbol"));
-    }
-
-    fn no_pause_checkpoint_fixture(
-        files: usize,
-        symbols: usize,
-        dimension: usize,
-    ) -> (usize, CheckpointWork, u128) {
-        let root = tempfile::tempdir().unwrap();
-        let mut paths = Vec::new();
-        for file in 0..files {
-            let path = root.path().join(format!("fixture_{file}.rs"));
-            let source = (0..symbols).map(|symbol| format!(
-                "/// Deterministic cold-build RSS fixture, file {file}, symbol {symbol}.\npub fn item_{file}_{symbol}(value: u64) -> u64 {{ value.wrapping_add({symbol}) }}\n"
-            )).collect::<String>();
-            fs::write(&path, source).unwrap();
-            paths.push(path);
-        }
-        let start = Instant::now();
-        let (index, work) = with_checkpoint_work(|| {
-            let _policy =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            retry_lane_pause(|| {
-                SemanticIndex::build(
-                    root.path(),
-                    &paths,
-                    &mut |texts: Vec<String>| Ok(vec![vec![0.25; dimension]; texts.len()]),
-                    128,
-                )
-            })
-            .unwrap()
-        });
-        let elapsed = start.elapsed().as_millis();
-        (index.len(), work, elapsed)
-    }
-
-    #[test]
-    fn normal_cold_build_has_zero_checkpoint_work() {
-        let (chunks, work, _) = no_pause_checkpoint_fixture(3, 10, 16);
-        assert_eq!(chunks, 30);
-        assert_eq!(
-            work,
-            CheckpointWork::default(),
-            "a normal build allocated or copied pause checkpoints"
-        );
-    }
-
-    #[test]
-    fn normal_semantic_retry_preserves_reconnect_grace_before_any_pause() {
-        let root = tempfile::tempdir().unwrap();
-        let file = root.path().join("grace.rs");
-        fs::write(&file, "/// First value.\npub fn first(x: u64) -> u64 { x + 1 }\n/// Second value.\npub fn second(x: u64) -> u64 { x + 2 }\n").unwrap();
-        let ctx = Arc::new(crate::context::AppContext::new(
-            crate::context::default_language_provider_factory(),
-            crate::config::Config::default(),
-        ));
-        ctx.set_unbound_build_abandon_grace_for_test(Duration::from_secs(300));
-        ctx.mark_subc_unbound();
-        let grace = ctx.subc_lifecycle_admission();
-        let strict = grace.clone();
-        let strict_checks = Arc::new(AtomicUsize::new(0));
-        let checks = strict_checks.clone();
-        let (index, work) = with_checkpoint_work(|| {
-            let _policy = PauseRetryScope::new(
-                Duration::from_secs(15),
-                Duration::from_secs(60),
-                move || !grace.unbound_past_grace(),
-            )
-            .with_pause_current(move || {
-                checks.fetch_add(1, Ordering::SeqCst);
-                strict.is_bound()
-            });
-            retry_lane_pause(|| {
-                SemanticIndex::build(
-                    root.path(),
-                    std::slice::from_ref(&file),
-                    &mut |texts: Vec<String>| Ok(vec![vec![1.0, 0.0]; texts.len()]),
-                    1,
-                )
-            })
-            .unwrap()
-        });
-        assert!(index.len() > 0);
-        assert_eq!(
-            strict_checks.load(Ordering::SeqCst),
-            0,
-            "normal indexing used the pause-only immediate-unbind rule"
-        );
-        assert_eq!(work, CheckpointWork::default());
-        ctx.mark_subc_bound();
-    }
-
-    #[test]
-    fn lane_paused_owned_cursors_resume_after_completed_batches() {
-        use crate::synapse_embed::pause_test_support::*;
-        for refresh in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let file = root.path().join("cursor.rs");
-            fs::write(
-                &file,
-                "/// First.\npub fn first(x: u64) -> u64 { x + 1 }\n/// Second.\npub fn second(x: u64) -> u64 { x + 2 }\n/// Third.\npub fn third(x: u64) -> u64 { x + 3 }\n",
-            )
-            .unwrap();
-            let mut initial = if refresh {
-                let index = SemanticIndex::build(
-                    root.path(),
-                    std::slice::from_ref(&file),
-                    &mut |texts: Vec<String>| Ok(vec![vec![0.0, 1.0]; texts.len()]),
-                    1,
-                )
-                .unwrap();
-                fs::write(&file, "/// First.\npub fn first(x: u64) -> u64 { x + 4 }\n/// Second.\npub fn second(x: u64) -> u64 { x + 5 }\n/// Third.\npub fn third(x: u64) -> u64 { x + 6 }\n").unwrap();
-                Some(index)
-            } else {
-                None
-            };
-            with_lane_pause_clock(START, |clock| {
-                let _policy =
-                    PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-                let mut inputs = Vec::new();
-                let mut embed = |texts: Vec<String>| {
-                    inputs.extend(texts.clone());
-                    if inputs.len() == 2 && clock.load(Ordering::SeqCst) == START {
-                        Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(
-                            crate::synapse_embed::LanePause {
-                                lane_id: MODEL.into(),
-                                fingerprint: Some("pinned".into()),
-                                retry_after_ms: Some(PAUSE_MS),
-                                paused_until_ms: START + PAUSE_MS,
-                                reason: "maintenance".into(),
-                                cause: Default::default(),
-                                safe_to_retry_same_request: true,
-                                record_id: 0,
-                            },
-                        )
-                        .to_string())
-                    } else {
-                        Ok(vec![vec![1.0, 0.0]; texts.len()])
-                    }
-                };
-                let before = lane_pause_chunk_calls();
-                if refresh {
-                    let mut index = initial.take().unwrap();
-                    let result = retry_lane_pause(|| {
-                        index.refresh_invalidated_files(
-                            root.path(),
-                            std::slice::from_ref(&file),
-                            &mut embed,
-                            1,
-                            100,
-                            &mut |_, _| {},
-                        )
-                    })
-                    .unwrap();
-                    assert_eq!(result.added_entries.len(), 3);
-                } else {
-                    let index = retry_lane_pause(|| {
-                        SemanticIndex::build(
-                            root.path(),
-                            std::slice::from_ref(&file),
-                            &mut embed,
-                            1,
-                        )
-                    })
-                    .unwrap();
-                    assert_eq!(index.len(), 3);
-                }
-                assert_eq!(inputs.len(), 4, "resume re-embedded a completed batch");
-                assert_eq!(inputs[1], inputs[2]);
-                assert_ne!(inputs[0], inputs[2]);
-                assert_eq!(lane_pause_chunk_calls() - before, 1);
-            });
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "manual no-pause cold-build peak RSS measurement"]
-    fn profile_no_pause_cold_build_peak_rss() {
-        let (chunks, work, elapsed_ms) = no_pause_checkpoint_fixture(100, 40, 1024);
-        assert_eq!(chunks, 4_000);
-        let status = fs::read_to_string("/proc/self/status").unwrap();
-        let peak_kib = status
-            .lines()
-            .find(|line| line.starts_with("VmHWM:"))
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        println!("NO_PAUSE_COLD_RSS chunks={chunks} dimension=1024 peak_kib={peak_kib} elapsed_ms={elapsed_ms} checkpoint_allocations={} checkpoint_inserts={} checkpoint_clones={}",
-            work.allocations, work.inserts, work.clones);
-    }
-
-    #[test]
-    fn lane_paused_cold_build_waits_without_rechunking_and_resumes() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            let _policy =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            with_fake_synapse(clock.clone(), None, |config, requests| {
-                let directory = tempfile::tempdir().unwrap();
-                let file = directory.path().join("pause.ts");
-                fs::write(&file, "export function keyword() { return 1; }\n").unwrap();
-                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                let before = lane_pause_chunk_calls();
-                let mut attempts = Vec::new();
-                let mut embed = |texts: Vec<String>| {
-                    attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
-                    model.embed(texts)
-                };
-                let walks = std::cell::Cell::new(0);
-                let index = retry_lane_pause(|| {
-                    let files = pause_job_files(directory.path(), || {
-                        walks.set(walks.get() + 1);
-                        Ok(fs::read_dir(directory.path())
-                            .unwrap()
-                            .map(|entry| entry.unwrap().path())
-                            .filter(|path| path.is_file())
-                            .collect())
-                    })
-                    .map_err(|_| "corpus walk failed".to_string())?;
-                    SemanticIndex::build_with_progress_and_cancellation_caps(
-                        directory.path(),
-                        &files,
-                        &mut embed,
-                        100,
-                        EmbedTextCaps::default(),
-                        &mut |_, _| {},
-                        &mut || true,
-                    )
-                })
-                .unwrap();
-                assert!(index.len() > 0);
-                assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
-                assert_eq!(lane_pause_chunk_calls() - before, 1);
-                assert_eq!(walks.get(), 1);
-                assert_eq!(
-                    requests
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(_, request)| request["method"] == "embed.batch")
-                        .count(),
-                    2
-                );
-                assert!(embedding_backend_build_health(directory.path()).is_none());
-            });
-        });
-    }
-
-    #[test]
-    fn lane_paused_invalid_hint_uses_backoff_without_hot_loop() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            let _policy =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            with_fake_synapse(
-                clock.clone(),
-                Some(serde_json::json!(
-                    crate::synapse_embed::MAX_LANE_PAUSE_MS + 1
-                )),
-                |config, requests| {
-                    let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                    let rows = retry_lane_pause(|| {
-                        execute_build_embedding_batch(vec!["keyword".into()], &mut |texts| {
-                            model.embed(texts)
-                        })
-                    })
-                    .unwrap();
-                    assert_eq!(rows.len(), 1);
-                    let times = requests
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(_, request)| request["method"] == "embed.batch")
-                        .map(|(now, _)| *now - START)
-                        .collect::<Vec<_>>();
-                    assert_eq!(&times[..4], &[0, 15_000, 45_000, 105_000]);
-                    assert_eq!(
-                        times.len(),
-                        48,
-                        "45 minutes must not spin or hit a retry limit"
-                    );
-                    assert_eq!(times.last(), Some(&2_745_000));
-                },
-            );
-        });
-    }
-
-    #[test]
-    fn lane_paused_wait_uses_maximum_of_hint_and_worker_backoff() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            let _scope =
-                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
-            let mut attempts = Vec::new();
-            let result = retry_lane_pause(|| {
-                attempts.push(unix_millis_now());
-                if attempts.len() == 4 {
-                    return Ok(4);
-                }
-                let reply = pause_reply(serde_json::json!(1_000));
-                let pause = crate::synapse_embed::LanePause {
-                    lane_id: MODEL.into(),
-                    fingerprint: Some("pinned".into()),
-                    retry_after_ms: Some(1_000),
-                    paused_until_ms: reply["error"]["details"]["paused_until_ms"]
-                        .as_u64()
-                        .unwrap(),
-                    reason: "maintenance".into(),
-                    cause: Default::default(),
-                    safe_to_retry_same_request: true,
-                    record_id: 0,
-                };
-                Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(pause).to_string())
-            });
-            assert_eq!(result, Ok(4));
-            assert_eq!(
-                attempts,
-                vec![START, START + 5_000, START + 15_000, START + 35_000]
-            );
-            assert_eq!(
-                clock.load(std::sync::atomic::Ordering::SeqCst),
-                START + 35_000
-            );
-        });
-    }
-
-    #[test]
-    fn lane_paused_live_refresh_retains_prepared_chunks_until_resume() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            let _policy =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            with_fake_synapse(clock, None, |config, requests| {
-                let directory = tempfile::tempdir().unwrap();
-                let file = directory.path().join("live.ts");
-                fs::write(&file, "export function keyword() { return 2; }\n").unwrap();
-                let mut index = SemanticIndex::new(directory.path().to_path_buf(), 2);
-                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                let before = lane_pause_chunk_calls();
-                let mut attempts = Vec::new();
-                let refresh = retry_lane_pause(|| {
-                    index.refresh_invalidated_files(
-                        directory.path(),
-                        std::slice::from_ref(&file),
-                        &mut |texts| {
-                            attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
-                            model.embed(texts)
-                        },
-                        100,
-                        100,
-                        &mut |_, _| {},
-                    )
-                })
-                .unwrap();
-                assert!(!refresh.added_entries.is_empty());
-                assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
-                assert_eq!(requests.lock().unwrap().len(), 3);
-            });
-        });
-    }
-
-    /// Builds a one-file index the way the legacy cold build does: a retry
-    /// loop around the corpus walk and the build, embedding through `model`.
-    /// Returns the index, each embedding attempt's test-clock time, and how
-    /// often the corpus was walked.
-    fn build_one_file_index_through_pause_retry(
-        directory: &Path,
-        model: &mut SemanticEmbeddingModel,
-    ) -> (Result<SemanticIndex, String>, Vec<u64>, usize) {
-        let file = directory.join("compile.ts");
-        fs::write(&file, "export function keyword() { return 1; }\n").unwrap();
-        let mut attempts = Vec::new();
-        let mut embed = |texts: Vec<String>| {
-            attempts.push(unix_millis_now());
-            model.embed(texts)
-        };
-        let walks = std::cell::Cell::new(0);
-        let index = retry_lane_pause(|| {
-            let files = pause_job_files(directory, || {
-                walks.set(walks.get() + 1);
-                Ok(vec![file.clone()])
-            })
-            .map_err(|_| "corpus walk failed".to_string())?;
-            SemanticIndex::build_with_progress_and_cancellation_caps(
-                directory,
-                &files,
-                &mut embed,
-                100,
-                EmbedTextCaps::default(),
-                &mut |_, _| {},
-                &mut || true,
-            )
-        });
-        (index, attempts, walks.get())
-    }
-
-    /// Synapse answers `shape_compiling` (the pinned fixture carries
-    /// `retry_after_ms: 1000`; this fake compiles for one second) whenever
-    /// a request blocks on a cold compile past its deadline (after a restart,
-    /// an OS update, or a long input reaching an unused width). The legacy
-    /// cold build must treat that as a wait, not as the failure that clears
-    /// the semantic index and its status.
-    #[test]
-    fn shape_compiling_cold_build_waits_out_the_compile_and_resumes() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            let _policy =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            with_compiling_synapse(clock.clone(), 1_000, |config, requests| {
-                let directory = tempfile::tempdir().unwrap();
-                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                let before = lane_pause_chunk_calls();
-                let (index, attempts, walks) =
-                    build_one_file_index_through_pause_retry(directory.path(), &mut model);
-                let index = index.expect("a compiling model must not fail the build");
-                assert!(index.len() > 0);
-                // The one-second hint is shorter than the worker's backoff.
-                assert_eq!(attempts, vec![START, START + 15_000]);
-                assert_eq!(lane_pause_chunk_calls() - before, 1, "the retry re-chunked");
-                assert_eq!(walks, 1, "the retry walked the corpus again");
-                let batches = requests
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(_, request)| request["method"] == "embed.batch")
-                    .count();
-                assert_eq!(batches, 2);
-                assert!(embedding_backend_build_health(directory.path()).is_none());
-            });
-        });
-    }
-
-    /// Where no worker may wait (an executor job), the refusal comes back as
-    /// an error the legacy build loop retries instead of publishing `Failed`.
-    #[test]
-    fn shape_compiling_error_is_a_pause_the_legacy_build_retries() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            with_compiling_synapse(clock.clone(), 1_000, |config, _requests| {
-                let directory = tempfile::tempdir().unwrap();
-                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                let (index, attempts, _) =
-                    build_one_file_index_through_pause_retry(directory.path(), &mut model);
-                let error = index.err().expect("no policy, so no wait and no retry");
-                assert_eq!(attempts, vec![START]);
-                let pause = crate::synapse_embed::LanePause::from_error(&error)
-                    .unwrap_or_else(|| panic!("not a pause: {error}"));
-                assert_eq!(pause.retry_after_ms, Some(1_000));
-                assert!(embedding_failure_is_transient(&error), "{error}");
-                assert_eq!(
-                    crate::synapse_embed::lane_pause_for_root(
-                        config.route_project_root.as_deref().unwrap()
-                    )
-                    .map(|pause| pause.paused_until_ms),
-                    Some(START + 1_000)
-                );
-            });
-        });
-    }
-
-    /// A compile longer than the worker's backoff is waited out for the
-    /// hinted time, and status shows the warm-up and when it ends meanwhile.
-    #[test]
-    fn shape_compiling_wait_honours_a_hint_longer_than_the_backoff() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            let _policy =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            with_compiling_synapse(clock.clone(), 90_000, |config, _requests| {
-                let root = config.route_project_root.clone().unwrap();
-                let waits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-                let seen = std::rc::Rc::clone(&waits);
-                let hook_clock = clock.clone();
-                let directory = tempfile::tempdir().unwrap();
-                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                let (index, attempts, _) = with_lane_pause_wait_hook(
-                    move |delay| {
-                        let pause = crate::synapse_embed::lane_pause_for_root(&root).unwrap();
-                        seen.borrow_mut()
-                            .push((delay, pause.paused_until_ms, pause.reason));
-                        hook_clock.fetch_add(
-                            delay.as_millis() as u64,
-                            std::sync::atomic::Ordering::SeqCst,
-                        );
-                    },
-                    || build_one_file_index_through_pause_retry(directory.path(), &mut model),
-                );
-                assert!(index.unwrap().len() > 0);
-                assert_eq!(attempts, vec![START, START + 90_000]);
-                assert_eq!(
-                    *waits.borrow(),
-                    vec![(
-                        Duration::from_secs(90),
-                        START + 90_000,
-                        "shape_compiling: …".to_string()
-                    )]
-                );
-            });
-        });
-    }
-
-    /// An unhinted warm-up waits the worker's backoff, and status shows that
-    /// wait's end rather than a pause that already ended.
-    #[test]
-    fn unhinted_warm_up_status_shows_when_the_backoff_retry_runs() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            let _policy =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            let reply = serde_json::json!({"result": {"error": {
-                "class": "transient", "code": "model_loading", "message": "loading",
-            }}});
-            with_fake_synapse_refusing(
-                clock.clone(),
-                START + 1,
-                move |_| reply.clone(),
-                |config, _requests| {
-                    let root = config.route_project_root.clone().unwrap();
-                    let ends = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-                    let seen = std::rc::Rc::clone(&ends);
-                    let hook_clock = clock.clone();
-                    let directory = tempfile::tempdir().unwrap();
-                    let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                    let (index, attempts, _) = with_lane_pause_wait_hook(
-                        move |delay| {
-                            seen.borrow_mut().push(
-                                crate::synapse_embed::lane_pause_for_root(&root)
-                                    .map(|pause| pause.paused_until_ms),
-                            );
-                            hook_clock.fetch_add(
-                                delay.as_millis() as u64,
-                                std::sync::atomic::Ordering::SeqCst,
-                            );
-                        },
-                        || build_one_file_index_through_pause_retry(directory.path(), &mut model),
-                    );
-                    assert!(index.unwrap().len() > 0);
-                    assert_eq!(attempts, vec![START, START + 15_000]);
-                    assert_eq!(*ends.borrow(), vec![Some(START + 15_000)]);
-                },
-            );
-        });
-    }
-
-    /// A live refresh refused while the model compiles keeps the served
-    /// index and resumes the same chunks after the hint.
-    #[test]
-    fn shape_compiling_live_refresh_keeps_its_index_and_resumes() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |clock| {
-            let _policy =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            with_compiling_synapse(clock, 90_000, |config, requests| {
-                let directory = tempfile::tempdir().unwrap();
-                let file = directory.path().join("live.ts");
-                fs::write(&file, "export function keyword() { return 2; }\n").unwrap();
-                let mut index = SemanticIndex::new(directory.path().to_path_buf(), 2);
-                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                let before = lane_pause_chunk_calls();
-                let mut attempts = Vec::new();
-                let refresh = retry_lane_pause(|| {
-                    index.refresh_invalidated_files(
-                        directory.path(),
-                        std::slice::from_ref(&file),
-                        &mut |texts| {
-                            attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
-                            model.embed(texts)
-                        },
-                        100,
-                        100,
-                        &mut |_, _| {},
-                    )
-                })
-                .unwrap();
-                assert!(!refresh.added_entries.is_empty());
-                assert_eq!(attempts, vec![(START, 1), (START + 90_000, 1)]);
-                assert_eq!(requests.lock().unwrap().len(), 3);
-            });
-        });
-    }
-
-    /// An unbind while a background thread waits out a compile ends the
-    /// wait without another embedding request.
-    #[test]
-    fn shape_compiling_wait_on_a_background_thread_is_interrupted_by_unbind() {
-        use crate::synapse_embed::pause_test_support::*;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let handle = std::thread::spawn(|| {
-            with_lane_pause_clock(START, |clock| {
-                with_compiling_synapse(clock, 90_000, |config, requests| {
-                    let bound = Arc::new(AtomicBool::new(true));
-                    let strict = Arc::clone(&bound);
-                    let _policy = PauseRetryScope::new(
-                        Duration::from_secs(15),
-                        Duration::from_secs(60),
-                        || true,
-                    )
-                    .with_pause_current(move || strict.load(Ordering::SeqCst));
-                    let directory = tempfile::tempdir().unwrap();
-                    let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                    let (index, attempts, _) = with_lane_pause_wait_hook(
-                        move |_| bound.store(false, Ordering::SeqCst),
-                        || build_one_file_index_through_pause_retry(directory.path(), &mut model),
-                    );
-                    let batches = requests
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(_, request)| request["method"] == "embed.batch")
-                        .count();
-                    (index.err(), attempts, batches)
-                })
-            })
-        });
-        let (error, attempts, batches) = handle.join().unwrap();
-        assert_eq!(error.as_deref(), Some("semantic lane superseded"));
-        assert_eq!(attempts, vec![START]);
-        assert_eq!(batches, 1);
-    }
-
-    #[test]
-    fn lane_paused_refresh_drops_files_deleted_before_retry() {
-        use crate::synapse_embed::pause_test_support::*;
-        let root = tempfile::tempdir().unwrap();
-        let kept = root.path().join("a_kept.rs");
-        let deleted = root.path().join("b_deleted.rs");
-        let source = |tag: &str| {
-            format!("/// First {tag}.\npub fn first_{tag}(x: u64) -> u64 {{ x + 1 }}\n/// Second {tag}.\npub fn second_{tag}(x: u64) -> u64 {{ x + 2 }}\n")
-        };
-        fs::write(&kept, source("kept")).unwrap();
-        fs::write(&deleted, source("gone")).unwrap();
-        let files = vec![kept.clone(), deleted.clone()];
-        let mut worker = SemanticIndex::build(
-            root.path(),
-            &files,
-            &mut |texts: Vec<String>| Ok(vec![vec![0.0, 1.0]; texts.len()]),
-            1,
-        )
-        .unwrap();
-        // `worker` is the refresh worker's copy; `serving` stands for the index
-        // searches read, which receives the refresh result through
-        // `apply_refresh_update` exactly as the completion drain hands it over.
-        let mut serving = worker.clone();
-        // Both files change, so the refresh embeds every chunk again.
-        fs::write(&kept, source("kept_edit")).unwrap();
-        fs::write(&deleted, source("gone_edit")).unwrap();
-        let _policy =
-            PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-        let removed = deleted.clone();
-        let mut inputs: Vec<String> = Vec::new();
-        let mut paused_at = None;
-        let update = with_lane_pause_wait_hook(
-            // The file disappears while the lane is paused.
-            move |_| fs::remove_file(&removed).unwrap(),
-            || {
-                retry_lane_pause(|| {
-                    worker.refresh_invalidated_files(
-                        root.path(),
-                        &files,
-                        &mut |texts: Vec<String>| {
-                            // Pause once, on a batch of the deleted file after
-                            // one of its batches already finished, so the saved
-                            // checkpoint holds finished rows of that file.
-                            let finished_deleted =
-                                inputs.iter().any(|text| text.contains("gone_edit"));
-                            let batch_deleted = texts.iter().any(|text| text.contains("gone_edit"));
-                            if paused_at.is_none() && finished_deleted && batch_deleted {
-                                paused_at = Some(inputs.len());
-                                return Err(
-                                    crate::synapse_embed::SynapseEmbeddingError::LanePaused(
-                                        crate::synapse_embed::LanePause {
-                                            lane_id: MODEL.into(),
-                                            fingerprint: Some("pinned".into()),
-                                            retry_after_ms: Some(PAUSE_MS),
-                                            paused_until_ms: START + PAUSE_MS,
-                                            reason: "maintenance".into(),
-                                            cause: Default::default(),
-                                            safe_to_retry_same_request: true,
-                                            record_id: 0,
-                                        },
-                                    )
-                                    .to_string(),
-                                );
-                            }
-                            inputs.extend(texts.clone());
-                            Ok(vec![vec![1.0, 0.0]; texts.len()])
-                        },
-                        1,
-                        100,
-                        &mut |_, _| {},
-                    )
-                })
-            },
-        )
-        .unwrap();
-        assert!(!deleted.exists());
-        assert!(paused_at.is_some(), "the refresh never paused: {inputs:?}");
-        assert_eq!(
-            Some(inputs.len()),
-            paused_at,
-            "the retry embedded again: {inputs:?}"
-        );
-        assert!(
-            update
-                .added_entries
-                .iter()
-                .all(|entry| entry.file() == kept),
-            "the retry kept rows of a file deleted during the pause"
-        );
-        assert_eq!(
-            update.added_entries.len(),
-            3,
-            "{:?}",
-            update
-                .added_entries
-                .iter()
-                .map(|entry| (entry.file().to_path_buf(), entry.chunk.name.clone()))
-                .collect::<Vec<_>>()
-        );
-        serving.apply_refresh_update(
-            update.added_entries,
-            update.updated_metadata,
-            &update.completed_paths,
-        );
-        for index in [&serving, &worker] {
-            let results = index.search(&[1.0, 0.0], 100);
-            assert!(
-                results.iter().all(|result| result.file != deleted),
-                "deleted file came back: {results:?}"
-            );
-            assert!(results.iter().any(|result| result.file == kept));
-        }
-        assert!(serving.recorded_file_freshness(&deleted).is_none());
-    }
-
-    #[test]
-    fn lane_paused_wait_is_cancelled_when_worker_is_superseded() {
-        use crate::synapse_embed::pause_test_support::*;
-        with_lane_pause_clock(START, |_clock| {
-            let _scope =
-                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || false);
-            let mut attempts = 0;
-            let result: Result<(), String> = retry_lane_pause(|| {
-                attempts += 1;
-                Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(
-                    crate::synapse_embed::LanePause {
-                        lane_id: MODEL.into(),
-                        fingerprint: Some("pinned".into()),
-                        retry_after_ms: Some(PAUSE_MS),
-                        paused_until_ms: START + PAUSE_MS,
-                        reason: "maintenance".into(),
-                        cause: Default::default(),
-                        safe_to_retry_same_request: true,
-                        record_id: 0,
-                    },
-                )
-                .to_string())
-            });
-            assert_eq!(attempts, 0);
-            assert_eq!(result.unwrap_err(), "semantic lane superseded");
-        });
-    }
-
-    #[test]
-    fn lane_paused_cold_job_stops_on_quiesce_or_own_cancellation() {
-        use crate::synapse_embed::pause_test_support::*;
-        for quiesce in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let file = root.path().join("cancel.rs");
-            fs::write(&file, "pub fn cancelled() {}\n").unwrap();
-            let ctx = Arc::new(crate::context::AppContext::new(
-                crate::context::default_language_provider_factory(),
-                crate::config::Config::default(),
-            ));
-            let lifecycle = ctx.subc_lifecycle_admission();
-            let grace = lifecycle.clone();
-            let own = Arc::new(AtomicBool::new(true));
-            let checks = Arc::new(AtomicUsize::new(0));
-            let at_cancel = Arc::new(AtomicUsize::new(0));
-            let _policy = PauseRetryScope::new(
-                Duration::from_secs(15),
-                Duration::from_secs(60),
-                move || !grace.unbound_past_grace(),
-            )
-            .with_pause_current(move || lifecycle.is_bound());
-            with_lane_pause_clock(START, |clock| {
-                let own_cancel = own.clone();
-                let checks_hook = checks.clone();
-                let at_cancel_hook = at_cancel.clone();
-                let ctx_hook = ctx.clone();
-                with_lane_pause_wait_hook(
-                    move |_| {
-                        at_cancel_hook.store(checks_hook.load(Ordering::SeqCst), Ordering::SeqCst);
-                        if quiesce {
-                            ctx_hook.mark_subc_unbound();
-                        } else {
-                            own_cancel.store(false, Ordering::SeqCst);
-                        }
-                    },
-                    || {
-                        let calls = std::cell::Cell::new(0);
-                        let result = retry_lane_pause_while(
-                            || {
-                                SemanticIndex::build_with_progress_and_cancellation_caps(
-                                    root.path(),
-                                    std::slice::from_ref(&file),
-                                    &mut |_| {
-                                        calls.set(calls.get() + 1);
-                                        assert_eq!(
-                                            calls.get(),
-                                            1,
-                                            "a quiesced paused build attempted more embedding work"
-                                        );
-                                        Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(crate::synapse_embed::LanePause {
-                                lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
-                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(), cause: Default::default(), safe_to_retry_same_request: true, record_id: 0,
-                            }).to_string())
-                                    },
-                                    100,
-                                    EmbedTextCaps::default(),
-                                    &mut |_, _| {},
-                                    &mut || own.load(Ordering::SeqCst),
-                                )
-                            },
-                            &mut || {
-                                checks.fetch_add(1, Ordering::SeqCst);
-                                own.load(Ordering::SeqCst)
-                            },
-                        );
-                        assert_eq!(result.err().as_deref(), Some("semantic lane superseded"));
-                        assert_eq!(
-                            checks.load(Ordering::SeqCst),
-                            at_cancel.load(Ordering::SeqCst) + 1
-                        );
-                        assert_eq!(calls.get(), 1, "a cancelled paused build did more indexing");
-                        assert_eq!(clock.load(Ordering::SeqCst), START);
-                    },
-                );
-            });
-        }
     }
 
     #[test]
@@ -14725,404 +12225,6 @@ Connection: close
         );
     }
 
-    #[test]
-    #[ignore = "large-base serving-lock benchmark"]
-    fn revision_new_file_batch_has_bounded_serving_lock_time() {
-        let root = test_project_root();
-        let mut private = SemanticIndex::new(root.clone(), 2);
-        add_invalidation_fixture_entry(&mut private, root.join("entry_only.rs"), 0);
-        let row = private.entries.pop().unwrap();
-        private.entries = vec![row; 1_000_000];
-        private.file_mtimes.clear();
-        private.file_sizes.clear();
-        private.file_hashes.clear();
-        let base = Arc::new(private.into_shared_base().unwrap());
-        let mut serving = SemanticIndex::from_shared_base(root.clone(), base);
-        let added = (0..512)
-            .map(|i| root.join(format!("new_{i}.rs")))
-            .collect::<Vec<_>>();
-        let start = Instant::now();
-        serving.invalidate_files(&added);
-        let elapsed = start.elapsed();
-        eprintln!("million-entry base, 512 new files, serving write-lock work: {elapsed:?}");
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "new-file batch scanned the base: {elapsed:?}"
-        );
-        assert_eq!(serving.len(), 1_000_000);
-        serving.invalidate_file(&root.join("entry_only.rs"));
-        assert_eq!(
-            serving.len(),
-            0,
-            "entry-only files must be in the membership set"
-        );
-    }
-
-    #[test]
-    fn revision_borrower_tree_is_checked_with_hashes_before_serving() {
-        let owner = tempfile::tempdir().unwrap();
-        let borrower = tempfile::tempdir().unwrap();
-        let a = owner.path().join("a.rs");
-        let gone = owner.path().join("gone.rs");
-        write_rust_file(&a, "owner_name");
-        write_rust_file(&gone, "deleted_in_borrower");
-        let mut source = build_test_index(owner.path(), &[a.clone(), gone]);
-        let config = SemanticBackendConfig::default();
-        source.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 3));
-        let local = borrower.path().join("a.rs");
-        let added = borrower.path().join("added.rs");
-        write_rust_file(&local, "local_name");
-        filetime::set_file_mtime(
-            &local,
-            filetime::FileTime::from_system_time(source.file_mtimes[&a]),
-        )
-        .unwrap();
-        write_rust_file(&added, "new_local");
-        let mut adopted = source
-            .adopt_frozen_base_for_root(borrower.path(), &config)
-            .unwrap();
-        let paths = adopted.borrowed_changed_paths(&[local.clone(), added.clone()]);
-        assert_eq!(
-            paths.len(),
-            3,
-            "same size and timestamp must not hide different branch contents"
-        );
-        adopted.invalidate_files(&paths);
-        assert!(adopted.search(&[1.0, 0.0, 0.0], 100).is_empty());
-        assert_eq!(
-            adopted.retain_files_with_changed_content(vec![local.clone()]),
-            vec![local.clone()],
-            "tombstone-only paths recover without a metadata record"
-        );
-        adopted
-            .refresh_invalidated_files(
-                borrower.path(),
-                &paths,
-                &mut test_vector_for_texts,
-                8,
-                100,
-                &mut |_, _| {},
-            )
-            .unwrap();
-        let mut oracle = build_test_index(borrower.path(), &[local, added]);
-        oracle.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 3));
-        assert_eq!(adopted.to_bytes(), oracle.to_bytes());
-        assert!(adopted
-            .search(&[1.0, 0.0, 0.0], 100)
-            .iter()
-            .all(|row| row.name != "owner_name" && row.name != "deleted_in_borrower"));
-    }
-
-    #[test]
-    fn revision_tombstone_without_content_change_is_recoverable() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("lib.rs");
-        write_rust_file(&file, "unchanged");
-        let mut index = build_test_index(temp.path(), std::slice::from_ref(&file));
-        let _worker = index.fork_for_refresh();
-        assert!(index
-            .retain_files_with_changed_content(vec![file.clone()])
-            .is_empty());
-        index.remove_indexed_files(std::slice::from_ref(&file));
-        assert_eq!(index.len(), 0);
-        assert!(index.recorded_file_freshness(&file).is_none());
-        assert_eq!(
-            index.retain_files_with_changed_content(vec![file.clone()]),
-            vec![file.clone()]
-        );
-        index
-            .refresh_invalidated_files(
-                temp.path(),
-                &[file],
-                &mut test_vector_for_texts,
-                8,
-                100,
-                &mut |_, _| {},
-            )
-            .unwrap();
-        assert!(index.len() > 0);
-    }
-
-    #[test]
-    fn revision_live_base_preserves_dimension_guard_for_added_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("base.rs");
-        write_rust_file(&file, "existing");
-        let mut index = build_test_index(temp.path(), &[file]);
-        let _worker = index.fork_for_refresh();
-        assert!(index.entries.is_empty());
-        assert!(index.len() > 0);
-        let added = temp.path().join("added.rs");
-        write_rust_file(&added, "new_one");
-        let before = index.to_bytes();
-        let result = index.refresh_invalidated_files(
-            temp.path(),
-            &[added],
-            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-            8,
-            100,
-            &mut |_, _| {},
-        );
-        assert!(
-            result.is_err(),
-            "nonempty inherited rows must constrain the embedding dimension"
-        );
-        assert_eq!(index.to_bytes(), before);
-    }
-
-    #[test]
-    fn shared_overlay_equivalence_and_sharing() {
-        let temp = tempfile::tempdir().unwrap();
-        let owner_root = temp.path().join("owner");
-        fs::create_dir(&owner_root).unwrap();
-        let files = (0..64)
-            .map(|i| {
-                let path = owner_root.join(format!("file_{i:02}.rs"));
-                write_rust_file(&path, &format!("symbol_{i}"));
-                path
-            })
-            .collect::<Vec<_>>();
-        let original = build_test_index(&owner_root, &files);
-        let base = Arc::new(original.clone().into_shared_base().unwrap());
-        let weak = Arc::downgrade(&base);
-        let mut roots = Vec::new();
-        // Include the owner: freezing does not give it a different mutation path.
-        for i in 0..11 {
-            let root = if i == 0 {
-                owner_root.clone()
-            } else {
-                temp.path().join(format!("borrower_{i}"))
-            };
-            fs::create_dir_all(&root).unwrap();
-            let mut oracle_files = Vec::new();
-            for (ordinal, file) in files.iter().enumerate() {
-                let path = root.join(file.file_name().unwrap());
-                if i != 0 {
-                    // Later roots must start with the original contents and
-                    // mtimes, not changes made by earlier loop iterations.
-                    write_rust_file(&path, &format!("symbol_{ordinal}"));
-                    filetime::set_file_mtime(
-                        &path,
-                        filetime::FileTime::from_system_time(original.file_mtimes[file]),
-                    )
-                    .unwrap();
-                }
-                oracle_files.push(path);
-            }
-            let mut oracle = build_test_index(&root, &oracle_files);
-            let mut serving = SemanticIndex::from_shared_base(root.clone(), Arc::clone(&base));
-            let mut worker = serving.clone();
-            for (name, symbol) in [
-                ("file_00.rs", Some("changed")),
-                ("added.rs", Some("added")),
-                ("file_01.rs", None),
-                ("file_01.rs", Some("readded")),
-                ("file_00.rs", Some("changed_twice")),
-            ] {
-                let path = root.join(name);
-                match symbol {
-                    Some(symbol) => write_rust_file(&path, symbol),
-                    None => fs::remove_file(&path).unwrap(),
-                }
-                serving.invalidate_file(&path);
-                let update = worker
-                    .refresh_invalidated_files(
-                        &root,
-                        std::slice::from_ref(&path),
-                        &mut test_vector_for_texts,
-                        8,
-                        1000,
-                        &mut |_, _| {},
-                    )
-                    .unwrap();
-                serving.apply_refresh_update(
-                    update.added_entries,
-                    update.updated_metadata,
-                    &update.completed_paths,
-                );
-                oracle
-                    .refresh_invalidated_files(
-                        &root,
-                        std::slice::from_ref(&path),
-                        &mut test_vector_for_texts,
-                        8,
-                        1000,
-                        &mut |_, _| {},
-                    )
-                    .unwrap();
-                assert_eq!(serving.to_bytes(), oracle.to_bytes());
-                assert_eq!(worker.to_bytes(), oracle.to_bytes());
-                for query in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]] {
-                    for k in [1, 7, 1000] {
-                        assert_eq!(
-                            format!("{:?}", serving.search(&query, k)),
-                            format!("{:?}", oracle.search(&query, k))
-                        );
-                    }
-                }
-                assert!(Arc::ptr_eq(
-                    serving
-                        .shared_base
-                        .as_ref()
-                        .expect("edits must not materialize the base"),
-                    &base
-                ));
-                assert!(Arc::ptr_eq(worker.shared_base.as_ref().unwrap(), &base));
-                assert!(serving.entries.len() < original.entries.len() / 4);
-                assert!(
-                    worker.estimated_memory().estimated_bytes.unwrap()
-                        < original.estimated_memory().estimated_bytes.unwrap() / 3
-                );
-            }
-            roots.push((serving, worker));
-        }
-        assert_eq!(Arc::strong_count(&base), 23);
-        drop(base);
-        drop(roots);
-        assert!(
-            weak.upgrade().is_none(),
-            "the last index must release its base"
-        );
-    }
-
-    #[test]
-    fn revision_late_borrower_starts_from_owner_base_not_owner_delta() {
-        let temp = tempfile::tempdir().unwrap();
-        let owner_root = temp.path().join("owner");
-        let borrower_root = temp.path().join("borrower");
-        fs::create_dir(&owner_root).unwrap();
-        fs::create_dir(&borrower_root).unwrap();
-        let mut owner = SemanticIndex::new(owner_root.clone(), 2);
-        let config = SemanticBackendConfig::default();
-        owner.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
-        for i in 0..64 {
-            add_invalidation_fixture_entry(&mut owner, owner_root.join(format!("file_{i}.rs")), i);
-        }
-        let worker = owner.fork_for_refresh();
-        owner.invalidate_files(&[owner_root.join("file_0.rs"), owner_root.join("file_1.rs")]);
-        add_invalidation_fixture_entry(&mut owner, owner_root.join("file_0.rs"), 100);
-        add_invalidation_fixture_entry(&mut owner, owner_root.join("added.rs"), 101);
-        let mut borrower = owner
-            .adopt_frozen_base_for_root(&borrower_root, &config)
-            .unwrap();
-        assert!(Arc::ptr_eq(
-            owner.shared_base.as_ref().unwrap(),
-            borrower.shared_base.as_ref().unwrap()
-        ));
-        assert!(Arc::ptr_eq(
-            worker.shared_base.as_ref().unwrap(),
-            borrower.shared_base.as_ref().unwrap()
-        ));
-        assert_eq!(
-            borrower.entries.len(),
-            0,
-            "owner checkout deltas must not cross roots"
-        );
-        assert_eq!(borrower.file_mtimes.len(), 0);
-        assert_eq!(borrower.to_bytes(), worker.to_bytes());
-        let expected = worker
-            .search(&[1.0, 1.0], 1000)
-            .into_iter()
-            .map(|mut row| {
-                row.file = borrower_root.join(row.file.strip_prefix(&owner_root).unwrap());
-                format!("{row:?}")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            borrower
-                .search(&[1.0, 1.0], 1000)
-                .iter()
-                .map(|row| format!("{row:?}"))
-                .collect::<Vec<_>>(),
-            expected
-        );
-        borrower.invalidate_file(&borrower_root.join("file_2.rs"));
-        assert_eq!(
-            owner.entries.len(),
-            2,
-            "borrower edits must not mutate the donor delta"
-        );
-    }
-
-    #[test]
-    fn shared_overlay_corpus_refresh_and_segments_match_private() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let a = root.join("a.rs");
-        let b = root.join("b.rs");
-        let empty = root.join("empty.rs");
-        write_rust_file(&a, "old_a");
-        write_rust_file(&b, "old_b");
-        fs::write(&empty, "").unwrap();
-        let original = build_test_index(root, &[a.clone(), b.clone(), empty.clone()]);
-        let mut private = original.clone();
-        let mut serving = original.clone();
-        let mut worker = serving.fork_for_refresh();
-        assert!(Arc::ptr_eq(
-            serving.shared_base.as_ref().unwrap(),
-            worker.shared_base.as_ref().unwrap()
-        ));
-        write_rust_file(&a, "new_a");
-        fs::remove_file(&b).unwrap();
-        let files = [a.clone(), empty];
-        private
-            .refresh_stale_files(root, &files, &mut test_vector_for_texts, 8, &mut |_, _| {})
-            .unwrap();
-        worker
-            .refresh_stale_files(root, &files, &mut test_vector_for_texts, 8, &mut |_, _| {})
-            .unwrap();
-        assert_eq!(worker.to_bytes(), private.to_bytes());
-        assert_eq!(serving.to_bytes(), original.to_bytes());
-        let paths = semantic_changed_paths(&original, &worker);
-        assert_eq!(paths, BTreeSet::from([a, b]));
-        let mut bytes = original.to_bytes();
-        bytes.extend(worker.build_segment_frame(1, &paths).unwrap());
-        let replayed = SemanticIndex::from_bytes(&bytes, root).unwrap();
-        assert_eq!(replayed.to_bytes(), private.to_bytes());
-        let roundtrip = SemanticIndex::from_bytes(&worker.to_bytes(), root).unwrap();
-        assert_eq!(roundtrip.to_bytes(), private.to_bytes());
-    }
-
-    #[test]
-    fn shared_overlay_slow_failed_refresh_is_isolated() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let path = root.join("lib.rs");
-        write_rust_file(&path, "before");
-        let original = build_test_index(&root, std::slice::from_ref(&path));
-        let base = Arc::new(original.into_shared_base().unwrap());
-        let serving = SemanticIndex::from_shared_base(root.clone(), base);
-        let before = serving.to_bytes();
-        let rows = format!("{:?}", serving.search(&[1.0, 0.0, 0.0], 100));
-        let mut worker = serving.clone();
-        write_rust_file(&path, "after");
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let result = worker.refresh_invalidated_files(
-                &root,
-                &[path],
-                &mut |_| {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    Err("backend failed".to_string())
-                },
-                8,
-                100,
-                &mut |_, _| {},
-            );
-            assert!(result.is_err());
-            worker
-        });
-        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(serving.to_bytes(), before);
-        assert_eq!(format!("{:?}", serving.search(&[1.0, 0.0, 0.0], 100)), rows);
-        release_tx.send(()).unwrap();
-        let worker = handle.join().unwrap();
-        assert_eq!(worker.to_bytes(), before);
-        assert_eq!(serving.to_bytes(), before);
-    }
-
     fn build_test_index(project_root: &Path, files: &[PathBuf]) -> SemanticIndex {
         let mut embed = test_vector_for_texts;
         SemanticIndex::build(project_root, files, &mut embed, 8).unwrap()
@@ -15210,47 +12312,6 @@ Connection: close
         assert_eq!(parse.to_string(), "unsupported file extension");
         assert!(!parse.is_expected_non_code());
         assert!(!io.is_expected_non_code());
-    }
-
-    #[test]
-    fn audit10_plain_clone_dirty_updates_survive_another_writer() {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let files = (0..64)
-            .map(|i| project.path().join(format!("file_{i}.rs")))
-            .collect::<Vec<_>>();
-        for file in &files {
-            fs::write(file, "pub fn symbol() {}\n").unwrap();
-        }
-        let mut first = build_test_index(project.path(), &files);
-        assert!(first.write_to_disk(storage.path(), "overlap"));
-        let second = std::rc::Rc::new(std::cell::RefCell::new(first.clone()));
-        first
-            .file_mtimes
-            .insert(files[0].clone(), SystemTime::UNIX_EPOCH);
-        first.extend_dirty_paths(std::iter::once(files[0].clone()));
-        let second_at_snapshot = second.clone();
-        let path = files[1].clone();
-        let updated_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(50);
-        PERSIST_DIRTY_SNAPSHOT_PROBE.with(|probe| {
-            *probe.borrow_mut() = Some(Box::new(move || {
-                let mut second = second_at_snapshot.borrow_mut();
-                second.file_mtimes.insert(path.clone(), updated_mtime);
-                second.extend_dirty_paths(std::iter::once(path));
-            }));
-        });
-        assert!(first.write_to_disk(storage.path(), "overlap"));
-        assert_eq!(
-            second.borrow().file_mtimes.get(&files[1]),
-            Some(&updated_mtime)
-        );
-        assert!(first.last_append_read_bytes.load(Ordering::Relaxed) > 0);
-        assert!(second.borrow().write_to_disk(storage.path(), "overlap"));
-        let bytes = fs::read(storage.path().join("semantic/overlap/semantic.bin")).unwrap();
-        let restored = SemanticIndex::from_bytes(&bytes, project.path()).unwrap();
-        assert_eq!(restored.file_mtimes.get(&files[1]), Some(&updated_mtime));
-        let fork = first.fork_for_refresh();
-        assert!(!Arc::ptr_eq(&fork.dirty_paths, &first.dirty_paths));
     }
 
     #[test]
@@ -15494,212 +12555,6 @@ Connection: close
             .iter()
             .find(|entry| entry.chunk.file == file && entry.chunk.kind == SymbolKind::FileSummary)
             .unwrap_or_else(|| panic!("missing file-summary entry in {}", file.display()))
-    }
-
-    #[test]
-    fn borrowed_snapshots_deserialize_once_share_memory_and_drop_with_last_holder() {
-        let owner = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let borrower_a = tempfile::tempdir().unwrap();
-        let borrower_b = tempfile::tempdir().unwrap();
-        let relative = Path::new("src/lib.rs");
-        for root in [owner.path(), borrower_a.path(), borrower_b.path()] {
-            let file = root.join(relative);
-            fs::create_dir_all(file.parent().unwrap()).unwrap();
-            fs::write(&file, "pub fn shared_symbol() -> bool { true }\n").unwrap();
-        }
-        let owner_file = owner.path().join(relative);
-        let metadata = fs::metadata(&owner_file).unwrap();
-        let mut index = SemanticIndex::new(owner.path().to_path_buf(), 3);
-        index.entries.push(EmbeddingEntry {
-            chunk: SemanticChunk {
-                file: owner_file.clone(),
-                name: "shared_symbol".to_string(),
-                qualified_name: None,
-                kind: SymbolKind::Function,
-                start_line: 0,
-                end_line: 0,
-                exported: true,
-                embed_text: "shared symbol".to_string(),
-                snippet: "pub fn shared_symbol() -> bool { true }".to_string(),
-            },
-            norm: vector_norm(&[1.0, 0.0, 0.0]),
-            vector: vec![1.0, 0.0, 0.0].into(),
-        });
-        index.file_mtimes.insert(
-            owner_file.clone(),
-            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        );
-        index.file_sizes.insert(owner_file.clone(), metadata.len());
-        index.file_hashes.insert(
-            owner_file,
-            blake3::hash(b"pub fn shared_symbol() -> bool { true }\n"),
-        );
-        index.set_fingerprint(SemanticIndexFingerprint {
-            backend: "test".to_string(),
-            model: "shared-base".to_string(),
-            base_url: FALLBACK_BACKEND.to_string(),
-            dimension: 3,
-            chunking_version: default_chunking_version(),
-            ..Default::default()
-        });
-        assert!(index.shared_base.is_none(), "owner indexes stay private");
-
-        let project_key = format!(
-            "shared-base-{}",
-            blake3::hash(owner.path().as_os_str().as_encoded_bytes()).to_hex()
-        );
-        let dir = storage.path().join("semantic").join(&project_key);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("semantic.bin"), index.to_bytes()).unwrap();
-        let loads_before = SHARED_SEMANTIC_BASE_LOADS.load(Ordering::Relaxed);
-        let hits_before = SHARED_SEMANTIC_BASE_HITS.load(Ordering::Relaxed);
-        let a = SemanticIndex::read_from_disk_borrow_tolerant(
-            storage.path(),
-            &project_key,
-            borrower_a.path(),
-        )
-        .unwrap();
-        let b = SemanticIndex::read_from_disk_borrow_tolerant(
-            storage.path(),
-            &project_key,
-            borrower_b.path(),
-        )
-        .unwrap();
-        let a_base = a.shared_base.as_ref().unwrap();
-        let b_base = b.shared_base.as_ref().unwrap();
-        assert!(Arc::ptr_eq(a_base, b_base));
-        assert!(SHARED_SEMANTIC_BASE_LOADS.load(Ordering::Relaxed) > loads_before);
-        assert!(SHARED_SEMANTIC_BASE_HITS.load(Ordering::Relaxed) > hits_before);
-        assert_eq!(
-            a.search(&[1.0, 0.0, 0.0], 1)[0].file,
-            borrower_a.path().join(relative)
-        );
-        assert_eq!(
-            b.search(&[1.0, 0.0, 0.0], 1)[0].file,
-            borrower_b.path().join(relative)
-        );
-        assert_eq!(a.estimated_memory().estimated_bytes, Some(0));
-        assert!(shared_semantic_bases_memory().estimated_bytes.unwrap_or(0) > 0);
-
-        let weak = Arc::downgrade(a_base);
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(borrower_a.path().to_path_buf()),
-                ..crate::config::Config::default()
-            },
-        );
-        *ctx.semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(a);
-        assert!(ctx.evict_idle_artifacts());
-        assert!(
-            weak.upgrade().is_some(),
-            "the second borrower keeps the base live"
-        );
-        drop(b);
-        assert!(
-            weak.upgrade().is_none(),
-            "the last borrower releases the base"
-        );
-    }
-
-    #[test]
-    fn revision_rebuilt_generation_is_shared_while_old_base_is_live() {
-        let owner = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let borrower_a = tempfile::tempdir().unwrap();
-        let borrower_b = tempfile::tempdir().unwrap();
-        let relative = Path::new("src/lib.rs");
-        for root in [owner.path(), borrower_a.path(), borrower_b.path()] {
-            let file = root.join(relative);
-            fs::create_dir_all(file.parent().unwrap()).unwrap();
-            fs::write(&file, "pub fn hash_guard() {}\n").unwrap();
-        }
-        let owner_file = owner.path().join(relative);
-        let metadata = fs::metadata(&owner_file).unwrap();
-        let mut index = SemanticIndex::new(owner.path().to_path_buf(), 2);
-        index.entries.push(EmbeddingEntry {
-            chunk: SemanticChunk {
-                file: owner_file.clone(),
-                name: "hash_guard".to_string(),
-                qualified_name: None,
-                kind: SymbolKind::Function,
-                start_line: 0,
-                end_line: 0,
-                exported: true,
-                embed_text: "hash guard".to_string(),
-                snippet: "pub fn hash_guard() {}".to_string(),
-            },
-            norm: vector_norm(&[1.0, 0.0]),
-            vector: vec![1.0, 0.0].into(),
-        });
-        index.file_mtimes.insert(
-            owner_file.clone(),
-            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        );
-        index.file_sizes.insert(owner_file.clone(), metadata.len());
-        index
-            .file_hashes
-            .insert(owner_file, blake3::hash(b"pub fn hash_guard() {}\n"));
-        index.set_fingerprint(SemanticIndexFingerprint {
-            backend: "test".to_string(),
-            model: "hash-guard".to_string(),
-            base_url: FALLBACK_BACKEND.to_string(),
-            dimension: 2,
-            chunking_version: default_chunking_version(),
-            ..Default::default()
-        });
-        let project_key = format!(
-            "hash-fallback-{}",
-            blake3::hash(owner.path().as_os_str().as_encoded_bytes()).to_hex()
-        );
-        let dir = storage.path().join("semantic").join(&project_key);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("semantic.bin"), index.to_bytes()).unwrap();
-        let shared = SemanticIndex::read_from_disk_borrow_tolerant(
-            storage.path(),
-            &project_key,
-            borrower_a.path(),
-        )
-        .unwrap();
-        assert!(shared.shared_base.is_some());
-
-        let changed_vector = vec![0.0, 1.0];
-        index.entries[0].norm = vector_norm(&changed_vector);
-        index.entries[0].vector = changed_vector.into();
-        index
-            .fingerprint
-            .as_mut()
-            .unwrap()
-            .model
-            .push_str("-rebuilt");
-        fs::write(dir.join("semantic.bin"), index.to_bytes()).unwrap();
-        let fallback = SemanticIndex::read_from_disk_borrow_tolerant(
-            storage.path(),
-            &project_key,
-            borrower_b.path(),
-        )
-        .unwrap();
-        let new_base = fallback
-            .shared_base
-            .as_ref()
-            .expect("new generation must stay shared");
-        let second = SemanticIndex::read_from_disk_borrow_tolerant(
-            storage.path(),
-            &project_key,
-            borrower_b.path(),
-        )
-        .unwrap();
-        assert!(Arc::ptr_eq(new_base, second.shared_base.as_ref().unwrap()));
-        assert!(!Arc::ptr_eq(new_base, shared.shared_base.as_ref().unwrap()));
-        assert_eq!(shared.search(&[1.0, 0.0], 1)[0].score, 1.1);
-        assert_eq!(fallback.search(&[1.0, 0.0], 1)[0].score, 0.0);
-        let old_weak = Arc::downgrade(shared.shared_base.as_ref().unwrap());
-        drop(shared);
-        assert!(old_weak.upgrade().is_none());
-        assert_eq!(second.entry_count(), 1);
     }
 
     #[test]
@@ -16131,110 +12986,6 @@ Connection: close
     }
 
     #[test]
-    #[ignore = "opt-in many-chunks and 1/100-file refresh allocation benchmark"]
-    fn hot_path_semantic_work_counts() {
-        use crate::search_hot_path_measurements::measure;
-        let temp = tempfile::tempdir().unwrap();
-        let files = (0..200)
-            .map(|n| {
-                let file = temp.path().join(format!("src/file_{n}.rs"));
-                let source = (0..40)
-                    .map(|i| format!("pub fn function_{i}() -> usize {{\n    let initial_value = {i};\n    initial_value + 1\n}}\n"))
-                    .collect::<String>();
-                write_source(&file, &source);
-                file
-            })
-            .collect::<Vec<_>>();
-        let mut index = build_recorded_test_index(temp.path(), &files);
-        assert!(
-            index.entries.len() >= 8000,
-            "fixture must contain many semantic chunks"
-        );
-        for entry in &mut index.entries {
-            entry.vector = entry.vector.iter().copied().cycle().take(384).collect();
-            entry.norm = vector_norm(&entry.vector);
-        }
-        index.dimension = 384;
-        let query = vec![0.5; 384];
-        let results = measure("semantic/many_chunks_per_file", || {
-            index.search_filtered(&query, 50, |_| true)
-        });
-        assert_eq!(results.len(), 50);
-        for count in [1, 100] {
-            let update = measure(&format!("semantic/refresh_{count}"), || {
-                index
-                    .refresh_invalidated_files(
-                        temp.path(),
-                        &files[..count],
-                        &mut |texts| {
-                            Ok(texts
-                                .iter()
-                                .map(|text| {
-                                    deterministic_test_vector(text)
-                                        .into_iter()
-                                        .cycle()
-                                        .take(384)
-                                        .collect()
-                                })
-                                .collect())
-                        },
-                        16,
-                        1000,
-                        &mut |_, _| {},
-                    )
-                    .unwrap()
-            });
-            std::hint::black_box(update);
-        }
-        let deferred = (0..100)
-            .map(|n| {
-                let file = temp.path().join(format!("deferred/file_{n}.rs"));
-                write_source(&file, &fs::read_to_string(&files[0]).unwrap());
-                file
-            })
-            .collect::<Vec<_>>();
-        index
-            .refresh_invalidated_files(
-                temp.path(),
-                &deferred,
-                &mut |_| panic!("files beyond the cap must not embed"),
-                16,
-                200,
-                &mut |_, _| {},
-            )
-            .unwrap();
-        assert_eq!(index.deferred_files.len(), 100);
-        measure("semantic/refresh_full_cap_100_deferred", || {
-            index
-                .refresh_invalidated_files(
-                    temp.path(),
-                    &files[..1],
-                    &mut |_| panic!("unchanged admitted chunks must reuse embeddings"),
-                    16,
-                    200,
-                    &mut |_, _| {},
-                )
-                .unwrap()
-        });
-        let borrowed = SemanticIndex::from_shared_base(
-            temp.path().to_path_buf(),
-            Arc::new(index.into_shared_base().ok().unwrap()),
-        );
-        let filter_calls = std::cell::Cell::new(0);
-        let results = measure("semantic/borrowed_many_chunks_per_file", || {
-            borrowed.search_filtered(&query, 50, |_| {
-                filter_calls.set(filter_calls.get() + 1);
-                true
-            })
-        });
-        assert_eq!(results.len(), 50);
-        println!(
-            "HOT_PATH {}",
-            serde_json::json!({"case": "semantic/filter_calls", "calls": filter_calls.get()})
-        );
-    }
-
-    #[test]
     fn full_cap_refresh_skips_deferred_reads_but_failed_changes_free_capacity() {
         let temp = tempfile::tempdir().unwrap();
         let indexed = temp.path().join("a.rs");
@@ -16352,153 +13103,6 @@ Connection: close
     }
 
     #[test]
-    #[ignore = "opt-in counts for unchanged semantic lifecycle audit findings"]
-    fn semantic_audit_remaining_work_counts() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let paths = (0..200)
-            .map(|ordinal| {
-                let path = root.join(format!("file_{ordinal}.rs"));
-                fs::write(&path, b"fn symbol() {}\n").unwrap();
-                path
-            })
-            .collect::<Vec<_>>();
-        let mut index = SemanticIndex::new(root.clone(), 2);
-        for ordinal in 0..8_000 {
-            add_invalidation_fixture_entry(
-                &mut index,
-                paths[ordinal as usize % 200].clone(),
-                ordinal,
-            );
-        }
-        for path in &paths {
-            let metadata = fs::metadata(path).unwrap();
-            index
-                .file_mtimes
-                .insert(path.clone(), metadata.modified().unwrap());
-            index.file_sizes.insert(path.clone(), metadata.len());
-            index
-                .file_hashes
-                .insert(path.clone(), blake3::hash(b"fn symbol() {}\n"));
-        }
-        let requested = BTreeSet::from([paths[0].clone()]);
-        let shared = Arc::new(index.clone().into_shared_base().ok().unwrap());
-        let borrowed = SemanticIndex::from_shared_base(root.clone(), shared);
-        let (files, count_allocations) =
-            crate::test_allocations::count(|| borrowed.indexed_file_count());
-        assert_eq!(files, 200);
-        let (delta, delta_allocations) =
-            crate::test_allocations::count(|| borrowed.delta_for_paths(&requested));
-        assert_eq!(delta.entries.len(), 40);
-        let mut overlay = borrowed.clone();
-        overlay.hide_base_files(requested.iter());
-        overlay.entries = delta.entries.clone();
-        let (fork, fork_allocations) =
-            crate::test_allocations::count(|| overlay.fork_for_refresh());
-        assert_eq!(fork.entries.len(), 40);
-        crate::cache_freshness::reset_hash_file_if_small_count_for_debug();
-        let (changed, adoption_allocations) =
-            crate::test_allocations::count(|| borrowed.borrowed_changed_paths(&paths));
-        assert!(changed.is_empty());
-        let adoption_hashes = crate::cache_freshness::hash_file_if_small_count_for_debug();
-        assert_eq!(adoption_hashes, 200);
-        crate::search_hot_path_measurements::reset();
-        let (audit, audit_allocations) =
-            crate::test_allocations::count(|| borrowed.search(&[1.0, 0.5], usize::MAX));
-        assert_eq!(audit.len(), 8_000);
-        assert_eq!(
-            crate::search_hot_path_measurements::counts().score_evaluations,
-            8_000
-        );
-        println!("SEMANTIC_WORK unchanged_lifecycle: chunks=8000 files=200 indexed_file_count_allocations={count_allocations} delta_1_file_allocations={delta_allocations} fork_40_chunk_overlay_allocations={fork_allocations} adoption_allocations={adoption_allocations} adoption_hashes={adoption_hashes} full_recall_scores=8000 full_recall_allocations={audit_allocations}");
-    }
-
-    #[test]
-    fn private_semantic_filter_runs_once_per_file_and_keeps_result_bytes() {
-        let root = test_project_root();
-        let mut index = SemanticIndex::new(root.clone(), 2);
-        for ordinal in 0..8_000 {
-            // The production walker constructs native paths component by
-            // component. A slash-containing join would create mixed separators
-            // in this private fixture on Windows, unlike the shared-base paths.
-            let file = root.join("src").join(format!("file_{}.rs", ordinal % 200));
-            add_invalidation_fixture_entry(&mut index, file, ordinal);
-        }
-        let query = [1.0, 0.5];
-        // The shared-base path already caches eligibility per file; it supplies
-        // an independent representation of the same chunks, order and scores.
-        let borrowed = SemanticIndex::from_shared_base(
-            root,
-            Arc::new(index.clone().into_shared_base().ok().unwrap()),
-        );
-        let expected = borrowed.search_filtered(&query, 50, |path| !path.ends_with("file_1.rs"));
-        let calls = std::cell::Cell::new(0);
-        crate::search_hot_path_measurements::reset();
-        let (actual, allocations) = crate::test_allocations::count(|| {
-            index.search_filtered(&query, 50, |path| {
-                calls.set(calls.get() + 1);
-                // Match the allocating test-file predicate used by public search.
-                !path
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .to_ascii_lowercase()
-                    .ends_with("file_1.rs")
-            })
-        });
-        let bytes = |results: &[SemanticResult]| {
-            serde_json::to_vec(
-                &results
-                    .iter()
-                    .map(|result| {
-                        (
-                            &result.file,
-                            &result.name,
-                            &result.snippet,
-                            result.score.to_bits(),
-                            result.rank_score.to_bits(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
-        assert_eq!(bytes(&actual), bytes(&expected));
-        let work = crate::search_hot_path_measurements::counts();
-        println!("SEMANTIC_WORK private_filter: chunks=8000 files=200 calls={} allocations={allocations} scores={} sorted={}", calls.get(), work.score_evaluations, work.candidates_sorted);
-        assert_eq!(
-            calls.get(),
-            200,
-            "private eligibility must be cached per file"
-        );
-    }
-
-    #[test]
-    fn shared_semantic_native_paths_preserve_persisted_bytes_and_identity() {
-        let root = test_project_root();
-        let file = root.join("src").join("lib.rs");
-        let mut index = SemanticIndex::new(root.clone(), 2);
-        add_invalidation_fixture_entry(&mut index, file.clone(), 0);
-        let private_bytes = index.to_bytes();
-        let private_identity = blake3::hash(&private_bytes);
-        let private_results = index.search(&[1.0, 0.5], 1);
-        let borrowed =
-            SemanticIndex::from_shared_base(root, Arc::new(index.into_shared_base().ok().unwrap()));
-        let shared_results = borrowed.search(&[1.0, 0.5], 1);
-        assert_eq!(private_results.len(), 1);
-        assert_eq!(shared_results.len(), 1);
-        // Compare spelling, not Path equality, which accepts either separator
-        // on Windows and would hide the mixed-separator regression.
-        assert_eq!(shared_results[0].file.as_os_str(), file.as_os_str());
-        assert_eq!(
-            shared_results[0].score.to_bits(),
-            private_results[0].score.to_bits()
-        );
-        let shared_bytes = borrowed.to_bytes();
-        assert_eq!(shared_bytes, private_bytes);
-        assert_eq!(blake3::hash(&shared_bytes), private_identity);
-    }
-
-    #[test]
     fn semantic_decode_reads_one_vector_at_a_time_and_preserves_bits() {
         struct Reads<'a> {
             cursor: std::io::Cursor<&'a [u8]>,
@@ -16610,63 +13214,6 @@ Connection: close
             )
             .unwrap_err();
             assert_eq!(error, "unexpected end of data reading vector");
-        }
-    }
-
-    #[test]
-    fn borrowed_semantic_filter_runs_once_per_file_and_keeps_result_bytes() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let mut index = SemanticIndex::new(root.clone(), 2);
-        for ordinal in 0..40 {
-            let file = root.join(if ordinal % 2 == 0 {
-                "keep.rs"
-            } else {
-                "skip.rs"
-            });
-            add_invalidation_fixture_entry(&mut index, file, ordinal);
-        }
-        let expected = index.search_filtered(&[1.0, 0.5], 50, |path| path.ends_with("keep.rs"));
-        let borrowed =
-            SemanticIndex::from_shared_base(root, Arc::new(index.into_shared_base().ok().unwrap()));
-        for keep in [true, false] {
-            let calls = std::cell::Cell::new(0);
-            let actual = borrowed.search_filtered(&[1.0, 0.5], 50, |path| {
-                calls.set(calls.get() + 1);
-                assert!(path.is_absolute());
-                path.ends_with("keep.rs") == keep
-            });
-            assert_eq!(calls.get(), 2);
-            assert_eq!(actual.len(), 20);
-            if keep {
-                let bytes = |results: &[SemanticResult]| {
-                    serde_json::to_vec(
-                        &results
-                            .iter()
-                            .map(|result| {
-                                (
-                                    &result.file,
-                                    &result.name,
-                                    &result.qualified_name,
-                                    &result.kind,
-                                    result.start_line,
-                                    result.end_line,
-                                    result.exported,
-                                    &result.snippet,
-                                    result.score.to_bits(),
-                                    result.rank_score.to_bits(),
-                                    result.cap_protected,
-                                    result.source,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap()
-                };
-                assert_eq!(bytes(&actual), bytes(&expected));
-            } else {
-                assert!(actual.iter().all(|result| result.file.ends_with("skip.rs")));
-            }
         }
     }
 
@@ -17289,230 +13836,6 @@ public class Greeter {
         index
             .file_hashes
             .insert(file, blake3::hash(&ordinal.to_le_bytes()));
-    }
-
-    #[test]
-    fn freezing_declines_instead_of_panicking_when_a_dirty_path_is_outside_the_root() {
-        // A delta path outside the root once turned the freeze into a panic:
-        // the shareability check covered entries, metadata maps and deferred
-        // files but not the dirty-path set, and the move then hit an expect.
-        // Under the daemon that panic is a fatal actor exit (exit 4 three
-        // times on 2026-09-14).
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp
-            .path()
-            .join("owner")
-            .canonicalize()
-            .unwrap_or_else(|_| {
-                fs::create_dir_all(temp.path().join("owner")).unwrap();
-                temp.path().join("owner").canonicalize().unwrap()
-            });
-        let borrower = temp.path().join("borrower");
-        fs::create_dir_all(&borrower).unwrap();
-        let mut index = SemanticIndex::new(project_root.clone(), 2);
-        let file = project_root.join("file_0.rs");
-        fs::write(&file, "fn symbol_0() {}\n").unwrap();
-        add_invalidation_fixture_entry(&mut index, file, 0);
-        let config = SemanticBackendConfig::default();
-        index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
-        // A fresh index carries no delta set (None means "structural diff");
-        // seed one the way a refresh does so the stray path is really carried.
-        index.set_dirty_paths(Some(BTreeSet::from([temp
-            .path()
-            .join("elsewhere")
-            .join("stray.rs")])));
-        let entries_before = index.entries.len();
-
-        let adopted = index.adopt_frozen_base_for_root(&borrower, &config);
-
-        assert!(adopted.is_none(), "an unshareable index must stay private");
-        assert!(index.shared_base.is_none());
-        assert_eq!(
-            index.entries.len(),
-            entries_before,
-            "the private index survives intact"
-        );
-
-        // The same index with an in-root dirty path freezes normally.
-        let mut shareable = SemanticIndex::new(project_root.clone(), 2);
-        let file = project_root.join("file_1.rs");
-        fs::write(&file, "fn symbol_1() {}\n").unwrap();
-        add_invalidation_fixture_entry(&mut shareable, file.clone(), 1);
-        shareable.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
-        shareable.set_dirty_paths(Some(BTreeSet::from([file])));
-        assert!(shareable
-            .adopt_frozen_base_for_root(&borrower, &config)
-            .is_some());
-        assert!(shareable.shared_base.is_some());
-    }
-
-    #[test]
-    fn health_memory_reuses_immutable_semantic_base_accounting() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let mut source = SemanticIndex::new(root.clone(), 2);
-        for ordinal in 0..2048 {
-            add_invalidation_fixture_entry(
-                &mut source,
-                root.join(format!("file_{ordinal}.rs")),
-                ordinal,
-            );
-        }
-        let base = Arc::new(source.into_shared_base().ok().unwrap());
-        SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.set(0));
-        let expected = base.estimated_memory();
-        let cold = SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.replace(0));
-        assert_eq!(cold, 4096, "both byte folds must examine the fixture");
-        for _ in 0..3 {
-            assert_eq!(base.estimated_memory(), expected);
-        }
-        let warm = SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.replace(0));
-        let views = (0..50)
-            .map(|_| SemanticIndex::from_shared_base(root.clone(), Arc::clone(&base)))
-            .collect::<Vec<_>>();
-        for view in &views {
-            assert_eq!(view.estimated_memory().counts["entries"], 2048);
-        }
-        let root_visits = SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.replace(0));
-        println!("shared semantic accounting: entries=2048 cold_visits={cold} warm_3_visits={warm} root_50_visits={root_visits}");
-        assert_eq!(
-            (warm, root_visits),
-            (0, 0),
-            "unchanged shared rows were rescanned"
-        );
-
-        // Tombstones hide base-file entries only in this root's view, so a changed
-        // view must not reuse the shared base's unfiltered count.
-        let mut changed = SemanticIndex::from_shared_base(root.clone(), Arc::clone(&base));
-        changed.hide_base_files([&root.join("file_0.rs")]);
-        assert_eq!(changed.entry_count(), 2047);
-        add_invalidation_fixture_entry(&mut changed, root.join("file_0.rs"), 3000);
-        assert_eq!(changed.entry_count(), 2048);
-        assert_eq!(views[0].entry_count(), 2048);
-        assert_eq!(base.estimated_memory(), expected);
-        let replacement = ViewSemanticBase::new(vec![Arc::new(SemanticVectors {
-            provider_refused_chunks: 0,
-            entries: changed.entries,
-        })]);
-        assert_eq!(replacement.base.estimated_memory().counts["entries"], 1);
-        assert_ne!(replacement.base.estimated_memory(), expected);
-    }
-
-    #[test]
-    fn owner_frozen_base_is_counted_once_across_owner_and_borrower_views() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path().join("owner");
-        fs::create_dir_all(&project_root).unwrap();
-        let project_root = project_root.canonicalize().unwrap();
-        let borrower = temp.path().join("borrower");
-        fs::create_dir_all(&borrower).unwrap();
-        let mut index = SemanticIndex::new(project_root.clone(), 2);
-        for ordinal in 0..16 {
-            let file = project_root.join(format!("file_{ordinal}.rs"));
-            fs::write(&file, format!("fn symbol_{ordinal}() {{}}\n")).unwrap();
-            add_invalidation_fixture_entry(&mut index, file, ordinal);
-        }
-        let config = SemanticBackendConfig::default();
-        index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
-        let private_bytes = index.estimated_memory().estimated_bytes.unwrap();
-        let vector_bytes: usize = index
-            .entries
-            .iter()
-            .map(|entry| entry.vector.len() * std::mem::size_of::<f32>())
-            .sum();
-        assert!(private_bytes > 0 && vector_bytes > 0);
-
-        // The drain freezes the owner's installed index for its own root; a
-        // borrower adopting it later gets a second view of the same base.
-        let owner_view = index
-            .adopt_frozen_base_for_root(&project_root, &config)
-            .expect("a shareable owner index freezes");
-        let borrower_view = index
-            .adopt_frozen_base_for_root(&borrower, &config)
-            .expect("a frozen base can be adopted");
-        let base = Arc::clone(index.shared_base.as_ref().unwrap());
-        let base_bytes = base.estimated_memory().estimated_bytes.unwrap();
-        // The base holds every vector the private index held. Path-derived
-        // bytes vary with the platform's path forms (the base came out at
-        // well under half the private estimate on Windows CI), so compare the
-        // vector payload, which does not.
-        assert_eq!(base.entry_count, 16);
-        assert!(
-            base_bytes >= vector_bytes as u64,
-            "{base_bytes} vs vector payload {vector_bytes}"
-        );
-
-        for view in [&index, &owner_view, &borrower_view] {
-            assert_eq!(
-                view.estimated_memory().estimated_bytes,
-                Some(0),
-                "a view of a shared base must not count the base on its root's row"
-            );
-        }
-        let occurrences = live_shared_semantic_bases()
-            .iter()
-            .filter(|live| Arc::ptr_eq(live, &base))
-            .count();
-        assert_eq!(occurrences, 1, "the owner's base is counted exactly once");
-        assert!(shared_semantic_bases_memory().estimated_bytes.unwrap() >= base_bytes);
-
-        // The base must not become findable by borrowed loads: the lookup
-        // registry used by `read_from_disk_borrow_tolerant` stays untouched.
-        assert!(!shared_semantic_bases()
-            .lock()
-            .unwrap()
-            .values()
-            .any(|weak| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&base))));
-
-        let weak = Arc::downgrade(&base);
-        drop((index, owner_view, borrower_view, base));
-        assert_eq!(weak.strong_count(), 0);
-        assert!(!live_shared_semantic_bases()
-            .iter()
-            .any(|live| std::ptr::eq(Arc::as_ptr(live), weak.as_ptr())));
-    }
-
-    #[test]
-    fn batch_invalidation_matches_sequential_calls_with_one_retain_pass() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_root = temp.path().canonicalize().unwrap();
-        let mut source = SemanticIndex::new(project_root.clone(), 2);
-        let files = (0..8)
-            .map(|ordinal| {
-                let file = project_root.join(format!("file_{ordinal}.rs"));
-                fs::write(&file, format!("fn symbol_{ordinal}() {{}}\n")).unwrap();
-                add_invalidation_fixture_entry(&mut source, file.clone(), ordinal);
-                file
-            })
-            .collect::<Vec<_>>();
-        let invalidated = vec![files[1].clone(), files[3].clone(), files[6].clone()];
-
-        let shared = Arc::new(source.clone().into_shared_base().ok().unwrap());
-        let mut shared_batched =
-            SemanticIndex::from_shared_base(project_root.clone(), Arc::clone(&shared));
-        shared_batched.invalidate_files(&invalidated);
-        let mut sequential = source.clone();
-        let mut batched = source;
-        for file in &invalidated {
-            sequential.invalidate_file(file);
-        }
-        batched.invalidate_files(&invalidated);
-
-        assert!(sequential.shared_base.is_none());
-        assert!(batched.shared_base.is_none());
-        assert!(shared_batched.shared_base.is_some());
-        assert_eq!(batched.to_bytes(), sequential.to_bytes());
-        assert_eq!(shared_batched.to_bytes(), batched.to_bytes());
-        assert_eq!(
-            shared_batched.entry_vectors_for_test(),
-            batched.entry_vectors_for_test()
-        );
-        assert_eq!(
-            sequential.removal_retain_passes_for_test(),
-            invalidated.len()
-        );
-        assert_eq!(batched.removal_retain_passes_for_test(), 1);
-        assert_eq!(shared_batched.removal_retain_passes_for_test(), 1);
     }
 
     #[cfg(unix)]
@@ -18335,26 +14658,6 @@ public class Greeter {
     }
 
     #[test]
-    fn query_instruction_does_not_change_index_fingerprint() {
-        let mut config = SemanticBackendConfig {
-            backend: SemanticBackend::OpenAiCompatible,
-            model: "text-embedding-qwen3-embedding-0.6b".to_string(),
-            base_url: Some("http://127.0.0.1:1234/v1".to_string()),
-            ..SemanticBackendConfig::default()
-        };
-        let automatic = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
-        config.query_instruction = "off".to_string();
-        let off = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
-        config.query_instruction = crate::config::QWEN3_EMBEDDING_CODE_SEARCH_TASK.to_string();
-        let literal = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
-
-        assert_eq!(automatic.as_string(), off.as_string());
-        assert_eq!(off.as_string(), literal.as_string());
-        assert!(automatic.matches(&off));
-        assert!(off.matches(&literal));
-    }
-
-    #[test]
     fn query_embedding_cache_keys_the_text_sent_to_the_server() {
         let (base_url, inputs, handle) = start_recording_embedding_server(2);
         let config = SemanticBackendConfig {
@@ -18899,45 +15202,6 @@ public class Greeter {
         let requests = server.requests();
         assert!(requests.len() < 2 * 16 - 1, "{requests:?}");
         assert_eq!(requests.iter().filter(|rows| rows.len() == 1).count(), 9);
-    }
-
-    #[test]
-    fn skipped_chunk_summaries_pin_approved_text_and_persist_both_reasons() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("src")).unwrap();
-        let mut index = SemanticIndex::new(root.path().to_path_buf(), 2);
-        let files = ('a'..='g')
-            .map(|name| root.path().join(format!("src/{name}.rs")))
-            .collect::<Vec<_>>();
-        for (ordinal, file) in files.iter().enumerate() {
-            add_invalidation_fixture_entry(&mut index, file.clone(), ordinal as u64);
-        }
-        index.apply_refused_rows_update(files.iter().map(|file| (file.clone(), 1)).collect());
-        let refused = "semantic search is incomplete: 7 chunks skipped because the embedding provider refused them: src/a.rs, src/b.rs, src/c.rs, src/d.rs, src/e.rs (+2 more files)";
-        assert_eq!(index.skipped_chunks_summary().as_deref(), Some(refused));
-        index.apply_context_skips_update(BTreeMap::from([(files[2].clone(), 1)]));
-        let expected = format!("{refused}\nsemantic search is incomplete: 1 chunks skipped because they exceed the model's input limit: src/c.rs");
-        assert_eq!(index.skipped_rows(), 8);
-        assert_eq!(
-            index.skipped_chunks_summary().as_deref(),
-            Some(expected.as_str())
-        );
-        let restored = SemanticIndex::from_bytes(&index.to_bytes(), root.path()).unwrap();
-        assert_eq!(
-            restored.skipped_chunks_summary().as_deref(),
-            Some(expected.as_str())
-        );
-        let base = Arc::new(
-            restored
-                .into_shared_base()
-                .unwrap_or_else(|_| panic!("shareable fixture")),
-        );
-        let sibling = tempfile::tempdir().unwrap();
-        let shared = SemanticIndex::from_shared_base(sibling.path().to_path_buf(), base);
-        assert_eq!(
-            shared.skipped_chunks_summary().as_deref(),
-            Some(expected.as_str())
-        );
     }
 
     #[test]
@@ -19787,24 +16051,6 @@ public class Greeter {
     }
 
     #[test]
-    fn semantic_fingerprint_changes_when_embed_text_caps_change() {
-        let mut config = SemanticBackendConfig {
-            backend: SemanticBackend::OpenAiCompatible,
-            model: "test-embedding".to_string(),
-            base_url: Some("http://127.0.0.1:1234/v1".to_string()),
-            ..SemanticBackendConfig::default()
-        };
-        let legacy = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
-
-        config.max_input_tokens = Some(531);
-        let expanded = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
-
-        assert_ne!(legacy.embed_text_caps, expanded.embed_text_caps);
-        assert_ne!(legacy.as_string(), expanded.as_string());
-        assert!(!legacy.matches(&expanded));
-    }
-
-    #[test]
     fn file_summary_embed_text_is_independent_of_symbol_caps() {
         let project_root = PathBuf::from("/proj");
         let file = project_root.join("src/long.rs");
@@ -19919,306 +16165,6 @@ public class Greeter {
         );
         assert_eq!(summary.embed_text.chars().count(), 1600);
         assert!(summary.embed_text.ends_with('x'));
-    }
-
-    pub(crate) fn saved_pre_budget_summary_fixture(
-        small: bool,
-    ) -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        PathBuf,
-        SemanticIndexFingerprint,
-    ) {
-        saved_summary_fixture_for_tokens(small.then_some(20))
-    }
-
-    fn saved_summary_fixture_for_tokens(
-        max_input_tokens: Option<usize>,
-    ) -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        PathBuf,
-        SemanticIndexFingerprint,
-    ) {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = project.path().canonicalize().unwrap();
-        let file = root.join("summary.rs");
-        let source = "//! A long module description that deliberately exceeds the configured small embedding budget.\npub fn exported() {\n    42;\n}\n";
-        fs::write(&file, source).unwrap();
-        let config = SemanticBackendConfig {
-            backend: SemanticBackend::Ollama,
-            max_input_tokens,
-            ..Default::default()
-        };
-        let fingerprint = SemanticIndexFingerprint::from_config(&config, 4);
-        let mut embedder = RecordingEmbedder::default();
-        let mut index = SemanticIndex::build_with_caps(
-            &root,
-            &[file.clone()],
-            &mut |texts| embedder.embed(texts),
-            16,
-            fingerprint.embed_text_caps,
-        )
-        .unwrap();
-        let old = build_file_summary_chunk(
-            &file,
-            &root,
-            source,
-            &["exported"],
-            &[Some("pub fn exported()")],
-        );
-        let summary = index
-            .entries
-            .iter_mut()
-            .find(|entry| entry.chunk.kind == SymbolKind::FileSummary)
-            .unwrap();
-        *summary = EmbeddingEntry::new(old.clone(), deterministic_test_vector(&old.embed_text));
-        index.set_fingerprint(fingerprint.clone());
-        assert!(index.write_to_disk(storage.path(), "summary-budget"));
-        let path = storage.path().join("semantic/summary-budget/semantic.bin");
-        let mut bytes = fs::read(&path).unwrap();
-        let len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
-        let mut identity: serde_json::Value = serde_json::from_slice(&bytes[13..13 + len]).unwrap();
-        identity
-            .as_object_mut()
-            .unwrap()
-            .remove("file_summary_budget_limited");
-        let legacy_identity = serde_json::to_vec(&identity).unwrap();
-        bytes.splice(13..13 + len, legacy_identity.iter().copied());
-        bytes[9..13].copy_from_slice(&(legacy_identity.len() as u32).to_le_bytes());
-        fs::write(path, bytes).unwrap();
-        (project, storage, root, fingerprint)
-    }
-
-    #[test]
-    fn audit10_9_legacy_small_cap_load_repairs_only_summaries_and_borrowers_adopt() {
-        let (_project, storage, root, fingerprint) = saved_pre_budget_summary_fixture(true);
-        let before =
-            SemanticIndex::read_from_disk_borrow_tolerant(storage.path(), "summary-budget", &root)
-                .unwrap();
-        assert!(!before.search(&[1.0, 0.0, 0.0, 0.0], 100).is_empty());
-        assert!(before
-            .live_entries()
-            .any(|(_, entry)| entry.chunk.kind == SymbolKind::FileSummary
-                && entry.chunk.embed_text.chars().count() > 70));
-        let symbols = |index: &SemanticIndex| {
-            index
-                .live_entries()
-                .filter(|(_, entry)| entry.chunk.kind != SymbolKind::FileSummary)
-                .map(|(_, entry)| (entry.chunk.name.clone(), entry.vector.to_vec()))
-                .collect::<Vec<_>>()
-        };
-        let symbols_before = symbols(&before);
-        assert_eq!(
-            symbols_before.len(),
-            1,
-            "the fixture must contain a reusable symbol vector"
-        );
-        let mut embedder = RecordingEmbedder::default();
-        let (repaired, changed) = SemanticIndex::read_from_disk_with_summary_repair(
-            storage.path(),
-            "summary-budget",
-            &root,
-            false,
-            Some(&fingerprint.as_string()),
-            &mut |texts| embedder.embed(texts),
-            16,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            changed,
-            "a legacy small-cap cache needs summary invalidation"
-        );
-        assert_eq!(embedder.total_embedded_texts(), 1);
-        assert!(embedder
-            .embedded_texts()
-            .iter()
-            .all(|text| text.contains("kind:file-summary") && text.chars().count() <= 70));
-        assert_eq!(symbols_before, symbols(&repaired));
-        assert!(repaired.write_to_disk(storage.path(), "summary-budget"));
-        let scanned = repaired
-            .append_scan_bytes_for_test(storage.path(), "summary-budget")
-            .unwrap();
-        assert!(
-            scanned
-                < fs::metadata(storage.path().join("semantic/summary-budget/semantic.bin"))
-                    .unwrap()
-                    .len() as usize
-        );
-        let after =
-            SemanticIndex::read_from_disk_borrow_tolerant(storage.path(), "summary-budget", &root)
-                .unwrap();
-        assert!(!after.search(&[1.0, 0.0, 0.0, 0.0], 100).is_empty());
-        assert!(after
-            .live_entries()
-            .filter(|(_, entry)| entry.chunk.kind == SymbolKind::FileSummary)
-            .all(|(_, entry)| entry.chunk.embed_text.chars().count() <= 70));
-        let mut again = RecordingEmbedder::default();
-        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
-            storage.path(),
-            "summary-budget",
-            &root,
-            false,
-            Some(&fingerprint.as_string()),
-            &mut |texts| again.embed(texts),
-            16,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!changed);
-        assert_eq!(again.total_embedded_texts(), 0);
-    }
-
-    #[test]
-    fn audit10_9_legacy_default_cap_load_does_not_rebuild_summaries() {
-        let (_project, storage, root, fingerprint) = saved_pre_budget_summary_fixture(false);
-        let path = storage.path().join("semantic/summary-budget/semantic.bin");
-        let before = fs::read(&path).unwrap();
-        let mut embedder = RecordingEmbedder::default();
-        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
-            storage.path(),
-            "summary-budget",
-            &root,
-            false,
-            Some(&fingerprint.as_string()),
-            &mut |texts| embedder.embed(texts),
-            16,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!changed);
-        assert_eq!(embedder.total_embedded_texts(), 0);
-        assert_eq!(fs::read(path).unwrap(), before);
-    }
-
-    #[test]
-    fn audit10_9_legacy_small_cap_fitting_summaries_persist_marker_without_embedding() {
-        let (_project, storage, root, identity) = saved_summary_fixture_for_tokens(Some(256));
-        let mut embedder = RecordingEmbedder::default();
-        let (index, changed) = SemanticIndex::read_from_disk_with_summary_repair(
-            storage.path(),
-            "summary-budget",
-            &root,
-            false,
-            Some(&identity.as_string()),
-            &mut |texts| embedder.embed(texts),
-            16,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(changed);
-        assert_eq!(embedder.total_embedded_texts(), 0);
-        assert!(index.write_to_disk(storage.path(), "summary-budget"));
-        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
-            storage.path(),
-            "summary-budget",
-            &root,
-            false,
-            Some(&identity.as_string()),
-            &mut |_| panic!("metadata-only repair must persist"),
-            16,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!changed);
-    }
-
-    #[test]
-    fn audit10_9_older_writer_delta_reopens_summary_repair() {
-        let (_project, storage, root, identity) = saved_pre_budget_summary_fixture(true);
-        let old =
-            SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
-                .unwrap();
-        let (fixed, _) = SemanticIndex::read_from_disk_with_summary_repair(
-            storage.path(),
-            "summary-budget",
-            &root,
-            false,
-            Some(&identity.as_string()),
-            &mut |texts: Vec<String>| {
-                Ok(texts
-                    .iter()
-                    .map(|text| deterministic_test_vector(text))
-                    .collect())
-            },
-            16,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(fixed.write_to_disk(storage.path(), "summary-budget"));
-        let paths = BTreeSet::from([root.join("summary.rs")]);
-        let frame = old.build_segment_frame(1, &paths).unwrap();
-        OpenOptions::new()
-            .append(true)
-            .open(storage.path().join("semantic/summary-budget/semantic.bin"))
-            .unwrap()
-            .write_all(&frame)
-            .unwrap();
-        let mut embedder = RecordingEmbedder::default();
-        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
-            storage.path(),
-            "summary-budget",
-            &root,
-            false,
-            Some(&identity.as_string()),
-            &mut |texts| embedder.embed(texts),
-            16,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            changed,
-            "an old writer's delta cannot retain the repaired marker"
-        );
-        assert_eq!(embedder.total_embedded_texts(), 1);
-    }
-
-    #[test]
-    fn audit10_9_summary_repair_failure_keeps_rows_and_marker_unchanged() {
-        let (_project, storage, root, _) = saved_pre_budget_summary_fixture(true);
-        let mut index =
-            SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
-                .unwrap();
-        let file = root.join("second.rs");
-        let source = "//! Another description long enough to exceed the small embedding budget.\npub fn second() {}\n";
-        fs::write(&file, source).unwrap();
-        let chunk = build_file_summary_chunk(
-            &file,
-            &root,
-            source,
-            &["second"],
-            &[Some("pub fn second()")],
-        );
-        let vector = deterministic_test_vector(&chunk.embed_text);
-        index.entries.push(EmbeddingEntry::new(chunk, vector));
-        let metadata = fs::metadata(&file).unwrap();
-        index
-            .file_mtimes
-            .insert(file.clone(), metadata.modified().unwrap());
-        index.file_sizes.insert(file.clone(), metadata.len());
-        index
-            .file_hashes
-            .insert(file, blake3::hash(source.as_bytes()));
-        let before = index.to_bytes();
-        let mut calls = 0;
-        let result = index.repair_legacy_file_summaries(
-            &mut |texts: Vec<String>| {
-                calls += 1;
-                if calls == 2 {
-                    return Err("backend interrupted".to_string());
-                }
-                Ok(texts
-                    .iter()
-                    .map(|text| deterministic_test_vector(text))
-                    .collect())
-            },
-            1,
-        );
-        assert!(result.is_err());
-        assert_eq!(calls, 2);
-        assert_eq!(index.to_bytes(), before);
     }
 
     #[test]
@@ -20709,37 +16655,6 @@ mod embedding_backend_retry_status_tests {
         assert!(lock._guard.is_some());
     }
 
-    #[test]
-    fn audit10_reuse_map_joins_only_requested_shared_paths() {
-        let mut index = audit10_vector_index(vec![vec![1.0, 0.0]; 64]);
-        for (i, entry) in index.entries.iter_mut().enumerate() {
-            entry.chunk.file = index.project_root.join(format!("file_{i}.rs"));
-            index
-                .file_mtimes
-                .insert(entry.chunk.file.clone(), SystemTime::UNIX_EPOCH);
-            index.file_sizes.insert(entry.chunk.file.clone(), 0);
-        }
-        let requested = index.entries[0].chunk.file.clone();
-        let mut worker = index.fork_for_refresh();
-        assert!(worker.shared_base.is_some());
-        SHARED_PATH_JOINS.with(|count| count.set(0));
-        let reuse = worker.build_chunk_reuse_map(std::slice::from_ref(&requested));
-        assert_eq!(reuse.len(), 1);
-        let rows = reuse[&requested].values().next().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(&*rows[0].vector, &[1.0, 0.0]);
-        SHARED_PATH_JOINS.with(|count| assert_eq!(count.get(), 1));
-        worker.tombstones.insert(
-            requested
-                .strip_prefix(&worker.project_root)
-                .unwrap()
-                .to_path_buf(),
-        );
-        SHARED_PATH_JOINS.with(|count| count.set(0));
-        assert!(worker.build_chunk_reuse_map(&[requested]).is_empty());
-        SHARED_PATH_JOINS.with(|count| assert_eq!(count.get(), 0));
-    }
-
     fn audit10_vector_index(vectors: Vec<Vec<f32>>) -> SemanticIndex {
         let root = std::env::current_dir().unwrap();
         let file = root.join("vectors.rs");
@@ -20795,54 +16710,6 @@ mod embedding_backend_retry_status_tests {
                 SemanticIndex::from_bytes(&index.to_bytes(), &index.project_root).unwrap_err();
             assert!(error.contains("non-finite"), "{error}");
         }
-    }
-
-    #[test]
-    fn audit10_semantic_view_rejects_nonfinite_vectors() {
-        let producer = ViewPayloadProducer {
-            chunker_version: "1",
-            template_version: "1",
-            model_fingerprint: "test",
-        };
-        let run = SemanticVectors {
-            entries: audit10_vector_index(vec![vec![f32::NAN, 1.0]]).entries,
-            provider_refused_chunks: 0,
-        };
-        let bytes = run.encode_view_payload(&producer);
-        assert!(
-            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
-                .is_err()
-        );
-        let valid = SemanticVectors {
-            entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
-            provider_refused_chunks: 0,
-        };
-        let bytes = valid.encode_view_payload(&producer);
-        let decoded =
-            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
-                .unwrap();
-        assert_eq!(decoded.encode_view_payload(&producer), bytes);
-    }
-
-    #[test]
-    fn audit10_semantic_view_rejects_unknown_kind() {
-        let producer = ViewPayloadProducer {
-            chunker_version: "1",
-            template_version: "1",
-            model_fingerprint: "test",
-        };
-        let run = SemanticVectors {
-            entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
-            provider_refused_chunks: 0,
-        };
-        let mut bytes = run.encode_view_payload(&producer);
-        let name = b"audit_vector_0";
-        let offset = bytes.windows(name.len()).position(|w| w == name).unwrap();
-        bytes[offset + name.len() + 4] = 255;
-        assert!(
-            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
-                .is_err()
-        );
     }
 
     #[test]
@@ -20990,24 +16857,6 @@ mod embedding_backend_retry_status_tests {
     // own record runs first with its schedule position; the loop then stamps
     // the backoff it computed, so a loop on its fourth attempt (60 s) never
     // shows the builder's first-attempt 15 s.
-    #[test]
-    fn loop_deadline_overrides_the_builder_schedule_position() {
-        let root = unique_root("loop-deadline");
-        record_embedding_backend_build_failure_for_test(&root, "connection refused");
-        let before = unix_millis_now();
-        record_embedding_backend_retry_deadline(
-            &root,
-            "connection refused",
-            std::time::Duration::from_secs(60),
-        );
-        let health = embedding_backend_build_health(&root).expect("status recorded");
-        assert!(
-            health.next_retry_ms >= before + 60_000,
-            "deadline {} is not the loop's 60 s backoff from {before}",
-            health.next_retry_ms
-        );
-        clear_embedding_backend_build_failure(&root);
-    }
 
     // A parked status must not outlive the loop that would retry it.
     #[test]

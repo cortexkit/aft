@@ -9,10 +9,17 @@
 //! per-block translation of those keys into canonical ones, validation of a
 //! resolved configuration object and the migration-notice projection digest.
 //!
-//! Retired keys are never refused. Every load translates them in memory into
-//! their current equivalents, and the current keys then pass through the
-//! normal user/project trust rules. The user's own file is additionally
-//! rewritten on disk by [`crate::config_fix::auto_migrate_user_config`]; a
+//! A name retired two or more releases ago ([`REFUSED_RETIRED_PATHS`] and the
+//! prefixed tool names in [`LEGACY_TOOL_ALIASES`]) is refused with
+//! `removed_config_key`. The translation below still covers those names,
+//! because `aft doctor --fix` and the automatic rewrite of the user file
+//! ([`crate::config_fix::auto_migrate_user_config`]) build their rewrite from
+//! it; ordinary loading refuses them before translating. Names retired more
+//! recently are translated in memory into their current equivalents on every
+//! load, and the current keys then pass through the normal user/project trust
+//! rules. The keys the per-repository data store retires
+//! ([`DATA_LAYER_RETIRED_PATHS`]) get a notice until
+//! [`DATA_LAYER_KEYS_REFUSED_FROM`] and are refused from that release on. A
 //! project file is never written, only reported with a notice. The TypeScript plugins carry a mirror of
 //! the same rules in `packages/aft-bridge/src/feature-config.ts`; the config
 //! parity fixtures and the shared notice-projection fixtures keep them equal.
@@ -98,19 +105,128 @@ pub const REMOVED_OPENCODE_PATHS: [(&str, &str); 2] = [
     ("opencode.server_password_env", "permission.assert"),
 ];
 
-/// Removed transport settings fail only in the base and first-level harness blocks.
+/// Keys the per-repository data store leaves with nothing to do. A config
+/// file that sets one gets a notice saying it no longer does anything, and
+/// `doctor --fix` deletes it, but the automatic rewrite of the user file
+/// leaves it in place. Until the code that reads them (index views, and the
+/// path that serves a worktree from another checkout's indexes) is deleted,
+/// the values a file supplies still reach `ViewsConfig` and `WorktreeConfig`, so
+/// translation keeps them in the document. From
+/// [`DATA_LAYER_KEYS_REFUSED_FROM`] a config that sets one is refused.
+/// Mirrors the TypeScript `REMOVED_DATA_LAYER_PATHS`.
+pub const REMOVED_DATA_LAYER_PATHS: [&str; 3] = [
+    "views.callgraph_copies",
+    "views.enabled",
+    "worktree.ram_overlay",
+];
+
+/// `views.idle_checkout_hours` and the key that replaces it. It is translated
+/// like any retired key (and the user file rewritten) until
+/// [`DATA_LAYER_KEYS_REFUSED_FROM`], then refused.
+pub const RETIRED_IDLE_CHECKOUT_HOURS: (&str, &str) =
+    ("views.idle_checkout_hours", "idle.checkout_hours");
+
+/// First release, as (major, minor), that refuses the keys in
+/// [`DATA_LAYER_RETIRED_PATHS`] with `removed_config_key`. Earlier releases
+/// translate or keep them, with a notice. Mirrors the TypeScript
+/// `DATA_LAYER_KEYS_REFUSED_FROM`.
+pub const DATA_LAYER_KEYS_REFUSED_FROM: (u64, u64) = (0, 65);
+
+/// Every key the data-layer cutover retires, refused from
+/// [`DATA_LAYER_KEYS_REFUSED_FROM`].
+pub const DATA_LAYER_RETIRED_PATHS: [&str; 4] = [
+    "views.callgraph_copies",
+    "views.enabled",
+    "views.idle_checkout_hours",
+    "worktree.ram_overlay",
+];
+
+/// The (major, minor) release a version string names, ignoring the patch and
+/// any pre-release or build suffix.
+fn parse_release(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// The (major, minor) release of this build, from the crate version.
+pub fn running_release() -> (u64, u64) {
+    parse_release(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0))
+}
+
+/// `0.65.0` for [`DATA_LAYER_KEYS_REFUSED_FROM`], as notices print it.
+fn refused_from_version() -> String {
+    let (major, minor) = DATA_LAYER_KEYS_REFUSED_FROM;
+    format!("{major}.{minor}.0")
+}
+
+/// Removed settings fail only in the base and first-level harness blocks.
 pub fn removed_config_key_errors(map: &Map<String, Value>) -> Vec<String> {
-    let mut errors = removed_opencode_key_errors(map);
+    removed_config_key_errors_at(map, running_release())
+}
+
+/// [`removed_config_key_errors`] for one config file. Names retired in 0.62
+/// or earlier ([`REFUSED_RETIRED_PATHS`] and the prefixed tool names) refuse
+/// only the user file, which AFT rewrites itself. A project file belongs to
+/// its repository, where a refusal would leave everyone who opens it without
+/// AFT until a tracked file is edited, so those names are translated with a
+/// notice there. Settings removed outright still refuse either file. Mirrors
+/// the plugins' `removedConfigKeyErrors(..., refuseRetired)`.
+pub fn removed_config_key_errors_for_file(
+    map: &Map<String, Value>,
+    user_file: bool,
+) -> Vec<String> {
+    removed_errors(map, running_release(), user_file)
+}
+
+/// [`removed_config_key_errors`] as the release `release` judges it: the
+/// data-layer keys fail only from [`DATA_LAYER_KEYS_REFUSED_FROM`].
+pub fn removed_config_key_errors_at(map: &Map<String, Value>, release: (u64, u64)) -> Vec<String> {
+    removed_errors(map, release, true)
+}
+
+fn removed_errors(
+    map: &Map<String, Value>,
+    release: (u64, u64),
+    refuse_retired: bool,
+) -> Vec<String> {
+    let mut errors = removed_block_key_errors(map, release, refuse_retired);
     if let Some(harnesses) = map.get("harnesses").and_then(Value::as_object) {
         for (name, block) in harnesses {
             if let Some(block) = block.as_object() {
-                for error in removed_opencode_key_errors(block) {
+                for error in removed_block_key_errors(block, release, refuse_retired) {
                     errors.push(error.replacen(
                         "removed_config_key:",
                         &format!("removed_config_key:harnesses.{name}."),
                         1,
                     ));
                 }
+            }
+        }
+    }
+    errors
+}
+
+fn removed_block_key_errors(
+    map: &Map<String, Value>,
+    release: (u64, u64),
+    refuse_retired: bool,
+) -> Vec<String> {
+    let mut errors = removed_opencode_key_errors(map);
+    if refuse_retired {
+        errors.extend(
+            refused_retired_names(map).into_iter().map(|name| {
+                format!("removed_config_key:{name}; run npx @cortexkit/aft doctor --fix")
+            }),
+        );
+    }
+    if release >= DATA_LAYER_KEYS_REFUSED_FROM {
+        for path in DATA_LAYER_RETIRED_PATHS {
+            if has_path(map, path) {
+                errors.push(format!(
+                    "removed_config_key:{path}; run npx @cortexkit/aft doctor --fix"
+                ));
             }
         }
     }
@@ -124,10 +240,62 @@ fn removed_opencode_key_errors(map: &Map<String, Value>) -> Vec<String> {
     let mut errors = Vec::new();
     for (path, _) in REMOVED_OPENCODE_PATHS {
         if opencode.contains_key(path.strip_prefix("opencode.").unwrap()) {
-            errors.push(format!("removed_config_key:{path}; run aft doctor --fix"));
+            errors.push(format!(
+                "removed_config_key:{path}; run npx @cortexkit/aft doctor --fix"
+            ));
         }
     }
     errors
+}
+
+/// Names retired in 0.62 or earlier, refused from 0.64, in the order a
+/// refusal lists them. A config that still sets one is refused with
+/// `removed_config_key`; `doctor --fix` (or the automatic rewrite of the user
+/// file) replaces it with its current equivalent or deletes it. Names retired
+/// more recently (`bridge.hang_threshold` and the data-layer keys) are not
+/// listed: they are still translated, with a notice. Mirrors the TypeScript
+/// `REFUSED_RETIRED_PATHS`.
+pub const REFUSED_RETIRED_PATHS: [&str; 20] = [
+    "sandbox.enabled",
+    "tool_surface",
+    "hoist_builtin_tools",
+    "enabled",
+    "search_index",
+    "experimental_search_index",
+    "semantic_search",
+    "experimental_semantic_search",
+    "callgraph_store",
+    "github.enabled",
+    "gh_read",
+    "gh_shim.enabled",
+    "experimental_lsp_ty",
+    "experimental_bash_rewrite",
+    "experimental_bash_compress",
+    "experimental_bash_background",
+    "experimental.bash",
+    "idle.lsp_ttl_minutes",
+    "inspect.tier2_soft_deadline_ms",
+    "inspect.max_drill_down_items",
+];
+
+/// The refused retired names one block sets: the paths in
+/// [`REFUSED_RETIRED_PATHS`], then each prefixed tool name
+/// ([`LEGACY_TOOL_ALIASES`]) its `disabled_tools` list contains, once each and
+/// by its bare name, as the retired-key notices list it.
+fn refused_retired_names(map: &Map<String, Value>) -> Vec<String> {
+    let mut names: Vec<String> = REFUSED_RETIRED_PATHS
+        .iter()
+        .filter(|path| has_path(map, path))
+        .map(|path| (*path).to_string())
+        .collect();
+    if let Some(Value::Array(entries)) = map.get("disabled_tools") {
+        for name in entries.iter().filter_map(Value::as_str) {
+            if legacy_tool_alias(name).is_some() && !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Retired top-level (or nested) config paths and their replacement.
@@ -166,7 +334,13 @@ pub const REMOVED_INSPECT_LSP_PATHS: [(&str, &str); 3] = [
 /// `bridge.hang_threshold` counted request timeouts toward restarting the
 /// bridge; a timeout now fails only its own request, and the bridge's hang
 /// watchdog judges a stuck child by its silence instead.
-pub const REMOVED_NO_EFFECT_PATHS: [(&str, &str); 1] = [("bridge.hang_threshold", "")];
+/// `inspect.tier2_idle_minutes` delayed the whole-repository analyses the
+/// OpenCode plugin started when a session went idle; those analyses now run
+/// only when `aft_inspect` is called.
+pub const REMOVED_NO_EFFECT_PATHS: [(&str, &str); 2] = [
+    ("bridge.hang_threshold", ""),
+    ("inspect.tier2_idle_minutes", ""),
+];
 
 /// Notice sentence for a retired `bridge.hang_threshold`. Mirrors the
 /// TypeScript `RETIRED_HANG_THRESHOLD_NOTE`.
@@ -238,6 +412,12 @@ pub struct DocumentTranslation {
     /// key inside a harness block carries its `harnesses.<id>.` prefix; a
     /// prefixed tool name inside `disabled_tools` is listed by that name.
     pub retired_keys: Vec<String>,
+    /// Every removed data-layer key ([`REMOVED_DATA_LAYER_PATHS`]) the
+    /// document supplied, sorted and de-duplicated, with the same harness
+    /// prefix as `retired_keys`. Translation keeps these keys in the document
+    /// and they never set `legacy_input`, so the automatic rewrite of the user
+    /// file leaves them alone; they get their own notice instead.
+    pub removed_keys: Vec<String>,
 }
 
 /// Record one supplied retired key of the block whose key prefix is `prefix`.
@@ -450,15 +630,69 @@ fn drop_no_effect_paths(map: &mut Map<String, Value>, prefix: &str, out: &mut Do
     }
 }
 
+/// The `idle.checkout_hours` value a retired `views.idle_checkout_hours`
+/// value becomes: a whole number clamped to the current range, or the default
+/// for anything else. Shared by load-time translation and `doctor --fix`;
+/// mirrors the TypeScript translation.
+pub fn retired_idle_checkout_hours(value: &Value) -> i64 {
+    safe_whole_number(value)
+        .unwrap_or(i64::from(crate::config::DEFAULT_IDLE_CHECKOUT_HOURS))
+        .clamp(
+            i64::from(crate::config::MIN_IDLE_CHECKOUT_HOURS),
+            i64::from(crate::config::MAX_IDLE_CHECKOUT_HOURS),
+        )
+}
+
+/// Translate the keys the data-layer cutover retires in one block:
+/// `views.idle_checkout_hours` becomes `idle.checkout_hours` (clamped to its
+/// range) unless that is already set, exactly as `doctor --fix` rewrites it.
+/// The removed keys ([`REMOVED_DATA_LAYER_PATHS`]) are only listed: their
+/// values stay in the document until the code that reads them is deleted.
+fn translate_data_layer_paths(
+    map: &mut Map<String, Value>,
+    prefix: &str,
+    out: &mut DocumentTranslation,
+) {
+    let (retired, replacement) = RETIRED_IDLE_CHECKOUT_HOURS;
+    if let Some(value) = take_nested(map, "views", "idle_checkout_hours") {
+        record_retired(out, prefix, retired);
+        if map
+            .get("idle")
+            .and_then(|idle| idle.get("checkout_hours"))
+            .is_some()
+        {
+            superseded(
+                out,
+                format!("{prefix}{retired}"),
+                format!("{retired} is ignored because {replacement} is set"),
+            );
+        } else {
+            let hours = retired_idle_checkout_hours(&value);
+            let idle = map
+                .entry("idle".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(idle) = idle {
+                idle.insert("checkout_hours".to_string(), Value::from(hours));
+            }
+        }
+    }
+    for path in REMOVED_DATA_LAYER_PATHS {
+        if has_path(map, path) {
+            out.removed_keys.push(format!("{prefix}{path}"));
+        }
+    }
+}
+
 /// What a retired `enabled: false` no longer does. The translation only hides
 /// tools; indexing continues, so a user who relied on it to keep AFT out of a
 /// repository must also switch the indexes off. Mirrors the TypeScript
 /// `RETIRED_ENABLED_FALSE_INDEXES_NOTE`.
 pub const RETIRED_ENABLED_FALSE_INDEXES_NOTE: &str = "enabled: false no longer turns AFT off: it is translated to disabling every tool, but the trigram, semantic and callgraph indexes still build. To keep AFT from indexing this repository, also set indexes.trigram, indexes.semantic and indexes.callgraph to false.";
 
-/// Translate flat experimental aliases to nested settings. Graduating
-/// `experimental.bash` explicitly sets omitted feature flags to false;
-/// otherwise the current default-on bash settings would silently enable them.
+/// Translate flat experimental aliases to nested settings and move the
+/// `experimental.bash` block to top-level `bash`. Graduating a block that sets
+/// a feature flag explicitly sets its omitted flags to false; otherwise the
+/// current default-on bash settings would silently enable them.
 fn translate_experimental_paths(
     map: &mut Map<String, Value>,
     prefix: &str,
@@ -515,11 +749,8 @@ fn translate_experimental_paths(
         return;
     };
     if let Some(legacy) = legacy.as_object() {
-        if !["rewrite", "compress", "background"]
-            .iter()
-            .any(|leaf| legacy.contains_key(*leaf))
-        {
-            return;
+        if legacy.is_empty() {
+            record_retired(out, prefix, "experimental.bash");
         }
         for leaf in legacy.keys() {
             record_retired(out, prefix, &format!("experimental.bash.{leaf}"));
@@ -533,11 +764,19 @@ fn translate_experimental_paths(
             );
         } else {
             let mut bash = Map::new();
-            for leaf in ["rewrite", "compress", "background"] {
-                bash.insert(
-                    leaf.to_string(),
-                    Value::Bool(legacy.get(leaf) == Some(&Value::Bool(true))),
-                );
+            // A block with only reminder settings never opted into the
+            // feature flags, so they keep their current defaults instead of
+            // being written as false.
+            if ["rewrite", "compress", "background"]
+                .iter()
+                .any(|leaf| legacy.contains_key(*leaf))
+            {
+                for leaf in ["rewrite", "compress", "background"] {
+                    bash.insert(
+                        leaf.to_string(),
+                        Value::Bool(legacy.get(leaf) == Some(&Value::Bool(true))),
+                    );
+                }
             }
             for leaf in [
                 "long_running_reminder_enabled",
@@ -547,7 +786,9 @@ fn translate_experimental_paths(
                     bash.insert(leaf.to_string(), value.clone());
                 }
             }
-            map.insert("bash".to_string(), Value::Object(bash));
+            if !bash.is_empty() {
+                map.insert("bash".to_string(), Value::Object(bash));
+            }
         }
     } else {
         record_retired(out, prefix, "experimental.bash");
@@ -583,6 +824,7 @@ fn translate_block(
     };
     translate_github_aliases(map, &prefix, out);
     translate_inspect_lsp_paths(map, &prefix, out);
+    translate_data_layer_paths(map, &prefix, out);
     drop_no_effect_paths(map, &prefix, out);
     translate_experimental_paths(map, &prefix, out);
     if let Some(Value::Object(sandbox)) = map.get_mut("sandbox") {
@@ -640,12 +882,9 @@ fn translate_block(
         }
     }
 
+    // `experimental.bash` was already recorded, leaf by leaf, and removed by
+    // `translate_experimental_paths`.
     for (path, _) in RETIRED_PATHS {
-        // A block with only reminder settings never opted into experimental
-        // bash features. Leave it unchanged instead of adding false flags.
-        if path == "experimental.bash" {
-            continue;
-        }
         if has_path(map, path) {
             record_retired(out, &prefix, path);
         }
@@ -855,6 +1094,8 @@ pub fn translate_document(map: &mut Map<String, Value>, tier: DocumentTier) -> D
     }
     out.retired_keys.sort();
     out.retired_keys.dedup();
+    out.removed_keys.sort();
+    out.removed_keys.dedup();
     out
 }
 
@@ -870,11 +1111,15 @@ fn has_enabled_false_note(translation: &DocumentTranslation) -> bool {
 /// says so. Nothing is applied for them, so a notice never counts them among
 /// the keys whose "current equivalents" were applied. Kept in key order;
 /// mirrors the TypeScript `NO_EFFECT_RETIRED_NOTES`.
-pub const NO_EFFECT_RETIRED_NOTES: [(&str, &str); 3] = [
+pub const NO_EFFECT_RETIRED_NOTES: [(&str, &str); 4] = [
     ("bridge.hang_threshold", RETIRED_HANG_THRESHOLD_NOTE),
     (
         "inspect.max_drill_down_items",
         "inspect.max_drill_down_items never had an effect, so the setting can be removed.",
+    ),
+    (
+        "inspect.tier2_idle_minutes",
+        "inspect.tier2_idle_minutes no longer does anything: AFT runs whole-repository analyses only when aft_inspect is called, so the setting can be removed.",
     ),
     (
         "inspect.tier2_soft_deadline_ms",
@@ -887,22 +1132,56 @@ pub const NO_EFFECT_RETIRED_NOTES: [(&str, &str); 3] = [
 fn no_effect_note(key: &str) -> Option<&'static str> {
     NO_EFFECT_RETIRED_NOTES
         .iter()
-        .find(|(path, _)| {
-            key == *path
-                || key
-                    .strip_suffix(path)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-        })
+        .find(|(path, _)| names_path(key, path))
         .map(|(_, note)| *note)
+}
+
+/// Whether `key`, which may carry a `harnesses.<id>.` prefix, is `path`.
+fn names_path(key: &str, path: &str) -> bool {
+    key == path
+        || key
+            .strip_suffix(path)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// Why each removed data-layer key no longer does anything, in
+/// [`REMOVED_DATA_LAYER_PATHS`] order. Mirrors the TypeScript
+/// `REMOVED_DATA_LAYER_NOTES`.
+pub const REMOVED_DATA_LAYER_NOTES: [(&str, &str); 3] = [
+    (
+        "views.callgraph_copies",
+        "views.callgraph_copies is gone because no checkout borrows another checkout's call graph any more.",
+    ),
+    (
+        "views.enabled",
+        "views.enabled is gone because AFT now keeps one index store per repository and always uses it.",
+    ),
+    (
+        "worktree.ram_overlay",
+        "worktree.ram_overlay is gone because every worktree now has its own index state, so there is no borrowed index to patch in memory.",
+    ),
+];
+
+/// The sentence saying a file that still names `views.idle_checkout_hours`
+/// will be refused. Mirrors the TypeScript `retiredIdleCheckoutHoursNote`.
+pub fn retired_idle_checkout_hours_note() -> String {
+    let (retired, replacement) = RETIRED_IDLE_CHECKOUT_HOURS;
+    format!(
+        "{retired} is now {replacement}; from {} AFT refuses a config file that still sets {retired}.",
+        refused_from_version()
+    )
 }
 
 /// Build a retired-key notice. `with_equivalents` renders the sentence about
 /// keys whose current equivalents were applied, given those keys joined by
 /// ", "; it is used only when there are such keys. The sentences for keys
 /// that no longer do anything follow, once each. A file whose only retired
-/// keys have no effect gets just those sentences.
+/// keys have no effect gets just those sentences. `still_in_file` is true
+/// when the file keeps the retired keys (it was not rewritten), so the notice
+/// warns about keys a later release refuses.
 fn retired_keys_notice(
     translation: &DocumentTranslation,
+    still_in_file: bool,
     with_equivalents: impl FnOnce(&str) -> String,
 ) -> String {
     let mut equivalents = Vec::new();
@@ -928,29 +1207,70 @@ fn retired_keys_notice(
         if has_enabled_false_note(translation) {
             parts.push(RETIRED_ENABLED_FALSE_INDEXES_NOTE.to_string());
         }
+        if still_in_file
+            && equivalents
+                .iter()
+                .any(|key| names_path(key, RETIRED_IDLE_CHECKOUT_HOURS.0))
+        {
+            parts.push(retired_idle_checkout_hours_note());
+        }
     }
     parts.extend(notes.into_iter().map(str::to_string));
     parts.join(" ")
 }
 
+/// Notice for a config file, user or project, that still sets removed
+/// data-layer keys. Empty when it sets none. The file is never rewritten for
+/// them automatically; `doctor --fix` deletes them. Mirrors the TypeScript
+/// `removedConfigKeysNoticeMessage`.
+pub fn removed_keys_notice(path: &str, translation: &DocumentTranslation) -> String {
+    if translation.removed_keys.is_empty() {
+        return String::new();
+    }
+    let mut parts = vec![format!(
+        "{path} sets removed keys ({}); AFT ignores them, and from {} it refuses a config file that sets them. Run `npx @cortexkit/aft doctor --fix` to remove them.",
+        translation.removed_keys.join(", "),
+        refused_from_version()
+    )];
+    for (key_path, note) in REMOVED_DATA_LAYER_NOTES {
+        if translation
+            .removed_keys
+            .iter()
+            .any(|key| names_path(key, key_path))
+        {
+            parts.push(note.to_string());
+        }
+    }
+    parts.join(" ")
+}
+
 /// Notice for a project config file whose retired keys were translated in
-/// memory. The file itself is never written: it is shared through the
-/// repository. Mirrors the TypeScript `legacyConfigNoticeMessage`.
+/// memory, followed by the notice for any removed keys it sets. The file
+/// itself is never written: it is shared through the repository. Mirrors the
+/// TypeScript `legacyConfigNoticeMessage`.
 pub fn project_retired_keys_notice(path: &str, translation: &DocumentTranslation) -> String {
-    retired_keys_notice(translation, |keys| {
+    let retired = retired_keys_notice(translation, true, |keys| {
         format!(
             "{path} uses retired keys ({keys}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file."
         )
-    })
+    });
+    let removed = removed_keys_notice(path, translation);
+    [retired, removed]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Notice for the user config file after AFT rewrote its retired keys.
+/// Notice for the user config file after AFT rewrote its retired keys. It
+/// names only the keys the rewrite replaced; removed keys the file still sets
+/// get their own notice ([`removed_keys_notice`]).
 pub fn user_config_migrated_notice(
     path: &str,
     backup: &str,
     translation: &DocumentTranslation,
 ) -> String {
-    retired_keys_notice(translation, |keys| {
+    retired_keys_notice(translation, false, |keys| {
         format!(
             "AFT updated {path}: its retired keys ({keys}) now use their current equivalents. The previous file is saved as {backup}."
         )
@@ -964,7 +1284,7 @@ pub fn user_config_not_migrated_notice(
     reason: &str,
     translation: &DocumentTranslation,
 ) -> String {
-    retired_keys_notice(translation, |keys| {
+    retired_keys_notice(translation, true, |keys| {
         format!(
             "{path} uses retired keys ({keys}); AFT applied their current equivalents but could not update the file ({reason}). Run `npx @cortexkit/aft doctor --fix` to update it."
         )
@@ -1043,8 +1363,14 @@ fn project_block(block: &Map<String, Value>) -> Value {
     let mut legacy_paths = Map::new();
     // Retired keys with no replacement are projected too: otherwise adding one
     // to a file whose notice was already acknowledged would keep the old
-    // digest and the saved record would hide the new notice.
-    for (path, _) in RETIRED_PATHS.into_iter().chain(REMOVED_NO_EFFECT_PATHS) {
+    // digest and the saved record would hide the new notice. The data-layer
+    // keys are projected for the same reason.
+    for path in RETIRED_PATHS
+        .into_iter()
+        .chain(REMOVED_NO_EFFECT_PATHS)
+        .map(|(path, _)| path)
+        .chain(DATA_LAYER_RETIRED_PATHS)
+    {
         let value = match path.split_once('.') {
             Some((container, leaf)) => block
                 .get(container)
@@ -1249,7 +1575,12 @@ mod tests {
         .unwrap();
         for case in fixture["cases"].as_array().unwrap() {
             let doc = case["doc"].as_object().unwrap();
-            let errors = removed_config_key_errors(doc);
+            // A case may name the release that judges it; the data-layer
+            // keys are refused only from DATA_LAYER_KEYS_REFUSED_FROM.
+            let errors = match case.get("release").and_then(Value::as_str) {
+                Some(release) => removed_config_key_errors_at(doc, parse_release(release).unwrap()),
+                None => removed_config_key_errors(doc),
+            };
             let expected = case["errors"]
                 .as_array()
                 .unwrap()
@@ -1681,6 +2012,203 @@ mod tests {
                 case["digest"].as_str().unwrap(),
                 "{}",
                 case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn release_parsing_reads_major_and_minor_only() {
+        assert_eq!(parse_release("0.65.0"), Some((0, 65)));
+        assert_eq!(parse_release("0.64.12-beta.1"), Some((0, 64)));
+        assert_eq!(parse_release("1.2"), Some((1, 2)));
+        assert_eq!(parse_release("latest"), None);
+        assert_eq!(
+            running_release(),
+            parse_release(env!("CARGO_PKG_VERSION")).unwrap()
+        );
+    }
+
+    /// Each data-layer key is accepted (with a notice) before 0.65.0 and
+    /// refused from it on, in the base block and in a harness block.
+    #[test]
+    fn each_data_layer_key_is_refused_only_from_the_refusing_release() {
+        assert_eq!(DATA_LAYER_KEYS_REFUSED_FROM, (0, 65));
+        for path in DATA_LAYER_RETIRED_PATHS {
+            let (container, leaf) = path.split_once('.').unwrap();
+            let base = json!({ container: { leaf: 1 } });
+            let harness = json!({ "harnesses": { "pi": { container: { leaf: 1 } } } });
+            for doc in [&base, &harness] {
+                let doc = doc.as_object().unwrap();
+                assert!(
+                    removed_config_key_errors_at(doc, (0, 64)).is_empty(),
+                    "{path}"
+                );
+            }
+            assert_eq!(
+                removed_config_key_errors_at(base.as_object().unwrap(), (0, 65)),
+                vec![format!(
+                    "removed_config_key:{path}; run npx @cortexkit/aft doctor --fix"
+                )]
+            );
+            assert_eq!(
+                removed_config_key_errors_at(harness.as_object().unwrap(), (0, 65)),
+                vec![format!(
+                    "removed_config_key:harnesses.pi.{path}; run npx @cortexkit/aft doctor --fix"
+                )]
+            );
+            assert_eq!(
+                removed_config_key_errors_at(base.as_object().unwrap(), (1, 0)).len(),
+                1,
+                "{path}"
+            );
+        }
+    }
+
+    /// `views.idle_checkout_hours` moves to `idle.checkout_hours`, clamped to
+    /// its range, unless that is already set; it is listed as a retired key
+    /// and so triggers the user file's automatic rewrite.
+    #[test]
+    fn retired_views_idle_checkout_hours_translates_like_doctor_fix() {
+        let (value, out) = translate(json!({
+            "views": {"idle_checkout_hours": 48},
+            "idle": {"root_ttl_minutes": 20},
+            "harnesses": {"pi": {"views": {"idle_checkout_hours": 0, "enabled": true}}}
+        }));
+        assert_eq!(
+            value,
+            json!({
+                "idle": {"root_ttl_minutes": 20, "checkout_hours": 48},
+                "harnesses": {"pi": {"views": {"enabled": true}, "idle": {"checkout_hours": 1}}}
+            })
+        );
+        assert!(out.legacy_input);
+        assert_eq!(
+            out.retired_keys,
+            vec![
+                "harnesses.pi.views.idle_checkout_hours",
+                "views.idle_checkout_hours"
+            ]
+        );
+        assert_eq!(out.removed_keys, vec!["harnesses.pi.views.enabled"]);
+
+        for (raw, hours) in [
+            (json!(9000), 8760),
+            (json!(12.0), 12),
+            (json!(12.5), 168),
+            (json!("never"), 168),
+        ] {
+            assert_eq!(retired_idle_checkout_hours(&raw), hours, "{raw}");
+        }
+
+        let (value, out) = translate(json!({
+            "views": {"idle_checkout_hours": 2},
+            "idle": {"checkout_hours": 5}
+        }));
+        assert_eq!(value, json!({"idle": {"checkout_hours": 5}}));
+        assert_eq!(out.warnings[0].code, "superseded_legacy_config");
+        assert_eq!(
+            out.warnings[0].message,
+            "views.idle_checkout_hours is ignored because idle.checkout_hours is set"
+        );
+    }
+
+    /// The removed keys stay in the document (their values still reach the
+    /// old code until it is deleted), are listed apart from the retired keys,
+    /// and never set `legacy_input`, so the user file is not rewritten for
+    /// them.
+    #[test]
+    fn removed_data_layer_keys_stay_in_the_document_and_are_listed_apart() {
+        let doc = json!({
+            "views": {"enabled": true, "callgraph_copies": 2},
+            "worktree": {"ram_overlay": false},
+            "harnesses": {"opencode": {"worktree": {"ram_overlay": true}}}
+        });
+        let (value, out) = translate(doc.clone());
+        assert_eq!(value, doc);
+        assert!(!out.legacy_input);
+        assert!(out.retired_keys.is_empty());
+        assert_eq!(
+            out.removed_keys,
+            vec![
+                "harnesses.opencode.worktree.ram_overlay",
+                "views.callgraph_copies",
+                "views.enabled",
+                "worktree.ram_overlay"
+            ]
+        );
+    }
+
+    #[test]
+    fn data_layer_notices_name_the_file_the_keys_and_the_refusing_release() {
+        let (_, removed) = translate(json!({
+            "views": {"enabled": true, "callgraph_copies": 2},
+            "worktree": {"ram_overlay": false}
+        }));
+        let lead = "/u/aft.jsonc sets removed keys (views.callgraph_copies, views.enabled, worktree.ram_overlay); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run `npx @cortexkit/aft doctor --fix` to remove them.";
+        let reasons = REMOVED_DATA_LAYER_NOTES
+            .iter()
+            .map(|(_, note)| *note)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            removed_keys_notice("/u/aft.jsonc", &removed),
+            format!("{lead} {reasons}")
+        );
+        // Only the reasons for the keys the file sets, harness prefix or not.
+        let (_, one) = translate(json!({"harnesses": {"pi": {"worktree": {"ram_overlay": true}}}}));
+        assert_eq!(
+            removed_keys_notice("/p", &one),
+            format!(
+                "/p sets removed keys (harnesses.pi.worktree.ram_overlay); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run `npx @cortexkit/aft doctor --fix` to remove them. {}",
+                REMOVED_DATA_LAYER_NOTES[2].1
+            )
+        );
+        assert_eq!(
+            removed_keys_notice("/p", &DocumentTranslation::default()),
+            ""
+        );
+        // A project file that only sets removed keys gets just that notice.
+        assert_eq!(
+            project_retired_keys_notice("/u/aft.jsonc", &removed),
+            format!("{lead} {reasons}")
+        );
+
+        let (_, both) = translate(json!({
+            "views": {"idle_checkout_hours": 24, "enabled": true}
+        }));
+        let idle_note = "views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours.";
+        assert_eq!(retired_idle_checkout_hours_note(), idle_note);
+        assert_eq!(
+            project_retired_keys_notice("/p", &both),
+            format!(
+                "/p uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file. {idle_note} /p sets removed keys (views.enabled); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run `npx @cortexkit/aft doctor --fix` to remove them. {}",
+                REMOVED_DATA_LAYER_NOTES[1].1
+            )
+        );
+        // The automatic rewrite replaced the retired key, so its notice names
+        // only that key and says nothing about refusal or the removed key.
+        assert_eq!(
+            user_config_migrated_notice("/u", "/u.bak-1", &both),
+            "AFT updated /u: its retired keys (views.idle_checkout_hours) now use their current equivalents. The previous file is saved as /u.bak-1."
+        );
+        assert_eq!(
+            user_config_not_migrated_notice("/u", "read-only", &both),
+            format!("/u uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents but could not update the file (read-only). Run `npx @cortexkit/aft doctor --fix` to update it. {idle_note}")
+        );
+    }
+
+    /// Adding a data-layer key to a file whose notice was acknowledged is a
+    /// new notice identity, so the new notice is not hidden.
+    #[test]
+    fn adding_a_data_layer_key_changes_the_notice_identity() {
+        let digest = |doc: Value| notice_digest(&notice_projection(doc.as_object()));
+        let acknowledged = digest(json!({"search_index": false}));
+        for path in DATA_LAYER_RETIRED_PATHS {
+            let (container, leaf) = path.split_once('.').unwrap();
+            assert_ne!(
+                acknowledged,
+                digest(json!({"search_index": false, container: { leaf: 1 }})),
+                "{path}"
             );
         }
     }

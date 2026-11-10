@@ -53,11 +53,7 @@ export interface StatusBar {
   disabled_categories?: string[];
   errors?: number;
   warnings?: number;
-  dead_code?: number;
-  unused_exports?: number;
-  duplicates?: number;
   todos?: number;
-  tier2_stale?: boolean;
 }
 
 export interface AftStatusSnapshot {
@@ -194,30 +190,15 @@ function readStatusBar(value: unknown): StatusBar | undefined {
     : [];
   const errors = readOptionalNumber(bar.errors);
   const warnings = readOptionalNumber(bar.warnings);
-  const deadCode = readOptionalNumber(bar.dead_code);
-  const unusedExports = readOptionalNumber(bar.unused_exports);
-  const duplicates = readOptionalNumber(bar.duplicates);
   const todos = readOptionalNumber(bar.todos);
-  if (
-    errors === null &&
-    warnings === null &&
-    deadCode === null &&
-    unusedExports === null &&
-    duplicates === null &&
-    todos === null &&
-    disabled.length === 0
-  ) {
+  if (errors === null && warnings === null && todos === null && disabled.length === 0) {
     return undefined;
   }
   return {
     ...(disabled.length > 0 ? { disabled_categories: disabled } : {}),
     ...(errors !== null ? { errors } : {}),
     ...(warnings !== null ? { warnings } : {}),
-    ...(deadCode !== null ? { dead_code: deadCode } : {}),
-    ...(unusedExports !== null ? { unused_exports: unusedExports } : {}),
-    ...(duplicates !== null ? { duplicates } : {}),
     ...(todos !== null ? { todos } : {}),
-    ...(bar.tier2_stale === true ? { tier2_stale: true } : {}),
   };
 }
 
@@ -417,13 +398,10 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     const rows = [
       ["errors", sb.errors],
       ["warnings", sb.warnings],
-      ["dead code", sb.dead_code],
-      ["unused exports", sb.unused_exports],
-      ["duplicates", sb.duplicates],
       ["todos", sb.todos],
     ].filter((row): row is [string, number] => typeof row[1] === "number");
     if (rows.length > 0) {
-      lines.push("", `Code Health${sb.tier2_stale ? " (~ stale)" : ""}`);
+      lines.push("", "Code Health");
       for (const [label, value] of rows) lines.push(`- ${label}: ${formatCount(value)}`);
     }
   }
@@ -563,13 +541,10 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     const rows = [
       ["Errors", sb.errors],
       ["Warnings", sb.warnings],
-      ["Dead code", sb.dead_code],
-      ["Unused exports", sb.unused_exports],
-      ["Duplicates", sb.duplicates],
       ["TODOs", sb.todos],
     ].filter((row): row is [string, number] => typeof row[1] === "number");
     if (rows.length > 0) {
-      lines.push("", `### Code Health${sb.tier2_stale ? " (~ stale)" : ""}`);
+      lines.push("", "### Code Health");
       for (const [label, value] of rows) lines.push(`- **${label}:** ${formatCount(value)}`);
     }
   }

@@ -431,6 +431,7 @@ pub(crate) fn format_ranked_page(
     summary: &GrepResult,
     project_root: &Path,
 ) -> String {
+    let project_root = super::result_display_root(project_root);
     let mut sections = Vec::with_capacity(page.len());
     for file in page {
         let path = &file.lines[0].file;

@@ -61,24 +61,6 @@ pub(crate) fn acquire_blocking_while_with_limiter(
     acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, || false)
 }
 
-/// Same admission as [`acquire_blocking_while_with_limiter`], but the holder
-/// and queue census name `root` instead of `unknown`. The root is a label only:
-/// unlike [`ColdBuildAdmissionRequest::for_root`] it does not let other builds
-/// for the same root share this permit, so slot accounting is unchanged.
-pub(crate) fn acquire_blocking_while_for_root_with_limiter(
-    limiter: &Arc<ColdBuildLimiter>,
-    kind: &str,
-    root: &std::path::Path,
-    admitted: impl Fn() -> bool,
-) -> Option<ColdBuildPermit> {
-    let request = ColdBuildAdmissionRequest::labelled_with_root(
-        root.display().to_string(),
-        kind,
-        ColdBuildAdmissionClass::Maintenance,
-    );
-    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, || false)
-}
-
 /// Identify the source of a cold-build request without exposing a limiter knob.
 ///
 /// The classes deliberately have no absolute priority ordering. When a class
@@ -150,21 +132,6 @@ impl ColdBuildAdmissionRequest {
         }
     }
 
-    /// A request whose census entry names `root` without joining that root's
-    /// shared permit.
-    pub(crate) fn labelled_with_root(
-        root: impl Into<String>,
-        request_id: impl Into<String>,
-        class: ColdBuildAdmissionClass,
-    ) -> Self {
-        Self {
-            request_id: request_id.into(),
-            root: None,
-            census_root: Some(root.into()),
-            class,
-        }
-    }
-
     fn census_label(&self) -> Option<&str> {
         self.root.as_deref().or(self.census_root.as_deref())
     }
@@ -201,7 +168,8 @@ pub(crate) struct ColdBuildLimiterCensus {
 }
 
 /// Attempt immediate admission without bypassing queued requests from the other
-/// class. Background schedulers use this when they can defer rejected work.
+/// class. Tests use it to hold a slot of a given class.
+#[cfg(test)]
 pub(crate) fn try_acquire_classified_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     request: &ColdBuildAdmissionRequest,
@@ -366,15 +334,6 @@ pub(crate) fn test_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
     Arc::new(ColdBuildLimiter::new(limit))
 }
 
-#[cfg(test)]
-pub(crate) fn acquire_blocking_while_with_test_limiter(
-    limiter: &Arc<ColdBuildLimiter>,
-    kind: &str,
-    admitted: impl Fn() -> bool,
-) -> Option<ColdBuildPermit> {
-    acquire_blocking_while_with_limiter(limiter, kind, admitted)
-}
-
 #[derive(Debug)]
 pub(crate) struct ColdBuildLimiter {
     available: AtomicUsize,
@@ -519,13 +478,6 @@ impl ColdBuildLimiter {
             #[cfg(test)]
             refusal_observer: Mutex::new(None),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn observe_refusals_for_test(&self) -> crossbeam_channel::Receiver<String> {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        *self.refusal_observer.lock().unwrap() = Some(tx);
-        rx
     }
 
     pub(crate) fn limit(&self) -> usize {
@@ -956,31 +908,6 @@ mod tests {
             );
             std::thread::yield_now();
         }
-    }
-
-    #[test]
-    fn root_labelled_permits_name_the_root_without_sharing_a_slot() {
-        let limiter = test_limiter(4);
-        let root = std::path::Path::new("/work/labelled-root");
-        let first = acquire_blocking_while_for_root_with_limiter(&limiter, "first", root, || true)
-            .expect("first labelled permit");
-        let second =
-            acquire_blocking_while_for_root_with_limiter(&limiter, "second", root, || true)
-                .expect("second labelled permit");
-
-        let census = limiter.census();
-        assert_eq!(census.holders.len(), 2, "{census:?}");
-        assert!(census
-            .holders
-            .iter()
-            .all(|holder| holder.root == root.display().to_string() && holder.sharers == 1));
-        assert_eq!(
-            limiter.available.load(Ordering::Acquire),
-            2,
-            "a root label must not merge two builds into one shared slot"
-        );
-        drop((first, second));
-        assert_eq!(limiter.available.load(Ordering::Acquire), 4);
     }
 
     #[test]

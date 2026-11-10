@@ -70,6 +70,7 @@ pub struct NotFoundAnswer {
 impl NotFoundAnswer {
     /// The reply text, with paths shown relative to `display_root`.
     pub fn render(&self, display_root: &Path) -> String {
+        let display_root = super::result_display_root(display_root);
         if self.names.is_empty() {
             return format!(
                 "`{}` not found in this project, and no similar names were found.",
@@ -146,17 +147,34 @@ pub fn nearest_names<'a>(
     let mut locations: HashMap<String, (bool, NearestName)> = HashMap::new();
     let mut occurrences = 0usize;
 
+    let request_files = super::request_files::current();
     for path in files.into_iter().take(NEAREST_NAME_FILE_LIMIT) {
         if occurrences >= NEAREST_NAME_MAX_OCCURRENCES {
             break;
         }
-        let Ok(metadata) = std::fs::metadata(path) else {
-            continue;
+        // A file this search request already read is scanned from those
+        // bytes rather than read again.
+        let file = match request_files.as_ref().and_then(|files| files.kept(path)) {
+            Some(file) if file.bytes().len() as u64 > NEAREST_NAME_MAX_FILE_BYTES => continue,
+            Some(file) => file,
+            None => {
+                let Ok(metadata) = std::fs::metadata(path) else {
+                    continue;
+                };
+                if metadata.len() > NEAREST_NAME_MAX_FILE_BYTES {
+                    continue;
+                }
+                let Ok(fetched) = super::request_files::read_through(
+                    request_files.as_deref(),
+                    path,
+                    super::request_files::read_whole_file,
+                ) else {
+                    continue;
+                };
+                fetched.file
+            }
         };
-        if metadata.len() > NEAREST_NAME_MAX_FILE_BYTES {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Some(text) = file.utf8() else {
             continue;
         };
 

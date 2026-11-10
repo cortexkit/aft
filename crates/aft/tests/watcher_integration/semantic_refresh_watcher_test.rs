@@ -690,14 +690,18 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     );
     wait_for_semantic_status(&mut owner, "owner semantic index", |response| {
         response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["entries"].as_u64().unwrap_or(0) > 0
+            && response["semantic_index"]["files_embedded"] == 1
+            && response["semantic_index"]["chunks_embedded"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
     });
     assert!(owner.shutdown().success());
     server.reset_requests();
 
     let quiet_ms = std::ffi::OsStr::new("2000");
     let mut borrower =
-        AftProcess::spawn_with_real_watcher_env(&[("AFT_SEMANTIC_QUIET_WINDOW_MS", quiet_ms)]);
+        AftProcess::spawn_with_real_watcher_env(&[("AFT_TEST_DATA_QUIET_MS", quiet_ms)]);
     let configured = configure_semantic_openai_with_overlay(
         &mut borrower,
         &worktree,
@@ -724,8 +728,14 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     )
     .expect("edit borrow-only source");
     wait_for_semantic_status(&mut borrower, "borrow-only semantic mask", |response| {
-        response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["entries"] == 0
+        // Masking the sole borrowed file leaves no vectors to serve. The
+        // index store reports the semantic index's stage as filling, without
+        // scheduling a fill for a borrow-only checkout.
+        response["semantic_index"]["status"] == "building"
+            && response["semantic_index"]["stage"] == "filling"
+            && response["semantic_index"]["entries_done"] == 0
+            && response["semantic_index"]["entries_total"] == 1
+            && response["semantic_index"]["filling"] == false
     });
 
     let storm = worktree.join("storm");
@@ -748,8 +758,8 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     server.reset_requests();
     let gate = storage.path().join("semantic-quiet-gate");
     let mut overlay = AftProcess::spawn_with_real_watcher_env(&[
-        ("AFT_SEMANTIC_QUIET_WINDOW_MS", quiet_ms),
-        ("AFT_TEST_SEMANTIC_QUIET_GATE", gate.as_os_str()),
+        ("AFT_TEST_DATA_QUIET_MS", quiet_ms),
+        ("AFT_TEST_DATA_QUIET_GATE", gate.as_os_str()),
     ]);
     let configured = configure_semantic_openai_with_overlay(
         &mut overlay,
@@ -830,6 +840,11 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
         let _ = status(&mut overlay);
         thread::sleep(Duration::from_millis(10));
     }
+    wait_for_semantic_status(&mut overlay, "storm fill completed", |response| {
+        response["semantic_index"]["status"] == "ready"
+            && response["semantic_index"]["filling"] == false
+            && response["data_store"]["pending_edits"] == 0
+    });
     assert!(
         server.non_probe_requests().is_empty(),
         "overlay storm files gone inside the quiet window must not be embedded"
@@ -857,7 +872,12 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     ]);
     let storage = tempfile::tempdir().expect("create storage dir");
     let server = MockEmbeddingServer::start();
-    let mut aft = AftProcess::spawn_with_real_watcher();
+    // The index store embeds an edit once the checkout has gone quiet, two
+    // minutes after the last change; this test shortens that to a second.
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[(
+        "AFT_TEST_DATA_QUIET_MS",
+        std::ffi::OsStr::new("1000"),
+    )]);
 
     let configure =
         configure_semantic_openai(&mut aft, project.path(), storage.path(), &server.base_url);
@@ -868,7 +888,10 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
 
     let ready = wait_for_semantic_status(&mut aft, "initial ready", |response| {
         response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["entries"].as_u64().unwrap_or(0) >= 3
+            && response["semantic_index"]["files_embedded"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 3
             && response["semantic_index"]["refreshing_count"] == 0
     });
     assert_eq!(ready["semantic_index"]["refreshing_count"], 0);
@@ -923,16 +946,23 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
         mid_refresh["success"], true,
         "mid-refresh semantic search should succeed: {mid_refresh:?}"
     );
-    assert_eq!(mid_refresh["status"], "ready", "{mid_refresh:?}");
-    assert_eq!(mid_refresh["semantic_status"], "ready", "{mid_refresh:?}");
-    assert_eq!(mid_refresh["interpreted_as"], "semantic");
-    let mid_warnings = mid_refresh["warnings"].as_array().expect("warnings array");
-    assert!(
-        mid_warnings.iter().any(|warning| warning
-            .as_str()
-            .is_some_and(|text| text.contains("1 file(s) refreshing"))),
-        "expected refreshing warning, got {mid_warnings:?}"
+    // The reply is partial: the index serves, but the refreshing file's
+    // vectors are missing until the refresh finishes. The index store names
+    // that file, where today's index answered "ready" with a count warning.
+    assert_eq!(mid_refresh["status"], "partial", "{mid_refresh:?}");
+    assert_eq!(
+        mid_refresh["semantic_status"], "refreshing",
+        "{mid_refresh:?}"
     );
+    assert_eq!(mid_refresh["interpreted_as"], "semantic");
+    let mid_text = mid_refresh["text"].as_str().unwrap_or_default();
+    assert!(
+        mid_text
+            .replace('\\', "/")
+            .contains("semantic: 1 file(s) not yet embedded: src/b.rs"),
+        "expected the refreshing file to be named, got {mid_text:?}"
+    );
+    assert_eq!(mid_refresh["complete"], false, "{mid_refresh:?}");
     let mid_results = mid_refresh["results"].as_array().expect("results array");
     assert!(
         mid_results.iter().any(|result| {
@@ -1062,7 +1092,7 @@ fn watcher_deleted_alias_path_invalidates_canonical_search_and_semantic_entries(
     let canonical_root = fs::canonicalize(&real_root).expect("canonicalize real root");
     let canonical_file = fs::canonicalize(&source_file).expect("canonicalize source file");
     let alias_file = alias_root.join("src/lib.rs");
-    let project_key = aft::search_index::artifact_cache_key(&canonical_root);
+    let project_key = aft::root_identity::key::artifact_cache_key(&canonical_root);
     aft::root_cache::configure_artifact_access(&canonical_root, &project_key, false);
 
     let mut search_index = SearchIndex::build(&canonical_root);
@@ -1151,7 +1181,10 @@ fn semantic_build_recovers_when_backend_returns_after_transient_outage() {
 
     let ready = wait_for_semantic_status(&mut aft, "recovered ready", |response| {
         response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["entries"].as_u64().unwrap_or(0) >= 1
+            && response["semantic_index"]["files_embedded"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
     });
     assert_eq!(ready["semantic_index"]["status"], "ready");
 

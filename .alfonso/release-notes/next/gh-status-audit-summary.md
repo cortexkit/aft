@@ -1,1 +1,0 @@
-- `gh --status` now shows a count and the 10 newest operator-bypass entries instead of the whole audit log; `gh --status --audit` prints the full list.

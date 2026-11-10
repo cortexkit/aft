@@ -30,11 +30,6 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
-/// A small git repository whose `target` function has one caller per module.
-fn project(parent: &Path, modules: usize) -> PathBuf {
-    project_named(parent, "project", modules)
-}
-
 fn project_named(parent: &Path, name: &str, modules: usize) -> PathBuf {
     let root = parent.join(name);
     std::fs::create_dir_all(&root).unwrap();
@@ -139,31 +134,6 @@ fn callers(aft: &mut AftProcess, root: &Path) -> Value {
     }
 }
 
-fn callers_once(aft: &mut AftProcess, root: &Path) -> Value {
-    aft.send(
-        &json!({
-            "id": "immediate-callers", "command": "callers",
-            "file": root.join("target.ts"), "symbol": "target"
-        })
-        .to_string(),
-    )
-}
-
-fn callers_after_comparison(aft: &mut AftProcess, root: &Path) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        let response = callers(aft, root);
-        if response["complete"] != false {
-            return response;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "comparison never settled: {response:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -196,153 +166,6 @@ fn published_generation(storage: &Path) -> String {
         .unwrap()
         .trim()
         .to_string()
-}
-
-#[test]
-fn legacy_callgraph_restart_reuses_the_published_generation() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = project(fixture.path(), 3);
-    let storage = fixture.path().join("storage");
-
-    let mut first = AftProcess::spawn();
-    configure(&mut first, &root, &storage);
-    assert_eq!(callers(&mut first, &root)["total_callers"], 3);
-    let built = published_generation(&storage);
-    first.shutdown();
-
-    let mut restarted = AftProcess::spawn();
-    configure(&mut restarted, &root, &storage);
-    assert_eq!(callers(&mut restarted, &root)["total_callers"], 3);
-    let served = published_generation(&storage);
-    let (_, log) = restarted.stderr_output();
-    assert_eq!(
-        served, built,
-        "a restart on an unchanged root must reuse the published generation, \
-         not cold-build a new one; restart log:\n{log}"
-    );
-}
-
-#[test]
-fn legacy_callgraph_restart_first_query_answers_without_waiting_for_comparison() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = project(fixture.path(), 3);
-    let storage = fixture.path().join("storage");
-    let mut first = AftProcess::spawn();
-    configure(&mut first, &root, &storage);
-    assert_eq!(callers(&mut first, &root)["total_callers"], 3);
-    let built = published_generation(&storage);
-    first.shutdown();
-
-    let mut restarted = AftProcess::spawn_with_real_watcher();
-    configure(&mut restarted, &root, &storage);
-    let response = callers_once(&mut restarted, &root);
-    assert_eq!(
-        response["success"], true,
-        "first query must answer, not Building: {response:?}"
-    );
-    assert_eq!(response["total_callers"], 3);
-    let settled = callers_after_comparison(&mut restarted, &root);
-    assert_ne!(settled["complete"], false, "{settled:?}");
-    assert_eq!(settled["total_callers"], 3);
-    assert_eq!(published_generation(&storage), built);
-}
-
-#[test]
-fn legacy_callgraph_restart_after_an_offline_edit_reuses_the_generation() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = project(fixture.path(), 3);
-    let storage = fixture.path().join("storage");
-
-    let mut first = AftProcess::spawn();
-    configure(&mut first, &root, &storage);
-    assert_eq!(callers(&mut first, &root)["total_callers"], 3);
-    let built = published_generation(&storage);
-    first.shutdown();
-
-    // One file gains a second caller while no engine runs.
-    std::fs::write(
-        root.join("caller0.ts"),
-        "import { target } from './target';\n\
-         export function caller0(value: number) { return target(value); }\n\
-         export function offlineCaller(value: number) { return target(value); }\n",
-    )
-    .unwrap();
-
-    // The restarted engine installs a real file watcher, as in production.
-    let mut restarted = AftProcess::spawn_with_real_watcher();
-    configure(&mut restarted, &root, &storage);
-    // The old snapshot is available during comparison, but only the settled
-    // answer claims to include edits made while no engine was running.
-    let response = callers_after_comparison(&mut restarted, &root);
-    let served = published_generation(&storage);
-    let (_, log) = restarted.stderr_output();
-    assert_eq!(
-        served, built,
-        "one offline edit must not cost a cold build; restart log:\n{log}"
-    );
-    // The watcher only reports edits made after it starts, so an edit made
-    // while no engine ran reaches the store only if the restart compares the
-    // stored files with the disk.
-    assert_eq!(
-        response["total_callers"], 4,
-        "the reused store must include the caller added while no engine ran: \
-         {response:?}\nrestart log:\n{log}"
-    );
-}
-
-#[test]
-fn legacy_callgraph_second_live_engine_on_the_same_root_reuses_the_generation() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = project(fixture.path(), 3);
-    let storage = fixture.path().join("storage");
-
-    let mut owner = AftProcess::spawn();
-    configure(&mut owner, &root, &storage);
-    assert_eq!(callers(&mut owner, &root)["total_callers"], 3);
-    let built = published_generation(&storage);
-
-    let mut second = AftProcess::spawn();
-    configure(&mut second, &root, &storage);
-    assert_eq!(callers(&mut second, &root)["total_callers"], 3);
-    let served = published_generation(&storage);
-    let (_, log) = second.stderr_output();
-    owner.shutdown();
-    assert_eq!(
-        served, built,
-        "a second engine on a root with a live owner must serve the owner's \
-         generation; second engine log:\n{log}"
-    );
-}
-
-#[test]
-fn legacy_callgraph_restart_while_another_engine_holds_the_root_reuses_the_generation() {
-    let fixture = tempfile::tempdir().unwrap();
-    let root = project(fixture.path(), 3);
-    let storage = fixture.path().join("storage");
-
-    let mut owner = AftProcess::spawn();
-    configure(&mut owner, &root, &storage);
-    assert_eq!(callers(&mut owner, &root)["total_callers"], 3);
-    let built = published_generation(&storage);
-
-    // The engine that built the store restarts while a second engine keeps
-    // the root open, and the restarted engine starts after the builder left.
-    let mut holder = AftProcess::spawn();
-    configure(&mut holder, &root, &storage);
-    assert_eq!(callers(&mut holder, &root)["total_callers"], 3);
-    owner.shutdown();
-
-    let mut restarted = AftProcess::spawn();
-    configure(&mut restarted, &root, &storage);
-    assert_eq!(callers(&mut restarted, &root)["total_callers"], 3);
-    let served = published_generation(&storage);
-    let (_, log) = restarted.stderr_output();
-    holder.shutdown();
-    assert_eq!(
-        served, built,
-        "an engine restarting while another engine holds the root must reuse \
-         the published generation; restart log:\n{log}"
-    );
 }
 
 #[test]

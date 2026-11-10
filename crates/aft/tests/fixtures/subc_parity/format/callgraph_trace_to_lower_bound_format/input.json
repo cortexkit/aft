@@ -5,7 +5,10 @@
     "success": true,
     "total_paths": 61,
     "total_paths_is_lower_bound": true,
-    "entry_points_found": 3,
+    "root_counts": {
+      "main": 1,
+      "public_api": 2
+    },
     "hub_summary": {
       "message": "Next: at least 61 paths — showing 15; traversal capped; narrow with scope"
     },

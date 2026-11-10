@@ -85,7 +85,6 @@ impl Tally {
 
 struct Event {
     pid: u32,
-    start_ns: u64,
     op: String,
     kind: String,
     duration_ns: u64,
@@ -103,7 +102,6 @@ fn parse_trace(text: &str) -> Vec<Event> {
             }
             Some(Event {
                 pid: fields[0].parse().ok()?,
-                start_ns: fields[2].parse().ok()?,
                 op: fields[3].to_string(),
                 kind: fields[4].to_string(),
                 duration_ns: fields[5].parse().ok()?,
@@ -250,16 +248,33 @@ impl Census {
             let (store, expected) = if label.starts_with("bash ") {
                 ("storage: opencode/bash-tasks", 0)
             } else if label.starts_with("edit 1:") {
-                ("storage: opencode/backups", 6)
+                // Three directory flushes for the new backup folders, then the
+                // snapshot: its content file takes a full flush, the undo index
+                // file and its folder take ordinary fsyncs, and meta.json's
+                // full flush then commits all of them to the drive.
+                self.assert_full_flushes(&events, &roots, label, 5);
+                ("storage: opencode/backups", 7)
             } else if label.starts_with("edit ") {
-                ("storage: opencode/backups", 3)
+                // The snapshot alone: two full flushes (content, meta.json)
+                // and two ordinary fsyncs ordered before the last one.
+                self.assert_full_flushes(&events, &roots, label, 2);
+                ("storage: opencode/backups", 4)
             } else if label.starts_with("undo ") {
-                // Include the user-file sync, not just stack metadata.
-                let count = count_syncs(&events, |event| {
+                // Include the user-file sync, not just stack metadata. The
+                // restored file and meta.json take full flushes; the undo
+                // index file and its folder take ordinary fsyncs that
+                // meta.json's full flush commits.
+                let in_scope = |event: &Event| {
                     let store = store_of(&event.path, &roots, &self.project);
                     store == "storage: opencode/backups" || store == "project (user files)"
-                });
-                assert_eq!(count, 3, "{label}: undo syncs including restored file");
+                };
+                let count = count_syncs(&events, in_scope);
+                assert_eq!(count, 4, "{label}: undo syncs including restored file");
+                let full = events
+                    .iter()
+                    .filter(|event| in_scope(event) && event.op == "F_FULLFSYNC")
+                    .count();
+                assert_eq!(full, 2, "{label}: undo full drive flushes");
                 return;
             } else if label.starts_with("checkpoint create") {
                 ("storage: opencode/checkpoints", 8)
@@ -276,6 +291,29 @@ impl Census {
             });
             assert_eq!(count, expected, "{label}: {store} sync count");
         }
+    }
+}
+
+impl Census {
+    /// Full drive flushes (`F_FULLFSYNC`) an edit makes under the backup store:
+    /// the expensive kind on macOS, which an edit must not add back.
+    fn assert_full_flushes(
+        &self,
+        events: &[Event],
+        roots: &[(&str, &str)],
+        label: &str,
+        expected: u64,
+    ) {
+        let full = events
+            .iter()
+            .filter(|event| {
+                let store = store_of(&event.path, roots, &self.project);
+                (store == "storage: opencode/backups"
+                    || (label.starts_with("edit 1:") && store == "storage: opencode"))
+                    && event.op == "F_FULLFSYNC"
+            })
+            .count() as u64;
+        assert_eq!(full, expected, "{label}: backup full drive flushes");
     }
 }
 
@@ -494,7 +532,7 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(json!({ "experimental": { "bash": { "background": true } } })),
+            "config": user_config(json!({ "bash": { "rewrite": false, "compress": false, "background": true } })),
         }),
     );
     assert_eq!(configured["success"], true, "{configured:?}");
@@ -722,208 +760,4 @@ fn durability_census_sync_flavour_costs() {
         );
     }
     println!("{report}");
-}
-
-/// Environment variable that turns `durability_census_in_process_child` from a
-/// no-op into the measured workload; its value is the scratch directory.
-const CHILD_ENV: &str = "AFT_DURABILITY_CENSUS_CHILD";
-/// Marker paths: the child renames a path that does not exist, the tracer logs
-/// the failed rename, and the parent splits the trace there.
-const MARK_PREFIX: &str = "/aft-durability-census-mark/";
-
-fn census_mark(label: &str) {
-    let _ = std::fs::rename(format!("{MARK_PREFIX}{label}"), format!("{MARK_PREFIX}-"));
-}
-
-/// Stores the daemon scenario cannot reach in the test harness (semantic
-/// indexing is off there, and no production request creates a views pin), run
-/// in a child copy of this test binary that carries the tracer.
-#[test]
-#[ignore = "measurement: counts fsyncs for semantic, search-cache and pin writes; run alone with --nocapture"]
-fn durability_census_in_process_stores() {
-    trace_in_process_stores(false);
-}
-
-#[test]
-fn durability_syscall_in_process_counts() {
-    trace_in_process_stores(true);
-}
-
-fn trace_in_process_stores(verify_counts: bool) {
-    let scratch = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(scratch.path()).unwrap();
-    let library = build_interposer(&root);
-    let trace = root.join("trace.tsv");
-    let work = root.join("work");
-    std::fs::create_dir_all(&work).unwrap();
-    let status = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--ignored",
-            "--exact",
-            "durability_census_test::durability_census_in_process_child",
-            "--test-threads=1",
-        ])
-        .env(CHILD_ENV, &work)
-        .env("DYLD_INSERT_LIBRARIES", &library)
-        .env("AFT_SYNC_TRACE", &trace)
-        .status()
-        .unwrap();
-    assert!(status.success(), "census child failed");
-
-    let text = std::fs::read_to_string(&trace).unwrap();
-    let work_text = work.display().to_string();
-    let work_root = work_text.strip_prefix("/private").unwrap_or(&work_text);
-    let roots = [("work", work_root)];
-    let mut report = String::from("# durability census (in-process stores)\n");
-    let mut label: Option<(String, u64)> = None;
-    let mut events = Vec::new();
-    for event in parse_trace(&text) {
-        if let Some(name) = event.path.strip_prefix(MARK_PREFIX) {
-            if let Some((previous, started)) = label.take() {
-                let elapsed = (event.start_ns - started) as f64 / 1e6;
-                summarize(
-                    &mut report,
-                    &previous,
-                    &format!("elapsed {elapsed:.1} ms"),
-                    &events,
-                    &roots,
-                    "/nonexistent-project",
-                    event.pid,
-                );
-                if verify_counts {
-                    let expected = match previous.as_str() {
-                        "semantic: first persist (full snapshot)" | "pins: live pin create" => {
-                            Some(1)
-                        }
-                        "semantic: persist after one changed file (segment append)" => Some(0),
-                        name if name.starts_with("search index: cache write")
-                            || name.starts_with("pins: protect")
-                            || name == "pins: release" =>
-                        {
-                            Some(0)
-                        }
-                        _ => None,
-                    };
-                    if let Some(expected) = expected {
-                        assert_eq!(
-                            count_syncs(&events, |_| true),
-                            expected,
-                            "{previous}: real syscall count"
-                        );
-                    }
-                }
-            }
-            events.clear();
-            if name != "end" {
-                label = Some((name.to_string(), event.start_ns));
-            }
-            continue;
-        }
-        let path = event.path.strip_prefix("/private").unwrap_or(&event.path);
-        let path2 = event.path2.strip_prefix("/private").unwrap_or(&event.path2);
-        if label.is_some() && (path.starts_with(work_root) || path2.starts_with(work_root)) {
-            events.push(event);
-        }
-    }
-    println!("{report}");
-    if let Some(dir) = std::env::var_os("AFT_DURABILITY_CENSUS_OUT") {
-        let dir = PathBuf::from(dir).join("in-process");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(&trace, dir.join("full.trace")).unwrap();
-        std::fs::write(dir.join("report.txt"), &report).unwrap();
-    }
-}
-
-/// The workload `durability_census_in_process_stores` traces. Does nothing
-/// unless started by that test.
-#[test]
-#[ignore = "child of durability_census_in_process_stores"]
-fn durability_census_in_process_child() {
-    use aft::blob_store::v2::{FamilyKey, FamilyPlane};
-    use aft::pins::LivePin;
-    use aft::search_index::SearchIndex;
-    use aft::semantic_index::SemanticIndex;
-    use aft::views::registry::FamilyRegistry;
-
-    let Some(work) = std::env::var_os(CHILD_ENV) else {
-        return;
-    };
-    let work = PathBuf::from(work);
-    let project = work.join("project");
-    let storage = work.join("storage");
-    std::fs::create_dir_all(project.join("src")).unwrap();
-    std::fs::create_dir_all(&storage).unwrap();
-    let files: Vec<PathBuf> = (0..20)
-        .map(|index| {
-            let path = project.join(format!("src/module_{index}.rs"));
-            std::fs::write(
-                &path,
-                format!("pub fn function_{index}(value: u32) -> u32 {{\n    value + {index}\n}}\n"),
-            )
-            .unwrap();
-            path
-        })
-        .collect();
-    // A stub embedder: four dimensions derived from the text length, so no
-    // model is needed and every chunk gets a vector.
-    let mut embed = |texts: Vec<String>| {
-        Ok::<Vec<Vec<f32>>, String>(
-            texts
-                .into_iter()
-                .map(|text| {
-                    let n = text.len() as f32;
-                    vec![n, n.sqrt(), 1.0, 0.5]
-                })
-                .collect(),
-        )
-    };
-
-    census_mark("semantic: build in memory (no disk expected)");
-    let mut index = SemanticIndex::build(&project, &files, &mut embed, 16).unwrap();
-    census_mark("semantic: first persist (full snapshot)");
-    assert!(index.write_to_disk(&storage, "census"));
-    std::fs::write(
-        &files[0],
-        "pub fn function_0(value: u32) -> u32 {\n    value * 2\n}\n",
-    )
-    .unwrap();
-    census_mark("semantic: refresh one changed file in memory");
-    index
-        .refresh_stale_files(&project, &files, &mut embed, 16, &mut |_, _| {})
-        .unwrap();
-    census_mark("semantic: persist after one changed file (segment append)");
-    assert!(index.write_to_disk(&storage, "census"));
-
-    census_mark("search index: build in memory");
-    let mut search = SearchIndex::build(&project);
-    census_mark("search index: cache write (cache.bin)");
-    assert!(search.write_to_disk(&storage.join("index").join("census"), None));
-    // The same write for a real-sized tree (this crate's sources), where the
-    // synced file is megabytes rather than kilobytes.
-    let crate_src = crate::test_helpers::manifest_dir().join("src");
-    census_mark("search index: build crates/aft/src in memory");
-    let mut large = SearchIndex::build(&crate_src);
-    census_mark("search index: cache write for crates/aft/src");
-    assert!(large.write_to_disk(&storage.join("index").join("large"), None));
-
-    census_mark("pins: open family registry and register view (setup)");
-    let registry = FamilyRegistry::open(&storage, "census").unwrap();
-    let view = registry
-        .register_view_with_storage(registry.storage(), "census", &project)
-        .unwrap();
-    census_mark("pins: live pin create");
-    let mut live = LivePin::create(&view).unwrap();
-    let key = |seed: u8| FamilyKey::new(FamilyPlane::Trigram, [seed; 32]);
-    census_mark("pins: protect 1 key");
-    live.protect(&[key(1)]).unwrap();
-    census_mark("pins: protect 10 keys in one call");
-    let batch: Vec<FamilyKey> = (10..20).map(key).collect();
-    live.protect(&batch).unwrap();
-    census_mark("pins: protect 10 keys one call each");
-    for seed in 20..30 {
-        live.protect(&[key(seed)]).unwrap();
-    }
-    census_mark("pins: release");
-    live.release();
-    census_mark("end");
 }

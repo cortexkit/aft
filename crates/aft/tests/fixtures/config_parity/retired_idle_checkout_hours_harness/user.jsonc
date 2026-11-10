@@ -1,0 +1,12 @@
+{
+  "idle": {
+    "root_ttl_minutes": 20
+  },
+  "harnesses": {
+    "pi": {
+      "views": {
+        "idle_checkout_hours": 12
+      }
+    }
+  }
+}

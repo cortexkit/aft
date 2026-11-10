@@ -206,7 +206,7 @@ pub fn classify_resolved_standing_root(
 ) -> Result<StandingArtifactIdentity, ScopedKeyError> {
     let Some(git_toplevel) = resolved_git_toplevel else {
         return Ok(StandingArtifactIdentity::NonGit {
-            artifact_key: crate::search_index::artifact_path_identity_key(resolved_target),
+            artifact_key: crate::root_identity::key::artifact_path_identity_key(resolved_target),
         });
     };
 
@@ -214,12 +214,12 @@ pub fn classify_resolved_standing_root(
         // This deliberately calls the session derivation itself rather than a
         // sibling reimplementation, keeping top-level sharing byte-identical.
         return Ok(StandingArtifactIdentity::GitToplevel {
-            artifact_key: crate::search_index::artifact_cache_key(resolved_target),
+            artifact_key: crate::root_identity::key::artifact_cache_key(resolved_target),
         });
     }
 
     let relative = scoped_relative_path(resolved_target, git_toplevel)?;
-    let repo_identity = crate::search_index::canonical_git_root_commit_identity(git_toplevel)
+    let repo_identity = crate::root_identity::key::canonical_git_root_commit_identity(git_toplevel)
         .map_err(|error| ScopedKeyError::GitProbe {
             path: git_toplevel.to_path_buf(),
             detail: error.to_string(),
@@ -267,8 +267,8 @@ pub(crate) fn resolve_standing_root_with_recheck(
         path: expanded,
         detail: error.to_string(),
     })?;
-    let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
-    let identity = crate::search_index::resolve_root_identity_with_recheck(
+    let mut timings = crate::root_identity::key::ArtifactCacheKeyTimings::default();
+    let identity = crate::root_identity::key::resolve_root_identity_with_recheck(
         &target,
         &target,
         storage,
@@ -406,7 +406,7 @@ mod tests {
         );
         assert_ne!(
             scoped,
-            crate::search_index::artifact_key_from_git_identity("root-a\nroot-b")
+            crate::root_identity::key::artifact_key_from_git_identity("root-a\nroot-b")
         );
     }
 
@@ -456,7 +456,7 @@ mod tests {
         };
         let root = std::fs::canonicalize(repo.path()).unwrap();
         let subtree = root.join("src");
-        assert!(crate::search_index::artifact_cache_key_memoized_only(&root).is_none());
+        assert!(crate::root_identity::key::artifact_cache_key_memoized_only(&root).is_none());
 
         let subtree_identity = classify_resolved_standing_root(&subtree, Some(&root)).unwrap();
         assert!(matches!(
@@ -464,11 +464,11 @@ mod tests {
             StandingArtifactIdentity::GitSubtree { .. }
         ));
         assert!(
-            crate::search_index::artifact_cache_key_memoized_only(&root).is_none(),
+            crate::root_identity::key::artifact_cache_key_memoized_only(&root).is_none(),
             "subtree derivation must not pre-warm the repository session key"
         );
 
-        let session_key = crate::search_index::artifact_cache_key(&root);
+        let session_key = crate::root_identity::key::artifact_cache_key(&root);
         assert_ne!(subtree_identity.artifact_key(), session_key);
         let top_level = classify_resolved_standing_root(&root, Some(&root)).unwrap();
         assert_eq!(top_level.artifact_key(), session_key);
@@ -480,7 +480,7 @@ mod tests {
         let identity = classify_resolved_standing_root(root.path(), None).unwrap();
         assert_eq!(
             identity.artifact_key(),
-            crate::search_index::artifact_path_identity_key(root.path())
+            crate::root_identity::key::artifact_path_identity_key(root.path())
         );
     }
 

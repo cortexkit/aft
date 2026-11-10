@@ -7,7 +7,8 @@ mod context_storage;
 
 // Import `test_helpers` from `callgraph_store_test` rather than compiling a
 // second copy of the helper tests in this target.
-use callgraph_store_test::test_helpers;
+#[path = "../helpers/mod.rs"]
+mod test_helpers;
 
 #[path = "../build_path_independence.rs"]
 mod build_path_independence;
@@ -17,18 +18,6 @@ mod fake_helper_cache_test;
 #[path = "../helpers/fake_lsp.rs"]
 mod fake_lsp;
 
-// Include ignored benchmarks and reproductions so they can still run by name
-// without linking a separate test executable for each source file.
-#[path = "../callgraph_borrowed_disclosure_test.rs"]
-mod callgraph_borrowed_disclosure_test;
-#[path = "../callgraph_query_bench.rs"]
-mod callgraph_query_bench;
-#[path = "../callgraph_refresh_bench.rs"]
-mod callgraph_refresh_bench;
-#[path = "../callgraph_refresh_cold_equivalence_test.rs"]
-mod callgraph_refresh_cold_equivalence_test;
-#[path = "../callgraph_store_test.rs"]
-mod callgraph_store_test;
 #[path = "../compress_spike.rs"]
 mod compress_spike;
 #[path = "../daemon_unexplained_writes_probe.rs"]

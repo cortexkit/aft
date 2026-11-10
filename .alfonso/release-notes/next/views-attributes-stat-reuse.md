@@ -1,1 +1,0 @@
-- With views on, repositories that track a .gitattributes file no longer re-read every file after each edit or new session: AFT reuses what it read unless the file changed.

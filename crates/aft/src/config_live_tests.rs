@@ -161,16 +161,9 @@ fn inspect_categories_and_lsp_idle_reload_without_restart() {
         fixture.ctx.config().lsp_idle_minutes,
         crate::config::LspIdleMinutes::Never
     );
-    assert!(!fixture
-        .ctx
-        .automatic_tier2_refresh_categories_for_test()
-        .contains(&crate::inspect::InspectCategory::DeadCode));
-    fixture
-        .ctx
-        .update_status_bar_tier2(Some(99), Some(2), Some(3), Some(4), false);
+    fixture.ctx.update_status_bar_todos(Some(4));
     let counts = fixture.ctx.status_bar_count_values();
     assert!(counts.disabled_categories.contains(&"dead_code"));
-    assert_eq!(counts.dead_code, None);
     assert_eq!(counts.todos, None);
     write(
         &fixture.user_path,

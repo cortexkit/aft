@@ -43,7 +43,7 @@ const status = {
   semantic_index: { status: "ready", refreshing_count: 0, entries: 10, dimension: 384 },
   disk: { storage_dir: "/cache", trigram_disk_bytes: 1, semantic_disk_bytes: 2 },
   lsp_servers: 0,
-  status_bar: { errors: 0, warnings: 0, dead_code: 0, unused_exports: 0, duplicates: 1, todos: 0 },
+  status_bar: { errors: 0, warnings: 0, todos: 0 },
   message: "",
 };
 

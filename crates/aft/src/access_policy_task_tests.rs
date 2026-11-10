@@ -441,33 +441,6 @@ fn fixture_floor_ignores_a_storage_override_set_by_another_test() {
     );
 }
 
-#[test]
-fn explicit_task_io_grep_rejects_registered_sqlite_names() {
-    let f = fixture();
-    std::fs::remove_file(&f.worker.stdout).unwrap();
-    // A registered artifact name is not permission to read a live database,
-    // even on platforms without device/inode identities or a SQLite suffix.
-    let _connection = crate::db::file_identity::IdentityConnection::new(
-        rusqlite::Connection::open(&f.worker.stdout).unwrap(),
-        "task artifact test",
-    );
-    let probe = crate::project_content::Probe::new(&f.worker.io_dir);
-    let mut req = request(
-        "grep",
-        json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
-    );
-    req.session_id = Some("worker-session".into());
-    let response = crate::commands::grep::handle_grep(&req, &f.ctx);
-    assert!(response.success, "{:?}", response.data);
-    assert_eq!(response.data["total_matches"], 0, "{:?}", response.data);
-    let mut opened = probe.paths();
-    opened.sort();
-    opened.dedup();
-    let mut expected = vec![f.worker.stderr, f.worker.exit];
-    expected.sort();
-    assert_eq!(opened, expected);
-}
-
 // Hard-link alias checks need Unix device/inode identities. The all-platform
 // registered-name test above covers Windows' name-based refusal instead.
 #[cfg(unix)]

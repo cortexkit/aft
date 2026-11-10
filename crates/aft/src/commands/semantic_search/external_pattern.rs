@@ -1,82 +1,14 @@
-//! Explicit patterns against another Git project use the same collectors and
-//! ranking engines as the current project, but never its resident artifacts.
-//! The borrowed postings must be checked first: a stale posting can otherwise
-//! rule out a file whose new content matches the pattern.
+//! Explicit patterns against another Git project with no checkout in the index
+//! store use the same collectors and ranking engines as the current project,
+//! over an in-memory index of the files a bounded walk of that project read.
 
 use super::*;
 
 pub(super) struct Corpus<'a> {
     pub index: Arc<SearchIndex>,
     pub generation: GenerationToken,
-    semantic: &'a ReadOnlyArtifact<Arc<SemanticIndex>>,
     check: external_disk_check::DiskCheck,
-    age: Option<Duration>,
-    saved: bool,
     root: &'a Path,
-    artifact_path: Option<&'a Path>,
-}
-
-/// Reuse the external query path's checked overlay, including its short reuse
-/// window and resumable comparison. Both query and pattern requests must see
-/// the same disk-validated copy and generation for cached rankings.
-pub(super) fn checked_index(
-    ctx: &AppContext,
-    root: &Path,
-    saved: &Arc<SearchIndex>,
-    semantic: Option<&Arc<SemanticIndex>>,
-    generation: &GenerationToken,
-) -> (
-    external_disk_check::CheckedIndex,
-    Option<Duration>,
-    GenerationToken,
-) {
-    let budgets = external_disk_check::budgets();
-    let lookup = ctx.with_checked_overlays(|overlays| {
-        overlays.lookup(
-            root,
-            generation.as_str(),
-            saved,
-            semantic,
-            budgets.reuse_window,
-        )
-    });
-    let (checked, age) = match lookup {
-        external_disk_check::OverlayLookup::Reuse(checked, age) => (checked, Some(age)),
-        lookup => {
-            let previous = match lookup {
-                external_disk_check::OverlayLookup::Resume(copy) => Some(copy),
-                _ => None,
-            };
-            let checked = external_disk_check::check_against_disk(
-                saved,
-                previous.as_ref(),
-                root,
-                semantic.map(Arc::as_ref),
-            );
-            if !search_cancellation_requested() {
-                crate::slog_debug!(
-                    "external disk check of {}{}: {} files compared in {} ms, {} read in {} ms ({} not read, walk complete: {})",
-                    root.display(),
-                    if previous.is_some() { " (resumed)" } else { "" },
-                    checked.check.files_examined,
-                    checked.walk_time.as_millis(),
-                    checked.check.reread,
-                    checked.reread_time.as_millis(),
-                    checked.check.not_reread,
-                    checked.check.walk_complete,
-                );
-                ctx.with_checked_overlays(|overlays| {
-                    overlays.remember(root, generation.as_str(), saved, semantic, checked.clone())
-                });
-            }
-            (checked, None)
-        }
-    };
-    let generation = checked.applied_digest.as_ref().map_or_else(
-        || generation.clone(),
-        |digest| GenerationToken::new_with_str(&format!("{}:disk:{digest}", generation.as_str())),
-    );
-    (checked, age, generation)
 }
 
 impl Corpus<'_> {
@@ -85,31 +17,26 @@ impl Corpus<'_> {
         compiled: &pattern_compile::CompiledPattern,
         include_tests: bool,
     ) -> std::io::Result<crate::search_index::GrepFileCollection> {
-        let mut collection = self.index.snapshot().collect_grep_matches_by_file(
-            compiled,
-            &PathFilters::default(),
-            self.root,
-            grep_path_exclusion(include_tests),
-            regex_route::limits(),
-            &regex_route::examine_priority,
-            &regex_route::keep_past_line_limit,
-        )?;
+        let mut collection = super::waits::timed(super::waits::SearchWait::Rayon, || {
+            self.index.snapshot().collect_grep_matches_by_file(
+                compiled,
+                &PathFilters::default(),
+                self.root,
+                grep_path_exclusion(include_tests),
+                regex_route::limits(),
+                &regex_route::examine_priority,
+                &regex_route::keep_past_line_limit,
+            )
+        })?;
         // Even a completed examination of the postings cannot claim that the
         // pattern matched nothing if the walk or re-read left files unchecked.
         collection.examination_capped |= !self.check.verified();
         Ok(collection)
     }
 
-    fn semantic_index(&self, ctx: &AppContext) -> Option<&SemanticIndex> {
-        match self.semantic {
-            ReadOnlyArtifact::Fresh(index)
-            | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
-                if semantic_fingerprint_matches_session(ctx, index) =>
-            {
-                Some(index)
-            }
-            _ => None,
-        }
+    /// Another project has no meaning index outside the index store.
+    fn semantic_index(&self, _ctx: &AppContext) -> Option<&SemanticIndex> {
+        None
     }
 
     pub(super) fn semantic_results(
@@ -120,15 +47,10 @@ impl Corpus<'_> {
         plan: &extensions::LanePlan<'_>,
     ) -> SplitSemantic {
         let Some(index) = self.semantic_index(ctx) else {
-            return match self.semantic {
-                ReadOnlyArtifact::Degraded(_) => SplitSemantic::unavailable(
-                    "building", borrowed_semantic_loading_notice(0),
-                ),
-                _ => SplitSemantic::unavailable(
-                    "unavailable",
-                    "Semantic search is not available for the external root; lexical engine results follow.",
-                ),
-            };
+            return SplitSemantic::unavailable(
+                "unavailable",
+                "Semantic search is not available for the external root; lexical engine results follow.",
+            );
         };
         if !plan.contains(SearchLaneKind::Semantic) {
             let mut semantic = SplitSemantic::unavailable("ready", "");
@@ -158,6 +80,7 @@ impl Corpus<'_> {
             query_vector: Some(vector),
             not_ready: None,
             checkout_gaps: None,
+            data_meaning: None,
         }
     }
 
@@ -182,16 +105,8 @@ impl Corpus<'_> {
     }
 
     fn disclose(&self, response: &mut Response, semantic_served: bool) {
-        if self.saved {
-            disclose_checked_saved_index(
-                response,
-                self.root,
-                self.artifact_path,
-                &self.check,
-                self.age,
-                semantic_served,
-            );
-        } else if response.success {
+        let _ = semantic_served;
+        if response.success {
             let Some(data) = response.data.as_object_mut() else {
                 return;
             };
@@ -242,66 +157,30 @@ pub(super) fn handle(
     compiled: &pattern_compile::CompiledPattern,
     root: &Path,
 ) -> Response {
-    let config = ctx.config();
-    let storage = config.cache_storage_dir();
-    let source = ExternalReadinessSource::new(ctx, root, storage.as_deref());
+    let runtime_source = RuntimeReadinessSource { ctx };
     let mut readiness = extensions.sample_readiness(&extensions::Root::new(
         root,
-        &source as &dyn extensions::ReadinessSource,
+        &runtime_source as &dyn extensions::ReadinessSource,
     ));
     if readiness.cancelled() || search_cancellation_requested() {
         return cancelled_search_response(req);
     }
-    let artifacts = source.loaded().expect("external readiness loads artifacts");
-    let semantic = match &artifacts.semantic {
-        ReadOnlyArtifact::Fresh(index)
-        | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
-            if semantic_fingerprint_matches_session(ctx, index) =>
-        {
-            Some(index)
-        }
-        _ => None,
-    };
-    let saved = match &artifacts.search {
-        ReadOnlyArtifact::Fresh(index)
-        | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. }) => {
-            Some(index)
-        }
-        ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
-        _ => None,
-    };
-    let (checked, age, generation) = if let Some(saved) = saved {
-        checked_index(ctx, root, saved, semantic, &artifacts.search_generation)
-    } else {
-        // Checking an empty index performs the same bounded, ignore-aware walk
-        // and reads files into an in-memory copy. Nothing is saved to the other
-        // project's cache, and both lanes can rank the files actually reached.
-        let empty = SearchIndex::empty_ready_for_root(root);
-        let checked = external_disk_check::check_against_disk(
-            &Arc::new(empty),
-            None,
-            root,
-            semantic.map(Arc::as_ref),
-        );
-        let generation = GenerationToken::new_with_str(&format!(
-            "{}:walk:{}",
-            artifacts.search_generation.as_str(),
-            checked.applied_digest.as_deref().unwrap_or("empty"),
-        ));
-        (checked, None, generation)
-    };
+    // A bounded, ignore-aware walk reads the project's files into an
+    // in-memory index; nothing is saved to the other project's storage.
+    let empty = SearchIndex::empty_ready_for_root(root);
+    let checked = external_disk_check::check_against_disk(&Arc::new(empty), None, root, None);
+    let generation = GenerationToken::new_with_str(&format!(
+        "external:walk:{}",
+        checked.applied_digest.as_deref().unwrap_or("empty"),
+    ));
     if search_cancellation_requested() {
         return cancelled_search_response(req);
     }
     let corpus = Corpus {
         index: checked.index,
         generation,
-        semantic: &artifacts.semantic,
         check: checked.check,
-        age,
-        saved: saved.is_some(),
         root,
-        artifact_path: artifacts.search_artifact_path.as_deref(),
     };
     readiness.lexical_index = true;
     let include_tests = req
@@ -357,19 +236,7 @@ pub(super) fn handle(
         (plan, response)
     };
     if response.success {
-        let mut metadata = ExternalBorrowMetadata::default();
-        match &artifacts.search {
-            ReadOnlyArtifact::Stale(stale) => {
-                metadata.record_drift(stale.drift_count, stale.ignore_rules_differ)
-            }
-            ReadOnlyArtifact::Degraded(degradation) => {
-                metadata.degraded_reason = Some(degradation.reason)
-            }
-            _ => {}
-        }
-        if let ReadOnlyArtifact::Stale(stale) = &artifacts.semantic {
-            metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
-        }
+        let metadata = ExternalBorrowMetadata::default();
         if let Some(data) = response.data.as_object_mut() {
             data.extend(
                 external_response_extras(root, &metadata)
@@ -377,9 +244,6 @@ pub(super) fn handle(
                     .unwrap()
                     .clone(),
             );
-            if let ReadOnlyArtifact::Degraded(_) = &artifacts.search {
-                append_reply_paragraph(data, "Borrowed trigram index loading stopped at the interactive budget; the pattern and query used a bounded lexical scan instead.");
-            }
         }
         let semantic_served = plan.contains(SearchLaneKind::Semantic);
         corpus.disclose(&mut response, semantic_served);

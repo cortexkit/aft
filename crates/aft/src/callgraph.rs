@@ -18,11 +18,12 @@ use tree_sitter::Node;
 #[cfg(not(test))]
 use tree_sitter::Parser;
 
-use crate::callgraph_store::disk_facts::{CanonicalProbeMemo, DiskFacts};
+use crate::callgraph_store::disk_facts::DiskFacts;
 use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
+use crate::callgraph_store::join::syntax_index::{Direct, Nav, SyntaxIndex};
 #[cfg(test)]
-use crate::calls::{call_node_kinds, extract_callee_name, extract_full_callee};
-use crate::calls::{extract_calls_full, extract_rust_value_references};
+use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
+use crate::calls::{extract_calls_full_with, extract_rust_value_references_with};
 #[cfg(test)]
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
@@ -233,7 +234,6 @@ impl<K: Eq + std::hash::Hash + Clone + MemoKeyWeight, V> BoundedMemo<K, V> {
 /// the memo is dropped when publication completes or the build aborts.
 pub(crate) struct ModuleResolutionMemo {
     enabled: bool,
-    canonical_probes: Arc<CanonicalProbeMemo>,
     module_paths: MemoCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
     json_values: MemoCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
     workspace_packages: MemoCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
@@ -253,7 +253,6 @@ impl Default for ModuleResolutionMemo {
     fn default() -> Self {
         Self {
             enabled: true,
-            canonical_probes: Arc::default(),
             module_paths: MemoCell::new(BoundedMemo::new(
                 MODULE_RESOLUTION_MEMO_MAX_ENTRIES,
                 MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES,
@@ -284,14 +283,6 @@ impl Default for ModuleResolutionMemo {
 }
 
 impl ModuleResolutionMemo {
-    pub(crate) fn disk_facts(&self, root: &Path) -> DiskFacts {
-        if self.enabled {
-            DiskFacts::with_probe_memo(root, Arc::clone(&self.canonical_probes))
-        } else {
-            DiskFacts::new(root)
-        }
-    }
-
     fn resolve_module_path(
         &self,
         from_dir: &Path,
@@ -402,30 +393,6 @@ impl ModuleResolutionMemo {
         self.workspace_packages
             .borrow_mut()
             .insert(key, resolved, retained_weight);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_test(enabled: bool, collect_metrics: bool) -> Self {
-        Self {
-            enabled,
-            collect_metrics,
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn module_computations_for_test(&self) -> HashMap<ModuleResolutionKey, usize> {
-        self.module_computations.borrow().clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn json_probes_for_test(&self) -> HashMap<PathBuf, usize> {
-        self.json_probes.borrow().clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn rust_declaration_parses_for_test(&self) -> HashMap<String, usize> {
-        self.rust_declaration_parses.borrow().clone()
     }
 
     #[cfg(test)]
@@ -542,56 +509,6 @@ pub(crate) fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
     full_callee == short_name || (!full_callee.contains('.') && !full_callee.contains("::"))
 }
 
-fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut candidates = Vec::new();
-    let qualified_query = symbol_name.contains("::");
-
-    let mut consider = |candidate: &str| {
-        let matches = if qualified_query {
-            candidate == symbol_name
-        } else {
-            candidate == symbol_name || symbol_unqualified_name(candidate) == symbol_name
-        };
-
-        if matches && seen.insert(candidate.to_string()) {
-            candidates.push(candidate.to_string());
-        }
-    };
-
-    for candidate in file_data.symbol_metadata.keys() {
-        consider(candidate);
-    }
-    for candidate in file_data.calls_by_symbol.keys() {
-        consider(candidate);
-    }
-    for candidate in &file_data.exported_symbols {
-        consider(candidate);
-    }
-
-    candidates.sort();
-    candidates
-}
-
-pub(crate) fn resolve_symbol_query_in_data(
-    file_data: &FileCallData,
-    file: &Path,
-    symbol_name: &str,
-) -> Result<String, AftError> {
-    let candidates = symbol_query_candidates(file_data, symbol_name);
-    match candidates.as_slice() {
-        [candidate] => Ok(candidate.clone()),
-        [] => Err(AftError::SymbolNotFound {
-            name: symbol_name.to_string(),
-            file: file.display().to_string(),
-        }),
-        _ => Err(AftError::AmbiguousSymbol {
-            name: symbol_name.to_string(),
-            candidates,
-        }),
-    }
-}
-
 /// A call or function-value dependency site owned by a symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
@@ -634,6 +551,71 @@ pub struct SymbolMeta {
     /// Attribute that marks the symbol as externally reachable, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_point_attribute: Option<String>,
+    /// Whether the program starts here, as the symbol's language defines
+    /// it (see [`starts_program`]). For Rust this is only half the answer:
+    /// the file must also be the root of a binary target, which depends on
+    /// its path and Cargo manifest, so readers that know those check it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub program_start: bool,
+}
+
+/// Whether the symbol `identity` of `kind` is where a program in `lang`
+/// starts, as the language defines it: `fn main` at the top of a Rust file,
+/// `func main` in a Go `package main` (`go_main_package`), and `main` in C,
+/// C++ and Objective-C. Go also starts every package's top-level
+/// `func init()` (`go_init`: the file declares one with no parameters)
+/// before `main`; the runtime calls it and code never can. A Python program
+/// starts in the module code run as `__main__`, which
+/// [`python_runs_as_main`] finds. JavaScript and TypeScript define no
+/// starting function.
+fn starts_program(
+    lang: LangId,
+    identity: &str,
+    kind: &SymbolKind,
+    go_main_package: bool,
+    go_init: bool,
+) -> bool {
+    if *kind != SymbolKind::Function {
+        return false;
+    }
+    match lang {
+        LangId::Rust | LangId::C | LangId::Cpp | LangId::ObjC => identity == "main",
+        LangId::Go => (identity == "main" && go_main_package) || (identity == "init" && go_init),
+        _ => false,
+    }
+}
+
+/// Whether a Go file declares a top-level `func init()`: a function, so no
+/// receiver, with no parameters. Go runs each one when the program starts.
+fn go_declares_init(source: &str, root: tree_sitter::Node<'_>) -> bool {
+    root.named_children(&mut root.walk()).any(|node| {
+        node.kind() == "function_declaration"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| &source[name.byte_range()] == "init")
+            && node
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| parameters.named_child_count() == 0)
+    })
+}
+
+/// Whether a Python module has a top-level `if __name__ == "__main__":`
+/// block: the code Python runs only when the module is the program itself.
+/// The module's top-level code then starts the program.
+fn python_runs_as_main(source: &str, root: tree_sitter::Node<'_>) -> bool {
+    root.named_children(&mut root.walk()).any(|node| {
+        node.kind() == "if_statement"
+            && node
+                .child_by_field_name("condition")
+                .is_some_and(|condition| {
+                    let text = source[condition.byte_range()]
+                        .chars()
+                        .filter(|ch| !ch.is_whitespace())
+                        .map(|ch| if ch == '\'' { '"' } else { ch })
+                        .collect::<String>();
+                    text == "__name__==\"__main__\"" || text == "\"__main__\"==__name__"
+                })
+    })
 }
 
 /// Per-file call data: call sites grouped by containing symbol, plus
@@ -1403,28 +1385,6 @@ pub(crate) fn build_file_data_from_source(
     build_file_data_from_source_with_lang(path, source, lang)
 }
 
-pub(crate) fn build_file_data_with_typescript_objects(
-    path: &Path,
-    source: &str,
-) -> Result<
-    (
-        FileCallData,
-        Option<crate::callgraph_store::join::ParseBlob>,
-    ),
-    AftError,
-> {
-    let lang =
-        detect_language_from_source(path, source).ok_or_else(|| AftError::InvalidRequest {
-            message: format!("unsupported file for call graph: {}", path.display()),
-        })?;
-    if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
-        return build_file_data_from_source_with_lang(path, source, lang).map(|data| (data, None));
-    }
-    let (tree, lang) = crate::parser::parse_resolved_source(path, source, lang)?;
-    let lines = SourceLineIndex::new(source);
-    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true)
-}
-
 #[derive(Debug)]
 struct SymbolCallRange {
     symbol_index: usize,
@@ -1434,17 +1394,18 @@ struct SymbolCallRange {
 
 type SourceLineIndex = crate::callgraph_store::LineIndex;
 
-fn collect_calls_by_symbol(
+fn collect_calls_by_symbol<'tree>(
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     lang: LangId,
     symbols: &[Symbol],
     line_index: &SourceLineIndex,
+    nav: impl Nav<'tree>,
 ) -> HashMap<String, Vec<CallSite>> {
     attribute_sites_to_symbols(
         line_index,
         symbols,
-        extract_calls_full(source, root, 0, source.len(), lang),
+        extract_calls_full_with(source, root, 0, source.len(), lang, nav),
         lang,
     )
 }
@@ -1522,16 +1483,17 @@ fn split_macro_body_calls(
     (ordinary, body_calls)
 }
 
-fn collect_rust_value_refs_by_symbol(
+fn collect_rust_value_refs_by_symbol<'tree>(
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     symbols: &[Symbol],
     line_index: &SourceLineIndex,
+    nav: impl Nav<'tree>,
 ) -> HashMap<String, Vec<CallSite>> {
     let mut references = attribute_sites_to_symbols(
         line_index,
         symbols,
-        extract_rust_value_references(source, root),
+        extract_rust_value_references_with(source, root, nav),
         LangId::Rust,
     );
     // A function item remains a reference whether it is passed to an API or
@@ -1542,17 +1504,22 @@ fn collect_rust_value_refs_by_symbol(
     references
 }
 
-fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> Option<bool> {
+fn rust_item_is_test<'tree>(
+    source: &str,
+    root: tree_sitter::Node<'tree>,
+    byte: usize,
+    nav: impl Nav<'tree>,
+) -> Option<bool> {
     if root.has_error() {
         return None;
     }
     let mut node = root.descendant_for_byte_range(byte, byte)?;
     let mut item = node;
-    while let Some(parent) = item.parent() {
-        if item.kind() == "attribute_item" {
-            while let Some(next) = item.next_named_sibling() {
+    while let Some(parent) = nav.parent(item) {
+        if nav.kind(item) == "attribute_item" {
+            while let Some(next) = nav.next_named_sibling(item) {
                 item = next;
-                if item.kind() != "attribute_item" && !item.is_extra() {
+                if nav.kind(item) != "attribute_item" && !item.is_extra() {
                     break;
                 }
             }
@@ -1561,9 +1528,10 @@ fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> 
         }
         item = parent;
     }
-    while let Some(parent) = node.parent() {
-        let mut sibling = node.prev_named_sibling();
-        while let Some(attribute) = sibling.filter(|n| n.kind() == "attribute_item" || n.is_extra())
+    while let Some(parent) = nav.parent(node) {
+        let mut sibling = nav.prev_named_sibling(node);
+        while let Some(attribute) =
+            sibling.filter(|n| nav.kind(*n) == "attribute_item" || n.is_extra())
         {
             let text = source[attribute.byte_range()]
                 .split_whitespace()
@@ -1571,7 +1539,7 @@ fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> 
             if text == "#[test]" || text == "#[cfg(test)]" {
                 return Some(true);
             }
-            sibling = attribute.prev_named_sibling();
+            sibling = nav.prev_named_sibling(attribute);
         }
         node = parent;
     }
@@ -1694,49 +1662,33 @@ thread_local! {
     static CALL_SITE_KIND_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn classify_call_site_kinds(
-    root: tree_sitter::Node<'_>,
+fn classify_call_site_kinds<'tree>(
+    root: tree_sitter::Node<'tree>,
     calls: &mut HashMap<String, Vec<CallSite>>,
     value_refs: &mut HashMap<String, Vec<CallSite>>,
+    nav: impl Nav<'tree>,
 ) {
     let mut syntax_by_span = calls
         .values()
         .chain(value_refs.values())
         .flatten()
         .map(|site| ((site.byte_start, site.byte_end), CallSiteSyntax::default()))
-        .collect::<HashMap<_, _>>();
+        .collect::<rustc_hash::FxHashMap<_, _>>();
     if syntax_by_span.is_empty() {
         return;
     }
 
-    // Looking every range up from the root repeats long descents on nested calls.
-    // One cursor walk retains argument context on a heap-backed ancestor path.
-    let mut cursor = root.walk();
-    let mut argument_parents = Vec::new();
-    'walk: loop {
-        let node = cursor.node();
+    // Looking every range up from the root repeats long descents on nested
+    // calls. One walk keeps each node's parent kind, the argument context.
+    nav.walk_with_parent_kind(root, |node, kind, parent_kind| {
         #[cfg(test)]
         CALL_SITE_KIND_NODE_VISITS.with(|visits| visits.set(visits.get() + 1));
         if let Some(syntax) = syntax_by_span.get_mut(&(node.start_byte(), node.end_byte())) {
             // Equal-span descendants overwrite ancestors, matching the deepest range lookup.
-            syntax.construction = node.kind() == "new_expression";
-            syntax.argument = argument_parents.last().copied().unwrap_or(false);
+            syntax.construction = kind == "new_expression";
+            syntax.argument = matches!(parent_kind, Some("arguments" | "argument_list"));
         }
-        let arguments = matches!(node.kind(), "arguments" | "argument_list");
-        if cursor.goto_first_child() {
-            argument_parents.push(arguments);
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                break 'walk;
-            }
-            argument_parents.pop();
-        }
-    }
+    });
     for site in calls.values_mut().flatten() {
         if syntax_by_span[&(site.byte_start, site.byte_end)].construction {
             site.kind = CallSiteKind::Construction;
@@ -1757,17 +1709,37 @@ pub(crate) fn build_file_data_from_tree(
     tree: &tree_sitter::Tree,
     line_index: &SourceLineIndex,
 ) -> Result<FileCallData, AftError> {
-    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false)
+    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false, Direct, None)
         .map(|(data, _)| data)
 }
 
-fn build_file_data_from_tree_observed(
+/// Like [`build_file_data_from_tree`], with `index`, the tree's syntax
+/// index, answering every walk and parent or sibling lookup. With
+/// `outline`, also fills it with the file's symbols as the parser extracts
+/// them, before the call graph qualifies, adds or merges any.
+pub(crate) fn build_file_data_from_index<'tree>(
     path: &Path,
     source: &str,
     lang: LangId,
-    tree: &tree_sitter::Tree,
+    tree: &'tree tree_sitter::Tree,
+    line_index: &SourceLineIndex,
+    index: &SyntaxIndex<'tree>,
+    outline: Option<&mut Vec<Symbol>>,
+) -> Result<FileCallData, AftError> {
+    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false, index, outline)
+        .map(|(data, _)| data)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_file_data_from_tree_observed<'tree>(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    tree: &'tree tree_sitter::Tree,
     line_index: &SourceLineIndex,
     collect_objects: bool,
+    nav: impl Nav<'tree>,
+    outline: Option<&mut Vec<Symbol>>,
 ) -> Result<
     (
         FileCallData,
@@ -1784,25 +1756,34 @@ fn build_file_data_from_tree_observed(
     };
 
     // Get symbols (for call site extraction and export detection)
-    let mut symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
+    let mut symbols = crate::parser::extract_symbols_from_tree_with(&source, &tree, lang, nav)?;
+    if let Some(outline) = outline {
+        outline.clone_from(&symbols);
+    }
     let object_nodes = crate::callgraph_store::join::dispatch::complete_typescript_symbols(
         source,
         lang,
         tree.root_node(),
         &mut symbols,
+        nav,
     );
     let mut rust_qualified = HashMap::new();
     if lang == LangId::Rust {
-        rust_qualified = qualify_rust_impl_methods(source, tree.root_node(), &mut symbols);
-        symbols.extend(rust_trait_members(source, tree.root_node()));
+        rust_qualified = qualify_rust_impl_methods(source, tree.root_node(), &mut symbols, nav);
+        symbols.extend(rust_trait_members(source, tree.root_node(), nav));
     }
 
     let root = tree.root_node();
     let mut macro_body_calls_by_macro = HashMap::new();
     let mut macro_mentions_by_symbol = HashMap::new();
     let mut calls_by_symbol = if lang == LangId::Rust {
-        let (raw_calls, macro_facts) =
-            crate::calls::extract_rust_calls_with_macro_facts(&source, root, 0, source.len());
+        let (raw_calls, macro_facts) = crate::calls::extract_rust_calls_with_macro_facts_with(
+            &source,
+            root,
+            0,
+            source.len(),
+            nav,
+        );
         let (raw_calls, body_calls) =
             split_macro_body_calls(line_index, &symbols, raw_calls, &macro_facts.bodies);
         macro_body_calls_by_macro = body_calls;
@@ -1810,7 +1791,7 @@ fn build_file_data_from_tree_observed(
             attribute_sites_to_symbols(line_index, &symbols, macro_facts.unparsed_mentions, lang);
         attribute_sites_to_symbols(line_index, &symbols, raw_calls, lang)
     } else {
-        collect_calls_by_symbol(&source, root, lang, &symbols, line_index)
+        collect_calls_by_symbol(&source, root, lang, &symbols, line_index, nav)
     };
     if let Some(python) = &python {
         let mut owned = HashMap::<String, Vec<CallSite>>::new();
@@ -1830,7 +1811,7 @@ fn build_file_data_from_tree_observed(
         calls_by_symbol = owned;
     }
     let mut value_refs_by_symbol = if lang == LangId::Rust {
-        collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index)
+        collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index, nav)
     } else if lang == LangId::Go {
         attribute_sites_to_symbols(
             line_index,
@@ -1842,20 +1823,20 @@ fn build_file_data_from_tree_observed(
         attribute_sites_to_symbols(
             line_index,
             &symbols,
-            crate::calls::extract_js_callback_references(source, root),
+            crate::calls::extract_js_callback_references_with(source, root, nav),
             lang,
         )
     } else {
         HashMap::new()
     };
 
-    let default_export = find_default_export(&source, root, path, lang);
+    let default_export = find_default_export(&source, root, path, lang, nav);
 
     if let Some(default_export) = &default_export {
         if default_export.synthetic {
             let byte_start = default_export.node.byte_range().start;
             let byte_end = default_export.node.byte_range().end;
-            let raw_calls = extract_calls_full(&source, root, byte_start, byte_end, lang);
+            let raw_calls = extract_calls_full_with(&source, root, byte_start, byte_end, lang, nav);
             let sites: Vec<CallSite> = raw_calls
                 .into_iter()
                 .filter(|(_, short, _, _, _)| *short != default_export.symbol)
@@ -1876,7 +1857,7 @@ fn build_file_data_from_tree_observed(
         }
     }
 
-    classify_call_site_kinds(root, &mut calls_by_symbol, &mut value_refs_by_symbol);
+    classify_call_site_kinds(root, &mut calls_by_symbol, &mut value_refs_by_symbol, nav);
 
     // Collect exported symbol names
     let mut exported_symbols: Vec<String> = symbols
@@ -1894,7 +1875,7 @@ fn build_file_data_from_tree_observed(
     }
 
     let rust_attribute_entry_points = if lang == LangId::Rust {
-        crate::parser::rust_attribute_entry_points(&source, root)
+        crate::parser::rust_attribute_entry_points_with(&source, root, nav)
             .into_iter()
             .map(|entry| {
                 let name = rust_qualified
@@ -1908,6 +1889,13 @@ fn build_file_data_from_tree_observed(
         HashMap::new()
     };
 
+    // Every Go variable of a main package initializes with the program.
+    let go_main_package = lang == LangId::Go
+        && root.named_children(&mut root.walk()).any(|n| {
+            n.kind() == "package_clause" && source[n.byte_range()].trim() == "package main"
+        });
+    let python_main = lang == LangId::Python && python_runs_as_main(source, root);
+    let go_init = lang == LangId::Go && go_declares_init(source, root);
     // Build per-symbol metadata for entry point detection
     let mut symbol_metadata: HashMap<String, SymbolMeta> = symbols
         .iter()
@@ -1921,6 +1909,7 @@ fn build_file_data_from_tree_observed(
                             source,
                             root,
                             line_index.byte_offset(s.range.start_line, s.range.start_col),
+                            nav,
                         )
                     } else {
                         Some(false)
@@ -1934,14 +1923,16 @@ fn build_file_data_from_tree_observed(
                         .get(&identity)
                         .cloned()
                         .or_else(|| {
-                            (lang == LangId::Go
-                                && s.kind == SymbolKind::Variable
-                                && root.named_children(&mut root.walk()).any(|n| {
-                                    n.kind() == "package_clause"
-                                        && source[n.byte_range()].trim() == "package main"
-                                }))
-                            .then(|| "go_package_initializer".to_string())
+                            (go_main_package && s.kind == SymbolKind::Variable)
+                                .then(|| "go_package_initializer".to_string())
                         }),
+                    program_start: starts_program(
+                        lang,
+                        &identity,
+                        &s.kind,
+                        go_main_package,
+                        go_init,
+                    ),
                 },
             )
         })
@@ -1957,31 +1948,34 @@ fn build_file_data_from_tree_observed(
                 line: default_export.node.start_position().row as u32 + 1,
                 range: crate::parser::node_range(&default_export.node),
                 entry_point_attribute: None,
+                program_start: false,
             });
     }
     // Template calls have a real macro owner. The owner is not a root: only
     // an invocation from reachable code can make its outgoing edges live.
     if lang == LangId::Rust {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == "macro_definition" {
+        // A later definition of the same macro name replaces an earlier one,
+        // in the order of a stack walk over named children.
+        nav.walk_named(root, |node, kind| {
+            if kind == "macro_definition" {
                 if let Some(name) = node.child_by_field_name("name") {
                     symbol_metadata.insert(
                         format!("{}!", &source[name.byte_range()]),
                         SymbolMeta {
-                            is_test: rust_item_is_test(source, root, node.start_byte()),
+                            is_test: rust_item_is_test(source, root, node.start_byte(), nav),
                             kind: SymbolKind::Function,
                             exported: false,
                             signature: None,
                             line: node.start_position().row as u32 + 1,
                             range: crate::parser::node_range(&node),
                             entry_point_attribute: None,
+                            program_start: false,
                         },
                     );
                 }
             }
-            stack.extend(node.named_children(&mut node.walk()));
-        }
+            true
+        });
     }
     if calls_by_symbol.contains_key(TOP_LEVEL_SYMBOL)
         || value_refs_by_symbol.contains_key(TOP_LEVEL_SYMBOL)
@@ -2001,6 +1995,7 @@ fn build_file_data_from_tree_observed(
                     end_col: 0,
                 },
                 entry_point_attribute: None,
+                program_start: python_main,
             });
     }
     if lang == LangId::Go {
@@ -2019,6 +2014,7 @@ fn build_file_data_from_tree_observed(
                     end_col: 0,
                 },
                 entry_point_attribute: None,
+                program_start: false,
             },
         );
     }
@@ -2048,16 +2044,22 @@ fn build_file_data_from_tree_observed(
     Ok((data, objects))
 }
 
-pub(crate) fn rust_module_qualified_name(node: Node<'_>, source: &str, name: &str) -> String {
+/// `name` qualified by the inline modules around `node`.
+pub(crate) fn rust_module_qualified_name<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+    nav: impl Nav<'tree>,
+) -> String {
     let mut modules = Vec::new();
-    let mut parent = node.parent();
+    let mut parent = nav.parent(node);
     while let Some(ancestor) = parent {
-        if ancestor.kind() == "mod_item" {
+        if nav.kind(ancestor) == "mod_item" {
             if let Some(name) = ancestor.child_by_field_name("name") {
                 modules.push(node_text(name, source));
             }
         }
-        parent = ancestor.parent();
+        parent = nav.parent(ancestor);
     }
     modules.reverse();
     modules.push(name.to_string());
@@ -2065,16 +2067,16 @@ pub(crate) fn rust_module_qualified_name(node: Node<'_>, source: &str, name: &st
 }
 
 // Same-named types in separate inline modules must not share method identities.
-fn qualify_rust_impl_methods(
+fn qualify_rust_impl_methods<'tree>(
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     symbols: &mut [Symbol],
+    nav: impl Nav<'tree>,
 ) -> HashMap<String, Option<String>> {
     let mut types = HashSet::new();
-    let mut declarations = vec![root];
-    while let Some(node) = declarations.pop() {
+    nav.walk_named(root, |node, kind| {
         if matches!(
-            node.kind(),
+            kind,
             "struct_item" | "enum_item" | "trait_item" | "type_item"
         ) {
             if let Some(name) = node.child_by_field_name("name") {
@@ -2082,25 +2084,27 @@ fn qualify_rust_impl_methods(
                     node,
                     source,
                     &node_text(name, source),
+                    nav,
                 ));
             }
         }
-        declarations.extend(node.named_children(&mut node.walk()));
-    }
+        true
+    });
     let mut scopes = HashMap::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "impl_item" {
+    nav.walk_named(root, |node, kind| {
+        if kind == "impl_item" {
             let declared_here = ["type", "trait"]
                 .iter()
                 .filter_map(|field| node.child_by_field_name(field))
                 .any(|ty| {
                     let name = node_text(ty, source);
                     let base = name.split('<').next().unwrap_or(&name);
-                    types.contains(&rust_module_qualified_name(node, source, base))
+                    types.contains(&rust_module_qualified_name(node, source, base, nav))
                 });
             if !declared_here {
-                continue;
+                // Nothing under an impl of a type declared elsewhere is
+                // qualified, nested impls included.
+                return false;
             }
             if let Some(body) = node.child_by_field_name("body") {
                 for method in body
@@ -2108,7 +2112,7 @@ fn qualify_rust_impl_methods(
                     .filter(|n| n.kind() == "function_item")
                 {
                     if let Some(name) = method.child_by_field_name("name") {
-                        let prefix = rust_module_qualified_name(node, source, "");
+                        let prefix = rust_module_qualified_name(node, source, "", nav);
                         scopes.insert(
                             (
                                 method.end_position().row as u32,
@@ -2121,8 +2125,8 @@ fn qualify_rust_impl_methods(
                 }
             }
         }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
+        true
+    });
     let mut translated = HashMap::new();
     for symbol in symbols.iter_mut().filter(|s| s.kind == SymbolKind::Method) {
         if let Some(prefix) = scopes.get(&(
@@ -2150,25 +2154,24 @@ fn qualify_rust_impl_methods(
     translated
 }
 
-fn rust_trait_members(source: &str, root: Node<'_>) -> Vec<Symbol> {
+fn rust_trait_members<'tree>(source: &str, root: Node<'tree>, nav: impl Nav<'tree>) -> Vec<Symbol> {
     let mut symbols = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "trait_item" {
+    nav.walk_named(root, |node, kind| {
+        if kind == "trait_item" {
             if let (Some(name), Some(body)) = (
                 node.child_by_field_name("name"),
                 node.child_by_field_name("body"),
             ) {
                 let name = node_text(name, source);
                 let mut scope = Vec::new();
-                let mut parent = node.parent();
+                let mut parent = nav.parent(node);
                 while let Some(ancestor) = parent {
-                    if ancestor.kind() == "mod_item" {
+                    if nav.kind(ancestor) == "mod_item" {
                         if let Some(module) = ancestor.child_by_field_name("name") {
                             scope.push(node_text(module, source));
                         }
                     }
-                    parent = ancestor.parent();
+                    parent = nav.parent(ancestor);
                 }
                 scope.reverse();
                 scope.push(name.clone());
@@ -2205,8 +2208,8 @@ fn rust_trait_members(source: &str, root: Node<'_>) -> Vec<Symbol> {
                 }
             }
         }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
+        true
+    });
     symbols
 }
 
@@ -2223,40 +2226,23 @@ fn find_default_export<'tree>(
     root: Node<'tree>,
     path: &Path,
     lang: LangId,
+    nav: impl Nav<'tree>,
 ) -> Option<DefaultExport<'tree>> {
     if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
         return None;
     }
-    find_default_export_inner(source, root, path)
-}
-
-fn find_default_export_inner<'tree>(
-    source: &str,
-    node: Node<'tree>,
-    path: &Path,
-) -> Option<DefaultExport<'tree>> {
-    if node.kind() == "export_statement" {
-        if let Some(default_export) = default_export_from_statement(source, node, path) {
-            return Some(default_export);
+    // The first export statement in preorder that names a default export.
+    let mut found = None;
+    nav.walk(root, |node, kind| {
+        if found.is_some() {
+            return false;
         }
-    }
-
-    let mut cursor = node.walk();
-    if !cursor.goto_first_child() {
-        return None;
-    }
-
-    loop {
-        let child = cursor.node();
-        if let Some(default_export) = find_default_export_inner(source, child, path) {
-            return Some(default_export);
+        if kind == "export_statement" {
+            found = default_export_from_statement(source, node, path);
         }
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-
-    None
+        found.is_none()
+    });
+    found
 }
 
 fn default_export_from_statement<'tree>(
@@ -3110,7 +3096,15 @@ impl RustCrateRootMemo {
 }
 
 fn read_rust_crate_targets(crate_root: &Path, facts: &FactPaths<'_>) -> Option<RustCrateTargets> {
-    let bytes = facts.attributed_bytes(&crate_root.join("Cargo.toml"))?;
+    let manifest = crate_root.join("Cargo.toml");
+    // A crate's targets come from `[lib] path`, the target tables and their
+    // auto-discovery switches, so a change to any of them changes this
+    // answer. Without these fields the read named no field, and only another
+    // reader's unrelated field on the same file kept it from counting as
+    // reading the whole file.
+    facts.config_fact(&manifest, "disk.lib.path");
+    facts.config_fact(&manifest, "disk.targets");
+    let bytes = facts.attributed_bytes(&manifest)?;
     let cargo: toml::Value = toml::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
     let lib = cargo
         .get("lib")
@@ -3364,40 +3358,6 @@ fn find_tsconfig_dir(from_dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> 
     None
 }
 
-/// The `compilerOptions.paths` of `tsconfig_dir/tsconfig.json` as
-/// `resolve_tsconfig_path` reads them: the directory targets are relative to
-/// (`baseUrl`, default the tsconfig's directory) and each alias with its
-/// targets. None when the file is missing, unparsable or has no `paths`.
-pub(crate) fn tsconfig_path_aliases(
-    tsconfig_dir: &Path,
-    facts: &FactPaths<'_>,
-) -> Option<(PathBuf, Vec<(String, Vec<String>)>)> {
-    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), None, facts)?;
-    let compiler_options = tsconfig.get("compilerOptions")?;
-    let paths = compiler_options.get("paths")?.as_object()?;
-    let base_url = compiler_options
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .unwrap_or(".");
-    let aliases = paths
-        .iter()
-        .map(|(alias, targets)| {
-            let targets = targets
-                .as_array()
-                .map(|targets| {
-                    targets
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            (alias.clone(), targets)
-        })
-        .collect();
-    Some((tsconfig_dir.join(base_url), aliases))
-}
-
 fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {
     if let Some(star_index) = alias.find('*') {
         let (prefix, suffix_with_star) = alias.split_at(star_index);
@@ -3566,10 +3526,25 @@ fn resolve_workspace_package(
     facts
         .facts
         .memo_start(&workspace_root, "package", package_name);
-    let resolved = cached_workspace_member_dirs(&workspace_root, memo, facts)
-        .iter()
-        .find(|dir| package_json_name(dir, memo, facts).as_deref() == Some(package_name))
-        .map(|dir| facts.canonical(dir).unwrap_or_else(|| dir.clone()));
+    // A recorder that keeps every read with its answer records the name's key
+    // instead of the member walk and the names it read: the walk is the same
+    // for every reader, and kept in each it was most of a monorepo's stored
+    // call graph. `js_workspace_package_map` sets the key when the name's
+    // member changes.
+    let keyed = facts.facts.records_answers();
+    if keyed {
+        facts
+            .facts
+            .record_domain(&crate::callgraph_store::join::js_package_key(
+                &checkout_relative(facts, &workspace_root),
+                package_name,
+            ));
+        facts.facts.pause_recording();
+    }
+    let resolved = workspace_package_member(&workspace_root, package_name, memo, facts);
+    if keyed {
+        facts.facts.resume_recording();
+    }
 
     facts
         .facts
@@ -3586,6 +3561,63 @@ fn resolve_workspace_package(
     }
 
     resolved
+}
+
+/// The member of the workspace at `workspace_root` whose `package.json` names
+/// `package_name`, resolved: the first in member order when several do.
+fn workspace_package_member(
+    workspace_root: &Path,
+    package_name: &str,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> Option<PathBuf> {
+    cached_workspace_member_dirs(workspace_root, memo, facts)
+        .iter()
+        .find(|dir| package_json_name(dir, memo, facts).as_deref() == Some(package_name))
+        .map(|dir| facts.canonical(dir).unwrap_or_else(|| dir.clone()))
+}
+
+/// `path` relative to the checkout root of `facts`, with `/` separators.
+fn checkout_relative(facts: &FactPaths<'_>, path: &Path) -> String {
+    path.strip_prefix(facts.root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Each JavaScript workspace package's resolved member folder, by the key a
+/// reader records for looking its name up ([`js_package_key`]), for each of
+/// `candidates` that is a workspace root. A name several members share maps
+/// to the member [`resolve_workspace_package`] finds. Read through `facts`
+/// without a memo, so a map built before and after a change compares what
+/// the resolver would find in each.
+///
+/// [`js_package_key`]: crate::callgraph_store::join::js_package_key
+pub(crate) fn js_workspace_package_map(
+    facts: &FactPaths<'_>,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for candidate in candidates {
+        if !is_workspace_root(&candidate, None, facts) {
+            continue;
+        }
+        let root = facts
+            .canonical(&candidate)
+            .unwrap_or_else(|| candidate.clone());
+        let relative = checkout_relative(facts, &root);
+        for dir in workspace_member_dirs(&root, None, facts) {
+            let Some(name) = package_json_name(&dir, None, facts) else {
+                continue;
+            };
+            let key = crate::callgraph_store::join::js_package_key(&relative, &name);
+            map.entry(key).or_insert_with(|| {
+                let resolved = facts.canonical(&dir).unwrap_or(dir);
+                resolved.to_string_lossy().into_owned()
+            });
+        }
+    }
+    map
 }
 
 /// The member list for a workspace root, walked at most once per cache
@@ -4911,6 +4943,7 @@ def right():
                 lang,
                 &symbols,
                 &SourceLineIndex::new(source),
+                Direct,
             );
             let mut reference = reference;
             reference.remove("Worker");
@@ -4958,6 +4991,7 @@ def right():
             LangId::TypeScript,
             &symbols,
             &SourceLineIndex::new(source),
+            Direct,
         );
         assert_eq!(actual, reference, "overlapping and adjacent ranges changed");
         assert_eq!(
@@ -4995,6 +5029,7 @@ def right():
                     end_col: 0,
                 },
                 entry_point_attribute: None,
+                program_start: false,
             },
         );
         let file_data = FileCallData {
@@ -5818,173 +5853,6 @@ function hidden() {}
         }
     }
 
-    /// A bare package import that is not a workspace member costs one
-    /// member-directory walk per (workspace, package), not one per resolution:
-    /// the walk's answer must reach the process-wide cache even when the caller
-    /// resolves with a throwaway memo, which is what the refresh and extract
-    /// paths do per import.
-    #[test]
-    fn workspace_package_miss_is_walked_once_across_throwaway_memos() {
-        use crate::callgraph_store::facts::{DirEntry, ProjectFacts};
-        use std::cell::Cell;
-        use std::sync::Arc;
-
-        struct CountingFacts<'a> {
-            inner: &'a DiskFacts,
-            list_dir_calls: Cell<usize>,
-        }
-        impl ProjectFacts for CountingFacts<'_> {
-            fn is_file(&self, rel: &[u8]) -> bool {
-                self.inner.is_file(rel)
-            }
-            fn is_dir(&self, rel: &[u8]) -> bool {
-                self.inner.is_dir(rel)
-            }
-            fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
-                self.inner.config_bytes(rel)
-            }
-            fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
-                self.inner.symlink_target(rel)
-            }
-            fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
-                self.inner.canonical(rel)
-            }
-            fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {
-                self.list_dir_calls.set(self.list_dir_calls.get() + 1);
-                self.inner.list_dir(rel)
-            }
-        }
-
-        let dir = TempDir::new().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        fs::write(
-            root.join("package.json"),
-            r#"{"workspaces":["packages/*"]}"#,
-        )
-        .unwrap();
-        for member in ["a", "b", "c"] {
-            let member_dir = root.join("packages").join(member);
-            fs::create_dir_all(member_dir.join("src")).unwrap();
-            fs::write(
-                member_dir.join("package.json"),
-                format!(r#"{{"name":"@ws/{member}"}}"#),
-            )
-            .unwrap();
-        }
-        let disk = DiskFacts::new(&root);
-        let counting = CountingFacts {
-            inner: &disk,
-            list_dir_calls: Cell::new(0),
-        };
-        let facts = FactPaths {
-            root: &root,
-            facts: &counting,
-        };
-        clear_workspace_package_cache();
-
-        let first = resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(first, None, "react is not a member");
-        let walked = counting.list_dir_calls.get();
-        assert!(
-            walked > 0,
-            "the first miss must walk the member directories"
-        );
-
-        let second = resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(second, None);
-        assert_eq!(
-            counting.list_dir_calls.get(),
-            walked,
-            "a second resolution with a fresh memo must not walk again"
-        );
-
-        // The walk is per workspace, not per package: a different non-member
-        // import is answered from the same member list.
-        let third = resolve_workspace_package(
-            &root,
-            "effect",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(third, None, "effect is not a member either");
-        assert_eq!(
-            counting.list_dir_calls.get(),
-            walked,
-            "a second package on the same workspace must reuse the member walk"
-        );
-        // And a member resolves from the same list too.
-        let member = resolve_workspace_package(
-            &root,
-            "@ws/b",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        )
-        .expect("@ws/b is a member");
-        assert!(member.ends_with("packages/b"), "{member:?}");
-        assert_eq!(counting.list_dir_calls.get(), walked);
-
-        // A configure of some OTHER root must leave this workspace's entries
-        // alone: the daemon binds other roots many times a minute.
-        let other = TempDir::new().unwrap();
-        clear_workspace_package_cache_under(other.path());
-        resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(
-            counting.list_dir_calls.get(),
-            walked,
-            "clearing under another root must not drop this workspace's entries"
-        );
-        crate::callgraph_store::invalidate_refresh_workspace_package_cache(other.path());
-        resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert_eq!(
-            counting.list_dir_calls.get(),
-            walked,
-            "another root's manifest refresh must not drop this workspace's entries"
-        );
-        // A configure of THIS root drops them.
-        clear_workspace_package_cache_under(&root);
-        resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        let rewalked = counting.list_dir_calls.get();
-        assert!(rewalked > walked, "clearing under this root re-walks");
-
-        // A workspace manifest change is the other thing that may re-walk.
-        clear_workspace_package_cache();
-        resolve_workspace_package(
-            &root,
-            "react",
-            Some(&ModuleResolutionMemo::default()),
-            &facts,
-        );
-        assert!(
-            counting.list_dir_calls.get() > rewalked,
-            "after the cache is dropped the next miss walks again"
-        );
-    }
-
     #[test]
     fn same_named_methods_use_scoped_symbol_identity() {
         let dir = TempDir::new().unwrap();
@@ -6144,5 +6012,53 @@ function helperB() {}
     fn extract_parameters_javascript() {
         let params = extract_parameters("function handleClick(event, target)", LangId::JavaScript);
         assert_eq!(params, vec!["event", "target"]);
+    }
+}
+
+#[cfg(test)]
+fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let qualified_query = symbol_name.contains("::");
+    let mut consider = |candidate: &str| {
+        let matches = if qualified_query {
+            candidate == symbol_name
+        } else {
+            candidate == symbol_name || symbol_unqualified_name(candidate) == symbol_name
+        };
+        if matches && seen.insert(candidate.to_string()) {
+            candidates.push(candidate.to_string());
+        }
+    };
+    for candidate in file_data.symbol_metadata.keys() {
+        consider(candidate);
+    }
+    for candidate in file_data.calls_by_symbol.keys() {
+        consider(candidate);
+    }
+    for candidate in &file_data.exported_symbols {
+        consider(candidate);
+    }
+    candidates.sort();
+    candidates
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_symbol_query_in_data(
+    file_data: &FileCallData,
+    file: &Path,
+    symbol_name: &str,
+) -> Result<String, AftError> {
+    let candidates = symbol_query_candidates(file_data, symbol_name);
+    match candidates.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Err(AftError::SymbolNotFound {
+            name: symbol_name.to_string(),
+            file: file.display().to_string(),
+        }),
+        _ => Err(AftError::AmbiguousSymbol {
+            name: symbol_name.to_string(),
+            candidates,
+        }),
     }
 }

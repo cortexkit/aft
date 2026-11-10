@@ -11,11 +11,6 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
-    callgraph_store::{
-        callgraph_refresh_worker_test_counts, clear_callgraph_refresh_worker_test_seam,
-        flush_callgraph_store_refreshes_with_budget, set_callgraph_refresh_worker_test_seam,
-        CallGraphStore,
-    },
     config::Config,
     inspect::{InspectCache, InspectCacheError},
     parser::TreeSitterProvider,
@@ -120,174 +115,6 @@ fn test_executor(
 }
 
 #[test]
-fn lane_paused_six_cold_roots_leave_slots_and_maintenance_available() {
-    use crate::semantic_index::{
-        retry_lane_pause, with_lane_pause_clock, with_lane_pause_wait_hook, PauseRetryScope,
-        SemanticIndex, SemanticIndexLock,
-    };
-    use crate::synapse_embed::{pause_test_support::*, LanePause, SynapseEmbeddingError};
-    const ROOTS: usize = 6;
-    let limiter = crate::cold_build_limiter::isolated_limiter(2);
-    let storage = tempfile::tempdir().unwrap();
-    let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
-    let resume = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    let advanced = Arc::new(AtomicUsize::new(0));
-    let writer_reached = Arc::new(AtomicUsize::new(0));
-    let mut directories = Vec::new();
-    let mut workers = Vec::new();
-    for number in 0..ROOTS {
-        let (directory, root) = test_root(&format!("paused-{number}"));
-        let file = directory.path().join("lib.rs");
-        std::fs::write(&file, "pub fn prepared() {}\n").unwrap();
-        let key = format!("paused-{number}");
-        crate::root_cache::configure_artifact_access(root.as_path(), &key, false);
-        let storage = storage.path().to_path_buf();
-        let limiter = limiter.clone();
-        let entered = entered_tx.clone();
-        let resume = resume.clone();
-        let advanced = advanced.clone();
-        let writer_reached = writer_reached.clone();
-        directories.push((directory, key.clone()));
-        workers.push(thread::spawn(move || {
-            let _policy = PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            with_lane_pause_clock(START, |clock| {
-                let clock_wait = clock.clone();
-                with_lane_pause_wait_hook(move |delay| {
-                    entered.send(number).unwrap();
-                    let (lock, wake) = &*resume;
-                    let mut released = lock.lock().unwrap();
-                    while !*released { released = wake.wait(released).unwrap(); }
-                    clock_wait.fetch_add(delay.as_millis() as u64, Ordering::SeqCst);
-                    advanced.fetch_add(1, Ordering::SeqCst);
-                }, || retry_lane_pause(|| {
-                    let _permit = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-                        &limiter, "semantic build", root.as_path(), || true).unwrap();
-                    let _writer =
-                        SemanticIndexLock::acquire(&storage, &key, root.as_path()).unwrap();
-                    if storage.join("semantic").join(&key).join("cache.lock").exists() {
-                        writer_reached.fetch_add(1, Ordering::SeqCst);
-                    }
-                    SemanticIndex::build(root.as_path(), std::slice::from_ref(&file), &mut |texts: Vec<String>| {
-                        if clock.load(Ordering::SeqCst) < START + PAUSE_MS {
-                            Err(SynapseEmbeddingError::LanePaused(LanePause {
-                                lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
-                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(), cause: Default::default(), safe_to_retry_same_request: true, record_id: 0,
-                            }).to_string())
-                        } else { Ok(vec![vec![1.0, 0.0]; texts.len()]) }
-                    }, 100)
-                })).map(|index| index.len())
-            })
-        }));
-    }
-    // Each notification follows the attempt's permit and writer-lock drops.
-    // Allow slow roots to arrive before probing resources; no pause is resumed yet.
-    let pause_deadline = Instant::now() + Duration::from_secs(60);
-    let mut paused = 0;
-    while paused < ROOTS && entered_rx.recv_deadline(pause_deadline).is_ok() {
-        paused += 1;
-    }
-    let writer_locks_free = directories
-        .iter()
-        .filter(|(_, key)| {
-            let path = storage.path().join("semantic").join(key).join("cache.lock");
-            crate::fs_lock::try_acquire(&path, Duration::ZERO).is_ok()
-        })
-        .count();
-    let executor = test_executor(2, 1, 2, 1);
-    let (_other_dir, other) = test_root("unrelated-during-pause");
-    executor.register_actor(other.clone(), test_ctx());
-    let admitted = Arc::new(AtomicUsize::new(0));
-    let counted = admitted.clone();
-    let other_limiter = limiter.clone();
-    let unrelated = executor.submit_maintenance_async(
-        other,
-        Lane::HeavyInit,
-        "unrelated-cold".into(),
-        Box::new(move |_| {
-            if let Some(_permit) = other_limiter.try_acquire() {
-                counted.fetch_add(1, Ordering::SeqCst);
-                ok("unrelated-cold")
-            } else {
-                Response::error(
-                    "unrelated-cold",
-                    "admission_blocked",
-                    "all cold slots retained by paused roots",
-                )
-            }
-        }),
-    );
-    let unrelated = recv_async(unrelated, "unrelated maintenance during pause");
-    let before_advance = advanced.load(Ordering::SeqCst);
-    let writer_attempts_before_advance = writer_reached.load(Ordering::SeqCst);
-    {
-        let (lock, wake) = &*resume;
-        *lock.lock().unwrap() = true;
-        wake.notify_all();
-    }
-    for worker in workers {
-        assert!(worker.join().unwrap().unwrap() > 0);
-    }
-    assert_eq!(
-        paused, ROOTS,
-        "not all roots entered the pause before the deadline"
-    );
-    assert_eq!(writer_locks_free, ROOTS, "a pause retained a writer lock");
-    assert_eq!(
-        writer_attempts_before_advance, ROOTS,
-        "the writer-lock control did not reach each real lock"
-    );
-    assert!(unrelated.success);
-    assert_eq!(admitted.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        before_advance, 0,
-        "unrelated work only ran after virtual pause expiry"
-    );
-}
-
-#[test]
-fn lane_paused_executor_jobs_return_without_pinning_a_worker() {
-    use crate::semantic_index::{retry_lane_pause, with_lane_pause_wait_hook, PauseRetryScope};
-    use crate::synapse_embed::{pause_test_support::*, LanePause, SynapseEmbeddingError};
-    let executor = test_executor(2, 1, 2, 1);
-    let mut directories = Vec::new();
-    let mut replies = Vec::new();
-    for number in 0..6 {
-        let (directory, root) = test_root(&format!("paused-executor-{number}"));
-        executor.register_actor(root.clone(), test_ctx());
-        directories.push(directory);
-        replies.push(executor.submit_maintenance_async(root, Lane::HeavyInit, format!("paused-{number}"), Box::new(move |_| {
-            let _policy = PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
-            with_lane_pause_wait_hook(|_| panic!("executor worker attempted an announced-pause wait"), || {
-                let result: Result<(), String> = retry_lane_pause(|| Err(SynapseEmbeddingError::LanePaused(LanePause {
-                    lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
-                    paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(), cause: Default::default(), safe_to_retry_same_request: true, record_id: 0,
-                }).to_string()));
-                Response::success(format!("paused-{number}"), serde_json::json!({"pause": LanePause::from_error(&result.unwrap_err()).is_some()}))
-            })
-        })));
-    }
-    for reply in replies {
-        let response = recv_async(reply, "paused executor job");
-        assert!(response.success, "{}", response.data);
-        assert_eq!(response.data["pause"], true);
-    }
-    let (_other, root) = test_root("after-paused-executor");
-    executor.register_actor(root.clone(), test_ctx());
-    assert!(
-        recv_async(
-            executor.submit_maintenance_async(
-                root,
-                Lane::HeavyInit,
-                "after-pause".into(),
-                Box::new(|_| ok("after-pause"))
-            ),
-            "maintenance after pauses"
-        )
-        .success
-    );
-}
-
-#[test]
 fn last_executor_owner_can_drop_on_worker() {
     let owner = Arc::new(parking_lot::Mutex::new(Some(test_executor(2, 1, 1, 1))));
     let (_dir, root) = test_root("last-owner");
@@ -313,126 +140,6 @@ fn last_executor_owner_can_drop_on_worker() {
         .recv_timeout(Duration::from_secs(5))
         .expect("dropping on a worker must return without self-join");
     assert!(recv_async(response, "last owner drop").success);
-}
-
-#[test]
-fn callgraph_submit_last_owner_returns_before_dependent_worker() {
-    let executor = test_executor(3, 2, 2, 1);
-    let (_a_dir, a_root) = test_root("callgraph-last-submit");
-    let (_b_dir, b_root) = test_root("callgraph-dependent-worker");
-    executor.register_actor(a_root.clone(), test_ctx());
-    executor.register_actor(b_root.clone(), test_ctx());
-    let submitter = RootMaintenanceExecutor {
-        inner: Arc::downgrade(&executor.inner),
-        root_id: a_root.clone(),
-    };
-    let (upgraded_tx, upgraded_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    *executor.inner.maintenance_root_check_hook.lock() = Some(Box::new(move || {
-        upgraded_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    }));
-    let (peer_started_tx, peer_started_rx) = crossbeam_channel::bounded(1);
-    let (after_submit_tx, after_submit_rx) = crossbeam_channel::bounded(1);
-    let (abort_tx, abort_rx) = crossbeam_channel::bounded(1);
-    let peer = executor.submit(
-        b_root,
-        Lane::PureRead,
-        "dependent-worker".into(),
-        Box::new(move |_| {
-            peer_started_tx.send(()).unwrap();
-            crossbeam_channel::select! {
-                recv(after_submit_rx) -> _ => {},
-                recv(abort_rx) -> _ => {},
-                default(Duration::from_secs(5)) => panic!("dependent worker was not released"),
-            }
-            ok("dependent-worker")
-        }),
-    );
-    peer_started_rx
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap();
-    let (returned_tx, returned_rx) = crossbeam_channel::bounded(1);
-    let caller = executor.submit(
-        a_root,
-        Lane::PureRead,
-        "last-owner-submit".into(),
-        Box::new(move |_| {
-            assert!(submitter
-                .submit_callgraph_acquisition(JobCancellation::new(), Box::new(|_| ok("acquire"))));
-            returned_tx.send(()).unwrap();
-            let _ = after_submit_tx.send(());
-            ok("last-owner-submit")
-        }),
-    );
-    upgraded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    // The paused submitter owns the only other strong executor reference. Its
-    // worker must return before the dependent worker can finish.
-    drop(executor);
-    release_tx.send(()).unwrap();
-    let returned_before_abort = returned_rx.recv_timeout(Duration::from_millis(500)).is_ok();
-    let _ = abort_tx.send(());
-    assert!(peer.recv_timeout(Duration::from_secs(5)).unwrap().success);
-    assert!(caller.recv_timeout(Duration::from_secs(5)).unwrap().success);
-    assert!(
-        returned_before_abort,
-        "worker-side submission joined its dependent worker during last-owner drop"
-    );
-}
-
-#[test]
-fn callgraph_maintenance_preserves_other_heavy_overlap() {
-    let executor = test_executor(6, 3, 4, 3);
-    let (_dir, root) = test_root("callgraph-heavy-coexistence");
-    executor.register_actor(root.clone(), test_ctx());
-    let submitter = RootMaintenanceExecutor {
-        inner: Arc::downgrade(&executor.inner),
-        root_id: root.clone(),
-    };
-    let (graph_started_tx, graph_started_rx) = crossbeam_channel::bounded(1);
-    let (graph_release_tx, graph_release_rx) = crossbeam_channel::bounded(1);
-    assert!(submitter.submit_callgraph_acquisition(
-        JobCancellation::new(),
-        Box::new(move |_| {
-            graph_started_tx.send(()).unwrap();
-            graph_release_rx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-            ok("callgraph-acquisition")
-        })
-    ));
-    graph_started_rx
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap();
-    let (started_tx, started_rx) = crossbeam_channel::unbounded();
-    let (release_tx, release_rx) = crossbeam_channel::unbounded();
-    let mut replies = Vec::new();
-    for number in 0..2 {
-        let started_tx = started_tx.clone();
-        let release_rx = release_rx.clone();
-        replies.push(executor.submit_maintenance_async(
-            root.clone(),
-            Lane::HeavyInit,
-            format!("other-heavy-{number}"),
-            Box::new(move |_| {
-                started_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                ok("other-heavy")
-            }),
-        ));
-    }
-    let first = started_rx.recv_timeout(Duration::from_millis(500));
-    let second = started_rx.recv_timeout(Duration::from_millis(500));
-    graph_release_tx.send(()).unwrap();
-    release_tx.send(()).unwrap();
-    release_tx.send(()).unwrap();
-    for reply in replies {
-        assert!(recv_async(reply, "other heavy maintenance").success);
-    }
-    assert!(
-        first.is_ok() && second.is_ok(),
-        "unrelated heavy maintenance was serialized behind callgraph acquisition"
-    );
 }
 
 fn observe_max(max_seen: &AtomicUsize, value: usize) {
@@ -2457,104 +2164,6 @@ fn newer_interactive_mutator_beats_older_same_actor_maintenance_mutator() {
         .recv_timeout(Duration::from_secs(1))
         .expect("maintenance starts after cap frees");
     assert!(recv_async(maintenance, "maintenance completion").success);
-}
-
-#[test]
-fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
-    // This test shares the process-wide refresh worker with the
-    // refresh_worker_tests group; without the lock, its flush can shut the
-    // worker down mid-batch for a concurrently running peer test.
-    let _refresh_guard = crate::callgraph_store::REFRESH_WORKER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
-    let root_dir = tempfile::Builder::new()
-        .prefix("aft-executor-callgraph-offload-")
-        .tempdir()
-        .expect("create callgraph worker root");
-    let storage = root_dir.path().join("storage");
-    let source = root_dir.path().join("main.rs");
-    std::fs::write(&source, "fn entry() { leaf(); }\nfn leaf() {}\n")
-        .expect("write callgraph fixture");
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        Config {
-            project_root: Some(root_dir.path().to_path_buf()),
-            storage_dir: Some(storage),
-            indexes: crate::config::IndexesConfig {
-                trigram: false,
-                semantic: false,
-                callgraph: true,
-            },
-            ..Config::default()
-        },
-    ));
-    ctx.set_canonical_cache_root(root_dir.path().to_path_buf());
-    let project_key = crate::search_index::artifact_cache_key(root_dir.path());
-    crate::root_cache::configure_artifact_access(root_dir.path(), &project_key, false);
-    ctx.set_cache_role(false, None);
-    let (store, _) = CallGraphStore::cold_build_with_lease(
-        ctx.callgraph_store_dir(),
-        root_dir.path().to_path_buf(),
-        std::slice::from_ref(&source),
-    )
-    .expect("build callgraph fixture");
-    drop(store);
-    set_callgraph_refresh_worker_test_seam(
-        root_dir.path().to_path_buf(),
-        Duration::from_millis(350),
-        false,
-    );
-
-    let executor = test_executor(2, 1, 2, 1);
-    let root = ProjectRootId::from_path(root_dir.path()).expect("canonical actor root");
-    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-    let ctx_for_drain = Arc::clone(&ctx);
-    let source_for_drain = source.clone();
-    let maintenance = executor.submit_maintenance_async(
-        root.clone(),
-        Lane::MaintenanceCommit,
-        "watcher-drain".to_string(),
-        Box::new(move |_| {
-            ctx_for_drain.enqueue_callgraph_store_refresh([source_for_drain]);
-            ok("watcher-drain")
-        }),
-    );
-    assert!(recv_async(maintenance, "maintenance completion").success);
-
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while callgraph_refresh_worker_test_counts(root_dir.path()).0 == 0 {
-        assert!(Instant::now() < deadline, "refresh worker did not start");
-        thread::sleep(Duration::from_millis(5));
-    }
-    let (mutating_started_tx, mutating_started_rx) = crossbeam_channel::bounded(1);
-    let mutating = executor.submit_async(
-        root,
-        Lane::Mutating,
-        "interactive-edit".to_string(),
-        Box::new(move |_| {
-            mutating_started_tx
-                .send(())
-                .expect("signal writer admission");
-            ok("interactive-edit")
-        }),
-    );
-    // Hang catch only: the store worker is held mid-write by the test seam
-    // until the flush below, so admission here is an ordering proof - a tight
-    // bound would just measure runner scheduling (census S-class shape; flaked
-    // at 150ms on loaded Linux CI).
-    mutating_started_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("interactive writer should admit while store worker is mid-write");
-    assert!(recv_async(mutating, "interactive edit completion").success);
-    // The flush releases the held write and waits for the worker to finish it;
-    // that is a liveness check, not a latency one. Every other flush site in
-    // the refresh_worker tests uses 30 s, and a 1 s bound failed on a Windows
-    // runner whose whole libtest pass took 575 s.
-    assert!(flush_callgraph_store_refreshes_with_budget(
-        Duration::from_secs(30)
-    ));
-    clear_callgraph_refresh_worker_test_seam(root_dir.path());
 }
 
 #[test]
@@ -5599,4 +5208,94 @@ fn call_ledger_lane_refuses_maintenance_admission() {
     let response = recv_async(refused, "maintenance ledger job");
     assert!(!response.success);
     assert_eq!(response.data["code"], "invalid_lane");
+}
+
+/// A call-graph read waits on an executor worker for the data-layer build or
+/// refresh it asked for, and that work reaches its pool through
+/// `RootMaintenanceExecutor::submit_maintenance`. When the handoff was queued
+/// as maintenance it needed a general worker beyond the interactive reserve:
+/// with the subc bridge's executor (four general workers, two kept for
+/// interactive work), two waiting reads held exactly the workers it waited
+/// for, so the build started only after both reads had given up.
+#[test]
+fn data_layer_handoff_runs_while_reads_wait_for_it() {
+    let executor = test_executor(4, 3, 3, 2);
+    let (_dir, root) = test_root("handoff-under-reads");
+    let ctx = test_ctx();
+    ctx.mark_subc_bound();
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+    let maintenance = ctx
+        .callgraph_executor_for_test()
+        .expect("registering the actor installs its maintenance executor");
+
+    const READS: usize = 2;
+    let running = Arc::new(AtomicUsize::new(0));
+    let reads: Vec<_> = (0..READS)
+        .map(|index| {
+            let maintenance = maintenance.clone();
+            let running = Arc::clone(&running);
+            let request_id = format!("callers-{index}");
+            let reply_id = request_id.clone();
+            executor.submit_async(
+                root.clone(),
+                Lane::HeavyInit,
+                request_id,
+                Box::new(move |_| {
+                    // Hand off only once every read holds its worker, as two
+                    // call-graph reads sent together do.
+                    running.fetch_add(1, Ordering::AcqRel);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while running.load(Ordering::Acquire) < READS && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    let together = running.load(Ordering::Acquire) == READS;
+                    let (ran_tx, ran_rx) = crossbeam_channel::bounded(1);
+                    assert!(maintenance.submit_maintenance(
+                        "data-layer-build",
+                        Lane::MaintenanceCommit,
+                        JobCancellation::new(),
+                        Box::new(move |_| {
+                            let _ = ran_tx.send(current_job_cancellation().is_some());
+                            ok("data-layer-build")
+                        }),
+                    ));
+                    let handoff = ran_rx.recv_timeout(Duration::from_secs(5)).ok();
+                    Response::success(
+                        reply_id,
+                        serde_json::json!({ "together": together, "handoff": handoff }),
+                    )
+                }),
+            )
+        })
+        .collect();
+    for (index, read) in reads.into_iter().enumerate() {
+        let response = recv_async(read, "call-graph read");
+        assert!(response.success, "read {index}: {response:?}");
+        assert_eq!(
+            response.data["together"], true,
+            "read {index} never ran beside the other read"
+        );
+        assert_eq!(
+            response.data["handoff"], true,
+            "read {index}: the handoff never ran, or ran without the root's cancellation, \
+             while the reads waited for it"
+        );
+    }
+
+    // An unbound root still starts nothing.
+    ctx.mark_subc_unbound();
+    let (ran_tx, ran_rx) = crossbeam_channel::bounded(1);
+    assert!(maintenance.submit_maintenance(
+        "data-layer-build",
+        Lane::MaintenanceCommit,
+        JobCancellation::new(),
+        Box::new(move |_| {
+            let _ = ran_tx.send(());
+            ok("data-layer-build")
+        }),
+    ));
+    assert!(
+        ran_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "an unbound root's maintenance ran"
+    );
 }

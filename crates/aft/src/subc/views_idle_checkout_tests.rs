@@ -1,8 +1,17 @@
 use super::*;
 
+/// Whether `ctx`'s checkout in the data layer is bound, without binding it.
+fn checkout_bound(ctx: &AppContext) -> bool {
+    matches!(
+        ctx.probe_data_checkout(),
+        Some(crate::data_layer::surfaces::DataCheckoutProbe::Bound(_))
+    )
+}
+
 #[test]
-fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_first_reply() {
+fn idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_first_reply() {
     let _env = crate::test_env::hermetic_git_env_guard();
+
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("main");
     std::fs::create_dir_all(&root).unwrap();
@@ -37,8 +46,7 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
         storage_dir: Some(storage),
         ..Default::default()
     };
-    config.views.enabled = true;
-    config.views.idle_checkout_hours = 1;
+    config.idle.checkout_hours = 1;
     config.indexes.semantic = false;
     let ctx = Arc::new(AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
@@ -48,13 +56,28 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
     ctx.set_canonical_cache_root(root.as_path().to_path_buf());
     ctx.set_standing_artifact_exempt(true);
     ctx.note_request();
+    // Bind the checkout and let its build publish before the first grep, so
+    // grep answers from the publication and the release below drops a
+    // settled checkout. (A grep that ran before the publication would fall
+    // back to today's search index and start a build of it, which nothing in
+    // this test drains, and which blocks the release as a build in flight.)
+    ctx.data_checkout().expect("the data layer binds the root");
+    let started = Instant::now();
+    while crate::data_layer::tools::search::DataText::ready(&ctx).is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the checkout never published its text plane"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let request: crate::protocol::RawRequest = serde_json::from_value(json!({
-        "id": "idle-views-grep", "command": "grep", "pattern": "target"
+        "id": "idle-checkout-grep", "command": "grep", "pattern": "target"
     }))
     .unwrap();
     let first = crate::commands::grep::handle_grep(&request, &ctx);
     assert!(first.success, "{:?}", first.data);
-    assert!(ctx.lexical_view_is_ready());
+    assert_eq!(first.data["index_status"], "Ready", "{:?}", first.data);
+    assert!(checkout_bound(&ctx));
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root.clone(), ctx.clone()));
     let channels = HashMap::from([(
@@ -79,10 +102,7 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
     };
     let used = ctx.last_request_at();
     sweep(&mut roots, used + Duration::from_secs(3599));
-    assert!(
-        ctx.lexical_view_is_ready(),
-        "use inside the window stays resident"
-    );
+    assert!(checkout_bound(&ctx), "use inside the window stays resident");
 
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -100,61 +120,34 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
     let due = used + Duration::from_secs(3601);
     sweep(&mut roots, due);
     assert!(
-        ctx.lexical_view_is_ready(),
+        checkout_bound(&ctx),
         "an in-flight call keeps the connected checkout"
     );
     release_tx.send(()).unwrap();
     assert!(call.recv_timeout(Duration::from_secs(30)).unwrap().success);
     let deadline = Instant::now() + Duration::from_secs(30);
-    while ctx.lexical_view_is_ready() {
+    while checkout_bound(&ctx) {
         sweep(&mut roots, due);
         assert!(
             Instant::now() < deadline,
-            "idle connected views were not released"
+            "the idle connected checkout was not released; blocker: {:?}",
+            ctx.try_artifact_eviction_blocker(false)
         );
         std::thread::yield_now();
     }
     assert!(executor.actor_registered(&root));
     assert!(!ctx.subc_unbound_quiesced(), "the route remains connected");
-    let paths = ctx.storage_paths();
-    let family = ctx.memoized_artifact_cache_key(root.as_path());
-    // Releasing the views ends their sessions on a background thread that
-    // needs the same storage reservation lock as the sweep. Poll the session
-    // rows read-only, so repeated sweeps cannot starve that cleanup, then
-    // sweep once at the unchanged idle clock.
-    let ledger =
-        crate::blob_store::v3::LedgerReader::open_existing(paths.artifacts.as_path(), &family)
-            .unwrap();
-    loop {
-        let sessions: u64 = ledger
-            .read(|connection| {
-                Ok(connection
-                    .query_row("SELECT COUNT(*) FROM view_sessions", [], |row| row.get(0))?)
-            })
-            .unwrap();
-        if sessions == 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "checkout view sessions stayed open: family={family}, sessions={sessions}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let clock = crate::pins::now_ms() + 3_601_000;
-    let report = crate::storage_retention::sweep_checkout_views_at_for_test(&paths, &family, clock);
-    assert!(report.errors.is_empty(), "{report:?}");
-    assert!(
-        report.removed_roots > 0,
-        "checkout member stayed protected: {report:?}"
-    );
+
     ctx.note_request();
     let reply = crate::commands::grep::handle_grep(&request, &ctx);
     assert!(
         reply.success,
-        "the first reply after eviction must answer: {:?}",
+        "the first reply after the release must answer: {:?}",
         reply.data
     );
+    // The publication stayed on disk: the next use binds the checkout again
+    // and answers from it at once, without a walk.
     assert_eq!(reply.data["index_status"], "Ready", "{:?}", reply.data);
-    assert!(ctx.lexical_view_is_ready());
+    assert_eq!(reply.data["total_matches"], 1, "{:?}", reply.data);
+    assert!(checkout_bound(&ctx));
 }

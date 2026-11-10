@@ -226,7 +226,7 @@ cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fm
 echo "  crates.io package sizes..."
 crate_limit=$((10 * 1024 * 1024))
 crate_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/package
-for crate in aft-tokenizer aft-secret-rules agent-file-tools; do
+for crate in aft-tokenizer aft-secret-rules aft-store agent-file-tools; do
   cargo package -p "$crate" --no-verify --allow-dirty -q >/dev/null 2>&1 || {
     echo "Error: cargo package -p $crate failed; run it to see why"; exit 1;
   }

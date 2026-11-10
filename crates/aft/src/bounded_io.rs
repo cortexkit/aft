@@ -589,42 +589,6 @@ pub(crate) fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -
 pub(crate) fn enter(budget: Option<Budget>) -> Scope {
     Scope(CURRENT.with(|current| current.replace(budget)))
 }
-/// The deadline bounded calls see while [`excluding_wait`] runs, far enough
-/// out that only their per-access cap limits them, so a stalled filesystem
-/// still fails within that cap. Afterwards the request's own deadline moves
-/// later by the time the wait actually took, not by this amount.
-const WAIT_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
-/// Runs `wait`, work that waits for or brings up shared state the request then
-/// reads (binding the checkout's lexical view, for example), without spending
-/// the request's filesystem deadline on it.
-///
-/// A request's deadline starts when the request arrives. A request that first
-/// waits behind such work on a loaded machine could otherwise find its
-/// deadline already spent when its first read starts, and fail with
-/// `read_deadline_exceeded` before reading anything. Inside `wait`, bounded
-/// calls keep the request's failure, permission and probe records but are
-/// limited only by their per-access cap; afterwards the request's deadline
-/// moves later by however long `wait` took, so its reads get the time the
-/// request had left when the wait began.
-pub(crate) fn excluding_wait<T>(wait: impl FnOnce() -> T) -> T {
-    let Some(budget) = current() else {
-        return wait();
-    };
-    let started = Instant::now();
-    let result = {
-        let mut held = budget;
-        held.deadline = started + WAIT_DEADLINE;
-        let _scope = enter(Some(held));
-        wait()
-    };
-    let waited = started.elapsed();
-    CURRENT.with(|current| {
-        if let Some(budget) = current.borrow_mut().as_mut() {
-            budget.deadline += waited;
-        }
-    });
-    result
-}
 /// Keep the last `margin` of the current request's budget for its reply:
 /// move the filesystem deadline `margin` earlier for the rest of the
 /// command. A request calls this before its last filesystem work, so a
@@ -1894,7 +1858,7 @@ fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
         options.custom_flags(libc::O_NONBLOCK | if _no_follow { libc::O_NOFOLLOW } else { 0 });
     }
     let scratch_check = crate::task_temp_reads::check_path(path)?;
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .content_reads
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut file = options.open(path)?;
@@ -1911,7 +1875,7 @@ fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
         .try_reserve(usize::try_from(metadata.len()).map_err(io::Error::other)?)
         .map_err(io::Error::other)?;
     file.read_to_end(&mut bytes)?;
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .content_read_bytes
         .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(bytes)

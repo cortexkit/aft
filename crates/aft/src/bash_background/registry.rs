@@ -208,16 +208,22 @@ pub(crate) const OWNER_PAUSED_REASON: &str = "paused_by_owner";
 pub const RUN_ENDED_REASON: &str = "run_ended";
 
 /// How an owner-directed stop is labelled to the agent: a run or scope end,
-/// or a cancellation that leaves the scope usable.
+/// a cancellation that leaves the scope usable, or the person revoking a
+/// folder the command's sandbox allowed.
 /// `None` for any other status reason.
 pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
     match reason {
         Some(SCOPE_REVOKED_REASON | "scope revoked") => Some("scope revoked"),
         Some(RUN_ENDED_REASON) => Some("run ended"),
         Some(OWNER_PAUSED_REASON) => Some("cancelled by owner"),
+        Some(folder_grants::FOLDER_ACCESS_REVOKED_REASON) => {
+            Some(folder_grants::FOLDER_ACCESS_REVOKED_LABEL)
+        }
         _ => None,
     }
 }
+#[path = "folder_grants.rs"]
+pub(crate) mod folder_grants;
 #[path = "remote.rs"]
 pub(crate) mod remote;
 #[path = "return_files.rs"]
@@ -811,6 +817,33 @@ pub struct BgCompletion {
     pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants_summary: Option<String>,
+}
+
+impl BgCompletion {
+    pub(crate) fn into_push_frame(self) -> PushFrame {
+        let mut frame = BashCompletedFrame::new(
+            self.task_id,
+            self.session_id,
+            self.status,
+            self.exit_code,
+            self.command,
+            self.output_preview,
+            self.output_truncated,
+            self.original_tokens,
+            self.compressed_tokens,
+            self.tokens_skipped,
+        );
+        frame.bash_output_list_envelope = self.bash_output_list_envelope;
+        frame.launching_identity = self.launching_identity;
+        frame.changed_files = self.changed_files;
+        frame.status_reason = self.status_reason;
+        frame.output_incomplete = self.output_incomplete;
+        frame.live_descendants = self.live_descendants;
+        frame.live_descendants_omitted = self.live_descendants_omitted;
+        frame.live_descendants_unavailable = self.live_descendants_unavailable;
+        frame.live_descendants_summary = self.live_descendants_summary;
+        PushFrame::BashCompleted(frame)
+    }
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -7867,6 +7900,12 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|remote| remote.cancel_pending))
         .then(|| metadata.task_id.clone());
+        // A saved folder grant this command's sandbox holds may have been
+        // revoked while AFT was down, when no revoke could see the command.
+        let folder_check = metadata
+            .folder_grants
+            .is_some()
+            .then(|| (metadata.task_id.clone(), metadata.session_id.clone()));
         let (marker, process_alive) = if matches!(
             metadata.status,
             BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
@@ -8016,6 +8055,9 @@ impl BgTaskRegistry {
             if !self.hold_remote_worker(&task_id) {
                 self.resume_remote_task(&task_id)?;
             }
+        }
+        if let Some((task_id, session)) = folder_check {
+            self.stop_if_folder_grant_revoked(&task_id, &session, self.grant_db());
         }
         Ok(())
     }
@@ -11746,6 +11788,18 @@ impl BgTaskRegistry {
             .unwrap_or_default()
     }
 
+    pub(crate) fn pending_completion_ids(&self) -> HashMap<String, HashSet<String>> {
+        let mut ids: HashMap<String, HashSet<String>> = HashMap::new();
+        if let Ok(completions) = self.inner.completions.lock() {
+            for completion in completions.iter() {
+                ids.entry(completion.session_id.clone())
+                    .or_default()
+                    .insert(completion.task_id.clone());
+            }
+        }
+        ids
+    }
+
     fn remove_pending_completion(&self, task_id: &str) -> Option<BgCompletion> {
         let mut completions = self.inner.completions.lock().ok()?;
         let idx = completions
@@ -13241,14 +13295,6 @@ impl BgTaskRegistry {
             }
         }
         Some(false)
-    }
-
-    /// Hold the watch map lock for the duration of `while_held`, so a test can
-    /// prove a caller does not wait for it.
-    #[cfg(test)]
-    pub(crate) fn hold_watchdog_tasks_lock_for_test(&self, while_held: impl FnOnce()) {
-        let _held = self.inner.watchdog_tasks.lock();
-        while_held();
     }
 
     pub(crate) fn retire_watchdog_task(&self, task_id: &str) {
@@ -15074,28 +15120,7 @@ impl BgTaskRegistry {
         // sender is shared behind a Mutex. It still uses the same stdout writer
         // closure as foreground progress frames, preserving the existing lock/
         // flush behavior in main.rs.
-        let mut frame = BashCompletedFrame::new(
-            completion.task_id,
-            completion.session_id,
-            completion.status,
-            completion.exit_code,
-            completion.command,
-            completion.output_preview,
-            completion.output_truncated,
-            completion.original_tokens,
-            completion.compressed_tokens,
-            completion.tokens_skipped,
-        );
-        frame.bash_output_list_envelope = completion.bash_output_list_envelope;
-        frame.launching_identity = completion.launching_identity;
-        frame.changed_files = completion.changed_files;
-        frame.status_reason = completion.status_reason;
-        frame.output_incomplete = completion.output_incomplete;
-        frame.live_descendants = completion.live_descendants;
-        frame.live_descendants_omitted = completion.live_descendants_omitted;
-        frame.live_descendants_unavailable = completion.live_descendants_unavailable;
-        frame.live_descendants_summary = completion.live_descendants_summary;
-        sender(PushFrame::BashCompleted(frame));
+        sender(completion.into_push_frame());
     }
 
     fn completion_token_counts(
@@ -17356,7 +17381,17 @@ impl BgTask {
             // also never started. Accepted results keep the launch task handle.
             terminal: (state.metadata.is_terminal()
                 && (!remote.accepted || remote::remote_refusal(&state.metadata).is_some()))
-            .then(|| self.snapshot_locked(state, 0)),
+            .then(|| {
+                let mut snapshot = self.snapshot_locked(state, 0);
+                // Deadline and drain replies use this projection without reading
+                // task state again. Publish the diagnostics with the status,
+                // even before the terminal output cache has been rendered.
+                if let Some(note) = rendered_execution_note(&state.metadata) {
+                    snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
+                }
+                append_remote_report(&mut snapshot.output_preview, &state.metadata);
+                snapshot
+            }),
         };
         *self.runon_launch_state.lock().unwrap() = Some(launch);
     }

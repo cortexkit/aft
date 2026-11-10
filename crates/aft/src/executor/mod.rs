@@ -1,8 +1,4 @@
 mod single_flight;
-pub(crate) mod view_publication;
-pub use view_publication::{
-    install_standalone_scope, standalone_request_gate, StandaloneGate, StandaloneScope,
-};
 
 #[cfg(test)]
 mod tests;
@@ -1182,31 +1178,72 @@ impl Drop for SubmissionExecutor {
 }
 
 impl RootMaintenanceExecutor {
-    pub(crate) fn submit_callgraph_acquisition(
+    /// Admits `job` as this root's maintenance and runs it at once on the
+    /// calling thread, with the root's cancellation installed as the current
+    /// job's: `cancellation` gains the root and its bind lifecycle, so a root
+    /// unbinding cancels whatever the job starts at its checkpoints. The
+    /// executor refuses the job, and drops it unrun, under the same rules as
+    /// a maintenance job on a worker: the root is unbound, its folder is
+    /// gone, its actor is not registered or failed, or the token is already
+    /// cancelled. `false` when the executor has shut down; the caller must
+    /// not run the work some other way, which would reactivate a retired
+    /// root.
+    ///
+    /// The data layer's background work is the only caller, and its job only
+    /// hands the work to a pool of its own threads. The job does not wait
+    /// for a worker: a call-graph read waits on a worker for the build or
+    /// refresh it asked for, and the scheduler keeps its last
+    /// `interactive_reserve` general workers from maintenance. When the
+    /// handoff was queued as maintenance, two such reads on a four-worker
+    /// pool (one on a two-worker pool) held exactly the workers the handoff
+    /// waited for, so the build started only after each read had given up.
+    /// `lane` only labels the admission in the log.
+    pub(crate) fn submit_maintenance(
         &self,
+        request_id: &str,
+        lane: Lane,
         cancellation: JobCancellation,
         job: ExecutorJob,
     ) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
-        let executor = SubmissionExecutor(Some(Executor { inner }));
-        let (tx, _rx) = oneshot::channel();
-        executor
-            .0
-            .as_ref()
-            .unwrap()
-            .submit_with_completion_cancellable(
-                self.root_id.clone(),
-                JobClass::Maintenance,
-                Lane::HeavyInit,
-                CALLGRAPH_ACQUISITION_REQUEST_ID.into(),
-                job,
-                CompletionSender::Async(tx),
-                Some(cancellation),
-                None,
-                None,
+        // Dropped off-worker if it turns out to be the executor's last owner.
+        let owner = SubmissionExecutor(Some(Executor { inner }));
+        let executor = owner.0.as_ref().unwrap();
+        // A root stat can stall on disk I/O; probe it before taking the
+        // scheduler lock, as a queued submission does.
+        let root_exists = executor.maintenance_root_is_dir(&self.root_id);
+        let admitted = {
+            let state = executor.inner.state.lock();
+            state
+                .actors
+                .get(&self.root_id)
+                .filter(|actor| !actor.fatal && !actor.ctx.subc_unbound_quiesced())
+                .map(|actor| {
+                    let token = cancellation
+                        .with_root(self.root_id.as_path())
+                        .with_lifecycle(actor.ctx.subc_lifecycle_admission());
+                    (Arc::clone(&actor.ctx), token)
+                })
+        };
+        let Some((ctx, token)) = admitted.filter(|_| root_exists) else {
+            log::debug!(
+                "executor refused maintenance: request_id={request_id} lane={lane:?} root={} \
+                 (unbound, missing or unregistered)",
+                self.root_id.as_path().display()
             );
+            return true;
+        };
+        if token.cancel_requested_before_commit() || !token.mark_running() {
+            return true;
+        }
+        log::debug!(
+            "executor admitted maintenance: request_id={request_id} lane={lane:?} root={}",
+            self.root_id.as_path().display()
+        );
+        let _installed = JobCancellationContextGuard::install(Some(token));
+        let _ = job(&ctx);
         true
     }
 }
@@ -1319,7 +1356,7 @@ impl Executor {
         if inserted {
             ctx.install_callgraph_executor(maintenance);
             let app = ctx.app();
-            crate::root_cache::register_live_scope(&ctx.storage_dir(), &memory_root);
+            crate::cache_location::markers::register_live_scope(&ctx.storage_dir(), &memory_root);
             app.register_memory_context(memory_root, &ctx);
             app.actor_root_registered();
         }
@@ -1342,7 +1379,10 @@ impl Executor {
         };
         if let Some(actor) = removed.as_ref() {
             let app = actor.ctx.app();
-            crate::root_cache::unregister_live_scope(&actor.ctx.storage_dir(), root_id.as_path());
+            crate::cache_location::markers::unregister_live_scope(
+                &actor.ctx.storage_dir(),
+                root_id.as_path(),
+            );
             app.unregister_memory_context(root_id.as_path(), &actor.ctx);
             app.actor_root_unregistered();
         }
@@ -1404,7 +1444,10 @@ impl Executor {
             return false;
         };
         let app = actor.ctx.app();
-        crate::root_cache::unregister_live_scope(&actor.ctx.storage_dir(), root_id.as_path());
+        crate::cache_location::markers::unregister_live_scope(
+            &actor.ctx.storage_dir(),
+            root_id.as_path(),
+        );
         app.unregister_memory_context(root_id.as_path(), &actor.ctx);
         app.actor_root_unregistered();
         std::thread::spawn(move || {
@@ -1455,9 +1498,6 @@ impl Executor {
     /// Interactive tools other than inspect retain their normal completion path.
     pub(crate) fn cancel_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
         let mut state = self.inner.state.lock();
-        if let Some(actor) = state.actors.get(root_id) {
-            view_publication::cancel_for_context(&actor.ctx);
-        }
         let mut cancelled = state
             .actors
             .get_mut(root_id)
@@ -1699,9 +1739,7 @@ impl Executor {
                     | "trace_to_symbol"
                     | "trace_data"
             )
-            && self
-                .actor_context(&root_id)
-                .is_some_and(|ctx| ctx.callgraph_views_enabled())
+            && self.actor_context(&root_id).is_some_and(|_ctx| false)
         {
             Lane::PureRead
         } else {
@@ -2932,9 +2970,7 @@ impl ActorState {
     }
 
     fn is_idle(&self) -> bool {
-        self.actor_total_inflight == 0
-            && !self.has_queued_jobs()
-            && !view_publication::running_for_context(&self.ctx)
+        self.actor_total_inflight == 0 && !self.has_queued_jobs()
     }
 
     fn has_queued_jobs_for(&self, job_class: JobClass) -> bool {
@@ -4638,11 +4674,6 @@ fn detached_writer_backoff(attempts: u32) -> Duration {
 const EPOCH_WAIT_POLL: Duration = Duration::from_millis(25);
 
 fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
-    let _actor_scope = view_publication::ActorScope::install(
-        Arc::clone(&run_job.ctx),
-        Arc::clone(&run_job.epoch),
-        Arc::clone(&run_job.detached_writers),
-    );
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
     let _waiting_writers_ctx = ActorWaitingWritersGuard::install(ActorWriterDemand {
         queued: Arc::clone(&run_job.waiting_writers),

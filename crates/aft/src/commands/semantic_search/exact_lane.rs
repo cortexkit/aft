@@ -13,6 +13,7 @@ use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::commands::semantic_search::plan_table::SearchLaneKind;
 use crate::commands::semantic_search::{LaneExecution, LaneInput, SearchLane};
+use crate::data_layer::tools::search::TextIndex;
 use crate::query_shape::{extract_content_tokens, minimum_content_token_window};
 use crate::search_index::{
     read_search_corpus_file, SearchCorpusEligibility, SearchIndex, SearchIndexSnapshot,
@@ -66,10 +67,26 @@ pub fn exact_phrase(query: &str) -> &str {
 
 /// Normalized exact phrase for verbatim comparison.
 pub fn normalize_exact_phrase(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
+    // Normalizing never lengthens the text. Exact-size storage keeps a
+    // prepared body's cache charge within its source range.
+    let mut out = String::with_capacity(text.len());
+    push_normalized_exact_phrase(text, &mut out);
+    out.shrink_to_fit();
+    out
+}
+
+/// Appends `text`'s normalized exact phrase to `out`: its words joined by
+/// single spaces, ASCII-lowercased. Callers that normalize many lines into one
+/// buffer use this so they can't drift from [`normalize_exact_phrase`].
+pub fn push_normalized_exact_phrase(text: &str, out: &mut String) {
+    let start = out.len();
+    for word in text.split_whitespace() {
+        if out.len() > start {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out[start..].make_ascii_lowercase();
 }
 
 /// Return whether a file can possibly contain an E2 window for all query tokens.
@@ -273,7 +290,25 @@ impl ExactLane {
         include_tests: bool,
         scope: &ExactEvidenceScope,
     ) -> VerifiedExactSet {
-        let matches = match snapshot.whole_corpus_exact_pass_scoped(
+        self.execute_ready_mode_index(
+            TextIndex::Snapshot(snapshot),
+            project_root,
+            query,
+            include_tests,
+            scope,
+        )
+    }
+
+    /// [`Self::execute_ready_mode_scoped`] over either text index source.
+    pub(crate) fn execute_ready_mode_index(
+        &self,
+        index: TextIndex<'_>,
+        project_root: &Path,
+        query: &str,
+        include_tests: bool,
+        scope: &ExactEvidenceScope,
+    ) -> VerifiedExactSet {
+        let matches = match index.whole_corpus_exact_pass_scoped(
             query,
             project_root,
             Some(&|path| super::path_allowed_by_include_tests(path, project_root, include_tests)),
@@ -550,7 +585,34 @@ impl ExactLane {
         fallback_options: Option<&FallbackExactOptions>,
         scope: &ExactEvidenceScope,
     ) -> Result<ServeOutcome, MemoError> {
-        let is_ready = snapshot.is_some();
+        self.search_scoped_index(
+            snapshot.map(TextIndex::Snapshot),
+            project_root,
+            snapshot_generation,
+            query,
+            include_tests,
+            offset,
+            top_k,
+            fallback_options,
+            scope,
+        )
+    }
+
+    /// [`Self::search_scoped_snapshot`] over either text index source: ready
+    /// mode when `index` is given, the bounded fallback walk otherwise.
+    pub(crate) fn search_scoped_index(
+        &self,
+        index: Option<TextIndex<'_>>,
+        project_root: &Path,
+        snapshot_generation: GenerationToken,
+        query: &str,
+        include_tests: bool,
+        offset: usize,
+        top_k: usize,
+        fallback_options: Option<&FallbackExactOptions>,
+        scope: &ExactEvidenceScope,
+    ) -> Result<ServeOutcome, MemoError> {
+        let is_ready = index.is_some();
         // Index loading can finish without changing snapshot_generation. Give
         // fallback results a separate memo key so they cannot be reused once
         // the full index is ready.
@@ -566,14 +628,8 @@ impl ExactLane {
         let fallback_opts = fallback_options.unwrap_or(&default_opts);
 
         self.memo.get_or_verify(&key, offset, top_k, || {
-            if is_ready {
-                Ok(self.execute_ready_mode_scoped(
-                    snapshot.unwrap(),
-                    project_root,
-                    query,
-                    include_tests,
-                    scope,
-                ))
+            if let Some(index) = index {
+                Ok(self.execute_ready_mode_index(index, project_root, query, include_tests, scope))
             } else {
                 let mut fallback =
                     self.execute_fallback_mode(project_root, query, include_tests, fallback_opts);
@@ -762,22 +818,28 @@ impl PreparedExactCache {
     }
 
     fn prepare(&self, digest: blake3::Hash, text: &str) -> Arc<PreparedExactText> {
-        let cell = {
-            let mut state = self.state.lock();
+        use super::waits::{self, SearchWait};
+        // A placeholder found unfilled means another request is preparing the
+        // same content: waiting for it is a wait, preparing it ourselves is not.
+        let (cell, another_preparing) = {
+            let mut state = waits::timed(SearchWait::PrepareCache, || self.state.lock());
             state.clock = state.clock.wrapping_add(1);
             let clock = state.clock;
             if let Some(entry) = state.entries.get_mut(&digest) {
                 entry.last_used = clock;
+                waits::record_prepared_text(|counts| counts.hits += 1);
                 if let Some(prepared) = entry.text.get() {
                     return Arc::clone(prepared);
                 }
-                Arc::clone(&entry.text)
+                (Arc::clone(&entry.text), true)
             } else {
+                waits::record_prepared_text(|counts| counts.misses += 1);
                 // Bound placeholders as well as prepared bytes. A placeholder
                 // single-flights parallel queries without holding the map lock
                 // during normalization and symbol scanning.
                 if state.entries.len() >= 1024 {
                     state.evict_oldest();
+                    waits::record_prepared_text(|counts| counts.evicted_by_count += 1);
                 }
                 let cell = Arc::new(OnceLock::new());
                 state.entries.insert(
@@ -788,9 +850,10 @@ impl PreparedExactCache {
                         bytes: 0,
                     },
                 );
-                cell
+                (cell, false)
             }
         };
+        let other_wait = another_preparing.then(|| waits::time(SearchWait::PrepareCache));
         let prepared = cell.get_or_init(|| {
             #[cfg(test)]
             self.preparations
@@ -799,7 +862,8 @@ impl PreparedExactCache {
             crate::search_hot_path_measurements::record(|counts| counts.exact_preparations += 1);
             Arc::new(PreparedExactText::new(text))
         });
-        let mut state = self.state.lock();
+        drop(other_wait);
+        let mut state = waits::timed(SearchWait::PrepareCache, || self.state.lock());
         if let Some(entry) = state.entries.get_mut(&digest) {
             if Arc::ptr_eq(&entry.text, &cell) && entry.bytes == 0 {
                 entry.bytes = prepared.retained_bytes();
@@ -808,6 +872,7 @@ impl PreparedExactCache {
         }
         while state.bytes > self.max_bytes {
             state.evict_oldest();
+            waits::record_prepared_text(|counts| counts.evicted_by_bytes += 1);
         }
         Arc::clone(prepared)
     }
@@ -835,14 +900,20 @@ pub(crate) fn verify_cached_exact_matches_in_text_with_member(
     )
 }
 
-/// Lexical verification and the exact lane normalize the same freshly read
-/// bytes. Share their existing bounded preparation, not their phrase, window or
-/// definition match decisions. Keep both disk reads so intervening edits remain
-/// visible to the lane that reads the changed bytes.
+/// Lexical verification and the exact lane normalize the same bytes, which
+/// one search request reads once (see `request_files`). Share their existing
+/// bounded preparation, keyed by the bytes' digest, not their phrase, window
+/// or definition match decisions; a later request that reads changed bytes
+/// gets a new digest and prepares them afresh.
 pub(super) fn prepare_exact_text(text: &str, digest: blake3::Hash) -> Arc<PreparedExactText> {
     static CACHE: OnceLock<PreparedExactCache> = OnceLock::new();
+    // Prepared text runs about twice the size of its source (the normalized
+    // copy plus the symbol list). On AFT's own tree, about 18 MB of text,
+    // that is 36-40 MB, and a 32 MiB cap evicted an entry on every miss
+    // (hit rate 66-80% under eight concurrent searches). The cache is
+    // process-wide, so this cap is its whole memory cost.
     CACHE
-        .get_or_init(|| PreparedExactCache::new(32 * 1024 * 1024))
+        .get_or_init(|| PreparedExactCache::new(64 * 1024 * 1024))
         .prepare(digest, text)
 }
 

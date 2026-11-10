@@ -1,1 +1,0 @@
-Long-running shell commands, build-server jobs and watches no longer get cut by a runner's 90-second silence rule: AFT's loop that supervises the command now reports it alive, even when the command prints nothing.

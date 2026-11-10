@@ -40,9 +40,13 @@ pub(super) struct ScopeDescriptions {
     evicted: u64,
     cleanup_pending: HashSet<ScopeKey>,
     cleanup_failed_attempts: u64,
+    saved_grant_sweep: access_grants::sweep::Stats,
 }
 
 impl ScopeDescriptions {
+    pub(super) fn grant_sweep(&mut self, stats: access_grants::sweep::Stats) {
+        self.saved_grant_sweep.add(stats);
+    }
     pub(super) fn cleanup_started(&mut self, stamp: &ScopeStamp) {
         self.cleanup_pending
             .insert(scope_describe::stamp_key(stamp));
@@ -60,6 +64,13 @@ impl ScopeDescriptions {
 
     pub(super) fn cleanup_health(&self) -> Value {
         json!({"pending_scopes": self.cleanup_pending.len(), "failed_attempts": self.cleanup_failed_attempts})
+    }
+
+    pub(super) fn grant_sweep_health(&self) -> Value {
+        let sweep = &self.saved_grant_sweep;
+        json!({"scopes_checked": sweep.described, "grants_deleted": sweep.deleted_grants,
+            "cant_tell": sweep.indeterminate, "errors": sweep.errors + sweep.timeouts + sweep.database_errors,
+            "last_pass_at_ms": sweep.last_pass_at_ms})
     }
 
     pub(super) fn record(
@@ -315,6 +326,7 @@ pub(super) fn snapshot(
             "all_routes_idle_over_30m_roots": idle_roots, "roots_with_ended_scopes": ended_roots,
             "scope_describe_cache_evicted": descriptions.evicted,
             "scope_cleanup": descriptions.cleanup_health(),
+            "saved_grant_sweep": descriptions.grant_sweep_health(),
             "scoped": scoped.value(), "unscoped": unscoped.value(), "by_principal": by_principal,
             "principal_limit": PRINCIPAL_LIMIT, "principals_omitted": omitted_principals,
             "omitted_principal_routes": omitted_routes, "omitted_principal_roots": omitted_roots.len()}),

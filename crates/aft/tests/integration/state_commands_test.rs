@@ -718,49 +718,32 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     assert!(aft.shutdown().success());
 }
 
-/// After a finalizing bind, wait until exactly one artifact family is owned
-/// and built for the root, and return its saved identity kind. A views-off
-/// root builds its trigram index under `index/<family>`; with views on the
-/// legacy index is never written and the checkout's lexical view builds the
-/// family's trigram plane under `blobs/v3/<family>` instead. That view is
-/// built by the first lexical query, not during configure maintenance of the
-/// stdin/stdout process these tests spawn, so each wait round sends a grep.
+/// After a finalizing bind, wait until the index store has built exactly one
+/// family for the root under `data/<family>` and grep answers from it, and
+/// return the root's saved identity kind. The index is built by the first
+/// lexical query, not during configure maintenance of the stdin/stdout
+/// process these tests spawn, so each wait round sends a grep.
 #[cfg(unix)]
 fn wait_for_single_built_family(aft: &mut AftProcess, storage: &Path) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        let owners = entry_names(storage, "artifact-owners");
-        let mut built = entry_names(storage, "index");
-        built.extend(
-            entry_names(storage, "blobs/v3")
-                .into_iter()
-                .filter(|family| {
-                    storage
-                        .join("blobs/v3")
-                        .join(family)
-                        .join("trigram.sqlite")
-                        .is_file()
-                }),
+        let grep = aft
+            .send(&json!({"id": "build-lexical", "command": "grep", "pattern": "fn"}).to_string());
+        assert_eq!(grep["success"], true, "{grep}");
+        let families = entry_names(storage, "data");
+        assert!(
+            families.len() <= 1,
+            "one folder must build one index family: {families:?}"
         );
-        built.sort();
-        built.dedup();
-        if owners.len() == 1 && built.contains(&owners[0]) {
-            assert_eq!(built, owners, "one folder must build one index family");
+        if families.len() == 1 && grep["index_status"] == "Ready" {
             let saved = saved_root_identities(storage);
             assert_eq!(saved.len(), 1, "{saved:?}");
             return saved[0]["identity"]["kind"].as_str().unwrap().to_string();
         }
         assert!(
-            owners.len() <= 1,
-            "one folder must own one artifact family: {owners:?}"
-        );
-        assert!(
             std::time::Instant::now() < deadline,
-            "no index was built after the finalizing bind: owners={owners:?} index={built:?}"
+            "no index was built after the finalizing bind: families={families:?} grep={grep}"
         );
-        let grep = aft
-            .send(&json!({"id": "build-lexical", "command": "grep", "pattern": "fn"}).to_string());
-        assert_eq!(grep["success"], true, "{grep}");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

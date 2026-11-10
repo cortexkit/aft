@@ -357,19 +357,21 @@ pub(crate) struct Scope {
 #[derive(Clone, Copy)]
 pub(crate) enum StartLog {
     Info,
+    #[cfg(test)]
     Quiet,
 }
 
 fn start_message(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -> Option<String> {
-    if matches!(log, StartLog::Quiet) {
-        return None;
+    match log {
+        #[cfg(test)]
+        StartLog::Quiet => None,
+        StartLog::Info => Some(format!(
+            "indexing start root={} kind={} total={:?}",
+            root.display(),
+            kind,
+            total
+        )),
     }
-    Some(format!(
-        "indexing start root={} kind={} total={:?}",
-        root.display(),
-        kind,
-        total
-    ))
 }
 
 pub(crate) fn start(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -> Scope {
@@ -410,45 +412,12 @@ pub(crate) fn phase(phase: &'static str, total: Option<usize>) {
     });
 }
 
-/// Changes a fill's stage without resetting its file-work counters. Preparation,
-/// admission and embedding are stages of the same budgeted file queue.
-pub(crate) fn stage(stage: &'static str) {
-    CURRENT.with(|current| {
-        if let Some(entry) = current.borrow().as_ref() {
-            let mut entry = lock(entry);
-            if entry.phase != stage {
-                entry.phase = stage;
-                if let Some(token) = &entry.cancellation {
-                    token.report_progress();
-                }
-            }
-        }
-    });
-}
-
 pub(crate) fn advance(files: usize) {
     CURRENT.with(|current| {
         if let Some(entry) = current.borrow().as_ref() {
             let mut entry = lock(entry);
             let done = entry.done.saturating_add(files as u64);
             entry.advance(done, Instant::now());
-        }
-    });
-}
-
-pub(crate) fn remaining(files: usize) {
-    CURRENT.with(|current| {
-        if let Some(entry) = current.borrow().as_ref() {
-            let mut entry = lock(entry);
-            entry.total = Some(entry.done.saturating_add(files as u64));
-        }
-    });
-}
-
-pub(crate) fn completed(files: usize) {
-    CURRENT.with(|current| {
-        if let Some(entry) = current.borrow().as_ref() {
-            lock(entry).advance(files as u64, Instant::now());
         }
     });
 }
@@ -495,49 +464,44 @@ pub(crate) fn snapshot(warming_roots: u64) -> Snapshot {
     REGISTRY.snapshot(warming_roots, Instant::now())
 }
 
-/// Stable work counters only: queue age and lock waits must not look like work.
-pub(crate) fn work_for_root(root: &Path) -> Vec<(u64, &'static str, u64, Option<u64>)> {
-    let root = root.to_string_lossy();
-    lock(&REGISTRY.0)
-        .running
-        .iter()
-        .filter_map(|(id, entry)| {
-            let entry = lock(entry);
-            (entry.root == root && entry.kind.starts_with("callgraph ") && !entry.fallback)
-                .then_some((*id, entry.phase, entry.done, entry.chunks_embedded))
-        })
-        .collect()
-}
-
 /// Test fixtures observe only their unique root. The production census keeps
 /// its cap, so a parallel test with many older jobs cannot hide a fixture's row.
 #[cfg(test)]
 pub(crate) fn snapshot_for_root(root: &Path, warming_roots: u64) -> Snapshot {
-    let root = root.to_string_lossy();
+    snapshot_for_roots(&[root], warming_roots)
+}
+
+/// Every running and queued job of the given roots, uncapped, and none of the
+/// jobs other tests in the process registered for their own roots.
+#[cfg(test)]
+pub(crate) fn snapshot_for_roots(roots: &[&Path], warming_roots: u64) -> Snapshot {
+    let roots = roots
+        .iter()
+        .map(|root| root.to_string_lossy())
+        .collect::<Vec<_>>();
+    let owned = |root: &str| roots.iter().any(|owned| owned == root);
     let now = Instant::now();
     let state = lock(&REGISTRY.0);
     Snapshot {
         running: state
             .running
             .values()
-            .find_map(|entry| {
+            .filter_map(|entry| {
                 let entry = lock(entry);
-                (entry.root == root && !entry.shadowed).then(|| entry.render(now))
+                (owned(&entry.root) && !entry.shadowed).then(|| entry.render(now))
             })
-            .into_iter()
             .collect(),
         queued: state
             .queued
             .values()
-            .find_map(|entry| {
+            .filter_map(|entry| {
                 let entry = lock(entry);
-                (entry.root == root).then(|| Queued {
+                owned(&entry.root).then(|| Queued {
                     root: entry.root.clone(),
                     kind: entry.kind.clone(),
                     waited_seconds: now.saturating_duration_since(entry.started).as_secs_f64(),
                 })
             })
-            .into_iter()
             .collect(),
         warming_roots,
         omitted: Omitted {

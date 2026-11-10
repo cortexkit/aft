@@ -102,10 +102,9 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
       return bridge;
     };
     // Mirror flat `experimental_bash_*` configure overrides back into the
-    // nested user-facing config shape that Pi's plugin reads from
-    // `ctx.config.experimental.bash.*` to decide whether to register
-    // bash_status / bash_kill. Without this, gating in registerBashTool would
-    // skip them even when the bridge has experimental_bash_background=true.
+    // user-facing `bash` block that Pi's plugin reads to decide whether to
+    // register bash_status / bash_kill, so registration matches the bridge.
+    // A flag the overrides leave out stays off, as it does on the wire.
     const bashExperimental = {
       ...(configOverrides.experimental_bash_rewrite !== undefined
         ? { rewrite: configOverrides.experimental_bash_rewrite as boolean }
@@ -118,7 +117,9 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
         : {}),
     };
     const ctxConfig: Record<string, unknown> =
-      Object.keys(bashExperimental).length > 0 ? { experimental: { bash: bashExperimental } } : {};
+      Object.keys(bashExperimental).length > 0
+        ? { bash: { rewrite: false, compress: false, background: false, ...bashExperimental } }
+        : {};
     const ctx: PluginContext = {
       pool,
       config: ctxConfig as PluginContext["config"],

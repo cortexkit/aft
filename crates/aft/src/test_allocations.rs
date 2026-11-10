@@ -74,6 +74,9 @@ pub(crate) fn heap_marker(prefix: &str, phase: &str) {
     }
 }
 
+/// Bytes allocated and not yet freed, process-wide. Only the Linux daemon
+/// heap probe reads it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn live_bytes() -> usize {
     LIVE_BYTES.load(Ordering::Relaxed)
 }

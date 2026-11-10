@@ -14,6 +14,81 @@ fn metadata(task: &ResolvedTask) -> PersistedTask {
 }
 
 #[test]
+fn metadata_persistence_db_row_resolves_both_streams_once() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let metadata = metadata(&task);
+    write_task_at(&task, &metadata).unwrap();
+    fs::write(&task.paths.stdout, b"stdout").unwrap();
+    fs::write(&task.paths.stderr, b"err").unwrap();
+    work_counts::reset();
+    let row = metadata.to_bash_task_row("runner", &task.paths).unwrap();
+    let counts = work_counts::get();
+    assert_eq!(row.output_bytes, Some(9));
+    assert_eq!(counts.metadata_reads, 1, "one layout verification per row");
+    assert_eq!(
+        counts.parses, 1,
+        "one typed decode supplies the version too"
+    );
+    assert_eq!(counts.artifact_opens, 2, "both output files are sampled");
+}
+
+#[test]
+fn metadata_persistence_read_decodes_task_once() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let metadata = metadata(&task);
+    write_task_at(&task, &metadata).unwrap();
+    work_counts::reset();
+    let saved = read_task_at(&task).unwrap();
+    assert_eq!(saved.task_id, metadata.task_id);
+    assert_eq!(saved.command, "synthetic task");
+    assert_eq!(work_counts::get().metadata_reads, 1);
+    assert_eq!(work_counts::get().parses, 1, "no intermediate Value tree");
+}
+
+#[test]
+fn metadata_persistence_future_shape_is_refused_before_decode_error() {
+    let storage = tempfile::tempdir().unwrap();
+    for version in [u64::from(SCHEMA_VERSION) + 1, u64::MAX] {
+        let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+        // Deliberately omit today's required fields: an unknown future shape
+        // must retain the unsupported-format error that prevents quarantine.
+        fs::write(
+            &task.paths.json,
+            format!(r#"{{"schema_version":{version}}}"#),
+        )
+        .unwrap();
+        let error = read_task_at(&task).unwrap_err();
+        assert!(
+            crate::persisted_format::UnsupportedPersistedFormat::from_io_error(&error).is_some(),
+            "future schema {version} was treated as corrupt: {error}"
+        );
+    }
+}
+
+#[test]
+fn metadata_persistence_current_shape_errors_remain_decode_errors() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let valid = serde_json::to_string(&metadata(&task)).unwrap();
+    for content in [
+        format!(r#"{{"schema_version":{SCHEMA_VERSION}}}"#),
+        valid.replacen("{", &format!(r#"{{"schema_version":{SCHEMA_VERSION},"#), 1),
+        "{broken".into(),
+    ] {
+        fs::write(&task.paths.json, &content).unwrap();
+        let expected = serde_json::from_str::<PersistedTask>(&content).unwrap_err();
+        let error = read_task_at(&task).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), expected.to_string());
+        assert!(
+            crate::persisted_format::UnsupportedPersistedFormat::from_io_error(&error).is_none()
+        );
+    }
+}
+
+#[test]
 fn metadata_persistence_equal_bytes_skip_replacement_and_changed_bytes_write() {
     let storage = tempfile::tempdir().unwrap();
     let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();

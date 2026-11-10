@@ -1,1 +1,0 @@
-`aft_search` formats caller annotations faster on large projects. Caller lookups no longer scan every indexed symbol, reducing database work for `aft_callgraph callers` as well. Results are unchanged.

@@ -192,7 +192,7 @@ fn tool_spawned_shells_carry_no_sdk_default_consumer_identity_material() {
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
                 "bash": { "background": true },
-                "sandbox": { "enabled": false }
+                "sandbox": { "profile": { "worker": "relaxed", "head": "off" } }
             })),
         })
         .to_string(),
@@ -597,7 +597,7 @@ fn bash_rejects_invalid_pty_dimensions() {
             "project_root": dir.path(),
             "storage_dir": dir.path().join("storage"),
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),
@@ -743,7 +743,7 @@ fn non_pty_foreground_and_deferred_bash_children_get_isolated_sessions() {
             "project_root": project.path(),
             "storage_dir": storage.path(),
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),

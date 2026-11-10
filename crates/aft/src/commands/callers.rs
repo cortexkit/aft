@@ -1,26 +1,17 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::{
-    callers_result, index_refusal_response, note_callgraph_served, store_error_response,
+    callers_result, note_callgraph_served, store_error_response,
 };
-use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use crate::{slog_info, slog_warn};
 
 /// Handle a `callers` request.
 pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_callers(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Graph,
-        BorrowedOp::Callers,
-    );
-    response
+    answer_callers(req, ctx)
 }
 
 fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -81,28 +72,23 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let store = match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Error(error) => {
-            return store_error_response(&req.id, "callers", error)
-        }
-        other => return index_refusal_response(&req.id, "callers", ctx, &other),
-    };
-
-    if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
-        &req.id, "callers", ctx, &store, &file_path,
+    let (snapshot, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
+        &req.id,
+        "callers",
+        ctx,
+        &[file_path.as_path()],
     ) {
-        return response;
-    }
-
-    // Retain the pinned reader while a separate transaction builds the answer.
-    let snapshot = match store.read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => return store_error_response(&req.id, "callers", error),
+        Ok(graph) => graph,
+        Err(response) => return response,
     };
     let started = Instant::now();
     let include_tests = include_tests_param(req);
     let outcome = callers_result(&snapshot, &file_path, symbol, depth, include_tests);
+    if let Some(response) =
+        crate::data_layer::tools::callgraph::failed_reads(&req.id, "callers", data_view.as_ref())
+    {
+        return response;
+    }
     let elapsed_ms = started.elapsed().as_millis();
 
     match outcome {

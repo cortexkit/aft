@@ -2002,14 +2002,6 @@ pub fn windows_gh_cmd(binary: &Path) -> Vec<u8> {
     format!("@echo off\r\n\"{rendered}\" gh-shim %*\r\n").into_bytes()
 }
 
-#[cfg(all(test, unix))]
-pub(crate) fn write_storage_permission_fixture(root: &Path) {
-    let hooks = root
-        .join(GIT_HOOKS_DIR_NAME)
-        .join(&managed_git_hook_set().key);
-    ensure_managed_git_hooks(&hooks).unwrap();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,8 +12,5 @@
     "semantic": true,
     "trigram": true
   },
-  "restrict_to_project_root": false,
-  "views": {
-    "enabled": true
-  }
+  "restrict_to_project_root": false
 }

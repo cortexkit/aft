@@ -350,12 +350,26 @@ impl Drop for DeferredInspectRootPermit {
     }
 }
 
-#[derive(Debug)]
+/// The stats and manifest hashes of a root's sources, its inventory, and the
+/// index-store checkout the inventory came from, if any: the final listing
+/// reads the same checkout, so both listings come from the same source.
 struct InspectRootStatSnapshot(
     Vec<(PathBuf, u64, SystemTime)>,
     Arc<crate::inspect::inventory::InspectInventory>,
     Vec<(PathBuf, blake3::Hash)>,
+    Option<Arc<crate::data_layer::runtime::DataCheckout>>,
 );
+
+impl std::fmt::Debug for InspectRootStatSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("InspectRootStatSnapshot")
+            .field(&self.0)
+            .field(&self.1)
+            .field(&self.2)
+            .field(&self.3.is_some())
+            .finish()
+    }
+}
 
 impl PartialEq for InspectRootStatSnapshot {
     fn eq(&self, other: &Self) -> bool {
@@ -365,12 +379,25 @@ impl PartialEq for InspectRootStatSnapshot {
 
 impl Eq for InspectRootStatSnapshot {}
 
+#[cfg(test)]
 fn capture_inspect_root_stats_until(
     root: &Path,
     deadline: Option<InspectRequestDeadline>,
 ) -> Result<InspectRootStatSnapshot, String> {
+    capture_inspect_root_stats_from(root, deadline, None)
+}
+
+/// The root's stat snapshot, listing its sources from `checkout`'s current
+/// view when one is bound and stands in for a walk, and from a walk of the
+/// folder otherwise.
+fn capture_inspect_root_stats_from(
+    root: &Path,
+    deadline: Option<InspectRequestDeadline>,
+    checkout: Option<Arc<crate::data_layer::runtime::DataCheckout>>,
+) -> Result<InspectRootStatSnapshot, String> {
     capture_inspect_root_stats_while(
         root,
+        checkout,
         move || deadline.is_none_or(InspectRequestDeadline::has_work_budget),
         move || {
             deadline
@@ -382,6 +409,7 @@ fn capture_inspect_root_stats_until(
 
 fn capture_inspect_root_stats_while(
     root: &Path,
+    checkout: Option<Arc<crate::data_layer::runtime::DataCheckout>>,
     has_work_budget: impl Fn() -> bool + Send + Sync + 'static,
     timeout_detail: impl Fn() -> String,
 ) -> Result<InspectRootStatSnapshot, String> {
@@ -390,10 +418,13 @@ fn capture_inspect_root_stats_while(
     let mut files = Vec::new();
     let has_work_budget = Arc::new(has_work_budget);
     let walk_budget = Arc::clone(&has_work_budget);
-    let inventory = Arc::new(crate::inspect::inventory::InspectInventory::collect(
-        root,
-        move || walk_budget(),
-    ));
+    let from_store = checkout
+        .as_ref()
+        .and_then(|checkout| checkout.view())
+        .and_then(|view| crate::inspect::inventory::InspectInventory::from_checkout(root, &view));
+    let inventory = Arc::new(from_store.unwrap_or_else(|| {
+        crate::inspect::inventory::InspectInventory::collect(root, move || walk_budget())
+    }));
     for file in &inventory.sources {
         if !has_work_budget() {
             return Err(timeout_detail());
@@ -443,7 +474,9 @@ fn capture_inspect_root_stats_while(
     if !has_work_budget() {
         return Err(timeout_detail());
     }
-    Ok(InspectRootStatSnapshot(files, inventory, manifests))
+    Ok(InspectRootStatSnapshot(
+        files, inventory, manifests, checkout,
+    ))
 }
 
 #[cfg(test)]
@@ -464,7 +497,7 @@ fn verify_final_root_stats(
         return Err(request_deadline_terminal(Some(phase_entry), deadline));
     }
     let stat_phase = phase_log.start(phase_entry);
-    match capture_inspect_root_stats_until(project_root, Some(deadline)) {
+    match capture_inspect_root_stats_from(project_root, Some(deadline), initial_stats.3.clone()) {
         Ok(final_stats) if final_stats == *initial_stats => {
             stat_phase.complete();
             Ok(())
@@ -832,135 +865,21 @@ fn handle_inspect_payload(
         return inspect_interrupted_response(&req.id);
     }
 
-    // Wait while the request's config/query guard is alive. The result is pinned
-    // once and handed into workers; they must not open another generation.
-    let tier2_enabled = InspectCategory::active()
-        .iter()
-        .any(|category| category.is_tier2() && snapshot.config.inspect.category_enabled(*category));
-    start_on_demand_callgraph_for_inspect(ctx, &snapshot.config);
-    // With views on, the graph-backed categories read the checkout's v3 view,
-    // pinned once for this request; an unavailable view is reported, never
-    // replaced by the legacy scanner's store.
-    let v3_routed = tier2_enabled && ctx.callgraph_views_enabled();
-    let routed_store = if tier2_enabled && (ctx.checkout_query_runtime_active() || v3_routed) {
-        request_deadline.map_or_else(
-            || ctx.callgraph_store_for_query_without_wait(),
-            |deadline| {
-                ctx.callgraph_store_for_ops_until(deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP))
-            },
-        )
-    } else {
-        crate::context::CallgraphStoreAccess::Unavailable
-    };
-    // A checkout over `views.callgraph_copies` reads the main checkout's
-    // graph. Where its files differ, dead code and the other graph-backed
-    // categories would describe the main checkout's code, so they report the
-    // borrowed graph as unavailable instead.
-    let routed_store = match (&routed_store, v3_routed) {
-        (crate::context::CallgraphStoreAccess::Ready(_), true) => {
-            match crate::commands::callgraph_borrowed::borrowed_callgraph(ctx)
-                .filter(crate::commands::callgraph_borrowed::BorrowedCallgraph::can_differ)
-            {
-                Some(borrowed) => crate::context::CallgraphStoreAccess::Error(
-                    crate::callgraph_store::CallGraphStoreError::Unavailable(
-                        borrowed.summary_line(),
-                    ),
-                ),
-                None => routed_store,
-            }
-        }
-        _ => routed_store,
-    };
-    let checkout_routed = ctx.checkout_query_outcome().is_some() || v3_routed;
-    // Why the v3 view could not serve, observed once from the access this
-    // request already holds: a SQLite lock is contention (pending, retry),
-    // anything else is unavailability.
-    let routed_observation = v3_routed.then(|| match &routed_store {
-        crate::context::CallgraphStoreAccess::Error(error)
-            if error.is_transient_lock_contention() =>
-        {
-            (crate::feature_status::IndexObservation::building(), true)
-        }
-        crate::context::CallgraphStoreAccess::Error(
-            crate::callgraph_store::CallGraphStoreError::Unavailable(message),
-        ) if crate::view_storage_reserve::is_message(message) => (
-            crate::feature_status::IndexObservation::unavailable(message.clone()),
-            false,
-        ),
-        crate::context::CallgraphStoreAccess::Error(error) => (
-            crate::feature_status::IndexObservation::unavailable(error.to_string()),
-            false,
-        ),
-        access => (
-            crate::feature_status::callgraph_access_observation(ctx, access),
-            false,
-        ),
-    });
-    let checkout_store = if checkout_routed {
-        match routed_store {
-            crate::context::CallgraphStoreAccess::Ready(store) => Some(store),
-            _ => None,
-        }
-    } else {
-        None
-    };
     let manager = ctx.inspect_manager();
-    // A writer-backed unscoped request must retain contribution reuse. Only
-    // requests the legacy scanner cannot serve need an ephemeral view scan.
-    let needs_ephemeral_view = (scope_was_provided || !ctx.inspect_writer()) && tier2_enabled;
-    // Reuse the blocking request's inventory, or collect it once for a warm
-    // request. Explaining an unavailable view must not walk the project again.
-    let checkout_view_files =
-        (needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed).then(|| {
-            observed_stats
-                .map(|stats| {
-                    stats
-                        .0
-                        .iter()
-                        .map(|(path, _, _)| path.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| {
-                    crate::callgraph::walk_project_files(&snapshot.project_root).collect()
-                })
-        });
-    let checkout_store =
-        if needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed {
-            manager.current_checkout_view(
-                &snapshot,
-                checkout_view_files.as_deref().unwrap_or_default(),
-                observed_stats.map(|stats| stats.0.as_slice()),
-            )
-        } else {
-            checkout_store
-        };
-    let view_callgraph_observation = if needs_ephemeral_view
-        && snapshot.config.views.enabled
-        && !checkout_routed
-        && checkout_store.is_none()
+    // Dead code reads its call graph from the root's checkout (see
+    // `data_layer::tools::inspect`).
+    if snapshot
+        .config
+        .inspect
+        .category_enabled(InspectCategory::DeadCode)
     {
-        Some(crate::feature_status::observe_callgraph_query_with_contention(ctx))
-    } else if checkout_store.is_none() {
-        routed_observation
-    } else {
-        None
-    };
-    // A v3-routed request scans only with a reader in hand; without one its
-    // graph-backed categories report the gap below rather than running the
-    // legacy reuse scanner.
-    let use_checkout_view = (needs_ephemeral_view || v3_routed)
-        && snapshot.config.views.enabled
-        && (checkout_store.is_some() || (checkout_routed && !v3_routed));
-    let checkout_view_unavailability = (needs_ephemeral_view
-        && snapshot.config.views.enabled
-        && !checkout_routed
-        && checkout_store.is_none())
-    .then(|| {
-        manager.checkout_view_unavailability(
-            &snapshot,
-            checkout_view_files.as_deref().unwrap_or_default(),
-        )
-    });
+        if let Some(checkout) = ctx
+            .data_checkout()
+            .filter(|checkout| checkout.checkout().planes().callgraph)
+        {
+            manager.read_dead_code_from_data_layer(&snapshot.project_root, &checkout);
+        }
+    }
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
@@ -975,7 +894,7 @@ fn handle_inspect_payload(
         } else if scope_was_provided
             && !sections.detail_categories.is_empty()
             && !sections.includes(category)
-            && (!category.is_tier2() || use_checkout_view)
+            && !category.is_tier2()
         {
             // Explicit scoped sections must not start unrequested producers.
             // Legacy Tier-2 cache reads can still disclose existing results
@@ -1017,7 +936,7 @@ fn handle_inspect_payload(
         if outcomes.contains_key(&category) {
             continue;
         }
-        if (scope_was_provided || !ctx.inspect_writer() || v3_routed) && !use_checkout_view {
+        if scope_was_provided || !ctx.inspect_writer() {
             continue;
         }
         if request_deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
@@ -1032,7 +951,6 @@ fn handle_inspect_payload(
             continue;
         }
         let manager = manager.clone();
-        let checkout_store = checkout_store.clone();
         let snapshot = snapshot.clone();
         let scope = scope.clone();
         let callgraph_phase = phase_log.and_then(|phase_log| {
@@ -1069,9 +987,7 @@ fn handle_inspect_payload(
             let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
-            let outcome = if use_checkout_view {
-                manager.tier2_run_with_pinned_view(snapshot, category, scope, checkout_store)
-            } else if force_root_diagnostics {
+            let outcome = if force_root_diagnostics {
                 manager.tier2_run_with_reuse_blocking_fresh(snapshot, category, scope)
             } else {
                 manager.tier2_run_with_reuse_blocking(snapshot, category, scope)
@@ -1189,6 +1105,17 @@ fn handle_inspect_payload(
             crate::inspect::job::attach_dead_code_language_coverage(payload, &files);
         }
     }
+    // Dead code and unused exports read the dead-code graph, which this
+    // request built or reused. It is released once no request has read it
+    // for a while.
+    if [InspectCategory::DeadCode, InspectCategory::UnusedExports]
+        .iter()
+        .any(|category| {
+            snapshot.config.inspect.category_enabled(*category) && outcomes.contains_key(category)
+        })
+    {
+        manager.note_dead_code_request(Instant::now());
+    }
     // Truthful fleet-status values update from whatever this collection proved,
     // even when the freshness gate below refuses the payload: a verified count
     // stays verified, and pending or failed categories remain absent rather
@@ -1203,75 +1130,22 @@ fn handle_inspect_payload(
     if scope_was_provided {
         for (category, outcome) in &mut outcomes {
             if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
-                let reserve_reason = view_callgraph_observation
-                    .as_ref()
-                    .and_then(|(observation, _)| observation.unavailable_reason.as_ref())
-                    .filter(|reason| crate::view_storage_reserve::is_message(reason));
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
                     JobOutcome::Stale { .. } => "cached analysis freshness could not be verified".into(),
-                    _ if reserve_reason.is_some() => reserve_reason.unwrap().clone(),
-                    _ if snapshot.config.views.enabled => "checkout call graph view is not ready; no legacy or borrowed analysis was substituted".into(),
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
                 };
-                // A locked call-graph database is contention, not absence: both
-                // the query observation and the view reader's own open can see
-                // the lock, and either one makes the answer "pending, retry".
-                let callgraph_contended = view_callgraph_observation
-                    .as_ref()
-                    .is_some_and(|(_, transient_lock_contention)| *transient_lock_contention);
-                let callgraph_pending = (callgraph_contended
-                    || checkout_view_unavailability
-                        .as_ref()
-                        .is_some_and(|unavailability| unavailability.is_busy()))
-                    && matches!(
-                        *category,
-                        InspectCategory::DeadCode | InspectCategory::UnusedExports
-                    );
-                let mut payload = if let Some(unavailability) = checkout_view_unavailability
-                    .as_ref()
-                    .filter(|_| *category == InspectCategory::DeadCode && !callgraph_pending)
-                {
-                    let mut payload = manager.tier2_incomplete_payload(
-                        &snapshot,
-                        *category,
-                        &scope,
-                        unavailability.kind(),
-                        unavailability.reason(),
-                    );
-                    payload["code"] = serde_json::json!(unavailability.kind());
-                    payload
-                } else if callgraph_pending {
-                    // The observation may have opened the store after the lock
-                    // cleared; the reader's busy verdict still means building.
-                    let index = view_callgraph_observation
-                        .as_ref()
-                        .filter(|(_, contended)| *contended)
-                        .map_or_else(
-                            || crate::feature_status::IndexObservation::building().consumer_json(),
-                            |(observation, _)| observation.consumer_json(),
-                        );
-                    serde_json::json!({
-                        "status": "pending",
-                        "code": "callgraph_building",
-                        "index": index,
-                        "building": { "state": "building" },
-                        "reason": "waiting for or projecting the checkout call graph",
-                        "complete": false,
-                    })
-                } else {
-                    manager.tier2_incomplete_payload(
-                        &snapshot,
-                        *category,
-                        &scope,
-                        "tier2_unavailable",
-                        reason,
-                    )
-                };
+                let mut payload = manager.tier2_incomplete_payload(
+                    &snapshot,
+                    *category,
+                    &scope,
+                    "tier2_unavailable",
+                    reason,
+                );
                 // Enabling checkout views requests real scoped Tier-2 analysis.
                 // A missing or stale view is a gap, not an intentional skip.
-                if !snapshot.config.views.enabled {
+                {
                     payload["not_computed"] = Value::Bool(true);
                 }
                 *outcome = JobOutcome::Fresh { payload };
@@ -1368,19 +1242,6 @@ fn scoped_in_root_file_count(
             (count, true)
         },
     )
-}
-
-/// A linked worktree builds its call graph when a query first needs it, and
-/// the Tier-2 categories (dead code and the like) need it. Route one call-graph
-/// access so the main checkout's graph answers or that build starts; the
-/// scans themselves still read the published view.
-fn start_on_demand_callgraph_for_inspect(ctx: &AppContext, config: &crate::config::Config) {
-    let tier2_enabled = InspectCategory::active()
-        .iter()
-        .any(|category| category.is_tier2() && config.inspect.category_enabled(*category));
-    if tier2_enabled && ctx.callgraph_build_on_demand() {
-        let _ = ctx.callgraph_store_for_query_without_wait();
-    }
 }
 
 fn scoped_runtime_notes(
@@ -1584,7 +1445,6 @@ pub(crate) fn handle_inspect_deferred_with_clock(
     // Start any on-demand call-graph build here, while this request still runs
     // under its root actor. The body below runs on a detached thread without
     // one, where starting the build would leave it to a later query instead.
-    start_on_demand_callgraph_for_inspect(&ctx, &snapshot.config);
     let completion_request_id = request_id.clone();
     let shutdown_log = phase_log.clone();
     let cancellation = crate::executor::current_job_cancellation()
@@ -1646,13 +1506,7 @@ pub(crate) fn handle_inspect_deferred_with_clock(
                     return;
                 }
             };
-            if ctx.checkout_query_runtime_active() {
-                // Resolve call-graph availability before diagnostics can end the
-                // request. Response finalization must report the same outcome
-                // even if no background scan is submitted.
-                let _ = ctx
-                    .callgraph_store_for_ops_until(deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP));
-            }
+
             // Queueing instead of sharing a response keeps request-specific scopes,
             // phase logs, and terminals independent while bounding expensive work to
             // one detached inspect body per root.
@@ -1674,7 +1528,6 @@ pub(crate) fn handle_inspect_deferred_with_clock(
                     request_deadline_terminal(next_phase(&applicability), deadline),
                 ),
             };
-            crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
             if response.success {
                 if let Some(payload) = response.data.as_object_mut() {
                     let sections = parse_sections(request.params.get("sections"))
@@ -1824,51 +1677,17 @@ fn inspect_shutdown_terminal(
     })
 }
 
-/// Feed fleet-status values from inspect outcomes. Only a verified payload
-/// supplies a category count; pending or failed categories remain absent in the
-/// truthful values state instead of being replaced with zero.
+/// Feed the status bar's TODO count from inspect outcomes. Only a verified
+/// payload supplies the count; a pending or failed TODO scan leaves the last
+/// known value in place instead of replacing it with zero.
 fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
-    if outcomes
-        .get(&InspectCategory::DeadCode)
-        .and_then(JobOutcome::payload)
-        .is_some_and(|payload| payload["supported_language_files"] == 0)
-    {
-        ctx.clear_status_bar_dead_code_count();
-    }
     // `JobOutcome::payload()` exposes only Fresh data or a stat-verified stale
     // cache, so an unavailable category cannot overwrite a proven value.
-    let count_of = |category: InspectCategory| -> Option<usize> {
-        outcomes
-            .get(&category)
-            .and_then(JobOutcome::payload)
-            .and_then(|payload| available_count_from_payload(category, payload))
-    };
-    let any_tier2_stale = [
-        InspectCategory::DeadCode,
-        InspectCategory::UnusedExports,
-        InspectCategory::Duplicates,
-    ]
-    .iter()
-    .any(|category| match outcomes.get(category) {
-        Some(JobOutcome::Fresh { payload }) => {
-            category_is_incomplete(payload)
-                && (available_count_from_payload(*category, payload).is_none()
-                    || partial_parse_findings_available(*category, payload))
-        }
-        Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. } | JobOutcome::Failed { .. }) => {
-            true
-        }
-        None => false,
-    });
-    let todos = count_of(InspectCategory::Todos);
-
-    ctx.update_status_bar_tier2(
-        count_of(InspectCategory::DeadCode),
-        count_of(InspectCategory::UnusedExports),
-        count_of(InspectCategory::Duplicates),
-        todos,
-        any_tier2_stale,
-    );
+    let todos = outcomes
+        .get(&InspectCategory::Todos)
+        .and_then(JobOutcome::payload)
+        .and_then(|payload| available_count_from_payload(InspectCategory::Todos, payload));
+    ctx.update_status_bar_todos(todos);
 }
 
 /// A blocking `aft_inspect` may update alert state only from accepted snapshots
@@ -1905,6 +1724,96 @@ fn record_blocking_inspect_observations(
 /// `reports_diagnostics` is false only for a scoped inspect that did not
 /// select diagnostics; every other inspect first waits for the background
 /// applicability walk (see `wait_for_project_applicability_walk`).
+/// How long an inspect waits, once the watcher has acknowledged its flush
+/// marker, for the changes the watcher saw before the marker to be handed to
+/// the index store. The watcher holds a changed path for its 250 ms flush
+/// window before passing it on, and the dispatch thread then records it in
+/// the store, so this leaves room for both.
+const WATCHER_CATCH_UP_LIMIT: Duration = Duration::from_secs(1);
+
+/// Makes the index store hold every change made on disk before this inspect
+/// started, before the TODO count and dead code read the store's records.
+///
+/// The store hears of a change made outside AFT only through the file
+/// watcher, and native file events can arrive after the request does
+/// (FSEvents and Windows notifications are slower than inotify). So the
+/// watcher is asked to acknowledge a flush marker, which it sees only after
+/// every earlier event, and the inspect then waits until those events have
+/// been recorded in the store. When that cannot be confirmed (no watcher
+/// runs, the marker is not acknowledged in time, or the hand-over does not
+/// finish in time), the store compares its files with the disk instead, as it
+/// does when the watcher loses events. The TODO count and dead code wait for
+/// that comparison as they wait for a build, and report themselves pending if
+/// it outlasts their wait, so a count from before the change is never reported
+/// as current.
+fn catch_up_index_store_with_disk(
+    ctx: &AppContext,
+    project_root: &Path,
+    deadline: InspectRequestDeadline,
+) {
+    let config = ctx.config();
+    if !config.inspect.category_enabled(InspectCategory::Todos)
+        && !config.inspect.category_enabled(InspectCategory::DeadCode)
+    {
+        return;
+    }
+    let started = Instant::now();
+    let caught_up = watcher_caught_up(ctx, project_root, deadline);
+    if !caught_up {
+        ctx.data_rescan();
+    }
+    crate::slog_info!(
+        "perf inspect_watcher_catch_up: caught_up={caught_up} ms={}",
+        started.elapsed().as_millis()
+    );
+}
+
+/// Whether every change the watcher of `project_root` was sent before this
+/// call has been recorded in the index store (see
+/// [`catch_up_index_store_with_disk`]).
+fn watcher_caught_up(
+    ctx: &AppContext,
+    project_root: &Path,
+    deadline: InspectRequestDeadline,
+) -> bool {
+    if !ctx.watcher_runtime_active() {
+        return false;
+    }
+    let (flush, counters) = {
+        let counters = ctx.watcher_counters();
+        // The watcher acknowledges flush markers only once the journal shell
+        // commands use to report changed files exists, so create it as a
+        // command does.
+        counters
+            .bash_changes
+            .get_or_init(|| Arc::new(crate::bash_changed_files::Journal::default()));
+        (Arc::clone(&counters.bash_flush), counters)
+    };
+    let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let flush_deadline = deadline
+        .work_at()
+        .min(Instant::now() + crate::watcher_backend::flush::BASH_FLUSH_LIMIT);
+    if !flush.wait(&root, flush_deadline) {
+        return false;
+    }
+    // The watcher has taken in every earlier event, but may still hold its
+    // paths in its flush window or the dispatch channel; the dispatch thread's
+    // drain is what records them in the store. The window is read first: it
+    // empties only after its paths are in the channel.
+    let settle_deadline = deadline
+        .work_at()
+        .min(Instant::now() + WATCHER_CATCH_UP_LIMIT);
+    loop {
+        if !counters.flush_window_holds_paths() && !ctx.watcher_query_has_pending_changes() {
+            return true;
+        }
+        if Instant::now() >= settle_deadline || inspect_cancellation_requested() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn run_blocking_inspect_body(
     req: &RawRequest,
     ctx: &AppContext,
@@ -1948,27 +1857,32 @@ fn run_blocking_inspect_body(
             );
         }
     };
-    let initial_stats = match capture_inspect_root_stats_until(&project_root, Some(deadline)) {
-        Ok(snapshot) => snapshot,
-        Err(detail) if detail.contains("inspect_request_timeout") => {
-            return build_inspect_terminal(
-                &req.id,
-                &phase_log,
-                request_deadline_terminal(next_phase(&applicability), deadline),
-            );
-        }
-        Err(detail) => {
-            return build_inspect_terminal(
-                &req.id,
-                &phase_log,
-                InspectTerminal::PhaseFailed {
-                    failed_phase: None,
-                    failure_reason: "inspect_not_fresh",
-                    failure_detail: Some(detail),
-                },
-            );
-        }
-    };
+    catch_up_index_store_with_disk(ctx, &project_root, deadline);
+    if inspect_cancellation_requested() {
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+    let initial_stats =
+        match capture_inspect_root_stats_from(&project_root, Some(deadline), ctx.data_checkout()) {
+            Ok(snapshot) => snapshot,
+            Err(detail) if detail.contains("inspect_request_timeout") => {
+                return build_inspect_terminal(
+                    &req.id,
+                    &phase_log,
+                    request_deadline_terminal(next_phase(&applicability), deadline),
+                );
+            }
+            Err(detail) => {
+                return build_inspect_terminal(
+                    &req.id,
+                    &phase_log,
+                    InspectTerminal::PhaseFailed {
+                        failed_phase: None,
+                        failure_reason: "inspect_not_fresh",
+                        failure_detail: Some(detail),
+                    },
+                );
+            }
+        };
     wait_at_deferred_inspect_body_gate_for_test(deadline, &req.id);
     delay_inspect_body_from_env_for_test(deadline);
     if inspect_cancellation_requested() {
@@ -3082,100 +2996,20 @@ fn build_inspect_terminal(
     }
 }
 
-pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response {
-    let categories = match parse_tier2_categories(req.params.get("categories")) {
-        Ok(categories) => categories,
-        Err(message) => return invalid_request(&req.id, message),
-    };
-
-    if !ctx.inspect_writer() {
-        let skipped = categories
-            .iter()
-            .map(|category| {
-                serde_json::json!({
-                    "category": category.as_str(),
-                    "reason": "inspect_read_only",
-                })
-            })
-            .collect::<Vec<_>>();
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "queued_categories": [],
-                "in_flight_categories": [],
-                "errors": [],
-                "skipped_categories": skipped,
-            }),
-        );
-    }
-
-    let snapshot = match build_snapshot(ctx) {
-        Ok(snapshot) => snapshot,
-        Err(response) => return response.with_id(&req.id),
-    };
-    let manager = ctx.inspect_manager();
-    let submission = manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
-    if submission.has_new_work() {
-        ctx.note_tier2_refresh_started();
-    }
-
-    let queued = submission
-        .queued_categories
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let errors = submission
-        .errors
-        .iter()
-        .map(|error| {
-            serde_json::json!({
-                "category": error.category.as_str(),
-                "message": error.message.as_str(),
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut data = serde_json::json!({
-        "queued_categories": queued.clone(),
-        "in_flight_categories": queued,
-        "errors": errors,
-    });
-    if !submission.retry_paused.is_empty() {
-        data["skipped_categories"] = Value::Array(
-            submission
-                .retry_paused
-                .iter()
-                .map(|pause| {
-                    serde_json::json!({
-                        "category": pause.category.as_str(),
-                        "reason": "last_build_failed",
-                        "last_failure": pause.reason,
-                        "identical_failures": pause.identical_failures,
-                        "retry_at_ms": pause.retry_at_ms,
-                    })
-                })
-                .collect(),
-        );
-    }
-    if !submission.resource_waits.is_empty() {
-        let skipped = data["skipped_categories"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        data["skipped_categories"] = Value::Array(
-            skipped
-                .into_iter()
-                .chain(submission.resource_waits.iter().map(|wait| {
-                    serde_json::json!({
-                        "category": wait.category.as_str(),
-                        "reason": "waiting_for_inspect_cache_writer_lease",
-                        "retry_at_ms": wait.retry_at_ms,
-                    })
-                }))
-                .collect(),
-        );
-    }
-
-    Response::success(&req.id, data)
+/// Answers the retired `inspect_tier2_run` request with success and does
+/// nothing. Plugin builds from before whole-repository analyses became
+/// on-demand-only send it when a session goes idle, until their host reloads
+/// the plugin; answering success keeps them from logging a failure each time.
+/// Remove this handler, and its dispatch entry, in the next release.
+pub fn handle_inspect_tier2_run(req: &RawRequest, _ctx: &AppContext) -> Response {
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "queued_categories": [],
+            "in_flight_categories": [],
+            "errors": [],
+        }),
+    )
 }
 
 trait ResponseIdExt {
@@ -3283,7 +3117,8 @@ fn finish_tier2_phases(
             }
             if let Some(tier2_phase) = tier2_phase {
                 if payload["status"] == "pending" {
-                    tier2_phase.fail("callgraph_building; retry aft_inspect");
+                    let reason = payload["reason"].as_str().unwrap_or("callgraph_building");
+                    tier2_phase.fail(format!("{reason}; retry aft_inspect"));
                 } else {
                     tier2_phase.complete();
                 }
@@ -3329,12 +3164,14 @@ fn receive_tier2_completion_until(
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            if category == InspectCategory::DeadCode && manager.dead_code_build_is_pending() {
-                return Some(JobOutcome::Fresh {
-                    payload: serde_json::json!({
-                        "status": "pending", "reason": "callgraph_building", "complete": false,
-                    }),
-                });
+            if category == InspectCategory::DeadCode {
+                if let Some(reason) = manager.dead_code_pending_reason() {
+                    return Some(JobOutcome::Fresh {
+                        payload: serde_json::json!({
+                            "status": "pending", "reason": reason, "complete": false,
+                        }),
+                    });
+                }
             }
             if request_deadline.is_some_and(|request| now >= request.work_at()) {
                 return Some(JobOutcome::Failed {
@@ -3502,23 +3339,6 @@ fn add_section(section: &str, categories: &mut BTreeSet<InspectCategory>) -> Res
     }
     categories.insert(category);
     Ok(())
-}
-
-fn parse_tier2_categories(value: Option<&Value>) -> Result<Vec<InspectCategory>, String> {
-    let sections = parse_sections(value)?.detail_categories;
-    let categories = if sections.is_empty() {
-        InspectCategory::active()
-            .iter()
-            .copied()
-            .filter(|category| category.is_tier2())
-            .collect::<Vec<_>>()
-    } else {
-        sections
-            .into_iter()
-            .filter(|category| category.is_tier2())
-            .collect::<Vec<_>>()
-    };
-    Ok(categories)
 }
 
 fn parse_scope(
@@ -5817,74 +5637,16 @@ mod status_bar_refresh_tests {
         );
     }
 
-    #[test]
-    fn unsupported_language_gap_does_not_hide_failed_supported_files() {
-        let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(5), Some(0), Some(0), Some(0), false);
-        let outcome = JobOutcome::Fresh {
-            payload: serde_json::json!({
-                "count": 8, "complete": false, "supported_language_files": 1,
-                "gaps": [{"kind": "language_unsupported", "language": "python", "files": 1}],
-                "parse_errors": [{"file": "broken.ts", "message": "syntax error"}],
-            }),
-        };
-        refresh_status_bar_counts(
-            &ctx,
-            &[(InspectCategory::DeadCode, outcome)].into_iter().collect(),
-        );
-        assert_eq!(ctx.status_bar_count_values().dead_code, Some(5));
-        assert!(ctx.status_bar_count_values().tier2_stale);
-    }
-
     fn outcomes(
         entries: Vec<(InspectCategory, JobOutcome)>,
     ) -> BTreeMap<InspectCategory, JobOutcome> {
         entries.into_iter().collect()
     }
 
-    // #1: a Pending-only Tier-2 (no scan has ever produced counts) must NOT
-    // populate the status bar — otherwise it renders fabricated `~D0 U0 C0`
-    // zeros that lie about project health.
+    /// The whole-repository analyses run only inside `aft_inspect`; their
+    /// results never reach the status bar, which keeps only E/W and T.
     #[test]
-    fn pending_tier2_does_not_populate_status_bar() {
-        let ctx = ctx();
-        assert!(ctx.status_bar_counts().is_none());
-
-        refresh_status_bar_counts(
-            &ctx,
-            &outcomes(vec![
-                (InspectCategory::DeadCode, JobOutcome::pending(true)),
-                (InspectCategory::UnusedExports, JobOutcome::pending(true)),
-                (InspectCategory::Duplicates, JobOutcome::pending(true)),
-            ]),
-        );
-
-        assert!(
-            ctx.status_bar_counts().is_none(),
-            "Pending Tier-2 must leave the bar unpopulated (no fabricated zeros)"
-        );
-    }
-
-    // Stale-without-cache is equally untrustworthy — also must not populate.
-    #[test]
-    fn stale_without_cache_does_not_populate_status_bar() {
-        let ctx = ctx();
-        refresh_status_bar_counts(
-            &ctx,
-            &outcomes(vec![(
-                InspectCategory::DeadCode,
-                JobOutcome::Stale {
-                    cached: None,
-                    in_flight: true,
-                },
-            )]),
-        );
-        assert!(ctx.status_bar_counts().is_none());
-    }
-
-    // A real Fresh outcome populates the bar with the actual counts.
-    #[test]
-    fn fresh_tier2_populates_status_bar() {
+    fn whole_repository_outcomes_leave_the_status_bar_alone() {
         let ctx = ctx();
         refresh_status_bar_counts(
             &ctx,
@@ -5896,12 +5658,6 @@ mod status_bar_refresh_tests {
                     },
                 ),
                 (
-                    InspectCategory::UnusedExports,
-                    JobOutcome::Fresh {
-                        payload: serde_json::json!({ "count": 3 }),
-                    },
-                ),
-                (
                     InspectCategory::Duplicates,
                     JobOutcome::Fresh {
                         payload: serde_json::json!({ "count": 1 }),
@@ -5909,100 +5665,58 @@ mod status_bar_refresh_tests {
                 ),
             ]),
         );
-        let counts = ctx.status_bar_count_values();
-        assert_eq!(counts.errors, None);
-        assert_eq!(counts.warnings, None);
-        assert_eq!(counts.dead_code, Some(7));
-        assert_eq!(counts.unused_exports, Some(3));
-        assert_eq!(counts.duplicates, Some(1));
-        assert!(!counts.tier2_stale);
+        assert_eq!(
+            ctx.status_bar_count_values(),
+            AppContext::new(Box::new(TreeSitterProvider::new()), Default::default())
+                .status_bar_count_values()
+        );
     }
 
-    // Stale-WITH-cache populates (last-known counts) and marks the bar stale.
-    // All three categories must carry a cached value — the bar stays suppressed
-    // until every Tier-2 category is real, never fabricating a 0 (#1).
+    // A Pending TODO scan (no count produced yet) must NOT populate the bar
+    // with a fabricated zero.
     #[test]
-    fn stale_with_cache_populates_and_marks_stale() {
+    fn pending_todos_do_not_populate_status_bar() {
         let ctx = ctx();
-        let stale_cache = |count: i64| JobOutcome::Stale {
-            cached: Some(serde_json::json!({ "count": count })),
-            in_flight: true,
-        };
         refresh_status_bar_counts(
             &ctx,
-            &outcomes(vec![
-                (InspectCategory::DeadCode, stale_cache(12)),
-                (InspectCategory::UnusedExports, stale_cache(4)),
-                (InspectCategory::Duplicates, stale_cache(2)),
-            ]),
+            &outcomes(vec![(InspectCategory::Todos, JobOutcome::pending(true))]),
         );
-        let counts = ctx.status_bar_count_values();
-        assert_eq!(counts.errors, None);
-        assert_eq!(counts.warnings, None);
-        assert_eq!(counts.dead_code, Some(12));
-        assert_eq!(counts.unused_exports, Some(4));
-        assert_eq!(counts.duplicates, Some(2));
-        assert!(counts.tier2_stale);
+        assert_eq!(ctx.status_bar_count_values().todos, None);
     }
 
-    // A single category (others Pending) must NOT surface the bar — the core
-    // partial-completion fabrication guard at the sync refresh path (#1).
+    // Stale-without-cache is equally untrustworthy — also must not populate.
     #[test]
-    fn single_category_does_not_populate_status_bar() {
+    fn stale_todos_without_cache_do_not_populate_status_bar() {
         let ctx = ctx();
         refresh_status_bar_counts(
             &ctx,
             &outcomes(vec![(
-                InspectCategory::DeadCode,
-                JobOutcome::Fresh {
-                    payload: serde_json::json!({ "count": 9 }),
+                InspectCategory::Todos,
+                JobOutcome::Stale {
+                    cached: None,
+                    in_flight: true,
                 },
             )]),
         );
-        assert!(
-            ctx.status_bar_counts().is_none(),
-            "one real category must not surface a bar with fabricated U0 C0"
-        );
+        assert_eq!(ctx.status_bar_count_values().todos, None);
     }
 
     #[test]
-    fn incomplete_fresh_payload_keeps_status_bar_counts_stale_not_current() {
+    fn fresh_todos_populate_status_bar() {
         let ctx = ctx();
-        ctx.update_status_bar_tier2(Some(7), Some(3), Some(1), None, false);
         refresh_status_bar_counts(
             &ctx,
-            &outcomes(vec![
-                (
-                    InspectCategory::DeadCode,
-                    JobOutcome::Fresh {
-                        payload: serde_json::json!({
-                            "unavailable": true, "complete": false,
-                            "building": {"state": "building"},
-                            "gaps": [{"reason": "still building"}]
-                        }),
-                    },
-                ),
-                (
-                    InspectCategory::UnusedExports,
-                    JobOutcome::Fresh {
-                        payload: serde_json::json!({
-                            "count": 0, "complete": false, "parse_errors": [{"file": "a.ts"}]
-                        }),
-                    },
-                ),
-                (
-                    InspectCategory::Duplicates,
-                    JobOutcome::Fresh {
-                        payload: serde_json::json!({"count": 1}),
-                    },
-                ),
-            ]),
+            &outcomes(vec![(
+                InspectCategory::Todos,
+                JobOutcome::Fresh {
+                    payload: serde_json::json!({ "count": 7 }),
+                },
+            )]),
         );
         let counts = ctx.status_bar_count_values();
-        assert!(counts.tier2_stale);
-        assert_eq!(counts.dead_code, Some(7));
-        assert_eq!(counts.unused_exports, Some(3));
-        assert_eq!(counts.duplicates, Some(1));
+        assert_eq!(counts.errors, None);
+        assert_eq!(counts.warnings, None);
+        assert_eq!(counts.todos, Some(7));
     }
 }
 
@@ -6155,83 +5869,6 @@ mod render_text_tests {
 
         assert_eq!(text, "PARTIAL — dead code unavailable: analysis did not finish; retry aft_inspect.\nDead code analysis unavailable (no callgraph)");
         assert!(!text.contains("Dead code: 0"));
-    }
-
-    #[test]
-    fn non_git_obsolete_store_discloses_unknown_dead_code_and_preserves_unused_exports() {
-        use crate::callgraph_store::CallGraphStore;
-        use crate::inspect::{InspectJob, JobKey};
-        use std::sync::{Arc, RwLock};
-
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(root.path()).unwrap();
-        let source = root.join("helper.ts");
-        std::fs::write(&source, "export function unused_helper() {}\n").unwrap();
-        assert!(!root.join(".git").exists());
-        let (store, _) = CallGraphStore::cold_build_with_lease(
-            storage.path().to_path_buf(),
-            root.clone(),
-            &[source.clone()],
-        )
-        .unwrap();
-        let database = store.sqlite_path().to_path_buf();
-        drop(store);
-        let conn = rusqlite::Connection::open(database).unwrap();
-        conn.execute(
-            "UPDATE meta SET v = 'old-output-fingerprint' WHERE k = 'fingerprint'",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        assert!(
-            CallGraphStore::open_readonly(storage.path().to_path_buf(), root.clone())
-                .unwrap()
-                .is_none()
-        );
-
-        let mut job = InspectJob {
-            job_id: 1,
-            key: JobKey::for_project_category(InspectCategory::DeadCode),
-            category: InspectCategory::DeadCode,
-            scope_files: vec![source],
-            project_root: root.clone(),
-            inspect_dir: storage.path().join("inspect"),
-            config: Arc::new(crate::config::Config {
-                project_root: Some(root),
-                ..Default::default()
-            }),
-            symbol_cache: Arc::new(RwLock::new(crate::parser::SymbolCache::new())),
-            inspect_writer: true,
-            callgraph_writer: true,
-            callgraph_snapshot: None,
-        };
-        let dead = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
-            .outcome
-            .unwrap()
-            .aggregate;
-        let dead = summary_for(InspectCategory::DeadCode, &dead);
-        job.category = InspectCategory::UnusedExports;
-        let unused = crate::inspect::scanners::unused_exports::run_unused_exports_scan(&job)
-            .outcome
-            .unwrap()
-            .aggregate;
-        let text = render(serde_json::json!({
-            "dead_code": dead,
-            "unused_exports": summary_for(InspectCategory::UnusedExports, &unused),
-        }));
-        assert!(
-            text.starts_with("PARTIAL — dead code unavailable:"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Dead code analysis unavailable (no callgraph)"),
-            "{text}"
-        );
-        assert!(!text.contains("Dead code: 0"), "{text}");
-        assert!(dead.get("count").is_none(), "{dead:#}");
-        assert_eq!(unused["count"], 1, "{unused:#}");
-        assert!(text.contains("Unused exports: 1"), "{text}");
     }
 
     #[test]
@@ -6750,7 +6387,6 @@ mod fresh_payload_tests {
                 .unwrap()
                 .contains("dead code: off"));
             assert_eq!(manager.reuse_start_count_for_test(), 0);
-            assert_eq!(manager.automatic_tier2_schedule_count_for_test(), 0);
             assert_eq!(manager.source_scan_files_for_test(), 0);
             assert_eq!(ctx.lsp().server_count(), 0);
         }
@@ -7224,9 +6860,12 @@ mod fresh_payload_tests {
                     }
                     if key == "status" {
                         if value == "pending" {
-                            assert_eq!(
-                                fields.get("reason"),
-                                Some(&serde_json::json!("callgraph_building"))
+                            assert!(
+                                matches!(
+                                    fields.get("reason").and_then(Value::as_str),
+                                    Some("callgraph_building" | "dead_code_building")
+                                ),
+                                "a pending result names what it waits for: {value}"
                             );
                             assert_eq!(fields.get("complete"), Some(&Value::Bool(false)));
                             assert!(!fields.contains_key("count"));
@@ -8399,8 +8038,6 @@ mod deferred_terminal_tests {
         fn inspect_request_deadline_unscoped_callgraph_stays_building() {
             let (_root, ctx, mut request) = fixture();
             request.params = serde_json::json!({});
-            let (_sender, receiver) = crossbeam_channel::unbounded();
-            *ctx.callgraph_store_rx().lock() = Some(receiver);
             let manager = ctx.inspect_manager();
             manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
             manager.hold_in_flight_lock_for_test(|| {
@@ -8409,7 +8046,6 @@ mod deferred_terminal_tests {
                     assert_eq!(response.data["summary"][category]["complete"], false);
                     assert!(response.data["summary"][category].get("count").is_none());
                 }
-                assert!(ctx.callgraph_cold_build_active());
             });
             manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, false);
         }
@@ -8547,7 +8183,6 @@ mod deferred_terminal_tests {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
         config.storage_dir = Some(storage.path().to_path_buf());
-        config.views.enabled = false;
         config.indexes.trigram = false;
         config.indexes.semantic = false;
         config.inspect.tier2_pass_timeout_ms = 600_000;
@@ -8579,8 +8214,6 @@ mod deferred_terminal_tests {
             crate::inspect::job::canonicalize_normalized(&root)
         );
         assert!(snapshot.inspect_writer && snapshot.callgraph_writer);
-        start_on_demand_callgraph_for_inspect(&ctx, snapshot.config.as_ref());
-        let _ = ctx.callgraph_store_for_query_without_wait();
         let scope = JobScope::for_project(root.clone());
         for category in InspectCategory::active().iter().copied() {
             eprintln!("inspect profile seed starting: {category}");
@@ -8713,6 +8346,7 @@ mod deferred_terminal_tests {
         INSPECT_STAT_CALLS.with(|count| count.set(0));
         let result = capture_inspect_root_stats_while(
             root.path(),
+            None,
             || crate::callgraph::PROJECT_WALK_ENTRIES.with(|count| count.get() < 8),
             || "inspect_request_timeout".to_string(),
         );
@@ -9420,6 +9054,10 @@ mod deferred_terminal_tests {
         assert_eq!(manager.reuse_start_count_for_test(), starts_before);
     }
 
+    /// A dead-code pass still working out dead code at inspect's deadline is
+    /// reported as pending on its own analysis, not on the call graph: the
+    /// call graph was ready, and the first analysis of a checkout can take
+    /// tens of seconds by itself.
     #[test]
     fn inspect_builder_timeout_is_pending_while_building() {
         let (_tx, rx) = std::sync::mpsc::channel();
@@ -9434,6 +9072,28 @@ mod deferred_terminal_tests {
         )
         .expect("deadline produces an honest failure");
         assert!(matches!(outcome, JobOutcome::Fresh { payload }
+            if payload == serde_json::json!({"status": "pending", "reason": "dead_code_building", "complete": false})));
+    }
+
+    /// A dead-code pass still waiting for its call graph at inspect's
+    /// deadline (to be published, or to catch up with edits) is reported as
+    /// waiting for the call graph.
+    #[test]
+    fn inspect_builder_timeout_names_the_call_graph_while_the_pass_waits_for_it() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let manager = crate::inspect::InspectManager::new();
+        manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
+        manager.set_dead_code_waiting_for_callgraph_for_test(true);
+        let outcome = receive_tier2_completion_until(
+            rx,
+            &manager,
+            InspectCategory::DeadCode,
+            std::time::Instant::now() + Duration::from_millis(20),
+            None,
+        )
+        .expect("deadline produces an honest failure");
+        manager.set_dead_code_waiting_for_callgraph_for_test(false);
+        assert!(matches!(outcome, JobOutcome::Fresh { payload }
             if payload == serde_json::json!({"status": "pending", "reason": "callgraph_building", "complete": false})));
     }
 
@@ -9447,8 +9107,11 @@ mod deferred_terminal_tests {
         )
         .unwrap();
         let ctx = deferred_test_context(&root);
+        ctx.update_config(|config| config.indexes.callgraph = true);
+        // Dead code reads its call graph from the root's index-store
+        // checkout, so the run can only complete once that graph is built.
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
         let mut config = ctx.config().as_ref().clone();
-        config.views.enabled = false;
         config.indexes.callgraph = true;
         let snapshot = InspectSnapshot::new(
             root.clone(),
@@ -9456,9 +9119,13 @@ mod deferred_terminal_tests {
             Arc::new(config),
             ctx.symbol_cache(),
         );
-        let project_key = crate::search_index::artifact_cache_key(&root);
+        let project_key = crate::root_identity::key::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let manager = ctx.inspect_manager();
+        manager.read_dead_code_from_data_layer(
+            &root,
+            &ctx.data_checkout().expect("the index store binds the root"),
+        );
         let limiter = crate::cold_build_limiter::test_limiter(1);
         manager.set_cold_build_limiter(limiter.clone());
         let request = crate::cold_build_limiter::ColdBuildAdmissionRequest::new(
@@ -9504,15 +9171,6 @@ mod deferred_terminal_tests {
             Some("pending"),
             "{outcome:?}"
         );
-        ctx.update_status_bar_tier2(Some(41), Some(0), Some(0), Some(0), false);
-        refresh_status_bar_counts(
-            &ctx,
-            &[(InspectCategory::DeadCode, outcome.clone())]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(ctx.status_bar_count_values().dead_code, Some(41));
-        assert!(ctx.status_bar_count_values().tier2_stale);
         let mut payloads = InspectCategory::active()
             .iter()
             .map(|category| (*category, serde_json::json!({"count": 0})))
@@ -9527,7 +9185,7 @@ mod deferred_terminal_tests {
         assert_eq!(
             payload["summary"]["dead_code"],
             serde_json::json!({
-            "status": "pending", "reason": "callgraph_building", "complete": false})
+            "status": "pending", "reason": "dead_code_building", "complete": false})
         );
         assert_eq!(
             payload["scanner_state"]["pending_categories"],
@@ -9626,127 +9284,5 @@ mod deferred_terminal_tests {
             "build_denied (borrow-only)"
         );
         assert_eq!(InspectBuilderState::Absent.as_str(), "absent");
-    }
-}
-
-#[cfg(test)]
-mod checkout_deferred_tests {
-    use super::*;
-    use crate::views::contracts::{QueryWait, ViewAccess, WaitOutcome};
-    use crate::views::manifest_v2::{ManifestHeader, ManifestV2, Producers};
-    use crate::views::snapshot::{LiveDelta, OpenGeneration, Snapshot};
-
-    struct Timeout {
-        snapshot: Snapshot,
-        gap: PathBuf,
-        calls: std::sync::atomic::AtomicUsize,
-    }
-    impl QueryWait for Timeout {
-        fn wait_for(
-            &self,
-            _: &ViewAccess,
-            _: crate::blob_store::v2::FamilyPlane,
-            _: Duration,
-        ) -> WaitOutcome {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            WaitOutcome::TimedOut {
-                snapshot: self.snapshot.clone(),
-                unreflected: vec![self.gap.clone()],
-            }
-        }
-    }
-    fn run(active: bool) -> (Response, usize) {
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("README.md"), "# Fixture\n").unwrap();
-        let mut config = crate::config::Config::default();
-        config.project_root = Some(root.path().to_path_buf());
-        let ctx = Arc::new(AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            config,
-        ));
-        ctx.set_harness(crate::harness::Harness::Opencode);
-        let manifest = ManifestV2::new(ManifestHeader {
-            producers: Producers {
-                trigram: "test".into(),
-                semantic: None,
-                callgraph: crate::views::callgraph::PRODUCER.into(),
-            },
-            head_tree: None,
-            ignore_fingerprint: None,
-            segment: None,
-        });
-        let snapshot =
-            LiveDelta::new(Arc::new(OpenGeneration::new("test", manifest, None))).snapshot();
-        let waiter = Arc::new(Timeout {
-            snapshot,
-            gap: root.path().join("pending.ts"),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        });
-        if active {
-            let registry =
-                crate::views::registry::FamilyRegistry::open(storage.path(), "inspect-test")
-                    .unwrap();
-            let access = ViewAccess::Owner(
-                registry
-                    .register_view_with_storage(registry.storage(), "scope", root.path())
-                    .unwrap(),
-            );
-            ctx.install_checkout_query_runtime(Arc::new(
-                crate::views::query_wait::CheckoutQueryRuntime {
-                    access,
-                    waiter: waiter.clone(),
-                    callgraph: Arc::new(crate::views::callgraph::CallgraphPlane::default()),
-                },
-            ));
-        }
-        let request: RawRequest = serde_json::from_value(
-            serde_json::json!({"id":"deferred-checkout", "command":"inspect"}),
-        )
-        .unwrap();
-        let (started, release) = install_deferred_inspect_stat_gate_for_test();
-        let DispatchOutcome::Deferred(mut pending) = handle_inspect_deferred(&request, ctx.clone())
-        else {
-            panic!("expected deferred inspect");
-        };
-        started.recv_timeout(Duration::from_secs(5)).unwrap();
-        release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let response = loop {
-            if let Some(response) = (pending.poll)(&ctx) {
-                break response;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        (
-            response,
-            waiter.calls.load(std::sync::atomic::Ordering::Relaxed),
-        )
-    }
-    #[test]
-    fn deferred_checkout_timeout_attaches_named_gaps_before_guard_drops() {
-        let _serial = deferred_inspect_test_lock();
-        let (response, calls) = run(true);
-        assert_eq!(calls, 1, "one wait budget per worker request");
-        assert_eq!(response.data["complete"], false);
-        assert_eq!(response.data["inspect_terminal"], "partial");
-        assert!(crate::subc_format::format_inspect_for_test(&response)
-            .starts_with("PARTIAL — callgraph view pending:"));
-        let gaps = response.data["gaps"].as_array().unwrap();
-        assert!(gaps.iter().any(|gap| gap["kind"] == "view_pending"
-            && gap["path"]
-                .as_str()
-                .is_some_and(|p| p.ends_with("pending.ts"))));
-    }
-    #[test]
-    fn default_deferred_inspect_has_no_checkout_wait_or_gap_fields() {
-        let _serial = deferred_inspect_test_lock();
-        let (response, calls) = run(false);
-        assert_eq!(calls, 0);
-        assert_eq!(response.data["inspect_terminal"], "fresh");
-        assert_eq!(response.data["complete"], true);
-        assert!(response.data.get("gaps").is_none());
     }
 }

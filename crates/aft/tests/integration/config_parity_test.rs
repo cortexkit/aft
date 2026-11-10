@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use aft::config::{Config, UserServerDef};
 use aft::config_resolve::{resolve_config_for_harness, ConfigTier};
-use aft::feature_config::validate_resolved_config;
+use aft::feature_config::{validate_resolved_config, REMOVED_OPENCODE_PATHS};
 use aft::harness::Harness;
 use serde_json::Value;
 use std::str::FromStr;
@@ -103,13 +103,40 @@ fn read_harness(dir: &Path) -> Harness {
         .unwrap_or_else(|error| panic!("invalid fixture harness {value:?}: {error}"))
 }
 
+/// Whether the plugins refuse this user file before the engine sees it: they
+/// refuse the removed OpenCode prompt-server keys in every tier, while the
+/// names retired in 0.62 or earlier are translated in a user file.
+fn plugins_refuse_user_file(user: &ConfigTier) -> bool {
+    resolve_config_for_harness(std::slice::from_ref(user), None)
+        .errors
+        .iter()
+        .any(|error| {
+            error.starts_with("removed_config_key:")
+                && REMOVED_OPENCODE_PATHS
+                    .iter()
+                    .any(|(path, _)| error.contains(path))
+        })
+}
+
 fn assert_case(dir: &Path) -> Option<String> {
     let case = dir.file_name().unwrap().to_string_lossy().to_string();
 
     // Build the ordered tier list exactly as the plugin will: user first, then
     // project. Absent files contribute no tier.
     let mut tiers = Vec::new();
-    if let Some(user) = read_tier(dir, "user.jsonc", "user") {
+    if let Some(mut user) = read_tier(dir, "user.jsonc", "user") {
+        // The engine rewrites the user file to current keys before it resolves
+        // it, and the plugins translate the user file in memory for that one
+        // start, so feed the resolver the rewritten text. The exception is a
+        // user file the plugins refuse outright (the removed OpenCode
+        // prompt-server keys): it never reaches the engine, so it stays as
+        // written and both sides report its own refusal. A file the rewrite
+        // cannot parse is also passed through for the resolver to reject.
+        if !plugins_refuse_user_file(&user) {
+            if let Ok(migration) = aft::config_fix::migrate_user_config_text(&user.doc) {
+                user.doc = migration.text;
+            }
+        }
         tiers.push(user);
     }
     if let Some(project) = read_tier(dir, "project.jsonc", "project") {
@@ -118,7 +145,9 @@ fn assert_case(dir: &Path) -> Option<String> {
 
     let harness = read_harness(dir);
     // The fixtures include retired keys such as `search_index`, `gh_read` and
-    // `idle.lsp_ttl_minutes`; both languages translate them in memory.
+    // `idle.lsp_ttl_minutes`. In the user file both languages apply their
+    // current equivalents; in a project file the names retired in 0.62 or
+    // earlier are refused with `removed_config_key`.
     let result = resolve_config_for_harness(&tiers, Some(&harness));
 
     let golden: Value = serde_json::from_str(&platform_fixture_text(

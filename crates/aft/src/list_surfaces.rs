@@ -196,7 +196,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, read_bounded_snippet_line, truncate_chars, split_semantic_results, handle_split_search, reply",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, read_bounded_snippet_line, truncate_chars, split_semantic_results, split_semantic_from_data, handle_split_search, reply",
             },
         ],
     },
@@ -256,10 +256,14 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
                 kind: ReasonKind::Bounding,
                 predicate_name: "walk_time_limit_reached, walk_files_unbounded, bounded_fallback_walk_files_with_limits_target",
             },
+            // glob_from_view answers from the data layer's checkout listing,
+            // which never walks, so it reports walk_truncated false and no
+            // skipped mounts; a directory missing from the listing is handed
+            // to fallback_glob, whose walk can stop early.
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, discover_glob_root, named_ignored_glob_walk_stops_at_cap_and_deadline, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, glob_from_view, discover_glob_root, named_ignored_glob_walk_stops_at_cap_and_deadline, walk_truncated, skipped_foreign_mounts",
             },
             ReasonEntry {
                 reason: Reason::Cap,
@@ -395,6 +399,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "late_results_for_consumer",
         location_or_primitive: "LATE_RESULTS_PAGE_MAX (256), SQL LIMIT cap + 1, take(cap), max_body",
         reason: "tool-provider protocol feed pagination uses entries, cursor and more, not an AFT ListEnvelope; the existing 256-entry limit and encoded reply-byte bound retain continuation through the shared cursor",
+    },
+    ExclusionEntry {
+        file: "db/access_grants.rs",
+        enclosing_item: "saved_scope_batch",
+        location_or_primitive: "SQL LIMIT, PER_TICK (4)",
+        reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
     },
     ExclusionEntry {
         file: "db/call_ledger.rs",
@@ -769,7 +779,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal corpus census, not a paginated findings list; an incomplete walk reports a named gap, marks scope_files_complete false, and renders the count as a lower bound",
     },
     ExclusionEntry {
-        file: "root_cache.rs",
+        file: "cache_location/markers.rs",
         enclosing_item: "sweep_all_read_markers_pinned, sweep_marker_generation, read_marker_protection, marker_file_is_protected",
         location_or_primitive: "shared repair traversal budget and read-marker byte limit",
         reason: "internal marker liveness and cleanup, not result lists; incomplete or oversized marker reads protect the cache rather than authorize deletion",

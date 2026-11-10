@@ -96,6 +96,14 @@ pub struct RootMemorySnapshot {
     pub pending_install: MemoryEstimate,
     pub exact_memo: MemoryEstimate,
     pub compression_filters: MemoryEstimate,
+    /// What the root's checkout in the data layer holds that its planes
+    /// share: the checkout state lists, its open segments and its snapshot.
+    /// The bytes each plane holds alone are in `trigram` (text), `callgraph`
+    /// and `semantic` (meaning search), each as `data_layer_bytes`; the
+    /// block cache every checkout shares is counted once per process.
+    /// Present only while the data layer runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_layer: Option<MemoryEstimate>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -191,7 +199,18 @@ impl RootMemorySnapshot {
             pending_install: MemoryEstimate::estimated(0),
             exact_memo: MemoryEstimate::estimated(0),
             compression_filters: MemoryEstimate::estimated(0),
+            data_layer: None,
         }
+    }
+
+    /// Attach the data layer's estimate for this root, when it runs, and
+    /// fold it into the root's status and attributed total.
+    pub fn with_data_layer(mut self, data_layer: Option<MemoryEstimate>) -> Self {
+        self.data_layer = data_layer;
+        let rollup = self.rollup();
+        self.status = rollup.status;
+        self.attributed_bytes = rollup.attributed_bytes;
+        self
     }
 
     /// Attach the finished-but-uninstalled load estimate and fold it into the
@@ -218,7 +237,7 @@ impl RootMemorySnapshot {
     }
 
     fn rollup(&self) -> RootMemoryRollup {
-        RootMemoryRollup::from_estimates(&[
+        let mut estimates = vec![
             &self.semantic,
             &self.trigram,
             &self.symbols,
@@ -231,7 +250,9 @@ impl RootMemorySnapshot {
             &self.pending_install,
             &self.exact_memo,
             &self.compression_filters,
-        ])
+        ];
+        estimates.extend(self.data_layer.as_ref());
+        RootMemoryRollup::from_estimates(&estimates)
     }
 
     pub fn busy_subsystem_count(&self) -> usize {
@@ -242,9 +263,12 @@ impl RootMemorySnapshot {
         self.rollup().not_estimated_subsystems
     }
 
-    /// Bytes released by `evict_idle_artifacts`: retained index handles, symbol
-    /// data, and inspect caches. This deliberately shares the already-collected
-    /// estimates instead of taking a second estimate on the reply path.
+    /// Bytes released when the root goes idle: retained index handles,
+    /// symbol data, inspect caches, and the data layer's checkout, which the
+    /// idle reaper's release drops (its planes' bytes are in `trigram`,
+    /// `semantic` and `callgraph`, what they share in `data_layer`). This
+    /// deliberately shares the already-collected estimates instead of taking
+    /// a second estimate on the reply path.
     pub fn evictable_bytes(&self) -> u64 {
         [
             &self.trigram,
@@ -255,6 +279,7 @@ impl RootMemorySnapshot {
             &self.exact_memo,
         ]
         .into_iter()
+        .chain(self.data_layer.as_ref())
         .filter_map(|estimate| estimate.estimated_bytes)
         .fold(0, u64::saturating_add)
     }
@@ -392,17 +417,16 @@ pub struct ProcessMemorySnapshot {
     /// a request-path read is null until the first process-wide observation exists.
     pub allocator_observation_age_ms: Option<u64>,
     pub total_attributed_bytes: u64,
-    /// Resident views-on semantic arena bytes, every family counted once
-    /// (see [`SemanticArenaCensus`]). Included in `total_attributed_bytes`.
-    pub semantic_arena_bytes: u64,
     /// Live local ONNX embedding sessions, shared across roots and query/build workers.
     pub embedding_sessions: u64,
     /// Serialized weight bytes for those sessions, counted once per session.
     /// This estimates model storage, not ORT's transient tensors or allocator slack.
     pub embedding_model_bytes: u64,
-    /// Embedded chunks resident in those arenas. Each holds one embedding
-    /// vector, so it can be checked against an allocator's block counts.
-    pub semantic_resident_chunks: u64,
+    /// Bytes resident in the data layer's block cache, shared by every
+    /// checkout and counted once here. Included in `total_attributed_bytes`.
+    /// Present only once a checkout of this process has bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_layer_block_cache_bytes: Option<u64>,
     pub unattributed_bytes: Option<i64>,
     pub root_count: usize,
     pub busy_subsystems: usize,
@@ -526,63 +550,6 @@ impl AllocatorPressureRelief {
     }
 }
 
-/// One family's resident views-on semantic arena.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SemanticArenaRow {
-    pub storage: String,
-    pub family: String,
-    pub runs: usize,
-    pub chunks: usize,
-    pub bytes: u64,
-}
-
-/// The views-on semantic arenas alive in this process. A family's arena is
-/// shared by every view of that family and appears once in the process
-/// registry, so its runs are counted here exactly once and never on a root
-/// row. A root row counts only its own overlay (see `CheckoutSemantic`).
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct SemanticArenaCensus {
-    pub bytes: u64,
-    pub resident_chunks: u64,
-    /// Largest family first.
-    pub families: Vec<SemanticArenaRow>,
-}
-
-impl SemanticArenaCensus {
-    pub fn measure() -> Self {
-        let mut families: Vec<SemanticArenaRow> = crate::views::semantic_arena::live_arenas()
-            .iter()
-            .map(|arena| {
-                let memory = arena.memory();
-                SemanticArenaRow {
-                    storage: arena.storage().display().to_string(),
-                    family: arena.family().to_owned(),
-                    runs: memory.runs,
-                    chunks: memory.chunks,
-                    bytes: memory.bytes,
-                }
-            })
-            .collect();
-        families.sort_by(|a, b| {
-            b.bytes
-                .cmp(&a.bytes)
-                .then_with(|| a.family.cmp(&b.family))
-                .then_with(|| a.storage.cmp(&b.storage))
-        });
-        Self {
-            bytes: families
-                .iter()
-                .map(|row| row.bytes)
-                .fold(0u64, u64::saturating_add),
-            resident_chunks: families
-                .iter()
-                .map(|row| usize_to_u64(row.chunks))
-                .fold(0u64, u64::saturating_add),
-            families,
-        }
-    }
-}
-
 impl ProcessMemorySnapshot {
     pub fn from_roots(
         roots: &BTreeMap<String, RootMemorySnapshot>,
@@ -593,7 +560,7 @@ impl ProcessMemorySnapshot {
             rollups.iter(),
             roots.len(),
             shared_semantic_bases,
-            &SemanticArenaCensus::measure(),
+            crate::data_layer::surfaces::block_cache_estimate().as_ref(),
             AllocatorObservation::measure(),
         )
     }
@@ -602,7 +569,7 @@ impl ProcessMemorySnapshot {
         roots: impl Iterator<Item = &'a RootMemoryRollup>,
         root_count: usize,
         shared_semantic_bases: &MemoryEstimate,
-        semantic_arenas: &SemanticArenaCensus,
+        data_layer_block_cache: Option<&MemoryEstimate>,
         allocator_observation: AllocatorObservation,
     ) -> Self {
         let mut root_attributed_bytes = 0u64;
@@ -620,9 +587,11 @@ impl ProcessMemorySnapshot {
             snapshot: allocator,
             age_ms: allocator_observation_age_ms,
         } = allocator_observation;
+        let data_layer_block_cache_bytes =
+            data_layer_block_cache.and_then(|cache| cache.estimated_bytes);
         let total_attributed_bytes = root_attributed_bytes
             .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
-            .saturating_add(semantic_arenas.bytes)
+            .saturating_add(data_layer_block_cache_bytes.unwrap_or(0))
             .saturating_add(embedding.model_bytes)
             .saturating_add(sqlite.memory_used_bytes);
         let rss_bytes = process_rss_bytes();
@@ -649,10 +618,9 @@ impl ProcessMemorySnapshot {
             allocator,
             allocator_observation_age_ms,
             total_attributed_bytes,
-            semantic_arena_bytes: semantic_arenas.bytes,
             embedding_sessions: embedding.sessions,
             embedding_model_bytes: embedding.model_bytes,
-            semantic_resident_chunks: semantic_arenas.resident_chunks,
+            data_layer_block_cache_bytes,
             unattributed_bytes,
             root_count,
             busy_subsystems,
@@ -668,6 +636,9 @@ impl ProcessMemorySnapshot {
 /// around 27 KB, and JSON keys serialize alphabetically, so an oversized
 /// `memory.roots` map pushes later sections past the cut).
 pub const MEMORY_SNAPSHOT_ROOT_DETAIL_CAP: usize = 8;
+
+/// Operations the census names by their allocation high-water mark.
+const CENSUS_ALLOCATION_LABELS: usize = 5;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemorySnapshot {
@@ -687,25 +658,33 @@ pub struct MemorySnapshot {
     /// snapshots borrowed loads share and the indexes owner roots froze when
     /// they installed them. Root rows count zero for a view of such a base.
     pub shared_semantic_bases: MemoryEstimate,
-    /// Views-on semantic arenas, one row per family, attributed once
-    /// process-wide (`process.semantic_arena_bytes`).
-    pub semantic_arenas: SemanticArenaCensus,
+    /// The data layer's block cache, shared by every checkout and attributed
+    /// once process-wide (`process.data_layer_block_cache_bytes`). Present
+    /// only once a checkout of this process has bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_layer_block_cache: Option<MemoryEstimate>,
     pub process: ProcessMemorySnapshot,
+    /// The operations whose live heap bytes peaked highest since the
+    /// previous census, highest first, as the `aft` binary's allocation
+    /// tracer counts them. Only the uncapped census carries them, and only
+    /// when an operation allocated since the last one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allocation_labels: Vec<crate::alloc_trace::LabelPeak>,
 }
 
 /// Memory attributed once for the whole process rather than to any root:
-/// shared semantic bases and views-on semantic arenas.
+/// shared semantic bases and the data layer's block cache.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedProcessMemory {
     pub(crate) shared_semantic_bases: MemoryEstimate,
-    pub(crate) semantic_arenas: SemanticArenaCensus,
+    pub(crate) data_layer_block_cache: Option<MemoryEstimate>,
 }
 
 impl SharedProcessMemory {
     pub(crate) fn measure() -> Self {
         Self {
             shared_semantic_bases: crate::semantic_index::shared_semantic_bases_memory(),
-            semantic_arenas: SemanticArenaCensus::measure(),
+            data_layer_block_cache: crate::data_layer::surfaces::block_cache_estimate(),
         }
     }
 }
@@ -747,7 +726,7 @@ impl MemoryRollupSnapshot {
             roots.values(),
             roots.len(),
             &shared.shared_semantic_bases,
-            &shared.semantic_arenas,
+            shared.data_layer_block_cache.as_ref(),
             allocator,
         );
         let roots_total = roots.len();
@@ -817,7 +796,7 @@ impl MemorySnapshot {
     ) -> Self {
         let SharedProcessMemory {
             shared_semantic_bases,
-            semantic_arenas,
+            data_layer_block_cache,
         } = shared;
         // Totals cover EVERY root before the detail map is capped.
         let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
@@ -825,7 +804,7 @@ impl MemorySnapshot {
             rollups.iter(),
             roots.len(),
             &shared_semantic_bases,
-            &semantic_arenas,
+            data_layer_block_cache.as_ref(),
             allocator,
         );
         let roots_total = roots.len();
@@ -834,6 +813,12 @@ impl MemorySnapshot {
         } else {
             (roots, 0, 0)
         };
+        // Reading the marks restarts them, so only the census reads them.
+        let allocation_labels = if cap_detail {
+            Vec::new()
+        } else {
+            crate::alloc_trace::take_census_peaks(CENSUS_ALLOCATION_LABELS)
+        };
         Self {
             roots_status,
             roots,
@@ -841,8 +826,9 @@ impl MemorySnapshot {
             roots_omitted,
             roots_omitted_bytes,
             shared_semantic_bases,
-            semantic_arenas,
+            data_layer_block_cache,
             process,
+            allocation_labels,
         }
     }
 }
@@ -1127,7 +1113,15 @@ fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
             .expect("allocator snapshot test thread log")
             .push(name);
     }
-    allocator_memory_snapshot_impl()
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let started = std::time::Instant::now();
+    let snapshot = allocator_memory_snapshot_impl();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    LAST_ALLOCATOR_WALK_MS.store(
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    snapshot
 }
 
 fn allocator_observation(source: AllocatorSource) -> (AllocatorMemorySnapshot, Option<u64>) {
@@ -1189,12 +1183,39 @@ pub const ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 pub const ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(300);
 
+/// Periodic allocator readers wait at least this many times the last walk's
+/// own duration before walking again, so walks take at most 0.5% of the time.
+/// A walk is cheap on macOS (tens of milliseconds on a multi-GiB heap), but
+/// glibc's `mallinfo2` visits every free chunk while holding that arena's
+/// lock, which on a fragmented heap takes seconds.
+const ALLOCATOR_WALK_COST_FACTOR: u64 = 200;
+
+/// The longest an expensive walk can stretch a periodic reader's reuse window,
+/// so a slow allocator still gets a fresh reading every ten minutes.
+const ALLOCATOR_WALK_MAX_REUSE_MS: u64 = 10 * 60 * 1000;
+
+/// How long a periodic reader may reuse an allocator observation whose walk
+/// took `walk_ms`: `floor_ms` for a cheap walk, stretched to
+/// `ALLOCATOR_WALK_COST_FACTOR` times the walk's duration for an expensive
+/// one, and never past `ALLOCATOR_WALK_MAX_REUSE_MS` (or `floor_ms`, if that
+/// is larger).
+pub(crate) fn allocator_reuse_window_ms(floor_ms: u64, walk_ms: u64) -> u64 {
+    walk_ms
+        .saturating_mul(ALLOCATOR_WALK_COST_FACTOR)
+        .clamp(floor_ms, ALLOCATOR_WALK_MAX_REUSE_MS.max(floor_ms))
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 /// The module loop ticks every 250ms. Sampling at this cadence would repeatedly
-/// take allocator-zone locks, so cache a process-wide observation for 60s.
+/// take allocator-zone locks, so cache a process-wide observation for at least
+/// 60s, longer when walks are expensive (see `allocator_reuse_window_ms`).
 /// This bounds allocator statistics walks to one per idle minute, or two for a
 /// relief pass that uses its before/after snapshots.
 const ALLOCATOR_SLACK_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Wall-clock duration of the most recent allocator statistics walk, on any
+/// thread, in milliseconds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_ALLOCATOR_WALK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const UNKNOWN_ALLOCATOR_SLACK: u64 = u64::MAX;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1428,9 +1449,23 @@ fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u6
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn sample_is_stale(now_ms: u64) -> bool {
-    let sampled_at = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire);
+    sample_is_stale_after(
+        LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire),
+        now_ms,
+        LAST_ALLOCATOR_WALK_MS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Whether a sample taken at `sampled_at` is due for replacement at `now_ms`
+/// when the last walk took `walk_ms`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sample_is_stale_after(sampled_at: u64, now_ms: u64, walk_ms: u64) -> bool {
     sampled_at == UNSAMPLED_AT_MS
-        || now_ms.saturating_sub(sampled_at) >= ALLOCATOR_SLACK_SAMPLE_INTERVAL.as_millis() as u64
+        || now_ms.saturating_sub(sampled_at)
+            >= allocator_reuse_window_ms(
+                ALLOCATOR_SLACK_SAMPLE_INTERVAL.as_millis() as u64,
+                walk_ms,
+            )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1797,6 +1832,36 @@ mod tests {
         assert_eq!(signed_difference(5, 8), -3);
     }
 
+    #[test]
+    fn allocator_reuse_window_stretches_with_walk_cost() {
+        // A cheap walk keeps the floor.
+        assert_eq!(allocator_reuse_window_ms(30_000, 0), 30_000);
+        assert_eq!(allocator_reuse_window_ms(30_000, 150), 30_000);
+        // An expensive walk waits 200 times its own duration...
+        assert_eq!(allocator_reuse_window_ms(30_000, 1_000), 200_000);
+        // ...but never more than ten minutes.
+        assert_eq!(allocator_reuse_window_ms(30_000, 6_500), 600_000);
+        assert_eq!(allocator_reuse_window_ms(30_000, u64::MAX), 600_000);
+        // A floor above the cap still wins.
+        assert_eq!(allocator_reuse_window_ms(900_000, 6_500), 900_000);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn slack_sample_waits_longer_after_an_expensive_walk() {
+        assert!(sample_is_stale_after(UNSAMPLED_AT_MS, 0, 0));
+        // A cheap walk: due once a minute.
+        assert!(!sample_is_stale_after(0, 59_999, 20));
+        assert!(sample_is_stale_after(0, 60_000, 20));
+        // A one-second walk: due after 200 seconds, not after one minute.
+        assert!(!sample_is_stale_after(0, 60_000, 1_000));
+        assert!(!sample_is_stale_after(0, 199_999, 1_000));
+        assert!(sample_is_stale_after(0, 200_000, 1_000));
+        // A multi-second glibc walk: capped at ten minutes.
+        assert!(!sample_is_stale_after(0, 599_999, 6_500));
+        assert!(sample_is_stale_after(0, 600_000, 6_500));
+    }
+
     #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
     #[test]
     fn cached_allocator_before_first_publication_is_unavailable_not_unsupported() {
@@ -1920,9 +1985,15 @@ mod tests {
         let snapshot = ProcessMemorySnapshot::from_roots(&BTreeMap::new(), &shared);
         assert_eq!(snapshot.sqlite.status, "measured");
         assert!(snapshot.sqlite.memory_highwater_bytes >= snapshot.sqlite.memory_used_bytes);
+        // The data layer's block cache is counted once for the process when
+        // a test of this process has bound a checkout.
         assert_eq!(
             snapshot.total_attributed_bytes,
-            snapshot.sqlite.memory_used_bytes.saturating_add(7)
+            snapshot
+                .sqlite
+                .memory_used_bytes
+                .saturating_add(7)
+                .saturating_add(snapshot.data_layer_block_cache_bytes.unwrap_or(0))
         );
 
         let serialized = serde_json::to_value(&snapshot).expect("serialize process memory");

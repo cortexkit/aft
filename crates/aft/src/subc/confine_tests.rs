@@ -378,53 +378,6 @@ fn confined_restart_and_fail_closed() {
 }
 
 #[test]
-fn confined_walks_ignore_ready_parent_index() {
-    let f = Fixture::new();
-    std::fs::write(f.pin.join("ghost.rs"), "fn pinned_token() {}\n").unwrap();
-    std::fs::remove_file(f.pin.join("only.rs")).unwrap();
-    let index = crate::search_index::SearchIndex::build(f.repo.path());
-    assert!(index.ready);
-    std::fs::remove_file(f.pin.join("ghost.rs")).unwrap();
-    std::fs::write(f.pin.join("only.rs"), "fn pinned_token() {}\n").unwrap();
-    *f.ctx.search_index().write().unwrap() = Some(index);
-    std::fs::write(f.live.join("ignore-rules"), "only.rs\n").unwrap();
-    for name in [".gitignore", ".ignore", ".aftignore"] {
-        std::os::unix::fs::symlink("../live/ignore-rules", f.pin.join(name)).unwrap();
-    }
-    for name in ["grep", "glob"] {
-        let response = f.call(name, arguments(name, "."));
-        assert!(response.success, "{response:?}");
-        assert_eq!(
-            response.data["fallback"], "filesystem",
-            "{name}: {response:?}"
-        );
-        assert_eq!(response.data["complete"], true);
-        assert!(response.data.get("walk_truncated").is_none());
-        assert!(!response.data["text"].as_str().unwrap().contains("(walk)"));
-        let files = if name == "grep" {
-            response.data["matches"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|row| row["file"].as_str().unwrap())
-                .collect::<Vec<_>>()
-        } else {
-            response.data["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|file| file.as_str().unwrap())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(files, [f.pin.join("only.rs").to_str().unwrap()]);
-        let text = serde_json::to_string(&response).unwrap();
-        for forbidden in ["sentinel.rs", "outside_secret", "ghost.rs", "escape-file"] {
-            assert!(!text.contains(forbidden), "{name}: {text}");
-        }
-    }
-}
-
-#[test]
 fn confined_catalog_validation_and_monotonic_freeze() {
     let f = Fixture::new();
     for value in [json!("other"), json!(null), json!(false), json!({})] {

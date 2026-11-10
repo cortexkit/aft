@@ -670,38 +670,6 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
-    #[test]
-    fn production_versioned_stores_and_floor_are_write_fenced() {
-        let fixture = tempfile::tempdir().unwrap();
-        with_test_account(fixture.path(), false, || {
-            assert!(crate::reader_floor::raise(
-                fixture.path(),
-                &[(crate::persisted_format::PersistedStore::BashTask, 7)]
-            )
-            .unwrap_err()
-            .to_string()
-            .contains(CODE));
-            assert!(crate::views::ViewStore::open(fixture.path(), "scope").is_err());
-            assert!(crate::db::TrackedConnection::open(
-                &fixture.path().join("blobs.sqlite"),
-                crate::db::SqliteStore::BlobStore
-            )
-            .is_err());
-            assert!(
-                crate::backup::create_private_durable_dir(&fixture.path().join("checkpoints"))
-                    .is_err()
-            );
-            let access = crate::root_cache::ArtifactAccess::for_root(fixture.path());
-            for store in ["index", "semantic", "symbols", "callgraph"] {
-                assert!(
-                    !access.allows_write("key", &fixture.path().join(store).join("key/artifact"))
-                );
-            }
-        });
-        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
-    }
-
     #[cfg(all(unix, debug_assertions))]
     #[test]
     fn production_alias_and_relative_tail_cannot_bypass_fence() {

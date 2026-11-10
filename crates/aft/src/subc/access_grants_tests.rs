@@ -75,6 +75,58 @@ fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
     .unwrap();
     result
 }
+
+#[test]
+fn grants_answer_source_does_not_change_head_authority() {
+    use crate::access_policy::HeadPolicy;
+    use crate::db::access_grant_rows::GrantSource;
+    let (dir, ctx, head, worker) = fixture();
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    let inside = AccessGrant {
+        path: head.project_root.clone(),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    };
+    let policy = policy_for_scope(&conn, &scope_key(&head), &ctx)
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.head_policy(&inside), HeadPolicy::Allow);
+    assert_eq!(
+        answer_source(&conn, &worker, false, Some(&policy), &inside).unwrap(),
+        Some(GrantSource::HeadPolicy)
+    );
+    assert_eq!(policy.head_policy(&inside), HeadPolicy::Allow);
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let grant = AccessGrant {
+        path: policy_path(&outside),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    };
+    for source in [Some(GrantSource::Person), None] {
+        store::revoke(&conn, &scope_key(&head), &grant.path).unwrap();
+        store::insert_with_source(&conn, &scope_key(&head), &grant, Some("acc_head"), source)
+            .unwrap();
+        let policy = policy_for_scope(&conn, &scope_key(&head), &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::Allow);
+        assert_eq!(
+            answer_source(&conn, &worker, false, Some(&policy), &grant).unwrap(),
+            Some(source.map_or(GrantSource::Unknown, |_| GrantSource::HeadGrant))
+        );
+        assert_eq!(
+            policy.head_policy(&grant),
+            HeadPolicy::Allow,
+            "classification cannot mutate the approval policy"
+        );
+    }
+    assert_eq!(
+        answer_source(&conn, &worker, true, None, &grant).unwrap(),
+        Some(GrantSource::Person)
+    );
+}
 fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
 }
@@ -1495,63 +1547,6 @@ fn grants_policy_reads_revocation_on_the_next_check() {
             AccessDecision::Deny(AccessDenial::OutsideRoots)
         );
         assert!(ctx.validate_read_path("check", "worker", &path).is_err());
-    });
-}
-
-#[test]
-fn scoped_read_lists_load_policy_and_grants_once_per_call() {
-    let _storage_override = crate::test_env::without_storage_override();
-    let (_dir, ctx, head, worker) = fixture();
-    let shared = head.project_root.join("shared");
-    std::fs::write(&shared, "shared").unwrap();
-    remote_policy::catalog(
-        catalog_request(json!([{"path":shared,"mode":"read"}])),
-        &worker,
-        &ctx,
-    )
-    .unwrap();
-    ctx.update_config(|config| config.project_root = Some(worker.project_root.clone()));
-    let src = worker.project_root.join("src");
-    std::fs::create_dir(&src).unwrap();
-    for index in 0..160 {
-        std::fs::write(src.join(format!("item{index:03}.rs")), "pub fn item() {}\n").unwrap();
-    }
-    *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(
-        &worker.project_root,
-    ));
-    crate::access_policy::with_scope(Some(scope_key(&worker)), || {
-        assert_eq!(
-            ctx.access_policy("scope-sanity").unwrap().decide(
-                AccessOperation::Read,
-                &policy_path(&shared),
-                false
-            ),
-            AccessDecision::Allow
-        );
-        for (tool, params) in [
-            ("glob", json!({"path":"src", "pattern":"**/*.rs"})),
-            ("outline", json!({"directory":src})),
-            ("outline", json!({"target":src,"files":true})),
-        ] {
-            let req = crate::protocol::RawRequest {
-                id: format!("scoped-policy-once-{tool}"),
-                command: tool.into(),
-                session_id: Some(worker.session.clone()),
-                lsp_hints: None,
-                params,
-            };
-            for _ in 0..2 {
-                let probe = crate::context::policy_load_probe::Probe::new(&req.id);
-                let response = if tool == "glob" {
-                    crate::commands::glob::handle_glob(&req, &ctx)
-                } else {
-                    crate::commands::outline::handle_outline(&req, &ctx)
-                };
-                assert!(response.success, "{response:?}");
-                let loads = probe.counts();
-                assert_eq!((loads.policies, loads.grants), (1, 1), "{loads:?}");
-            }
-        }
     });
 }
 

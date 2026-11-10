@@ -67,13 +67,6 @@ impl DiskFacts {
             canonical_probes: None,
         }
     }
-
-    pub fn with_probe_memo(project_root: &Path, memo: Arc<CanonicalProbeMemo>) -> Self {
-        Self {
-            canonical_probes: Some(memo),
-            ..Self::new(project_root)
-        }
-    }
 }
 
 impl ProjectFacts for DiskFacts {

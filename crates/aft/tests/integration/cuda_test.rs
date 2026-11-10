@@ -1,15 +1,9 @@
-use std::fs;
 use std::path::Path;
 
-use aft::callgraph_store::CallGraphStore;
-use aft::commands::callgraph_store_adapter;
 use aft::parser::{detect_language, LangId};
-use serde_json::{json, Value};
-use tempfile::tempdir;
+use serde_json::json;
 
 use super::helpers::AftProcess;
-
-const CUDA_SOURCE: &str = include_str!("../fixtures/sample.cu");
 
 #[test]
 fn cuda_extensions_outline_and_zoom_use_the_cuda_grammar() {
@@ -53,56 +47,4 @@ fn cuda_extensions_outline_and_zoom_use_the_cuda_grammar() {
     );
 
     assert!(aft.shutdown().success());
-}
-
-#[test]
-fn cuda_store_records_kernel_launch_and_device_helper_edges() {
-    let dir = tempdir().expect("temporary CUDA project");
-    let root = fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
-    let file = root.join("sample.cu");
-    fs::write(&file, CUDA_SOURCE).expect("write CUDA fixture");
-
-    let store = CallGraphStore::open(root.join(".callgraph-store"), root.clone())
-        .expect("open callgraph store");
-    store
-        .cold_build(std::slice::from_ref(&file))
-        .expect("build CUDA callgraph");
-
-    let kernel_callers = response_json(callgraph_store_adapter::callers_result(
-        &store,
-        &file,
-        "transform",
-        1,
-        true,
-    ));
-    assert_exact_caller(&kernel_callers, "launch_transform");
-
-    let helper_callers = response_json(callgraph_store_adapter::callers_result(
-        &store, &file, "scale", 1, true,
-    ));
-    assert_exact_caller(&helper_callers, "transform");
-}
-
-fn response_json<T: serde::Serialize>(
-    result: Result<T, aft::callgraph_store::CallGraphStoreError>,
-) -> Value {
-    serde_json::to_value(result.expect("callgraph store query")).expect("serialize store response")
-}
-
-fn assert_exact_caller(response: &Value, symbol: &str) {
-    let callers = response["callers"]
-        .as_array()
-        .expect("caller groups")
-        .iter()
-        .flat_map(|group| group["callers"].as_array().expect("group callers"))
-        .collect::<Vec<_>>();
-    assert_eq!(callers.len(), 1, "unexpected caller response: {response:#}");
-    assert_eq!(
-        callers[0]["symbol"], symbol,
-        "caller response: {response:#}"
-    );
-    assert!(
-        callers[0]["resolved_by"].is_null(),
-        "same-file call should resolve exactly: {response:#}"
-    );
 }

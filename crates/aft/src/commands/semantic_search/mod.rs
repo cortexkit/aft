@@ -18,12 +18,14 @@ pub mod plan_table;
 pub mod provenance;
 mod recall_audit;
 mod regex_route;
+pub mod request_files;
 pub(crate) mod rerank;
 pub mod scoring;
 pub(crate) mod snippet_bounds;
 pub mod split_query;
 pub mod telemetry;
 pub mod trailer;
+pub mod waits;
 
 pub use comparator::{r3_cmp, score_free_r3_cmp, CandidateResult, RankedTuple, SymbolOffsetRange};
 pub use evidence_descriptor::{
@@ -102,7 +104,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -118,37 +120,44 @@ use crate::context::{AppContext, SemanticIndexStatus};
 use crate::feature_status::{
     cause as feature_cause, observed_index_status, IndexEffective, IndexObservation, IndexPlane,
 };
+use crate::git_root_resolution::GitRootResolutionError;
 use crate::grep_executor::{self, GrepParams};
 use crate::inspect::job::{is_test_file, is_test_support_file};
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
-use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact, ReadOnlyDegradation};
 use crate::search_index::{
-    sort_grep_matches_by_mtime_desc, try_read_with_budget, walk_project_files_from_matching,
-    GrepMatch, GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
+    sort_grep_matches_by_mtime_desc, walk_project_files_from_matching, GrepMatch,
+    GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
     INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
     query_embedding_is_busy, query_embedding_timeout_budget, strip_query_embedding_busy_marker,
     strip_query_embedding_timeout_marker, EmbeddingModel, QueryBudget, SemanticIndex,
-    SemanticIndexFingerprint, SemanticResult,
+    SemanticResult,
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
 
 const DEFAULT_TOP_K: usize = 10;
+
+/// [`crate::search_index::try_read_with_budget`], timed as a readiness wait:
+/// every artifact read the search makes through it retries a contended lock
+/// in 1 ms sleeps until its budget runs out.
+fn try_read_with_budget<T>(
+    lock: &std::sync::RwLock<T>,
+    budget: Duration,
+) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    waits::timed(waits::SearchWait::Readiness, || {
+        crate::search_index::try_read_with_budget(lock, budget)
+    })
+}
 /// Semantic candidate admission is ranking policy, not a public response-size limit.
 /// Keeping it fixed prevents page-cap changes from rewriting the fused list.
 pub const SEMANTIC_ENUMERATION_LIMIT: usize = 100;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
-/// Fresh borrowed trigram bases were measured ready 1.1–2.5 seconds after root
-/// bind. Waiting through that observed window prevents a healthy first search
-/// from returning an empty loading response while keeping a stuck load bounded.
-const FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET: Duration = Duration::from_millis(2_500);
-const SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
 const TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE: &str =
     "trigram index building; results from a bounded walk";
@@ -157,32 +166,6 @@ const TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE: &str =
 thread_local! {
     static FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
-}
-
-fn first_search_index_load_wait_budget() -> Duration {
-    #[cfg(test)]
-    if let Some(budget) = FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
-        return budget;
-    }
-    FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET
-}
-
-#[cfg(test)]
-fn with_first_search_index_load_wait_budget_for_test<T>(
-    budget: Duration,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset(Option<Duration>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(|slot| slot.set(self.0));
-        }
-    }
-
-    let previous =
-        FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(|slot| slot.replace(Some(budget)));
-    let _reset = Reset(previous);
-    action()
 }
 
 #[cfg(test)]
@@ -195,29 +178,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `action` with `hook` installed as the trigram-load wait hook on this
-/// thread, and removes it (dropping anything it captured) when `action` ends.
-#[cfg(test)]
-fn with_search_index_load_wait_hook_for_test<T>(
-    hook: impl FnMut() + 'static,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            // Assign rather than `Option::take`: the list-envelope scanner treats
-            // `.take(` as a list-cutting site, and this only clears a test hook.
-            SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-
-    SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let _reset = Reset;
-    action()
-}
-
-const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
-const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
 const BORROWED_SEMANTIC_LOADING: &str = "Semantic lane is loading the shared index";
 
 /// The opening line of a reply served while a shared (borrowed) semantic index
@@ -296,215 +256,8 @@ enum SearchMode {
     Hybrid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchIndexWaitError {
-    Cancelled,
-    Contended,
-}
-
 struct RuntimeReadinessSource<'a> {
     ctx: &'a AppContext,
-}
-
-#[derive(Clone)]
-struct ExternalBorrowedArtifacts {
-    search: ReadOnlyArtifact<Arc<SearchIndex>>,
-    semantic: ReadOnlyArtifact<Arc<SemanticIndex>>,
-    search_generation: GenerationToken,
-    /// On-disk file of the borrowed search index, when one exists; its
-    /// modification time says when the index was last saved.
-    search_artifact_path: Option<PathBuf>,
-}
-
-struct ExternalReadinessSource<'a> {
-    ctx: &'a AppContext,
-    root: &'a Path,
-    storage_dir: Option<&'a Path>,
-    loaded: OnceLock<ExternalBorrowedArtifacts>,
-}
-
-impl<'a> ExternalReadinessSource<'a> {
-    fn new(ctx: &'a AppContext, root: &'a Path, storage_dir: Option<&'a Path>) -> Self {
-        Self {
-            ctx,
-            root,
-            storage_dir,
-            loaded: OnceLock::new(),
-        }
-    }
-
-    fn load(&self) -> &ExternalBorrowedArtifacts {
-        self.loaded.get_or_init(|| {
-            let artifact = crate::readonly_artifacts::search_index_artifact_generation(
-                self.root,
-                self.storage_dir,
-            );
-            let generation = artifact
-                .as_ref()
-                .map(|artifact| format!("{:?}", artifact.generation))
-                .unwrap_or_else(|| "absent".to_string());
-            let mut search = self
-                .ctx
-                .open_borrowed_search_index(self.root, self.storage_dir);
-            let semantic = self
-                .ctx
-                .open_borrowed_semantic_index(self.root, self.storage_dir);
-            // The background search-index load may finish while semantic artifacts
-            // load. Recheck it until the first-search budget expires rather than
-            // treating an earlier degraded result as final for this request.
-            let deadline = Instant::now() + first_search_index_load_wait_budget();
-            while matches!(search, ReadOnlyArtifact::Degraded(_))
-                && Instant::now() < deadline
-                && !search_cancellation_requested()
-            {
-                search = self
-                    .ctx
-                    .open_borrowed_search_index(self.root, self.storage_dir);
-                if matches!(search, ReadOnlyArtifact::Degraded(_)) {
-                    std::thread::sleep(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL);
-                }
-            }
-            ExternalBorrowedArtifacts {
-                search,
-                semantic,
-                search_generation: GenerationToken::new_with_str(&format!(
-                    "borrowed:{}:{generation}",
-                    self.root.display()
-                )),
-                search_artifact_path: artifact.map(|artifact| artifact.path),
-            }
-        })
-    }
-
-    fn loaded(&self) -> Option<&ExternalBorrowedArtifacts> {
-        self.loaded.get()
-    }
-}
-
-impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
-    fn sample(&self) -> extensions::ReadinessObservation<'_> {
-        use extensions::{
-            ReadinessObservation, SemanticReadiness, SemanticSnapshot, SymbolIndexStatus,
-            SymbolReadiness, TrigramReadiness,
-        };
-
-        let Some(artifacts) = self.loaded() else {
-            return ReadinessObservation {
-                semantic: SemanticReadiness {
-                    status: SemanticIndexStatus::Building {
-                        stage: "loading_artifacts".to_string(),
-                        files: None,
-                        entries_done: None,
-                        entries_total: None,
-                    },
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                trigram: TrigramReadiness {
-                    status: IndexStatus::Building,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                symbol: SymbolReadiness {
-                    status: SymbolIndexStatus::Disabled,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-            };
-        };
-
-        let trigram = match &artifacts.search {
-            ReadOnlyArtifact::Fresh(index)
-            | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. }) => {
-                TrigramReadiness {
-                    status: IndexStatus::Ready,
-                    snapshot: Some(Arc::new(index.snapshot())),
-                    evicted: false,
-                    lock_contended: false,
-                }
-            }
-            ReadOnlyArtifact::Degraded(_) | ReadOnlyArtifact::Absent => TrigramReadiness {
-                status: IndexStatus::Fallback,
-                snapshot: None,
-                evicted: false,
-                lock_contended: false,
-            },
-            ReadOnlyArtifact::Cancelled => TrigramReadiness {
-                status: IndexStatus::Building,
-                snapshot: None,
-                evicted: false,
-                lock_contended: false,
-            },
-        };
-        let semantic =
-            match &artifacts.semantic {
-                ReadOnlyArtifact::Fresh(index)
-                | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale {
-                    index, ..
-                }) if semantic_fingerprint_matches_session(self.ctx, index) => SemanticReadiness {
-                    status: SemanticIndexStatus::ready(),
-                    snapshot: Some(SemanticSnapshot::from_borrowed(Arc::clone(index))),
-                    evicted: false,
-                    lock_contended: false,
-                },
-                ReadOnlyArtifact::Cancelled => SemanticReadiness {
-                    status: SemanticIndexStatus::Building {
-                        stage: "loading_artifacts".to_string(),
-                        files: None,
-                        entries_done: None,
-                        entries_total: None,
-                    },
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                ReadOnlyArtifact::Degraded(_) => SemanticReadiness {
-                    status: SemanticIndexStatus::Failed(
-                        "borrowed_semantic_index_load_budget".to_string(),
-                    ),
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_) => SemanticReadiness {
-                    status: SemanticIndexStatus::Failed("fingerprint_mismatch".to_string()),
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                ReadOnlyArtifact::Absent => SemanticReadiness {
-                    status: SemanticIndexStatus::Disabled,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-            };
-
-        ReadinessObservation {
-            semantic,
-            trigram,
-            symbol: SymbolReadiness {
-                status: SymbolIndexStatus::Disabled,
-                snapshot: None,
-                evicted: false,
-                lock_contended: false,
-            },
-        }
-    }
-
-    fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
-        let artifacts = self.load();
-        if matches!(artifacts.search, ReadOnlyArtifact::Cancelled)
-            || matches!(artifacts.semantic, ReadOnlyArtifact::Cancelled)
-        {
-            extensions::ReadinessWait::Cancelled
-        } else {
-            extensions::ReadinessWait::Completed
-        }
-    }
 }
 
 impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
@@ -514,183 +267,95 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
             SymbolReadiness, TrigramReadiness,
         };
 
-        let semantic = match try_read_with_budget(
-            self.ctx.semantic_index_status(),
-            INTERACTIVE_ARTIFACT_READ_BUDGET,
-        ) {
-            Some(status) => {
-                let status = status.clone();
-                // A views-on root reports the index its checkout view serves
-                // for the installed snapshot. The fill worker builds it
-                // before the lane is served and after every fill, so a sample
-                // normally finds it built, possibly out of date (the search
-                // itself rebuilds an out-of-date one). Between a publication
-                // and the worker's rebuild there is none; `serving_index`
-                // then builds it, because without a snapshot the semantic
-                // lane would silently drop out of this search. If it cannot
-                // be built, the lane is failed for this search with that
-                // reason, never served from the legacy index, which a
-                // views-on root does not build. A started lane whose view is
-                // still loading, or failed to load, is sampled in that state
-                // even when the shared status was rewritten to ready.
-                // Views-off roots never have a checkout lane.
-                use crate::views::semantic_runtime::CheckoutSemanticState;
-                let lane = matches!(status, SemanticIndexStatus::Ready { .. })
-                    .then(|| self.ctx.checkout_semantic().state())
-                    .flatten();
-                if let Some(lane) = lane {
-                    let unserved = |status| SemanticReadiness {
-                        status,
-                        snapshot: None,
-                        evicted: false,
-                        lock_contended: false,
-                    };
-                    match lane {
-                        CheckoutSemanticState::Ready(runtime) => match runtime.serving_index() {
-                            Ok(index) => SemanticReadiness {
-                                status,
-                                snapshot: Some(SemanticSnapshot::from_borrowed(index)),
-                                evicted: false,
-                                lock_contended: false,
-                            },
-                            Err(reason) => {
-                                // A built semantic view whose index cannot be
-                                // served is a view failure: count it in health.
-                                // Contention clears by itself and is not counted.
-                                if !crate::views::semantic_runtime::is_transient_reason(&reason) {
-                                    self.ctx.note_view_load_failure("semantic", &reason);
+        // With the data layer on and semantic search on for the root, the
+        // lane is the data layer's meaning plane, sampled as it stands now
+        // and retained, so the ranking reads the generation admitted here.
+        let data_semantic = crate::data_layer::tools::search::DataSemantic::current(self.ctx);
+        let semantic = if let Some(data) = data_semantic {
+            SemanticReadiness {
+                status: data.status(),
+                snapshot: data
+                    .serving()
+                    .map(|meaning| SemanticSnapshot::from_data(Arc::clone(meaning))),
+                evicted: false,
+                lock_contended: false,
+            }
+        } else {
+            match try_read_with_budget(
+                self.ctx.semantic_index_status(),
+                INTERACTIVE_ARTIFACT_READ_BUDGET,
+            ) {
+                Some(status) => {
+                    let status = status.clone();
+                    if matches!(status, SemanticIndexStatus::Ready { .. }) {
+                        match try_read_with_budget(
+                            self.ctx.semantic_index(),
+                            INTERACTIVE_ARTIFACT_READ_BUDGET,
+                        ) {
+                            Some(index) => {
+                                let evicted = index.is_none();
+                                let snapshot =
+                                    (!evicted).then(|| SemanticSnapshot::from_guard(index));
+                                SemanticReadiness {
+                                    evicted,
+                                    status,
+                                    snapshot,
+                                    lock_contended: false,
                                 }
-                                unserved(SemanticIndexStatus::Failed(reason))
                             }
-                        },
-                        CheckoutSemanticState::Loading => unserved(SemanticIndexStatus::Building {
-                            stage: crate::views::semantic_runtime::CHECKOUT_VIEW_LOADING_STAGE
-                                .to_string(),
-                            files: None,
-                            entries_done: None,
-                            entries_total: None,
-                        }),
-                        CheckoutSemanticState::Unavailable(reason) => {
-                            unserved(SemanticIndexStatus::Failed(reason))
-                        }
-                    }
-                } else if matches!(status, SemanticIndexStatus::Ready { .. }) {
-                    match try_read_with_budget(
-                        self.ctx.semantic_index(),
-                        INTERACTIVE_ARTIFACT_READ_BUDGET,
-                    ) {
-                        Some(index) => {
-                            let evicted = index.is_none();
-                            let snapshot = (!evicted).then(|| SemanticSnapshot::from_guard(index));
-                            SemanticReadiness {
-                                evicted,
+                            None => SemanticReadiness {
                                 status,
-                                snapshot,
-                                lock_contended: false,
-                            }
+                                snapshot: None,
+                                evicted: false,
+                                lock_contended: true,
+                            },
                         }
-                        None => SemanticReadiness {
+                    } else {
+                        SemanticReadiness {
                             status,
                             snapshot: None,
                             evicted: false,
-                            lock_contended: true,
-                        },
-                    }
-                } else {
-                    SemanticReadiness {
-                        status,
-                        snapshot: None,
-                        evicted: false,
-                        lock_contended: false,
-                    }
-                }
-            }
-            None => SemanticReadiness {
-                status: SemanticIndexStatus::Building {
-                    stage: "status_lock".to_string(),
-                    files: None,
-                    entries_done: None,
-                    entries_total: None,
-                },
-                snapshot: None,
-                evicted: false,
-                lock_contended: true,
-            },
-        };
-
-        let trigram = if let Some(snapshot) = self.ctx.lexical_view_snapshot("aft_search") {
-            match snapshot {
-                Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
-                    TrigramReadiness {
-                        status: IndexStatus::Ready,
-                        snapshot: Some(Arc::new(snapshot)),
-                        evicted: false,
-                        lock_contended: false,
-                    }
-                }
-                Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
-                    TrigramReadiness {
-                        status: IndexStatus::Building,
-                        snapshot: None,
-                        evicted: false,
-                        lock_contended: false,
-                    }
-                }
-                Err(_) => TrigramReadiness {
-                    status: IndexStatus::Fallback,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-            }
-        } else {
-            match try_read_with_budget(self.ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
-                Some(index) if index.as_ref().is_some_and(SearchIndex::is_ready) => {
-                    TrigramReadiness {
-                        status: IndexStatus::Ready,
-                        snapshot: index.as_ref().map(SearchIndex::snapshot).map(Arc::new),
-                        evicted: false,
-                        lock_contended: false,
-                    }
-                }
-                Some(index) if index.is_some() => TrigramReadiness {
-                    status: IndexStatus::Building,
-                    snapshot: None,
-                    evicted: false,
-                    lock_contended: false,
-                },
-                Some(_) => {
-                    let receiver = try_read_with_budget(
-                        self.ctx.search_index_rx(),
-                        INTERACTIVE_ARTIFACT_READ_BUDGET,
-                    );
-                    match receiver {
-                        Some(receiver) if receiver.is_some() => TrigramReadiness {
-                            status: IndexStatus::Building,
-                            snapshot: None,
-                            evicted: false,
                             lock_contended: false,
-                        },
-                        Some(_) => TrigramReadiness {
-                            status: IndexStatus::Fallback,
-                            snapshot: None,
-                            evicted: false,
-                            lock_contended: false,
-                        },
-                        None => TrigramReadiness {
-                            status: IndexStatus::Building,
-                            snapshot: None,
-                            evicted: false,
-                            lock_contended: true,
-                        },
+                        }
                     }
                 }
-                None => TrigramReadiness {
-                    status: IndexStatus::Building,
+                None => SemanticReadiness {
+                    status: SemanticIndexStatus::Building {
+                        stage: "status_lock".to_string(),
+                        files: None,
+                        entries_done: None,
+                        entries_total: None,
+                    },
                     snapshot: None,
                     evicted: false,
                     lock_contended: true,
                 },
+            }
+        };
+
+        let trigram = if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some() {
+            TrigramReadiness {
+                status: IndexStatus::Ready,
+                snapshot: None,
+                data_view: true,
+                evicted: false,
+                lock_contended: false,
+            }
+        } else {
+            // No text plane serves yet: building while the checkout's first
+            // publication is on the way, otherwise a bounded scan answers.
+            let building = crate::data_layer::surfaces::report(self.ctx)
+                .is_some_and(|report| report.text.status == crate::data_layer::surfaces::BUILDING);
+            TrigramReadiness {
+                status: if building {
+                    IndexStatus::Building
+                } else {
+                    IndexStatus::Fallback
+                },
+                snapshot: None,
+                evicted: false,
+                lock_contended: false,
+                data_view: false,
             }
         };
 
@@ -724,21 +389,17 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     }
 
     fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
-        if self.ctx.lexical_views_enabled() {
+        if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some() {
             return extensions::ReadinessWait::Completed;
         }
-        // A writer-held pointer cannot be advanced by the loader drain below;
-        // preserve the interactive contention bound instead of sleeping 2.5s.
-        if matches!(
-            self.ctx.search_index().try_read(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ) {
+        // A data-layer meaning plane that serves answers the search now;
+        // waiting longer would not change what it serves.
+        if crate::data_layer::tools::search::DataSemantic::current(self.ctx)
+            .is_some_and(|data| data.serving().is_some())
+        {
             return extensions::ReadinessWait::Completed;
         }
-        match search_index_ready_with_budget(self.ctx, first_search_index_load_wait_budget()) {
-            Err(SearchIndexWaitError::Cancelled) => extensions::ReadinessWait::Cancelled,
-            Ok(_) | Err(SearchIndexWaitError::Contended) => extensions::ReadinessWait::Completed,
-        }
+        extensions::ReadinessWait::Completed
     }
 }
 
@@ -811,6 +472,47 @@ pub(crate) fn search_cancellation_requested() -> bool {
     crate::executor::current_job_cancelled()
 }
 
+/// `req` answered from `external`, the data-layer checkout of the repository
+/// at `root` outside the configured root, with what today's external replies
+/// carry: `external_root`, and, for a daemonless query of a standing root,
+/// the stale CLI snapshot warning when the root still owes a strict
+/// verification (its durable flag that only a full `aft index` run clears)
+/// or files changed since the snapshot the checkout holds; the answer is then
+/// partial.
+fn external_data_layer_search(
+    req: &RawRequest,
+    ctx: &AppContext,
+    root: &Path,
+    external: &crate::data_layer::tools::search::ExternalSearch,
+) -> Response {
+    let (mut response, drift) = external.search(req, ctx);
+    if !response.success {
+        return response;
+    }
+    let mut metadata = if ctx.daemonless_query_mode() {
+        standing_snapshot_metadata(root, Some(&ctx.storage_dir()))
+    } else {
+        ExternalBorrowMetadata::default()
+    };
+    metadata.record_drift(drift, false);
+    let stale = metadata.stale_cli_snapshot();
+    if let Some(body) = response.data.as_object_mut() {
+        body.insert(
+            "external_root".into(),
+            serde_json::json!(root.display().to_string()),
+        );
+        if stale {
+            let warnings = body
+                .entry("warnings")
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(warnings) = warnings.as_array_mut() {
+                warnings.push(serde_json::json!(STALE_CLI_SNAPSHOT_WARNING));
+            }
+        }
+    }
+    stale_cli_snapshot_partial_response(response, stale)
+}
+
 fn cancelled_search_response(req: &RawRequest) -> Response {
     cancelled_search_response_from_id(&req.id)
 }
@@ -853,13 +555,45 @@ pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> 
     )
 }
 
+thread_local! {
+    static ABSOLUTE_RESULT_PATHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The borrowed engine keeps its own root for indexing and source reads, but
+/// its paths must remain absolute for a caller in another project. Rendering
+/// runs synchronously on this thread; parallel file reads finish before it.
+/// If rendering moves to another thread, pass this presentation state there
+/// explicitly or external hits will become ambiguous again.
+pub(crate) fn with_absolute_result_paths<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ABSOLUTE_RESULT_PATHS.with(|absolute| absolute.set(self.0));
+        }
+    }
+    let _restore = Restore(ABSOLUTE_RESULT_PATHS.with(|absolute| absolute.replace(true)));
+    run()
+}
+
+/// An empty prefix leaves an absolute result path intact when stripped.
+fn result_display_root(project_root: &Path) -> &Path {
+    if ABSOLUTE_RESULT_PATHS.with(std::cell::Cell::get) {
+        Path::new("")
+    } else {
+        project_root
+    }
+}
+
 fn handle_semantic_search_with_disk_fallback(
     req: &RawRequest,
     ctx: &AppContext,
     allow_disk_fallback: bool,
 ) -> Response {
     let config = ctx.config();
-    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
+    let _pin = false.then(|| ctx.pin_config_to(config));
+    // Every phase of this request reads its candidate files through one set,
+    // so each file is read from disk once (see `request_files`).
+    let _request_files = request_files::install();
     use extensions::{RawQuery, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
@@ -896,7 +630,7 @@ fn handle_semantic_search_with_disk_fallback(
         .map(str::trim)
         .filter(|path| !path.is_empty());
     let external_root = if let Some(requested_path) = requested_path {
-        let requested = project_root.join(crate::readonly_artifacts::expand_tilde(requested_path));
+        let requested = project_root.join(crate::git_root_resolution::expand_tilde(requested_path));
         let storage = crate::access_policy::policy_path(&ctx.storage_dir());
         let scan_root_is_protected = |root: &Path| {
             // Resolve both sides: storage may be configured through a parent
@@ -996,28 +730,17 @@ fn handle_semantic_search_with_disk_fallback(
         external_root.as_deref().unwrap_or(&project_root),
         requested_path.map(Path::new).unwrap_or(&project_root),
     );
+    // With the data layer, a repository whose checkout `aft index` or another
+    // AFT published is answered from that checkout, as its own root would be.
+    if let Some(root) = external_root.as_deref() {
+        if let Some(external) = crate::data_layer::tools::search::ExternalSearch::of(ctx, root) {
+            return external_data_layer_search(req, ctx, root, &external);
+        }
+    }
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
-    let import_building = if external_root.is_none() {
-        match ctx.lexical_view_snapshot("aft_search") {
-            Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
-                // Importing existing indexes is expected progress. Let the
-                // bounded file scan answer and disclose the unavailable indexes
-                // even when neither index has published a snapshot yet.
-                true
-            }
-            Some(Err(error)) => {
-                return crate::context::view_load_error_response(
-                    &req.id,
-                    crate::context::view_load_failure_message(error),
-                );
-            }
-            _ => false,
-        }
-    } else {
-        false
-    };
+    let import_building = false;
     let allow_disk_fallback = allow_disk_fallback || import_building;
     if let Some((pattern_text, compiled)) = pattern {
         return handle_pattern_request(
@@ -1070,14 +793,7 @@ fn handle_semantic_search_with_disk_fallback(
         text: raw_query.original_query(),
     });
     let runtime_source = RuntimeReadinessSource { ctx };
-    let storage_dir = ctx.config().cache_storage_dir();
-    let external_source = external_root
-        .as_deref()
-        .map(|root| ExternalReadinessSource::new(ctx, root, storage_dir.as_deref()));
-    let readiness_source: &dyn extensions::ReadinessSource = external_source
-        .as_ref()
-        .map(|source| source as &dyn extensions::ReadinessSource)
-        .unwrap_or(&runtime_source);
+    let readiness_source: &dyn extensions::ReadinessSource = &runtime_source;
     let root = Root::new(
         external_root.as_deref().unwrap_or(&project_root),
         readiness_source,
@@ -1122,7 +838,7 @@ fn handle_semantic_search_with_disk_fallback(
         page_request,
         extensions,
         &plan,
-        external_source.as_ref(),
+        external_root.as_deref(),
         allow_disk_fallback,
     );
     if response.success {
@@ -1427,7 +1143,9 @@ fn collect_pattern_list(
         path_exclusion: grep_path_exclusion(include_tests),
     };
     Ok(split_query::PatternList::from_bounded_scan(
-        grep_executor::execute(ctx, compiled, &scope, &params),
+        waits::timed(waits::SearchWait::Grep, || {
+            grep_executor::execute(ctx, compiled, &scope, &params)
+        }),
         project_root,
         pattern,
     ))
@@ -1456,6 +1174,9 @@ struct SplitSemantic {
     not_ready: Option<SemanticIndexStatus>,
     /// Gaps of a views-on checkout answer, disclosed like a query-only reply.
     checkout_gaps: Option<CheckoutSemanticGaps>,
+    /// The data layer's meaning plane the candidates came from, which then
+    /// scores the pattern's definitions too.
+    data_meaning: Option<Arc<crate::data_layer::tools::search::DataMeaning>>,
 }
 
 impl SplitSemantic {
@@ -1469,6 +1190,24 @@ impl SplitSemantic {
             query_vector: None,
             not_ready: None,
             checkout_gaps: None,
+            data_meaning: None,
+        }
+    }
+
+    /// A lane whose index is not ready, `status`, described as the query-only
+    /// paths describe it.
+    fn not_ready(ctx: &AppContext, status: SemanticIndexStatus) -> Self {
+        let state = semantic_lane_state(ctx, semantic_status_label(&status), &status, 0);
+        Self {
+            results: Vec::new(),
+            more_available: false,
+            status: state.semantic_status,
+            gap: state.opening_line(),
+            served: false,
+            query_vector: None,
+            not_ready: Some(status),
+            checkout_gaps: None,
+            data_meaning: None,
         }
     }
 
@@ -1486,7 +1225,11 @@ fn split_semantic_results(
     prose: &str,
     include_tests: bool,
     project_root: &Path,
+    plan: &extensions::LanePlan<'_>,
 ) -> SplitSemantic {
+    if let Some(meaning) = data_meaning_for(ctx, plan) {
+        return split_semantic_from_data(ctx, prose, include_tests, project_root, plan, meaning);
+    }
     // Every disclosure below comes from the functions the query-only paths
     // use, so a split reply words a semantic lane state exactly as a
     // query-only reply against the same index does.
@@ -1501,27 +1244,16 @@ fn split_semantic_results(
         // A query-only request against an index that is not ready is served
         // by `handle_engine_only_search`, which describes the lane with
         // `semantic_lane_state`; a split request describes it the same way.
-        let state = semantic_lane_state(ctx, semantic_status_label(&status), &status, 0);
-        return SplitSemantic {
-            results: Vec::new(),
-            more_available: false,
-            status: state.semantic_status,
-            gap: state.opening_line(),
-            served: false,
-            query_vector: None,
-            not_ready: Some(status),
-            checkout_gaps: None,
-        };
+        return SplitSemantic::not_ready(ctx, status);
     }
     let mass_refresh_pending = status.mass_refresh_pending();
     // With views enabled, the root's own checkout view serves the semantic
     // lane; it is `None` for every views-off root.
-    let checkout_semantic = ctx.checkout_semantic_runtime();
     let loaded = match semantic_index_loaded_with_budget(ctx) {
         Ok(loaded) => loaded,
         Err(()) => return SplitSemantic::from_gap(semantic_artifacts_busy_gap()),
     };
-    if !loaded && checkout_semantic.is_none() {
+    if !loaded {
         return SplitSemantic::from_gap(semantic_not_loaded_gap(ctx));
     }
     let query_vector = match embed_query(prose, ctx) {
@@ -1530,34 +1262,16 @@ fn split_semantic_results(
     };
     let fetch_limit = SEMANTIC_ENUMERATION_LIMIT.saturating_add(1);
     let ann_cost = telemetry::CostPhase::start("ann");
-    let mut checkout_gaps = None;
-    let mut results = if let Some(runtime) = checkout_semantic.as_ref() {
-        match runtime.search(&query_vector, fetch_limit, &|file| {
-            path_allowed_by_include_tests(file, project_root, include_tests)
-        }) {
-            Ok(answer) => {
-                if !answer.complete() {
-                    checkout_gaps = Some(CheckoutSemanticGaps::from(&answer));
-                }
-                answer.results
-            }
-            Err(error) => {
-                // The reply names the gap; health counts the failed view
-                // unless it is contention that clears by itself.
-                if !crate::views::semantic_runtime::is_transient_reason(&error) {
-                    ctx.note_view_load_failure("semantic", &error);
-                }
-                checkout_gaps = Some(CheckoutSemanticGaps::unavailable(error));
-                Vec::new()
-            }
-        }
-    } else {
+    let checkout_gaps: Option<CheckoutSemanticGaps> = None;
+    let mut results = {
         match try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
             Some(index) => index
                 .as_ref()
                 .map(|index| {
-                    index.search_filtered(&query_vector, fetch_limit, |file| {
-                        path_allowed_by_include_tests(file, project_root, include_tests)
+                    waits::timed(waits::SearchWait::VectorSearch, || {
+                        index.search_filtered(&query_vector, fetch_limit, |file| {
+                            path_allowed_by_include_tests(file, project_root, include_tests)
+                        })
                     })
                 })
                 .unwrap_or_default(),
@@ -1582,34 +1296,99 @@ fn split_semantic_results(
         },
         gap: mass_refresh_pending.map(semantic_mass_refresh_disclosure),
         served: true,
-        // A checkout view's vectors are not scored per file here, so a view
-        // leaves admission to lexical relevance.
-        query_vector: checkout_semantic.is_none().then_some(query_vector),
+        query_vector: Some(query_vector),
         not_ready: None,
         checkout_gaps,
+        data_meaning: None,
+    }
+}
+
+/// [`split_semantic_results`] when the data layer's meaning plane serves the
+/// lane: `meaning` is the plane readiness admitted, `None` when it cannot
+/// serve this request. Worded as the query-only paths word the same state.
+fn split_semantic_from_data(
+    ctx: &AppContext,
+    prose: &str,
+    include_tests: bool,
+    project_root: &Path,
+    plan: &extensions::LanePlan<'_>,
+    meaning: Option<Arc<crate::data_layer::tools::search::DataMeaning>>,
+) -> SplitSemantic {
+    let status = match plan.readiness.semantic_status() {
+        Some(status) => status.clone(),
+        None => crate::data_layer::tools::search::DataSemantic::current(ctx)
+            .map_or_else(SemanticIndexStatus::ready, |data| data.status()),
+    };
+    if !matches!(status, SemanticIndexStatus::Ready { .. }) {
+        return SplitSemantic::not_ready(ctx, status);
+    }
+    let Some(meaning) = meaning else {
+        return SplitSemantic::from_gap(semantic_not_loaded_gap(ctx));
+    };
+    let query_vector = match embed_query_for_data(prose, ctx, &meaning) {
+        Ok(vector) => vector,
+        Err(error) => return SplitSemantic::from_gap(semantic_embed_gap(&error)),
+    };
+    let fetch_limit = SEMANTIC_ENUMERATION_LIMIT.saturating_add(1);
+    let ann_cost = telemetry::CostPhase::start("ann");
+    let (mut results, checkout_gaps) =
+        data_meaning_search(&meaning, &query_vector, fetch_limit, &|file| {
+            path_allowed_by_include_tests(file, project_root, include_tests)
+        });
+    if ctx.shared_artifacts_read_only() {
+        results.retain(|result| result.file.is_file());
+    }
+    let more_available = results.len() > SEMANTIC_ENUMERATION_LIMIT;
+    drop(ann_cost);
+    results.truncate(SEMANTIC_ENUMERATION_LIMIT);
+    SplitSemantic {
+        results,
+        more_available,
+        status: checkout_gaps
+            .as_ref()
+            .map_or("ready", CheckoutSemanticGaps::status),
+        gap: None,
+        served: true,
+        query_vector: Some(query_vector),
+        not_ready: None,
+        checkout_gaps,
+        data_meaning: Some(meaning),
     }
 }
 
 /// Each given file's best chunk cosine with the query, from the resident
-/// semantic index. A file with no indexed chunk, or an index that stayed
+/// semantic index, or from the data layer's meaning plane `data` when it
+/// served the lane. A file with no indexed chunk, or an index that stayed
 /// busy, is absent.
 fn file_cosines(
     ctx: &AppContext,
     query_vector: &[f32],
     paths: &[PathBuf],
+    data: Option<&crate::data_layer::tools::search::DataMeaning>,
 ) -> HashMap<PathBuf, f32> {
-    let Some(index) = try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-    else {
-        return HashMap::new();
-    };
-    let Some(index) = index.as_ref() else {
-        return HashMap::new();
+    use crate::data_layer::tools::search::MeaningIndex;
+    let guard;
+    let index = match data {
+        Some(meaning) => MeaningIndex::Data(meaning),
+        None => {
+            let Some(read) =
+                try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+            else {
+                return HashMap::new();
+            };
+            guard = read;
+            let Some(index) = guard.as_ref() else {
+                return HashMap::new();
+            };
+            MeaningIndex::Snapshot(index)
+        }
     };
     paths
         .iter()
         .filter_map(|path| {
             index
-                .search_filtered(query_vector, 1, |file| file == path.as_path())
+                .search_filtered(query_vector, 1, &|file| file == path.as_path())
+                .ok()?
                 .first()
                 .map(|result| (path.clone(), result.score))
         })
@@ -1649,12 +1428,7 @@ fn handle_split_search<'a>(
     let lexical_ready = if external.is_some() {
         true
     } else {
-        SearchLaneStatus::recover_evicted_trigram(ctx);
-        match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET) {
-            Ok(ready) => ready,
-            Err(SearchIndexWaitError::Cancelled) => return (plan, cancelled_search_response(req)),
-            Err(SearchIndexWaitError::Contended) => false,
-        }
+        search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
     };
     let patterns = match external {
         Some(corpus) => match corpus.collect(compiled, include_tests) {
@@ -1675,10 +1449,13 @@ fn handle_split_search<'a>(
     }
     let semantic = match external {
         Some(corpus) => corpus.semantic_results(ctx, prose, include_tests, &plan),
-        None => split_semantic_results(ctx, prose, include_tests, project_root),
+        None => split_semantic_results(ctx, prose, include_tests, project_root, &plan),
     };
     if search_cancellation_requested() {
         return (plan, cancelled_search_response(req));
+    }
+    if let Some(meaning) = &semantic.data_meaning {
+        meaning.note_read(&req.id);
     }
     let serves = |lane: &SearchLaneKind| match lane {
         SearchLaneKind::Lexical => lexical_ready,
@@ -1698,7 +1475,12 @@ fn handle_split_search<'a>(
         .as_deref()
         .map(|vector| match external {
             Some(corpus) => corpus.cosines(ctx, vector, &definition_paths),
-            None => file_cosines(ctx, vector, &definition_paths),
+            None => file_cosines(
+                ctx,
+                vector,
+                &definition_paths,
+                semantic.data_meaning.as_deref(),
+            ),
         })
         .unwrap_or_default();
     let top_cosine = semantic.results.first().map(|result| result.score);
@@ -1992,7 +1774,7 @@ impl SearchLaneStatus {
                 if (Self::not_observed(&observation)
                     || observation.unavailable_reason.as_deref()
                         == Some(feature_cause::SEMANTIC_BUILD_FAILED))
-                    && super::configure::trigger_semantic_index_reload_if_evicted(ctx) =>
+                    && false =>
             {
                 semantic_reload_started = true;
                 IndexObservation::building()
@@ -2008,23 +1790,6 @@ impl SearchLaneStatus {
 
     fn not_observed(observation: &IndexObservation) -> bool {
         observation.unavailable_reason.as_deref() == Some(feature_cause::RUNTIME_NOT_OBSERVED)
-    }
-
-    /// Start reloading an idle-evicted trigram index before the request waits
-    /// for trigram readiness, so a reload that finishes inside the wait
-    /// budget serves this query (grep and glob recover the same way).
-    fn recover_evicted_trigram(ctx: &AppContext) {
-        let resident_or_loading = ctx
-            .search_index()
-            .try_read()
-            .map_or(true, |index| index.is_some())
-            || ctx
-                .search_index_rx()
-                .try_read()
-                .map_or(true, |receiver| receiver.is_some());
-        if ctx.config().indexes.trigram && !resident_or_loading {
-            super::configure::trigger_search_index_reload_if_evicted(ctx);
-        }
     }
 
     fn observe_current(ctx: &AppContext) -> Self {
@@ -2072,7 +1837,17 @@ impl SearchLaneStatus {
                     _ => lane.effective.as_str().to_string(),
                 };
                 let state = if name == "semantic" {
-                    match ctx.semantic_index_status().try_read().ok().as_deref() {
+                    // With the data layer's meaning plane serving the lane,
+                    // its own status words the label.
+                    let status = match crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+                        Some(data) => Some(data.status()),
+                        None => ctx
+                            .semantic_index_status()
+                            .try_read()
+                            .ok()
+                            .map(|status| status.clone()),
+                    };
+                    match status.as_ref() {
                         Some(SemanticIndexStatus::Ready { refreshing, .. })
                             if !refreshing.is_empty() && lane.is_ready() =>
                         {
@@ -2161,9 +1936,21 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
-        if let Ok(index) = ctx.semantic_index().try_read() {
-            if let Some(index) = index.as_ref() {
-                disclose_skipped_semantic_rows(data, index);
+        match crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+            Some(semantic) => {
+                if let Some((summary, rows, reason)) = semantic
+                    .serving()
+                    .and_then(|meaning| meaning.skipped_chunks())
+                {
+                    disclose_skipped_chunks(data, &summary, rows, reason);
+                }
+            }
+            None => {
+                if let Ok(index) = ctx.semantic_index().try_read() {
+                    if let Some(index) = index.as_ref() {
+                        disclose_skipped_semantic_rows(data, index);
+                    }
+                }
             }
         }
         // The lanes are observed after the answer was built, so on their own
@@ -2251,7 +2038,23 @@ fn disclose_skipped_semantic_rows(
     let Some(summary) = index.skipped_chunks_summary() else {
         return;
     };
-    append_reply_paragraph(data, &summary);
+    disclose_skipped_chunks(
+        data,
+        &summary,
+        index.skipped_rows(),
+        index.skipped_chunk_reason(),
+    );
+}
+
+/// Marks a reply partial for `rows` chunks the embedder skipped, with
+/// `summary` naming them and `reason` saying why.
+fn disclose_skipped_chunks(
+    data: &mut serde_json::Map<String, serde_json::Value>,
+    summary: &str,
+    rows: usize,
+    reason: crate::semantic_index::SemanticSkipReason,
+) {
+    append_reply_paragraph(data, summary);
     data.insert("complete".to_string(), serde_json::json!(false));
     data.insert("status".to_string(), serde_json::json!("partial"));
     data.insert("semantic_status".to_string(), serde_json::json!("partial"));
@@ -2259,14 +2062,8 @@ fn disclose_skipped_semantic_rows(
         .entry("semantic_gap")
         .or_insert_with(|| serde_json::json!({}));
     if let Some(gap) = gap.as_object_mut() {
-        gap.insert(
-            "skipped_chunks".to_string(),
-            serde_json::json!(index.skipped_rows()),
-        );
-        gap.insert(
-            "reason".to_string(),
-            serde_json::json!(index.skipped_chunk_reason()),
-        );
+        gap.insert("skipped_chunks".to_string(), serde_json::json!(rows));
+        gap.insert("reason".to_string(), serde_json::json!(reason));
         gap.insert("summary".to_string(), serde_json::json!(summary));
     }
 }
@@ -2275,7 +2072,7 @@ fn disclose_skipped_semantic_rows(
 /// callgraph cannot serve it, the enrichment is explicitly omitted with the
 /// callgraph index status and the analysis code, never silently absent.
 fn callgraph_enrichment_json(ctx: &AppContext) -> serde_json::Value {
-    if warm_callgraph_store(ctx).is_some() {
+    if warm_callgraph(ctx).is_some() {
         return serde_json::json!({
             "status": "applied",
             "code": serde_json::Value::Null,
@@ -2359,7 +2156,7 @@ fn handle_semantic_search_inner(
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
-    external_source: Option<&ExternalReadinessSource<'_>>,
+    external_root: Option<&Path>,
     allow_disk_fallback: bool,
 ) -> Response {
     if search_cancellation_requested() {
@@ -2394,17 +2191,10 @@ fn handle_semantic_search_inner(
     params.offset = page_request.offset();
     let project_root = grep_executor::project_root(ctx);
     let shape = query_shape::classify(&params.query);
-    if let Some(external_source) = external_source {
-        return handle_external_search(
-            req,
-            ctx,
-            params,
-            shape,
-            page_request,
-            extensions,
-            engine_plan,
-            external_source,
-        );
+    // A repository outside the project with no checkout in the index store
+    // is answered by a bounded scan of its files, with a disclosure.
+    if let Some(external_root) = external_root {
+        return handle_external_unindexed_fallback(req, ctx, &params, top_k, &shape, external_root);
     }
     // An unsettled artifact identity keeps indexes off until the next bind;
     // answer through the bounded grep fallback and disclose the bind failure.
@@ -2424,21 +2214,33 @@ fn handle_semantic_search_inner(
             top_k,
         );
     }
-    let semantic_status_snapshot = match try_read_with_budget(
-        ctx.semantic_index_status(),
-        INTERACTIVE_ARTIFACT_READ_BUDGET,
-    ) {
-        Some(status) => status.clone(),
-        None => {
-            return artifact_contention_fallback_response(
-                req,
-                ctx,
-                &params,
-                &shape,
-                &project_root,
-                top_k,
-                SEMANTIC_STATUS_BUSY,
-            );
+    // With the data layer's meaning plane serving the lane, the reply
+    // reports the status the readiness sample saw for it, the one the plan
+    // was made from, and never today's index status.
+    let data_semantic = crate::data_layer::tools::search::DataSemantic::current(ctx);
+    let semantic_status_snapshot = if let Some(data) = &data_semantic {
+        engine_plan
+            .readiness
+            .semantic_status()
+            .cloned()
+            .unwrap_or_else(|| data.status())
+    } else {
+        match try_read_with_budget(
+            ctx.semantic_index_status(),
+            INTERACTIVE_ARTIFACT_READ_BUDGET,
+        ) {
+            Some(status) => status.clone(),
+            None => {
+                return artifact_contention_fallback_response(
+                    req,
+                    ctx,
+                    &params,
+                    &shape,
+                    &project_root,
+                    top_k,
+                    SEMANTIC_STATUS_BUSY,
+                );
+            }
         }
     };
     // The readiness sample can see the semantic lane in a state the shared
@@ -2448,11 +2250,12 @@ fn handle_semantic_search_inner(
     // the reply reports the sampled state, not the shared `ready`. When the
     // lane itself is loaded, its footer also says it was unavailable for this
     // query.
-    let sampled = matches!(semantic_status_snapshot, SemanticIndexStatus::Ready { .. })
-        .then(|| engine_plan.readiness.semantic_status())
-        .flatten()
-        .filter(|status| !matches!(status, SemanticIndexStatus::Ready { .. }))
-        .cloned();
+    let sampled = (data_semantic.is_none()
+        && matches!(semantic_status_snapshot, SemanticIndexStatus::Ready { .. }))
+    .then(|| engine_plan.readiness.semantic_status())
+    .flatten()
+    .filter(|status| !matches!(status, SemanticIndexStatus::Ready { .. }))
+    .cloned();
     let checkout_failure = match &sampled {
         Some(SemanticIndexStatus::Failed(reason)) => Some(reason.clone()),
         _ => None,
@@ -2460,23 +2263,7 @@ fn handle_semantic_search_inner(
     let semantic_status_snapshot = sampled.unwrap_or(semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    SearchLaneStatus::recover_evicted_trigram(ctx);
-    let lexical_ready = match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
-    {
-        Ok(ready) => ready,
-        Err(SearchIndexWaitError::Cancelled) => return cancelled_search_response(req),
-        Err(SearchIndexWaitError::Contended) => {
-            return artifact_contention_fallback_response(
-                req,
-                ctx,
-                &params,
-                &shape,
-                &project_root,
-                top_k,
-                "search index remained busy",
-            );
-        }
-    };
+    let lexical_ready = search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET);
     // Ordinary roots retain the index-lane refusal policy. Parent children
     // may still be warming their first indexes, so their reader engines use
     // the existing bounded exact/lexical fallback instead.
@@ -2565,266 +2352,6 @@ fn handle_semantic_search_inner(
     }
 }
 
-fn handle_external_search(
-    req: &RawRequest,
-    ctx: &AppContext,
-    params: SemanticSearchParams,
-    shape: QueryShape,
-    page_request: paging::ValidatedPageRequest,
-    extensions: &dyn extensions::SearchExtensions,
-    engine_plan: &extensions::LanePlan<'_>,
-    readiness_source: &ExternalReadinessSource<'_>,
-) -> Response {
-    let top_k = page_request.top_k();
-    let external_root = readiness_source.root.to_path_buf();
-    let artifacts = readiness_source
-        .loaded()
-        .expect("external readiness always loads artifacts before execution");
-    let mut borrow_metadata = if ctx.daemonless_query_mode() {
-        standing_snapshot_metadata(&external_root, Some(&ctx.storage_dir()))
-    } else {
-        ExternalBorrowMetadata::default()
-    };
-    let mut warnings = Vec::new();
-    let search_index = match &artifacts.search {
-        ReadOnlyArtifact::Fresh(index) => Arc::clone(index),
-        ReadOnlyArtifact::Degraded(degradation) => {
-            if engine_plan.contains(SearchLaneKind::Semantic) {
-                borrow_metadata.degraded_reason = Some(degradation.reason);
-                warnings.push(
-                    "Borrowed trigram index loading stopped at the interactive budget; continuing with the semantic lane.".to_string(),
-                );
-                Arc::new(SearchIndex::new())
-            } else {
-                return handle_external_borrowed_degraded_fallback(
-                    req,
-                    ctx,
-                    &params,
-                    top_k,
-                    &shape,
-                    &external_root,
-                    *degradation,
-                );
-            }
-        }
-        ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
-        ReadOnlyArtifact::Absent => {
-            if engine_plan.contains(SearchLaneKind::Semantic) {
-                warnings.push(
-                    "External trigram index is not available; continuing with the semantic lane."
-                        .to_string(),
-                );
-                Arc::new(SearchIndex::new())
-            } else {
-                return handle_external_unindexed_fallback(
-                    req,
-                    ctx,
-                    &params,
-                    top_k,
-                    &shape,
-                    &external_root,
-                );
-            }
-        }
-        ReadOnlyArtifact::Stale(stale) => {
-            borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
-            crate::slog_warn!(
-                "{}",
-                borrowed_drift_log_message("search", &external_root, stale.drift_count)
-            );
-            Arc::clone(&stale.index)
-        }
-    };
-    if let ReadOnlyArtifact::Stale(stale) = &artifacts.semantic {
-        borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
-        crate::slog_warn!(
-            "{}",
-            borrowed_drift_log_message("semantic", &external_root, stale.drift_count)
-        );
-    }
-    if borrow_metadata.standing_snapshot {
-        borrow_metadata.record_drift(search_index.borrowed_stat_mismatch_count(), false);
-    }
-
-    if borrow_metadata.stale_cli_snapshot() {
-        warnings.push(STALE_CLI_SNAPSHOT_WARNING.to_string());
-    }
-    let mode = choose_mode(
-        &params.query,
-        &shape,
-        engine_plan.readiness.lexical_index,
-        &mut warnings,
-    );
-    let ranked_mode = matches!(mode, SearchMode::Semantic | SearchMode::Hybrid);
-    let usable_semantic_index = match &artifacts.semantic {
-        ReadOnlyArtifact::Fresh(index)
-        | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
-            if semantic_fingerprint_matches_session(ctx, index) =>
-        {
-            Some(Arc::clone(index))
-        }
-        _ => None,
-    };
-    // Only the ranked handler consults the semantic index, and only when the
-    // plan has a semantic lane.
-    let semantic_lane_answers = ranked_mode
-        && engine_plan.contains(SearchLaneKind::Semantic)
-        && usable_semantic_index.is_some();
-    // The grep and ranked (hybrid/semantic) handlers below can answer from
-    // this project's saved trigram or semantic index, which loading it never
-    // compared with the files now on disk.
-    let served_from_saved_index = matches!(
-        artifacts.search,
-        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
-    ) || usable_semantic_index.is_some();
-    let search_artifact_path = artifacts.search_artifact_path.clone();
-    let notice_root = external_root.clone();
-
-    // Bring the saved trigram index in line with the disk before it answers.
-    // An identifier in a ranked mode is answered by the exact sweep instead,
-    // which compares every file with the saved index itself.
-    let identifier_sweep =
-        ranked_mode && external_exact::IdentifierTerms::from_query(&params.query).is_some();
-    let mut search_generation = artifacts.search_generation.clone();
-    let mut disk_check = None;
-    let search_index = if matches!(
-        artifacts.search,
-        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
-    ) && !identifier_sweep
-    {
-        let (checked, age, generation) = external_pattern::checked_index(
-            ctx,
-            &external_root,
-            &search_index,
-            usable_semantic_index.as_ref(),
-            &artifacts.search_generation,
-        );
-        if search_cancellation_requested() {
-            return cancelled_search_response(req);
-        }
-        search_generation = generation;
-        disk_check = Some((checked.check, age));
-        checked.index
-    } else {
-        search_index
-    };
-
-    let mut response = match mode {
-        SearchMode::Regex | SearchMode::Literal => handle_external_grep_search(
-            req,
-            ctx,
-            &params.query,
-            page_request,
-            &shape,
-            mode,
-            warnings,
-            &external_root,
-            params.include_tests,
-            &search_index,
-            &borrow_metadata,
-            extensions,
-            engine_plan,
-            &search_generation,
-        ),
-        SearchMode::Semantic | SearchMode::Hybrid => handle_external_semantic_or_hybrid_search(
-            req,
-            ctx,
-            params,
-            shape,
-            mode,
-            warnings,
-            external_root,
-            &search_index,
-            &artifacts.semantic,
-            &search_generation,
-            borrow_metadata,
-            page_request,
-            extensions,
-            engine_plan,
-            disk_check
-                .as_ref()
-                .is_none_or(|(check, _)| check.verified()),
-        ),
-    };
-    if let Some((check, age)) = &disk_check {
-        disclose_checked_saved_index(
-            &mut response,
-            &notice_root,
-            search_artifact_path.as_deref(),
-            check,
-            *age,
-            semantic_lane_answers,
-        );
-    } else if served_from_saved_index {
-        disclose_unverified_saved_index(
-            &mut response,
-            &notice_root,
-            search_artifact_path.as_deref(),
-            None,
-        );
-    }
-    response
-}
-
-/// Report on an external reply whose saved trigram index was compared with
-/// the files on disk first (see `external_disk_check`).
-///
-/// A check that covered every file ends the reply with one line saying so and
-/// what had changed. A check cut short by its time limit keeps the
-/// unchecked-index notice, saying how far the check got, and marks the reply
-/// incomplete. Either way, when the semantic lane answered from a saved
-/// semantic index that predates some files, the reply says how many. `age` is
-/// how long ago the check was made when an earlier query's check was reused;
-/// both sentences then say so.
-fn disclose_checked_saved_index(
-    response: &mut Response,
-    external_root: &Path,
-    search_artifact_path: Option<&Path>,
-    check: &external_disk_check::DiskCheck,
-    age: Option<Duration>,
-    semantic_lane_answered: bool,
-) {
-    if !response.success {
-        return;
-    }
-    let Some(data) = response.data.as_object_mut() else {
-        return;
-    };
-    if data.contains_key("exact_sweep") {
-        return;
-    }
-    let mut summary = check.to_json();
-    summary["reused"] = serde_json::json!(age.is_some());
-    summary["checked_ms_ago"] =
-        serde_json::json!(age.map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)));
-    data.insert("saved_index_check".to_string(), summary);
-    if check.verified() {
-        append_reply_paragraph(
-            data,
-            &external_disk_check::verified_line(check, external_root, age),
-        );
-    } else {
-        data.insert("complete".to_string(), serde_json::json!(false));
-    }
-    let semantic_line = semantic_lane_answered
-        .then(|| external_disk_check::semantic_outdated_line(check, external_root))
-        .flatten();
-    if let Some(line) = &semantic_line {
-        append_reply_paragraph(data, line);
-    }
-    if !check.verified() {
-        disclose_unverified_saved_index(
-            response,
-            external_root,
-            search_artifact_path,
-            Some((
-                &external_disk_check::checked_ago(age),
-                &external_disk_check::unverified_detail(check),
-            )),
-        );
-    }
-}
-
 fn append_reply_paragraph(data: &mut serde_json::Map<String, serde_json::Value>, paragraph: &str) {
     let text = data
         .get("text")
@@ -2836,85 +2363,6 @@ fn append_reply_paragraph(data: &mut serde_json::Map<String, serde_json::Value>,
         format!("{text}\n\n{paragraph}")
     };
     data.insert("text".to_string(), serde_json::json!(text));
-}
-
-/// Tell the agent that an external reply came from another project's saved
-/// index without a full check against that project's files on disk.
-///
-/// Nothing in this session refreshes another project's index, and loading it
-/// does not compare it with the files on disk, so text added or changed since
-/// it was saved can be missing from the results. `checked`, when given, is how
-/// long ago a time-limited comparison ran (empty when it ran for this query)
-/// and how far it got; without it nothing was compared.
-/// Replies whose identifier sweep read every changed file from disk (they
-/// carry `exact_sweep`) are already checked and get no notice.
-fn disclose_unverified_saved_index(
-    response: &mut Response,
-    external_root: &Path,
-    search_artifact_path: Option<&Path>,
-    checked: Option<(&str, &str)>,
-) {
-    if !response.success {
-        return;
-    }
-    let Some(data) = response.data.as_object_mut() else {
-        return;
-    };
-    if data.contains_key("exact_sweep") {
-        return;
-    }
-    let saved_at = search_artifact_path
-        .and_then(|path| fs::metadata(path).ok())
-        .and_then(|metadata| metadata.modified().ok());
-    let when = saved_at
-        .map(|saved_at| {
-            let millis = saved_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| since.as_millis() as i64);
-            let age = std::time::SystemTime::now()
-                .duration_since(saved_at)
-                .unwrap_or_default();
-            format!(
-                " (saved {}, {} ago)",
-                crate::subc_format::format_unix_millis_utc(millis - millis.rem_euclid(1000)),
-                format_coarse_age(age)
-            )
-        })
-        .unwrap_or_default();
-    let notice = match checked {
-        None => format!(
-            "Answered from the saved AFT index of {}{when}, which was not checked against the files on disk: text added or changed since it was saved may be missing. Use grep with path for an exhaustive check.",
-            external_root.display()
-        ),
-        Some((ago, checked)) => format!(
-            "Answered from the saved AFT index of {}{when}, which was only partly checked against the files on disk{ago}: {checked}. Text added or changed since it was saved may be missing from the files not checked. Use grep with path for an exhaustive check.",
-            external_root.display()
-        ),
-    };
-    append_reply_paragraph(data, &notice);
-    data.insert(
-        "saved_index_unverified".to_string(),
-        serde_json::json!({
-            "saved_at_unix_ms": saved_at.and_then(|saved_at| saved_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|since| since.as_millis() as u64)),
-        }),
-    );
-}
-
-/// `45 s`, `12 min`, `6 h`, `3 days`: enough to judge how stale an index is.
-fn format_coarse_age(age: Duration) -> String {
-    let seconds = age.as_secs();
-    if seconds < 60 {
-        format!("{seconds} s")
-    } else if seconds < 3_600 {
-        format!("{} min", seconds / 60)
-    } else if seconds < 172_800 {
-        format!("{} h", seconds / 3_600)
-    } else {
-        format!("{} days", seconds / 86_400)
-    }
 }
 
 /// Bounded lexical scan of a foreign git root that has no borrowable AFT
@@ -2931,27 +2379,7 @@ fn handle_external_unindexed_fallback(
     shape: &QueryShape,
     external_root: &Path,
 ) -> Response {
-    handle_external_bounded_lexical_fallback(req, ctx, params, top_k, shape, external_root, None)
-}
-
-fn handle_external_borrowed_degraded_fallback(
-    req: &RawRequest,
-    ctx: &AppContext,
-    params: &SemanticSearchParams,
-    top_k: usize,
-    shape: &QueryShape,
-    external_root: &Path,
-    degradation: ReadOnlyDegradation,
-) -> Response {
-    handle_external_bounded_lexical_fallback(
-        req,
-        ctx,
-        params,
-        top_k,
-        shape,
-        external_root,
-        Some(degradation),
-    )
+    handle_external_bounded_lexical_fallback(req, ctx, params, top_k, shape, external_root)
 }
 
 fn handle_external_bounded_lexical_fallback(
@@ -2961,7 +2389,6 @@ fn handle_external_bounded_lexical_fallback(
     top_k: usize,
     shape: &QueryShape,
     external_root: &Path,
-    degradation: Option<ReadOnlyDegradation>,
 ) -> Response {
     let borrow_metadata = ExternalBorrowMetadata::default();
     let display_root = absolute_display_root(external_root);
@@ -2992,7 +2419,6 @@ fn handle_external_bounded_lexical_fallback(
             params,
             shape,
             external_root,
-            degradation,
             ExternalFallbackBody {
                 results: reply.results,
                 text: reply.text,
@@ -3054,13 +2480,14 @@ fn handle_external_bounded_lexical_fallback(
         max_results: top_k,
         path_exclusion: grep_path_exclusion(params.include_tests),
     };
-    let result = grep_executor::execute(ctx, &compiled, &scope, &grep_params);
+    let result = waits::timed(waits::SearchWait::Grep, || {
+        grep_executor::execute(ctx, &compiled, &scope, &grep_params)
+    });
     if search_cancellation_requested() {
         return cancelled_search_response(req);
     }
 
     let result_source = if literal { "literal" } else { "regex" };
-    let interpreted_as = if literal { "literal" } else { "regex" };
     let result_values = result
         .matches
         .iter()
@@ -3068,36 +2495,9 @@ fn handle_external_bounded_lexical_fallback(
         .collect::<Vec<_>>();
     let more_available =
         result.walk_truncated || result.truncated || result.total_matches > result.matches.len();
-    if degradation.is_none() {
-        // No index exists, so nothing could rank this query; say so plainly,
-        // with how much of the project the scan for its literal text covered.
-        let text = unindexed_scan_text(&result, &display_root, external_root, &params.query);
-        let envelope = fallback_search_envelope(
-            result_values.len(),
-            more_available,
-            result.engine_capped,
-            result.walk_truncated || result.skipped_foreign_mounts > 0,
-        );
-        return external_fallback_response(
-            req,
-            params,
-            shape,
-            external_root,
-            None,
-            ExternalFallbackBody {
-                results: result_values,
-                text,
-                walk_truncated: result.walk_truncated,
-                more_available,
-                engine_capped: result.engine_capped,
-                // The reply text states the scan's coverage in plain words.
-                fully_degraded: false,
-                envelope,
-                exact_sweep: None,
-            },
-        );
-    }
-    let text = format_grep_search_text(&result, &display_root, interpreted_as);
+    // No index exists, so nothing could rank this query; say so plainly,
+    // with how much of the project the scan for its literal text covered.
+    let text = unindexed_scan_text(&result, &display_root, external_root, &params.query);
     let envelope = fallback_search_envelope(
         result_values.len(),
         more_available,
@@ -3109,14 +2509,14 @@ fn handle_external_bounded_lexical_fallback(
         params,
         shape,
         external_root,
-        degradation,
         ExternalFallbackBody {
             results: result_values,
             text,
             walk_truncated: result.walk_truncated,
             more_available,
             engine_capped: result.engine_capped,
-            fully_degraded: true,
+            // The reply text states the scan's coverage in plain words.
+            fully_degraded: false,
             envelope,
             exact_sweep: None,
         },
@@ -3142,25 +2542,15 @@ fn external_fallback_response(
     params: &SemanticSearchParams,
     shape: &QueryShape,
     external_root: &Path,
-    degradation: Option<ReadOnlyDegradation>,
     body: ExternalFallbackBody,
 ) -> Response {
     let borrow_metadata = ExternalBorrowMetadata::default();
-    let mut text = body.text;
-    if degradation.is_some() {
-        text.push_str("\n\n");
-        text.push_str(BORROWED_SEARCH_LOAD_FOOTER);
-    }
+    let text = body.text;
 
-    let mut warnings = Vec::new();
-    if degradation.is_some() {
-        warnings.push(BORROWED_SEARCH_LOAD_WARNING.to_string());
-    } else {
-        warnings.push(format!(
-            "No AFT index exists for {} — returning a bounded lexical scan (no semantic ranking). Open a session in that project for full indexed search.",
-            external_root.display()
-        ));
-    }
+    let mut warnings = vec![format!(
+        "No AFT index exists for {} — returning a bounded lexical scan (no semantic ranking). Open a session in that project for full indexed search.",
+        external_root.display()
+    )];
     if body.walk_truncated {
         warnings.push(
             "Lexical scan stopped early (file-count or time budget reached); results may be incomplete.".to_string(),
@@ -3174,12 +2564,6 @@ fn external_fallback_response(
     if let Some(envelope) = &body.envelope {
         crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, envelope);
     }
-    if let Some(degradation) = degradation {
-        extras.insert(
-            "borrowed_index_degraded_reason".to_string(),
-            serde_json::json!(degradation.reason),
-        );
-    }
     if let Some(summary) = body.exact_sweep {
         extras.insert("exact_sweep".to_string(), summary);
     }
@@ -3189,13 +2573,9 @@ fn external_fallback_response(
             query: &params.query,
             interpreted_as: "literal",
             query_kind: query_kind_label(shape.kind),
-            semantic_status: if degradation.is_some() {
-                "external_borrowed_degraded"
-            } else {
-                "external_unindexed"
-            },
+            semantic_status: "external_unindexed",
             status: "ready",
-            complete: degradation.is_none() && !body.walk_truncated,
+            complete: !body.walk_truncated,
             text,
             results: body.results,
             more_available: body.more_available,
@@ -3205,474 +2585,6 @@ fn external_fallback_response(
             extras,
         },
     )
-}
-
-fn handle_external_grep_search(
-    req: &RawRequest,
-    ctx: &AppContext,
-    query: &str,
-    page_request: paging::ValidatedPageRequest,
-    shape: &QueryShape,
-    mode: SearchMode,
-    mut warnings: Vec<String>,
-    external_root: &Path,
-    include_tests: bool,
-    search_index: &SearchIndex,
-    borrow_metadata: &ExternalBorrowMetadata,
-    extensions: &dyn extensions::SearchExtensions,
-    engine_plan: &extensions::LanePlan<'_>,
-    search_generation: &GenerationToken,
-) -> Response {
-    let top_k = page_request.top_k();
-    let auto_regex = mode == SearchMode::Regex;
-    let mut effective_mode = mode;
-    let compile_literal_fallback = || -> Result<_, Response> {
-        match pattern_compile::compile(
-            query,
-            CompileOpts {
-                literal: true,
-                ..CompileOpts::default()
-            },
-        ) {
-            CompileResult::Ok(compiled) => Ok(compiled),
-            CompileResult::InvalidPattern { message, .. } => Err(Response::error_with_data(
-                &req.id,
-                "invalid_pattern",
-                message,
-                external_response_extras(external_root, borrow_metadata),
-            )),
-            CompileResult::UnsupportedSyntax { feature, .. } => Err(Response::error_with_data(
-                &req.id,
-                "unsupported_pattern",
-                format!(
-                    "Pattern uses regex syntax not supported by AFT's engine: {feature}. Rewrite without {feature} or use grep for explicit regex control."
-                ),
-                external_response_extras(external_root, borrow_metadata),
-            )),
-        }
-    };
-
-    let compiled = match pattern_compile::compile(
-        query,
-        CompileOpts {
-            literal: mode == SearchMode::Literal,
-            ..CompileOpts::default()
-        },
-    ) {
-        CompileResult::Ok(compiled) => compiled,
-        CompileResult::InvalidPattern { message, .. } => {
-            if auto_regex {
-                warnings.push(auto_regex_literal_fallback_warning(
-                    short_regex_compile_reason(&message),
-                ));
-                effective_mode = SearchMode::Literal;
-                match compile_literal_fallback() {
-                    Ok(compiled) => compiled,
-                    Err(response) => return response,
-                }
-            } else {
-                return Response::error_with_data(
-                    &req.id,
-                    "invalid_pattern",
-                    message,
-                    external_response_extras(external_root, borrow_metadata),
-                );
-            }
-        }
-        CompileResult::UnsupportedSyntax { feature, .. } => {
-            if auto_regex {
-                warnings.push(auto_regex_literal_fallback_warning(format!(
-                    "{feature} is not supported"
-                )));
-                effective_mode = SearchMode::Literal;
-                match compile_literal_fallback() {
-                    Ok(compiled) => compiled,
-                    Err(response) => return response,
-                }
-            } else {
-                return Response::error_with_data(
-                    &req.id,
-                    "unsupported_pattern",
-                    format!(
-                        "Pattern uses regex syntax not supported by AFT's engine: {feature}. Rewrite without {feature} or use grep for explicit regex control."
-                    ),
-                    external_response_extras(external_root, borrow_metadata),
-                );
-            }
-        }
-    };
-
-    let literal = effective_mode == SearchMode::Literal;
-    let fetch_limit = page_request.offset().saturating_add(top_k);
-    let mut result = match search_index.snapshot().search_grep_bounded(
-        &compiled,
-        &[],
-        &[],
-        external_root,
-        fetch_limit,
-        grep_path_exclusion(include_tests),
-        grep_executor::MAX_FALLBACK_WALK_FILES,
-        grep_executor::FALLBACK_WALK_BUDGET,
-    ) {
-        Ok(result) => result,
-        Err(error) => return Response::error(&req.id, "internal_error", error.to_string()),
-    };
-    result
-        .matches
-        .retain(|grep_match| grep_match.file.is_file());
-
-    if result.matches.is_empty() {
-        let extras = external_response_extras(external_root, borrow_metadata)
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        return stale_cli_snapshot_partial_response(
-            zero_result_escalation_response(
-                req,
-                ctx,
-                query,
-                shape,
-                effective_mode,
-                "external",
-                warnings,
-                include_tests,
-                external_root,
-                &absolute_display_root(external_root),
-                extras,
-                page_request,
-                extensions,
-                engine_plan,
-                Some((search_index, search_generation)),
-            ),
-            borrow_metadata.stale_cli_snapshot(),
-        );
-    }
-
-    let interval_end = page_request.offset().saturating_add(top_k);
-    let interval_has_more = result.total_matches > interval_end || result.truncated;
-    result.matches = result
-        .matches
-        .into_iter()
-        .skip(page_request.offset())
-        .take(top_k)
-        .collect();
-    let result_source = if literal { "literal" } else { "regex" };
-    let result_values = result
-        .matches
-        .iter()
-        .map(|grep_match| grep_match_to_json(grep_match, result_source))
-        .collect::<Vec<_>>();
-    let interpreted_as = interpreted_as_label(effective_mode);
-    let display_root = absolute_display_root(external_root);
-    let text = format_grep_search_text(&result, &display_root, interpreted_as);
-    let mut extras = external_response_extras(external_root, borrow_metadata)
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    if let Some(envelope) =
-        search_cut_envelope(result_values.len(), interval_has_more, result.engine_capped)
-    {
-        crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
-    }
-    search_response(
-        req,
-        SearchResponseParts {
-            query,
-            interpreted_as,
-            query_kind: query_kind_label(shape.kind),
-            semantic_status: "external",
-            status: "ready",
-            complete: !borrow_metadata.stale_cli_snapshot(),
-            text,
-            results: result_values,
-            more_available: interval_has_more,
-            engine_capped: result.engine_capped,
-            fully_degraded: false,
-            warnings,
-            extras,
-        },
-    )
-}
-
-fn handle_external_semantic_or_hybrid_search(
-    req: &RawRequest,
-    ctx: &AppContext,
-    params: SemanticSearchParams,
-    shape: QueryShape,
-    mode: SearchMode,
-    mut warnings: Vec<String>,
-    external_root: PathBuf,
-    search_index: &SearchIndex,
-    semantic_artifact: &ReadOnlyArtifact<Arc<SemanticIndex>>,
-    search_generation: &GenerationToken,
-    mut borrow_metadata: ExternalBorrowMetadata,
-    page_request: paging::ValidatedPageRequest,
-    extensions: &dyn extensions::SearchExtensions,
-    engine_plan: &extensions::LanePlan<'_>,
-    disk_checked_in_full: bool,
-) -> Response {
-    let mut semantic_status = "ready";
-    let semantic_index = match semantic_artifact {
-        ReadOnlyArtifact::Fresh(index)
-        | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
-            if semantic_fingerprint_matches_session(ctx, index) =>
-        {
-            Some(index.as_ref())
-        }
-        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_) => {
-            semantic_status = "unavailable";
-            warnings.push(
-                "External semantic index was built for a different embedding backend or model; returning lexical-only results from the trigram index.".to_string(),
-            );
-            None
-        }
-        ReadOnlyArtifact::Degraded(degradation) => {
-            semantic_status = "building";
-            warnings.push(
-                "Borrowed semantic index loading stopped at the interactive budget; returning lexical-only results from the trigram index.".to_string(),
-            );
-            borrow_metadata.degraded_reason = Some(degradation.reason);
-            None
-        }
-        ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
-        ReadOnlyArtifact::Absent => {
-            semantic_status = "unavailable";
-            warnings.push(
-                "External semantic index is not available; returning lexical-only results from the trigram index.".to_string(),
-            );
-            None
-        }
-    };
-
-    // An identifier is answered by every line that contains it. The borrowed
-    // index can predate the files on disk, so it only rules out files whose
-    // size and modification time still match it; the lexical lanes would pad
-    // the page with files that merely share the identifier's sub-tokens.
-    if let Some(terms) = external_exact::IdentifierTerms::from_query(&params.query) {
-        let usable_index =
-            (search_index.is_ready() && search_index.file_count() > 0).then_some(search_index);
-        let outcome = external_exact::sweep(
-            &external_root,
-            &terms,
-            usable_index,
-            params.include_tests,
-            Instant::now() + external_exact::SWEEP_BUDGET,
-        );
-        if search_cancellation_requested() {
-            return cancelled_search_response(req);
-        }
-        let reply = external_exact::reply(
-            &outcome,
-            &terms,
-            &external_root,
-            &absolute_display_root(&external_root),
-            params.offset,
-            page_request.top_k(),
-        );
-        let mut extras = external_response_extras(&external_root, &borrow_metadata)
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        if let Some(envelope) = &reply.envelope {
-            crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, envelope);
-        }
-        extras.insert("exact_sweep".to_string(), reply.summary);
-        extras.insert(
-            "lexical_only_fallback".to_string(),
-            serde_json::json!(semantic_status != "ready"),
-        );
-        extras.insert(
-            "semantic_unavailable".to_string(),
-            serde_json::json!(semantic_status != "ready"),
-        );
-        return search_response(
-            req,
-            SearchResponseParts {
-                query: &params.query,
-                interpreted_as: if semantic_status == "ready" {
-                    interpreted_as_label(mode)
-                } else {
-                    "lexical"
-                },
-                query_kind: query_kind_label(shape.kind),
-                semantic_status,
-                status: "ready",
-                // The identifier plan has no semantic lane, so semantic
-                // availability does not make this answer partial.
-                complete: !borrow_metadata.stale_cli_snapshot() && outcome.fully_covered(),
-                text: reply.text,
-                results: reply.results,
-                more_available: reply.more_available,
-                engine_capped: false,
-                fully_degraded: false,
-                warnings,
-                extras,
-            },
-        );
-    }
-
-    let mut semantic_more_available = false;
-    let mut semantic_results = if engine_plan.contains(SearchLaneKind::Semantic) {
-        semantic_index
-            .map(|semantic_index| {
-                embed_query_for_dimension(&params.query, ctx, Some(semantic_index.dimension())).map(
-                    |query_vector| {
-                        let mut results = semantic_index.search_filtered(
-                            &query_vector,
-                            SEMANTIC_ENUMERATION_LIMIT.saturating_add(1),
-                            |file| {
-                                path_allowed_by_include_tests(
-                                    file,
-                                    &external_root,
-                                    params.include_tests,
-                                )
-                            },
-                        );
-                        results.retain(|result| result.file.is_file());
-                        semantic_more_available = results.len() > SEMANTIC_ENUMERATION_LIMIT;
-                        if semantic_more_available {
-                            results.truncate(SEMANTIC_ENUMERATION_LIMIT);
-                        }
-                        rerank_semantic_candidates(&mut results, &shape, &params.query);
-                        results
-                    },
-                )
-            })
-            .transpose()
-            .unwrap_or_else(|error| {
-                semantic_status = "unavailable";
-                warnings.push(classify_embed_query_error(&error).detail);
-                None
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    let mut ranked = match run_engine_ranking(
-        &req.id,
-        ctx,
-        &external_root,
-        &params.query,
-        public_query(req),
-        params.include_tests,
-        std::mem::take(&mut semantic_results),
-        page_request,
-        extensions,
-        engine_plan,
-        Some((search_index, search_generation)),
-        None,
-    ) {
-        Ok(ranked) => ranked,
-        Err(error) => return Response::error(&req.id, "search_engine_failed", error),
-    };
-    ranked.results.retain(|result| result.file.is_file());
-    let more_available = ranked.more_available || semantic_more_available;
-    let snippets_incomplete =
-        enrich_snippets_from_source_with_context(&mut ranked.results, &external_root, Some(ctx));
-    let display_root = absolute_display_root(&external_root);
-    let (mut text, rendered_results) = format_ranked_text_counted(
-        &ranked.results,
-        &display_root,
-        more_available,
-        snippets_incomplete,
-        Some(ctx),
-        // "No file contains" holds only when the saved index was compared
-        // with every file on disk. A check cut short by its budget leaves
-        // files whose current text the index may not hold; the reply then
-        // says how far the check got (see `disclose_checked_saved_index`)
-        // and makes no claim that the literal is absent.
-        ranked
-            .literal_absent
-            .as_deref()
-            .filter(|_| disk_checked_in_full),
-    );
-    if let Some(answer) = &ranked.not_found {
-        text = answer.render(&display_root);
-    }
-    if semantic_status != "ready" {
-        let disclosure = if semantic_status == "building" {
-            borrowed_semantic_loading_notice(ranked.exact_match_files)
-        } else {
-            "Semantic search is not available for the external root; lexical engine results follow."
-                .to_string()
-        };
-        text = format!("{disclosure}\n\n{text}");
-    }
-    if let Some(line) = ranked.confidence_line {
-        text.push_str("\n\n");
-        text.push_str(line);
-    }
-    let mut extras = external_response_extras(&external_root, &borrow_metadata)
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    crate::list_surfaces::search::attach_projected_search_envelope(
-        &mut extras,
-        &ranked.results_list_envelope,
-    );
-    extras.insert("structuredContent".to_string(), ranked.structured_content);
-    extras.insert(
-        "rendered_results".to_string(),
-        serde_json::json!(rendered_results),
-    );
-    extras.insert(
-        "lexical_only_fallback".to_string(),
-        serde_json::json!(semantic_status != "ready"),
-    );
-    extras.insert(
-        "semantic_unavailable".to_string(),
-        serde_json::json!(semantic_status != "ready"),
-    );
-    extras.insert(
-        "lexical_engine_capped".to_string(),
-        serde_json::json!(ranked.engine_capped),
-    );
-    disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
-    disclose_rerank_note(&ranked.rerank_note, &mut text);
-    disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
-    disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
-    disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
-
-    let mut response = search_response(
-        req,
-        SearchResponseParts {
-            query: &params.query,
-            interpreted_as: if semantic_status == "ready" {
-                interpreted_as_label(mode)
-            } else {
-                "lexical"
-            },
-            query_kind: query_kind_label(shape.kind),
-            semantic_status,
-            status: if semantic_status == "building" {
-                "building"
-            } else {
-                "ready"
-            },
-            complete: semantic_status == "ready" && !borrow_metadata.stale_cli_snapshot(),
-            text,
-            results: ranked.results.iter().map(result_to_json).collect(),
-            more_available,
-            engine_capped: ranked.engine_capped,
-            fully_degraded: false,
-            warnings,
-            extras,
-        },
-    );
-    if let (Some(data), Some(index)) = (response.data.as_object_mut(), semantic_index) {
-        disclose_skipped_semantic_rows(data, index);
-    }
-    response
-}
-
-fn semantic_fingerprint_matches_session(ctx: &AppContext, index: &SemanticIndex) -> bool {
-    let config = ctx.config().semantic.clone();
-    let expected = SemanticIndexFingerprint::for_config_dimension(&config, index.dimension());
-    index
-        .fingerprint()
-        .map(|fingerprint| fingerprint.as_string() == expected.as_string())
-        .unwrap_or(false)
 }
 
 fn stale_cli_snapshot_partial_response(
@@ -3706,13 +2618,6 @@ fn external_response_extras(
     extras
 }
 
-fn borrowed_drift_log_message(index_kind: &str, root: &Path, drift_count: usize) -> String {
-    format!(
-        "borrowed {index_kind} index for {} has {drift_count} drifted file(s); serving current-disk snippets without agent-facing stale prose",
-        root.display()
-    )
-}
-
 fn absolute_display_root(root: &Path) -> PathBuf {
     root.join(".aft-external-display-root-nonprefix")
 }
@@ -3740,7 +2645,11 @@ fn path_is_hidden_test_file(path: &Path, project_root: &Path) -> bool {
     is_test_support_file(rel.as_ref()) || is_test_file(rel.as_ref())
 }
 
-fn path_allowed_by_include_tests(path: &Path, project_root: &Path, include_tests: bool) -> bool {
+pub(crate) fn path_allowed_by_include_tests(
+    path: &Path,
+    project_root: &Path,
+    include_tests: bool,
+) -> bool {
     include_tests || !path_is_hidden_test_file(path, project_root)
 }
 
@@ -3754,14 +2663,15 @@ fn lexical_candidate_exactness(
     content_tokens: &[String],
 ) -> (bool, usize, Option<usize>) {
     let _cost = telemetry::CostPhase::start("lexical_exactness");
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    let Ok(bytes) = fs::read(file) else {
+    let files = request_files::current();
+    let Ok(fetched) = waits::timed(waits::SearchWait::FileRead, || {
+        request_files::read_through(files.as_deref(), file, read_whole_source_file)
+    }) else {
         return (false, 0, None);
     };
-    let text = String::from_utf8_lossy(&bytes);
+    let text = fetched.file.lossy_text();
     let normalize_cost = telemetry::CostPhase::start("lexical_normalize");
-    let prepared = exact_lane::prepare_exact_text(&text, blake3::hash(&bytes));
+    let prepared = exact_lane::prepare_exact_text(text, fetched.file.digest());
     let normalized_text = prepared.normalized();
     drop(normalize_cost);
     let normalized_phrase = normalize_exact_phrase(exact_phrase(query));
@@ -3784,10 +2694,20 @@ fn lexical_candidate_exactness(
         return (false, 0, None);
     }
 
-    if let Some(width) = query_shape::minimum_content_token_window(&text, content_tokens) {
+    if let Some(width) = query_shape::minimum_content_token_window(text, content_tokens) {
         return (true, 0, Some(width));
     }
     (false, 0, None)
+}
+
+/// Read a whole source file as `std::fs::read` does, for a phase whose
+/// file the request's set does not hold yet.
+fn read_whole_source_file(
+    path: &Path,
+) -> std::io::Result<(Vec<u8>, Option<request_files::FileStat>)> {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read_path(path);
+    request_files::read_whole_file(path)
 }
 
 fn exact_phrase(query: &str) -> &str {
@@ -3972,7 +2892,9 @@ fn handle_grep_search(
             path_exclusion: grep_path_exclusion(include_tests),
         };
         (
-            grep_executor::execute(ctx, &compiled, &scope, &params),
+            waits::timed(waits::SearchWait::Grep, || {
+                grep_executor::execute(ctx, &compiled, &scope, &params)
+            }),
             None,
             None,
         )
@@ -4172,24 +3094,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// The hook runs before the index read with `false`, and after a lock timeout
-/// with `true`, so tests can release a contended writer before the fallback.
-#[cfg(test)]
-pub(crate) fn with_regex_route_lock_hook_for_test<T>(
-    hook: impl FnMut(bool) + 'static,
-    action: impl FnOnce() -> T,
-) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            REGEX_ROUTE_LOCK_HOOK.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-    REGEX_ROUTE_LOCK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let _reset = Reset;
-    action()
-}
-
 #[cfg(test)]
 fn regex_route_lock_hook(timed_out: bool) {
     REGEX_ROUTE_LOCK_HOOK.with(|slot| {
@@ -4207,45 +3111,52 @@ fn regex_route_collection(
     compiled: &pattern_compile::CompiledPattern,
     include_tests: bool,
 ) -> Option<std::io::Result<crate::search_index::GrepFileCollection>> {
-    let snapshot = if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
-        match snapshot {
-            Ok(snapshot) => snapshot.into_ready()?,
-            Err(error) => {
-                return Some(Err(std::io::Error::other(
-                    crate::context::view_load_failure_message(error),
-                )))
-            }
-        }
-    } else {
+    let snapshot = {
         #[cfg(test)]
         regex_route_lock_hook(false);
-        let Some(guard) =
-            try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-        else {
-            #[cfg(test)]
-            regex_route_lock_hook(true);
-            return None;
-        };
-        let index = guard.as_ref()?;
-        if !index.ready {
-            return None;
+        // The checkout's text index names the candidate files, when ready.
+        match waits::timed(waits::SearchWait::TextSearch, || {
+            data_layer_regex_candidates(ctx, compiled)
+        })? {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Some(Err(error)),
         }
-        index.snapshot()
     };
     let scope = crate::search_index::resolve_search_scope(&grep_executor::project_root(ctx), None);
     if !scope.use_index {
         return None;
     }
-    let collection = snapshot.collect_grep_matches_by_file(
-        compiled,
-        &PathFilters::default(),
-        &scope.root,
-        grep_path_exclusion(include_tests),
-        regex_route::limits(),
-        &regex_route::examine_priority,
-        &regex_route::keep_past_line_limit,
-    );
+    // Candidate files are verified on the global Rayon pool; the searching
+    // thread waits for that whole parallel section.
+    let collection = waits::timed(waits::SearchWait::Rayon, || {
+        snapshot.collect_grep_matches_by_file(
+            compiled,
+            &PathFilters::default(),
+            &scope.root,
+            grep_path_exclusion(include_tests),
+            regex_route::limits(),
+            &regex_route::examine_priority,
+            &regex_route::keep_past_line_limit,
+        )
+    });
     Some(collection)
+}
+
+/// The files the data layer's text index (its checkout's text plane) admits
+/// for `compiled`, as a snapshot the regex route verifies: `None` when this
+/// root's checkout has no ready text index.
+fn data_layer_regex_candidates(
+    ctx: &AppContext,
+    compiled: &pattern_compile::CompiledPattern,
+) -> Option<std::io::Result<crate::search_index::SearchIndexSnapshot>> {
+    let view = crate::data_layer::tools::grep::ready_view(ctx)?;
+    let scope =
+        crate::data_layer::tools::grep::ViewScope::of(view, &grep_executor::project_root(ctx))?;
+    Some(
+        scope
+            .candidates(compiled)
+            .map_err(|error| std::io::Error::other(error.to_string())),
+    )
 }
 
 fn short_regex_compile_reason(message: &str) -> Cow<'_, str> {
@@ -4284,6 +3195,9 @@ struct CheckoutSemanticGaps {
     unvouched: bool,
     /// The checkout view could not be read at all.
     unavailable: Option<String>,
+    /// Why the data layer's last fill stopped, while files still wait for
+    /// vectors; it is tried again later. Never set for a views-on answer.
+    fill_failure: Option<String>,
 }
 
 /// How many gap paths the response text names before summarizing the rest.
@@ -4298,12 +3212,18 @@ impl CheckoutSemanticGaps {
         }
     }
 
-    fn from(answer: &crate::views::semantic::SemanticQuery) -> Self {
+    /// What a data-layer meaning plane whose fill is under way does not
+    /// cover yet: the files waiting for vectors. Files that cannot be cut
+    /// into chunks are accounted for, as today's index leaves them out, and
+    /// chunks the embedder refused are disclosed as today's index discloses
+    /// them.
+    fn from_data(meaning: &crate::data_layer::tools::search::DataMeaning) -> Self {
         Self {
-            pending: answer.pending.clone(),
-            failed: answer.failed.clone(),
-            unvouched: answer.unvouched,
-            unavailable: answer.unavailable.clone(),
+            pending: meaning.coverage().pending.clone(),
+            failed: Vec::new(),
+            unvouched: false,
+            unavailable: None,
+            fill_failure: meaning.failure().map(str::to_string),
         }
     }
 
@@ -4313,6 +3233,7 @@ impl CheckoutSemanticGaps {
             failed: Vec::new(),
             unvouched: false,
             unavailable: Some(reason),
+            fill_failure: None,
         }
     }
 
@@ -4367,16 +3288,22 @@ impl CheckoutSemanticGaps {
                     .to_string(),
             );
         }
+        if let Some(error) = &self.fill_failure {
+            lines.push(format!(
+                "semantic: embedding the waiting files stopped and is retried later: {error}"
+            ));
+        }
         extras.insert("complete".into(), serde_json::json!(false));
-        extras.insert(
-            "semantic_gap".into(),
-            serde_json::json!({
-                "pending": pending,
-                "failed": failed,
-                "unvouched": self.unvouched,
-                "unavailable": self.unavailable,
-            }),
-        );
+        let mut gap = serde_json::json!({
+            "pending": pending,
+            "failed": failed,
+            "unvouched": self.unvouched,
+            "unavailable": self.unavailable,
+        });
+        if let Some(error) = &self.fill_failure {
+            gap["fill_failure"] = serde_json::json!(error);
+        }
+        extras.insert("semantic_gap".into(), gap);
         for line in lines {
             text.push('\n');
             text.push_str(&line);
@@ -4503,7 +3430,7 @@ fn file_stamp(path: &Path) -> memo::FileStamp {
 /// literal.
 fn literal_presence(
     ctx: &AppContext,
-    snapshot: &crate::search_index::SearchIndexSnapshot,
+    index: crate::data_layer::tools::search::TextIndex<'_>,
     project_root: &Path,
     generation: &GenerationToken,
     phrase: &str,
@@ -4517,17 +3444,12 @@ fn literal_presence(
     );
     let store = ctx.search_exact_memo();
     if let Some(entry) = store.literal_presence(&key) {
-        if literal_presence_still_holds(&entry, snapshot, phrase, project_root)? {
+        if literal_presence_still_holds(&entry, index, phrase, project_root)? {
             return Ok(entry.presence);
         }
     }
-    let entry = settle_literal_presence(
-        snapshot,
-        project_root,
-        phrase,
-        &normalized,
-        exact_candidates,
-    )?;
+    let entry =
+        settle_literal_presence(index, project_root, phrase, &normalized, exact_candidates)?;
     let presence = entry.presence;
     store.store_literal_presence(key, entry);
     Ok(presence)
@@ -4538,7 +3460,7 @@ fn literal_presence(
 /// possible holders (a file that gained the literal would join them).
 fn literal_presence_still_holds(
     entry: &memo::LiteralPresenceEntry,
-    snapshot: &crate::search_index::SearchIndexSnapshot,
+    index: crate::data_layer::tools::search::TextIndex<'_>,
     phrase: &str,
     project_root: &Path,
 ) -> std::io::Result<bool> {
@@ -4553,7 +3475,7 @@ fn literal_presence_still_holds(
         memo::LiteralPresence::Present => unchanged,
         memo::LiteralPresence::Absent => {
             unchanged
-                && snapshot
+                && index
                     .files_possibly_holding_phrase(phrase, project_root)?
                     .as_ref()
                     == Some(&entry.candidates)
@@ -4583,10 +3505,9 @@ impl PresenceReads {
         }
         #[cfg(test)]
         LITERAL_PRESENCE_READS.with(|count| count.set(count.get() + 1));
-        let stamp = file_stamp(path);
-        let text = crate::search_index::read_searchable_text(path)?;
+        let (stamp, holds) = presence_check(path, &self.normalized)?;
         self.read.push((path.to_path_buf(), stamp));
-        Some(exact_lane::normalize_exact_phrase(&text).contains(&self.normalized))
+        Some(holds)
     }
 
     fn entry(
@@ -4608,6 +3529,51 @@ impl PresenceReads {
     }
 }
 
+/// Whether `path`'s text holds `normalized`, with the file's stamp from
+/// before its bytes were read; `None` when the file cannot be read or is
+/// binary or not UTF-8 (as `read_searchable_text`).
+///
+/// The request's set serves bytes an earlier phase read only when that
+/// phase stamped them first. Bytes kept without a stamp are read again: a
+/// stamp taken now could be newer than those bytes, and the memo would then
+/// keep an answer about older text as if it described the current file.
+fn presence_check(path: &Path, normalized: &str) -> Option<(memo::FileStamp, bool)> {
+    let files = request_files::current();
+    let kept = files.as_ref().and_then(|files| files.kept(path));
+    let file = match kept {
+        Some(file) if file.stat().is_some() => file,
+        Some(_) => {
+            #[cfg(test)]
+            request_files::record_disk_read(path);
+            let stamp = file_stamp(path);
+            let text = crate::search_index::read_searchable_text(path)?;
+            return Some((
+                stamp,
+                exact_lane::normalize_exact_phrase(&text).contains(normalized),
+            ));
+        }
+        None => {
+            request_files::read_through(files.as_deref(), path, |path| {
+                let stat = fs::metadata(path)
+                    .ok()
+                    .map(|metadata| request_files::FileStat::of(&metadata));
+                Ok((crate::bounded_io::read(path, None)?, stat))
+            })
+            .ok()?
+            .file
+        }
+    };
+    let stamp = file.stat().map(|stat| (stat.size, stat.modified));
+    if crate::search_index::is_binary_bytes(file.bytes()) {
+        return None;
+    }
+    let text = file.utf8()?;
+    Some((
+        stamp,
+        exact_lane::normalize_exact_phrase(text).contains(normalized),
+    ))
+}
+
 /// Settle whether some file holds the literal, reading as little as
 /// possible: the exact candidates first, in rank order, stopping at the first
 /// that holds it (the common case reads one file); only when none does, the
@@ -4615,7 +3581,7 @@ impl PresenceReads {
 /// holder. Running out of reads or time, or meeting an unreadable file,
 /// settles nothing: that is never an absence.
 fn settle_literal_presence(
-    snapshot: &crate::search_index::SearchIndexSnapshot,
+    index: crate::data_layer::tools::search::TextIndex<'_>,
     project_root: &Path,
     phrase: &str,
     normalized: &str,
@@ -4638,7 +3604,7 @@ fn settle_literal_presence(
     }
     #[cfg(test)]
     LITERAL_PRESENCE_CORPUS_SCANS.with(|count| count.set(count.get() + 1));
-    let Some(candidates) = snapshot.files_possibly_holding_phrase(phrase, project_root)? else {
+    let Some(candidates) = index.files_possibly_holding_phrase(phrase, project_root)? else {
         return Ok(reads.entry(Undetermined, Vec::new()));
     };
     for path in &candidates {
@@ -4749,12 +3715,33 @@ fn matching_line_from_source(
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
-    let read_cost = telemetry::CostPhase::start("matching_read");
-    let source = std::fs::read_to_string(file).ok()?;
-    drop(read_cost);
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    matching_line_in_text(&source, query, symbol_range)
+    let Some(files) = request_files::current() else {
+        let read_cost = telemetry::CostPhase::start("matching_read");
+        let source = waits::timed(waits::SearchWait::FileRead, || {
+            request_files::read_through(None, file, read_whole_source_file)
+        })
+        .ok()?;
+        drop(read_cost);
+        return matching_line_in_text(source.file.utf8()?, query, symbol_range);
+    };
+    // The reranker's candidate text asks for the same line of the same file;
+    // the request's set answers both from one search of the text.
+    files.matching_line(
+        file,
+        query,
+        symbol_range.map(|range| (range.start, range.end)),
+        || {
+            let read_cost = telemetry::CostPhase::start("matching_read");
+            let fetched = waits::timed(waits::SearchWait::FileRead, || {
+                files.read(file, read_whole_source_file)
+            })?;
+            drop(read_cost);
+            Ok(fetched
+                .file
+                .utf8()
+                .and_then(|source| matching_line_in_text(source, query, symbol_range)))
+        },
+    )
 }
 
 /// Preparation is addressed by the bytes just read, not a path or watcher
@@ -4767,16 +3754,18 @@ fn matching_line_in_text(
     let _cost = telemetry::CostPhase::start("matching_line");
     static CACHE: std::sync::OnceLock<MatchingSourceCache> = std::sync::OnceLock::new();
     let prepare_cost = telemetry::CostPhase::start("matching_prepare");
+    let prepare_wait = waits::time(waits::SearchWait::MatchingPrepare);
     let prepared = CACHE
         .get_or_init(|| MatchingSourceCache::new(32 * 1024 * 1024))
         .prepare(source);
     drop(prepare_cost);
+    drop(prepare_wait);
     let phrase_cost = telemetry::CostPhase::start("matching_phrase");
+    let phrase_wait = waits::time(waits::SearchWait::MatchingPhrase);
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
         if let Some((line_index, line)) = source.lines().enumerate().find(|(index, _)| {
-            prepared.lines[*index]
-                .normalized
+            prepared.normalized[prepared.lines[*index].normalized.clone()]
                 .contains(&normalized_phrase)
         }) {
             // The phrase matched after whitespace normalization, so its first
@@ -4794,6 +3783,7 @@ fn matching_line_in_text(
     }
 
     drop(phrase_cost);
+    drop(phrase_wait);
     let content_tokens = query_shape::extract_content_tokens(query);
     let compact_tokens = content_tokens
         .iter()
@@ -4807,8 +3797,10 @@ fn matching_line_in_text(
         .filter(|token| token.len() >= 3)
         .collect::<Vec<_>>();
     let best_cost = telemetry::CostPhase::start("matching_best_line");
+    let best_wait = waits::time(waits::SearchWait::MatchingBestLine);
     let best = prepared.best_line(source, &compact_tokens);
     drop(best_cost);
+    drop(best_wait);
     if let Some((_, line_index, line)) = best {
         // Start the shown part of a long line at the earliest query token it
         // contains, so the window covers the region that made the line match.
@@ -4829,30 +3821,49 @@ fn matching_line_in_text(
 }
 
 struct MatchingContentLine {
-    normalized: String,
-    compact: String,
+    normalized: std::ops::Range<usize>,
+    compact: std::ops::Range<usize>,
     trigrams: std::sync::OnceLock<Box<[[u8; 3]]>>,
 }
 
 struct MatchingSource {
     lines: Vec<MatchingContentLine>,
+    normalized: String,
+    compact: String,
 }
 
 impl MatchingSource {
     fn new(source: &str) -> Self {
-        Self {
-            lines: source
-                .lines()
-                .map(|line| MatchingContentLine {
-                    normalized: exact_lane::normalize_exact_phrase(line),
-                    compact: line
-                        .chars()
+        // Two source-wide buffers avoid allocating and freeing two strings
+        // per line while concurrent searches churn the bounded content cache.
+        // Ranges keep line boundaries: neither phrase nor trigram matches may
+        // cross a newline, even though adjacent lines share an allocation.
+        let mut normalized = String::new();
+        let mut compact = String::new();
+        let lines = source
+            .lines()
+            .map(|line| {
+                let normalized_start = normalized.len();
+                exact_lane::push_normalized_exact_phrase(line, &mut normalized);
+                let compact_start = compact.len();
+                compact.extend(
+                    line.chars()
                         .filter(|ch| ch.is_alphanumeric())
-                        .flat_map(char::to_lowercase)
-                        .collect(),
+                        .flat_map(char::to_lowercase),
+                );
+                MatchingContentLine {
+                    normalized: normalized_start..normalized.len(),
+                    compact: compact_start..compact.len(),
                     trigrams: std::sync::OnceLock::new(),
-                })
-                .collect(),
+                }
+            })
+            .collect();
+        normalized.shrink_to_fit();
+        compact.shrink_to_fit();
+        Self {
+            lines,
+            normalized,
+            compact,
         }
     }
 
@@ -4861,14 +3872,12 @@ impl MatchingSource {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.lines.capacity() * std::mem::size_of::<MatchingContentLine>()
+            + self.normalized.capacity()
+            + self.compact.capacity()
             + self
                 .lines
                 .iter()
-                .map(|line| {
-                    line.normalized.capacity()
-                        + line.compact.capacity()
-                        + line.compact.len().saturating_sub(2) * 3
-                })
+                .map(|line| line.compact.len().saturating_sub(2) * 3)
                 .sum::<usize>()
     }
 
@@ -4884,11 +3893,12 @@ impl MatchingSource {
         let mut best_score = 0_usize;
         let mut missing = Vec::with_capacity(tokens.len());
         for (index, (line, prepared)) in source.lines().zip(&self.lines).enumerate() {
+            let compact = &self.compact[prepared.compact.clone()];
             missing.clear();
             let mut score = 0_usize;
             let mut remaining = 0_usize;
             for token in tokens {
-                if prepared.compact.contains(token) {
+                if compact.contains(token) {
                     score += token.len().saturating_mul(4);
                 } else {
                     missing.push(token);
@@ -4901,9 +3911,15 @@ impl MatchingSource {
                 continue;
             }
             if !missing.is_empty() {
+                let mut other_wait = prepared
+                    .trigrams
+                    .get()
+                    .is_none()
+                    .then(|| waits::time(waits::SearchWait::MatchingTrigramWait));
                 let trigrams = prepared.trigrams.get_or_init(|| {
-                    let mut trigrams = prepared
-                        .compact
+                    other_wait = None;
+                    let _build = waits::time(waits::SearchWait::MatchingTrigrams);
+                    let mut trigrams = compact
                         .as_bytes()
                         .windows(3)
                         .map(|trigram| {
@@ -4916,6 +3932,7 @@ impl MatchingSource {
                     trigrams.dedup();
                     trigrams.into_boxed_slice()
                 });
+                drop(other_wait);
                 for token in &missing {
                     remaining -= token.len().saturating_sub(2);
                     score += token
@@ -4959,6 +3976,7 @@ struct MatchingSourceState {
 
 impl MatchingSourceState {
     fn evict_oldest(&mut self) {
+        let _evict = waits::time(waits::SearchWait::MatchingEvict);
         if let Some(digest) = self
             .entries
             .iter()
@@ -4989,9 +4007,15 @@ impl MatchingSourceCache {
     }
 
     fn prepare(&self, source: &str) -> Arc<MatchingSource> {
-        let digest = blake3::hash(source.as_bytes());
-        let cell = {
-            let mut state = self.state.lock();
+        let digest = waits::timed(waits::SearchWait::MatchingDigest, || {
+            blake3::hash(source.as_bytes())
+        });
+        // As the exact preparation cache: an unfilled placeholder found here
+        // means another request is preparing the same source.
+        let (cell, another_preparing) = {
+            let mut state = waits::timed(waits::SearchWait::MatchingCacheLock, || {
+                waits::timed(waits::SearchWait::PrepareCache, || self.state.lock())
+            });
             state.clock = state.clock.wrapping_add(1);
             let clock = state.clock;
             if let Some(entry) = state.entries.get_mut(&digest) {
@@ -4999,7 +4023,7 @@ impl MatchingSourceCache {
                 if let Some(prepared) = entry.source.get() {
                     return Arc::clone(prepared);
                 }
-                Arc::clone(&entry.source)
+                (Arc::clone(&entry.source), true)
             } else {
                 // Bound in-flight placeholders as well as completed entries;
                 // normalization and trigram work never hold the map lock.
@@ -5015,17 +4039,25 @@ impl MatchingSourceCache {
                         bytes: 0,
                     },
                 );
-                cell
+                (cell, false)
             }
         };
+        let other_wait = another_preparing.then(|| waits::time(waits::SearchWait::PrepareCache));
+        let mut source_wait = Some(waits::time(waits::SearchWait::MatchingSourceWait));
         let prepared = cell.get_or_init(|| {
+            source_wait = None;
+            let _normalize = waits::time(waits::SearchWait::MatchingNormalize);
             #[cfg(test)]
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Arc::new(MatchingSource::new(source))
         });
+        drop(source_wait);
+        drop(other_wait);
         let retained_bytes = prepared.retained_bytes();
-        let mut state = self.state.lock();
+        let mut state = waits::timed(waits::SearchWait::MatchingCacheLock, || {
+            waits::timed(waits::SearchWait::PrepareCache, || self.state.lock())
+        });
         if let Some(entry) = state.entries.get_mut(&digest) {
             if Arc::ptr_eq(&entry.source, &cell) && entry.bytes == 0 {
                 entry.bytes = retained_bytes;
@@ -5078,22 +4110,31 @@ fn definition_line_from_source(
     file: &Path,
     symbol_range: SymbolOffsetRange,
 ) -> Option<(u32, String)> {
-    let source = std::fs::read_to_string(file).ok()?;
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(file);
-    line_at_offset(&source, symbol_range.start)
+    let source = request_source_file(file).ok()?;
+    line_at_offset(source.utf8()?, symbol_range.start)
 }
 
-fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str) -> bool {
+/// `path`'s bytes from the current request's set, read whole (as
+/// `std::fs::read` does) when the set does not hold them yet.
+fn request_source_file(path: &Path) -> std::io::Result<Arc<request_files::RequestFile>> {
+    let files = request_files::current();
+    waits::timed(waits::SearchWait::FileRead, || {
+        request_files::read_through(files.as_deref(), path, read_whole_source_file)
+    })
+    .map(|fetched| fetched.file)
+}
+
+pub(crate) fn definition_matches_identifier_token(
+    candidate: &CandidateResult,
+    query: &str,
+) -> bool {
     let Some(range) = candidate.symbol_range else {
         return false;
     };
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(&candidate.path);
-    let Ok(source) = std::fs::read(&candidate.path) else {
+    let Ok(source) = request_source_file(&candidate.path) else {
         return false;
     };
-    let Some(symbol) = source.get(range.start..range.end) else {
+    let Some(symbol) = source.bytes().get(range.start..range.end) else {
         return false;
     };
     definition_identifier_tokens(query)
@@ -5107,7 +4148,7 @@ fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str)
 
 /// The identifier-shaped words of `query` that a declaration's text must
 /// contain for a natural-language query to keep it as exact evidence.
-fn definition_identifier_tokens(query: &str) -> Vec<&str> {
+pub(crate) fn definition_identifier_tokens(query: &str) -> Vec<&str> {
     query
         .split_whitespace()
         .map(|token| {
@@ -5127,12 +4168,17 @@ fn identifier_has_code_reference(
     identifier: &str,
     parser: &mut crate::parser::FileParser,
 ) -> bool {
-    #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(path);
-    let Ok(source) = std::fs::read_to_string(path) else {
+    let Ok(file) = request_source_file(path) else {
         return false;
     };
-    let Ok((tree, _)) = parser.parse(path) else {
+    let Some(source) = file.utf8() else {
+        return false;
+    };
+    // Parse the bytes just checked, not a fresh read of the path, so the tree
+    // and the text agree even if the file changes meanwhile.
+    let Ok((tree, _)) = waits::timed(waits::SearchWait::Parse, || {
+        parser.parse_source_text(path, source)
+    }) else {
         return false;
     };
     source.match_indices(identifier).any(|(start, _)| {
@@ -5215,6 +4261,96 @@ fn take_windows_semantic_preview(
     metadata.remove(&semantic_path)
 }
 
+/// The path-lookup lane's files: those under `project_root` that
+/// `candidate_filter` admits and whose name, or `/`-separated path relative
+/// to the root, ends with one of `tokens`, newest first.
+///
+/// With the data layer's view of the root, while this context's file
+/// watcher keeps that view current, the files come from the view's path
+/// list, which holds every path the project walk would reach; otherwise (no
+/// view yet, no watcher, or a view that cannot stand in for the walk) from
+/// that walk. Both apply the same test to each file and the same order, so
+/// the lane's answer does not depend on which one ran.
+fn path_lookup_paths(
+    ctx: &AppContext,
+    data_text: Option<&crate::data_layer::tools::search::DataText>,
+    project_root: &Path,
+    tokens: &[&str],
+    candidate_filter: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let tokens = tokens
+        .iter()
+        .map(|token| token.replace('\\', "/"))
+        .collect::<Vec<_>>();
+    let matches = |path: &Path| {
+        if !candidate_filter(path) {
+            return false;
+        }
+        let relative = path
+            .strip_prefix(project_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let file_name = path.file_name().and_then(|name| name.to_str());
+        tokens.iter().any(|normalized| {
+            file_name == Some(normalized.as_str()) || relative.ends_with(normalized.as_str())
+        })
+    };
+    if let Some(text) = data_text.filter(|_| watcher_keeps_view_current(ctx)) {
+        // A file `matches` keeps has a relative path ending with a token (a
+        // file name equal to the token ends it too), so only those members
+        // need spelling out.
+        let ends_with_token = |relative: &[u8]| {
+            tokens
+                .iter()
+                .any(|token| relative.ends_with(token.as_bytes()))
+        };
+        if let Some(files) = waits::timed(waits::SearchWait::TextSearch, || {
+            text.files_matching(project_root, ends_with_token, matches)
+        }) {
+            return files;
+        }
+    }
+    // Reject unrelated filenames before the walker builds metadata and
+    // canonical display keys for sorting; the surviving order is unchanged.
+    let _walk = waits::time(waits::SearchWait::Walk);
+    walk_project_files_from_matching(project_root, project_root, &PathFilters::default(), matches)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for [`AppContext::watcher_runtime_active`] on this thread.
+    static WATCHER_LIVE_FOR_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` with this thread's path lookups treating the file watcher as
+/// running (`live`) or not, whatever the context's watcher does.
+#[cfg(test)]
+fn with_watcher_live_for_test<R>(live: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WATCHER_LIVE_FOR_TEST.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(WATCHER_LIVE_FOR_TEST.with(|slot| slot.replace(Some(live))));
+    run()
+}
+
+/// Whether this context's file watcher is running. Only then does the data
+/// layer's view learn of a file created outside AFT soon after it appears
+/// (a change still in the watcher's hands is disclosed on the reply as a
+/// pending-change gap); without a watcher the view keeps missing it, and a
+/// lookup by file name must walk the folder to find it.
+fn watcher_keeps_view_current(ctx: &AppContext) -> bool {
+    #[cfg(test)]
+    if let Some(live) = WATCHER_LIVE_FOR_TEST.with(std::cell::Cell::get) {
+        return live;
+    }
+    ctx.watcher_runtime_active()
+}
+
 fn run_engine_ranking(
     request_id: &str,
     ctx: &AppContext,
@@ -5229,6 +4365,7 @@ fn run_engine_ranking(
     borrowed_index: Option<(&SearchIndex, &GenerationToken)>,
     split: Option<&SplitEngineInput<'_>>,
 ) -> Result<EngineRanking, String> {
+    use crate::data_layer::tools::search::TextIndex;
     use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate, BLOCK_DEPTHS};
     use confidence::{Confidence, ConfidenceEngine};
     use lexical_lane::CanonicalLexicalLane;
@@ -5237,11 +4374,21 @@ fn run_engine_ranking(
     use telemetry::{ConfidenceTelemetry, TelemetryAssembler, TelemetryRun};
     use trailer::{ExactPassState, SearchTrailer};
 
+    // With the data layer running and its view's text plane ready, the
+    // lexical and exact lanes read that view; otherwise they read the legacy
+    // index, or the borrowed one of an external root.
+    let data_text = borrowed_index
+        .is_none()
+        .then(|| crate::data_layer::tools::search::DataText::ready(ctx))
+        .flatten();
+    if let Some(text) = &data_text {
+        text.note_read(request_id);
+    }
     // Semantic readiness can admit a request before the borrowed search index
     // finishes loading. Wait up to the first-search budget before exact
     // verification falls back to filesystem search, without holding the search
     // index's read lock.
-    if borrowed_index.is_none() && plan_needs_exact_index(plan) {
+    if borrowed_index.is_none() && data_text.is_none() && plan_needs_exact_index(plan) {
         use extensions::ReadinessSource as _;
         if (RuntimeReadinessSource { ctx }).bounded_first_search_wait()
             == extensions::ReadinessWait::Cancelled
@@ -5249,40 +4396,44 @@ fn run_engine_ranking(
             return Err("request_cancelled".to_string());
         }
     }
-    let lexical_view = if borrowed_index.is_none() {
-        ctx.lexical_view_snapshot("aft_search")
-            .transpose()
-            .map_err(crate::context::view_load_failure_message)?
-    } else {
-        None
-    };
-    let context_index = (borrowed_index.is_none() && lexical_view.is_none())
-        .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
-    let view_snapshot =
-        lexical_view.and_then(crate::views::trigram::LexicalViewSnapshot::into_ready);
+    let view_snapshot: Option<crate::search_index::SearchIndexSnapshot> = None;
     let empty_index = SearchIndex::new();
     let index = borrowed_index
         .map(|(index, _)| index)
-        .or_else(|| {
-            context_index
-                .as_ref()
-                .and_then(|guard| guard.as_ref())
-                .and_then(|guard| guard.as_ref())
-        })
         .unwrap_or(&empty_index);
-    let generation = view_snapshot
+    // When the data layer's meaning plane served the semantic lane, the
+    // generation names its vectors too, so a fill that lands is never served
+    // a list (or an exact pass) cached over the vectors before it.
+    let meaning_generation = borrowed_index
+        .is_none()
+        .then(|| plan.readiness.retained().data_meaning())
+        .flatten()
+        .map(|meaning| meaning.generation());
+    let with_meaning = |generation: String| match &meaning_generation {
+        Some(meaning) => format!("{generation}|{meaning}"),
+        None => generation,
+    };
+    let generation = data_text
         .as_ref()
-        .map(|snapshot| GenerationToken::new_with_str(&snapshot.content_generation()))
+        .map(|text| GenerationToken::new_with_str(&with_meaning(text.generation())))
+        .or_else(|| {
+            view_snapshot.as_ref().map(|snapshot| {
+                GenerationToken::new_with_str(&with_meaning(snapshot.content_generation()))
+            })
+        })
         .or_else(|| borrowed_index.map(|(_, generation)| generation.clone()))
         .unwrap_or_else(|| {
-            GenerationToken::new_with_str(&format!(
-                "{}:{}",
-                ctx.search_index_rx_generation(),
+            GenerationToken::new_with_str(&with_meaning(format!(
+                "no-text-index:{}",
                 ctx.semantic_index_rx_generation()
-            ))
+            )))
         });
-    let index_ready = view_snapshot.is_some() || index.is_ready();
+    let index_ready = data_text.is_some() || view_snapshot.is_some() || index.is_ready();
     let snapshot = view_snapshot.unwrap_or_else(|| index.snapshot());
+    let text_index = match &data_text {
+        Some(text) => TextIndex::Data(text),
+        None => TextIndex::Snapshot(&snapshot),
+    };
     let lexical_cost = telemetry::CostPhase::start("lexical");
     let content_tokens = query_shape::extract_content_tokens(query);
     let token_refs = content_tokens
@@ -5299,8 +4450,8 @@ fn run_engine_ranking(
     let mut index_disclosures = split
         .map(|split| split.patterns.index_read_gaps.clone())
         .unwrap_or_default();
-    let lexical = match CanonicalLexicalLane::from_snapshot(
-        &snapshot,
+    let lexical = match CanonicalLexicalLane::from_text_index(
+        text_index,
         &query_trigrams,
         Some(&candidate_filter),
         lexical_lane::LEXICAL_ENUMERATION_LIMIT,
@@ -5371,8 +4522,8 @@ fn run_engine_ranking(
     let mut exact_candidates =
         if plan.contains(SearchLaneKind::Exact) || plan.shape == SearchShape::Identifier {
             let outcome = exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
-                .search_scoped_snapshot(
-                    index_ready.then_some(&snapshot),
+                .search_scoped_index(
+                    index_ready.then_some(text_index),
                     project_root,
                     generation.clone(),
                     exact_input,
@@ -5439,8 +4590,8 @@ fn run_engine_ranking(
             for (fact_input, exact_form) in fact_inputs {
                 // Only phrase evidence is kept from these passes.
                 let outcome = lane
-                    .search_scoped_snapshot(
-                        index_ready.then_some(&snapshot),
+                    .search_scoped_index(
+                        index_ready.then_some(text_index),
                         project_root,
                         generation.clone(),
                         &fact_input,
@@ -5517,7 +4668,7 @@ fn run_engine_ranking(
             // that only a test uses still exists, and the ordinary ranking says
             // more about it than a not-found answer would.
             identifiers.iter().all(|identifier| {
-                snapshot
+                text_index
                     .whole_corpus_exact_pass(identifier, project_root, None)
                     .map(|matches| matches.is_empty())
                     .unwrap_or_else(|error| {
@@ -5558,7 +4709,7 @@ fn run_engine_ranking(
         .filter(|phrase| {
             match literal_presence(
                 ctx,
-                &snapshot,
+                text_index,
                 project_root,
                 &generation,
                 phrase,
@@ -5588,27 +4739,12 @@ fn run_engine_ranking(
             })
             .filter(|token| token.contains('.'))
             .collect::<Vec<_>>();
-        // Reject unrelated filenames before the walker builds metadata and
-        // canonical display keys for sorting; the surviving order is unchanged.
-        walk_project_files_from_matching(
+        path_lookup_paths(
+            ctx,
+            data_text.as_ref(),
             project_root,
-            project_root,
-            &PathFilters::default(),
-            |path| {
-                if !candidate_filter(path) {
-                    return false;
-                }
-                let relative = path
-                    .strip_prefix(project_root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let file_name = path.file_name().and_then(|name| name.to_str());
-                query_path_tokens.iter().any(|token| {
-                    let normalized = token.replace('\\', "/");
-                    file_name == Some(normalized.as_str()) || relative.ends_with(&normalized)
-                })
-            },
+            &query_path_tokens,
+            &candidate_filter,
         )
         .into_iter()
         .map(|path| {
@@ -5749,13 +4885,12 @@ fn run_engine_ranking(
                 .into_iter()
                 .map(|definition| definition.path.clone())
                 .filter(|path| {
-                    let lexical_score = snapshot
+                    let lexical_score = text_index
                         .lexical_rank_at_depth(
                             &query_trigrams,
                             Some(&|candidate: &Path| candidate == path.as_path()),
                             1,
                         )
-                        .map(|result| result.files)
                         .unwrap_or_else(|error| {
                             index_disclosures.push(error.to_string());
                             Vec::new()
@@ -5795,9 +4930,19 @@ fn run_engine_ranking(
                 candidates: exact_candidates.clone(),
             }),
             SearchLaneKind::Anchored => {
-                let (candidates, examined, excluded) = match anchored_lane::AnchoredLane::new()
-                    .execute_with_admission_report(&index, project_root, query, include_tests)
-                {
+                let anchored = anchored_lane::AnchoredLane::new();
+                let executed = match &data_text {
+                    Some(text) => {
+                        anchored.execute_on_data_view(text, project_root, query, include_tests)
+                    }
+                    None => anchored.execute_with_admission_report(
+                        &index,
+                        project_root,
+                        query,
+                        include_tests,
+                    ),
+                };
+                let (candidates, examined, excluded) = match executed {
                     Ok(result) => result,
                     Err(error) => {
                         index_disclosures.push(error.to_string());
@@ -6021,19 +5166,21 @@ fn run_engine_ranking(
     // the page.
     drop(fusion_cost);
     let rerank_cost = telemetry::CostPhase::start("rerank");
-    let rerank_note = rerank::rerank_canonical_head(
-        &mut page.reply,
-        page_request.offset(),
-        page_request.top_k(),
-        rerank::RerankRequest {
-            search: &ctx.config().search,
-            backend: rerank::installed_backend(ctx),
-            project_root,
-            prose: Some(query),
-            public_query,
-            path_scope: path_scope.as_ref(),
-        },
-    )?;
+    let rerank_note = waits::timed(waits::SearchWait::Rerank, || {
+        rerank::rerank_canonical_head(
+            &mut page.reply,
+            page_request.offset(),
+            page_request.top_k(),
+            rerank::RerankRequest {
+                search: &ctx.config().search,
+                backend: rerank::installed_backend(ctx),
+                project_root,
+                prose: Some(query),
+                public_query,
+                path_scope: path_scope.as_ref(),
+            },
+        )
+    })?;
     drop(rerank_cost);
     let fusion_cost = telemetry::CostPhase::start("fusion");
     // A split request then reorders the first block, which every request
@@ -6111,7 +5258,7 @@ fn run_engine_ranking(
         recall_audit::engine_audit(recall_audit::EngineAuditInput {
             project_root,
             plan,
-            snapshot: &snapshot,
+            index: text_index,
             query_trigrams: &query_trigrams,
             candidate_filter: &candidate_filter,
             lexical_order: lexical_candidates
@@ -6479,9 +5626,22 @@ fn handle_engine_only_search(
         // semantic retrieval would have ranked the targets, which is the
         // question a routing change has to answer before it is made.
         let full_ranking = if semantic_status == "ready" {
-            embed_query(&params.query, ctx).and_then(|vector| {
-                recall_audit_full_semantic(ctx, project_root, params.include_tests, &vector)
-            })
+            match data_meaning_for(ctx, plan) {
+                Some(Some(meaning)) => {
+                    embed_query_for_data(&params.query, ctx, &meaning).and_then(|vector| {
+                        recall_audit_full_semantic_from(
+                            crate::data_layer::tools::search::MeaningIndex::Data(&meaning),
+                            project_root,
+                            params.include_tests,
+                            &vector,
+                        )
+                    })
+                }
+                Some(None) => Err("semantic index not_ready".to_string()),
+                None => embed_query(&params.query, ctx).and_then(|vector| {
+                    recall_audit_full_semantic(ctx, project_root, params.include_tests, &vector)
+                }),
+            }
         } else {
             Err(format!("semantic index {semantic_status}"))
         };
@@ -6648,22 +5808,28 @@ fn handle_semantic_or_hybrid_search(
 
     // With views enabled, the root's own checkout view serves the semantic
     // lane; it is `None` for every views-off root.
-    let checkout_semantic = ctx.checkout_semantic_runtime();
-    let semantic_loaded = match semantic_index_loaded_with_budget(ctx) {
-        Ok(loaded) => loaded,
-        Err(()) => {
-            return artifact_contention_fallback_response(
-                req,
-                ctx,
-                &params,
-                &shape,
-                project_root,
-                top_k,
-                "semantic index remained busy",
-            );
-        }
+    // With the data layer on, its meaning plane serves the lane instead of
+    // today's index: `Some(None)` when it cannot serve this request.
+    let data_meaning = data_meaning_for(ctx, engine_plan);
+    let semantic_loaded = match &data_meaning {
+        Some(meaning) => meaning.is_some(),
+        None => match semantic_index_loaded_with_budget(ctx) {
+            Ok(loaded) => loaded,
+            Err(()) => {
+                return artifact_contention_fallback_response(
+                    req,
+                    ctx,
+                    &params,
+                    &shape,
+                    project_root,
+                    top_k,
+                    "semantic index remained busy",
+                );
+            }
+        },
     };
-    if !semantic_loaded && checkout_semantic.is_none() {
+    let data_meaning = data_meaning.flatten();
+    if !semantic_loaded {
         let gap = semantic_not_loaded_gap(ctx);
         return semantic_unavailable_or_fallback_response(
             req,
@@ -6685,7 +5851,11 @@ fn handle_semantic_or_hybrid_search(
         );
     }
 
-    let query_vector = match embed_query(&params.query, ctx) {
+    let embedded = match &data_meaning {
+        Some(meaning) => embed_query_for_data(&params.query, ctx, meaning),
+        None => embed_query(&params.query, ctx),
+    };
+    let query_vector = match embedded {
         Ok(query_vector) => query_vector,
         Err(error) => {
             if search_cancellation_requested() {
@@ -6723,33 +5893,23 @@ fn handle_semantic_or_hybrid_search(
     let semantic_limit = SEMANTIC_ENUMERATION_LIMIT;
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
     let mut semantic_gaps = None;
-    let mut semantic_results = if let Some(runtime) = checkout_semantic.as_ref() {
-        match runtime.search(&query_vector, semantic_fetch_limit, &|file| {
-            path_allowed_by_include_tests(file, project_root, params.include_tests)
-        }) {
-            Ok(answer) => {
-                if !answer.complete() {
-                    semantic_gaps = Some(CheckoutSemanticGaps::from(&answer));
-                }
-                answer.results
-            }
-            Err(error) => {
-                // The reply names the gap; health counts the failed view
-                // unless it is contention that clears by itself.
-                if !crate::views::semantic_runtime::is_transient_reason(&error) {
-                    ctx.note_view_load_failure("semantic", &error);
-                }
-                semantic_gaps = Some(CheckoutSemanticGaps::unavailable(error));
-                Vec::new()
-            }
-        }
+    let mut semantic_results = if let Some(meaning) = data_meaning.as_deref() {
+        meaning.note_read(&req.id);
+        let (results, gaps) =
+            data_meaning_search(meaning, &query_vector, semantic_fetch_limit, &|file| {
+                path_allowed_by_include_tests(file, project_root, params.include_tests)
+            });
+        semantic_gaps = gaps;
+        results
     } else {
         match try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
             Some(semantic_index) => semantic_index
                 .as_ref()
                 .map(|index| {
-                    index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
-                        path_allowed_by_include_tests(file, project_root, params.include_tests)
+                    waits::timed(waits::SearchWait::VectorSearch, || {
+                        index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
+                            path_allowed_by_include_tests(file, project_root, params.include_tests)
+                        })
                     })
                 })
                 .unwrap_or_default(),
@@ -6812,8 +5972,17 @@ fn handle_semantic_or_hybrid_search(
     }
     let more_available = engine_ranking.more_available || semantic_more_available;
     if let Some(audit) = engine_ranking.recall_audit.as_mut() {
-        let full_ranking =
-            recall_audit_full_semantic(ctx, project_root, params.include_tests, &query_vector);
+        let full_ranking = match data_meaning.as_deref() {
+            Some(meaning) => recall_audit_full_semantic_from(
+                crate::data_layer::tools::search::MeaningIndex::Data(meaning),
+                project_root,
+                params.include_tests,
+                &query_vector,
+            ),
+            None => {
+                recall_audit_full_semantic(ctx, project_root, params.include_tests, &query_vector)
+            }
+        };
         recall_audit::attach_semantic_coverage(audit, project_root, full_ranking, true);
     }
     let mut results = engine_ranking.results;
@@ -7585,7 +6754,9 @@ fn execute_degraded_grep_fallback(
     let max_results = top_k.clamp(1, DEGRADED_GREP_RESULT_LIMIT);
     let started = Instant::now();
     let (files, file_cap_reached, walk_budget_reached, skipped_foreign_mounts) =
-        collect_degraded_grep_files(project_root, include_tests, started);
+        waits::timed(waits::SearchWait::Walk, || {
+            collect_degraded_grep_files(project_root, include_tests, started)
+        });
     if search_cancellation_requested() {
         return Err(cancelled_search_response_from_id(request_id));
     }
@@ -7599,6 +6770,7 @@ fn execute_degraded_grep_fallback(
 
     let read_budget_reached = AtomicBool::new(walk_budget_reached);
     let cancellation = crate::executor::current_job_cancellation();
+    let rayon_wait = waits::time(waits::SearchWait::Rayon);
     let mut readable_files = files
         .par_iter()
         .enumerate()
@@ -7617,6 +6789,7 @@ fn execute_degraded_grep_fallback(
                 .map(|content| (index, file.clone(), content))
         })
         .collect::<Vec<_>>();
+    drop(rayon_wait);
     if search_cancellation_requested() {
         return Err(cancelled_search_response_from_id(request_id));
     }
@@ -7912,62 +7085,12 @@ fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
     Ok(semantic_index.is_some())
 }
 
-fn search_index_ready_with_budget(
-    ctx: &AppContext,
-    wait_budget: Duration,
-) -> Result<bool, SearchIndexWaitError> {
-    if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
-        return Ok(snapshot.is_ok_and(|snapshot| snapshot.is_ready()));
+fn search_index_ready_with_budget(ctx: &AppContext, _wait_budget: Duration) -> bool {
+    if crate::data_layer::tools::search::DataText::ready(ctx).is_some() {
+        return true;
     }
-    let deadline = Instant::now() + wait_budget;
-    loop {
-        if search_cancellation_requested() {
-            return Err(SearchIndexWaitError::Cancelled);
-        }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let read_budget = remaining.min(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL);
-        let Some(search_index) = try_read_with_budget(ctx.search_index(), read_budget) else {
-            if Instant::now() >= deadline {
-                return Err(SearchIndexWaitError::Contended);
-            }
-            continue;
-        };
-        if search_index.as_ref().is_some_and(|index| index.ready) {
-            return Ok(true);
-        }
-        drop(search_index);
-
-        // The loader publishes through a channel; the query holds neither the
-        // index nor receiver lock while draining, so it cannot block publication.
-        let Some(search_receiver) = try_read_with_budget(ctx.search_index_rx(), read_budget) else {
-            if Instant::now() >= deadline {
-                return Err(SearchIndexWaitError::Contended);
-            }
-            continue;
-        };
-        let load_in_progress = search_receiver.is_some();
-        drop(search_receiver);
-        if !load_in_progress {
-            return Ok(false);
-        }
-
-        #[cfg(test)]
-        SEARCH_INDEX_LOAD_WAIT_HOOK.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().as_mut() {
-                hook();
-            }
-        });
-        crate::runtime_drain::drain_search_index_events(ctx);
-        if search_cancellation_requested() {
-            return Err(SearchIndexWaitError::Cancelled);
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        std::thread::sleep(remaining.min(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL));
-    }
+    false
 }
 
 /// Ranks every semantic chunk against `query_vector` with no enumeration
@@ -7984,17 +7107,90 @@ fn recall_audit_full_semantic(
     let index = guard
         .as_ref()
         .ok_or_else(|| "semantic index is not loaded".to_string())?;
+    recall_audit_full_semantic_from(
+        crate::data_layer::tools::search::MeaningIndex::Snapshot(index),
+        project_root,
+        include_tests,
+        query_vector,
+    )
+}
+
+/// [`recall_audit_full_semantic`] over `index`, whichever source it reads.
+fn recall_audit_full_semantic_from(
+    index: crate::data_layer::tools::search::MeaningIndex<'_>,
+    project_root: &Path,
+    include_tests: bool,
+    query_vector: &[f32],
+) -> Result<Vec<recall_audit::AuditChunk>, String> {
     Ok(index
-        .search_filtered(query_vector, usize::MAX, |file| {
+        .search_filtered(query_vector, usize::MAX, &|file| {
             path_allowed_by_include_tests(file, project_root, include_tests)
         })
+        .map_err(|error| error.to_string())?
         .iter()
         .map(recall_audit::AuditChunk::from_result)
         .collect())
 }
 
+/// The data layer's meaning plane this request's semantic lane reads, when
+/// the data layer serves the lane: the plane readiness admitted, so ranking
+/// and readiness see one generation of its vectors, or, for a plan whose
+/// readiness was given rather than sampled, the plane as it stands now.
+/// `Some(None)` when the data layer serves the lane but cannot serve this
+/// request; `None` when today's index serves it.
+fn data_meaning_for(
+    ctx: &AppContext,
+    plan: &extensions::LanePlan<'_>,
+) -> Option<Option<Arc<crate::data_layer::tools::search::DataMeaning>>> {
+    let data = crate::data_layer::tools::search::DataSemantic::current(ctx)?;
+    Some(
+        plan.readiness
+            .retained()
+            .data_meaning()
+            .cloned()
+            .or_else(|| data.serving().cloned()),
+    )
+}
+
+/// The query's embedding for a search of the data layer's meaning plane:
+/// as [`embed_query`], checked against the plane's vector length.
+fn embed_query_for_data(
+    query: &str,
+    ctx: &AppContext,
+    meaning: &crate::data_layer::tools::search::DataMeaning,
+) -> Result<Vec<f32>, String> {
+    let _cost = telemetry::CostPhase::start("embedding");
+    let dimension = crate::data_layer::tools::search::MeaningIndex::Data(meaning).dimension();
+    embed_query_for_dimension(query, ctx, dimension)
+}
+
+/// The semantic lane's candidates from the data layer's meaning plane, and
+/// what the answer could not cover: files still waiting for vectors while a
+/// fill is under way, or the plane's store failing to read.
+fn data_meaning_search(
+    meaning: &crate::data_layer::tools::search::DataMeaning,
+    query_vector: &[f32],
+    fetch_limit: usize,
+    include: &dyn Fn(&Path) -> bool,
+) -> (Vec<SemanticResult>, Option<CheckoutSemanticGaps>) {
+    match crate::data_layer::tools::search::MeaningIndex::Data(meaning).search_filtered(
+        query_vector,
+        fetch_limit,
+        include,
+    ) {
+        Ok(results) => (
+            results,
+            (!meaning.complete()).then(|| CheckoutSemanticGaps::from_data(meaning)),
+        ),
+        Err(error) => (
+            Vec::new(),
+            Some(CheckoutSemanticGaps::unavailable(error.to_string())),
+        ),
+    }
+}
+
 fn search_index_ready(ctx: &AppContext) -> bool {
-    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET).unwrap_or(false)
+    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
@@ -8010,10 +7206,9 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
                         INTERACTIVE_ARTIFACT_READ_BUDGET.as_millis()
                     )
                 })?;
-        semantic_index
-            .as_ref()
-            .filter(|index| index.len() > 0)
-            .map(|index| index.dimension())
+        semantic_index.as_ref().and_then(|index| {
+            crate::data_layer::tools::search::MeaningIndex::Snapshot(index).dimension()
+        })
     };
     embed_query_for_dimension(query, ctx, index_dimension)
 }
@@ -8073,7 +7268,9 @@ fn embed_query_for_dimension(
     }
     let semantic_config = ctx.config().semantic.clone();
     let query_budget = QueryBudget::from_config(&semantic_config);
-    let mut model_ref = ctx.semantic_embedding_model().lock();
+    let mut model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+        ctx.semantic_embedding_model().lock()
+    });
     #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
     crate::semantic_index::observe_query_embedding_phase("model_mutex_first_acquired");
 
@@ -8082,12 +7279,18 @@ fn embed_query_for_dimension(
 
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_construction_start");
-        let constructed_model = EmbeddingModel::from_config_for_query(&semantic_config);
+        // Building the query model (loading it, or reaching the backend) is
+        // part of the first query's embedding wait.
+        let constructed_model = waits::timed(waits::SearchWait::Embed, || {
+            EmbeddingModel::from_config_for_query(&semantic_config)
+        });
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_construction_end");
         let constructed_model = constructed_model?;
 
-        model_ref = ctx.semantic_embedding_model().lock();
+        model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+            ctx.semantic_embedding_model().lock()
+        });
         #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
         crate::semantic_index::observe_query_embedding_phase("model_mutex_second_acquired");
         if model_ref.is_none() {
@@ -8097,7 +7300,9 @@ fn embed_query_for_dimension(
             {
                 let _discarded_model = constructed_model;
             }
-            model_ref = ctx.semantic_embedding_model().lock();
+            model_ref = waits::timed(waits::SearchWait::ModelLock, || {
+                ctx.semantic_embedding_model().lock()
+            });
             #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
             crate::semantic_index::observe_query_embedding_phase("model_mutex_reacquired");
         }
@@ -8106,13 +7311,31 @@ fn embed_query_for_dimension(
     let model = model_ref
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
+    // Embed through a handle on the installed model rather than under its
+    // mutex: the backend round trip of one query must not hold up another
+    // query whose vector is already cached. The handle keeps the
+    // serialization the backend itself needs (see `share_for_query`).
+    let mut query_model = model.share_for_query();
+    drop(model_ref);
+    let known_dimension = query_model.known_dimension();
     // Preserve the raw error so the timeout marker injected by
     // `send_embedding_request` survives — `classify_embed_query_error` reads it
     // to decide whether the configured query budget fired.
-    let query_vector = model
-        .embed_query_cached(query, query_budget)
-        .map_err(|error| format!("failed to embed query: {error}"))?;
-    drop(model_ref);
+    let query_vector = waits::timed(waits::SearchWait::Embed, || {
+        query_model.embed_query_cached(query, query_budget)
+    })
+    .map_err(|error| format!("failed to embed query: {error}"))?;
+    // A backend that reported its dimension with this query tells the
+    // installed model too, as it did when the query ran on that model.
+    if query_model.known_dimension() != known_dimension {
+        if let Some(model) = waits::timed(waits::SearchWait::ModelLock, || {
+            ctx.semantic_embedding_model().lock()
+        })
+        .as_mut()
+        {
+            model.adopt_query_dimension(&query_model);
+        }
+    }
 
     check_query_dimension(query_vector, index_dimension)
 }
@@ -8448,6 +7671,7 @@ fn format_grep_lexical_unavailable_text(
     project_root: &Path,
     footer_reason: &str,
 ) -> String {
+    let project_root = result_display_root(project_root);
     if result.matches.is_empty() {
         let retry = retry_nudge_for_unavailable_detail(detail);
         return format!(
@@ -8545,7 +7769,7 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
             let retrying_read_only_snapshot =
                 !crate::semantic_index::is_onnx_runtime_unavailable(error)
                     && ctx.shared_artifacts_read_only()
-                    && super::configure::trigger_semantic_index_reload_if_evicted(ctx);
+                    && false;
             Some(if retrying_read_only_snapshot {
                 SemanticLaneGap {
                     semantic_status: "building",
@@ -8568,8 +7792,8 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
 
 /// The gap for a ready index that is not loaded in memory. Starts a reload
 /// when the index was evicted, and says so.
-fn semantic_not_loaded_gap(ctx: &AppContext) -> SemanticLaneGap {
-    let reloading = super::configure::trigger_semantic_index_reload_if_evicted(ctx);
+fn semantic_not_loaded_gap(_ctx: &AppContext) -> SemanticLaneGap {
+    let reloading = false;
     SemanticLaneGap {
         semantic_status: "unavailable",
         status: "not_ready",
@@ -8964,6 +8188,7 @@ fn format_grep_search_text(
     project_root: &Path,
     interpreted_as: &str,
 ) -> String {
+    let project_root = result_display_root(project_root);
     let base = crate::commands::grep::format_grep_text(result, project_root);
     format!("{base}\n[interpreted_as: {interpreted_as}]")
 }
@@ -9117,13 +8342,27 @@ fn snippet_read_plans(
 }
 
 fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
+    // A file an earlier phase of this request read is cut into lines from
+    // those bytes; otherwise only the lines the plan needs are read.
+    if let Some(file) = request_files::current().and_then(|files| files.kept(path)) {
+        return bounded_snippet_lines_from(&mut file.bytes(), plan);
+    }
+    let _read = waits::time(waits::SearchWait::FileRead);
     let file = fs::File::open(path).ok()?;
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
-    let mut reader = std::io::BufReader::new(file);
+    #[cfg(test)]
+    request_files::record_disk_read(path);
+    bounded_snippet_lines_from(&mut std::io::BufReader::new(file), plan)
+}
+
+fn bounded_snippet_lines_from(
+    reader: &mut impl std::io::BufRead,
+    plan: SnippetReadPlan,
+) -> Option<Vec<String>> {
     let mut lines = Vec::new();
     let mut nonempty_lines = 0usize;
-    while let Some((line, nonempty)) = read_bounded_snippet_line(&mut reader).ok()? {
+    while let Some((line, nonempty)) = read_bounded_snippet_line(reader).ok()? {
         nonempty_lines += usize::from(nonempty);
         lines.push(line);
         if plan.is_satisfied(lines.len() - 1, nonempty_lines) {
@@ -9397,9 +8636,11 @@ fn enrich_snippets_from_source_reference(
         }
 
         let lines = file_lines.entry(result.file.clone()).or_insert_with(|| {
-            fs::read_to_string(&result.file)
-                .ok()
-                .map(|content| content.lines().map(str::to_string).collect())
+            waits::timed(waits::SearchWait::FileRead, || {
+                fs::read_to_string(&result.file)
+            })
+            .ok()
+            .map(|content| content.lines().map(str::to_string).collect())
         });
 
         if matches!(result.kind, SymbolKind::FileSummary) {
@@ -9638,6 +8879,7 @@ fn format_result_sections_counted(
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> (String, usize) {
+    let project_root = result_display_root(project_root);
     // Results arrive sorted by fused score desc. Group by file preserving
     // first-appearance order so the most relevant file's group renders first.
     // A BTreeMap would re-sort groups alphabetically by path and scramble the
@@ -9777,30 +9019,43 @@ fn push_snippet_lines(out: &mut snippet_bounds::BudgetedText, snippet: &str) -> 
 }
 
 fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<Option<String>> {
-    let Some(store) = warm_callgraph_store(ctx) else {
+    let Some((graph, view)) = warm_callgraph(ctx) else {
         return vec![None; results.len()];
     };
 
-    results
+    let annotations = results
         .iter()
-        .map(|result| blast_radius_annotation_for_result(&store, result))
-        .collect()
+        .map(|result| blast_radius_annotation_for_result(&graph, &view, result))
+        .collect();
+    // A file whose slice could not be read looked absent, so the counts may
+    // be short: leave every annotation out rather than show a wrong one.
+    if crate::data_layer::tools::callgraph::read_failure(&view).is_some() {
+        return vec![None; results.len()];
+    }
+    annotations
 }
 
-fn warm_callgraph_store(
+/// The index store's call graph for `ctx`'s root when it is current now:
+/// published, with no recorded edit waiting for it. Search annotates only
+/// from such a graph; it never waits for a refresh or starts one.
+fn warm_callgraph(
     ctx: &AppContext,
-) -> Option<std::sync::Arc<crate::callgraph_store::ReadonlyCallGraphStore>> {
-    let receiver = ctx.callgraph_store_rx().try_lock()?;
-    if receiver.is_some() {
-        return None;
-    }
-    drop(receiver);
-    try_read_with_budget(ctx.callgraph_store(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-        .and_then(|store| store.as_ref().map(std::sync::Arc::clone))
+) -> Option<(
+    crate::data_layer::tools::callgraph::DataGraph,
+    crate::data_layer::checkout::CheckoutView,
+)> {
+    let checkout = ctx
+        .data_checkout()
+        .filter(|checkout| checkout.checkout().planes().callgraph)?;
+    let view = checkout.view().filter(|view| {
+        view.status().callgraph == crate::data_layer::checkout::PlaneStatus::Ready
+    })?;
+    Some((view.callgraph(), view))
 }
 
 fn blast_radius_annotation_for_result(
-    store: &crate::callgraph_store::ReadonlyCallGraphStore,
+    graph: &crate::data_layer::tools::callgraph::DataGraph,
+    view: &crate::data_layer::checkout::CheckoutView,
     result: &HybridResult,
 ) -> Option<String> {
     if result.source == "lexical" || matches!(result.kind, SymbolKind::FileSummary) {
@@ -9809,8 +9064,11 @@ fn blast_radius_annotation_for_result(
     if result.name.trim().is_empty() {
         return None;
     }
+    if !crate::data_layer::tools::callgraph::covers(view, &result.file) {
+        return None;
+    }
 
-    let callers = callers_result(store, &result.file, &result.name, 1, true).ok()?;
+    let callers = callers_result(graph, &result.file, &result.name, 1, true).ok()?;
     let mut caller_basenames = Vec::new();
     let mut seen_files = HashSet::new();
     for group in &callers.callers {
@@ -10047,15 +9305,14 @@ fn degraded_warning(ctx: &AppContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::callgraph::walk_project_files;
-    use crate::callgraph_store::CallGraphStore;
+
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::semantic_index::{
         with_query_budget_for_test, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex,
     };
-    use serde_json::Value;
+
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -10099,18 +9356,6 @@ mod tests {
         .expect("build semantic search request")
     }
 
-    fn semantic_page_request(query: &str, top_k: usize, offset: usize) -> RawRequest {
-        serde_json::from_value(serde_json::json!({
-            "id": "semantic-search-page-test",
-            "command": "semantic_search",
-            "query": query,
-            "top_k": top_k,
-            "offset": offset,
-            "hint": "literal",
-        }))
-        .expect("build paged semantic search request")
-    }
-
     fn response_value(response: Response) -> serde_json::Value {
         serde_json::to_value(response).expect("serialize response")
     }
@@ -10137,7 +9382,7 @@ mod tests {
         }
         let ctx = test_context(&root);
         *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
-        *ctx.search_index().write().unwrap() = Some(SearchIndex::build(&root));
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
         take_literal_presence_counts();
         (project, ctx)
     }
@@ -10154,6 +9399,132 @@ mod tests {
         let response = response_value(handle_semantic_search(&request, ctx));
         assert_eq!(response["success"], true, "{response}");
         response["text"].as_str().expect("text").to_string()
+    }
+
+    #[test]
+    fn external_search_paths_are_absolute_for_walk_and_ready_index() {
+        let projects = tempfile::tempdir().expect("projects");
+        let storage = tempfile::tempdir().expect("storage");
+        let external = projects.path().join("project-a");
+        let session = projects.path().join("project-b");
+        for root in [&external, &session] {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("src/lib.rs"),
+                "pub fn handle_request(token: &str) -> bool { !token.is_empty() }\n// (?=handle_request)\n",
+            )
+            .unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let external = std::fs::canonicalize(external).unwrap();
+        let session = std::fs::canonicalize(session).unwrap();
+        let context = |root: &Path| {
+            let ctx = test_context(root);
+            ctx.update_config(|config| {
+                config.storage_dir = Some(storage.path().to_path_buf());
+                config.indexes.semantic = false;
+            });
+            ctx
+        };
+        let caller = context(&session);
+        let indexed = context(&external);
+        let requests = [
+            (
+                "query",
+                serde_json::json!({"query": "handle_request", "hint": "literal"}),
+            ),
+            ("pattern", serde_json::json!({"pattern": "handle_request"})),
+            (
+                "split",
+                serde_json::json!({"query": "handle_request", "pattern": "handle_request"}),
+            ),
+            (
+                "literal fallback",
+                serde_json::json!({"query": "(?=handle_request)"}),
+            ),
+            (
+                "nearest name",
+                serde_json::json!({"query": "handle_requesx"}),
+            ),
+        ];
+        // Rendered relative paths use this platform's separator (`src\lib.rs` on Windows).
+        let relative = Path::new("src").join("lib.rs").display().to_string();
+        for ready in [false, true] {
+            if ready {
+                crate::data_layer::surfaces::serve_text_index_for_test(&indexed);
+                assert!(
+                    crate::data_layer::tools::search::ExternalSearch::of(&caller, &external)
+                        .is_some()
+                );
+            } else {
+                assert!(
+                    crate::data_layer::tools::search::ExternalSearch::of(&caller, &external)
+                        .is_none()
+                );
+            }
+            for (route, params) in &requests {
+                // Suggestions and automatic regex-to-literal recovery belong
+                // to the engine; an unindexed walk has neither route.
+                if !ready && matches!(*route, "nearest name" | "literal fallback") {
+                    continue;
+                }
+                let mut req = semantic_request("", 5);
+                req.params = params.clone();
+                req.params["path"] = serde_json::json!(external);
+                let response = handle_semantic_search(&req, &caller);
+                assert!(response.success, "{route}, ready={ready}: {response:?}");
+                let text = response.data["text"].as_str().expect("text");
+                assert!(
+                    text.contains(&external.join("src/lib.rs").display().to_string()),
+                    "{route}, ready={ready}: {text}"
+                );
+                assert!(
+                    !text.lines().any(|line| line.starts_with(&relative)),
+                    "{route}, ready={ready}: {text}"
+                );
+                if ready {
+                    assert_eq!(
+                        response.data["fully_degraded"], false,
+                        "{route}: {response:?}"
+                    );
+                }
+                if ready && *route == "literal fallback" {
+                    assert_eq!(response.data["interpreted_as"], "literal", "{text}");
+                }
+                if *route == "split" {
+                    assert!(
+                        !text.contains(&format!("defined in {relative}")),
+                        "pattern summary must also identify the external project: {text}"
+                    );
+                }
+            }
+        }
+        // An external request must not change later rendering in its own root.
+        let response = handle_semantic_search(&semantic_request("handle_request", 5), &indexed);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains(&relative), "{text}");
+        assert!(!text.contains(&external.display().to_string()), "{text}");
+    }
+
+    #[test]
+    fn external_search_presentation_restores_after_nested_calls_and_panics() {
+        let root = Path::new("project");
+        assert_eq!(result_display_root(root), root);
+        let panic = std::panic::catch_unwind(|| {
+            with_absolute_result_paths(|| {
+                assert_eq!(result_display_root(root), Path::new(""));
+                with_absolute_result_paths(|| assert_eq!(result_display_root(root), Path::new("")));
+                assert_eq!(result_display_root(root), Path::new(""));
+                panic!("test presentation cleanup");
+            });
+        });
+        assert!(panic.is_err());
+        assert_eq!(result_display_root(root), root);
     }
 
     #[test]
@@ -10192,141 +9563,6 @@ mod tests {
         let text = presence_search(&ctx, "where is new-file.rs", 10, 0);
         assert!(text.contains("new-file.rs"), "{text}");
         assert!(crate::search_hot_path_measurements::counts().project_walks >= 1);
-    }
-
-    #[test]
-    #[ignore = "opt-in 20,000-file engine execution latency measurement"]
-    fn search_exec_latency_large_project() {
-        use crate::search_hot_path_measurements::{counts, reset};
-        let project = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(project.path()).unwrap();
-        for directory in 0..100 {
-            let dir = root.join(format!("src/subsystem_{directory:03}"));
-            fs::create_dir_all(&dir).unwrap();
-            for file in 0..200 {
-                let id = directory * 200 + file;
-                let path = dir.join(format!("module_{id:05}.rs"));
-                let content = format!(
-                    "//! Implementation of subsystem {directory}.\n\
-                    /// Processes domain events for module {id}.\n\
-                    pub fn module_{id}(value: usize) -> usize {{\n    value.saturating_add({id})\n}}\n\
-                    #[derive(Clone, Debug, Default)]\n\
-                    pub struct State{id} {{ pub value: usize, pub sequence: u64, pub pending: Vec<usize> }}\n\
-                    impl State{id} {{\n\
-                        pub fn record(&mut self, value: usize) {{\n\
-                            self.pending.push(value);\n\
-                            self.sequence = self.sequence.wrapping_add(1);\n\
-                            self.value = self.value.saturating_add(value);\n\
-                        }}\n\
-                        pub fn drain(&mut self) -> Vec<usize> {{ std::mem::take(&mut self.pending) }}\n\
-                        pub fn reset(&mut self) {{ self.value = 0; self.pending.clear(); }}\n\
-                        pub fn is_idle(&self) -> bool {{ self.pending.is_empty() }}\n\
-                    }}\n"
-                );
-                fs::write(&path, &content).unwrap();
-            }
-        }
-        let path = root.join("src/retry.rs");
-        let content = "/// The scheduler handles retries with a retry policy.\npub fn retry_policy() -> bool { true }\n// retry-policy-enabled\n";
-        fs::write(&path, content).unwrap();
-        let index = SearchIndex::build(&root);
-        assert_eq!(index.file_count(), 20_001);
-        let mut ctx = test_context(&root);
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
-        *ctx.search_index().write().unwrap() = Some(index);
-        for (class, query, pattern) in [
-            (
-                "natural_language",
-                "how does the scheduler handle retries",
-                None,
-            ),
-            (
-                "broad_exact_window",
-                "how does subsystem module value",
-                None,
-            ),
-            (
-                "prose_identifier",
-                "how does retry_policy schedule work",
-                None,
-            ),
-            ("identifier", "retry_policy", None),
-            ("missing_identifier", "missing_retry_policy", None),
-            ("code_literal", "\"retry-policy-enabled\"", None),
-            ("path", "retry.rs", None),
-            ("unresolved_path", "absent.rs", None),
-            ("prose_path", "where is retry.rs implemented", None),
-            (
-                "split_identifier",
-                "how does retry_policy schedule work",
-                Some("retry_policy"),
-            ),
-            (
-                "split_path",
-                "where is retry.rs implemented",
-                Some("retry_policy"),
-            ),
-        ] {
-            // Start each query with fresh request caches while retaining the
-            // prepared corpus; context setup stays outside the timed samples.
-            let index = ctx.search_index().write().unwrap().take().unwrap();
-            ctx = test_context(&root);
-            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
-            *ctx.search_index().write().unwrap() = Some(index);
-            let mut timings = Vec::new();
-            let mut cold = None;
-            let mut repeat = None;
-            let mut digests = HashSet::new();
-            for sample in 0..31 {
-                let mut request = serde_json::json!({
-                    "id": "search-exec-latency", "command": "semantic_search",
-                    "query": query, "top_k": 10,
-                });
-                if let Some(pattern) = pattern {
-                    request["pattern"] = serde_json::json!(pattern);
-                }
-                let request: RawRequest = serde_json::from_value(request).unwrap();
-                reset();
-                let started = Instant::now();
-                let response = handle_semantic_search(&request, &ctx);
-                let elapsed = started.elapsed();
-                let response = response_value(response);
-                assert_eq!(response["success"], true, "{response}");
-                assert_eq!(
-                    response["structuredContent"]["plan"]["readiness"]["lexical_index"], true,
-                    "{response}"
-                );
-                assert_eq!(
-                    response["structuredContent"]["plan"]["readiness"]["semantic_index"], false,
-                    "{response}"
-                );
-                let text = response["text"].as_str().unwrap();
-                let millis = elapsed.as_secs_f64() * 1000.0;
-                if sample == 0 {
-                    cold = Some(serde_json::json!({
-                        "exec_ms": millis, "work": counts(),
-                        "plan": response["structuredContent"]["plan"],
-                    }));
-                } else {
-                    timings.push(millis);
-                    repeat = Some(counts());
-                }
-                let normalized = text.replace(root.to_string_lossy().as_ref(), "<fixture>");
-                digests.insert(blake3::hash(normalized.as_bytes()).to_hex().to_string());
-            }
-            timings.sort_by(f64::total_cmp);
-            println!(
-                "SEARCH_EXEC {}",
-                serde_json::json!({
-                    "class": class, "query": query, "pattern": pattern, "files": 20_001,
-                "cold": cold, "repeat_samples": timings.len(),
-                "repeat_p50_ms": (timings[14] + timings[15]) / 2.0,
-                "repeat_p95_ms": timings[28], "repeat_work": repeat,
-                "repeat_exec_ms": timings,
-                    "text_digests": digests,
-                })
-            );
-        }
     }
 
     const BASH_WAIT_DETACH_ABSENT: &str = "No file contains `bash_wait_detach(`.";
@@ -10475,340 +9711,6 @@ mod tests {
         assert!(!text.contains("[similar]"), "{text}");
     }
 
-    /// The watcher updates the resident trigram index in place, which keeps
-    /// the index generation, so a kept absence is still found under the same
-    /// key on the next page. The possible-holder set it was settled against
-    /// changes when a file that may hold the literal is indexed, so the next
-    /// page settles again and finds it.
-    #[test]
-    fn kept_absence_is_settled_again_when_a_new_file_may_hold_the_literal() {
-        let (project, ctx) = presence_project(&[
-            ONLY_NAMES_IT,
-            ("config/settings.toml", "bash_wait_detach = true\n"),
-        ]);
-        let root = fs::canonicalize(project.path()).unwrap();
-        let first = presence_search(&ctx, "bash_wait_detach(", 1, 0);
-        assert!(first.starts_with(BASH_WAIT_DETACH_ABSENT), "{first}");
-        take_literal_presence_counts();
-
-        let generation = ctx.search_index_rx_generation();
-        let added = root.join("src/run.rs");
-        fs::write(
-            &added,
-            "fn run(task: u32) {\n    bash_wait_detach(task);\n}\n",
-        )
-        .unwrap();
-        ctx.search_index()
-            .write()
-            .unwrap()
-            .as_mut()
-            .expect("resident index")
-            .update_file(&added);
-        assert_eq!(
-            ctx.search_index_rx_generation(),
-            generation,
-            "an in-place index update keeps the generation, so the key is unchanged"
-        );
-
-        let second = presence_search(&ctx, "bash_wait_detach(", 1, 1);
-        assert!(
-            !second.starts_with("Found 0 results"),
-            "page 2 has a result: {second}"
-        );
-        assert!(!second.contains("No file contains"), "{second}");
-        let (reads, _) = take_literal_presence_counts();
-        assert!(reads > 0, "the absence must be settled again: {second}");
-    }
-
-    /// A readiness sample runs on the search path, so it reports the views-on
-    /// checkout index the worker last built for the installed snapshot and
-    /// does not rebuild it, even when that index is out of date.
-    #[test]
-    fn readiness_sample_never_builds_the_checkout_semantic_index() {
-        use extensions::ReadinessSource as _;
-        let project = tempfile::tempdir().expect("project");
-        let storage = tempfile::tempdir().expect("storage");
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        std::fs::write(root.join("lib.rs"), "pub fn needle() -> u8 {\n    1\n}\n").unwrap();
-        let ctx = test_context(&root);
-        let slot = ctx.checkout_semantic();
-        let (epoch, _wake) = slot.begin();
-        let runtime = Arc::new(
-            crate::views::semantic_runtime::CheckoutSemantic::new(
-                &crate::root_cache::StoragePaths::same(storage.path()),
-                "family",
-                "scope",
-                &root,
-                crate::views::semantic::SemanticProducer::current(
-                    "readiness-model",
-                    crate::semantic_index::EmbedTextCaps::default(),
-                ),
-                Arc::downgrade(slot),
-            )
-            .unwrap(),
-        );
-        runtime.load().unwrap();
-        runtime
-            .refresh(
-                crate::views::semantic::FillBudget::default(),
-                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-            )
-            .unwrap();
-        runtime.index().unwrap();
-        assert!(slot.install(epoch, Arc::clone(&runtime)));
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-
-        // An edit the driver has recorded makes the built index out of date.
-        std::fs::write(root.join("lib.rs"), "pub fn moved() {}\n").unwrap();
-        runtime
-            .driver()
-            .record_absolute_change(&root.join("lib.rs"));
-        let builds = runtime.plane().overlay_builds();
-        let source = RuntimeReadinessSource { ctx: &ctx };
-        let observation = source.sample();
-        assert!(
-            observation.semantic.snapshot.is_some(),
-            "a served checkout view must report as ready"
-        );
-        assert_eq!(
-            runtime.plane().overlay_builds(),
-            builds,
-            "a readiness sample built the checkout semantic index"
-        );
-    }
-
-    /// After a fill publishes a base readiness successor, the worker installs
-    /// that successor before it rebuilds the scored index. A search in that window
-    /// must still see the views-on semantic lane as ready: with no snapshot the
-    /// engine plans no semantic lane and answers lexical hits only, with no
-    /// symbol names or previews, while the reply still says `semantic: ready`.
-    #[test]
-    fn readiness_sample_serves_a_freshly_published_checkout_view() {
-        use extensions::ReadinessSource as _;
-        let project = tempfile::tempdir().expect("project");
-        let storage = tempfile::tempdir().expect("storage");
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        std::fs::write(root.join("lib.rs"), "pub fn needle() -> u8 {\n    1\n}\n").unwrap();
-        let ctx = test_context(&root);
-        let slot = ctx.checkout_semantic();
-        let (epoch, _wake) = slot.begin();
-        let runtime = Arc::new(
-            crate::views::semantic_runtime::CheckoutSemantic::new(
-                &crate::root_cache::StoragePaths::same(storage.path()),
-                "family",
-                "scope",
-                &root,
-                crate::views::semantic::SemanticProducer::current(
-                    "readiness-model",
-                    crate::semantic_index::EmbedTextCaps::default(),
-                ),
-                Arc::downgrade(slot),
-            )
-            .unwrap(),
-        );
-        runtime.load().unwrap();
-        // The file is inherited from the base. Its fill replaces the composed
-        // base generation; the worker manifest's base header stays fixed.
-        // Do not build the scored index here. The source.sample() call below
-        // must supply it even when publication has finished but the worker's
-        // index rebuild has not.
-        let published_before = runtime
-            .installed()
-            .generation()
-            .base()
-            .unwrap()
-            .name()
-            .to_owned();
-        runtime
-            .refresh(
-                crate::views::semantic::FillBudget::default(),
-                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-            )
-            .unwrap();
-        assert_ne!(
-            runtime.installed().generation().base().unwrap().name(),
-            published_before,
-            "the fill must install the base readiness successor"
-        );
-        assert!(slot.install(epoch, Arc::clone(&runtime)));
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-
-        let source = RuntimeReadinessSource { ctx: &ctx };
-        let observation = source.sample();
-        let sampled = observation
-            .semantic
-            .snapshot
-            .as_ref()
-            .and_then(extensions::SemanticSnapshot::index)
-            .map(|index| index as *const crate::semantic_index::SemanticIndex);
-        assert!(
-            sampled.is_some(),
-            "a freshly published checkout view must report as ready"
-        );
-        assert_eq!(
-            sampled,
-            Some(Arc::as_ptr(&runtime.index().unwrap())),
-            "readiness must hold the index that search scores for the installed snapshot"
-        );
-    }
-
-    /// A views-on root is served only by its checkout view. When the view's
-    /// index for the installed snapshot cannot be built, the search must not
-    /// answer lexical hits under `semantic: ready`: it reports the semantic
-    /// lane as unavailable and names why.
-    #[test]
-    fn views_on_search_names_a_checkout_index_that_cannot_be_built() {
-        let project = tempfile::tempdir().expect("project");
-        let storage = tempfile::tempdir().expect("storage");
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        std::fs::write(
-            root.join("lib.rs"),
-            "pub fn watchdog_needle() -> u8 {\n    1\n}\n",
-        )
-        .unwrap();
-        let ctx = test_context(&root);
-        install_ready_search_index(&ctx, &root);
-        let slot = ctx.checkout_semantic();
-        let (epoch, _wake) = slot.begin();
-        let runtime = Arc::new(
-            crate::views::semantic_runtime::CheckoutSemantic::new(
-                &crate::root_cache::StoragePaths::same(storage.path()),
-                "family",
-                "scope",
-                &root,
-                crate::views::semantic::SemanticProducer::current(
-                    "readiness-model",
-                    crate::semantic_index::EmbedTextCaps::default(),
-                ),
-                Arc::downgrade(slot),
-            )
-            .unwrap(),
-        );
-        runtime.load().unwrap();
-        // Fill and fold without the worker's rebuild, so the installed
-        // snapshot has no index and the next sample has to build one.
-        runtime
-            .refresh(
-                crate::views::semantic::FillBudget::default(),
-                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-            )
-            .unwrap();
-        assert!(slot.install(epoch, Arc::clone(&runtime)));
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-        // The error the plane reports when the installed generation is not
-        // resident.
-        let reason = "semantic plane: semantic generation not resident";
-        let _failure =
-            crate::views::semantic_runtime::fail_serving_index_build_for_test(&root, reason);
-
-        let response = response_value(handle_semantic_search(
-            &semantic_request("where is the watchdog needle defined", 5),
-            &ctx,
-        ));
-        assert_eq!(response["success"], true, "{response:#}");
-        assert_eq!(
-            response["semantic_status"], "unavailable",
-            "a checkout view that cannot serve must not read as ready: {response:#}"
-        );
-        assert_eq!(response["complete"], false, "{response:#}");
-        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
-        let text = response["text"].as_str().expect("text");
-        assert!(
-            text.contains(&format!("Semantic search unavailable: {reason}")),
-            "the reply must name the reason: {text}"
-        );
-        assert!(
-            !text.contains("semantic: ready"),
-            "the reply must not claim a ready semantic lane: {text}"
-        );
-        assert!(
-            text.contains(&format!("semantic: unavailable for this query ({reason})")),
-            "the lane footer must name the reason: {text}"
-        );
-        // Health counts the view that could not serve, with its full error,
-        // and marks the project degraded until a later successful load.
-        let health = ctx.try_health_snapshot(&root);
-        let last = health
-            .view_load_failure_last
-            .expect("the semantic view failure must reach health");
-        assert_eq!(last.plane, "semantic");
-        assert_eq!(last.error, reason);
-        assert!(
-            health
-                .view_load_failures
-                .keys()
-                .any(|key| key.starts_with("semantic:")),
-            "{:?}",
-            health.view_load_failures
-        );
-        assert!(ctx
-            .degraded_reasons()
-            .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
-    }
-
-    /// A started views-on lane with no loaded view yet answers for the state
-    /// its slot is in, even when something rewrote the shared status to ready
-    /// (watcher-gap invalidation does): a loading lane reads as building with
-    /// the building disclosure, a failed lane as unavailable with its reason.
-    /// Neither may answer lexical hits under `semantic: ready`.
-    #[test]
-    fn views_on_search_reports_a_loading_or_failed_lane_under_a_ready_status() {
-        let project = tempfile::tempdir().expect("project");
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        std::fs::write(
-            root.join("lib.rs"),
-            "pub fn watchdog_needle() -> u8 {\n    1\n}\n",
-        )
-        .unwrap();
-        let ctx = test_context(&root);
-        install_ready_search_index(&ctx, &root);
-        let slot = ctx.checkout_semantic();
-        let query = "where is the watchdog needle defined";
-        let footer = |text: &str| {
-            text.lines()
-                .find(|line| line.starts_with("semantic:"))
-                .unwrap_or_default()
-                .to_owned()
-        };
-
-        let (_loading, _wake) = slot.begin();
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-        let response = response_value(handle_semantic_search(&semantic_request(query, 5), &ctx));
-        assert_eq!(response["success"], true, "{response:#}");
-        assert_eq!(response["semantic_status"], "building", "{response:#}");
-        assert_eq!(response["complete"], false, "{response:#}");
-        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
-        let text = response["text"].as_str().expect("text");
-        assert!(
-            text.starts_with("Semantic index is building"),
-            "a loading lane must open with the building disclosure: {text}"
-        );
-        assert_eq!(footer(text), "semantic: building", "{text}");
-
-        let (failed, _wake) = slot.begin();
-        let reason = "view load: semantic plane: semantic generation not resident";
-        assert!(slot.fail(failed, reason.to_string()));
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-        let response = response_value(handle_semantic_search(&semantic_request(query, 5), &ctx));
-        assert_eq!(response["success"], true, "{response:#}");
-        assert_eq!(response["semantic_status"], "unavailable", "{response:#}");
-        assert_eq!(response["complete"], false, "{response:#}");
-        assert_eq!(response["lexical_only_fallback"], true, "{response:#}");
-        let text = response["text"].as_str().expect("text");
-        assert!(
-            text.starts_with(&format!("Semantic search unavailable: {reason}")),
-            "a failed lane must open with its reason: {text}"
-        );
-        assert_eq!(
-            footer(text),
-            format!(
-                "semantic: unavailable: {}",
-                crate::feature_status::cause::SEMANTIC_BUILD_FAILED
-            ),
-            "{text}"
-        );
-    }
-
     /// Mark the semantic lane ready with an empty resident index, so a test
     /// can exercise the walk routes aft_search takes while the trigram lane
     /// is not ready.
@@ -10864,11 +9766,8 @@ mod tests {
         assert!(!text.contains("semantic: ready"), "{text}");
     }
 
-    fn install_ready_search_index(ctx: &AppContext, project_root: &Path) {
-        let index = SearchIndex::build(project_root);
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+    fn install_ready_search_index(ctx: &AppContext, _project_root: &Path) {
+        crate::data_layer::surfaces::serve_text_index_for_test(ctx);
     }
 
     #[test]
@@ -10948,22 +9847,6 @@ mod tests {
             assert_eq!(result.file, root.join(format!("needle_{index:04}.rs")));
             assert!(result.exact);
         }
-    }
-
-    fn install_warm_callgraph_store(ctx: &AppContext, project_root: &Path) {
-        let root = std::fs::canonicalize(project_root).expect("canonical project root");
-        let files = walk_project_files(&root).collect::<Vec<_>>();
-        let store_dir = root.join(".callgraph-store-test");
-        let store =
-            CallGraphStore::open(store_dir.clone(), root.clone()).expect("open callgraph store");
-        store.cold_build(&files).expect("build callgraph store");
-        drop(store);
-        let store = CallGraphStore::open_readonly(store_dir, root)
-            .expect("open read-only callgraph store")
-            .expect("ready callgraph store");
-        *ctx.callgraph_store()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));
     }
 
     struct BlockingLocalProvider {
@@ -11081,21 +9964,50 @@ mod tests {
         handle.join().expect("embedding server thread");
     }
 
+    /// A context whose meaning plane is served for `semantic`, a fake
+    /// Synapse whose model lane refuses embeddings. The project holds no file
+    /// meaning search applies to (a `.txt` note), so the plane is complete
+    /// once made; it is made without loading the model, since the fake
+    /// serves one session and the query must have it. Returns the project,
+    /// its storage and the context.
+    /// The project, its storage, the context, and the guard that keeps
+    /// meaning-search fills off the fake backend: hold the guard for the
+    /// whole test. A fill round the query starts after it dropped would send
+    /// its own embedding request, which the tests count and which can pause
+    /// the lane before the query sees it.
+    fn served_over_fake_synapse(
+        mut semantic: SemanticBackendConfig,
+    ) -> (tempfile::TempDir, tempfile::TempDir, AppContext, impl Drop) {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(
+            root.join("remix-panel.txt"),
+            "// where remix panel mounted option switching handled\nexport const panel = true;\n",
+        )
+        .unwrap();
+        let ctx = test_context(&root);
+        semantic.route_project_root = Some(root.clone());
+        ctx.update_config(|config| {
+            config.semantic = semantic.clone();
+            config.storage_dir = Some(storage.path().to_path_buf());
+        });
+        ctx.set_canonical_cache_root(root.clone());
+        crate::semantic_admission::note_opened("data-layer-synapse-test", &root);
+        let model_free = crate::data_layer::meaning::fill_without_model_for_test(&root, 2);
+        wait_for_data_semantic(&ctx, |data| {
+            data.serving().is_some_and(|meaning| meaning.complete())
+        });
+        (project, storage, ctx, model_free)
+    }
+
     #[test]
     fn lane_paused_query_returns_lexical_results_with_approved_gap() {
         use crate::synapse_embed::pause_test_support::*;
         crate::semantic_index::with_lane_pause_clock(START, |clock| {
-            with_fake_synapse(clock.clone(), None, |mut semantic, requests| {
-                let project = tempfile::tempdir().unwrap();
-                std::fs::write(project.path().join("remix-panel.ts"),
-                    "// where remix panel mounted option switching handled\nexport const panel = true;\n").unwrap();
-                let ctx = test_context(project.path());
-                semantic.route_project_root = Some(project.path().to_path_buf());
-                ctx.update_config(|config| config.semantic = semantic.clone());
-                ctx.set_canonical_cache_root(project.path().to_path_buf());
-                *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-                *ctx.semantic_index().write().unwrap() =
-                    Some(SemanticIndex::new(project.path().to_path_buf(), 2));
+            with_fake_synapse(clock.clone(), None, |semantic, requests| {
+                let (_project, _storage, ctx, _model_free) = served_over_fake_synapse(semantic);
+                let before = requests.lock().unwrap().len();
                 let response = response_value(handle_semantic_search(
                     &semantic_request("where remix panel mounted option switching handled", 5),
                     &ctx,
@@ -11115,7 +10027,7 @@ mod tests {
                 assert!(!text.contains("semantic.query_timeout_ms"));
                 assert!(!text.contains("scheduled maintenance"));
                 assert_eq!(clock.load(Ordering::SeqCst), START);
-                assert_eq!(requests.lock().unwrap().len(), 2);
+                assert_eq!(requests.lock().unwrap().len() - before, 2);
                 let health = ctx.semantic_backend_health_snapshot();
                 assert!(!health.available);
                 assert_eq!(health.paused_until_ms, Some(START + PAUSE_MS));
@@ -11134,17 +10046,9 @@ mod tests {
     fn shape_compiling_query_falls_back_at_once_and_names_the_warm_up() {
         use crate::synapse_embed::pause_test_support::*;
         crate::semantic_index::with_lane_pause_clock(START, |clock| {
-            with_compiling_synapse(clock.clone(), 90_000, |mut semantic, requests| {
-                let project = tempfile::tempdir().unwrap();
-                std::fs::write(project.path().join("remix-panel.ts"),
-                    "// where remix panel mounted option switching handled\nexport const panel = true;\n").unwrap();
-                let ctx = test_context(project.path());
-                semantic.route_project_root = Some(project.path().to_path_buf());
-                ctx.update_config(|config| config.semantic = semantic.clone());
-                ctx.set_canonical_cache_root(project.path().to_path_buf());
-                *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-                *ctx.semantic_index().write().unwrap() =
-                    Some(SemanticIndex::new(project.path().to_path_buf(), 2));
+            with_compiling_synapse(clock.clone(), 90_000, |semantic, requests| {
+                let (_project, _storage, ctx, _model_free) = served_over_fake_synapse(semantic);
+                let before = requests.lock().unwrap().len();
                 let response = response_value(handle_semantic_search(
                     &semantic_request("where remix panel mounted option switching handled", 5),
                     &ctx,
@@ -11162,138 +10066,11 @@ mod tests {
                 assert!(!text.contains("shape_compiling"), "{text}");
                 // The query never waits for the compile.
                 assert_eq!(clock.load(Ordering::SeqCst), START);
-                assert_eq!(requests.lock().unwrap().len(), 2);
+                assert_eq!(requests.lock().unwrap().len() - before, 2);
                 let status = ctx.build_status_snapshot();
                 assert_eq!(status["semantic_index"]["state"], "paused", "{status}");
                 assert_eq!(status["semantic_index"]["paused_until_ms"], START + 90_000);
             });
-        });
-    }
-
-    #[test]
-    fn warm_up_during_initial_build_search_names_the_warm_up() {
-        use crate::synapse_embed::pause_test_support::*;
-        crate::semantic_index::with_lane_pause_clock(START, |_clock| {
-            let project = tempfile::tempdir().unwrap();
-            let source_file = project.path().join("remix-panel.ts");
-            let source =
-                "// where remix panel mounted option switching handled\nexport const panel = true;\n";
-            std::fs::write(&source_file, source).unwrap();
-            let ctx = test_context(project.path());
-            ctx.set_canonical_cache_root(project.path().to_path_buf());
-            // A ready keyword lane, as in the paused-build test above.
-            let mut index = SearchIndex::new();
-            index.index_file(&source_file, source.as_bytes());
-            index.ready = true;
-            *ctx.search_index().write().unwrap() = Some(index);
-            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
-                stage: "embedding".to_string(),
-                files: None,
-                entries_done: None,
-                entries_total: None,
-            };
-            record_warm_up_for_root(project.path(), START + 30_000);
-            let response = response_value(handle_semantic_search(
-                &semantic_request("where remix panel mounted option switching handled", 5),
-                &ctx,
-            ));
-            assert_eq!(response["success"], true, "{response}");
-            assert_eq!(response["lexical_only_fallback"], true, "{response}");
-            assert_eq!(
-                response["note"],
-                "Semantic search unavailable: the embedding model is warming up (expected ready in about 30s); using keyword search only."
-            );
-        });
-    }
-
-    #[test]
-    fn lane_paused_initial_build_search_shows_approved_sentence() {
-        use crate::synapse_embed::pause_test_support::*;
-        crate::semantic_index::with_lane_pause_clock(START, |_clock| {
-            let project = tempfile::tempdir().unwrap();
-            let source_file = project.path().join("remix-panel.ts");
-            let source =
-                "// where remix panel mounted option switching handled\nexport const panel = true;\n";
-            std::fs::write(&source_file, source).unwrap();
-            let ctx = test_context(project.path());
-            ctx.set_canonical_cache_root(project.path().to_path_buf());
-            // The keyword lane must already be ready. Without a resident
-            // trigram index the search starts a background build and serves
-            // only if that build finishes inside its short wait budget; on a
-            // loaded machine it does not, and with the paused semantic lane
-            // also unavailable the search refuses with
-            // `search_lanes_unavailable` before any pause notice is written.
-            let mut index = SearchIndex::new();
-            index.index_file(&source_file, source.as_bytes());
-            index.ready = true;
-            *ctx.search_index().write().unwrap() = Some(index);
-            // The cold build is waiting out the pause: no index is loaded, so
-            // the search never embeds its query and takes the lane state from
-            // the backend health snapshot.
-            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
-                stage: "embedding".to_string(),
-                files: None,
-                entries_done: None,
-                entries_total: None,
-            };
-            record_pause_for_root(project.path());
-            let response = response_value(handle_semantic_search(
-                &semantic_request("where remix panel mounted option switching handled", 5),
-                &ctx,
-            ));
-            assert_eq!(response["success"], true, "{response}");
-            assert_eq!(response["lexical_only_fallback"], true, "{response}");
-            let text = response["text"].as_str().unwrap();
-            let opening = text.split("\n\n").next().unwrap();
-            assert_eq!(
-                opening,
-                "Semantic search unavailable: the embedding model is paused; using keyword search only.",
-                "{text}"
-            );
-            assert!(!text.contains("Semantic backend unavailable"), "{text}");
-            assert!(!text.contains("scheduled maintenance"), "{text}");
-            assert_eq!(
-                response["note"],
-                "Semantic search unavailable: the embedding model is paused; using keyword search only."
-            );
-        });
-    }
-
-    #[test]
-    fn lane_paused_trigram_building_search_shows_approved_sentence() {
-        use crate::synapse_embed::pause_test_support::*;
-        crate::semantic_index::with_lane_pause_clock(START, |_clock| {
-            let project = tempfile::tempdir().unwrap();
-            let ctx = test_context(project.path());
-            ctx.set_canonical_cache_root(project.path().to_path_buf());
-            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
-                stage: "embedding".to_string(),
-                files: None,
-                entries_done: None,
-                entries_total: None,
-            };
-            let (publish, receiver) = crossbeam_channel::unbounded::<SearchIndex>();
-            ctx.install_search_index_rx(receiver, ctx.configure_generation());
-            record_pause_for_root(project.path());
-
-            // Keeping the publication sender alive holds the trigram lane in its
-            // building state while the search reply is rendered.
-            let response =
-                with_first_search_index_load_wait_budget_for_test(Duration::ZERO, || {
-                    handle_semantic_search(
-                        &semantic_request("where remix panel mounted option switching handled", 5),
-                        &ctx,
-                    )
-                });
-            let text = crate::subc_format::format_response("search", &response, false);
-            assert!(text.lines().any(|line| {
-                line == "Semantic search unavailable: the embedding model is paused; using keyword search only."
-            }), "{text}");
-            assert!(
-                text.lines().any(|line| line == "trigram: building"),
-                "{text}"
-            );
-            drop(publish);
         });
     }
 
@@ -11431,6 +10208,248 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    fn set_embedding_gate(gate: &(Mutex<bool>, Condvar), open: bool) {
+        let (released, wake) = gate;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = open;
+        wake.notify_all();
+    }
+
+    /// A context whose query model is a local provider that blocks while the
+    /// gate is closed, with its call count and a channel that hears each call
+    /// start.
+    fn context_with_gated_local_model(
+        project: &Path,
+        gate: &Arc<(Mutex<bool>, Condvar)>,
+    ) -> (AppContext, Arc<AtomicUsize>, std::sync::mpsc::Receiver<()>) {
+        let ctx = test_context(project);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        *ctx.semantic_embedding_model().lock() =
+            Some(SemanticEmbeddingModel::from_local_provider_for_test(
+                Box::new(BlockingLocalProvider {
+                    calls: Arc::clone(&calls),
+                    started: started_tx,
+                    gate: Arc::clone(gate),
+                }),
+                project.to_path_buf(),
+            ));
+        (ctx, calls, started_rx)
+    }
+
+    /// A query whose vector is cached answers while another query's
+    /// embedding is still running: the backend round trip does not hold the
+    /// context's model mutex.
+    #[test]
+    fn cached_query_vector_returns_while_another_query_embeds() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let (ctx, calls, started) = context_with_gated_local_model(project.path(), &gate);
+        let cached = embed_query("where cached vectors live", &ctx).expect("warm the cache");
+        started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("warming embedding ran");
+        set_embedding_gate(&gate, false);
+
+        let (hit, slow) = thread::scope(|scope| {
+            let slow = scope.spawn(|| {
+                with_query_budget_for_test(60_000, || {
+                    embed_query("how slow embeddings are handled", &ctx)
+                })
+            });
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("second embedding started");
+            let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+            let ctx = &ctx;
+            scope.spawn(move || {
+                let _ = hit_tx.send(embed_query("where cached vectors live", ctx));
+            });
+            // The gate is still closed: the slow query is inside the provider.
+            let hit = hit_rx.recv_timeout(Duration::from_secs(5));
+            set_embedding_gate(&gate, true);
+            (hit, slow.join().expect("slow query thread"))
+        });
+
+        let hit = hit.expect("a cached query must not wait for another query's embedding");
+        assert_eq!(hit.expect("cached query vector"), cached);
+        slow.expect("slow query embeds once the gate opens");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Two searches that miss the cache with the same query text ask the
+    /// backend once: the second waits for the first and reads its vector.
+    #[test]
+    fn concurrent_misses_for_one_query_text_embed_once() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (ctx, calls, started) = context_with_gated_local_model(project.path(), &gate);
+        let query = "how one query text is embedded once";
+
+        let (first, second) = thread::scope(|scope| {
+            let first =
+                scope.spawn(|| with_query_budget_for_test(60_000, || embed_query(query, &ctx)));
+            started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("first embedding started");
+            let second =
+                scope.spawn(|| with_query_budget_for_test(60_000, || embed_query(query, &ctx)));
+            // Let the second request reach its wait before the first ends;
+            // arriving later would only make it a plain cache hit.
+            thread::sleep(Duration::from_millis(200));
+            set_embedding_gate(&gate, true);
+            (
+                first.join().expect("first query thread"),
+                second.join().expect("second query thread"),
+            )
+        });
+
+        let first = first.expect("first query vector");
+        assert_eq!(second.expect("second query vector"), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A folder for the path-lookup lane: files a token names at several
+    /// depths, beside copies the project walk never lists (ignored by
+    /// `.gitignore` or `.aftignore`, in skipped folders, OS metadata files,
+    /// symlinks), test files, and hidden folders the walk does list. Returns
+    /// the folder and a context whose index-store checkout of it serves text.
+    fn path_lookup_fixture() -> (tempfile::TempDir, PathBuf, AppContext) {
+        let project = tempfile::tempdir().expect("create project dir");
+        let root = std::fs::canonicalize(project.path()).expect("canonical root");
+        let files = [
+            (".gitignore", "ignored/\n*.log\n"),
+            (".aftignore", "secret/\n"),
+            ("Cargo.toml", "[package]\nname = \"fixture\"\n"),
+            ("notes.md", "# notes\n"),
+            ("subc_format.rs", "pub fn top() {}\n"),
+            ("src/a/subc_format.rs", "pub fn a() {}\n"),
+            ("src/b/subc_format.rs", "pub fn b() {}\n"),
+            ("src/b/deep/nested/subc_format.rs", "pub fn nested() {}\n"),
+            ("src/b/my_subc_format.rs", "pub fn suffix() {}\n"),
+            ("src/subc_format_test.rs", "#[test] fn t() {}\n"),
+            ("tests/subc_format.rs", "#[test] fn t() {}\n"),
+            (".config/subc_format.rs", "pub fn hidden() {}\n"),
+            ("ignored/subc_format.rs", "pub fn ignored() {}\n"),
+            ("secret/subc_format.rs", "pub fn secret() {}\n"),
+            ("node_modules/pkg/subc_format.rs", "pub fn dep() {}\n"),
+            ("target/debug/subc_format.rs", "pub fn built() {}\n"),
+            ("dist/subc_format.rs", "pub fn dist() {}\n"),
+            ("src/._subc_format.rs", "resource fork\n"),
+            ("src/ehthumbs.db", "thumbs\n"),
+            ("build.log", "log line\n"),
+        ];
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&path, text).expect("write fixture file");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("src/a/subc_format.rs"),
+            root.join("src/linked_subc_format.rs"),
+        )
+        .expect("symlink fixture file");
+        let ctx = test_context(&root);
+        ctx.set_canonical_cache_root(root.clone());
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        (project, root, ctx)
+    }
+
+    /// The path-lookup lane answered from the index store's path list lists
+    /// the same files, in the same order, as the project walk it replaces:
+    /// names and suffixes at any depth, with the walk's ignore rules, skipped
+    /// folders, exclusions and the test-file filter applied.
+    #[test]
+    fn path_lookup_from_the_view_matches_the_project_walk() {
+        let (_project, root, ctx) = path_lookup_fixture();
+        let text = crate::data_layer::tools::search::DataText::ready(&ctx)
+            .expect("the checkout's text plane serves");
+        let token_sets: [&[&str]; 9] = [
+            &["subc_format.rs"],
+            &["b/subc_format.rs"],
+            &["format.rs"],
+            &["subc_format_test.rs"],
+            &["build.log"],
+            &["._subc_format.rs", "ehthumbs.db"],
+            &["linked_subc_format.rs"],
+            &["Cargo.toml", "notes.md", ".gitignore"],
+            &["src\\b\\deep\\nested\\subc_format.rs"],
+        ];
+        for include_tests in [false, true] {
+            let filter = |path: &Path| path_allowed_by_include_tests(path, &root, include_tests);
+            for tokens in token_sets {
+                let walked = path_lookup_paths(&ctx, None, &root, tokens, &filter);
+                let listed = with_watcher_live_for_test(true, || {
+                    path_lookup_paths(&ctx, Some(&text), &root, tokens, &filter)
+                });
+                assert_eq!(
+                    listed, walked,
+                    "tokens {tokens:?}, include_tests {include_tests}"
+                );
+            }
+        }
+        // The comparison above is not vacuous: the walk found nested files
+        // and left out every ignored, skipped and excluded copy.
+        let all = |path: &Path| path_allowed_by_include_tests(path, &root, true);
+        let mut found = with_watcher_live_for_test(true, || {
+            path_lookup_paths(&ctx, Some(&text), &root, &["subc_format.rs"], &all)
+        })
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .expect("under the root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ".config/subc_format.rs",
+                "src/a/subc_format.rs",
+                "src/b/deep/nested/subc_format.rs",
+                "src/b/my_subc_format.rs",
+                "src/b/subc_format.rs",
+                "subc_format.rs",
+                "tests/subc_format.rs",
+            ]
+        );
+    }
+
+    /// With a current view of the root (its file watcher running), the
+    /// path-lookup lane reads the view's path list and walks no folder.
+    /// Without a watcher, or without a view, it walks.
+    #[test]
+    fn path_lookup_walks_no_folder_when_a_current_view_exists() {
+        let (_project, root, ctx) = path_lookup_fixture();
+        let text = crate::data_layer::tools::search::DataText::ready(&ctx)
+            .expect("the checkout's text plane serves");
+        let filter = |path: &Path| path_allowed_by_include_tests(path, &root, true);
+        let lookup = |live: bool, text: Option<&crate::data_layer::tools::search::DataText>| {
+            crate::search_hot_path_measurements::reset();
+            let found = with_watcher_live_for_test(live, || {
+                path_lookup_paths(&ctx, text, &root, &["subc_format.rs"], &filter)
+            });
+            (
+                found,
+                crate::search_hot_path_measurements::counts().project_walks,
+            )
+        };
+
+        let (listed, walks) = lookup(true, Some(&text));
+        assert_eq!(walks, 0);
+        assert!(!listed.is_empty());
+        let (without_watcher, walks) = lookup(false, Some(&text));
+        assert_eq!(walks, 1);
+        assert_eq!(without_watcher, listed);
+        let (without_view, walks) = lookup(true, None);
+        assert_eq!(walks, 1);
+        assert_eq!(without_view, listed);
+    }
+
     #[test]
     fn classify_embed_query_error_names_timeout_budget_and_knob() {
         // A query-embedding timeout carries the budget that fired. The
@@ -11490,95 +10509,6 @@ mod tests {
                 classified.detail
             );
         }
-    }
-
-    #[test]
-    fn external_readiness_resamples_degraded_borrowed_load_before_once_lock_freezes_it() {
-        use crate::readonly_artifacts::{
-            with_borrowed_search_load_limits_for_test, BorrowedSearchLoadProbe,
-            BORROWED_SEARCH_LOAD_PROBES,
-        };
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        std::fs::write(root.join("lib.rs"), "pub fn borrowed_needle() {}\n").unwrap();
-        let mut index = SearchIndex::build(&root);
-        index.write_to_disk(
-            &crate::search_index::resolve_cache_dir(&root, Some(storage.path())),
-            None,
-        );
-        let ctx = test_context(&root);
-        let probe = Arc::new(BorrowedSearchLoadProbe::default());
-        probe.held.store(true, Ordering::SeqCst);
-        BORROWED_SEARCH_LOAD_PROBES
-            .lock()
-            .unwrap()
-            .insert(root.clone(), Arc::clone(&probe));
-        struct ReleaseProbe(PathBuf, Arc<BorrowedSearchLoadProbe>);
-        impl Drop for ReleaseProbe {
-            fn drop(&mut self) {
-                self.1.held.store(false, Ordering::SeqCst);
-                BORROWED_SEARCH_LOAD_PROBES.lock().unwrap().remove(&self.0);
-            }
-        }
-        let _release = ReleaseProbe(root.clone(), Arc::clone(&probe));
-        let initial = with_borrowed_search_load_limits_for_test(100_000, Duration::ZERO, || {
-            ctx.open_borrowed_search_index(&root, Some(storage.path()))
-        });
-        assert!(matches!(initial, ReadOnlyArtifact::Degraded(_)));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while probe.starts.load(Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < deadline, "borrowed loader did not start");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let source = ExternalReadinessSource::new(&ctx, &root, Some(storage.path()));
-        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
-        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                started_tx.send(()).unwrap();
-                let fresh = with_first_search_index_load_wait_budget_for_test(
-                    Duration::from_secs(2),
-                    || matches!(source.load().search, ReadOnlyArtifact::Fresh(_)),
-                );
-                done_tx.send(fresh).unwrap();
-            });
-            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            // A held loader cannot supply a ready artifact. Admission must keep
-            // waiting rather than memoizing the degraded observation in OnceLock.
-            let premature = done_rx.recv_timeout(Duration::from_millis(100));
-            assert!(matches!(premature, Err(crossbeam_channel::RecvTimeoutError::Timeout)),
-                "OnceLock froze a degraded borrowed observation before the loader was released: {premature:?}");
-            probe.held.store(false, Ordering::SeqCst);
-            assert!(
-                done_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
-                "resampling must retain the completed borrowed index"
-            );
-        });
-        assert_eq!(
-            extensions::ReadinessSource::sample(&source).trigram.status,
-            IndexStatus::Ready
-        );
-        assert_eq!(
-            probe.starts.load(Ordering::SeqCst),
-            1,
-            "resampling must reuse the same load"
-        );
-    }
-
-    #[test]
-    fn external_readiness_reports_building_before_bounded_borrow() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let ctx = test_context(project.path());
-        let source = ExternalReadinessSource::new(&ctx, project.path(), None);
-
-        let observation = extensions::ReadinessSource::sample(&source);
-
-        assert_eq!(observation.trigram.status, IndexStatus::Building);
-        assert!(matches!(
-            observation.semantic.status,
-            SemanticIndexStatus::Building { ref stage, .. } if stage == "loading_artifacts"
-        ));
     }
 
     #[test]
@@ -11669,70 +10599,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn building_status_returns_index_backed_fallback_results() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        let source = "pub fn needle_symbol() -> bool { true }\n";
-        std::fs::write(&source_file, source).expect("write source file");
-
-        let ctx = test_context(project.path());
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, source.as_bytes());
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "embedding".to_string(),
-            files: Some(1),
-            entries_done: Some(0),
-            entries_total: Some(1),
-        };
-
-        let response = response_value(handle_semantic_search(
-            &semantic_request("needle_symbol", 5),
-            &ctx,
-        ));
-
-        assert_eq!(response["success"], true);
-        assert_eq!(response["status"], "building");
-        assert_eq!(response["semantic_status"], "building");
-        // While semantic builds, only index-backed lanes produce results. The
-        // existing "lexical" label means no embedding lane ran; exact evidence
-        // may still refine those index-backed results.
-        assert_eq!(response["interpreted_as"], "lexical");
-        assert!(response["note"]
-            .as_str()
-            .expect("note")
-            .contains("lexical-only fallback"));
-        let text = response["text"].as_str().expect("text");
-        assert!(text.contains("lexical fallback"));
-        // No earlier build left an index for this root, so this is the first
-        // build; "rebuilding" would tell a new user something happened before.
-        assert!(
-            text.starts_with("Semantic index is building; lexical fallback results follow."),
-            "{text}"
-        );
-        assert!(!text.contains("rebuilding"), "{text}");
-        assert!(!text.contains(BORROWED_SEMANTIC_LOADING));
-        let results = response["results"].as_array().expect("results array");
-        assert!(
-            results.iter().any(|result| {
-                matches!(result["source"].as_str(), Some("exact" | "lexical"))
-                    && result["file"]
-                        .as_str()
-                        .expect("file")
-                        .ends_with("src/lib.rs")
-            }),
-            "expected index-backed fallback result, got {results:?}"
-        );
-    }
-
     /// Install a ready trigram index over one source file and put the semantic
     /// lane in `status`, for the disclosure tests below.
     fn lexical_ready_context_with_semantic(
@@ -11746,12 +10612,7 @@ mod tests {
         std::fs::write(&source_file, source).expect("write source file");
         let ctx = test_context(project);
         ctx.set_canonical_cache_root(project.to_path_buf());
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, source.as_bytes());
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
@@ -11789,16 +10650,67 @@ mod tests {
         );
     }
 
+    /// A context over `project` whose root is open in a session, so the data
+    /// layer's meaning plane serves its semantic search, with its own storage
+    /// and a ready trigram index. Today's semantic status is left `ready`,
+    /// so an answer that discloses a failure can only have it from the plane.
+    fn data_layer_context(project: &Path, storage: &Path) -> (PathBuf, AppContext) {
+        let root = std::fs::canonicalize(project).expect("canonical root");
+        let source_file = root.join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source_file, "pub fn needle_symbol() -> bool { true }\n")
+            .expect("write source file");
+        let ctx = test_context(&root);
+        // The storage folder is set before the checkout binds: a checkout
+        // keeps the folder it bound with, and the meaning plane looks for the
+        // ONNX Runtime and its install lock there.
+        ctx.update_config(|config| config.storage_dir = Some(storage.to_path_buf()));
+        ctx.set_canonical_cache_root(root.clone());
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        crate::semantic_admission::note_opened("data-layer-semantic-test", &root);
+        (root, ctx)
+    }
+
+    /// Asks the data layer's meaning plane of `ctx` (binding its checkout and
+    /// starting its fill) until `done` holds for how it stands.
+    fn wait_for_data_semantic(
+        ctx: &AppContext,
+        done: impl Fn(&crate::data_layer::tools::search::DataSemantic) -> bool,
+    ) -> crate::data_layer::tools::search::DataSemantic {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(found) = crate::data_layer::tools::search::DataSemantic::current(ctx)
+                .filter(|data| done(data))
+            {
+                return found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the meaning plane never reached the state: {:?}",
+                crate::data_layer::tools::search::DataSemantic::current(ctx)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A fill whose embedding model cannot load leaves the meaning plane
+    /// failed, and the reply says why, as today's failed index does.
     #[test]
     fn failed_semantic_lane_is_disclosed_in_the_reply_text() {
         let project = tempfile::tempdir().expect("create project dir");
-        let ctx = lexical_ready_context_with_semantic(
-            project.path(),
-            SemanticIndexStatus::Failed(
-                "ONNX Runtime not found. dlopen('libonnxruntime.dylib') failed: no such file. Run `npx @cortexkit/aft doctor --fix` to install it."
-                    .to_string(),
-            ),
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
+        let _failing = crate::data_layer::meaning::fail_model_loads_for_test(
+            &root,
+            "ONNX Runtime not found. dlopen('libonnxruntime.dylib') failed: no such file. Run `npx @cortexkit/aft doctor --fix` to install it.",
         );
+        wait_for_data_semantic(&ctx, |data| {
+            matches!(data.status(), SemanticIndexStatus::Failed(_))
+        });
 
         let response = response_value(handle_semantic_search(
             &semantic_request("where is the needle symbol implemented", 5),
@@ -11817,13 +10729,30 @@ mod tests {
         assert_eq!(response["semantic_status"], "unavailable");
     }
 
+    /// A fill that finds ONNX Runtime missing while the plugin is still
+    /// downloading it waits for the download, and the reply says so rather
+    /// than calling the runtime missing.
     #[test]
     fn waiting_for_the_onnx_runtime_download_is_disclosed_as_waiting() {
         let project = tempfile::tempdir().expect("create project dir");
-        let ctx = lexical_ready_context_with_semantic(
-            project.path(),
-            building(crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE),
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
+        // The plugin's installer holds this lock, with its pid, while it
+        // downloads.
+        let lock = storage
+            .path()
+            .join("onnxruntime")
+            .join(".aft-onnx-installing");
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+        let _failing = crate::data_layer::meaning::fail_model_loads_for_test(
+            &root,
+            "ONNX Runtime not found. dlopen('libonnxruntime.so') failed: no such file.",
         );
+        wait_for_data_semantic(&ctx, |data| {
+            matches!(data.status(), SemanticIndexStatus::Building { stage, .. }
+                if stage == crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE)
+        });
 
         let response = response_value(handle_semantic_search(
             &semantic_request("where is the needle symbol implemented", 5),
@@ -12034,182 +10963,61 @@ mod tests {
             .is_some_and(|reason| reason.contains("tcp connect to 127.0.0.1")));
     }
 
-    /// A first build against an unreachable embedding backend parks in its
-    /// retry loop with the index status still `Building`. The search reply used
-    /// to call that "rebuilding"; it must name the backend outage instead, with
-    /// the configured URL and the engine's reason.
+    /// A first fill against an embedding backend nothing listens on is retried
+    /// later with nothing filled, so the meaning plane (the data layer's
+    /// semantic index) reports itself waiting
+    /// for the backend. The search reply used to call that "rebuilding"; it
+    /// must name the backend outage instead, with the configured URL and the
+    /// engine's reason, and status must report the backend unavailable.
     #[test]
     fn unreachable_backend_during_cold_build_is_disclosed_not_called_rebuilding() {
+        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
         let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        let source = "pub fn needle_symbol() -> bool { true }\n";
-        std::fs::write(&source_file, source).expect("write source file");
-
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project.path().to_path_buf()),
-                semantic: crate::config::SemanticBackendConfig {
-                    base_url: Some("http://localhost:1234/v1".to_string()),
-                    ..crate::config::SemanticBackendConfig::default()
-                },
-                ..Config::default()
-            },
-        );
-        ctx.set_canonical_cache_root(project.path().to_path_buf());
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, source.as_bytes());
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "waiting_for_embedding_backend: connection refused".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-        crate::semantic_index::record_embedding_backend_build_failure_for_test(
-            project.path(),
-            "connection refused",
-        );
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
+        ctx.update_config(|config| {
+            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+            config.semantic.model = "test-unreachable".to_string();
+            config.semantic.base_url = Some(base_url.clone());
+        });
+        wait_for_data_semantic(&ctx, |data| {
+            matches!(data.status(), SemanticIndexStatus::Building { stage, .. }
+                if stage.starts_with("waiting_for_embedding_backend"))
+        });
 
         let response = response_value(handle_semantic_search(
             &semantic_request("needle_symbol", 5),
             &ctx,
         ));
         let status = ctx.build_status_snapshot();
-        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+        crate::semantic_index::clear_embedding_backend_retry_status(&root);
 
-        assert_eq!(response["success"], true);
-        assert_eq!(response["semantic_status"], "backend_unavailable");
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(
+            response["semantic_status"], "backend_unavailable",
+            "{response}"
+        );
         let text = response["text"].as_str().expect("text");
         assert!(
-            text.starts_with(
-                "Semantic backend unavailable (http://localhost:1234/v1): connection refused; lexical fallback results follow."
-            ),
+            text.starts_with(&format!("Semantic backend unavailable ({base_url}): ")),
             "unexpected disclosure: {text}"
         );
+        assert!(text.contains("lexical fallback results follow."), "{text}");
         assert!(!text.contains("rebuilding"), "{text}");
         assert!(response["note"]
             .as_str()
             .expect("note")
-            .starts_with("Semantic backend unavailable (http://localhost:1234/v1)"));
+            .starts_with(&format!("Semantic backend unavailable ({base_url})")));
 
         let semantic = &status["semantic_index"];
         assert_eq!(semantic["status"], "backend_unavailable", "{semantic}");
-        assert_eq!(semantic["reason"], "connection refused");
-        assert_eq!(semantic["backend_url"], "http://localhost:1234/v1");
-    }
-
-    #[test]
-    fn borrowed_loading_with_lexical_results_describes_shared_lane_truthfully() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        let source = "pub fn borrowed_loading_needle() {}\n";
-        std::fs::write(&source_file, source).expect("write source file");
-
-        let ctx = test_context(project.path());
-        ctx.set_cache_role(true, None);
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, source.as_bytes());
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-
-        let response = response_value(handle_semantic_search(
-            &semantic_request("borrowed_loading_needle", 5),
-            &ctx,
-        ));
-        let text = response["text"].as_str().expect("response text");
-        // The notice names the trigram index and what its exact pass found
-        // (the one file declaring the needle); it must not claim the lexical
-        // list is complete for exact matches it never checked.
+        assert_eq!(semantic["backend_url"], base_url.as_str(), "{semantic}");
         assert!(
-            text.starts_with(
-                "Semantic lane is loading the shared index; results below come from the trigram index: the 1 file with an exact match first, then lexical matches."
-            ),
-            "{text}"
-        );
-        assert!(!text.contains("complete for exact"), "{text}");
-        assert!(!text.contains("still building"));
-        assert!(!text.contains("rebuilding"));
-        assert!(response["results"]
-            .as_array()
-            .is_some_and(|results| !results.is_empty()));
-    }
-
-    #[test]
-    fn borrowed_loading_notice_reports_what_the_exact_pass_found() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let literal_file = project.path().join("scripts/check.py");
-        let field_file = project.path().join("src/server.rs");
-        let literal_source = "CHECKS = [\"residue-source-hash\"]\n";
-        let field_source = "pub struct Registry {\n    source: String,\n}\n";
-        for (path, text) in [(&literal_file, literal_source), (&field_file, field_source)] {
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
-            std::fs::write(path, text).expect("write file");
-        }
-
-        let ctx = test_context(project.path());
-        ctx.set_cache_role(true, None);
-        let mut index = SearchIndex::new();
-        index.index_file(&literal_file, literal_source.as_bytes());
-        index.index_file(&field_file, field_source.as_bytes());
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-
-        // The literal exists in one file: the notice counts that file, and the
-        // `source` field does not inflate the count.
-        let present = response_value(handle_semantic_search(
-            &semantic_request("residue-source-hash", 5),
-            &ctx,
-        ));
-        let text = present["text"].as_str().expect("response text");
-        assert!(
-            text.starts_with(
-                "Semantic lane is loading the shared index; results below come from the trigram index: the 1 file with an exact match first, then lexical matches."
-            ),
-            "{text}"
-        );
-
-        // The literal exists nowhere: the notice says the exact pass found
-        // nothing instead of vouching for the lexical list.
-        let absent = response_value(handle_semantic_search(
-            &semantic_request("residue-target-hash", 5),
-            &ctx,
-        ));
-        let text = absent["text"].as_str().expect("response text");
-        assert!(
-            text.starts_with(
-                "Semantic lane is loading the shared index; the trigram index's exact pass found no exact match for the query, so the results below are lexical matches on its words."
-            ),
-            "{text}"
+            semantic["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{semantic}"
         );
     }
 
@@ -12292,221 +11100,6 @@ mod tests {
     }
 
     #[test]
-    fn ready_symbols_with_pending_trigram_retain_lexical_fallback_results() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
-        let source = "pub fn handle_request(token: &str) -> bool { !token.is_empty() }\n";
-        std::fs::write(&source_file, source).unwrap();
-        let ctx = test_context(project.path());
-        ctx.update_config(|config| config.indexes.semantic = false);
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
-        ctx.symbol_cache().write().unwrap().insert(
-            source_file.clone(),
-            std::fs::metadata(&source_file).unwrap().modified().unwrap(),
-            source.len() as u64,
-            blake3::hash(source.as_bytes()),
-            Vec::new(),
-        );
-
-        // Publication is queued, but not resident at admission. This fixes the
-        // startup ordering without relying on thread scheduling or a sleep.
-        let (tx, rx) = crossbeam_channel::unbounded();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, source.as_bytes());
-        index.ready = true;
-        tx.send(index).unwrap();
-        assert!(ctx.search_index().read().unwrap().is_none());
-
-        let response = response_value(handle_semantic_search(
-            &semantic_request("request authentication handler", 5),
-            &ctx,
-        ));
-        let text = response["text"].as_str().expect("search text");
-        assert!(text.contains("pub fn handle_request"), "{response}");
-        assert!(text.contains("[lexical match]"), "{response}");
-        assert_eq!(response["complete"], false);
-        assert_eq!(response["semantic_status"], "disabled");
-        assert_eq!(
-            response["structuredContent"]["plan"]["readiness"]["lexical_index"],
-            true
-        );
-    }
-
-    #[test]
-    fn first_search_waits_for_slow_borrowed_base_and_returns_results() {
-        assert_eq!(
-            FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET,
-            Duration::from_millis(2_500)
-        );
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        let source = "pub fn waited_for_borrowed_artifact() {}\n";
-        std::fs::write(&source_file, source).expect("write source file");
-        let ctx = test_context(project.path());
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-        let publish_file = source_file.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            let mut index = SearchIndex::new();
-            index.index_file(&publish_file, source.as_bytes());
-            index.ready = true;
-            tx.send(index).expect("publish search index");
-        });
-
-        // Decision-evidence form: non-empty index-backed results prove the query
-        // waited for publication rather than taking the partial bounded walk.
-        // Elapsed-time bounds were removed because a loaded runner can deschedule
-        // either the publisher thread or this thread past any tight wall-clock budget;
-        // the generous budget below is a hang catch, not a timing assertion.
-        let response =
-            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(30), || {
-                response_value(handle_semantic_search(
-                    &semantic_request("waited_for_borrowed_artifact", 5),
-                    &ctx,
-                ))
-            });
-
-        assert_eq!(response["interpreted_as"], "lexical");
-        assert!(response["results"]
-            .as_array()
-            .is_some_and(|results| !results.is_empty()));
-        assert!(!response["text"]
-            .as_str()
-            .expect("response text")
-            .contains("nothing was searched yet"));
-    }
-
-    #[test]
-    fn building_indexes_refuse_with_each_lanes_status_instead_of_walking() {
-        // With both lanes still building there is no index to rank over.
-        // aft_search used to answer with a bounded filesystem walk here; the
-        // feature-config contract instead refuses with search_lanes_unavailable
-        // and each lane's status, and leaves the walk to grep.
-        let project = tempfile::tempdir().expect("create project dir");
-        std::fs::write(
-            project.path().join("needle.ts"),
-            "export const fresh_root_needle = 'fresh_root_needle';\n",
-        )
-        .expect("write source file");
-        let ctx = Arc::new(test_context(project.path()));
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-        let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-
-        // The search runs on its own thread so a hang fails this test instead
-        // of stalling the suite. Whether it refused rather than walked is read
-        // from the reply and the walk counter, never from how long it took: a
-        // loaded Windows runner has stretched this 0.3 s request past 3 s.
-        let wait_budget = Duration::from_millis(40);
-        let search_ctx = Arc::clone(&ctx);
-        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
-        let search = std::thread::spawn(move || {
-            let walks_before = grep_executor::fallback_walks_for_test();
-            let started = Instant::now();
-            let response = response_value(with_first_search_index_load_wait_budget_for_test(
-                wait_budget,
-                || handle_semantic_search(&semantic_request("fresh_root_needle", 5), &search_ctx),
-            ));
-            let waited = started.elapsed();
-            let walks = grep_executor::fallback_walks_for_test() - walks_before;
-            completed_tx
-                .send((response, waited, walks))
-                .expect("publish search response");
-        });
-        let (response, waited, walks) = completed_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a search while both lanes build must finish");
-        search.join().expect("search joins");
-
-        // The request still gives an in-flight trigram load its wait budget.
-        // The wait runs until its deadline, so this lower bound cannot flake.
-        assert!(waited >= wait_budget, "waited only {waited:?}");
-        assert_eq!(walks, 0, "the refusal must not start a filesystem walk");
-        assert_eq!(response["success"], false);
-        assert_eq!(response["code"], "search_lanes_unavailable");
-        assert_eq!(response["results"], serde_json::json!([]));
-        assert_eq!(
-            response["lanes"],
-            serde_json::json!({
-                "trigram": {"status": "building", "reason": null},
-                "semantic": {"status": "building", "reason": null},
-            })
-        );
-        assert_eq!(
-            response["omitted_lanes"],
-            serde_json::json!(["trigram", "semantic"])
-        );
-    }
-
-    #[test]
-    fn disabled_semantic_first_search_names_held_trigram_build_in_rendered_text() {
-        let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join("src")).unwrap();
-        std::fs::write(
-            project.path().join("src/lib.rs"),
-            "pub fn handle_request(token: &str) -> bool {\n  !token.is_empty()\n}\n\npub struct AuthService;\n",
-        ).unwrap();
-        let ctx = test_context(project.path());
-        ctx.update_config(|config| config.indexes.semantic = false);
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
-        let (publish, receiver) = crossbeam_channel::unbounded::<SearchIndex>();
-        ctx.install_search_index_rx(receiver, ctx.configure_generation());
-
-        // The live sender is a publication gate: no generation can become ready
-        // until this test releases it, regardless of the machine's scheduling.
-        let response = with_first_search_index_load_wait_budget_for_test(Duration::ZERO, || {
-            handle_semantic_search(&semantic_request("request authentication handler", 5), &ctx)
-        });
-        let text = crate::subc_format::format_response("search", &response, false);
-        assert!(!response.success, "{text}");
-        assert!(
-            text.lines().any(|line| line == "trigram: building"),
-            "{text}"
-        );
-        assert!(
-            text.lines()
-                .any(|line| line == "semantic: unavailable: disabled"),
-            "{text}"
-        );
-        assert!(!text.contains("Found 0 results."), "{text}");
-        assert!(!text.contains("see lanes"), "{text}");
-
-        publish.send(SearchIndex::build(project.path())).unwrap();
-        crate::runtime_drain::drain_search_index_events(&ctx);
-        let response =
-            handle_semantic_search(&semantic_request("request authentication handler", 5), &ctx);
-        let text = crate::subc_format::format_response("search", &response, false);
-        assert!(response.success, "{text}");
-        // Paths render with the platform separator (src\lib.rs on Windows).
-        let expected = format!(
-            "{} [lexical match]",
-            std::path::Path::new("src").join("lib.rs:1").display()
-        );
-        assert!(text.contains(&expected), "{text}");
-    }
-
-    #[test]
     fn refusal_message_names_both_lane_states() {
         let project = tempfile::tempdir().unwrap();
         let ctx = test_context(project.path());
@@ -12558,31 +11151,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_trigram_replacement_keeps_previous_generation_searchable() {
-        let project = tempfile::tempdir().unwrap();
-        std::fs::write(
-            project.path().join("needle.rs"),
-            "pub fn retained_generation_needle() {}\n",
-        )
-        .unwrap();
-        let ctx = test_context(project.path());
-        *ctx.search_index().write().unwrap() = Some(SearchIndex::build(project.path()));
-        let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-        let response = response_value(handle_semantic_search(
-            &semantic_request("retained_generation_needle", 5),
-            &ctx,
-        ));
-        assert_eq!(response["success"], true, "{response}");
-        assert!(
-            response["results"]
-                .as_array()
-                .is_some_and(|rows| !rows.is_empty()),
-            "{response}"
-        );
-    }
-
-    #[test]
     fn both_lanes_configured_off_refuse_with_no_search_lanes_enabled() {
         let project = tempfile::tempdir().expect("create project dir");
         let ctx = test_context(project.path());
@@ -12598,313 +11166,6 @@ mod tests {
         assert_eq!(response["code"], "no_search_lanes_enabled");
         assert_eq!(response["lanes"]["trigram"]["status"], "off");
         assert_eq!(response["lanes"]["semantic"]["status"], "off");
-    }
-
-    #[test]
-    fn exact_search_waits_for_loading_borrowed_trigram_with_semantic_already_ready() {
-        let project = exact_lane::tests::large_identifier_project();
-        let ctx = test_context(project.path());
-        ctx.set_cache_role(true, None);
-        install_ready_semantic_lane(&ctx, project.path());
-        let (tx, rx) = crossbeam_channel::unbounded();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-        // Build before the request so the build's own duration cannot use up
-        // the wait budget on a loaded machine. The loader then publishes only
-        // once the request is waiting on it: the load is still in flight when
-        // readiness is sampled, and lands during the wait.
-        let mut pending = Some((tx, SearchIndex::build(project.path())));
-        let response = with_search_index_load_wait_hook_for_test(
-            move || {
-                if let Some((tx, index)) = pending.take() {
-                    tx.send(index).unwrap();
-                }
-            },
-            || {
-                with_first_search_index_load_wait_budget_for_test(Duration::from_secs(2), || {
-                    response_value(handle_semantic_search(
-                        &semantic_request("isPrefixBoundThinkingModel", 50),
-                        &ctx,
-                    ))
-                })
-            },
-        );
-        assert_eq!(response["success"], true, "{response}");
-        assert!(ctx.search_index().read().unwrap().as_ref().is_some_and(SearchIndex::is_ready),
-            "exact search must drain the borrowed loader even when semantic readiness skips the admission wait");
-        assert_eq!(
-            response["results"].as_array().unwrap().len(),
-            47,
-            "{response}"
-        );
-        assert!(!response["text"]
-            .as_str()
-            .unwrap()
-            .contains("exact pass: bounded"));
-    }
-
-    /// The same wait when the query embedding then fails fast, as it does on a
-    /// machine without ONNX Runtime or with an unreachable backend. The
-    /// lexical fallback is chosen from the admission plan, so the trigram load
-    /// must be awaited before that plan is made, not only at ranking.
-    #[test]
-    fn exact_search_waits_for_loading_trigram_when_query_embedding_fails() {
-        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
-        let port = addr.port();
-        let project = exact_lane::tests::large_identifier_project();
-        let ctx = test_context(project.path());
-        ctx.set_cache_role(true, None);
-        ctx.update_config(|config| {
-            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
-            config.semantic.base_url = Some(format!("http://127.0.0.1:{port}/v1"));
-        });
-        install_ready_semantic_lane(&ctx, project.path());
-        let (tx, rx) = crossbeam_channel::unbounded();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-        // As above: built up front, published once the request waits on it.
-        let mut pending = Some((tx, SearchIndex::build(project.path())));
-        let response = with_search_index_load_wait_hook_for_test(
-            move || {
-                if let Some((tx, index)) = pending.take() {
-                    tx.send(index).unwrap();
-                }
-            },
-            || {
-                with_first_search_index_load_wait_budget_for_test(Duration::from_secs(5), || {
-                    response_value(handle_semantic_search(
-                        &semantic_request("isPrefixBoundThinkingModel", 50),
-                        &ctx,
-                    ))
-                })
-            },
-        );
-        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
-        assert_eq!(response["success"], true, "{response}");
-        assert!(
-            ctx.search_index()
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(SearchIndex::is_ready),
-            "exact search must drain the loading trigram index before choosing the lexical fallback"
-        );
-        assert_eq!(
-            response["results"].as_array().unwrap().len(),
-            47,
-            "{response}"
-        );
-    }
-
-    /// When the trigram load outlasts the wait budget, the plan is made without
-    /// the index and a failed query embedding falls back to a capped file walk
-    /// that can miss most matches. Here the load then lands during the request,
-    /// after the plan, as it did on a slow CI machine: the reply must still say
-    /// its results came from a bounded walk and that the walk hit its file cap,
-    /// and its lane footer must not claim the trigram lane was ready.
-    #[test]
-    fn exact_search_past_the_trigram_wait_budget_discloses_the_bounded_walk() {
-        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
-        let port = addr.port();
-        let project = exact_lane::tests::large_identifier_project();
-        let ctx = test_context(project.path());
-        ctx.set_cache_role(true, None);
-        ctx.update_config(|config| {
-            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
-            config.semantic.base_url = Some(format!("http://127.0.0.1:{port}/v1"));
-        });
-        install_ready_semantic_lane(&ctx, project.path());
-        let (tx, rx) = crossbeam_channel::unbounded();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-        // A zero budget makes the planning wait see the load in flight once and
-        // give up. The loader publishes at the request's next wait, after the
-        // plan was made without the index. `published_at_wait` records which
-        // wait published, so the test can check the hold really lasted.
-        let waits_seen = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let published_at_wait = std::rc::Rc::new(std::cell::Cell::new(None::<usize>));
-        let mut pending = Some((tx, SearchIndex::build(project.path())));
-        let hook_waits = std::rc::Rc::clone(&waits_seen);
-        let hook_published = std::rc::Rc::clone(&published_at_wait);
-        let response = with_search_index_load_wait_hook_for_test(
-            move || {
-                hook_waits.set(hook_waits.get() + 1);
-                if hook_waits.get() >= 2 {
-                    if let Some((tx, index)) = pending.take() {
-                        tx.send(index).unwrap();
-                        hook_published.set(Some(hook_waits.get()));
-                    }
-                }
-            },
-            || {
-                with_first_search_index_load_wait_budget_for_test(Duration::ZERO, || {
-                    handle_semantic_search(
-                        &semantic_request("isPrefixBoundThinkingModel", 50),
-                        &ctx,
-                    )
-                })
-            },
-        );
-        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
-        let rendered = crate::subc_format::format_response("search", &response, false);
-        let response = response_value(response);
-        assert_eq!(response["success"], true, "{response}");
-        assert!(
-            ctx.search_index()
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(SearchIndex::is_ready),
-            "the load must land during the request for this case: {response}"
-        );
-        assert_eq!(
-            published_at_wait.get(),
-            Some(2),
-            "the index must be held back through the planning wait: {response}"
-        );
-        // The plan the reply records is the one made before publication. The
-        // number of results is not checked: the capped walk reads directories
-        // in file-system order, so which matches fit under its cap varies by
-        // machine.
-        let plan = &response["structuredContent"]["plan"];
-        assert_eq!(
-            plan["readiness"]["lexical_index"], false,
-            "the plan must have been made before the index was loaded: {response}"
-        );
-        assert_eq!(plan["exact_mode"], "fallback", "{response}");
-        assert!(
-            rendered.starts_with(&format!(
-                "{TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE}\nDegraded grep reached its 1000-file scan cap; additional files were not scanned.\n\n"
-            )),
-            "{rendered}"
-        );
-        assert!(
-            rendered.lines().any(|line| line == "trigram: building"),
-            "{rendered}"
-        );
-        assert!(
-            !rendered.lines().any(|line| line == "trigram: ready"),
-            "{rendered}"
-        );
-        assert_eq!(response["lanes"]["trigram"]["status"], "building");
-        assert_eq!(response["status"], "partial");
-        assert_eq!(response["complete"], false);
-    }
-
-    #[test]
-    fn first_search_and_in_progress_load_complete_without_deadlock() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        let source = "pub fn no_deadlock_borrowed_artifact() {}\n";
-        std::fs::write(&source_file, source).expect("write source file");
-        let ctx = Arc::new(test_context(project.path()));
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-        let (tx, rx) = crossbeam_channel::unbounded();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-
-        // The publisher waits until the search is inside its trigram-load wait,
-        // so the index is always published while the search is waiting on it.
-        // A fixed sleep raced the wait budget on loaded runners.
-        let (waiting_tx, waiting_rx) = crossbeam_channel::bounded::<()>(1);
-        let publish_file = source_file.clone();
-        let publisher = std::thread::spawn(move || {
-            waiting_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("search enters its trigram-load wait");
-            let mut index = SearchIndex::new();
-            index.index_file(&publish_file, source.as_bytes());
-            index.ready = true;
-            tx.send(index).expect("publish search index");
-        });
-        let search_ctx = Arc::clone(&ctx);
-        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
-        let search = std::thread::spawn(move || {
-            // The publisher sends the index as soon as this search enters its
-            // load wait, so a healthy run ends long before this 30 s budget,
-            // which only ends the wait if publication stalls.
-            let response = with_search_index_load_wait_hook_for_test(
-                move || {
-                    let _ = waiting_tx.try_send(());
-                },
-                || {
-                    with_first_search_index_load_wait_budget_for_test(
-                        Duration::from_secs(30),
-                        || {
-                            response_value(handle_semantic_search(
-                                &semantic_request("no_deadlock_borrowed_artifact", 5),
-                                &search_ctx,
-                            ))
-                        },
-                    )
-                },
-            );
-            completed_tx
-                .send(response)
-                .expect("publish search response");
-        });
-
-        // Liveness, not speed: a deadlock never completes, while a slow but
-        // live run on a loaded machine finishes well inside this watchdog.
-        let response = completed_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("search and artifact publication must not deadlock");
-        assert!(response["results"]
-            .as_array()
-            .is_some_and(|results| !results.is_empty()));
-        publisher.join().expect("publisher joins");
-        search.join().expect("search joins");
-    }
-
-    #[test]
-    fn first_search_wait_observes_executor_cancellation() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let ctx = Arc::new(test_context(project.path()));
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-        let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-        let cancellation = crate::executor::JobCancellation::new();
-        let worker_cancellation = cancellation.clone();
-        let worker_ctx = Arc::clone(&ctx);
-        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
-        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
-        let worker = std::thread::spawn(move || {
-            let _installed = crate::executor::install_job_cancellation(worker_cancellation);
-            started_tx.send(()).expect("signal wait start");
-            let response =
-                with_first_search_index_load_wait_budget_for_test(Duration::from_secs(2), || {
-                    response_value(handle_semantic_search(
-                        &semantic_request("cancelled_wait", 5),
-                        &worker_ctx,
-                    ))
-                });
-            completed_tx
-                .send(response)
-                .expect("publish cancelled response");
-        });
-
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("search wait starts");
-        std::thread::sleep(Duration::from_millis(20));
-        cancellation.request_cancel();
-        let response = completed_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("cancelled wait completes promptly");
-        assert_eq!(response["code"], "request_cancelled");
-        worker.join().expect("cancelled search joins");
     }
 
     /// Every word this module puts in a search reply is one the shared
@@ -12941,73 +11202,26 @@ mod tests {
         );
     }
 
-    /// A reload is the right answer for an evicted shared snapshot: the artifact
-    /// is on disk and re-opening it works. The sibling test below pins the case
-    /// it is wrong for, so neither can pass by turning reloads off entirely.
+    /// No retry can install an ONNX Runtime that is not on the machine, so a
+    /// fill that finds it missing (with no download running) leaves the
+    /// semantic lane labelled with the missing runtime, not a retryable
+    /// state.
     #[test]
-    fn read_only_failed_snapshot_retries_on_semantic_query() {
+    fn missing_runtime_labels_the_semantic_lane_with_the_runtime() {
         let project = tempfile::tempdir().expect("create project dir");
         let storage = tempfile::tempdir().expect("create storage dir");
-        let ctx = test_context(project.path());
-        ctx.update_config(|config| {
-            config.indexes.semantic = true;
-            config.storage_dir = Some(storage.path().to_path_buf());
-        });
-        ctx.set_canonical_cache_root(project.path().to_path_buf());
-        ctx.set_cache_writer_capabilities(false, true);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            SemanticIndexStatus::Failed("shared snapshot absent".to_string());
-
-        // aft_search refuses when no index lane is ready; this test
-        // exercises query routing over a ready trigram lane.
-        install_ready_search_index(&ctx, project.path());
-        let response = response_value(handle_semantic_search(
-            &semantic_request_with_hint("retry snapshot", 5, "semantic"),
-            &ctx,
-        ));
-
-        // The trigram lane answers; the query also schedules the shared
-        // snapshot reload and labels the semantic lane as building.
-        assert_eq!(response["success"], true);
-        assert_eq!(
-            response["lanes"]["semantic"],
-            serde_json::json!({"status": "building", "reason": null})
-        );
-        assert_eq!(response["omitted_lanes"], serde_json::json!(["semantic"]));
-        assert!(ctx.semantic_index_rx().lock().is_some());
-        ctx.mark_subc_unbound();
-        ctx.cancel_unbound_artifact_work();
-    }
-
-    /// Same read-only root, different failure: no reload can install an ONNX
-    /// Runtime that is not on the machine, so the reply must name what is
-    /// missing instead of asking for another attempt.
-    #[test]
-    fn read_only_missing_runtime_reports_the_runtime_instead_of_a_reload() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let storage = tempfile::tempdir().expect("create storage dir");
-        let ctx = test_context(project.path());
-        ctx.update_config(|config| {
-            config.indexes.semantic = true;
-            config.storage_dir = Some(storage.path().to_path_buf());
-        });
-        ctx.set_canonical_cache_root(project.path().to_path_buf());
-        ctx.set_cache_writer_capabilities(false, true);
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
         // The message the embedding init actually produces, so the test cannot
         // drift from the wording the daemon puts in the status.
         let missing_runtime = crate::semantic_index::format_embedding_init_error(
             "Failed to load ONNX Runtime shared library libonnxruntime.dylib via dlopen: no such file",
         );
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            SemanticIndexStatus::Failed(missing_runtime);
+        let _failing =
+            crate::data_layer::meaning::fail_model_loads_for_test(&root, &missing_runtime);
+        wait_for_data_semantic(&ctx, |data| {
+            matches!(data.status(), SemanticIndexStatus::Failed(_))
+        });
 
-        // aft_search refuses when no index lane is ready; this test
-        // exercises query routing over a ready trigram lane.
-        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("retry snapshot", 5, "semantic"),
             &ctx,
@@ -13023,11 +11237,8 @@ mod tests {
             "semantic_platform_unsupported"
         };
         assert_eq!(response["lanes"]["semantic"]["reason"], expected_cause);
-        // The reload was not merely reported differently, it was never started:
-        // the receiver a scheduled reload installs is still absent.
+        // No reload of today's index was started for it.
         assert!(ctx.semantic_index_rx().lock().is_none());
-        ctx.mark_subc_unbound();
-        ctx.cancel_unbound_artifact_work();
     }
 
     #[test]
@@ -13439,219 +11650,6 @@ mod tests {
     }
 
     #[test]
-    fn regex_zero_results_escalate_once_to_hybrid_terms() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/reminder.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(
-            &source_file,
-            "const missing_route = true;\npub fn exported() {}\n",
-        )
-        .expect("write source file");
-        let ctx = test_context(project.path());
-        let mut index = SearchIndex::new();
-        index.index_file(
-            &source_file,
-            std::fs::read(&source_file).expect("read source").as_slice(),
-        );
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
-        let response = response_value(handle_semantic_search(
-            &semantic_request("^missing_route$", 5),
-            &ctx,
-        ));
-        assert_eq!(response["success"], true);
-        assert_eq!(response["result_count"], 1);
-        assert_eq!(response["zero_result_escalation"], true);
-        assert!(response["results"]
-            .as_array()
-            .expect("results")
-            .iter()
-            .any(|result| result["source"] == "lexical"));
-        assert!(response["text"]
-            .as_str()
-            .expect("text")
-            .contains("[interpreted_as: regex; no exact match — ranked by terms instead]"));
-
-        let first_project = tempfile::tempdir().expect("create first-lane project");
-        let first_source = first_project.path().join("src/lib.rs");
-        std::fs::create_dir_all(first_source.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&first_source, "pub fn exported() {}\n").expect("write source file");
-        let first_ctx = test_context(first_project.path());
-        *first_ctx
-            .semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-        // aft_search refuses when no index lane is ready.
-        install_ready_search_index(&first_ctx, first_project.path());
-        let first_lane_response = response_value(handle_semantic_search(
-            &semantic_request_with_hint(".*exported", 5, "regex"),
-            &first_ctx,
-        ));
-        assert!(
-            first_lane_response["result_count"]
-                .as_u64()
-                .is_some_and(|count| count > 0),
-            "response: {first_lane_response:?}"
-        );
-        assert_eq!(
-            first_lane_response
-                .get("zero_result_escalation")
-                .and_then(Value::as_bool),
-            None,
-            "response: {first_lane_response:?}"
-        );
-        assert!(!first_lane_response["text"]
-            .as_str()
-            .expect("text")
-            .contains("no exact match"));
-    }
-
-    /// A short quoted span routes as a code literal (exact and lexical lanes
-    /// on the unquoted text) and, like every non-regex `query`, keeps the
-    /// semantic lane: names and literals that must match verbatim belong in
-    /// `pattern`, so `query` is always also searched by meaning.
-    #[test]
-    fn three_token_quoted_span_routes_as_code_literal_and_keeps_semantic() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/reminder.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source_file, "const template = \"outside <touser>\";\n")
-            .expect("write source file");
-        let ctx = test_context(project.path());
-        let mut index = SearchIndex::new();
-        index.index_file(
-            &source_file,
-            std::fs::read(&source_file).expect("read source").as_slice(),
-        );
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
-        *ctx.semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(SemanticIndex::new(project.path().to_path_buf(), 3));
-        let (base_url, handle) = start_mock_embedding_server();
-        ctx.update_config(|config| {
-            config.semantic.backend = SemanticBackend::OpenAiCompatible;
-            config.semantic.base_url = Some(base_url);
-            config.semantic.model = "test-embedding".to_string();
-        });
-
-        let mut request = semantic_request("\"outside <touser>\" reminder text", 5);
-        request.id = "b2-three-token-quoted-span".to_string();
-        let response = response_value(handle_semantic_search(&request, &ctx));
-        assert_eq!(response["success"], true);
-        assert_eq!(response["interpreted_as"], "hybrid");
-        assert_eq!(
-            response["structuredContent"]["plan"]["shape"],
-            "code_literal"
-        );
-        assert_eq!(
-            response["structuredContent"]["plan"]["lanes_run"],
-            serde_json::json!(["exact", "lexical", "semantic"])
-        );
-        assert_eq!(
-            response["structuredContent"]["search"]["embedding_calls"],
-            1
-        );
-        assert!(response.get("zero_result_escalation").is_none());
-        handle.join().expect("embedding server thread");
-    }
-
-    #[test]
-    fn four_token_quoted_span_remains_natural_language_and_runs_hybrid() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/reminder.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source_file, "const template = \"outside <touser>\";\n")
-            .expect("write source file");
-        let ctx = test_context(project.path());
-        let mut index = SearchIndex::new();
-        index.index_file(
-            &source_file,
-            std::fs::read(&source_file).expect("read source").as_slice(),
-        );
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
-        *ctx.semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(SemanticIndex::new(project.path().to_path_buf(), 3));
-        let (base_url, handle) = start_mock_embedding_server();
-        ctx.update_config(|config| {
-            config.semantic.backend = SemanticBackend::OpenAiCompatible;
-            config.semantic.base_url = Some(base_url);
-            config.semantic.model = "test-embedding".to_string();
-        });
-
-        let mut request = semantic_request("\"outside <touser>\" reminder text here", 5);
-        request.id = "b2-four-token-quoted-span".to_string();
-        let response = response_value(handle_semantic_search(&request, &ctx));
-        assert_eq!(response["success"], true);
-        assert_eq!(response["interpreted_as"], "hybrid");
-        assert_eq!(
-            response["structuredContent"]["plan"]["shape"],
-            "natural_language"
-        );
-        assert!(response.get("zero_result_escalation").is_none());
-        handle.join().expect("embedding server thread");
-    }
-
-    #[test]
-    fn garbage_regex_zero_after_escalation_is_honest_zero() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source_file, "const present_route = true;\n").expect("write source file");
-        let ctx = test_context(project.path());
-        let mut index = SearchIndex::new();
-        index.index_file(
-            &source_file,
-            std::fs::read(&source_file).expect("read source").as_slice(),
-        );
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
-        let response = response_value(handle_semantic_search(
-            &semantic_request("^qzxjvpl_888$", 5),
-            &ctx,
-        ));
-        assert_eq!(response["success"], true);
-        assert_eq!(response["result_count"], 0);
-        assert_eq!(response["zero_result_escalation"], true);
-        assert!(response["text"]
-            .as_str()
-            .expect("text")
-            .contains("[interpreted_as: regex; no exact match — ranked by terms instead]"));
-    }
-
-    #[test]
     fn humanize_degraded_reason_messages() {
         let reasons = vec![
             "home_root".to_string(),
@@ -13905,194 +11903,6 @@ mod tests {
     }
 
     #[test]
-    fn churned_borrowed_tree_keeps_previous_generation_when_reload_is_budget_limited() {
-        let session = tempfile::tempdir().expect("session root");
-        let external = tempfile::tempdir().expect("external root");
-        let external_root =
-            std::fs::canonicalize(external.path()).expect("canonical external root");
-        let git_status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&external_root)
-            .status()
-            .expect("initialize external git fixture");
-        assert!(git_status.success());
-        let storage = tempfile::tempdir().expect("storage");
-        for file_index in 0..8 {
-            let file = external_root.join(format!(
-                "packages/pkg_{}/src/module_{file_index}.rs",
-                file_index % 8
-            ));
-            std::fs::create_dir_all(file.parent().expect("fixture parent"))
-                .expect("create nested fixture directory");
-            std::fs::write(
-                file,
-                format!("pub fn borrowed_tree_needle_{file_index}() {{}}\n"),
-            )
-            .expect("write borrowed fixture");
-        }
-        let cache_dir =
-            crate::search_index::resolve_cache_dir(&external_root, Some(storage.path()));
-        let mut index = SearchIndex::build(&external_root);
-        index.write_to_disk(&cache_dir, None);
-
-        let ctx = AppContext::new(
-            crate::context::default_language_provider_factory(),
-            crate::config::Config {
-                project_root: Some(session.path().to_path_buf()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..crate::config::Config::default()
-            },
-        );
-        let mut req = semantic_request("borrowed_tree_needle", 10);
-        req.params["path"] = serde_json::json!(external_root);
-        let first = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
-            10_000,
-            Duration::from_secs(5),
-            || response_value(handle_semantic_search(&req, &ctx)),
-        );
-        assert_eq!(first["success"], true, "initial borrow failed: {first:?}");
-
-        for file_index in 0..8 {
-            let file = external_root.join(format!(
-                "packages/pkg_{}/src/module_{file_index}.rs",
-                file_index % 8
-            ));
-            std::fs::write(
-                file,
-                format!("pub fn churned_borrowed_tree_{file_index}() {{}}\n"),
-            )
-            .expect("churn borrowed fixture");
-        }
-        let mut rebuilt = SearchIndex::build(&external_root);
-        rebuilt.write_to_disk(&cache_dir, None);
-
-        // The churned generation holds 8 files, inside the 10-entry budget
-        // below, while its trigram lookup table holds far more entries, so
-        // the reload reads the 8 file entries and then stops at the entry
-        // budget. The time budget is generous on purpose: with time unable
-        // to stop the reload, a count inside 1..=10 proves the entry budget
-        // is what stopped it. The lower bound matters too: a probe that
-        // never saw the reload (for example a root-key mismatch) reads 0
-        // and fails loudly instead of passing vacuously. Elapsed time
-        // cannot show any of this on a loaded runner, where the whole
-        // search can exceed 1 s even when the reload itself stopped
-        // immediately.
-        let records =
-            crate::search_index::observe_borrowed_load_records_read_for_test(&external_root);
-        let degraded = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
-            10,
-            Duration::from_secs(60),
-            || response_value(handle_semantic_search(&req, &ctx)),
-        );
-        crate::search_index::unobserve_borrowed_load_records_read_for_test(&external_root);
-
-        assert!(
-            (1..=10).contains(&records.load(Ordering::SeqCst)),
-            "churned generation must stop at the borrowed-load entry budget, read {} records",
-            records.load(Ordering::SeqCst)
-        );
-        assert_eq!(degraded["success"], true);
-        assert_ne!(degraded["fully_degraded"], true);
-        assert!(degraded["borrowed_index_degraded_reason"].is_null());
-    }
-
-    #[test]
-    fn borrowed_load_budget_degradation_has_locked_disclosure() {
-        let session = tempfile::tempdir().expect("session root");
-        let external = tempfile::tempdir().expect("external root");
-        std::fs::write(
-            external.path().join("fixture.rs"),
-            "pub fn budget_disclosure_needle() {}\n",
-        )
-        .expect("write external fixture");
-        let ctx = test_context(session.path());
-        // This test covers the generic scan, so the query has two words. A
-        // query that is one identifier takes the exact identifier sweep, which
-        // reads every file and so is not reported fully degraded.
-        let req = semantic_request("fn budget_disclosure_needle", 10);
-        let params = SemanticSearchParams {
-            query: "fn budget_disclosure_needle".to_string(),
-            top_k: 10,
-            offset: 0,
-            include_tests: false,
-        };
-        let shape = query_shape::classify(&params.query);
-
-        let response = response_value(handle_external_borrowed_degraded_fallback(
-            &req,
-            &ctx,
-            &params,
-            10,
-            &shape,
-            external.path(),
-            crate::readonly_artifacts::BORROWED_SEARCH_LOAD_DEGRADATION,
-        ));
-
-        assert_eq!(response["success"], true);
-        assert_eq!(response["complete"], false);
-        assert_eq!(response["fully_degraded"], true);
-        assert_eq!(
-            response["borrowed_index_degraded_reason"],
-            "borrowed_search_index_load_budget"
-        );
-        assert!(response["warnings"]
-            .as_array()
-            .expect("warnings")
-            .iter()
-            .any(|warning| warning.as_str() == Some(BORROWED_SEARCH_LOAD_WARNING)));
-        assert!(response["text"]
-            .as_str()
-            .expect("text")
-            .ends_with(BORROWED_SEARCH_LOAD_FOOTER));
-    }
-
-    #[test]
-    fn borrowed_load_budget_identifier_sweeps_disk_and_keeps_the_disclosure() {
-        let session = tempfile::tempdir().expect("session root");
-        let external = tempfile::tempdir().expect("external root");
-        std::fs::write(
-            external.path().join("fixture.rs"),
-            "pub fn budget_disclosure_needle() {}\n",
-        )
-        .expect("write external fixture");
-        let ctx = test_context(session.path());
-        let req = semantic_request("budget_disclosure_needle", 10);
-        let params = SemanticSearchParams {
-            query: "budget_disclosure_needle".to_string(),
-            top_k: 10,
-            offset: 0,
-            include_tests: false,
-        };
-        let shape = query_shape::classify(&params.query);
-
-        let response = response_value(handle_external_borrowed_degraded_fallback(
-            &req,
-            &ctx,
-            &params,
-            10,
-            &shape,
-            external.path(),
-            crate::readonly_artifacts::BORROWED_SEARCH_LOAD_DEGRADATION,
-        ));
-
-        assert_eq!(response["success"], true);
-        assert_eq!(response["complete"], false);
-        assert_eq!(response["fully_degraded"], false);
-        assert_eq!(response["exact_sweep"]["complete"], true);
-        let text = response["text"].as_str().expect("text");
-        assert!(text.contains("fixture.rs:1 [exact]"), "{text}");
-        assert!(text.contains("exact pass: complete; checked all"), "{text}");
-        assert!(text.ends_with(BORROWED_SEARCH_LOAD_FOOTER), "{text}");
-    }
-
-    #[test]
-    fn borrowed_drift_remains_available_in_logs() {
-        let message = borrowed_drift_log_message("semantic", Path::new("/borrowed"), 3);
-        assert!(message.contains("borrowed semantic index"));
-        assert!(message.contains("3 drifted file(s)"));
-    }
-
-    #[test]
     fn empty_semantic_index_skips_query_dimension_check() {
         let project = tempfile::tempdir().expect("create project dir");
         let (base_url, handle) = start_mock_embedding_server();
@@ -14330,6 +12140,77 @@ mod tests {
                 (score > 0).then_some((score, line_index, line))
             })
             .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+    }
+
+    #[test]
+    fn matching_line_packed_buffers_preserve_line_boundaries_and_normalization() {
+        let source = "  Alpha\tBETA \r\n\nİ café 中中中\u{2003}tail\nabc\ndef\n";
+        let prepared = MatchingSource::new(source);
+        for (line, stored) in source.lines().zip(&prepared.lines) {
+            assert_eq!(
+                &prepared.normalized[stored.normalized.clone()],
+                exact_lane::normalize_exact_phrase(line)
+            );
+            assert_eq!(
+                &prepared.compact[stored.compact.clone()],
+                line.chars()
+                    .filter(|ch| ch.is_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>()
+            );
+        }
+        assert_eq!(prepared.normalized.capacity(), prepared.normalized.len());
+        assert_eq!(prepared.compact.capacity(), prepared.compact.len());
+        let boundary = MatchingSource::new("ab\nc");
+        assert_eq!(boundary.best_line("ab\nc", &["abc".into()]), None);
+        assert_eq!(
+            boundary
+                .lines
+                .iter()
+                .map(|line| line.compact.len())
+                .sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn matching_line_packed_storage_does_not_increase_cache_charge() {
+        type LegacyLine = (String, String, std::sync::OnceLock<Box<[[u8; 3]]>>);
+        for source in [
+            "",
+            " \t\r\n\n",
+            "İ café 中中中\u{2003}tail\nabc\ndef\n",
+            include_str!("mod.rs"),
+        ] {
+            let legacy = source
+                .lines()
+                .map(|line| {
+                    (
+                        exact_lane::normalize_exact_phrase(line),
+                        line.chars()
+                            .filter(|ch| ch.is_alphanumeric())
+                            .flat_map(char::to_lowercase)
+                            .collect::<String>(),
+                        std::sync::OnceLock::new(),
+                    )
+                })
+                .collect::<Vec<LegacyLine>>();
+            let legacy_bytes = std::mem::size_of::<Vec<LegacyLine>>()
+                + legacy.capacity() * std::mem::size_of::<LegacyLine>()
+                + legacy
+                    .iter()
+                    .map(|(normalized, compact, _)| {
+                        normalized.capacity()
+                            + compact.capacity()
+                            + compact.len().saturating_sub(2) * 3
+                    })
+                    .sum::<usize>();
+            let packed_bytes = MatchingSource::new(source).retained_bytes();
+            // Only the two source-wide String headers are new fixed overhead;
+            // every nonempty line saves headers and per-string spare capacity.
+            assert!(packed_bytes <= legacy_bytes + 2 * std::mem::size_of::<String>());
+            eprintln!("matching storage: {} source bytes, {legacy_bytes} legacy charge, {packed_bytes} packed charge", source.len());
+        }
     }
 
     #[test]
@@ -15072,55 +12953,6 @@ mod tests {
             );
             assert!(text.contains("terminate_child();"), "{text}");
             assert!(text.contains("[lexical match]"), "{text}");
-        }
-    }
-
-    #[test]
-    fn unfilled_checkout_semantic_view_names_the_gap_without_a_ready_footer() {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        std::fs::write(root.join("lib.rs"), "pub fn kill_expired_task() {}\n").unwrap();
-        let ctx = test_context(&root);
-        install_ready_search_index(&ctx, &root);
-        let slot = ctx.checkout_semantic();
-        let (epoch, _wake) = slot.begin();
-        let runtime = Arc::new(
-            crate::views::semantic_runtime::CheckoutSemantic::new(
-                &crate::root_cache::StoragePaths::same(storage.path()),
-                "family",
-                "scope",
-                &root,
-                crate::views::semantic::SemanticProducer::current("gap-model", Default::default()),
-                Arc::downgrade(slot),
-            )
-            .unwrap(),
-        );
-        runtime.load().unwrap();
-        assert_eq!(runtime.index().unwrap().len(), 0);
-        assert!(slot.install(epoch, runtime));
-        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
-        let query = "how does the watchdog stop a background task";
-        for pattern in [None, Some("kill_expired_task")] {
-            let mut req = semantic_request(query, 8);
-            if let Some(pattern) = pattern {
-                req.params["pattern"] = serde_json::json!(pattern);
-            }
-            let response = with_precomputed_query_vector(query, vec![1.0, 0.0], || {
-                response_value(handle_semantic_search(&req, &ctx))
-            });
-            assert_eq!(response["success"], true, "{response}");
-            assert_eq!(response["complete"], false, "{response}");
-            assert_eq!(
-                response["semantic_gap"]["pending"],
-                serde_json::json!(["lib.rs"])
-            );
-            let text = response["text"].as_str().unwrap();
-            assert!(text.contains("not yet embedded: lib.rs"), "{text}");
-            assert!(
-                !text.lines().any(|line| line == "semantic: ready"),
-                "{text}"
-            );
         }
     }
 
@@ -15873,109 +13705,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_callgraph_adds_compact_blast_radius_suffixes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let src_dir = dir.path().join("src");
-        let fixture_dir = dir.path().join("fixtures");
-        std::fs::create_dir_all(&src_dir).expect("create src");
-        std::fs::create_dir_all(&fixture_dir).expect("create fixtures");
-        let target_file = src_dir.join("target.ts");
-        std::fs::write(
-            &target_file,
-            "export function covered() {\n  return 1;\n}\nexport function untested() {\n  return 2;\n}\n",
-        )
-        .expect("write target");
-        std::fs::write(
-            src_dir.join("app.ts"),
-            "import { covered, untested } from './target';\nexport function callerOne() {\n  return covered() + untested();\n}\nexport function callerTwo() {\n  return covered();\n}\n",
-        )
-        .expect("write app");
-        std::fs::write(
-            fixture_dir.join("covered_fixture.ts"),
-            "import { covered } from '../src/target';\nexport function fixtureCaller() {\n  return covered();\n}\n",
-        )
-        .expect("write fixture");
-        let ctx = test_context(dir.path());
-        install_warm_callgraph_store(&ctx, dir.path());
-
-        let results = vec![
-            HybridResult {
-                file: target_file.clone(),
-                name: "covered".to_string(),
-                kind: SymbolKind::Function,
-                start_line: 0,
-                end_line: 2,
-                exported: true,
-                snippet: String::new(),
-                score: 0.8,
-                source: "semantic",
-                semantic_score: Some(0.8),
-                lexical_score: None,
-                hybrid_boosted: false,
-                exact: false,
-                exact_phrase_count: 0,
-                exact_window_lines: None,
-                fusion_score: 0.0,
-            },
-            HybridResult {
-                file: target_file,
-                name: "untested".to_string(),
-                kind: SymbolKind::Function,
-                start_line: 3,
-                end_line: 5,
-                exported: true,
-                snippet: String::new(),
-                score: 0.7,
-                source: "semantic",
-                semantic_score: Some(0.7),
-                lexical_score: None,
-                hybrid_boosted: false,
-                exact: false,
-                exact_phrase_count: 0,
-                exact_window_lines: None,
-                fusion_score: 0.0,
-            },
-        ];
-
-        let text = format_semantic_text(&results, dir.path(), false, false, Some(&ctx));
-        let covered_line = text
-            .lines()
-            .find(|line| line.contains("covered [function]"))
-            .expect("covered row");
-        assert!(
-            covered_line.contains("↩"),
-            "covered row should show callers: {text}"
-        );
-        assert!(
-            covered_line.contains("app.ts") || covered_line.contains("covered_fixture.ts"),
-            "covered row should include caller basenames: {covered_line}"
-        );
-
-        let untested_line = text
-            .lines()
-            .find(|line| line.contains("untested [function]"))
-            .expect("untested row");
-        assert!(
-            untested_line.contains("↩"),
-            "untested row should show callers: {text}"
-        );
-        assert!(
-            untested_line.contains("app.ts"),
-            "untested caller basename missing: {untested_line}"
-        );
-
-        // The `⚠untested` marker was removed: it provided no actionable signal in
-        // a discovery tool and relied on is_test_support_file (fixtures/mocks
-        // only), so it false-flagged genuinely tested code. Blast radius keeps
-        // only the accurate `↩callers` + basenames.
-        assert!(
-            !text.contains("⚠untested"),
-            "untested marker must no longer appear in search output: {text}"
-        );
-    }
-
-    #[test]
-    fn absent_warm_callgraph_emits_no_blast_radius_and_starts_no_build() {
+    fn absent_warm_callgraph_emits_no_blast_radius() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = test_context(dir.path());
         let results = vec![write_symbol_hit(dir.path(), "target.rs", "target", 1)];
@@ -15986,8 +13716,72 @@ mod tests {
             !text.contains("↩"),
             "cold store should not annotate rows: {text}"
         );
-        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
-        assert!(ctx.callgraph_store_rx().lock().is_none());
+    }
+
+    /// A symbol hit is annotated with its caller count and the callers' files
+    /// from the index store's current call graph.
+    #[test]
+    fn symbol_hit_is_annotated_with_callers_from_the_index_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn target() {}\n").unwrap();
+        std::fs::write(root.join("first.rs"), "fn a() { crate::target(); }\n").unwrap();
+        std::fs::write(root.join("second.rs"), "fn b() { crate::target(); }\n").unwrap();
+        std::fs::write(
+            root.join("main.rs"),
+            "mod first;\nmod second;\nmod lib;\nuse lib::target;\nfn c() { target(); }\n",
+        )
+        .unwrap();
+        let checkout = crate::data_layer::runtime::DataCheckout::open_planes(
+            &root,
+            &temp.path().join("store"),
+            None,
+            crate::data_layer::checkout::Planes {
+                text: false,
+                callgraph: true,
+            },
+        )
+        .unwrap();
+        let crate::data_layer::runtime::Fresh::Ready(view) =
+            checkout.fresh_view(Duration::from_secs(60))
+        else {
+            panic!("call graph did not publish");
+        };
+        let callers = callers_result(&view.callgraph(), Path::new("lib.rs"), "target", 1, true)
+            .expect("callers of target");
+        assert!(callers.total_callers >= 1, "fixture has callers");
+
+        let mut hit = snippet_hit(
+            root.join("lib.rs"),
+            "target",
+            SymbolKind::Function,
+            0,
+            0,
+            0.5,
+        );
+        hit.source = "semantic";
+        let annotation = blast_radius_annotation_for_result(&view.callgraph(), &view, &hit)
+            .expect("a symbol hit with callers is annotated");
+        assert!(
+            annotation.starts_with(&format!("  ↩{}", callers.total_callers)),
+            "{annotation}"
+        );
+
+        // A lexical row, or a file the call graph doesn't cover, gets none.
+        hit.source = "lexical";
+        assert!(blast_radius_annotation_for_result(&view.callgraph(), &view, &hit).is_none());
+        let mut outside = snippet_hit(
+            temp.path().join("elsewhere.rs"),
+            "target",
+            SymbolKind::Function,
+            0,
+            0,
+            0.5,
+        );
+        outside.source = "semantic";
+        assert!(blast_radius_annotation_for_result(&view.callgraph(), &view, &outside).is_none());
     }
 
     #[test]
@@ -16031,51 +13825,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_reply_renders_one_shared_envelope_trailer_with_offset() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let mut index = SearchIndex::new();
-        for file_number in 0..6 {
-            let source_file = project.path().join(format!("src/file_{file_number}.rs"));
-            std::fs::create_dir_all(source_file.parent().expect("source parent"))
-                .expect("create source dir");
-            let source = format!("pub fn shared_trailer_marker_{file_number}() {{}}\n");
-            std::fs::write(&source_file, &source).expect("write source");
-            index.index_file(&source_file, source.as_bytes());
-        }
-        index.ready = true;
-
-        let ctx = test_context(project.path());
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
-        let response = handle_semantic_search(
-            &semantic_request_with_hint("shared_trailer_marker", 3, "literal"),
-            &ctx,
-        );
-        assert!(response.success, "engine search failed: {response:?}");
-        assert!(response.data.get("results_list_envelope").is_some());
-        let rendered = crate::subc_format::format_response("search", &response, false);
-        let trailer_lines = rendered
-            .lines()
-            .filter(|line| line.starts_with("shown "))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            trailer_lines.len(),
-            1,
-            "engine reply must render exactly one trailer: {rendered}"
-        );
-        assert_eq!(
-            trailer_lines[0],
-            "shown 3 of 6 results (cap) · narrow: offset, topK, path, includeTests"
-        );
-        assert!(!rendered.contains("More results available; raise topK to see more."));
-    }
-
-    #[test]
     fn fallback_walk_stopped_by_deadline_reports_walk() {
         let project = tempfile::tempdir().expect("create project dir");
         std::fs::create_dir_all(project.path().join("src")).expect("create source dir");
@@ -16109,181 +13858,6 @@ mod tests {
             crate::list_envelope::render_trailer(&page_cut).as_deref(),
             Some("shown 3 of ≥4 results (cap) · narrow: offset, topK, path, includeTests")
         );
-    }
-
-    #[test]
-    fn ready_uncontended_search_keeps_indexed_literal_results() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source_file, "pub fn parity_marker() {}\n").expect("write source");
-        let ctx = test_context(project.path());
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, b"pub fn parity_marker() {}\n");
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
-        let response = response_value(handle_semantic_search(
-            &semantic_request_with_hint("parity_marker", 5, "literal"),
-            &ctx,
-        ));
-        assert_eq!(response["success"], true);
-        assert_eq!(response["interpreted_as"], "lexical");
-        assert_eq!(
-            response["results"][0]["source"], "exact",
-            "the live exact lane now owns verbatim identifier matches"
-        );
-        assert!(response["results"][0]["file"]
-            .as_str()
-            .expect("result file")
-            .ends_with("src/lib.rs"));
-    }
-
-    #[test]
-    fn repeated_paged_search_reads_exact_candidates_once_per_query_generation() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source_file, "pub fn repeated_page_marker() {}\n").expect("write source");
-        let ctx = test_context(project.path());
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, b"pub fn repeated_page_marker() {}\n");
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
-        let pages = [(100, 0), (100, 100), (100, 200), (100, 300)]
-            .into_iter()
-            .chain((0..10).map(|page| (10, page * 10)))
-            .chain((0..4).map(|page| (25, page * 25)))
-            .chain([(100, 0)]);
-        for (top_k, offset) in pages {
-            let response = response_value(handle_semantic_search(
-                &semantic_page_request("repeated_page_marker", top_k, offset),
-                &ctx,
-            ));
-            assert_eq!(response["success"], true);
-        }
-
-        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 1);
-    }
-
-    #[test]
-    fn exact_page_memo_keys_include_corpus_generation() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let first = project.path().join("src/a.rs");
-        let second = project.path().join("src/b.rs");
-        std::fs::create_dir_all(first.parent().expect("source parent")).expect("create source dir");
-        std::fs::write(&first, "pub fn generation_marker() {}\n").expect("write first source");
-        std::fs::write(&second, "pub fn generation_marker() {}\n").expect("write second source");
-        let ctx = test_context(project.path());
-        let mut index = SearchIndex::new();
-        index.index_file(&first, b"pub fn generation_marker() {}\n");
-        index.index_file(&second, b"pub fn generation_marker() {}\n");
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
-        let before = response_value(handle_semantic_search(
-            &semantic_page_request("generation_marker", 1, 0),
-            &ctx,
-        ));
-        assert!(before["results"][0]["file"]
-            .as_str()
-            .expect("first result path")
-            .ends_with("src/a.rs"));
-
-        std::fs::write(&first, "pub fn unrelated() {}\n").expect("edit first source");
-        ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-            .expect("installed search index")
-            .update_file(&first);
-        ctx.note_search_index_rx_generation(1);
-
-        let after = response_value(handle_semantic_search(
-            &semantic_page_request("generation_marker", 1, 0),
-            &ctx,
-        ));
-        assert!(after["results"][0]["file"]
-            .as_str()
-            .expect("updated result path")
-            .ends_with("src/b.rs"));
-        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 2);
-    }
-
-    #[test]
-    fn contended_search_index_degrades_with_disclosure() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source_file, "pub fn contention_marker() {}\n").expect("write source");
-        let ctx = test_context(project.path());
-        let writer_guard = ctx
-            .search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let started = std::time::Instant::now();
-        // A first-search wait far longer than the time bound below: if the
-        // search ever waited out that budget on the writer-held index instead
-        // of degrading at once, the bound fails.
-        let response =
-            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(120), || {
-                response_value(handle_semantic_search(
-                    &semantic_request("contention_marker", 5),
-                    &ctx,
-                ))
-            });
-        drop(writer_guard);
-
-        // The property is that a contended index degrades with a disclosure
-        // instead of blocking: this thread holds the write lock until the
-        // search returns, so a search that blocked on it would never return,
-        // and one that waited out the first-search budget would take 120 s.
-        // The bound sits far above the product's per-read 250 ms artifact
-        // budget so that a loaded runner's slowness cannot fail it.
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(30),
-            "contended search took {elapsed:?}, far past its bounded response time: {response:#?}"
-        );
-        assert_eq!(response["success"], true);
-        assert_eq!(response["lexical_only_fallback"], true);
-        assert!(response["text"]
-            .as_str()
-            .expect("fallback text")
-            .contains("artifact contention"));
-    }
-
-    #[test]
-    fn contended_callgraph_receiver_does_not_block_search_formatting() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let ctx = test_context(project.path());
-        let receiver_guard = ctx.callgraph_store_rx().lock();
-        let started = std::time::Instant::now();
-        assert!(warm_callgraph_store(&ctx).is_none());
-        assert!(
-            started.elapsed() < INTERACTIVE_ARTIFACT_READ_BUDGET,
-            "callgraph receiver contention exceeded artifact budget"
-        );
-        drop(receiver_guard);
     }
 }
 
@@ -16374,9 +13948,7 @@ mod split_request_tests {
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SearchIndex::build(root));
+        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
         ctx
     }
 
@@ -16481,12 +14053,10 @@ mod split_request_tests {
         )
     }
 
-    fn save_external_index(root: &Path, storage: &Path) {
-        let mut index = SearchIndex::build(root);
-        index.write_to_disk(
-            &crate::search_index::resolve_cache_dir(root, Some(storage)),
-            None,
-        );
+    fn seed_ignored_legacy_cache(root: &Path, storage: &Path) {
+        let cache = crate::search_index::resolve_cache_dir(root, Some(storage));
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("cache.bin"), b"obsolete search cache").unwrap();
     }
 
     fn assert_external_split(response: &serde_json::Value, root: &Path) {
@@ -16515,170 +14085,6 @@ mod split_request_tests {
                 "{result}"
             );
         }
-    }
-
-    #[test]
-    fn external_search_reuses_saved_path_identity_after_git_is_added() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let session = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let (_dir, root) = project();
-        let owner = external_context(&root, storage.path(), false);
-        let key = owner
-            .memoized_artifact_cache_key_for_configure(&root, &root, storage.path(), None)
-            .unwrap()
-            .expect("settled path identity");
-        assert_eq!(
-            crate::root_identity::read(&root, storage.path()).unwrap(),
-            Some(crate::root_identity::Identity::Path)
-        );
-        save_external_index(&root, storage.path());
-
-        git_init(&root);
-        assert!(std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.com",
-                "add",
-                "."
-            ])
-            .current_dir(&root)
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.com",
-                "commit",
-                "-qm",
-                "initial"
-            ])
-            .current_dir(&root)
-            .status()
-            .unwrap()
-            .success());
-        assert_ne!(crate::search_index::artifact_cache_key(&root), key);
-
-        let ctx = external_context(session.path(), storage.path(), false);
-        let response = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
-            10_000,
-            Duration::from_secs(5),
-            || {
-                search(
-                    &ctx,
-                    serde_json::json!({
-                        "query": "scheduler drains the work queue", "pattern": "load_config", "path": root,
-                    }),
-                )
-            },
-        );
-        assert_external_split(&response, &root);
-        assert_eq!(
-            response["saved_index_check"]["complete"], true,
-            "{response}"
-        );
-        assert_eq!(
-            response["saved_index_check"]["files_examined"], 5,
-            "{response}"
-        );
-    }
-
-    #[test]
-    fn external_pattern_split_indexed() {
-        let session = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let (_dir, root) = project();
-        git_init(&root);
-        save_external_index(&root, storage.path());
-        let ctx = external_context(session.path(), storage.path(), false);
-        let response = search(
-            &ctx,
-            serde_json::json!({
-                "query": "scheduler drains the work queue", "pattern": "load_config", "path": root,
-            }),
-        );
-        assert_external_split(&response, &root);
-        assert_eq!(
-            response["saved_index_check"]["complete"], true,
-            "{response}"
-        );
-        assert_eq!(response["saved_index_check"]["files_examined"], 5);
-        assert!(
-            response["text"].as_str().unwrap().contains(&format!(
-                "Checked the saved AFT index of {} against all 5 files on disk",
-                root.display()
-            )),
-            "{response}"
-        );
-    }
-
-    #[test]
-    fn external_pattern_prose_uses_the_other_projects_semantic_index() {
-        let session = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let (_dir, root) = project();
-        git_init(&root);
-        let policy = root.join("src/policy.rs");
-        std::fs::write(&policy, "pub fn authorize_gateway() {}\n").unwrap();
-        save_external_index(&root, storage.path());
-        let ctx = external_context(session.path(), storage.path(), false);
-        let files = [policy.clone(), root.join("src/loader.rs")];
-        let mut semantic = SemanticIndex::build(
-            &root,
-            &files,
-            &mut |texts: Vec<String>| {
-                Ok(texts
-                    .iter()
-                    .map(|text| {
-                        if text.contains("authorize_gateway") {
-                            vec![1.0, 0.0]
-                        } else {
-                            vec![0.0, 1.0]
-                        }
-                    })
-                    .collect())
-            },
-            16,
-        )
-        .unwrap();
-        semantic.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
-            &ctx.config().semantic,
-            2,
-        ));
-        assert!(semantic.write_to_disk(
-            storage.path(),
-            &crate::search_index::artifact_cache_key(&root)
-        ));
-        // No query word occurs in the answer file. Finding it requires the
-        // other project's vectors, not the session's empty semantic lane.
-        // A non-matching pattern leaves the prose's base order untouched;
-        // matching definitions would intentionally change the split order.
-        let query = "where are credentials checked";
-        with_precomputed_query_vector(query, vec![1.0, 0.0], || {
-            let alone = search(&ctx, serde_json::json!({"query": query, "path": root}));
-            let split = search(
-                &ctx,
-                serde_json::json!({"query": query, "pattern": "no_such_identifier_x", "path": root}),
-            );
-            assert_eq!(split["success"], true, "{split}");
-            assert_eq!(split["semantic_status"], "ready", "{split}");
-            assert_eq!(split["pattern_summary"]["files_matched"], 0);
-            assert_eq!(file_names(&split), file_names(&alone), "{split}");
-            let answer = split["results"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|result| result["file"].as_str().unwrap().ends_with("policy.rs"))
-                .expect("the semantic-only answer is retained");
-            assert_eq!(answer["source"], "semantic", "{answer}");
-            assert_eq!(answer["semantic_score"], 1.0);
-            assert_eq!(answer["matched_by"], "query");
-        });
     }
 
     /// A prose search of another project nobody has open would have used
@@ -16738,43 +14144,6 @@ mod split_request_tests {
         );
     }
 
-    /// This session's own root, bound by a route that does not open it, has
-    /// no semantic index: the footer says `off (not opened)` and the first
-    /// prose search carries the notice.
-    #[test]
-    fn own_root_not_opened_reports_off_in_the_footer() {
-        let (_dir, root) = project();
-        let root = std::fs::canonicalize(root).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let ctx = external_context(&root, storage.path(), false);
-        ctx.set_canonical_cache_root(root.clone());
-        *ctx.semantic_index_status().write().unwrap() =
-            SemanticIndexStatus::Failed(crate::semantic_admission::NOT_OPENED_STATUS.to_string());
-        let mut index = SearchIndex::build(&root);
-        index.ready = true;
-        *ctx.search_index().write().unwrap() = Some(index);
-
-        let ask = || {
-            search(
-                &ctx,
-                serde_json::json!({"query": "scheduler drains the work queue", "session_id": "ses_own_root"}),
-            )
-        };
-        let first = ask();
-        assert_eq!(first["success"], true, "{first}");
-        let text = first["text"].as_str().unwrap();
-        assert!(text.contains("\nsemantic: off (not opened)"), "{text}");
-        assert_eq!(
-            text.matches("semantic search is off for ").count(),
-            1,
-            "{text}"
-        );
-        let second = ask();
-        let text = second["text"].as_str().unwrap();
-        assert!(text.contains("\nsemantic: off (not opened)"), "{text}");
-        assert!(!text.contains("semantic search is off for "), "{text}");
-    }
-
     #[test]
     fn external_pattern_split_unindexed() {
         let session = tempfile::tempdir().unwrap();
@@ -16796,53 +14165,6 @@ mod split_request_tests {
     }
 
     #[test]
-    fn external_pattern_disk_validation_finds_changed_and_added_files() {
-        let session = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let (_dir, root) = project();
-        git_init(&root);
-        std::fs::write(root.join("src/loader.rs"), "pub fn previous_name() {}\n").unwrap();
-        save_external_index(&root, storage.path());
-        // The saved postings cannot nominate the changed or new file for this
-        // pattern. Only validation against disk can make either one a candidate.
-        std::fs::write(
-            root.join("src/loader.rs"),
-            "pub fn fresh_pattern_name() {}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src/added.rs"),
-            "fn call() { fresh_pattern_name(); }\n",
-        )
-        .unwrap();
-        std::fs::remove_file(root.join("src/cli.rs")).unwrap();
-        let ctx = external_context(session.path(), storage.path(), false);
-        let response = search(
-            &ctx,
-            serde_json::json!({
-                "query": "scheduler drains the work queue", "pattern": "fresh_pattern_name", "path": root,
-            }),
-        );
-        assert_eq!(response["success"], true, "{response}");
-        assert_eq!(
-            response["pattern_summary"]["files_matched"], 2,
-            "{response}"
-        );
-        assert!(
-            file_names(&response).contains(&"loader.rs".to_string()),
-            "{response}"
-        );
-        assert_eq!(response["saved_index_check"]["changed"], 1, "{response}");
-        assert_eq!(response["saved_index_check"]["added"], 1);
-        assert_eq!(response["saved_index_check"]["removed"], 1);
-        let alone = search(
-            &ctx,
-            serde_json::json!({"pattern": "fresh_pattern_name", "path": root}),
-        );
-        assert_eq!(file_names(&alone), ["loader.rs", "added.rs"], "{alone}");
-    }
-
-    #[test]
     fn external_pattern_alone_and_zero_matches() {
         for indexed in [false, true] {
             let session = tempfile::tempdir().unwrap();
@@ -16850,7 +14172,7 @@ mod split_request_tests {
             let (_dir, root) = project();
             git_init(&root);
             if indexed {
-                save_external_index(&root, storage.path());
+                seed_ignored_legacy_cache(&root, storage.path());
             }
             let ctx = external_context(session.path(), storage.path(), false);
             let response = search(
@@ -16926,178 +14248,6 @@ mod split_request_tests {
                 serde_json::json!({"query": query, "pattern": "load_config", "path": root}),
             );
             assert_eq!(with, without);
-        }
-    }
-
-    #[test]
-    fn external_pattern_bounds_disclose_partial_coverage() {
-        for indexed in [false, true] {
-            let session = tempfile::tempdir().unwrap();
-            let storage = tempfile::tempdir().unwrap();
-            let (_dir, root) = project();
-            git_init(&root);
-            if indexed {
-                save_external_index(&root, storage.path());
-            }
-            let ctx = external_context(session.path(), storage.path(), false);
-            for query in [None, Some("scheduler drains the work queue")] {
-                regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(Some(1)));
-                // This case tests the file-count cap, so the disk walk gets a
-                // generous time budget: on a loaded Windows runner the default
-                // 2 s ran out before the walk reached any of the three files.
-                let capped = external_disk_check::with_budgets_for_test(
-                    Duration::from_secs(30),
-                    Duration::from_secs(30),
-                    || {
-                        search(
-                            &ctx,
-                            serde_json::json!({"query": query, "pattern": "load_config", "path": root}),
-                        )
-                    },
-                );
-                regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(None));
-                assert_eq!(capped["success"], true, "{capped}");
-                assert_eq!(capped["complete"], false);
-                assert_eq!(
-                    capped["results_list_envelope"]["reason"], "budget",
-                    "{capped}"
-                );
-                let text = capped["text"].as_str().unwrap();
-                assert!(text.contains("1 of 3 candidate files"), "{text}");
-                assert!(
-                    text.contains(&format!("grep with path {}", root.display())),
-                    "{text}"
-                );
-
-                let stopped = external_disk_check::with_budgets_for_test(
-                    Duration::ZERO,
-                    Duration::from_secs(5),
-                    || {
-                        search(
-                            &ctx,
-                            serde_json::json!({"query": query, "pattern": "no_such_identifier_x", "path": root}),
-                        )
-                    },
-                );
-                assert_eq!(stopped["success"], true, "{stopped}");
-                assert_eq!(stopped["complete"], false);
-                let text = stopped["text"].as_str().unwrap();
-                assert!(text.contains("no match in the"), "{text}");
-                assert!(text.contains("0 files on disk"), "{text}");
-                assert!(text.contains("grep with path"), "{text}");
-                if indexed {
-                    assert_eq!(stopped["saved_index_check"]["complete"], false);
-                } else {
-                    assert_eq!(stopped["unindexed_scan"]["complete"], false);
-                }
-            }
-        }
-    }
-
-    /// The missing-literal notice claims no file contains the literal, so it
-    /// may appear only when the check against the files on disk covered every
-    /// file. A check its walk budget cut short says how far it got instead,
-    /// and the reply makes no not-found claim.
-    #[test]
-    fn external_missing_literal_notice_needs_a_complete_disk_check() {
-        let session = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let (_dir, root) = project();
-        git_init(&root);
-        save_external_index(&root, storage.path());
-        let ctx = external_context(session.path(), storage.path(), false);
-        let params = serde_json::json!({"query": "load_settings(", "path": root, "topK": 10});
-        let notice = "No file contains `load_settings(`.";
-
-        let full = external_disk_check::with_budgets_for_test(
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            || search(&ctx, params.clone()),
-        );
-        assert_eq!(full["success"], true, "{full}");
-        assert_eq!(full["saved_index_check"]["complete"], true, "{full}");
-        let text = full["text"].as_str().unwrap();
-        assert!(text.contains(notice), "{text}");
-
-        let stopped = external_disk_check::with_budgets_for_test(
-            Duration::ZERO,
-            Duration::from_secs(5),
-            || search(&ctx, params.clone()),
-        );
-        assert_eq!(stopped["success"], true, "{stopped}");
-        assert_eq!(stopped["saved_index_check"]["complete"], false, "{stopped}");
-        assert_eq!(stopped["complete"], false, "{stopped}");
-        let text = stopped["text"].as_str().unwrap();
-        assert!(!text.contains("No file contains"), "{text}");
-        assert!(!text.contains("[similar]"), "{text}");
-        assert!(!text.contains("not found"), "{text}");
-        assert!(
-            text.contains("only 0 files on disk were compared with it before the time limit"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn external_pattern_mentions_place_the_definition_after_its_host() {
-        for indexed in [false, true] {
-            let session = tempfile::tempdir().unwrap();
-            let storage = tempfile::tempdir().unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let root = std::fs::canonicalize(dir.path()).unwrap();
-            git_init(&root);
-            std::fs::create_dir(root.join("src")).unwrap();
-            for i in 0..8 {
-                let mut text = format!("// scheduler {i} drains work\n");
-                if i == 3 {
-                    text.push_str("fn exit() { drain_now(); }\n");
-                }
-                std::fs::write(root.join(format!("src/p{i}.rs")), text).unwrap();
-            }
-            std::fs::write(root.join("src/defines.rs"), "pub fn drain_now() {}\n").unwrap();
-            if indexed {
-                save_external_index(&root, storage.path());
-            }
-            let ctx = external_context(session.path(), storage.path(), false);
-            // This test ranks a pattern definition after its host; the
-            // borrowed-load, disk-check and first-search waits it does not
-            // test run generous here so a loaded runner cannot truncate the
-            // file list being ranked.
-            let search_split = |params: serde_json::Value| {
-                crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
-                    1_000_000,
-                    Duration::from_secs(30),
-                    || {
-                        external_disk_check::with_budgets_for_test(
-                            Duration::from_secs(30),
-                            Duration::from_secs(30),
-                            || {
-                                with_first_search_index_load_wait_budget_for_test(
-                                    Duration::from_secs(30),
-                                    || search(&ctx, params),
-                                )
-                            },
-                        )
-                    },
-                )
-            };
-            let response = search_split(serde_json::json!({
-                "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
-            }));
-            assert_eq!(response["success"], true, "{response}");
-            let files = file_names(&response);
-            let Some(host) = files.iter().position(|name| name == "p3.rs") else {
-                panic!("host p3.rs missing from results: {response}");
-            };
-            assert_eq!(files[host + 1], "defines.rs", "{response}");
-            assert!(response["results"][host + 1]["supports"]
-                .as_str()
-                .unwrap()
-                .ends_with("p3.rs"));
-            let page = search_split(serde_json::json!({
-                "query": "the scheduler drains the work queue", "pattern": "drain_now", "path": root,
-                "offset": host, "topK": 2,
-            }));
-            assert_eq!(file_names(&page), ["p3.rs", "defines.rs"], "{page}");
         }
     }
 

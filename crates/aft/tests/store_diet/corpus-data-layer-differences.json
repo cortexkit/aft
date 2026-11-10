@@ -1,0 +1,906 @@
+[
+  {
+    "case": "cpp-header",
+    "operation": "callers",
+    "file": "widget.h",
+    "symbol": "use_widget",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "use_widget",
+      "file": "widget.h",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "cpp-header",
+    "operation": "call_tree",
+    "file": "widget.h",
+    "symbol": "use_widget",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "name": "use_widget",
+      "file": "widget.h",
+      "line": 7,
+      "signature": "inline int use_widget() { api::Widget widget; return widget.value(); }",
+      "resolved": true,
+      "children": [
+        {
+          "name": "api::Widget::value",
+          "file": "widget.h",
+          "line": 4,
+          "signature": "int value() { return 42; }",
+          "resolved": true,
+          "approximate": false,
+          "resolved_by": "type_match",
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "cpp-header",
+    "operation": "callers",
+    "file": "widget.h",
+    "symbol": "api::Widget",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "api::Widget",
+      "file": "widget.h",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "cpp-header",
+    "operation": "callers",
+    "file": "widget.h",
+    "symbol": "api",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "api",
+      "file": "widget.h",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "cpp-header",
+    "operation": "callers",
+    "file": "widget.h",
+    "symbol": "api::Widget::value",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "api::Widget::value",
+      "file": "widget.h",
+      "callers": [
+        {
+          "file": "widget.h",
+          "callers": [
+            {
+              "symbol": "use_widget",
+              "line": 7,
+              "approximate": false,
+              "resolved_by": "type_match"
+            }
+          ]
+        }
+      ],
+      "total_callers": 1,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "cpp-header",
+    "operation": "trace_to_symbol",
+    "file": "widget.h",
+    "symbol": "use_widget",
+    "to": "api::Widget::value",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "path": [
+        {
+          "symbol": "use_widget",
+          "file": "widget.h",
+          "line": 7
+        },
+        {
+          "symbol": "api::Widget::value",
+          "file": "widget.h",
+          "line": 4,
+          "approximate": false,
+          "resolved_by": "type_match"
+        }
+      ],
+      "complete": true
+    }
+  },
+  {
+    "case": "cpp-qualified",
+    "operation": "callers",
+    "file": "fixture.cpp",
+    "symbol": "Painter::draw",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "Painter::draw",
+      "file": "fixture.cpp",
+      "callers": [
+        {
+          "file": "fixture.cpp",
+          "callers": [
+            {
+              "symbol": "caller",
+              "line": 7,
+              "approximate": false,
+              "resolved_by": "type_match"
+            },
+            {
+              "symbol": "caller",
+              "line": 8
+            }
+          ]
+        }
+      ],
+      "total_callers": 2,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "cpp-qualified",
+    "operation": "callers",
+    "file": "fixture.cpp",
+    "symbol": "Painter",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "Painter",
+      "file": "fixture.cpp",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed Cpp code could not be resolved, so a dynamic or indirect call may still reach `Painter`."
+    }
+  },
+  {
+    "case": "cpp-qualified",
+    "operation": "callers",
+    "file": "fixture.cpp",
+    "symbol": "caller",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "caller",
+      "file": "fixture.cpp",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed Cpp code could not be resolved, so a dynamic or indirect call may still reach `caller`."
+    }
+  },
+  {
+    "case": "cpp-qualified",
+    "operation": "call_tree",
+    "file": "fixture.cpp",
+    "symbol": "caller",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "name": "caller",
+      "file": "fixture.cpp",
+      "line": 5,
+      "signature": "void caller(Painter *p, Painter obj)",
+      "resolved": true,
+      "children": [
+        {
+          "name": "foo",
+          "file": "fixture.cpp",
+          "line": 4,
+          "signature": "void foo();",
+          "resolved": true,
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        },
+        {
+          "name": "Painter::draw",
+          "file": "fixture.cpp",
+          "line": 3,
+          "signature": "void draw();",
+          "resolved": true,
+          "approximate": false,
+          "resolved_by": "type_match",
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        },
+        {
+          "name": "Painter::draw",
+          "file": "fixture.cpp",
+          "line": 3,
+          "signature": "void draw();",
+          "resolved": true,
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        },
+        {
+          "name": "bar",
+          "file": "fixture.cpp",
+          "line": 9,
+          "resolved": false,
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        },
+        {
+          "name": "templ",
+          "file": "fixture.cpp",
+          "line": 10,
+          "resolved": false,
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "cpp-qualified",
+    "operation": "callers",
+    "file": "fixture.cpp",
+    "symbol": "Foo",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "Foo",
+      "file": "fixture.cpp",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed Cpp code could not be resolved, so a dynamic or indirect call may still reach `Foo`."
+    }
+  },
+  {
+    "case": "cpp-qualified",
+    "operation": "callers",
+    "file": "fixture.cpp",
+    "symbol": "Foo::bar",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "symbol": "Foo::bar",
+      "file": "fixture.cpp",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 1,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 2,
+      "incomplete_reason": "Incomplete: 2 call sites in the analyzed Cpp code could not be resolved, so a dynamic or indirect call may still reach `bar`."
+    }
+  },
+  {
+    "case": "cpp-qualified",
+    "operation": "trace_to_symbol",
+    "file": "fixture.cpp",
+    "symbol": "caller",
+    "to": "Painter::draw",
+    "reason": "C++ method calls on typed receivers now resolve by type match; main left them unresolved",
+    "data_layer": {
+      "path": [
+        {
+          "symbol": "caller",
+          "file": "fixture.cpp",
+          "line": 5
+        },
+        {
+          "symbol": "Painter::draw",
+          "file": "fixture.cpp",
+          "line": 3,
+          "approximate": false,
+          "resolved_by": "type_match"
+        }
+      ],
+      "complete": true
+    }
+  },
+  {
+    "case": "cuda-kernel",
+    "operation": "trace_data",
+    "file": "sample.cu",
+    "symbol": "transform",
+    "expression": "data",
+    "reason": "trace_data hops are exact: an assignment in the origin function, and an argument followed into the callee's parameter",
+    "data_layer": {
+      "expression": "data",
+      "origin_file": "sample.cu",
+      "origin_symbol": "transform",
+      "hops": [
+        {
+          "file": "sample.cu",
+          "symbol": "transform",
+          "variable": "data[index]",
+          "line": 7,
+          "flow_type": "assignment",
+          "approximate": false
+        },
+        {
+          "file": "sample.cu",
+          "symbol": "scale",
+          "variable": "float value",
+          "line": 1,
+          "flow_type": "parameter",
+          "approximate": false
+        }
+      ],
+      "depth_limited": false
+    }
+  },
+  {
+    "case": "cuda-kernel",
+    "operation": "trace_data",
+    "file": "sample.cu",
+    "symbol": "launch_transform",
+    "expression": "data",
+    "reason": "trace_data hops are exact: an assignment in the origin function, and an argument followed into the callee's parameter",
+    "data_layer": {
+      "expression": "data",
+      "origin_file": "sample.cu",
+      "origin_symbol": "launch_transform",
+      "hops": [
+        {
+          "file": "sample.cu",
+          "symbol": "transform",
+          "variable": "float *data",
+          "line": 5,
+          "flow_type": "parameter",
+          "approximate": false
+        }
+      ],
+      "depth_limited": false
+    }
+  },
+  {
+    "case": "go-callback",
+    "operation": "trace_data",
+    "file": "callback.go",
+    "symbol": "entry",
+    "expression": "callback",
+    "reason": "trace_data hops are exact: an assignment in the origin function, and an argument followed into the callee's parameter",
+    "data_layer": {
+      "expression": "callback",
+      "origin_file": "callback.go",
+      "origin_symbol": "entry",
+      "hops": [
+        {
+          "file": "callback.go",
+          "symbol": "spawn",
+          "variable": "callback",
+          "line": 3,
+          "flow_type": "parameter",
+          "approximate": true
+        },
+        {
+          "file": "callback.go",
+          "symbol": "entry",
+          "variable": "saved",
+          "line": 3,
+          "flow_type": "assignment",
+          "approximate": false
+        }
+      ],
+      "depth_limited": false
+    }
+  },
+  {
+    "case": "rust-callback",
+    "operation": "trace_data",
+    "file": "lib.rs",
+    "symbol": "entry",
+    "expression": "callback",
+    "reason": "trace_data hops are exact: an assignment in the origin function, and an argument followed into the callee's parameter",
+    "data_layer": {
+      "expression": "callback",
+      "origin_file": "lib.rs",
+      "origin_symbol": "entry",
+      "hops": [
+        {
+          "file": "lib.rs",
+          "symbol": "spawn",
+          "variable": "callback",
+          "line": 1,
+          "flow_type": "parameter",
+          "approximate": true
+        },
+        {
+          "file": "lib.rs",
+          "symbol": "entry",
+          "variable": "saved",
+          "line": 1,
+          "flow_type": "assignment",
+          "approximate": false
+        }
+      ],
+      "depth_limited": false
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "call_tree",
+    "file": "src/callers.rs",
+    "symbol": "run_template!",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
+    "data_layer": {
+      "name": "run_template!",
+      "file": "src/callers.rs",
+      "line": 3,
+      "resolved": true,
+      "children": [
+        {
+          "name": "template_target",
+          "file": "src/targets.rs",
+          "line": 5,
+          "signature": "pub fn template_target() {}",
+          "resolved": true,
+          "approximate": true,
+          "resolved_by": "name_match",
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/targets.rs",
+    "symbol": "template_target",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
+    "data_layer": {
+      "symbol": "template_target",
+      "file": "src/targets.rs",
+      "callers": [
+        {
+          "file": "src/callers.rs",
+          "callers": [
+            {
+              "symbol": "run_template!",
+              "line": 5,
+              "approximate": true,
+              "resolved_by": "name_match"
+            },
+            {
+              "symbol": "template_caller_one",
+              "line": 27,
+              "approximate": true,
+              "resolved_by": "name_match",
+              "via": "run_template!"
+            },
+            {
+              "symbol": "template_caller_two",
+              "line": 31,
+              "approximate": true,
+              "resolved_by": "name_match",
+              "via": "run_template!"
+            }
+          ]
+        }
+      ],
+      "total_callers": 3,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/methods.rs",
+    "symbol": "poll_session",
+    "reason": "a self call in a macro-generated method resolves by name (approximate); main left it unresolved",
+    "data_layer": {
+      "symbol": "poll_session",
+      "file": "src/methods.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `poll_session`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "call_tree",
+    "file": "src/methods.rs",
+    "symbol": "poll_session",
+    "reason": "a self call in a macro-generated method resolves by name (approximate); main left it unresolved",
+    "data_layer": {
+      "name": "poll_session",
+      "file": "src/methods.rs",
+      "line": 3,
+      "signature": "async fn poll_session(&self, id: &str)",
+      "resolved": true,
+      "children": [
+        {
+          "name": "handle_refusal",
+          "file": "src/methods.rs",
+          "line": 9,
+          "signature": "async fn handle_refusal(&self, id: &str) -> bool",
+          "resolved": true,
+          "approximate": true,
+          "resolved_by": "name_match",
+          "children": [
+            {
+              "name": "is_empty",
+              "file": "src/methods.rs",
+              "line": 10,
+              "resolved": false,
+              "children": [],
+              "depth_limited": false,
+              "truncated": 0
+            }
+          ],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/callers.rs",
+    "symbol": "template_caller_one",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
+    "data_layer": {
+      "symbol": "template_caller_one",
+      "file": "src/callers.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `template_caller_one`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "call_tree",
+    "file": "src/callers.rs",
+    "symbol": "template_caller_one",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
+    "data_layer": {
+      "name": "template_caller_one",
+      "file": "src/callers.rs",
+      "line": 26,
+      "signature": "pub fn template_caller_one()",
+      "resolved": true,
+      "children": [
+        {
+          "name": "run_template!",
+          "file": "src/callers.rs",
+          "line": 3,
+          "resolved": true,
+          "children": [
+            {
+              "name": "template_target",
+              "file": "src/targets.rs",
+              "line": 5,
+              "signature": "pub fn template_target() {}",
+              "resolved": true,
+              "approximate": true,
+              "resolved_by": "name_match",
+              "children": [],
+              "depth_limited": false,
+              "truncated": 0
+            }
+          ],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/callers.rs",
+    "symbol": "custom_caller",
+    "reason": "one fewer unresolved call site in the crate, from the macro-generated self call that now resolves by name",
+    "data_layer": {
+      "symbol": "custom_caller",
+      "file": "src/callers.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `custom_caller`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/methods.rs",
+    "symbol": "handle_refusal",
+    "reason": "a self call in a macro-generated method resolves by name (approximate); main left it unresolved",
+    "data_layer": {
+      "symbol": "handle_refusal",
+      "file": "src/methods.rs",
+      "callers": [
+        {
+          "file": "src/methods.rs",
+          "callers": [
+            {
+              "symbol": "poll_session",
+              "line": 4,
+              "approximate": true,
+              "resolved_by": "name_match"
+            }
+          ]
+        }
+      ],
+      "total_callers": 1,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/callers.rs",
+    "symbol": "dsl_caller",
+    "reason": "one fewer unresolved call site in the crate, from the macro-generated self call that now resolves by name",
+    "data_layer": {
+      "symbol": "dsl_caller",
+      "file": "src/callers.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `dsl_caller`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/targets.rs",
+    "symbol": "dsl_target",
+    "reason": "one fewer unresolved call site in the crate, from the macro-generated self call that now resolves by name",
+    "data_layer": {
+      "symbol": "dsl_target",
+      "file": "src/targets.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "macro_note": {
+        "message": "1 mention of `dsl_target` inside macros could not be analyzed (one location per file): src/callers.rs:35",
+        "mentions": 1,
+        "sites": [
+          "src/callers.rs:35"
+        ]
+      },
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `dsl_target`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/methods.rs",
+    "symbol": "Runtime",
+    "reason": "one fewer unresolved call site in the crate, from the macro-generated self call that now resolves by name",
+    "data_layer": {
+      "symbol": "Runtime",
+      "file": "src/methods.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `Runtime`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/callers.rs",
+    "symbol": "select_caller",
+    "reason": "one fewer unresolved call site in the crate, from the macro-generated self call that now resolves by name",
+    "data_layer": {
+      "symbol": "select_caller",
+      "file": "src/callers.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `select_caller`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/callers.rs",
+    "symbol": "template_caller_two",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
+    "data_layer": {
+      "symbol": "template_caller_two",
+      "file": "src/callers.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `template_caller_two`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "call_tree",
+    "file": "src/callers.rs",
+    "symbol": "template_caller_two",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
+    "data_layer": {
+      "name": "template_caller_two",
+      "file": "src/callers.rs",
+      "line": 30,
+      "signature": "pub fn template_caller_two()",
+      "resolved": true,
+      "children": [
+        {
+          "name": "run_template!",
+          "file": "src/callers.rs",
+          "line": 3,
+          "resolved": true,
+          "children": [
+            {
+              "name": "template_target",
+              "file": "src/targets.rs",
+              "line": 5,
+              "signature": "pub fn template_target() {}",
+              "resolved": true,
+              "approximate": true,
+              "resolved_by": "name_match",
+              "children": [],
+              "depth_limited": false,
+              "truncated": 0
+            }
+          ],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "callers",
+    "file": "src/callers.rs",
+    "symbol": "matches_caller",
+    "reason": "one fewer unresolved call site in the crate, from the macro-generated self call that now resolves by name",
+    "data_layer": {
+      "symbol": "matches_caller",
+      "file": "src/callers.rs",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 4,
+      "depth_limited": false,
+      "truncated": 0,
+      "complete": false,
+      "unresolved_call_sites": 7,
+      "incomplete_reason": "Incomplete: 7 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `matches_caller`."
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "trace_to_symbol",
+    "file": "src/methods.rs",
+    "symbol": "poll_session",
+    "to": "handle_refusal",
+    "reason": "a self call in a macro-generated method resolves by name (approximate); main left it unresolved",
+    "data_layer": {
+      "path": [
+        {
+          "symbol": "poll_session",
+          "file": "src/methods.rs",
+          "line": 3
+        },
+        {
+          "symbol": "handle_refusal",
+          "file": "src/methods.rs",
+          "line": 9,
+          "approximate": true,
+          "resolved_by": "name_match"
+        }
+      ],
+      "complete": true
+    }
+  },
+  {
+    "case": "rust-macros",
+    "operation": "trace_to_symbol",
+    "file": "src/callers.rs",
+    "symbol": "template_caller_two",
+    "to": "template_target",
+    "reason": "a call inside a macro_rules! template is matched by name and marked approximate, in callers and in forward queries; main resolved it as a plain call",
+    "data_layer": {
+      "path": [
+        {
+          "symbol": "template_caller_two",
+          "file": "src/callers.rs",
+          "line": 30
+        },
+        {
+          "symbol": "run_template!",
+          "file": "src/callers.rs",
+          "line": 3
+        },
+        {
+          "symbol": "template_target",
+          "file": "src/targets.rs",
+          "line": 5,
+          "approximate": true,
+          "resolved_by": "name_match"
+        }
+      ],
+      "complete": true
+    }
+  }
+]

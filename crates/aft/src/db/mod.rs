@@ -2,6 +2,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 pub mod file_identity;
 pub mod lifecycle;
+pub(crate) mod sealed_database;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod shm_diagnostics;
 pub mod write_ledger;
@@ -13,6 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 pub mod access_asks;
+pub mod access_grant_rows;
 pub mod access_grants;
 pub mod backups;
 pub mod bash_tasks;
@@ -22,6 +24,7 @@ pub mod catalog_edit_modes;
 pub mod compression_events;
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 pub(crate) mod contention_probe;
+pub(crate) mod deferred_checkpoint;
 pub(crate) mod gh_speech;
 pub mod github_read_cache;
 pub mod remote_exec;
@@ -36,7 +39,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 26;
+pub const CURRENT_SCHEMA_VERSION: u32 = 28;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -65,6 +68,8 @@ const MIGRATION_VERSIONS: &[u32] = &[
     24,
     25,
     26,
+    access_grant_rows::SCHEMA_VERSION,
+    access_grant_rows::SOURCE_SCHEMA_VERSION,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -1050,6 +1055,8 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         )"),
         25 => conn.execute_batch(call_ledger::HELD_UPDATES_MIGRATION),
         26 => conn.execute_batch(catalog_edit_modes::MIGRATION),
+        access_grant_rows::SCHEMA_VERSION => access_grant_rows::migrate(conn),
+        access_grant_rows::SOURCE_SCHEMA_VERSION => access_grant_rows::migrate_source(conn),
         _ => Ok(()),
     }
 }

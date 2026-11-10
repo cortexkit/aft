@@ -30,13 +30,9 @@ pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     watched_directory_count: Arc<AtomicUsize>,
-    initial_coverage: super::InitialCoverage,
 }
 
 impl ProjectWatcher {
-    pub(crate) fn initial_coverage(&self) -> super::InitialCoverage {
-        self.initial_coverage.clone()
-    }
     pub(crate) fn create(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,
@@ -178,6 +174,17 @@ impl ProjectWatcher {
                     git_watched = watched;
                 }
             }
+        }
+        // Edits in a directory inotify couldn't watch reach the index only at
+        // the next rescan, so name the gaps where an operator will look.
+        if let Some(first) = gaps.first() {
+            crate::slog_warn!(
+                "watcher could not watch {} path(s) under {}; first: {} ({:?})",
+                gaps.len(),
+                root.display(),
+                first.path.display(),
+                first.kind
+            );
         }
         counters.bash_flush.set_marker_directory(
             if git_watched
@@ -503,11 +510,6 @@ impl ProjectWatcher {
             shutdown,
             join: Some(join),
             watched_directory_count,
-            initial_coverage: if gaps.is_empty() {
-                super::InitialCoverage::Complete
-            } else {
-                super::InitialCoverage::Incomplete(gaps)
-            },
         })
     }
 
@@ -1074,6 +1076,33 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn initial_subscription_reports_a_directory_it_could_not_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("locked/inner")).unwrap();
+        let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap();
+        let _denied = deny_initial_listing(root.join("locked"));
+        let registration =
+            register_initial_tree(&boundary, &Arc::new(RwLock::new(None)), &[], &mut |_| {
+                Ok(true)
+            })
+            .unwrap();
+        // The directory itself is watched, but nothing under it could be
+        // found, so the gap names it and its child stays unwatched.
+        assert!(registration.watched.contains(&root.join("locked")));
+        assert!(!registration.watched.contains(&root.join("locked/inner")));
+        assert_eq!(
+            registration.gaps,
+            vec![super::super::CoverageGap {
+                path: root.join("locked"),
+                kind: super::super::CoverageGapKind::ListingFailed(
+                    std::io::ErrorKind::PermissionDenied
+                ),
+            }]
+        );
+    }
+
+    #[test]
     fn initial_subscription_cannot_certify_a_root_lost_before_registration() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -1084,88 +1113,6 @@ pub(super) mod tests {
                 Ok(true)
             });
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn partial_initial_coverage_keeps_shared_watching_but_never_grants_v3_trust() {
-        let _serial = crate::blob_store::v3::serial_for_test();
-        let temp = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("readable")).unwrap();
-        std::fs::create_dir_all(root.join("unreadable/nested")).unwrap();
-        std::fs::write(root.join("unreadable/nested/file.rs"), b"fn hidden() {}\n").unwrap();
-        let _denied = deny_initial_listing(root.join("unreadable"));
-        let (tx, rx) = mpsc::channel();
-        let watcher = ProjectWatcher::create(
-            root.clone(),
-            vec![],
-            tx,
-            Arc::new(RwLock::new(None)),
-            Arc::new(AtomicU64::new(0)),
-        )
-        .unwrap();
-        let coverage = super::super::initial_coverage_of(&watcher);
-        let super::super::InitialCoverage::Incomplete(gaps) = &coverage else {
-            panic!("partial registration must name its gap")
-        };
-        assert!(gaps.iter().any(|gap| gap.path == root.join("unreadable")
-            && gap.kind
-                == super::super::CoverageGapKind::ListingFailed(
-                    std::io::ErrorKind::PermissionDenied
-                )));
-        let changed = root.join("readable/still-watched.rs");
-        std::fs::write(&changed, b"fn visible() {}\n").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let event = rx
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap()
-                .unwrap();
-            if event.paths.contains(&changed) {
-                break;
-            }
-        }
-        let _subscription = super::super::subscription::start(&root, coverage.clone());
-        assert_eq!(
-            super::super::subscription::status(&root).unwrap().coverage,
-            coverage
-        );
-        assert!(super::super::subscription::current(&root).is_none());
-        let policy = crate::blob_store::v2::TrigramPolicy {
-            max_file_size: 1 << 20,
-        };
-        let driver = crate::views::first_load::CheckoutDriver::new_v3(
-            storage.path(),
-            "family",
-            "worker",
-            &root,
-            crate::views::manifest_v2::Producers {
-                trigram: policy.fingerprint_hex(),
-                semantic: None,
-                callgraph: "unregistered".into(),
-            },
-            Arc::new(crate::views::first_load::ConfiguredMembershipWalker),
-            vec![Arc::new(crate::views::first_load::TrigramBridge::new(
-                storage.path().to_owned(),
-                policy,
-            ))],
-        )
-        .unwrap();
-        let access = driver.access();
-        let (snapshot, revision) = driver
-            .verified_bind(&access, driver.installed_snapshot().generation().clone())
-            .unwrap();
-        assert!(snapshot
-            .generation()
-            .published()
-            .unwrap()
-            .verified_frontier
-            .is_none());
-        assert!(driver.take_reconcile_work().walks > 0);
-        use crate::views::first_load::FirstLoadDriver;
-        driver.install(&access, &snapshot, revision).unwrap();
-        assert!(driver.installed_snapshot().needs_reconcile());
     }
 
     #[test]

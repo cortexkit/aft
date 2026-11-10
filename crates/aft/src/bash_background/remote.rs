@@ -207,6 +207,11 @@ fn reattach_backoff(attempt: u32) -> Duration {
 #[cfg(unix)]
 const DRAINING_RETRY_BUDGET_MS: u64 = 10 * 60 * 1000;
 
+/// Longest time the saved copy of a draining wait's note may lag the note
+/// shown in this process. The note reports only how long the wait has run.
+#[cfg(unix)]
+const DRAINING_NOTE_SAVE_INTERVAL_MS: u64 = 5_000;
+
 #[cfg(unix)]
 fn retries_draining(remote: &RemoteTask, verdict: &Verdict) -> bool {
     remote.explicit_runon
@@ -508,6 +513,13 @@ struct ReattachBudget {
     attempts: u32,
     /// Attach requests sent by this worker, including retries without progress.
     attach_attempts: u32,
+    /// The job whose `exec.cancel` the runner has already acknowledged, so this
+    /// worker waits for the job's terminal instead of sending the cancel again.
+    /// The cancel itself is saved in the task's remote metadata
+    /// (`cancel_requested`); this field only lives in memory, so a worker
+    /// started after a restart begins without it and sends the saved cancel
+    /// once more, in case the first never reached the runner.
+    cancel_acknowledged: Option<Uuid>,
     /// A test shortened the budget: the job's limits stay treated as passed.
     #[cfg(test)]
     budget_override: bool,
@@ -550,6 +562,7 @@ impl ReattachBudget {
             deadline: None,
             attempts: 0,
             attach_attempts: 0,
+            cancel_acknowledged: None,
             #[cfg(test)]
             budget_override: budget_override.is_some(),
             #[cfg(test)]
@@ -605,6 +618,7 @@ impl ReattachBudget {
         };
         self.job_end = tokio::time::Instant::now() + until_job_end;
         self.deadline = None;
+        self.cancel_acknowledged = None;
         #[cfg(test)]
         {
             self.clock_job_end = self.clock.as_ref().map(|clock| clock.now() + until_job_end);
@@ -1827,31 +1841,42 @@ impl OutputSink for TaskSink {
         if let Some(returns) = self.returns.as_mut() {
             returns.reset();
         }
-        self.commit(|r| {
-            if let Some(submission) = r.submission.as_mut() {
-                submission.reattached |= accepted.attached;
-                if !r.accepted {
-                    submission.recovered();
-                }
-            }
-            r.return_first_seq = None;
-            r.return_staging = Default::default();
-            r.job_id = Some(accepted.job_id);
-            r.queue_position = Some(accepted.queue_position);
-            r.accepted = true;
-            r.accepted_platform = accepted.platform.clone();
-            r.granted_network = accepted.network == Some(Network::Outbound);
-            if accepted.env_not_forwarded.is_some() {
-                r.env_not_forwarded = accepted.env_not_forwarded.clone();
-            }
-        })?;
+        // The acceptance saves output progress too, so its record must not
+        // become durable before the output files (as in `commit`).
+        self.dirty
+            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
         let mut db = DeferredDbWrites::new(&self.registry, &self.task);
         let mut state = self
             .task
             .state
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
-        state.remote_admission_note = None;
+        let previous = state.metadata.clone();
+        let r = state
+            .metadata
+            .remote
+            .as_mut()
+            .ok_or_else(|| io::Error::other("remote record absent"))?;
+        self.output_progress.store(r);
+        if let Some(submission) = r.submission.as_mut() {
+            submission.reattached |= accepted.attached;
+            if !r.accepted {
+                submission.recovered();
+            }
+        }
+        r.return_first_seq = None;
+        r.return_staging = Default::default();
+        r.job_id = Some(accepted.job_id);
+        r.queue_position = Some(accepted.queue_position);
+        r.accepted = true;
+        r.accepted_platform = accepted.platform.clone();
+        r.granted_network = accepted.network == Some(Network::Outbound);
+        if accepted.env_not_forwarded.is_some() {
+            r.env_not_forwarded = accepted.env_not_forwarded.clone();
+        }
+        // The job id and the execution note below are saved in one record
+        // write: a restart needs only the job id, and the note is derived
+        // from the same acceptance.
         append_executor_environment_disclosure(&mut state.metadata);
         if let Some(remote) = &state.metadata.remote {
             let note = remote_execution_note(remote);
@@ -1873,8 +1898,20 @@ impl OutputSink for TaskSink {
             accepted.job_id,
             capture_ms,
         );
-        self.registry
-            .persist_task_locked(&self.task, &state.metadata, &mut db)?;
+        if let Err(error) = self
+            .registry
+            .persist_task_locked(&self.task, &state.metadata, &mut db)
+        {
+            state.metadata = previous;
+            self.task
+                .drain_reply
+                .publish_metadata(&state.metadata, self.task.hard_kill_renewable);
+            return Err(error);
+        }
+        state.remote_admission_note = None;
+        self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
+        self.last_progress_persist = self.progress_now();
+        self.task.publish_runon_launch_state(&state);
         // The remote executor's Accepted record confirms inputs were captured.
         // Refusals skip Accepted; those callers wait for a settled terminal error.
         self.task.remote_launch_ready.store(true, Ordering::Release);
@@ -3595,11 +3632,18 @@ impl BgTaskRegistry {
                     if tests::stop_draining_worker(&root) {
                         return Ok(());
                     }
-                    let result = client
-                        .cancel_job(point.job_id)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
+                    let result = if recovery.cancel_acknowledged == Some(point.job_id) {
+                        Ok(())
+                    } else {
+                        client
+                            .cancel_job(point.job_id)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    };
+                    if result.is_ok() {
+                        recovery.cancel_acknowledged = Some(point.job_id);
+                    }
                     if self.finish_owner_pause_cancel(&task, result) {
                         return Ok(());
                     }
@@ -3901,6 +3945,8 @@ impl BgTaskRegistry {
         root: &Path,
     ) -> Result<Option<RunRequest>, String> {
         let budget = draining_budget_ms(root);
+        // When this wait last saved its note, and for which attempt.
+        let mut note_saved: Option<(u64, u32)> = None;
         loop {
             let (remote, now) = {
                 let mut db = DeferredDbWrites::new(self, task);
@@ -3922,8 +3968,24 @@ impl BgTaskRegistry {
                     "build server is draining for maintenance; retrying (attempt {}, {} of {} used)",
                     retry.attempts.saturating_add(1), retry_duration(now.saturating_sub(first).min(budget)), retry_duration(budget)
                 ));
-                self.persist_task_locked(task, &state.metadata, &mut db)
-                    .map_err(|e| e.to_string())?;
+                // Only the elapsed time in the note changes from one pass to
+                // the next. A restart rewrites the note on its first pass and
+                // needs nothing else from it, so the record is saved when the
+                // wait (or its attempt) begins and then at most once per
+                // `DRAINING_NOTE_SAVE_INTERVAL_MS`; in between, readers in this
+                // process see each update through the published metadata.
+                let save = note_saved.is_none_or(|(saved_at, attempts)| {
+                    attempts != retry.attempts
+                        || now.saturating_sub(saved_at) >= DRAINING_NOTE_SAVE_INTERVAL_MS
+                });
+                if save {
+                    self.persist_task_locked(task, &state.metadata, &mut db)
+                        .map_err(|e| e.to_string())?;
+                    note_saved = Some((now, retry.attempts));
+                } else {
+                    task.drain_reply
+                        .publish_metadata(&state.metadata, task.hard_kill_renewable);
+                }
                 (remote, now)
             };
             if remote.cancel_requested {
@@ -4199,6 +4261,8 @@ impl BgTaskRegistry {
                 .remote
                 .as_ref()
                 .is_some_and(|r| r.cancel_requested);
+            let cancel = cancel && recovery.cancel_acknowledged != Some(point.job_id);
+            let mut cancel_acknowledged = false;
             recovery.attach_attempts = recovery.attach_attempts.saturating_add(1);
             let attempt = recovery
                 .wait(point.job_id, async {
@@ -4208,14 +4272,18 @@ impl BgTaskRegistry {
                             .await
                             .map(|_| ())
                             .map_err(|e| e.to_string());
+                        cancel_acknowledged = result.is_ok();
                         if self.finish_owner_pause_cancel(task, result) {
                             return Ok(Attached::OwnerPauseSettled);
                         }
                     }
                     client.attach(point.clone()).await.map(Attached::Stream)
                 })
-                .await?;
-            match attempt {
+                .await;
+            if cancel_acknowledged {
+                recovery.cancel_acknowledged = Some(point.job_id);
+            }
+            match attempt? {
                 Ok(attached) => return Ok(attached),
                 Err(error) => recovery.log_attach_failure(&task.task_id, point.job_id, &error),
             }
@@ -6046,4 +6114,5 @@ pub(crate) use tests::{assert_siblings_submit_refused_before_connect, submit_run
 #[cfg(all(test, unix))]
 pub(crate) use tests::{
     captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
+    uncaptured_unknown_before_render_for_test,
 };

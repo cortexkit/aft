@@ -1,1 +1,0 @@
-- Background commands recover their completion notices after a restart without interference from sessions in another harness.

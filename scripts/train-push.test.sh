@@ -781,7 +781,8 @@ start_stack_train() {
 
 wait_stack_push() {
   local i
-  for i in $(seq 1 100); do
+  # Generous bound for loaded runners; the loop returns as soon as the run exists.
+  for i in $(seq 1 1500); do
     [ -n "$(origin_ref "$1" "refs/heads/train/$2")" ] &&
       [ -n "$(python3 - "$1/ci-state/runs" "$2" <<'PY'
 import json, pathlib, sys
@@ -879,7 +880,7 @@ test_stack_changed_parent() {
   rm -f "$dir/child.rc" "$dir/child.out"
   start_stack_train "$dir" child child --restack
   pid="$STACK_PID"
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 1500); do
     child_sha="$(origin_ref "$dir" refs/heads/train/child)"
     [ "$child_sha" != "$old_child" ] &&
       [ "$(python3 - "$dir/ci-state/runs" <<'PY'
@@ -1088,9 +1089,19 @@ test_stack_abandoned_parent() {
   rm -f "$dir/child.rc" "$dir/child.out"
   start_stack_train "$dir" child child --restack
   pid="$STACK_PID"
-  for _ in $(seq 1 100); do
-    [ "$(origin_ref "$dir" refs/heads/train/child)" != "$old_child" ] && break
-    [ -f "$dir/child.rc" ] && break
+  # Wait for the restacked push's own CI run, not just the moved ref: the ref
+  # moves before the fake CI records the run, and completing the first push's
+  # run instead leaves the new one pending, so the train would wait forever.
+  # The bound is generous because a loaded runner can take seconds to restack;
+  # the loop leaves as soon as the run exists.
+  for _ in $(seq 1 1500); do
+    [ "$(origin_ref "$dir" refs/heads/train/child)" != "$old_child" ] &&
+      [ "$(python3 - "$dir/ci-state/runs" <<'PY'
+import json, pathlib, sys
+print(sum(json.loads(p.read_text())['branch'] == 'train/child' for p in pathlib.Path(sys.argv[1]).glob('*.json')))
+PY
+)" = 2 ] && break
+    [ -f "$dir/child.rc" ] && ! kill -0 "$pid" 2>/dev/null && break
     sleep 0.02
   done
   complete_stack_ci "$dir" child success

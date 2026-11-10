@@ -2967,47 +2967,13 @@ describe("registerBashTool registers companions only while bash.background is on
     expectBackgroundControls(tools, true);
   });
 
-  // The legacy block is opt-in: a flag it does not set resolves to off, so a
-  // legacy config without `background: true` has no background tasks.
-  test("legacy rewrite=true only → bash registered without companions", () => {
-    const tools = registerWithConfig({
-      experimental: { bash: { rewrite: true } },
-    } as PluginContext["config"]);
-    expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, false);
-  });
-
-  test("legacy compress=true only → bash registered without companions", () => {
-    const tools = registerWithConfig({
-      experimental: { bash: { compress: true } },
-    } as PluginContext["config"]);
-    expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, false);
-  });
-
-  test("legacy background=true → full bash surface registered", () => {
-    const tools = registerWithConfig({
-      experimental: { bash: { background: true } },
-    } as PluginContext["config"]);
-    expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, true);
-  });
-
-  test("all legacy flags true → full bash surface registered", () => {
-    const tools = registerWithConfig({
-      experimental: { bash: { rewrite: true, compress: true, background: true } },
-    } as PluginContext["config"]);
-    expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, true);
-  });
-
   test("bash_status and bash_kill execute with task_id request shape", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const { bridge, calls } = makeTrackableMockBridge({ status: "completed", exit_code: 0 });
     const ctx: PluginContext = {
       pool: { getBridge: () => bridge } as unknown as PluginContext["pool"],
-      config: { experimental: { bash: { background: true } } } as PluginContext["config"],
+      config: { bash: { background: true } } as PluginContext["config"],
       storageDir: "/tmp/test",
     };
     registerBashTool(api, ctx);
@@ -3117,8 +3083,15 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(on).toContain("foreground");
     expect(on).toContain("wait: true");
     expect(on).toContain("auto-promote can remind you while you work");
-    // Demote background: true to the parallel-work-only case.
-    expect(on).toContain("other useful work to do while it runs");
+    // Demote background: true to the parallel-work-only case, where any work
+    // that doesn't need the command's result counts as parallel work.
+    expect(on).toContain(
+      "other work to do while it runs, and any work that doesn't need this command's result counts",
+    );
+    // A long command ends the turn only once everything left needs its result.
+    expect(on).toContain(
+      "first do the work that doesn't need this result, end the turn only when everything left needs it",
+    );
     // Name the exact anti-pattern this description previously caused.
     expect(on).toContain("never background a command and immediately `bash_watch` it");
     // Still forbid the bash_status polling loop.
@@ -3130,7 +3103,10 @@ describe("bash tool description (agent-facing wording)", () => {
     const watch = createBashWatchTool(ctx);
     expect(watch.description).toContain("short remaining wait on a task");
     expect(watch.description).toContain("120s by default");
-    expect(watch.description).toContain("bash({background:true})");
+    expect(watch.description).toContain(
+      "first do the work that doesn't need the result, end the turn only when everything left needs it",
+    );
+    expect(watch.description).toContain("bash({wait:true})");
     expect(watch.description).toContain("Never loop bash_status");
     const status = createBashStatusTool(ctx);
     expect(status.description).toContain("never loop");

@@ -1,24 +1,15 @@
 use std::path::Path;
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::{
-    impact_result, index_refusal_response, note_callgraph_served, store_error_response,
+    impact_result, note_callgraph_served, store_error_response,
 };
-use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle an `impact` request.
 pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_impact(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Graph,
-        BorrowedOp::Impact,
-    );
-    response
+    answer_impact(req, ctx)
 }
 
 fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -79,32 +70,28 @@ fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let store = match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Error(error) => {
-            return store_error_response(&req.id, "impact", error)
-        }
-        other => return index_refusal_response(&req.id, "impact", ctx, &other),
-    };
-
-    if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
-        &req.id, "impact", ctx, &store, &file_path,
+    let (snapshot, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
+        &req.id,
+        "impact",
+        ctx,
+        &[file_path.as_path()],
     ) {
-        return response;
-    }
-
-    // Retain the pinned reader while a separate transaction builds the answer.
-    let snapshot = match store.read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => return store_error_response(&req.id, "impact", error),
+        Ok(graph) => graph,
+        Err(response) => return response,
     };
-    match impact_result(
+    let outcome = impact_result(
         &snapshot,
         &file_path,
         symbol,
         depth,
         include_tests_param(req),
-    ) {
+    );
+    if let Some(response) =
+        crate::data_layer::tools::callgraph::failed_reads(&req.id, "impact", data_view.as_ref())
+    {
+        return response;
+    }
+    match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "impact", 0, "ok");
             serialized_response(&req.id, "impact", &result)

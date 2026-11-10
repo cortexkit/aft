@@ -552,8 +552,9 @@ Optional `outputOffset` / `stderrOffset` (`output_offset` / `stderr_offset` in P
 
 **`bash_watch`** — block on or register for a background task's output. In a main session sync
 waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s
-by default); for anything longer end the turn on `bash({background:true})` and let the completion
-reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. In a
+by default); for anything longer, first do the work that doesn't need the result, end the turn
+only when everything left needs it, and let the completion reminder wake you, or use
+`bash({wait:true})` when the result is needed before anything else. In a
 delegated (subagent) session, which cannot be woken once its turn ends, a sync wait without
 `timeoutMs` waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default),
 then reports the command is still running with how long it has run and its latest output; the
@@ -1177,11 +1178,12 @@ Categories run in two tiers:
 
 - **Tier 1** (`todos`, `metrics`) — computed synchronously with a ~1s soft deadline. Always
   present in the response.
-- **Tier 2** (`dead_code`, `unused_exports`, `duplicates`) — heavier cross-file analyses backed
-  by a callgraph snapshot. They run as background scans triggered on session idle. An
-  `aft_inspect` call reads cached aggregates and returns immediately: a category that hasn't been
-  scanned yet appears in `pending_categories`, and a category whose inputs changed since the last
-  scan appears in `stale_categories`. Tier 2 never blocks the call on a full scan.
+- **Tier 2** (`dead_code`, `unused_exports`, `duplicates`, `cycles`, `complexity`) — heavier
+  whole-repository analyses backed by a callgraph snapshot. They run only when `aft_inspect` is
+  called, never in the background, and the call waits until they are current. A cached result
+  whose inputs are unchanged answers quickly. The status bar does not show their counts. The
+  in-memory dead-code graph is released after 10 minutes without a dead-code request; the next
+  request builds it again.
 
 Response shape:
 
@@ -1342,7 +1344,7 @@ Call graph and data-flow analysis across the workspace.
 |------|-------------|
 | `call_tree` | What does this function call? (forward, default depth 5) |
 | `callers` | Where is this function called from? (reverse, default depth 1) |
-| `trace_to` | How does execution reach this function from entry points? |
+| `trace_to` | How does execution reach this function? Each path of callers runs back to a root, labelled main, test, attribute, public API, or no caller found. |
 | `impact` | What callers are affected if this function changes? |
 | `trace_to_symbol` | Shortest call path from one symbol to another. Needs `toSymbol` (and `toPath` to disambiguate). |
 | `trace_data` | Follow a value through assignments and parameters. Needs `expression`. |

@@ -148,6 +148,54 @@ function hubSummaryLine(
   return message ? theme.fg("warning", message) : undefined;
 }
 
+/** Root kinds in the order replies list them (see the Rust `RootKind`). */
+const ROOT_KINDS = ["main", "test", "attribute", "public_api", "no_caller_found"] as const;
+
+const ROOT_LABELS: Record<string, string> = {
+  main: "main",
+  test: "test",
+  attribute: "attribute",
+  public_api: "public API",
+  no_caller_found: "no caller found",
+};
+
+/** `count` roots of `kind`, as a summary line names them. */
+function rootCounted(kind: string, count: number): string {
+  const plural = count === 1 ? "" : "s";
+  switch (kind) {
+    case "main":
+      return count === 1 ? "main" : `${count} main functions`;
+    case "test":
+      return `${count} test${plural}`;
+    case "attribute":
+      return `${count} function${plural} with an entry attribute`;
+    case "public_api":
+      return `${count} public API function${plural}`;
+    default:
+      return `${count} function${plural} with no caller found`;
+  }
+}
+
+/** The roots a `trace_to` or `impact` reply reached, from its `root_counts`. */
+function rootSummary(record: Record<string, unknown>): string | undefined {
+  const counts = asRecord(record.root_counts);
+  if (!counts) return undefined;
+  const parts = ROOT_KINDS.flatMap((kind) => {
+    const count = asNumber(counts[kind]);
+    return count && count > 0 ? [rootCounted(kind, count)] : [];
+  });
+  return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+/** The tag on a path's root or an impact caller that is a root. */
+function rootTag(record: Record<string, unknown>): string | undefined {
+  const kind = asString(record.root);
+  const label = kind ? ROOT_LABELS[kind] : undefined;
+  if (!kind || !label) return undefined;
+  const attribute = asString(record.attribute);
+  return kind === "attribute" && attribute ? `[root: attribute ${attribute}]` : `[root: ${label}]`;
+}
+
 function renderTracePath(
   path: Record<string, unknown>,
   index: number,
@@ -155,16 +203,26 @@ function renderTracePath(
   theme: CallgraphTheme,
 ): void {
   lines.push(`Path ${index + 1}`);
+  const root = rootTag(path);
   asRecords(path.hops).forEach((hop, hopIndex) => {
     const symbol = asString(hop.symbol) ?? "(unknown)";
     const file = shortenPath(asString(hop.file) ?? "(unknown file)");
     const line = asNumber(hop.line);
-    const entry = hop.is_entry_point === true ? " [entry]" : "";
+    // The first hop is the root; an exported function further along stays
+    // inside the path and says so.
+    const tag =
+      hopIndex === 0
+        ? root
+          ? ` ${theme.fg("warning", root)}`
+          : ""
+        : hop.exported === true
+          ? " [exported]"
+          : "";
     const nameMatch = nameMatchEdgeMarker(hop, theme);
     lines.push(
       treeLine(
         hopIndex + 1,
-        `${symbol}${entry} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}${nameMatch}`,
+        `${symbol}${tag} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}${nameMatch}`,
       ),
     );
   });
@@ -298,19 +356,19 @@ export function formatCallgraphSections(
     const hubSummary = hubSummaryLine(record, theme);
     const totalPaths = asNumber(record.total_paths) ?? paths.length;
     const totalPathsIsLowerBound = asBoolean(record.total_paths_is_lower_bound) ?? false;
-    const entryPoints = asNumber(record.entry_points_found) ?? 0;
+    const roots = rootSummary(record);
     const sections = [
       joinNonEmpty([
         theme.fg(
           "success",
           `${totalPathsIsLowerBound ? "at least " : ""}${totalPaths} path${totalPaths === 1 ? "" : "s"}`,
         ),
-        theme.fg("muted", `${entryPoints} entry point${entryPoints === 1 ? "" : "s"}`),
+        roots ? theme.fg("muted", `roots: ${roots}`) : undefined,
         warning,
       ]),
     ];
     if (hubSummary) sections.push(hubSummary);
-    if (paths.length === 0) sections.push(theme.fg("muted", "No entry paths found."));
+    if (paths.length === 0) sections.push(theme.fg("muted", "No paths found."));
     paths.forEach((path, index) => {
       const lines: string[] = [];
       renderTracePath(path, index, lines, theme);
@@ -343,12 +401,15 @@ export function formatCallgraphSections(
     const testFilterNote = asString(record.test_filter_note);
     if (testFilterNote) sections.unshift(theme.fg("warning", testFilterNote));
     if (hubSummary) sections.push(hubSummary);
+    const roots = rootSummary(record);
+    if (roots) sections.push(theme.fg("muted", `Reaches ${roots}`));
     if (callers.length === 0) sections.push(theme.fg("muted", "No impacted callers found."));
     callers.forEach((caller) => {
       const file = shortenPath(asString(caller.caller_file) ?? "(unknown file)");
       const symbol = asString(caller.caller_symbol) ?? "(unknown)";
       const line = asNumber(caller.line) ?? 0;
-      const entry = caller.is_entry_point === true ? ` ${theme.fg("warning", "[entry]")}` : "";
+      const root = rootTag(caller);
+      const entry = root ? ` ${theme.fg("warning", root)}` : "";
       const nameMatch = nameMatchEdgeMarker(caller, theme);
       const reference =
         caller.relation === "callback_reference"

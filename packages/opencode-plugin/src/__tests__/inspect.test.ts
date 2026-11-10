@@ -7,7 +7,6 @@ import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import {
-  createInspectTier2IdleScheduler,
   inspectTools,
   parseInspectTerminal,
   renderInspectTerminal,
@@ -33,7 +32,6 @@ type ToolCallCall = {
   rawArgs: Record<string, unknown>;
   options?: Record<string, unknown>;
 };
-type CapturedTimer = { callback: () => void; delay: number; cleared: boolean };
 
 function createPluginContext(pool: BridgePool, config: Record<string, unknown>): PluginContext {
   return {
@@ -354,53 +352,4 @@ describe("aft_inspect tool", () => {
     expect(shouldRegisterInspectTool({ disabled_tools: [] })).toBe(true);
     expect(shouldRegisterInspectTool({ disabled_tools: ["aft_inspect"] })).toBe(false);
   });
-
-  test("session idle scheduling remains separate from an inspect terminal", async () => {
-    const timers: CapturedTimer[] = [];
-    const runs: string[] = [];
-    const scheduler = createInspectTier2IdleScheduler({
-      isEnabled: () => true,
-      idleMinutes: () => 4,
-      run: async (sessionID) => {
-        runs.push(sessionID);
-      },
-      setTimer: (callback, delay) => {
-        const timer = { callback, delay, cleared: false };
-        timers.push(timer);
-        return timer as unknown as ReturnType<typeof setTimeout>;
-      },
-      clearTimer: (timer) => {
-        (timer as unknown as CapturedTimer).cleared = true;
-      },
-    });
-
-    scheduler.schedule("sid-1");
-    expect(timers[0]?.delay).toBe(4 * 60 * 1000);
-    timers[0]?.callback();
-    await Promise.resolve();
-    expect(runs).toEqual(["sid-1"]);
-  });
-});
-test("inspect idle timer is passive and still cleared on disposal", () => {
-  let unrefs = 0;
-  let clears = 0;
-  const timer = {
-    unref: () => {
-      unrefs++;
-    },
-  } as unknown as ReturnType<typeof setTimeout>;
-  const scheduler = createInspectTier2IdleScheduler({
-    isEnabled: () => true,
-    idleMinutes: () => undefined,
-    run: async () => {},
-    setTimer: () => timer,
-    clearTimer: (value) => {
-      expect(value).toBe(timer);
-      clears++;
-    },
-  });
-  scheduler.schedule("session");
-  expect(unrefs).toBe(1);
-  scheduler.clearAll();
-  expect(clears).toBe(1);
 });

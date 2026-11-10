@@ -93,7 +93,12 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     const golden = await readFile(resolve(fixtureRoot, "structure.txt"), "utf8");
     for (const target of [paths, directory]) {
       const result = await harness.callTool("aft_outline", { target });
-      expect(harness.text(result)).toBe(golden);
+      // The status bar is appended only when a count changed since the session
+      // last saw it, for example when the background TODO count first arrives
+      // mid-test. That is timing, not outline structure; the bar has its own
+      // tests.
+      const text = harness.text(result).replace(/\n*\[AFT [^\]\n]*\]\s*$/, "\n");
+      expect(text).toBe(golden);
       expect(result.details).toMatchObject({ success: true, complete: true });
     }
   });

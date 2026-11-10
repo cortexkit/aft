@@ -2,6 +2,7 @@ import { Cause, Effect, Stream } from "effect";
 import { markHeldBgCompletions } from "./bg-notifications.js";
 import { error as logError, warn } from "./logger.js";
 import { releaseSessionState } from "./shared/session-cleanup.js";
+import { clearSessionDirectory } from "./shared/session-directory.js";
 import { resolveSubagentStatus } from "./shared/subagent-detect.js";
 import { callBashBridge } from "./tools/_shared.js";
 import type { PluginContext } from "./types.js";
@@ -286,6 +287,10 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
                 Effect.promise(async () => {
                   const sessionID = event.data.sessionID;
                   if (!sessionID) return;
+                  if (event.type === "session.moved") {
+                    clearSessionDirectory(sessionID);
+                    return;
+                  }
                   if (event.type === "session.deleted") {
                     const state = sessions.get(sessionID);
                     // Collect the in-memory kill targets before the entry is

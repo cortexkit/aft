@@ -1290,6 +1290,7 @@ pub(super) fn build_tool_response_frame_with_limit(
     policy: impl Into<ToolResponsePolicy>,
     max_body_len: usize,
 ) -> Result<WriterFrame, SubcError> {
+    let _alloc_label = crate::alloc_trace::scope(crate::alloc_trace::Label::FRAME_ENCODE, None);
     let policy = policy.into();
     let mut capped;
     let result = if result.text.len() > crate::tool_output::TEXT_LIMIT {

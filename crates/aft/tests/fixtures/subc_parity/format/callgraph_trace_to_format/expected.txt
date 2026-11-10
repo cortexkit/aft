@@ -1,5 +1,5 @@
-2 paths · 1 entry point · (depth limited, 1 truncated)
+2 paths · roots: 1 public API function · (depth limited, 1 truncated)
 Showing first 20 paths; 3 omitted high-fan-in paths.
 Path 1
-  ↳ entry [entry] [<PROJECT_ROOT>/src/entry.ts:1]
+  ↳ entry [root: public API] [<PROJECT_ROOT>/src/entry.ts:1]
     ↳ leaf [<PROJECT_ROOT>/src/main.ts:20] ~

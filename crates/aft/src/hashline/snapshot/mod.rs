@@ -511,9 +511,9 @@ impl SnapshotStore {
 
         if let Some((index, merged)) = coalesced {
             let previous_bytes = self.paths[&path][index].residency_bytes();
-            self.remove_history(
+            self.remove_history_for_content(
                 &EvictionRecord::new(&path, &published_snapshot.tag),
-                &content_fingerprint(&normalized_bytes),
+                &normalized_bytes,
             );
             let version = &mut self
                 .paths
@@ -564,9 +564,9 @@ impl SnapshotStore {
             }
         }
 
-        self.remove_history(
+        self.remove_history_for_content(
             &EvictionRecord::new(&path, &published_snapshot.tag),
-            &content_fingerprint(&normalized_bytes),
+            &normalized_bytes,
         );
         self.total_bytes = self.total_bytes.saturating_add(retained_bytes);
         self.paths
@@ -850,6 +850,21 @@ impl SnapshotStore {
         });
     }
 
+    /// [`Self::remove_history`] for content not fingerprinted yet. The
+    /// whole-content hash is computed only when the history holds an entry
+    /// for the same path and tag, which is rare: hashing first made every
+    /// tagged read and every applied edit hash the whole file again just to
+    /// find nothing to remove.
+    fn remove_history_for_content(&mut self, record: &EvictionRecord, normalized_bytes: &[u8]) {
+        if self
+            .eviction_history
+            .iter()
+            .any(|entry| entry.record == *record)
+        {
+            self.remove_history(record, &content_fingerprint(normalized_bytes));
+        }
+    }
+
     fn history_contains(&self, path: &Path, tag: &str) -> bool {
         self.eviction_history
             .iter()
@@ -862,16 +877,26 @@ impl SnapshotStore {
         tag: &str,
         normalized_bytes: &[u8],
     ) -> bool {
-        let fingerprint = content_fingerprint(normalized_bytes);
+        // Hashed only once an entry for the same path and tag turns up.
+        let mut fingerprint = None;
         self.eviction_history.iter().any(|entry| {
             entry.record.canonical_path == path
                 && entry.record.tag == tag
-                && entry.content_fingerprint != fingerprint
+                && entry.content_fingerprint
+                    != *fingerprint.get_or_insert_with(|| content_fingerprint(normalized_bytes))
         })
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whole-content fingerprints computed on this thread.
+    static CONTENT_FINGERPRINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn content_fingerprint(normalized_bytes: &[u8]) -> ContentFingerprint {
+    #[cfg(test)]
+    CONTENT_FINGERPRINTS.with(|count| count.set(count.get() + 1));
     *blake3::hash(normalized_bytes).as_bytes()
 }
 
@@ -1710,6 +1735,26 @@ mod tests {
         let path = root.join(name);
         fs::write(&path, bytes).expect("fixture write");
         path
+    }
+
+    /// Publishing, re-reading and resolving a file whose path and tag have
+    /// no eviction history never hashes its content: the fingerprint only
+    /// matters when it is compared with a history entry.
+    #[test]
+    fn publishing_and_resolving_without_history_hashes_no_content() {
+        let mut store = SnapshotStore::new();
+        let path = PathBuf::from("/tmp/fingerprint-free.txt");
+        let content = b"line one\nline two\n".repeat(512);
+        let first = snapshot(&content, [1]);
+        let tag = first.tag.clone();
+        CONTENT_FINGERPRINTS.with(|count| count.set(0));
+        store.publish(&path, first);
+        // The same content read again coalesces into the first version.
+        store.publish(&path, snapshot(&content, [2]));
+        store.publish(&path, snapshot(b"other content\n", [1]));
+        assert!(store.lookup(&path, &tag).is_ok());
+        assert_eq!(store.snapshot_count(), 2);
+        assert_eq!(CONTENT_FINGERPRINTS.with(|count| count.get()), 0);
     }
 
     #[test]

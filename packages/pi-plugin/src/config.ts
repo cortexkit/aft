@@ -8,6 +8,8 @@ import {
   DEFAULT_DISABLED_TOOLS,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
+  IDLE_CHECKOUT_HOURS_MAX,
+  IDLE_CHECKOUT_HOURS_MIN,
   isBlockedBashEnvKey,
   isProjectBlockedBashEnvKey,
   legacyConfigNoticeMessage,
@@ -24,6 +26,8 @@ import {
   type ResolvedIndexesConfig,
   readConfigTiers,
   removedConfigKeyErrors,
+  removedConfigKeysNoticeDigest,
+  removedConfigKeysNoticeMessage,
   resolveCortexKitConfigPaths,
   resolveIndexes,
   resolveLegacyAftConfigSources,
@@ -36,6 +40,7 @@ import {
   translateConfigDocument,
   unionDisabledTools,
   validateResolvedConfig,
+  viewsForConfigure,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 import { z } from "zod";
@@ -238,7 +243,6 @@ export interface LspServerConfig {
 export interface InspectConfig {
   enabled?: boolean;
   diagnostics_timeout_ms?: number;
-  tier2_idle_minutes?: number;
   tier2_pass_timeout_ms?: number;
   categories?: Partial<
     Record<
@@ -260,6 +264,12 @@ export interface InspectConfig {
 export interface IdleConfig {
   /** Unbound-root artifact eviction idle window in minutes. Default 30; clamped to 5..=30. */
   root_ttl_minutes?: number;
+  /**
+   * Hours without use after which a checkout counts as idle and drops its
+   * in-memory index state. Default 168; clamped to 1..=8760. Replaces
+   * `views.idle_checkout_hours`.
+   */
+  checkout_hours?: number;
 }
 
 export const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 120_000;
@@ -431,9 +441,15 @@ export function resolvedIndexes(config: AftConfig): ResolvedIndexesConfig {
   return resolveIndexes(config.indexes);
 }
 
+/**
+ * Removed keys. AFT keeps one index store per repository, so these no longer
+ * do anything; a file that sets them gets a notice, `aft doctor --fix` deletes
+ * them, and from 0.65.0 a config that sets them is refused. They stay in the
+ * type, undocumented, only so such a file still loads until then.
+ */
 export interface ViewsConfig {
-  /** Enable content-addressed index views. Default: false. */
   enabled?: boolean;
+  callgraph_copies?: number;
 }
 
 /** `remote_exec` (see `RemoteExecConfigSchema`). */
@@ -479,22 +495,22 @@ export interface AftConfig {
   index?: IndexConfig;
   /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
   storage?: { cache_dir?: string | null };
-  /** Content-addressed index views. Disabled by default. */
+  /** Removed: see `ViewsConfig`. */
   views?: ViewsConfig;
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
   callgraph_chunk_size?: number;
   /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
   inspect?: InspectConfig;
-  /** Idle reclamation windows for unbound-root artifacts and language servers. */
+  /**
+   * Idle windows: when the indexes of a root no session is using any more are
+   * evicted, and when an unused checkout drops its in-memory index state.
+   * Merged per key.
+   */
   idle?: IdleConfig;
   /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
   backup?: BackupConfig;
-  /**
-   * Linked-worktree RAM overlay. Default off. A repo may opt its worktrees
-   * in at project tier; it only spends that machine's RAM.
-   */
+  /** Removed key, like the `views` keys. Kept only so an old file still loads. */
   worktree?: {
-    /** Apply local watcher events to the in-RAM trigram delta. Never writes shared artifacts. */
     ram_overlay?: boolean;
   };
   /** Shell sandbox profiles; projects may choose a stricter role profile but cannot loosen one. */
@@ -502,8 +518,7 @@ export interface AftConfig {
   /**
    * Bash runtime configuration (runtime gate + rewrite + compress +
    * background). Registration is controlled by `disabled_tools` only.
-   * Graduated from `experimental.bash.*` in v0.27.2; the legacy nested
-   * form is still accepted for backward compat.
+   * Graduated from `experimental.bash.*` in v0.27.2.
    *
    * - `true`  — runtime on, all sub-features on (the default)
    * - `false` — runtime gate off; bash operations report `bash_disabled`
@@ -600,25 +615,17 @@ export function clampBashWatchSyncMaxMs(value: number | undefined): number {
  *   2. Top-level `bash: true`  → fully enabled (sub-features all true)
  *   3. Top-level `bash: { ... }` → runtime gate from `enabled` (default
  *      true); each sub-feature defaults true when not specified
- *   4. Top-level `bash` absent + any `experimental.bash.*` set → legacy
- *      fallback; sub-features take their explicit values (default false
- *      to preserve pre-v0.27.2 behavior — that block was opt-in); the
- *      runtime gate stays on
- *   5. Top-level `bash` absent + no experimental → everything on
+ *   4. Top-level `bash` absent → everything on
  *
- * Mirrors OpenCode's resolver exactly. Reminder tuning rides through from
- * whichever surface specified it (top-level wins, legacy fills the gap).
+ * Mirrors OpenCode's resolver exactly.
  */
 export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   const top = config.bash;
-  const legacy = config.experimental?.bash;
 
   const reminderEnabled =
-    (typeof top === "object" && top !== null ? top.long_running_reminder_enabled : undefined) ??
-    legacy?.long_running_reminder_enabled;
+    typeof top === "object" && top !== null ? top.long_running_reminder_enabled : undefined;
   const reminderInterval =
-    (typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined) ??
-    legacy?.long_running_reminder_interval_ms;
+    typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined;
 
   // Foreground wait-window: only the object form can set it; clamp to the
   // 5000ms floor and default to 15000ms when unset.
@@ -675,23 +682,6 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       subagent_background: top.subagent_background ?? true,
       detach_on_user_message: topDetachOnUserMessage,
     };
-  }
-
-  // Top-level absent. Honor legacy experimental.bash.* if any sub-flag was
-  // explicitly set — preserves pre-v0.27.2 opt-in semantics. An empty
-  // `experimental.bash: {}` (object present but feature keys absent) falls
-  // through to surface default; this avoids accidentally disabling bash for
-  // users who wrote an empty experimental block while migrating.
-  const hasLegacyFeatureFlag =
-    legacy &&
-    (legacy.rewrite !== undefined ||
-      legacy.compress !== undefined ||
-      legacy.background !== undefined);
-  if (hasLegacyFeatureFlag) {
-    const rewrite = legacy.rewrite === true;
-    const compress = legacy.compress === true;
-    const background = legacy.background === true;
-    return { ...base, enabled: true, rewrite, compress, background };
   }
 
   return { ...base, enabled: true, rewrite: true, compress: true, background: true };
@@ -854,21 +844,6 @@ const LspConfigSchema = z.object({
 });
 
 const ExperimentalConfigSchema = z.object({
-  /**
-   * @deprecated The bash family graduated from experimental in v0.27.2. Use
-   * the top-level `bash` key instead. Still accepted for backward compat —
-   * when present and top-level `bash` is absent, its values seed the
-   * resolved bash config. Will be removed in v0.28.
-   */
-  bash: z
-    .object({
-      rewrite: z.boolean().optional(),
-      compress: z.boolean().optional(),
-      background: z.boolean().optional(),
-      long_running_reminder_enabled: z.boolean().optional(),
-      long_running_reminder_interval_ms: z.number().int().positive().optional(),
-    })
-    .optional(),
   lsp_ty: z.boolean().optional(),
 });
 
@@ -1045,7 +1020,6 @@ const InspectConfigSchema = z.object({
     .transform((value) =>
       value === undefined ? undefined : clampInspectDiagnosticsTimeoutMs(value),
     ),
-  tier2_idle_minutes: z.number().min(0).optional(),
   tier2_pass_timeout_ms: z.number().int().positive().optional(),
   categories: z
     .object({
@@ -1072,35 +1046,31 @@ function clampIdleRootTtlMinutes(value: number): number {
   return Math.min(30, Math.max(5, value));
 }
 
+function clampIdleCheckoutHours(value: number): number {
+  return Math.min(IDLE_CHECKOUT_HOURS_MAX, Math.max(IDLE_CHECKOUT_HOURS_MIN, value));
+}
+
 const IdleConfigSchema = z.object({
   root_ttl_minutes: z
     .number()
     .int()
     .optional()
     .transform((value) => (value === undefined ? undefined : clampIdleRootTtlMinutes(value))),
+  checkout_hours: z
+    .number()
+    .int()
+    .optional()
+    .transform((value) => (value === undefined ? undefined : clampIdleCheckoutHours(value))),
 });
 
+/** Removed keys: see `ViewsConfig`. Kept only so an old file still loads. */
 const ViewsConfigSchema = z.object({
-  /** Enable content-addressed index views. Default: false. */
   enabled: z.boolean().optional(),
-  /**
-   * How many checkouts of one repository keep their own call graph, besides
-   * the main checkout. Another checkout reads the main checkout's graph, and
-   * its answers say which of its files differ. 0 makes every other checkout
-   * read the main checkout's graph. Default: 4.
-   */
   callgraph_copies: z.number().int().optional(),
-  /** Hours without use after which a checkout's view can be evicted. Default: 168, minimum 1. */
-  idle_checkout_hours: z.number().int().optional(),
 });
 
+/** Removed key: see `ViewsConfig`. Kept only so an old file still loads. */
 const WorktreeConfigSchema = z.object({
-  /**
-   * When true, a linked worktree applies local file-watcher events to the
-   * in-RAM trigram delta (and symbol-cache invalidation) so search reflects
-   * edits in that worktree. Default: false. Never writes the shared on-disk
-   * index. Semantic search and callgraph stay frozen.
-   */
   ram_overlay: z.boolean().optional(),
 });
 
@@ -1153,7 +1123,7 @@ const AftConfigFieldsSchema = z.object({
   /**
    * Bash runtime configuration. Three shapes: `true`, `false` (runtime gate
    * off), or `{ enabled?, rewrite?, compress?, background?, ... }`.
-   * Replaces `experimental.bash.*` (still accepted for backward compat).
+   * Replaces `experimental.bash.*`.
    */
   bash: BashConfigSchema.optional(),
   experimental: ExperimentalConfigSchema.optional(),
@@ -1210,6 +1180,9 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const indexes = mergeIndexes(base.indexes, override.indexes, !trusted);
   if (indexes === undefined) delete merged.indexes;
   else merged.indexes = indexes;
+  const idle = mergeIdleConfig(base.idle, override.idle);
+  if (idle === undefined) delete merged.idle;
+  else merged.idle = idle;
   // Apply harness values over this file's base values. Project-versus-user
   // hardening happens later in mergeConfigs, after both files' harnesses are applied.
   merged.sandbox = mergeSandboxConfig(base.sandbox, override.sandbox, true);
@@ -1309,7 +1282,10 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
 
   overrides.indexes = resolvedIndexes(config);
   if (config.index !== undefined) overrides.index = config.index;
-  if (config.views !== undefined) overrides.views = config.views;
+  // views.enabled does nothing any more; only the views keys the engine
+  // still reads are sent.
+  const views = viewsForConfigure(config.views);
+  if (views !== undefined) overrides.views = views;
   if (config.callgraph_chunk_size !== undefined)
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
@@ -1399,8 +1375,8 @@ export function resolveExperimentalConfigForConfigure(
   const overrides: ConfigureExperimentalOverrides = {};
 
   // Bash sub-features always flow through `resolveBashConfig` now — that's
-  // the single source of truth across top-level `bash`, legacy
-  // `experimental.bash.*`, and surface defaults. See the resolver above.
+  // the single source of truth across top-level `bash` and surface
+  // defaults. See the resolver above.
   const bash = resolveBashConfig(config);
   overrides.experimental_bash_rewrite = bash.rewrite;
   overrides.experimental_bash_compress = bash.compress;
@@ -1592,8 +1568,13 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
 
   // Retired keys are translated on the raw document, before schema
-  // validation, so they never reach Zod and never fail the load.
-  const removed = removedConfigKeyErrors(cleanConfig);
+  // validation, so they never reach Zod. Names retired in 0.62 or earlier are
+  // translated here in both files, never refused. The AFT binary rewrites the
+  // user file to current keys when it loads it (with a backup and a notice).
+  // A project file belongs to its repository, and refusing it would leave
+  // everyone who opens the repository without AFT until a tracked file is
+  // edited, so it loads with a notice instead.
+  const removed = removedConfigKeyErrors(cleanConfig, undefined, false);
   if (removed.length) {
     throw new ConfigRejectedError(removed);
   }
@@ -1617,15 +1598,26 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
       warn(text);
     }
   }
-  if (translation.legacyInput && tier === "user") {
-    // The AFT binary rewrites the user file to current keys when its
-    // configure next reads the file, and reports that rewrite to the user as
-    // a `config_migrated` configure warning. Queuing a notice here as well
-    // would show the user two notices, so the plugin only logs.
-    log(
-      `Config ${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); applied their current equivalents in memory`,
-    );
-  } else if (translation.legacyInput) {
+  if (tier === "user") {
+    if (translation.legacyInput) {
+      // The AFT binary rewrites the user file to current keys when its
+      // configure next reads the file, and reports that rewrite to the user
+      // as a `config_migrated` configure warning. Queuing a notice here as
+      // well would show the user two notices, so the plugin only logs.
+      log(
+        `Config ${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); applied their current equivalents in memory`,
+      );
+    }
+    if (translation.removedKeys.length > 0) {
+      // That rewrite leaves removed keys in the user file, so its notice never
+      // names them; this one does, once per file identity.
+      configLoadNotices.push({
+        configPath,
+        digest: removedConfigKeysNoticeDigest(translation),
+        message: removedConfigKeysNoticeMessage(configPath, translation),
+      });
+    }
+  } else if (translation.legacyInput || translation.removedKeys.length > 0) {
     configLoadNotices.push({
       configPath,
       digest: noticeDigest(projection),
@@ -1793,6 +1785,20 @@ function mergeWorktreeConfig(
   return { ...baseWorktree, ...overrideWorktree };
 }
 
+/** Each tier or harness block sets only the idle keys it names. */
+function mergeIdleConfig(
+  baseIdle: AftConfig["idle"],
+  overrideIdle: AftConfig["idle"],
+): { root_ttl_minutes: number | undefined; checkout_hours: number | undefined } | undefined {
+  const merged = {
+    root_ttl_minutes: overrideIdle?.root_ttl_minutes ?? baseIdle?.root_ttl_minutes,
+    checkout_hours: overrideIdle?.checkout_hours ?? baseIdle?.checkout_hours,
+  };
+  return merged.root_ttl_minutes === undefined && merged.checkout_hours === undefined
+    ? undefined
+    : merged;
+}
+
 function mergeInspectConfig(
   baseInspect: AftConfig["inspect"],
   overrideInspect: AftConfig["inspect"],
@@ -1939,20 +1945,10 @@ function mergeExperimentalConfig(
   base?: ExperimentalConfig,
   override?: ExperimentalConfig,
 ): ExperimentalConfig | undefined {
-  const bash: Record<string, unknown> = {
-    ...base?.bash,
-    ...override?.bash,
-  };
   const experimental: Record<string, unknown> = {
     ...base,
     ...override,
   };
-
-  if (Object.values(bash).some((value) => value !== undefined)) {
-    experimental.bash = bash;
-  } else {
-    delete experimental.bash;
-  }
   if (Object.values(experimental).every((value) => value === undefined)) return undefined;
 
   return Object.fromEntries(
@@ -2159,6 +2155,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   }
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
+  const idle = mergeIdleConfig(base.idle, override.idle);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
   const remoteExec = mergeRemoteExecConfig(base.remote_exec, override.remote_exec);
   const backup = mergeProjectBackupConfig(base.backup, override.backup);
@@ -2180,6 +2177,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   delete safeOverride.bash;
   delete safeOverride.inspect;
   delete safeOverride.worktree;
+  delete safeOverride.idle;
   delete safeOverride.pi;
   delete safeOverride.views;
 
@@ -2192,6 +2190,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(bash !== undefined ? { bash } : {}),
     ...(inspect !== undefined ? { inspect } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
+    ...(idle !== undefined ? { idle } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(remoteExec !== undefined ? { remote_exec: remoteExec } : {}),
     ...(backup !== undefined ? { backup } : {}),
@@ -2296,7 +2295,8 @@ export function buildConfigTierConfigureParams(
 /**
  * Load and resolve the user and project config for one project. The result
  * always carries a sorted `disabled_tools` list and fully resolved `indexes`.
- * Retired keys are translated, never refused. Throws {@link ConfigRejectedError}
+ * Retired keys are translated, except that a project file naming one retired
+ * in 0.62 or earlier is refused. Throws {@link ConfigRejectedError}
  * when a document or security setting is invalid, or the resolved configuration
  * is incomplete. A rejected reload must keep the last-good configuration.
  */

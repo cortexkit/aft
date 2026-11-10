@@ -11,10 +11,10 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::Parser;
 use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 
-use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+use crate::cache_freshness::{self};
 use crate::callgraph::resolve_module_path;
+use crate::callgraph_store::join::syntax_index::{Direct, Nav};
 use crate::error::AftError;
-use crate::symbol_cache_disk;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
 const MAX_REEXPORT_DEPTH: usize = 10;
@@ -786,21 +786,6 @@ fn is_h_header(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("h")
 }
 
-/// Language for a stored-content key, without reading a possibly newer file.
-/// An unresolved header is a cache miss; its source must be parsed before a key
-/// can be chosen safely.
-pub(crate) fn language_for_content_hash(path: &Path, hash: blake3::Hash) -> Option<LangId> {
-    if is_h_header(path) {
-        return HEADER_PARSE_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entries
-            .get(&hash)
-            .map(|(_, lang)| *lang);
-    }
-    language_for_extension(path)
-}
-
 pub(crate) fn language_for_extension(path: &Path) -> Option<LangId> {
     if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
         return Some(LangId::Groovy);
@@ -1268,6 +1253,11 @@ struct CachedSymbols {
     /// multi-file outline derived from the same tree. They share this entry's
     /// freshness key and are dropped with it when the file's content changes.
     outline_facts: Option<Arc<crate::commands::outline::OutlineParseFacts>>,
+    /// The symbols are a table shared with other checkouts' caches, whose
+    /// memory the process-wide table cache counts once (see
+    /// [`SymbolCache::insert_shared_table`]); this cache leaves them out of
+    /// its own estimate.
+    shared_table: bool,
 }
 
 /// A fresh cache entry with everything a multi-file outline needs to render
@@ -1279,7 +1269,9 @@ pub(crate) struct CachedOutline {
     pub(crate) facts: Arc<crate::commands::outline::OutlineParseFacts>,
 }
 
-fn content_hash_for_source(source: &str) -> blake3::Hash {
+/// The content hash a symbol-cache entry records for `source`: none (zero)
+/// past the hashing size cap.
+pub(crate) fn content_hash_for_source(source: &str) -> blake3::Hash {
     if source.len() as u64 > cache_freshness::CONTENT_HASH_SIZE_CAP {
         cache_freshness::zero_hash()
     } else {
@@ -1349,13 +1341,7 @@ pub struct SymbolCache {
 
 pub type SharedSymbolCache = Arc<RwLock<SymbolCache>>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SymbolCacheLoadOutcome {
-    pub(crate) loaded: usize,
-    pub(crate) needs_persistence: bool,
-}
-
-fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
+pub(crate) fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
     symbols.iter().fold(0u64, |bytes, symbol| {
         let scope_bytes = symbol.scope_chain.iter().fold(0u64, |scope_bytes, scope| {
             scope_bytes
@@ -1394,11 +1380,17 @@ fn module_bytes(modules: &[RustModule]) -> u64 {
         .sum()
 }
 
+/// The bytes `cached` holds for this cache alone: a shared symbol table is
+/// counted where it is shared, once for the process.
 fn cached_symbols_estimated_bytes(path: &Path, cached: &CachedSymbols) -> u64 {
     (std::mem::size_of::<PathBuf>() as u64)
         .saturating_add(crate::memory::path_bytes(path))
         .saturating_add(std::mem::size_of::<CachedSymbols>() as u64)
-        .saturating_add(symbols_estimated_bytes(&cached.symbols))
+        .saturating_add(if cached.shared_table {
+            0
+        } else {
+            symbols_estimated_bytes(&cached.symbols)
+        })
         .saturating_add(
             cached
                 .modules
@@ -1413,113 +1405,11 @@ fn cached_symbols_estimated_bytes(path: &Path, cached: &CachedSymbols) -> u64 {
         )
 }
 
-/// A disk symbol cache decoded and checked against the files on disk, not yet
-/// installed in a [`SymbolCache`].
-pub(crate) struct DecodedSymbolCache {
-    root: PathBuf,
-    entries: HashMap<PathBuf, CachedSymbols>,
-    outcome: SymbolCacheLoadOutcome,
-}
-
-impl DecodedSymbolCache {
-    /// Decodes the disk cache and drops entries whose source file changed.
-    /// Returns `None` when there is no usable disk cache.
-    fn read(storage_dir: &Path, project_key: &str, current_root: &Path) -> Option<Self> {
-        debug_assert!(current_root.is_absolute());
-        let cache = symbol_cache_disk::read_from_disk(storage_dir, project_key)?;
-        let mut entries = HashMap::new();
-        let mut outcome = SymbolCacheLoadOutcome::default();
-        let mut canonical_parents = crate::search_index::ParentCanonicalizationMemo::default();
-
-        for entry in cache.entries {
-            #[cfg(test)]
-            SYMBOL_CACHE_DECODE_TEST_BARRIERS.with(|slot| {
-                if let Some((arrived, released)) = slot.borrow_mut().take() {
-                    arrived.wait();
-                    released.wait();
-                }
-            });
-            let Some(path) = crate::search_index::cached_path_under_root_with_memo(
-                current_root,
-                &entry.relative_path,
-                &mut canonical_parents,
-            ) else {
-                outcome.needs_persistence = true;
-                continue;
-            };
-            let cached_freshness = FileFreshness {
-                mtime: entry.mtime,
-                size: entry.size,
-                content_hash: entry.content_hash,
-            };
-            let mtime = match cache_freshness::verify_file(&path, &cached_freshness) {
-                FreshnessVerdict::HotFresh => entry.mtime,
-                FreshnessVerdict::ContentFresh { new_mtime, .. } => {
-                    outcome.needs_persistence = true;
-                    new_mtime
-                }
-                FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
-                    outcome.needs_persistence = true;
-                    continue;
-                }
-            };
-
-            entries.insert(
-                path,
-                CachedSymbols {
-                    mtime,
-                    size: entry.size,
-                    content_hash: entry.content_hash,
-                    symbols: Arc::new(entry.symbols),
-                    modules: None,
-                    has_error: None,
-                    outline_facts: None,
-                },
-            );
-            outcome.loaded += 1;
-        }
-
-        Some(Self {
-            root: current_root.to_path_buf(),
-            entries,
-            outcome,
-        })
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     /// Parks a disk-cache decode before its next entry, so a test can act on
     /// the shared cache while the decode is in flight.
     static SYMBOL_CACHE_DECODE_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Loads the disk symbol cache into a shared cache for `generation`.
-///
-/// Decoding and checking each entry against its file (a stat, sometimes a
-/// content hash) happens with no lock held; only the final swap takes the
-/// write lock. Holding the write lock for the whole load blocked every outline,
-/// zoom and symbol lookup for as long as the startup load took. If the cache
-/// moved to another generation while decoding (a reconfigure reset it), the
-/// decoded entries belong to the old project state and are discarded, not
-/// merged.
-pub(crate) fn load_shared_symbol_cache_for_generation(
-    symbol_cache: &SharedSymbolCache,
-    generation: u64,
-    storage_dir: &Path,
-    project_key: &str,
-    current_root: &Path,
-) -> SymbolCacheLoadOutcome {
-    let Some(decoded) = DecodedSymbolCache::read(storage_dir, project_key, current_root) else {
-        return SymbolCacheLoadOutcome::default();
-    };
-    let Ok(mut cache) = symbol_cache.write() else {
-        return SymbolCacheLoadOutcome::default();
-    };
-    if cache.generation != generation {
-        return SymbolCacheLoadOutcome::default();
-    }
-    cache.install_decoded(decoded)
 }
 
 impl SymbolCache {
@@ -1575,6 +1465,21 @@ impl SymbolCache {
         )
     }
 
+    /// Insert pre-warmed symbols for a file as a table other checkouts'
+    /// caches may hold too. The caller keeps the table where the process
+    /// counts its memory once, for as long as any cache holds it, so this
+    /// cache's estimate leaves the table out.
+    pub(crate) fn insert_shared_table(
+        &mut self,
+        path: PathBuf,
+        mtime: SystemTime,
+        size: u64,
+        content_hash: blake3::Hash,
+        symbols: Arc<Vec<Symbol>>,
+    ) -> bool {
+        self.insert_entry(path, mtime, size, content_hash, symbols, None, None, true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_shared(
         &mut self,
@@ -1585,6 +1490,30 @@ impl SymbolCache {
         symbols: Arc<Vec<Symbol>>,
         modules: Option<Arc<Vec<RustModule>>>,
         has_error: Option<bool>,
+    ) -> bool {
+        self.insert_entry(
+            path,
+            mtime,
+            size,
+            content_hash,
+            symbols,
+            modules,
+            has_error,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_entry(
+        &mut self,
+        path: PathBuf,
+        mtime: SystemTime,
+        size: u64,
+        content_hash: blake3::Hash,
+        symbols: Arc<Vec<Symbol>>,
+        modules: Option<Arc<Vec<RustModule>>>,
+        has_error: Option<bool>,
+        shared_table: bool,
     ) -> bool {
         if let Some(cached) = self.entries.get_mut(&path) {
             if cached.mtime == mtime
@@ -1625,6 +1554,7 @@ impl SymbolCache {
             modules,
             has_error,
             outline_facts: None,
+            shared_table,
         };
         let next_bytes = if let Some((stored_path, previous)) = self.entries.get_key_value(&path) {
             self.entry_bytes = self
@@ -1694,81 +1624,6 @@ impl SymbolCache {
             .is_some_and(|cached| cached.mtime == mtime)
     }
 
-    /// Load valid symbol entries from disk, dropping only entries whose source file changed.
-    pub fn load_from_disk(
-        &mut self,
-        storage_dir: &Path,
-        project_key: &str,
-        current_root: &Path,
-    ) -> usize {
-        self.load_from_disk_with_outcome(storage_dir, project_key, current_root)
-            .loaded
-    }
-
-    fn load_from_disk_with_outcome(
-        &mut self,
-        storage_dir: &Path,
-        project_key: &str,
-        current_root: &Path,
-    ) -> SymbolCacheLoadOutcome {
-        match DecodedSymbolCache::read(storage_dir, project_key, current_root) {
-            Some(decoded) => self.install_decoded(decoded),
-            None => SymbolCacheLoadOutcome::default(),
-        }
-    }
-
-    /// Replace every entry with a decoded disk cache.
-    fn install_decoded(&mut self, decoded: DecodedSymbolCache) -> SymbolCacheLoadOutcome {
-        self.project_root = Some(decoded.root);
-        self.entries = decoded.entries;
-        self.entry_bytes = self.entries.iter().fold(0u64, |bytes, (path, cached)| {
-            bytes.saturating_add(cached_symbols_estimated_bytes(path, cached))
-        });
-        self.symbol_count = self
-            .entries
-            .values()
-            .map(|cached| cached.symbols.len())
-            .fold(0usize, usize::saturating_add);
-        self.mutation_revision = if decoded.outcome.needs_persistence {
-            1
-        } else {
-            0
-        };
-        self.persisted_revision = 0;
-        decoded.outcome
-    }
-
-    /// Load valid symbol entries from disk only when the caller still belongs
-    /// to the active cache generation.
-    pub fn load_from_disk_for_generation(
-        &mut self,
-        generation: u64,
-        storage_dir: &Path,
-        project_key: &str,
-        current_root: &Path,
-    ) -> usize {
-        self.load_from_disk_for_generation_with_outcome(
-            generation,
-            storage_dir,
-            project_key,
-            current_root,
-        )
-        .loaded
-    }
-
-    pub(crate) fn load_from_disk_for_generation_with_outcome(
-        &mut self,
-        generation: u64,
-        storage_dir: &Path,
-        project_key: &str,
-        current_root: &Path,
-    ) -> SymbolCacheLoadOutcome {
-        if self.generation != generation {
-            return SymbolCacheLoadOutcome::default();
-        }
-        self.load_from_disk_with_outcome(storage_dir, project_key, current_root)
-    }
-
     /// Invalidate cached symbols for a specific file.
     pub fn invalidate(&mut self, path: &Path) {
         if let Some((stored_path, previous)) = self.entries.remove_entry(path) {
@@ -1795,26 +1650,6 @@ impl SymbolCache {
     /// Current generation token.
     pub fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub(crate) fn needs_persistence(&self) -> bool {
-        self.mutation_revision != self.persisted_revision
-    }
-
-    pub(crate) fn persistence_revision(&self) -> u64 {
-        self.mutation_revision
-    }
-
-    pub(crate) fn mark_persisted_for_generation(
-        &mut self,
-        generation: u64,
-        persisted_revision: u64,
-    ) -> bool {
-        if self.generation != generation || self.mutation_revision != persisted_revision {
-            return false;
-        }
-        self.persisted_revision = persisted_revision;
-        true
     }
 
     /// Whether the cache has an entry for a file.
@@ -1883,7 +1718,11 @@ impl SymbolCache {
                 .saturating_add(std::mem::size_of::<PathBuf>() as u64)
                 .saturating_add(crate::memory::path_bytes(path))
                 .saturating_add(std::mem::size_of::<CachedSymbols>() as u64)
-                .saturating_add(symbols_estimated_bytes(&cached.symbols))
+                .saturating_add(if cached.shared_table {
+                    0
+                } else {
+                    symbols_estimated_bytes(&cached.symbols)
+                })
                 .saturating_add(
                     cached
                         .modules
@@ -1910,36 +1749,6 @@ impl SymbolCache {
         crate::memory::MemoryEstimate::estimated(entry_bytes.saturating_add(project_root_bytes))
             .count("entries", self.entries.len())
             .count("symbols", symbol_count)
-    }
-
-    pub(crate) fn project_root(&self) -> Option<PathBuf> {
-        self.project_root.clone()
-    }
-
-    pub(crate) fn disk_entries(
-        &self,
-    ) -> Vec<(&PathBuf, SystemTime, u64, blake3::Hash, &Vec<Symbol>)> {
-        // Persist EVERY parsed entry, including files that legitimately parse to
-        // zero symbols (e.g. a TS file with only imports, a config-shaped file).
-        // Previously these were filtered out, so they were never written to disk;
-        // on the next spawn `load_from_disk` couldn't reload them, the prewarm
-        // skip-check (`contains_path_with_mtime`) missed, and they were re-parsed
-        // on every startup forever (the "N new" churn in issue #86). An empty
-        // entry serializes to `symbols: []` — a few bytes — and makes the prewarm
-        // skip it. It also makes the "persisted symbol cache: N files" count
-        // accurate (was overstated by the filtered-out empties).
-        self.entries
-            .iter()
-            .map(|(path, cached)| {
-                (
-                    path,
-                    cached.mtime,
-                    cached.size,
-                    cached.content_hash,
-                    cached.symbols.as_ref(),
-                )
-            })
-            .collect()
     }
 }
 
@@ -2097,6 +1906,58 @@ impl FileParser {
         }
 
         let cached = self.cache.get(&canon).ok_or_else(|| AftError::ParseError {
+            message: format!("parser cache missing entry for {}", path.display()),
+        })?;
+        Ok((&cached.tree, cached.lang))
+    }
+
+    /// Parse `source`, the text a caller already read from `path`, without
+    /// reading the file again. The tree cache is shared with
+    /// [`FileParser::parse`]: a cached tree is reused only when it was parsed
+    /// from the same text (same size and content hash), so the tree always
+    /// describes `source`.
+    pub(crate) fn parse_source_text(
+        &mut self,
+        path: &Path,
+        source: &str,
+    ) -> Result<(&Tree, LangId), AftError> {
+        let lang = language_for_extension(path).ok_or_else(|| AftError::InvalidRequest {
+            message: format!(
+                "unsupported file extension: {}",
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("<none>")
+            ),
+        })?;
+        let size = source.len() as u64;
+        let content_hash = content_hash_for_source(source);
+        let reusable = size <= cache_freshness::CONTENT_HASH_SIZE_CAP
+            && self
+                .cache
+                .get(path)
+                .is_some_and(|cached| cached.size == size && cached.content_hash == content_hash);
+        if !reusable {
+            let (tree, lang) = parse_resolved_source(path, source, lang)?;
+            #[cfg(test)]
+            work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
+            self.cache.insert(
+                path.to_path_buf(),
+                CachedTree {
+                    // No stat was taken for this text. The epoch never equals
+                    // a real mtime, so a later `parse` of the path checks the
+                    // content hash before reusing this tree.
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size,
+                    content_hash,
+                    tree,
+                    lang,
+                    source: self
+                        .capture_source
+                        .then(|| captured_source(source.to_string())),
+                },
+            );
+        }
+        let cached = self.cache.get(path).ok_or_else(|| AftError::ParseError {
             message: format!("parser cache missing entry for {}", path.display()),
         })?;
         Ok((&cached.tree, cached.lang))
@@ -2564,7 +2425,19 @@ pub fn extract_symbols_from_tree(
     tree: &Tree,
     lang: LangId,
 ) -> Result<Vec<Symbol>, AftError> {
-    let mut symbols = extract_symbols_from_tree_unbounded(source, tree, lang)?;
+    extract_symbols_from_tree_with(source, tree, lang, Direct)
+}
+
+/// [`extract_symbols_from_tree`], with `nav` walking a Rust tree and
+/// answering its parent and sibling lookups. Other languages run tree-sitter
+/// queries, which walk the tree themselves.
+pub(crate) fn extract_symbols_from_tree_with<'tree>(
+    source: &str,
+    tree: &'tree Tree,
+    lang: LangId,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = extract_symbols_from_tree_unbounded(source, tree, lang, nav)?;
     for symbol in &mut symbols {
         if let Some(signature) = symbol.signature.as_mut() {
             truncate_signature(signature);
@@ -2587,15 +2460,16 @@ pub(crate) fn truncate_signature(signature: &mut String) {
     signature.push('…');
 }
 
-fn extract_symbols_from_tree_unbounded(
+fn extract_symbols_from_tree_unbounded<'tree>(
     source: &str,
-    tree: &Tree,
+    tree: &'tree Tree,
     lang: LangId,
+    nav: impl Nav<'tree>,
 ) -> Result<Vec<Symbol>, AftError> {
     let root = tree.root_node();
 
     if lang == LangId::Rust {
-        return extract_rs_symbols(source, &root);
+        return extract_rs_symbols(source, &root, nav);
     }
     if lang == LangId::Html {
         return extract_html_symbols(source, &root);
@@ -2621,9 +2495,9 @@ fn extract_symbols_from_tree_unbounded(
     })?;
 
     match lang {
-        LangId::TypeScript | LangId::Tsx => extract_ts_symbols(source, &root, query),
-        LangId::JavaScript => extract_js_symbols(source, &root, query),
-        LangId::Python => extract_py_symbols(source, &root, query),
+        LangId::TypeScript | LangId::Tsx => extract_ts_symbols(source, &root, query, nav),
+        LangId::JavaScript => extract_js_symbols(source, &root, query, nav),
+        LangId::Python => extract_py_symbols(source, &root, query, nav),
         LangId::Go => extract_go_symbols(source, &root, query),
         LangId::C => extract_c_symbols(source, &root, query),
         LangId::Cpp | LangId::Cuda | LangId::Metal => {
@@ -2674,9 +2548,20 @@ pub(crate) fn node_range(node: &Node) -> Range {
 /// This ensures that when agents edit/replace a symbol, they get the full
 /// declaration including `#[test]`, `#[derive(...)]`, `/// doc`, `@decorator`, etc.
 pub(crate) fn node_range_with_decorators(node: &Node, source: &str, lang: LangId) -> Range {
+    node_range_with_decorators_with(node, source, lang, Direct)
+}
+
+/// [`node_range_with_decorators`], looking up parents and siblings with
+/// `nav`.
+pub(crate) fn node_range_with_decorators_with<'tree>(
+    node: &Node<'tree>,
+    source: &str,
+    lang: LangId,
+    nav: impl Nav<'tree>,
+) -> Range {
     if matches!(lang, LangId::Python) {
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "decorated_definition" {
+        if let Some(parent) = nav.parent(*node) {
+            if nav.kind(parent) == "decorated_definition" {
                 return node_range(&parent);
             }
         }
@@ -2690,25 +2575,30 @@ pub(crate) fn node_range_with_decorators(node: &Node, source: &str, lang: LangId
     // does, because they're replacing the *declaration*). Walk up to the
     // export_statement so the range covers `export ...`/`export default ...`.
     if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "export_statement" {
-                return node_range_with_decorators_inner(&parent, source, lang);
+        if let Some(parent) = nav.parent(*node) {
+            if nav.kind(parent) == "export_statement" {
+                return node_range_with_decorators_inner(&parent, source, lang, nav);
             }
         }
     }
 
-    node_range_with_decorators_inner(node, source, lang)
+    node_range_with_decorators_inner(node, source, lang, nav)
 }
 
 /// Inner walk that handles preceding-sibling expansion (decorators, doc comments).
 /// Split from `node_range_with_decorators` so the export-statement parent path can
 /// recurse without re-checking the export wrapper.
-fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> Range {
+fn node_range_with_decorators_inner<'tree>(
+    node: &Node<'tree>,
+    source: &str,
+    lang: LangId,
+    nav: impl Nav<'tree>,
+) -> Range {
     let mut range = node_range(node);
 
     let mut current = *node;
-    while let Some(prev) = current.prev_sibling() {
-        let kind = prev.kind();
+    while let Some(prev) = nav.prev_sibling(current) {
+        let kind = nav.kind(prev);
         let should_include = match lang {
             LangId::Rust => {
                 // Include #[...] attributes
@@ -2879,9 +2769,9 @@ struct ExportIndex {
     names: HashSet<String>,
 }
 
-fn collect_exports(source: &str, root: &Node) -> ExportIndex {
+fn collect_exports<'tree>(source: &str, root: &Node<'tree>, nav: impl Nav<'tree>) -> ExportIndex {
     let mut ranges = Vec::new();
-    let names = walk_export_statements(source, root, |node| ranges.push(node.byte_range()));
+    let names = walk_export_statements(source, root, nav, |node| ranges.push(node.byte_range()));
     // Keep only ranges no other range contains. A node is inside some export
     // statement exactly when it is inside one of the outermost ones, and once
     // contained ranges are gone, both starts and ends increase along the list,
@@ -2929,7 +2819,7 @@ thread_local! {
 /// them from [`collect_exports`]; tests use this to check that walk.
 #[cfg(test)]
 fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
-    walk_export_statements(source, root, |_| {})
+    walk_export_statements(source, root, Direct, |_| {})
 }
 
 /// Pre-order walk of the whole tree: calls `on_export` for every
@@ -2940,31 +2830,21 @@ fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
 /// TypeScript grammar (an HTML page whose URL ended in `.d.ts`) produced an
 /// error-recovery tree deep enough to overflow the 2 MiB executor worker
 /// stack and abort the daemon - twice, 55 s apart, on the same request.
-fn walk_export_statements(
+fn walk_export_statements<'tree>(
     source: &str,
-    root: &Node,
+    root: &Node<'tree>,
+    nav: impl Nav<'tree>,
     mut on_export: impl FnMut(&Node),
 ) -> HashSet<String> {
     let mut exported = HashSet::new();
-    let mut cursor = root.walk();
-    loop {
-        let node = cursor.node();
-        if node.kind() == "export_statement" {
+    nav.walk(*root, |node, kind| {
+        if kind == "export_statement" {
             on_export(&node);
             collect_names_from_export_statement(source, &node, &mut exported);
         }
-        if cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                return exported;
-            }
-        }
-    }
+        true
+    });
+    exported
 }
 
 fn collect_names_from_export_statement(source: &str, node: &Node, exported: &mut HashSet<String>) {
@@ -3056,12 +2936,13 @@ fn extract_signature(source: &str, node: &Node) -> String {
     trimmed.to_string()
 }
 
-fn push_default_export_symbol(
+fn push_default_export_symbol<'tree>(
     symbols: &mut Vec<Symbol>,
     source: &str,
     lang: LangId,
-    body_node: Node,
-    def_node: Node,
+    body_node: Node<'tree>,
+    def_node: Node<'tree>,
+    nav: impl Nav<'tree>,
 ) {
     let kind = if body_node.kind() == "class" {
         SymbolKind::Class
@@ -3072,7 +2953,7 @@ fn push_default_export_symbol(
     symbols.push(Symbol {
         name: "default".to_string(),
         kind,
-        range: node_range_with_decorators(&def_node, source, lang),
+        range: node_range_with_decorators_with(&def_node, source, lang, nav),
         signature: Some(extract_signature(source, &def_node)),
         scope_chain: vec![],
         exported: true,
@@ -3100,18 +2981,19 @@ fn node_contains_descendant_kind(node: &Node, kind: &str) -> bool {
     }
 }
 
-fn push_ts_member_symbol(
+fn push_ts_member_symbol<'tree>(
     symbols: &mut Vec<Symbol>,
     source: &str,
-    name_node: Node<'_>,
-    def_node: Node<'_>,
+    name_node: Node<'tree>,
+    def_node: Node<'tree>,
     parent_name: &str,
     kind: SymbolKind,
+    nav: impl Nav<'tree>,
 ) {
     symbols.push(Symbol {
         name: node_text(source, &name_node).to_string(),
         kind,
-        range: node_range_with_decorators(&def_node, source, LangId::TypeScript),
+        range: node_range_with_decorators_with(&def_node, source, LangId::TypeScript, nav),
         signature: Some(extract_signature(source, &def_node)),
         scope_chain: vec![parent_name.to_string()],
         exported: false,
@@ -3120,14 +3002,19 @@ fn push_ts_member_symbol(
 }
 
 /// Extract symbols from TypeScript / TSX source.
-fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+fn extract_ts_symbols<'tree>(
+    source: &str,
+    root: &Node<'tree>,
+    query: &Query,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::TypeScript;
     let capture_names = query.capture_names();
 
     let ExportIndex {
         ranges: export_ranges,
         names: exported_names,
-    } = collect_exports(source, root);
+    } = collect_exports(source, root, nav);
 
     let mut symbols = Vec::new();
     let mut variable_names = VariableNameIndex::default();
@@ -3226,7 +3113,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3240,7 +3127,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&range_node, source, lang),
+                range: node_range_with_decorators_with(&range_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3250,7 +3137,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
         // Anonymous/default function or class expression
         if let (Some(body_node), Some(def_node)) = (default_body_node, default_def_node) {
-            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node);
+            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node, nav);
         }
 
         // Class declaration
@@ -3258,7 +3145,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Class,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3274,7 +3161,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Method,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![class_name.clone()],
                 exported: false, // methods inherit export from class
@@ -3296,6 +3183,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 def_node,
                 class_name,
                 SymbolKind::Method,
+                nav,
             );
         }
 
@@ -3304,7 +3192,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Interface,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3326,6 +3214,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 def_node,
                 interface_name,
                 SymbolKind::Method,
+                nav,
             );
         }
 
@@ -3344,6 +3233,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                     def_node,
                     interface_name,
                     SymbolKind::Method,
+                    nav,
                 );
             }
         }
@@ -3363,6 +3253,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 def_node,
                 object_name,
                 SymbolKind::Method,
+                nav,
             );
 
             // A named function expression also has a lexical name that callers may search for.
@@ -3376,6 +3267,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                             value_node,
                             object_name,
                             SymbolKind::Function,
+                            nav,
                         );
                     }
                 }
@@ -3387,7 +3279,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Enum,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3400,7 +3292,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::TypeAlias,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3411,8 +3303,8 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         // Top-level const/let variable declaration (not arrow functions — those are handled above)
         if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
             // Only include module-scope variables (parent is program/export_statement, not inside a function)
-            let is_top_level = def_node
-                .parent()
+            let is_top_level = nav
+                .parent(def_node)
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
             let range_node = var_decl_node.unwrap_or(def_node);
@@ -3426,7 +3318,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 symbols.push(Symbol {
                     name: name.to_string(),
                     kind: SymbolKind::Variable,
-                    range: node_range_with_decorators(&range_node, source, lang),
+                    range: node_range_with_decorators_with(&range_node, source, lang, nav),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
                     exported: is_exported(&def_node, &export_ranges),
@@ -3490,14 +3382,19 @@ impl VariableNameIndex {
 }
 
 /// Extract symbols from JavaScript source.
-fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+fn extract_js_symbols<'tree>(
+    source: &str,
+    root: &Node<'tree>,
+    query: &Query,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::JavaScript;
     let capture_names = query.capture_names();
 
     let ExportIndex {
         ranges: export_ranges,
         names: exported_names,
-    } = collect_exports(source, root);
+    } = collect_exports(source, root, nav);
 
     let mut symbols = Vec::new();
     let mut variable_names = VariableNameIndex::default();
@@ -3552,7 +3449,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3565,7 +3462,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&range_node, source, lang),
+                range: node_range_with_decorators_with(&range_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3574,14 +3471,14 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         }
 
         if let (Some(body_node), Some(def_node)) = (default_body_node, default_def_node) {
-            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node);
+            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node, nav);
         }
 
         if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Class,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3596,7 +3493,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Method,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![class_name.clone()],
                 exported: false,
@@ -3610,8 +3507,8 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         // .js file produced no symbol for outline/dead_code/callgraph. Mirror the
         // TS extractor: module-scope, non-function-valued, not already captured.
         if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
-            let is_top_level = def_node
-                .parent()
+            let is_top_level = nav
+                .parent(def_node)
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
             let range_node = var_decl_node.unwrap_or(def_node);
@@ -3625,7 +3522,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 symbols.push(Symbol {
                     name: name.to_string(),
                     kind: SymbolKind::Variable,
-                    range: node_range_with_decorators(&range_node, source, lang),
+                    range: node_range_with_decorators_with(&range_node, source, lang, nav),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
                     exported: is_exported(&def_node, &export_ranges),
@@ -3642,23 +3539,28 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
 /// Walk parent nodes to build a scope chain for Python symbols.
 /// A function inside `class_definition > block` gets the class name in its scope.
-fn py_scope_chain(node: &Node, source: &str) -> Vec<String> {
+fn py_scope_chain<'tree>(node: &Node<'tree>, source: &str, nav: impl Nav<'tree>) -> Vec<String> {
     let mut chain = Vec::new();
-    let mut current = node.parent();
+    let mut current = nav.parent(*node);
     while let Some(parent) = current {
-        if parent.kind() == "class_definition" {
+        if nav.kind(parent) == "class_definition" {
             if let Some(name_node) = parent.child_by_field_name("name") {
                 chain.push(node_text(source, &name_node).to_string());
             }
         }
-        current = parent.parent();
+        current = nav.parent(parent);
     }
     chain.reverse();
     chain
 }
 
 /// Extract symbols from Python source.
-fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+fn extract_py_symbols<'tree>(
+    source: &str,
+    root: &Node<'tree>,
+    query: &Query,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::Python;
     let capture_names = query.capture_names();
 
@@ -3735,7 +3637,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
         // Function definition
         if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
-            let scope = py_scope_chain(&def_node, source);
+            let scope = py_scope_chain(&def_node, source, nav);
             let is_method = !scope.is_empty();
             let name = node_text(source, &name_node).to_string();
             // Skip __init__ and other dunders as separate symbols — they're methods
@@ -3749,7 +3651,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             let sig = if decorated_fn_lines.contains(&def_node.start_position().row) {
                 // Find the decorated_definition parent to get decorator text
                 let mut sig_parts = Vec::new();
-                let mut parent = def_node.parent();
+                let mut parent = nav.parent(def_node);
                 while let Some(p) = parent {
                     if p.kind() == "decorated_definition" {
                         // Get decorator lines
@@ -3766,7 +3668,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                         }
                         break;
                     }
-                    parent = p.parent();
+                    parent = nav.parent(p);
                 }
                 sig_parts.push(extract_signature(source, &def_node));
                 Some(sig_parts.join("\n"))
@@ -3777,7 +3679,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name,
                 kind,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: sig,
                 scope_chain: scope.clone(),
                 exported: false, // Python has no export concept
@@ -3787,12 +3689,12 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
         // Class definition
         if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
-            let scope = py_scope_chain(&def_node, source);
+            let scope = py_scope_chain(&def_node, source, nav);
 
             // Build signature — include decorator if decorated
             let sig = if decorated_fn_lines.contains(&def_node.start_position().row) {
                 let mut sig_parts = Vec::new();
-                let mut parent = def_node.parent();
+                let mut parent = nav.parent(def_node);
                 while let Some(p) = parent {
                     if p.kind() == "decorated_definition" {
                         let mut dc = p.walk();
@@ -3808,7 +3710,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                         }
                         break;
                     }
-                    parent = p.parent();
+                    parent = nav.parent(p);
                 }
                 sig_parts.push(extract_signature(source, &def_node));
                 Some(sig_parts.join("\n"))
@@ -3819,7 +3721,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Class,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: sig,
                 scope_chain: scope.clone(),
                 exported: false,
@@ -3832,17 +3734,21 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     Ok(symbols)
 }
 
-fn rust_mod_scope_chain(node: &Node, source: &str) -> Vec<String> {
+fn rust_mod_scope_chain<'tree>(
+    node: &Node<'tree>,
+    source: &str,
+    nav: impl Nav<'tree>,
+) -> Vec<String> {
     let mut scopes = Vec::new();
-    let mut current = node.parent();
+    let mut current = nav.parent(*node);
 
     while let Some(parent) = current {
-        if parent.kind() == "mod_item" {
+        if nav.kind(parent) == "mod_item" {
             if let Some(name_node) = parent.child_by_field_name("name") {
                 scopes.push(node_text(source, &name_node).to_string());
             }
         }
-        current = parent.parent();
+        current = nav.parent(parent);
     }
 
     scopes.reverse();
@@ -3874,18 +3780,35 @@ pub(crate) fn rust_attribute_entry_points<'a>(
     source: &str,
     root: Node<'a>,
 ) -> Vec<RustAttributeEntryPoint> {
-    let bare_command_imported = rust_file_imports_tauri_command(source, root);
+    rust_attribute_entry_points_with(source, root, Direct)
+}
+
+/// [`rust_attribute_entry_points`], walking and looking up with `nav`.
+pub(crate) fn rust_attribute_entry_points_with<'tree>(
+    source: &str,
+    root: Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Vec<RustAttributeEntryPoint> {
+    let bare_command_imported = rust_file_imports_tauri_command(source, root, nav);
     let mut function_nodes = Vec::new();
-    rust_collect_function_items(root, &mut function_nodes);
+    nav.walk(root, |node, kind| {
+        if kind == "function_item" {
+            function_nodes.push(node);
+        }
+        true
+    });
 
     let mut entry_points = BTreeMap::new();
     for function_node in function_nodes {
-        let Some(attribute) =
-            rust_entry_point_attribute_for_function(source, &function_node, bare_command_imported)
-        else {
+        let Some(attribute) = rust_entry_point_attribute_for_function(
+            source,
+            &function_node,
+            bare_command_imported,
+            nav,
+        ) else {
             continue;
         };
-        let Some((name, scoped_name)) = rust_function_identity(source, &function_node) else {
+        let Some((name, scoped_name)) = rust_function_identity(source, &function_node, nav) else {
             continue;
         };
         entry_points
@@ -3900,28 +3823,16 @@ pub(crate) fn rust_attribute_entry_points<'a>(
     entry_points.into_values().collect()
 }
 
-fn rust_collect_function_items<'a>(node: Node<'a>, function_nodes: &mut Vec<Node<'a>>) {
-    if node.kind() == "function_item" {
-        function_nodes.push(node);
-    }
-
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            rust_collect_function_items(cursor.node(), function_nodes);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-}
-
-fn rust_function_identity(source: &str, function_node: &Node<'_>) -> Option<(String, String)> {
+fn rust_function_identity<'tree>(
+    source: &str,
+    function_node: &Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Option<(String, String)> {
     let name_node = function_node.child_by_field_name("name")?;
     let name = node_text(source, &name_node).to_string();
-    let declaration_list_owner = rust_function_declaration_list_owner(function_node);
+    let declaration_list_owner = rust_function_declaration_list_owner(function_node, nav);
 
-    match declaration_list_owner.as_ref().map(Node::kind) {
+    match declaration_list_owner.map(|owner| nav.kind(owner)) {
         Some("impl_item") => {
             let scope_name = rust_impl_scope_name(declaration_list_owner.as_ref().unwrap(), source);
             let scoped_name = if scope_name.is_empty() {
@@ -3933,7 +3844,7 @@ fn rust_function_identity(source: &str, function_node: &Node<'_>) -> Option<(Str
         }
         Some(owner_kind) if owner_kind != "mod_item" => None,
         _ => {
-            let scope_chain = rust_mod_scope_chain(function_node, source);
+            let scope_chain = rust_mod_scope_chain(function_node, source, nav);
             let scoped_name = if scope_chain.is_empty() {
                 name.clone()
             } else {
@@ -3944,11 +3855,13 @@ fn rust_function_identity(source: &str, function_node: &Node<'_>) -> Option<(Str
     }
 }
 
-fn rust_function_declaration_list_owner<'a>(function_node: &Node<'a>) -> Option<Node<'a>> {
-    function_node
-        .parent()
-        .filter(|parent| parent.kind() == "declaration_list")
-        .and_then(|parent| parent.parent())
+fn rust_function_declaration_list_owner<'tree>(
+    function_node: &Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Option<Node<'tree>> {
+    nav.parent(*function_node)
+        .filter(|parent| nav.kind(*parent) == "declaration_list")
+        .and_then(|parent| nav.parent(parent))
 }
 
 fn rust_impl_scope_name(impl_node: &Node, source: &str) -> String {
@@ -3975,14 +3888,15 @@ fn rust_impl_scope_name(impl_node: &Node, source: &str) -> String {
     }
 }
 
-fn rust_entry_point_attribute_for_function(
+fn rust_entry_point_attribute_for_function<'tree>(
     source: &str,
-    function_node: &Node,
+    function_node: &Node<'tree>,
     bare_command_imported: bool,
+    nav: impl Nav<'tree>,
 ) -> Option<&'static str> {
     let mut current = *function_node;
-    while let Some(prev) = current.prev_sibling() {
-        let kind = prev.kind();
+    while let Some(prev) = nav.prev_sibling(current) {
+        let kind = nav.kind(prev);
         match kind {
             "attribute_item" => {
                 if let Some(attribute) =
@@ -4055,27 +3969,19 @@ fn rust_entry_point_attribute_for_path(
         .find(|attribute| *attribute != "tauri::command" && *attribute == last_segment)
 }
 
-fn rust_file_imports_tauri_command(source: &str, root: Node<'_>) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "use_declaration"
-            && rust_use_declaration_imports_tauri_command(node_text(source, &node))
-        {
-            return true;
-        }
-
-        let mut cursor = node.walk();
-        if cursor.goto_first_child() {
-            loop {
-                stack.push(cursor.node());
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-    }
-
-    false
+fn rust_file_imports_tauri_command<'tree>(
+    source: &str,
+    root: Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> bool {
+    // Any `use` that imports the attribute decides it, wherever it is.
+    let mut imported = false;
+    nav.walk(root, |node, kind| {
+        imported |= kind == "use_declaration"
+            && rust_use_declaration_imports_tauri_command(node_text(source, &node));
+        !imported
+    });
+    imported
 }
 
 fn rust_use_declaration_imports_tauri_command(use_text: &str) -> bool {
@@ -4154,10 +4060,14 @@ fn rust_impl_parent_name(impl_target: &str) -> String {
         .to_string()
 }
 
-fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+fn extract_rs_symbols<'tree>(
+    source: &str,
+    root: &Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
     let mut symbols = Vec::new();
     let mut macro_bodies = Vec::new();
-    extract_rs_symbols_from_root(source, *root, &mut symbols, &mut macro_bodies);
+    extract_rs_symbols_from_root(source, *root, &mut symbols, &mut macro_bodies, nav);
 
     // Bodies found inside a macro body are queued on the same worklist rather
     // than handled by recursion, so deeply nested macros cannot exhaust the
@@ -4168,7 +4078,13 @@ fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
             continue;
         };
         let before = symbols.len();
-        extract_rs_symbols_from_root(source, tree.root_node(), &mut symbols, &mut macro_bodies);
+        extract_rs_symbols_from_root(
+            source,
+            tree.root_node(),
+            &mut symbols,
+            &mut macro_bodies,
+            Direct,
+        );
         found_macro_symbols |= symbols.len() > before;
     }
 
@@ -4229,11 +4145,12 @@ fn parse_rust_macro_body(source: &str, body: tree_sitter::Range) -> Option<Tree>
 
 /// Walk one Rust syntax tree, appending its symbols and queueing the bodies of
 /// item-position macros for a separate parse.
-fn extract_rs_symbols_from_root(
+fn extract_rs_symbols_from_root<'tree>(
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     symbols: &mut Vec<Symbol>,
     macro_bodies: &mut Vec<tree_sitter::Range>,
+    nav: impl Nav<'tree>,
 ) {
     let lang = LangId::Rust;
     let is_pub = |node: &Node| -> bool {
@@ -4262,12 +4179,12 @@ fn extract_rs_symbols_from_root(
         Some(node_text(source, &name_node).to_string())
     };
 
-    let item_symbol = |node: Node<'_>, kind: SymbolKind| -> Option<Symbol> {
+    let item_symbol = |node: Node<'tree>, kind: SymbolKind| -> Option<Symbol> {
         let name = symbol_name(&node)?;
         Some(Symbol {
             name,
             kind,
-            range: node_range_with_decorators(&node, source, lang),
+            range: node_range_with_decorators_with(&node, source, lang, nav),
             signature: Some(extract_signature(source, &node)),
             scope_chain: Vec::new(),
             exported: is_pub(&node),
@@ -4275,9 +4192,9 @@ fn extract_rs_symbols_from_root(
         })
     };
 
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        match node.kind() {
+    // Every node in preorder.
+    nav.walk(root, |node, kind| {
+        match kind {
             "macro_definition" => {
                 let mut rule_cursor = node.walk();
                 for rule in node.children(&mut rule_cursor) {
@@ -4296,8 +4213,8 @@ fn extract_rs_symbols_from_root(
             // the ones inside function bodies (`println!`, `vec!`, ...) keeps
             // the extra parsing proportional to item-level macros.
             "macro_invocation"
-                if node.parent().is_some_and(|parent| {
-                    matches!(parent.kind(), "source_file" | "declaration_list")
+                if nav.parent(node).is_some_and(|parent| {
+                    matches!(nav.kind(parent), "source_file" | "declaration_list")
                 }) =>
             {
                 let body = node
@@ -4311,21 +4228,20 @@ fn extract_rs_symbols_from_root(
                 }
             }
             "function_item" => {
-                let declaration_list_owner = node
-                    .parent()
-                    .filter(|parent| parent.kind() == "declaration_list")
-                    .and_then(|parent| parent.parent());
-                let in_non_module_declaration_list = declaration_list_owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.kind() != "mod_item");
+                let declaration_list_owner = nav
+                    .parent(node)
+                    .filter(|parent| nav.kind(*parent) == "declaration_list")
+                    .and_then(|parent| nav.parent(parent));
+                let in_non_module_declaration_list =
+                    declaration_list_owner.is_some_and(|owner| nav.kind(owner) != "mod_item");
 
                 if !in_non_module_declaration_list {
                     if let Some(name) = symbol_name(&node) {
-                        let scope_chain = rust_mod_scope_chain(&node, source);
+                        let scope_chain = rust_mod_scope_chain(&node, source, nav);
                         symbols.push(Symbol {
                             name,
                             kind: SymbolKind::Function,
-                            range: node_range_with_decorators(&node, source, lang),
+                            range: node_range_with_decorators_with(&node, source, lang, nav),
                             signature: Some(extract_signature(source, &node)),
                             scope_chain: scope_chain.clone(),
                             exported: is_pub(&node),
@@ -4388,8 +4304,8 @@ fn extract_rs_symbols_from_root(
                                             symbols.push(Symbol {
                                                 name,
                                                 kind: SymbolKind::Method,
-                                                range: node_range_with_decorators(
-                                                    &method, source, lang,
+                                                range: node_range_with_decorators_with(
+                                                    &method, source, lang, nav,
                                                 ),
                                                 signature: Some(extract_signature(source, &method)),
                                                 scope_chain: if scope_name.is_empty() {
@@ -4420,19 +4336,8 @@ fn extract_rs_symbols_from_root(
             }
             _ => {}
         }
-
-        let mut child_cursor = node.walk();
-        let mut children = Vec::new();
-        if child_cursor.goto_first_child() {
-            loop {
-                children.push(child_cursor.node());
-                if !child_cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-        pending.extend(children.into_iter().rev());
-    }
+        true
+    });
 }
 
 /// Extract symbols from Go source.
@@ -9635,7 +9540,6 @@ mod tests {
 
     use super::*;
     use crate::language::LanguageProvider;
-    use crate::symbol_cache_disk;
     use std::path::{Path, PathBuf};
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -9921,7 +9825,7 @@ mod tests {
                     }
                 }
             }
-            let index = collect_exports(source, &root);
+            let index = collect_exports(source, &root, Direct);
             assert_eq!(index.names, collect_exported_symbol_names(source, &root));
             let mut walk = root.walk();
             let mut checked = 0usize;
@@ -10198,7 +10102,7 @@ mod tests {
         let query_execute_elapsed = query_execute_started.elapsed();
 
         let direct_extract_started = std::time::Instant::now();
-        let symbols = extract_rs_symbols(source, &tree.root_node()).unwrap();
+        let symbols = extract_rs_symbols(source, &tree.root_node(), Direct).unwrap();
         let direct_extract_elapsed = direct_extract_started.elapsed();
 
         eprintln!(
@@ -10269,12 +10173,12 @@ mod tests {
             }
 
             if let (Some(name_node), Some(definition)) = (function_name, function_definition) {
-                let owner = rust_function_declaration_list_owner(&definition);
+                let owner = rust_function_declaration_list_owner(&definition, Direct);
                 if owner
                     .as_ref()
                     .is_none_or(|owner| owner.kind() == "mod_item")
                 {
-                    let scope_chain = rust_mod_scope_chain(&definition, source);
+                    let scope_chain = rust_mod_scope_chain(&definition, source, Direct);
                     symbols.push(Symbol {
                         name: node_text(source, &name_node).to_string(),
                         kind: SymbolKind::Function,
@@ -10400,7 +10304,7 @@ pub(crate) mod outer {
         let tree = parser.parse(source, None).unwrap();
 
         let query_symbols = extract_rs_symbols_with_query_oracle(source, tree.root_node());
-        let walk_symbols = extract_rs_symbols(source, &tree.root_node()).unwrap();
+        let walk_symbols = extract_rs_symbols(source, &tree.root_node(), Direct).unwrap();
         assert_eq!(
             rust_symbol_fingerprint(&walk_symbols),
             rust_symbol_fingerprint(&query_symbols)
@@ -10482,106 +10386,6 @@ pub(crate) mod outer {
             cache.recounted_memory_for_test(),
             "{step}"
         );
-    }
-
-    #[test]
-    fn symbol_memory_running_totals_match_recount_after_mixed_mutations() {
-        let root = tempfile::tempdir().unwrap();
-        let mut cache = SymbolCache::default();
-        cache.set_project_root(root.path().join("røøt"));
-        assert_symbol_memory_recount(&cache, "empty root is not counted");
-        let path = root.path().join("nested/first.rs");
-        let other = root.path().join("other.rs");
-        let now = SystemTime::UNIX_EPOCH;
-        let hash = cache_freshness::zero_hash();
-        let mut rich = test_symbol("longer_name");
-        rich.scope_chain = vec!["outer".into(), "inner".into()];
-        rich.parent = Some("parent".into());
-        cache.insert(path.clone(), now, 10, hash, vec![rich.clone()]);
-        assert_symbol_memory_recount(&cache, "insert");
-        cache.insert(other.clone(), now, 10, hash, Vec::new());
-        assert_symbol_memory_recount(&cache, "empty symbol table still counts its path");
-        let alias = root.path().join("nested//first.rs");
-        assert_eq!(path, alias);
-        cache.insert(alias.clone(), now, 10, hash, vec![rich.clone(); 7]);
-        assert_symbol_memory_recount(&cache, "growing replacement");
-        cache.insert(path.clone(), now, 10, hash, vec![test_symbol("x")]);
-        assert_symbol_memory_recount(&cache, "shrinking replacement");
-        cache.insert_shared(
-            path.clone(),
-            now,
-            10,
-            hash,
-            Arc::new(vec![test_symbol("x")]),
-            Some(Arc::new(vec![RustModule {
-                name: "outer".into(),
-                range: rich.range.clone(),
-                exported: false,
-                children: vec![RustModule {
-                    name: "child".into(),
-                    range: rich.range.clone(),
-                    exported: true,
-                    children: Vec::new(),
-                }],
-            }])),
-            Some(false),
-        );
-        assert_symbol_memory_recount(&cache, "same-content module attachment");
-        cache.insert_shared(
-            path.clone(),
-            now,
-            10,
-            hash,
-            Arc::new(vec![test_symbol("x")]),
-            Some(Arc::new(Vec::new())),
-            Some(true),
-        );
-        assert_symbol_memory_recount(&cache, "same-content module replacement");
-        cache.set_project_root(root.path().join("a-longer-project-root"));
-        assert_symbol_memory_recount(&cache, "root replacement");
-        assert_symbol_memory_recount(&cache.clone(), "clone");
-        cache.invalidate(&alias);
-        assert_symbol_memory_recount(&cache, "evict one of two entries");
-        cache.invalidate(&path);
-        assert_symbol_memory_recount(&cache, "evict missing entry");
-        cache.invalidate(&other);
-        assert_symbol_memory_recount(&cache, "evict last entry");
-        cache.insert(path.clone(), now, 10, hash, vec![rich.clone(); 3]);
-        let decoded = DecodedSymbolCache {
-            root: root.path().to_path_buf(),
-            entries: cache.entries.clone(),
-            outcome: SymbolCacheLoadOutcome {
-                loaded: 1,
-                needs_persistence: false,
-            },
-        };
-        cache.insert(other.clone(), now, 10, hash, vec![rich; 5]);
-        cache.install_decoded(decoded);
-        assert_symbol_memory_recount(&cache, "disk installation replaces existing totals");
-        let old_generation = cache.generation();
-        let generation = cache.reset();
-        assert_symbol_memory_recount(&cache, "clear nonempty cache");
-        assert!(!cache.insert_for_generation(
-            old_generation,
-            path.clone(),
-            now,
-            10,
-            hash,
-            vec![test_symbol("stale")]
-        ));
-        assert_symbol_memory_recount(&cache, "stale insert after clear");
-        assert!(cache.insert_for_generation(
-            generation,
-            other,
-            now,
-            10,
-            hash,
-            vec![test_symbol("fresh")]
-        ));
-        assert_symbol_memory_recount(&cache, "insert after clear");
-        cache.reset();
-        cache.reset();
-        assert_symbol_memory_recount(&cache, "repeated clear");
     }
 
     #[test]
@@ -10734,314 +10538,6 @@ pub(crate) mod outer {
         assert_eq!(get("double").kind, SymbolKind::Function);
         assert_eq!(get("$brand-color").kind, SymbolKind::Variable);
         assert_eq!(get(".card, .panel").kind, SymbolKind::Class);
-    }
-
-    #[test]
-    fn symbol_cache_load_from_disk_round_trips_synthetic_entry() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let storage = tempfile::tempdir().expect("create storage dir");
-        let source = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source, "pub fn cached() {}\n").expect("write source");
-        let mtime = std::fs::metadata(&source)
-            .expect("stat source")
-            .modified()
-            .expect("source mtime");
-        let content = std::fs::read(&source).expect("read source");
-        let size = content.len() as u64;
-        let hash = crate::cache_freshness::hash_bytes(&content);
-
-        let mut cache = SymbolCache::new();
-        cache.set_project_root(project.path().to_path_buf());
-        cache.insert(
-            source.clone(),
-            mtime,
-            size,
-            hash,
-            vec![test_symbol("cached")],
-        );
-        symbol_cache_disk::write_to_disk(&cache, storage.path(), "unit-project")
-            .expect("write symbol cache");
-
-        let mut restored = SymbolCache::new();
-        let outcome =
-            restored.load_from_disk_with_outcome(storage.path(), "unit-project", project.path());
-        let symbols = restored.get(&source, mtime).expect("restored symbols");
-
-        assert_eq!(outcome.loaded, 1);
-        assert!(!outcome.needs_persistence);
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].name, "cached");
-    }
-
-    #[test]
-    fn symbol_cache_load_from_disk_marks_mtime_refresh_for_persistence() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let storage = tempfile::tempdir().expect("create storage dir");
-        let source = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source, "pub fn cached() {}\n").expect("write source");
-        let metadata = std::fs::metadata(&source).expect("stat source");
-        let mtime = metadata.modified().expect("source mtime");
-        let content = std::fs::read(&source).expect("read source");
-
-        let mut cache = SymbolCache::new();
-        cache.set_project_root(project.path().to_path_buf());
-        cache.insert(
-            source.clone(),
-            mtime,
-            content.len() as u64,
-            crate::cache_freshness::hash_bytes(&content),
-            vec![test_symbol("cached")],
-        );
-        symbol_cache_disk::write_to_disk(&cache, storage.path(), "mtime-unit-project")
-            .expect("write symbol cache");
-
-        let advanced_mtime = mtime
-            .checked_add(std::time::Duration::from_secs(2))
-            .expect("advance source mtime");
-        filetime::set_file_mtime(
-            &source,
-            filetime::FileTime::from_system_time(advanced_mtime),
-        )
-        .expect("touch source");
-
-        let mut restored = SymbolCache::new();
-        let outcome = restored.load_from_disk_with_outcome(
-            storage.path(),
-            "mtime-unit-project",
-            project.path(),
-        );
-
-        assert_eq!(outcome.loaded, 1);
-        assert!(outcome.needs_persistence);
-        assert!(restored.get(&source, advanced_mtime).is_some());
-    }
-
-    #[test]
-    fn symbol_cache_load_from_disk_drops_stale_synthetic_entry() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let storage = tempfile::tempdir().expect("create storage dir");
-        let source = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source, "pub fn cached() {}\n").expect("write source");
-        let mtime = std::fs::metadata(&source)
-            .expect("stat source")
-            .modified()
-            .expect("source mtime");
-        let content = std::fs::read(&source).expect("read source");
-        let size = content.len() as u64;
-        let hash = crate::cache_freshness::hash_bytes(&content);
-
-        let mut cache = SymbolCache::new();
-        cache.set_project_root(project.path().to_path_buf());
-        cache.insert(
-            source.clone(),
-            mtime,
-            size,
-            hash,
-            vec![test_symbol("cached")],
-        );
-        symbol_cache_disk::write_to_disk(&cache, storage.path(), "stale-unit-project")
-            .expect("write symbol cache");
-
-        std::fs::write(&source, "pub fn cached() {}\npub fn fresh() {}\n").expect("change source");
-
-        let mut restored = SymbolCache::new();
-        let outcome = restored.load_from_disk_with_outcome(
-            storage.path(),
-            "stale-unit-project",
-            project.path(),
-        );
-
-        assert_eq!(outcome.loaded, 0);
-        assert!(outcome.needs_persistence);
-        assert_eq!(restored.len(), 0);
-    }
-
-    #[test]
-    fn stale_prewarm_generation_cannot_repopulate_symbol_cache_after_reset() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let storage = tempfile::tempdir().expect("create storage dir");
-        let source = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source, "pub fn cached() {}\n").expect("write source");
-        let mtime = std::fs::metadata(&source)
-            .expect("stat source")
-            .modified()
-            .expect("source mtime");
-        let content = std::fs::read(&source).expect("read source");
-        let size = content.len() as u64;
-        let hash = crate::cache_freshness::hash_bytes(&content);
-
-        let mut disk_cache = SymbolCache::new();
-        disk_cache.set_project_root(project.path().to_path_buf());
-        disk_cache.insert(
-            source.clone(),
-            mtime,
-            size,
-            hash,
-            vec![test_symbol("cached")],
-        );
-        symbol_cache_disk::write_to_disk(&disk_cache, storage.path(), "prewarm-reset")
-            .expect("write symbol cache");
-
-        let shared = Arc::new(RwLock::new(SymbolCache::new()));
-        let stale_generation = shared.write().unwrap().reset();
-        let active_generation = shared.write().unwrap().reset();
-        assert_ne!(stale_generation, active_generation);
-
-        {
-            let mut cache = shared.write().unwrap();
-            assert!(!cache
-                .set_project_root_for_generation(stale_generation, project.path().to_path_buf()));
-            assert_eq!(
-                cache.load_from_disk_for_generation(
-                    stale_generation,
-                    storage.path(),
-                    "prewarm-reset",
-                    project.path()
-                ),
-                0
-            );
-        }
-
-        let mut stale_parser =
-            FileParser::with_symbol_cache_generation(Arc::clone(&shared), Some(stale_generation));
-        stale_parser
-            .extract_symbols(&source)
-            .expect("stale prewarm parses source but must not write cache");
-
-        let cache = shared.read().unwrap();
-        assert_eq!(cache.generation(), active_generation);
-        assert_eq!(cache.len(), 0);
-        assert!(cache.project_root().is_none());
-        assert!(!cache.contains_key(&source));
-    }
-
-    /// Writes `count` source files and a disk symbol cache listing all of
-    /// them; returns the project dir, the storage dir and the source paths.
-    fn disk_symbol_cache_fixture(
-        count: usize,
-        key: &str,
-    ) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>) {
-        let project = tempfile::tempdir().expect("create project dir");
-        let storage = tempfile::tempdir().expect("create storage dir");
-        let mut disk_cache = SymbolCache::new();
-        disk_cache.set_project_root(project.path().to_path_buf());
-        let mut sources = Vec::new();
-        for index in 0..count {
-            let source = project.path().join(format!("f{index}.rs"));
-            std::fs::write(&source, format!("pub fn f{index}() {{}}\n")).unwrap();
-            let metadata = std::fs::metadata(&source).unwrap();
-            let content = std::fs::read(&source).unwrap();
-            disk_cache.insert(
-                source.clone(),
-                metadata.modified().unwrap(),
-                content.len() as u64,
-                crate::cache_freshness::hash_bytes(&content),
-                vec![test_symbol(&format!("f{index}"))],
-            );
-            sources.push(source);
-        }
-        symbol_cache_disk::write_to_disk(&disk_cache, storage.path(), key)
-            .expect("write symbol cache");
-        (project, storage, sources)
-    }
-
-    /// Starts a shared-cache load on another thread and parks it after the
-    /// disk cache has been read and decoded, before its entries are checked
-    /// against their files.
-    fn park_shared_load_mid_decode(
-        shared: &SharedSymbolCache,
-        generation: u64,
-        storage: &Path,
-        key: &str,
-        root: &Path,
-    ) -> (
-        std::sync::Arc<std::sync::Barrier>,
-        std::thread::JoinHandle<SymbolCacheLoadOutcome>,
-    ) {
-        let arrived = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let released = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let hook = (arrived.clone(), released.clone());
-        let shared = Arc::clone(shared);
-        let storage = storage.to_path_buf();
-        let key = key.to_owned();
-        let root = root.to_path_buf();
-        let handle = std::thread::spawn(move || {
-            SYMBOL_CACHE_DECODE_TEST_BARRIERS.with(|slot| *slot.borrow_mut() = Some(hook));
-            load_shared_symbol_cache_for_generation(&shared, generation, &storage, &key, &root)
-        });
-        arrived.wait();
-        (released, handle)
-    }
-
-    #[test]
-    fn startup_symbol_cache_load_decodes_without_holding_the_cache_lock() {
-        let (project, storage, sources) = disk_symbol_cache_fixture(3, "lock-free-load");
-        let shared = Arc::new(RwLock::new(SymbolCache::new()));
-        let generation = shared.read().unwrap().generation();
-        let (released, handle) = park_shared_load_mid_decode(
-            &shared,
-            generation,
-            storage.path(),
-            "lock-free-load",
-            project.path(),
-        );
-        // The load is parked mid-decode. Readers and writers must not wait on it.
-        let readable = shared.try_read().is_ok();
-        let writable = shared.try_write().is_ok();
-        released.wait();
-        let outcome = handle.join().unwrap();
-        assert!(readable, "a reader was blocked by the in-flight decode");
-        assert!(writable, "a writer was blocked by the in-flight decode");
-        assert_eq!(outcome.loaded, 3);
-        let cache = shared.read().unwrap();
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.project_root(), Some(project.path().to_path_buf()));
-        for source in &sources {
-            assert!(cache.contains_key(source));
-        }
-    }
-
-    #[test]
-    fn startup_symbol_cache_load_is_discarded_when_the_generation_moves_mid_decode() {
-        let (project, storage, sources) = disk_symbol_cache_fixture(3, "stale-load");
-        let shared = Arc::new(RwLock::new(SymbolCache::new()));
-        let generation = shared.read().unwrap().generation();
-        let (released, handle) = park_shared_load_mid_decode(
-            &shared,
-            generation,
-            storage.path(),
-            "stale-load",
-            project.path(),
-        );
-        // A reconfigure resets the cache while the decode is in flight, and a
-        // request of the new generation caches one file. `try_write` keeps a
-        // regression that holds the lock across the decode from deadlocking
-        // this test against the parked decode.
-        let active = shared
-            .try_write()
-            .expect("the cache lock is free while the decode is in flight")
-            .reset();
-        assert_ne!(active, generation);
-        let mut parser =
-            FileParser::with_symbol_cache_generation(Arc::clone(&shared), Some(active));
-        parser.extract_symbols(&sources[0]).unwrap();
-        released.wait();
-        let outcome = handle.join().unwrap();
-
-        assert_eq!(outcome, SymbolCacheLoadOutcome::default());
-        let cache = shared.read().unwrap();
-        assert_eq!(cache.generation(), active);
-        assert_eq!(cache.len(), 1, "the stale decode must not be merged in");
-        assert!(cache.contains_key(&sources[0]));
-        assert!(cache.project_root().is_none());
     }
 
     // --- Language detection ---
@@ -13609,74 +13105,6 @@ mod audit11_regressions {
         assert_eq!(
             replaced_bytes(source, LangId::Html, "A", "<h1>C</h1>"),
             "\u{feff}<html>\r\n<h1>C</h1><h1>B</h1>\r\n</html>\r\n".as_bytes()
-        );
-    }
-
-    /// A disk cache written before Go aliases and grouped type specs got
-    /// their own symbols passes every per-file freshness check, because the
-    /// source is unchanged. Only the extraction schema version can reject it.
-    #[test]
-    fn symbol_cache_written_before_go_alias_extraction_is_rebuilt() {
-        // The symbol-extraction schema version this release replaces.
-        const PREVIOUS_SCHEMA_VERSION: u32 = 4;
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        let file = root.join("types.go");
-        let source = "package main\r\ntype (\r\n\tFirst struct{}\r\n\tSecond = First\r\n)\r\n";
-        std::fs::write(&file, source).unwrap();
-        let metadata = std::fs::metadata(&file).unwrap();
-
-        // What the previous extractor stored: no alias, and the grouped spec
-        // ranged over the whole declaration.
-        let mut previous = SymbolCache::new();
-        previous.set_project_root(root.clone());
-        previous.insert(
-            file.clone(),
-            metadata.modified().unwrap(),
-            metadata.len(),
-            blake3::hash(source.as_bytes()),
-            vec![Symbol {
-                name: "First".to_string(),
-                kind: SymbolKind::Struct,
-                range: crate::symbols::Range {
-                    start_line: 1,
-                    start_col: 0,
-                    end_line: 4,
-                    end_col: 1,
-                },
-                signature: None,
-                scope_chain: Vec::new(),
-                exported: true,
-                parent: None,
-            }],
-        );
-        symbol_cache_disk::write_to_disk(&previous, storage.path(), "go-alias").unwrap();
-        let cache_file = symbol_cache_disk::cache_path(storage.path(), "go-alias");
-        let mut bytes = std::fs::read(&cache_file).unwrap();
-        // Header: 8-byte magic, then the format and schema versions.
-        bytes[12..16].copy_from_slice(&PREVIOUS_SCHEMA_VERSION.to_le_bytes());
-        std::fs::write(&cache_file, bytes).unwrap();
-
-        let mut cache = SymbolCache::new();
-        cache.set_project_root(root.clone());
-        cache.load_from_disk(storage.path(), "go-alias", &root);
-        let mut parser = FileParser::with_symbol_cache(Arc::new(RwLock::new(cache)));
-        let symbols = parser.extract_symbols(&file).unwrap();
-        let names = symbols
-            .iter()
-            .map(|symbol| {
-                (
-                    symbol.name.as_str(),
-                    symbol.range.start_line,
-                    symbol.range.end_line,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![("First", 2, 2), ("Second", 3, 3)],
-            "{symbols:?}"
         );
     }
 }

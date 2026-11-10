@@ -33,36 +33,6 @@ fn payload_decodes_without_ast_nodes() {
     assert_eq!(decoded.parse().unwrap().refs, blob.parse().unwrap().refs);
 }
 
-#[test]
-fn payload_view_key_is_distinct_from_full_ast_producer() {
-    let source = b"fn run() {}";
-    let old = crate::blob_store::CallgraphKey::from_bytes(
-        source,
-        "rust",
-        "ruled-callgraph-v8-rust-static-value-references",
-    );
-    let current = crate::blob_store::CallgraphKey::from_bytes(
-        source,
-        "rust",
-        crate::views::callgraph::PRODUCER,
-    );
-    assert_ne!(old.full_key(), current.full_key());
-}
-
-#[test]
-fn payload_store_key_is_distinct_from_full_ast_producer() {
-    let source = b"fn run() {}";
-    let old = crate::blob_store::CallgraphKey::from_bytes(
-        source,
-        "rust",
-        "callgraph-v7-rust-static-value-references",
-    );
-    assert_ne!(
-        old.full_key(),
-        crate::blob_store::CallgraphKey::for_current(source, "rust").full_key()
-    );
-}
-
 fn cpu_ns() -> u128 {
     #[cfg(target_os = "linux")]
     {

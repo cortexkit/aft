@@ -228,6 +228,16 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
     }
 }
 
+fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
+    // A bound checkout's call-graph plane in the index store serves every
+    // call-graph reader; nothing else does. Same mapping as the text plane.
+    match crate::data_layer::surfaces::report(ctx).map(|report| report.callgraph.status) {
+        Some(crate::data_layer::surfaces::READY) => IndexObservation::ready(),
+        Some(crate::data_layer::surfaces::BUILDING) => IndexObservation::building(),
+        _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
+    }
+}
+
 /// The recorded refusal, if any, of this root's artifact for `plane`: its own
 /// file written by a newer build, or the storage root's reader floor. Passive:
 /// consults only what readers and the startup floor check already recorded.
@@ -271,61 +281,35 @@ pub fn storage_refusal(
 // index is being replaced or updated, which reports as building.
 
 fn observe_trigram(ctx: &AppContext) -> IndexObservation {
-    if ctx.lexical_views_enabled() {
-        return if ctx.lexical_view_is_ready() {
-            IndexObservation::ready()
-        } else {
-            IndexObservation::building()
-        };
+    // A bound checkout's text plane in the index store serves the lexical
+    // lanes; nothing else does.
+    match crate::data_layer::surfaces::report(ctx).map(|report| report.text.status) {
+        Some(crate::data_layer::surfaces::READY) => IndexObservation::ready(),
+        Some(crate::data_layer::surfaces::BUILDING) => IndexObservation::building(),
+        _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
     }
-    let resident = match ctx.search_index().try_read() {
-        Ok(guard) => guard.as_ref().map(|index| index.ready),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            poisoned.into_inner().as_ref().map(|index| index.ready)
-        }
-        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
-    };
-    match resident {
-        Some(true) => IndexObservation::ready(),
-        Some(false) => IndexObservation::building(),
-        None => {
-            let loading = match ctx.search_index_rx().try_read() {
-                Ok(guard) => guard.is_some(),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
-                Err(std::sync::TryLockError::WouldBlock) => true,
-            };
-            if loading {
-                IndexObservation::building()
-            } else if trigram_disk_cache_valid(ctx) {
-                // Not resident (for example after idle eviction) but a valid
-                // persisted cache exists: the next query reloads it, so the
-                // lane is usable.
-                IndexObservation::ready()
-            } else {
-                IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED)
-            }
-        }
-    }
-}
-
-/// Whether this root's persisted trigram cache exists and has a valid header.
-/// Uses only the artifact key configure already derived; it never derives a
-/// key (a git probe) or reads the index body.
-fn trigram_disk_cache_valid(ctx: &AppContext) -> bool {
-    let Some(root) = ctx.canonical_cache_root_opt() else {
-        return false;
-    };
-    let Some(key) = ctx.cached_artifact_cache_key(&root) else {
-        return false;
-    };
-    let cache_dir = crate::search_index::resolve_cache_dir_with_key(
-        &key,
-        ctx.config().cache_storage_dir().as_deref(),
-    );
-    crate::search_index::SearchIndex::disk_cache_header_valid(&cache_dir)
 }
 
 fn observe_semantic(ctx: &AppContext) -> IndexObservation {
+    // With the data layer on, its meaning plane serves the lane: ready while
+    // it serves (a partial answer says so itself), and otherwise as its fill
+    // stands, whatever today's index status reads.
+    if let Some(data) = crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+        return match data.status() {
+            SemanticIndexStatus::Failed(message) => {
+                IndexObservation::unavailable(semantic_failure_cause(ctx, &message))
+            }
+            _ if ctx
+                .try_semantic_backend_health_snapshot()
+                .is_some_and(|health| !health.available) =>
+            {
+                IndexObservation::unavailable(cause::SEMANTIC_BACKEND_UNAVAILABLE)
+            }
+            SemanticIndexStatus::Ready { .. } => IndexObservation::ready(),
+            SemanticIndexStatus::Disabled => IndexObservation::off(),
+            SemanticIndexStatus::Building { .. } => IndexObservation::building(),
+        };
+    }
     let status = match ctx.semantic_index_status().try_read() {
         Ok(guard) => guard.clone(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
@@ -340,23 +324,11 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
     {
         return IndexObservation::unavailable(cause::SEMANTIC_BACKEND_UNAVAILABLE);
     }
-    // A started views-on lane serves only from its checkout view. Until that
-    // view is loaded the lane is loading or failed, whatever the shared status
-    // was last set to.
-    match ctx.checkout_semantic().try_state() {
-        None | Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Loading)) => {
-            return IndexObservation::building();
-        }
-        Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Unavailable(reason))) => {
-            return IndexObservation::unavailable(semantic_failure_cause(ctx, &reason));
-        }
-        Some(_) => {}
-    }
     let resident = match ctx.semantic_index().try_read() {
         Ok(guard) => guard.is_some(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
         Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
-    } || ctx.checkout_semantic_runtime().is_some();
+    };
     match status {
         SemanticIndexStatus::Ready { .. } if resident => IndexObservation::ready(),
         SemanticIndexStatus::Building { .. } => IndexObservation::building(),
@@ -414,39 +386,6 @@ pub const fn local_semantic_platform_supported() -> bool {
     ))
 }
 
-fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
-    if ctx.callgraph_views_enabled() {
-        return if ctx.callgraph_view_is_ready() {
-            IndexObservation::ready()
-        } else {
-            IndexObservation::building()
-        };
-    }
-    let resident = match ctx.callgraph_store().try_read() {
-        Ok(guard) => guard.is_some(),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
-        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
-    };
-    if resident && ctx.pending_callgraph_store_force_token().is_none() {
-        return IndexObservation::ready();
-    }
-    if ctx.callgraph_store_build_suspension().is_some() {
-        return IndexObservation::unavailable(cause::BUILD_SUSPENDED);
-    }
-    if ctx.callgraph_store_build_denial().is_some() {
-        return IndexObservation::unavailable(cause::CALLGRAPH_BUILD_DENIED);
-    }
-    if ctx
-        .callgraph_store_rx()
-        .try_lock()
-        .is_none_or(|rx| rx.is_some())
-        || ctx.pending_callgraph_store_force_token().is_some()
-    {
-        return IndexObservation::building();
-    }
-    IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED)
-}
-
 /// Translate the result of a callgraph store request into the plane's
 /// observation, so a consumer that already asked for the store reports the
 /// same state it acted on.
@@ -457,7 +396,6 @@ pub fn callgraph_access_observation(
     use crate::context::CallgraphStoreAccess;
     match access {
         CallgraphStoreAccess::Off => IndexObservation::off(),
-        CallgraphStoreAccess::Ready(_) => IndexObservation::ready(),
         CallgraphStoreAccess::Building => IndexObservation::building(),
         CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => {
             IndexObservation::building()
@@ -481,36 +419,9 @@ pub fn observe_callgraph_query(ctx: &AppContext) -> IndexObservation {
     observe_callgraph_query_with_contention(ctx).0
 }
 
-/// Observe a query access and indicate whether SQLite explicitly reported a
-/// transient busy or locked error while opening the published view database.
+/// Observe the current call-graph lane without opening a retired view database.
 pub fn observe_callgraph_query_with_contention(ctx: &AppContext) -> (IndexObservation, bool) {
-    let served_by_view = ctx.checkout_query_runtime_active()
-        || ctx.callgraph_views_enabled()
-        || (ctx.config().views.enabled
-            && ctx
-                .pinned_view_runtime()
-                .is_some_and(|view| view.manifest.is_some()));
-    if !served_by_view {
-        return (observed_index_status(ctx, IndexPlane::Callgraph), false);
-    }
-
-    let access = ctx.callgraph_store_for_query_without_wait();
-    match &access {
-        crate::context::CallgraphStoreAccess::Error(error)
-            if error.is_transient_lock_contention() =>
-        {
-            (IndexObservation::building(), true)
-        }
-        crate::context::CallgraphStoreAccess::Error(
-            crate::callgraph_store::CallGraphStoreError::Unavailable(message),
-        ) if crate::view_storage_reserve::is_message(message) => {
-            (IndexObservation::unavailable(message.clone()), false)
-        }
-        crate::context::CallgraphStoreAccess::Error(error) => {
-            (IndexObservation::unavailable(error.to_string()), false)
-        }
-        _ => (callgraph_access_observation(ctx, &access), false),
-    }
+    (observed_index_status(ctx, IndexPlane::Callgraph), false)
 }
 
 #[cfg(test)]

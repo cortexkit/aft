@@ -18,10 +18,6 @@ use serde::Serialize;
 
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 
-/// Reclaim oversized WAL allocations when SQLite resets a checkpointed log.
-/// Active transactions may exceed this; it is not a live WAL size cap.
-pub(crate) const WAL_JOURNAL_SIZE_LIMIT: i64 = 1024 * 1024;
-
 const CLOSE_CHECKPOINT_SEAM: &str = "db::TrackedConnection::drop";
 const CLOSE_CHECKPOINT_REASON: &str =
     "the close-time checkpoint result is unavailable without reopening the live SQLite file set, which would release this process's POSIX locks";
@@ -246,13 +242,6 @@ pub const SQLITE_UNINSTRUMENTED_OPENERS: &[SqliteUninstrumentedOpener] = &[
     },
 ];
 
-pub(crate) fn uninstrumented_opener(seam: &str) -> Option<SqliteUninstrumentedOpener> {
-    SQLITE_UNINSTRUMENTED_OPENERS
-        .iter()
-        .copied()
-        .find(|opener| opener.seam == seam)
-}
-
 fn live_counts() -> &'static Mutex<BTreeMap<SqliteStore, u64>> {
     static COUNTS: OnceLock<Mutex<BTreeMap<SqliteStore, u64>>> = OnceLock::new();
     COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -349,6 +338,10 @@ struct WalHookState {
     page_size: u64,
     checkpoint_counter: WriteCounter,
     residual_counter: WriteCounter,
+    /// The `aft.db` file this connection is attached to, so a commit inside
+    /// [`defer_wal_checkpoints`] can hand its checkpoint to the background
+    /// worker. `None` for other stores, which always checkpoint inline.
+    deferrable: Option<(PathBuf, crate::db::file_identity::FileIdentity)>,
 }
 
 impl WalHookState {
@@ -443,15 +436,22 @@ unsafe extern "C" fn tracked_wal_hook(
 ) -> c_int {
     let state = unsafe { &*(context.cast::<WalHookState>()) };
     state.observe_commit(frame_count);
-    #[cfg(test)]
-    unsafe {
-        crate::views::materialization::probe_wal(db, frame_count)
-    };
     let threshold = state.threshold_pages.load(Ordering::Relaxed);
     if threshold <= 0 || frame_count < threshold {
         return rusqlite::ffi::SQLITE_OK;
     }
+    if let Some((path, identity)) = state.deferrable.as_ref() {
+        // Past several thresholds the background worker is not keeping up
+        // (or cannot open the file); checkpoint here so the WAL stays bounded.
+        if DEFER_CHECKPOINTS.with(std::cell::Cell::get)
+            && frame_count < threshold.saturating_mul(DEFERRED_CHECKPOINT_LIMIT)
+        {
+            crate::db::deferred_checkpoint::request(path, *identity);
+            return rusqlite::ffi::SQLITE_OK;
+        }
+    }
 
+    let started = std::time::Instant::now();
     let mut log_frames = 0;
     let mut checkpointed_frames = 0;
     // This is the same threshold check and PASSIVE checkpoint used by SQLite's
@@ -466,23 +466,60 @@ unsafe extern "C" fn tracked_wal_hook(
         )
     };
     if result == rusqlite::ffi::SQLITE_OK {
-        #[cfg(test)]
-        unsafe {
-            crate::views::materialization::probe_checkpoint(
-                db,
-                0,
-                log_frames.into(),
-                checkpointed_frames.into(),
-            )
-        };
         let frames = state.record_checkpoint(log_frames, checkpointed_frames);
         state
             .checkpoint_counter
             .credit(0, state.bytes_for_frames(frames));
     }
+    INLINE_CHECKPOINT_TIME.with(|total| total.set(total.get() + started.elapsed()));
+    INLINE_CHECKPOINTS.with(|count| count.set(count.get() + 1));
     // SQLite's built-in autocheckpoint hook deliberately does not fail the
     // already-committed transaction when a PASSIVE checkpoint is busy.
     rusqlite::ffi::SQLITE_OK
+}
+
+/// How many autocheckpoint thresholds the WAL may pass while its checkpoints
+/// are deferred before a commit checkpoints inline anyway.
+const DEFERRED_CHECKPOINT_LIMIT: i32 = 8;
+
+thread_local! {
+    /// Time this thread spent in WAL checkpoints run inside its own commits.
+    static INLINE_CHECKPOINT_TIME: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    /// WAL checkpoints run inside this thread's own commits.
+    static INLINE_CHECKPOINTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Set while this thread's `aft.db` commits hand their checkpoints to the
+    /// background worker; see [`defer_wal_checkpoints`].
+    static DEFER_CHECKPOINTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `work` with the WAL checkpoint that any `aft.db` commit in it would
+/// run inline handed to a background worker instead, so a caller waiting on
+/// `work` never waits for the checkpoint's file copy and syncs. Use it for
+/// writes a tool call waits on; commits elsewhere keep SQLite's inline
+/// autocheckpoint. Durability is unchanged: a checkpoint only moves already
+/// committed pages from the WAL into the database file.
+pub(crate) fn defer_wal_checkpoints<R>(work: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DEFER_CHECKPOINTS.with(|defer| defer.set(self.0));
+        }
+    }
+    let _restore = Restore(DEFER_CHECKPOINTS.with(|defer| defer.replace(true)));
+    work()
+}
+
+/// WAL checkpoints that ran inside this thread's own commits so far.
+#[cfg(test)]
+pub(crate) fn inline_checkpoints_on_this_thread() -> u64 {
+    INLINE_CHECKPOINTS.with(std::cell::Cell::get)
+}
+
+/// Total time this thread has spent in WAL checkpoints that ran inside its
+/// own commits. Callers difference two readings to split a commit's time.
+pub(crate) fn inline_checkpoint_time_on_this_thread() -> std::time::Duration {
+    INLINE_CHECKPOINT_TIME.with(std::cell::Cell::get)
 }
 
 /// A `rusqlite::Connection` whose lifetime contributes to the process-wide
@@ -564,47 +601,6 @@ pub(crate) fn sqlite_open_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     std::borrow::Cow::Borrowed(path)
 }
 
-/// An immutable read of a quiescent main file must not create empty WAL/SHM
-/// files. If frames already exist, normal read-only SQLite reads include them.
-/// A racing writer can make this census stale. Before unlinking, generation
-/// cleanup rechecks the pointer in its own transaction (which it can only
-/// promote to a writer if nothing committed since its census) and, for V2,
-/// rechecks membership under the family registry's write transaction.
-pub(crate) fn census_open_path(path: &Path) -> rusqlite::Result<PathBuf> {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    let quiescent = match std::fs::metadata(PathBuf::from(wal)) {
-        Ok(metadata) => metadata.len() == 0,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                Some(error.to_string()),
-            ))
-        }
-    };
-    if !quiescent {
-        return Ok(sqlite_open_path(path).into_owned());
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| {
-                rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                    Some(error.to_string()),
-                )
-            })?
-            .join(path)
-    };
-    let normalized = sqlite_open_path(&absolute);
-    let mut uri = url::Url::from_file_path(normalized.as_ref())
-        .map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
-    uri.set_query(Some("immutable=1"));
-    Ok(PathBuf::from(uri.as_str()))
-}
-
 impl TrackedConnection {
     pub fn open(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
         Self::open_attributed(path, store, path.display().to_string())
@@ -618,16 +614,8 @@ impl TrackedConnection {
         production_write_gate(path)?;
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, OpenFlags::default())?;
-        #[cfg(test)]
-        let connection = crate::views::materialization::open_probe_connection(
-            &sqlite_open_path(path),
-            OpenFlags::default(),
-        )?;
-        #[cfg(not(test))]
-        let connection = crate::views::write_accounting::open_connection(
-            &sqlite_open_path(path),
-            OpenFlags::default(),
-        )?;
+        let connection =
+            rusqlite::Connection::open_with_flags(&sqlite_open_path(path), OpenFlags::default())?;
         Self::from_connection_attributed(connection, store, root_id)
     }
 
@@ -647,24 +635,11 @@ impl TrackedConnection {
         // store's `sqlite_readonly_uri`).
         let connection = if flags.contains(OpenFlags::SQLITE_OPEN_URI) && path.starts_with("file:")
         {
-            #[cfg(test)]
-            let connection =
-                crate::views::materialization::open_probe_connection(Path::new(path), flags)?;
-            #[cfg(not(test))]
-            let connection =
-                crate::views::write_accounting::open_connection(Path::new(path), flags)?;
+            let connection = rusqlite::Connection::open_with_flags(Path::new(path), flags)?;
             connection
         } else {
-            #[cfg(test)]
-            let connection = crate::views::materialization::open_probe_connection(
-                &sqlite_open_path(Path::new(path)),
-                flags,
-            )?;
-            #[cfg(not(test))]
-            let connection = crate::views::write_accounting::open_connection(
-                &sqlite_open_path(Path::new(path)),
-                flags,
-            )?;
+            let connection =
+                rusqlite::Connection::open_with_flags(&sqlite_open_path(Path::new(path)), flags)?;
             connection
         };
         Self::from_connection_attributed(connection, store, path.to_owned())
@@ -680,26 +655,7 @@ impl TrackedConnection {
         }
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, flags)?;
-        #[cfg(test)]
-        let connection =
-            crate::views::materialization::open_probe_connection(&sqlite_open_path(path), flags)?;
-        #[cfg(not(test))]
-        let connection =
-            crate::views::write_accounting::open_connection(&sqlite_open_path(path), flags)?;
-        Self::from_connection_attributed(connection, store, path.display().to_string())
-    }
-
-    pub(crate) fn open_census(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let _guard = crate::db::file_identity::filesystem_guard();
-        crate::private_storage::prepare_sqlite(path, flags)?;
-        let connection = Connection::open_with_flags(census_open_path(path)?, flags)?;
-        connection.set_db_config(
-            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-            true,
-        )?;
+        let connection = rusqlite::Connection::open_with_flags(&sqlite_open_path(path), flags)?;
         Self::from_connection_attributed(connection, store, path.display().to_string())
     }
 
@@ -743,6 +699,15 @@ impl TrackedConnection {
             root_id.clone(),
         );
         let residual_counter = crate::write_ledger::register(WriteDomain::Other, root_id);
+        let deferrable = (store == SqliteStore::AftDb)
+            .then(|| connection.path())
+            .flatten()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .and_then(|path| {
+                let path = PathBuf::from(path);
+                let identity = crate::db::file_identity::identity_of(&path)?;
+                Some((path, identity))
+            });
         let wal_hook = Box::new(WalHookState {
             threshold_pages: AtomicI32::new(DEFAULT_WAL_AUTOCHECKPOINT_PAGES as i32),
             last_log_frames: AtomicI32::new(0),
@@ -752,6 +717,7 @@ impl TrackedConnection {
             page_size,
             checkpoint_counter,
             residual_counter,
+            deferrable,
         });
         let context = std::ptr::from_ref(wal_hook.as_ref())
             .cast_mut()
@@ -835,37 +801,6 @@ impl TrackedConnection {
         i64::from(self.wal_hook.threshold_pages.load(Ordering::Relaxed))
     }
 
-    /// Disable commit-time autocheckpointing for refresh connections; the
-    /// worker performs explicit checkpoint attempts at refresh boundaries.
-    /// Keep the ledger's existing hook as an observer, with no checkpoint work.
-    pub(crate) fn configure_refresh_wal(&self) -> rusqlite::Result<()> {
-        self.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT)?;
-        self.pragma_update(None, "wal_autocheckpoint", 0)?;
-        self.wal_hook.threshold_pages.store(0, Ordering::Relaxed);
-        let context = std::ptr::from_ref(self.wal_hook.as_ref())
-            .cast_mut()
-            .cast::<c_void>();
-        unsafe {
-            rusqlite::ffi::sqlite3_wal_hook(self.handle(), Some(tracked_wal_hook), context);
-        }
-        // A queued batch opens a fresh connection. Closing its predecessor must
-        // not silently checkpoint between batches and defeat queue deferral.
-        self.set_db_config(
-            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-            true,
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn observed_wal_bytes(&self) -> u64 {
-        let frames = self.wal_hook.last_log_frames.load(Ordering::Relaxed).max(0) as u64;
-        if frames == 0 {
-            0
-        } else {
-            32 + frames.saturating_mul(self.page_size + 24)
-        }
-    }
-
     fn query_wal_checkpoint(
         &self,
         mode: WalCheckpointMode,
@@ -881,15 +816,6 @@ impl TrackedConnection {
                     checkpointed_frames: row.get(2)?,
                 })
             })?;
-        #[cfg(test)]
-        unsafe {
-            crate::views::materialization::probe_checkpoint(
-                self.connection.as_ref().unwrap().handle(),
-                result.busy,
-                result.log_frames,
-                result.checkpointed_frames,
-            )
-        };
         Ok(result)
     }
 
@@ -1081,28 +1007,6 @@ mod tests {
             open_on_this_thread(SqliteStore::CallgraphGeneration),
             baseline_callgraph
         );
-    }
-
-    #[test]
-    fn refresh_connections_limit_retained_wal_without_enabling_autocheckpoints() {
-        let dir = tempfile::tempdir().unwrap();
-        let connection = TrackedConnection::open(
-            &dir.path().join("refresh.sqlite"),
-            SqliteStore::CallgraphGeneration,
-        )
-        .unwrap();
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .unwrap();
-        connection.configure_refresh_wal().unwrap();
-        let limit: i64 = connection
-            .pragma_query_value(None, "journal_size_limit", |row| row.get(0))
-            .unwrap();
-        assert_eq!(limit, WAL_JOURNAL_SIZE_LIMIT);
-        assert_eq!(connection.wal_autocheckpoint_pages(), 0);
-        assert!(connection
-            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
-            .unwrap());
     }
 
     #[test]

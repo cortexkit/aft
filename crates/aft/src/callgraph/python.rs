@@ -393,3 +393,8 @@ impl<'a> Extractor<'a> {
         }
     }
 }
+aft_store::heap_bytes_of_fields!(CallBinding {
+    byte_start,
+    byte_end,
+    target,
+});

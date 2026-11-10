@@ -3858,23 +3858,20 @@ fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<Stri
         };
         format!("{prefix}{total_paths}")
     };
-    let entry_points = number_field(record, "entry_points_found").unwrap_or(0);
+    let roots = root_counts_summary(record);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
             "{total_paths_str} path{}",
             if total_paths_str == "1" { "" } else { "s" }
         )),
-        Some(format!(
-            "{entry_points} entry point{}",
-            if entry_points == 1 { "" } else { "s" }
-        )),
+        roots.map(|roots| format!("roots: {roots}")),
         (!warning.is_empty()).then_some(warning),
     ])];
     if let Some(summary) = hub_summary {
         sections.push(summary);
     }
     if paths.is_empty() {
-        sections.push("No entry paths found.".to_string());
+        sections.push("No paths found.".to_string());
     }
     for (index, path) in paths.iter().enumerate() {
         let mut lines = Vec::new();
@@ -3889,16 +3886,40 @@ fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<Stri
     sections
 }
 
+/// The roots a `trace_to` or `impact` reply reached, from its `root_counts`:
+/// `main, 4 tests, 2 public API functions`.
+fn root_counts_summary(record: &serde_json::Map<String, Value>) -> Option<String> {
+    record
+        .get("root_counts")
+        .and_then(Value::as_object)
+        .and_then(crate::commands::callgraph_roots::summary)
+}
+
+/// The root tag of a path or impact caller that has a `root` kind.
+fn root_tag(record: &serde_json::Map<String, Value>) -> Option<String> {
+    crate::commands::callgraph_roots::tag(
+        string_field(record, "root")?,
+        string_field(record, "attribute"),
+    )
+}
+
 fn render_trace_path(path: &serde_json::Map<String, Value>, index: usize, lines: &mut Vec<String>) {
     lines.push(format!("Path {}", index + 1));
+    let root = root_tag(path);
     for (hop_index, hop) in records_field(path, "hops").iter().enumerate() {
         let symbol = string_field(hop, "symbol").unwrap_or("(unknown)");
         let file = shorten_path(string_field(hop, "file").unwrap_or("(unknown file)"));
         let line = number_field(hop, "line");
-        let entry = if hop.get("is_entry_point").and_then(Value::as_bool) == Some(true) {
-            " [entry]"
+        // The first hop is the root; an exported function further along
+        // stays inside the path and says so.
+        let tag = if hop_index == 0 {
+            root.as_ref()
+                .map(|root| format!(" {root}"))
+                .unwrap_or_default()
+        } else if hop.get("exported").and_then(Value::as_bool) == Some(true) {
+            " [exported]".to_string()
         } else {
-            ""
+            String::new()
         };
         let name_match = name_match_edge_marker(hop);
         let location = match line {
@@ -3907,7 +3928,7 @@ fn render_trace_path(path: &serde_json::Map<String, Value>, index: usize, lines:
         };
         lines.push(tree_line(
             hop_index + 1,
-            &format!("{symbol}{entry} {location}{name_match}"),
+            &format!("{symbol}{tag} {location}{name_match}"),
         ));
     }
 }
@@ -3960,6 +3981,9 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
     if let Some(summary) = hub_summary {
         sections.push(summary);
     }
+    if let Some(roots) = root_counts_summary(record) {
+        sections.push(format!("Reaches {roots}"));
+    }
     if callers.is_empty() {
         sections.push("No impacted callers found.".to_string());
     }
@@ -3967,11 +3991,9 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         let file = shorten_path(string_field(caller, "caller_file").unwrap_or("(unknown file)"));
         let symbol = string_field(caller, "caller_symbol").unwrap_or("(unknown)");
         let line = number_field(caller, "line").unwrap_or(0);
-        let entry = if caller.get("is_entry_point").and_then(Value::as_bool) == Some(true) {
-            " [entry]"
-        } else {
-            ""
-        };
+        let root = root_tag(caller)
+            .map(|root| format!(" {root}"))
+            .unwrap_or_default();
         let name_match = name_match_edge_marker(caller);
         let expression = string_field(caller, "call_expression");
         let params = caller
@@ -3988,7 +4010,7 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         let mut lines = vec![
             format!("{file}:{line}"),
             format!(
-                "  ↳ {symbol}{entry}{name_match}{}",
+                "  ↳ {symbol}{root}{name_match}{}",
                 if string_field(caller, "relation") == Some("callback_reference") {
                     crate::commands::callgraph_store_adapter::CALLBACK_REFERENCE_LABEL
                 } else {
@@ -4481,11 +4503,42 @@ fn format_status(data: &Value) -> String {
         }
         s
     };
-    let callgraph = data
-        .pointer("/features/callgraph_store")
-        .and_then(Value::as_bool)
-        .map(|on| if on { "enabled" } else { "disabled" })
-        .unwrap_or("?");
+    let callgraph = match data
+        .pointer("/callgraph_store/status")
+        .and_then(Value::as_str)
+    {
+        // The data layer reports its call graph's state; a published graph
+        // with edits waiting to be resolved answers, so it stays ready.
+        Some(state) => {
+            let pending = data
+                .pointer("/callgraph_store/pending_edits")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let reason = data
+                .pointer("/callgraph_store/reason")
+                .and_then(Value::as_str);
+            match reason {
+                Some(reason) => format!("{state} ({reason})"),
+                None if pending > 0 => format!("{state} ({pending} edit(s) pending)"),
+                None => state.to_string(),
+            }
+        }
+        None => data
+            .pointer("/features/callgraph_store")
+            .and_then(Value::as_bool)
+            .map(|on| if on { "enabled" } else { "disabled" })
+            .unwrap_or("?")
+            .to_string(),
+    };
+    // Only the data layer's text plane names why it is off or unavailable
+    // here; today's index keeps its existing line.
+    let search = match (
+        data.get("callgraph_store"),
+        data.pointer("/search_index/reason").and_then(Value::as_str),
+    ) {
+        (Some(_), Some(reason)) => format!("{search} ({reason})"),
+        _ => search,
+    };
     lines.push(format!(
         "indexes: search {search} | semantic {semantic} | callgraph {callgraph}"
     ));
@@ -4510,8 +4563,17 @@ fn format_status(data: &Value) -> String {
             .unwrap_or("?");
         let trigram = format_optional_memory_bytes(disk.get("trigram_disk_bytes"));
         let semantic_disk = format_optional_memory_bytes(disk.get("semantic_disk_bytes"));
+        let data_store = disk
+            .get("data_store_bytes")
+            .map(|bytes| {
+                format!(
+                    "index store {}, ",
+                    format_optional_memory_bytes(Some(bytes))
+                )
+            })
+            .unwrap_or_default();
         lines.push(format!(
-            "storage: {storage} (trigram {trigram}, semantic {semantic_disk})"
+            "storage: {storage} ({data_store}trigram {trigram}, semantic {semantic_disk})"
         ));
     }
 
@@ -4566,6 +4628,14 @@ fn format_memory_block(memory: &Value) -> String {
     let mut lines = vec![format!(
         "Memory: RSS {rss} | attributed {attributed} | unattributed {unattributed}"
     )];
+    // Present only while the data layer runs: its block cache is shared by
+    // every root, so it is counted once here rather than on any root.
+    if let Some(cache) = process.get("data_layer_block_cache_bytes") {
+        lines[0].push_str(&format!(
+            " | data layer cache {}",
+            format_optional_memory_bytes(Some(cache))
+        ));
+    }
     if let Some(roots) = memory.get("roots").and_then(Value::as_object) {
         for (root, estimate) in roots {
             let total = format_optional_memory_bytes(estimate.get("attributed_bytes"));
@@ -4589,8 +4659,17 @@ fn format_memory_block(memory: &Value) -> String {
                 };
                 format!("{label} {value}")
             })
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+            let mut subsystems = subsystems;
+            if let Some(data_layer) = estimate.get("data_layer") {
+                let value = if data_layer.get("status").and_then(Value::as_str) == Some("busy") {
+                    "busy".to_string()
+                } else {
+                    format_optional_memory_bytes(data_layer.get("estimated_bytes"))
+                };
+                subsystems.push(format!("data layer {value}"));
+            }
+            let subsystems = subsystems.join(", ");
             lines.push(format!("  {root}: {total} ({subsystems})"));
         }
     }
@@ -4819,6 +4898,89 @@ mod status_memory_tests {
         assert!(rendered.contains("cache: shared repo index (built by the main checkout)"));
         assert!(rendered.contains("DEGRADED: home_root"));
     }
+
+    #[test]
+    fn status_text_reports_the_data_layer_planes_when_it_runs() {
+        let data = json!({
+            "version": "test",
+            "features": {"callgraph_store": true},
+            "search_index": {"status": "ready", "files": 12},
+            "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "ready", "pending_edits": 2, "unparsed_files": 0},
+            "disk": {
+                "storage_dir": "/s",
+                "trigram_disk_bytes": 0,
+                "semantic_disk_bytes": 0,
+                "data_store_bytes": 2048
+            },
+            "memory": {
+                "process": {"rss_bytes": 1024, "total_attributed_bytes": 1024,
+                    "unattributed_bytes": 0, "data_layer_block_cache_bytes": 4096},
+                "roots": {"/repo": {"attributed_bytes": 1024,
+                    "data_layer": {"status": "ready", "estimated_bytes": 512}}}
+            }
+        });
+        let rendered = format_status(&data);
+        assert!(
+            rendered.contains(
+                "indexes: search ready | semantic disabled | callgraph ready (2 edit(s) pending)"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("storage: /s (index store 2.0 KiB, trigram 0 B, semantic 0 B)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("| data layer cache 4.0 KiB"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("data layer 512 B)"), "{rendered}");
+
+        let off = json!({
+            "search_index": {"status": "off", "reason": "not_bound"},
+            "callgraph_store": {"status": "unavailable", "reason": "refresh_failed",
+                "pending_edits": 1, "unparsed_files": 0},
+        });
+        let rendered = format_status(&off);
+        assert!(
+            rendered.contains(
+                "search off (not_bound) | semantic ? | callgraph unavailable (refresh_failed)"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_text_without_the_data_layer_keeps_its_lines() {
+        // Today's payload: no `callgraph_store`, a search index reason from a
+        // refusal, and no index store on disk.
+        let data = json!({
+            "features": {"callgraph_store": true},
+            "search_index": {"status": "unavailable", "reason": "refused"},
+            "semantic_index": {"status": "ready"},
+            "disk": {"storage_dir": "/s", "trigram_disk_bytes": 1024, "semantic_disk_bytes": 0},
+            "memory": {
+                "process": {"rss_bytes": 1024, "total_attributed_bytes": 1024, "unattributed_bytes": 0},
+                "roots": {"/repo": {"attributed_bytes": 0}}
+            }
+        });
+        let rendered = format_status(&data);
+        assert!(
+            rendered.contains("indexes: search unavailable | semantic ready | callgraph enabled"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("storage: /s (trigram 1.0 KiB, semantic 0 B)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Memory: RSS 1.0 KiB | attributed 1.0 KiB | unattributed 0 B\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("data layer"), "{rendered}");
+        assert!(!rendered.contains("index store"), "{rendered}");
+    }
 }
 
 #[cfg(test)]
@@ -5000,7 +5162,7 @@ mod callgraph_format_tests {
             &json!({
                 "total_paths": 7,
                 "total_paths_is_lower_bound": true,
-                "entry_points_found": 2,
+                "root_counts": {"main": 1, "public_api": 1},
                 "hub_summary": {
                     "message": "Next: at least 7 paths — showing 2; traversal capped; narrow with scope"
                 },
@@ -5009,7 +5171,7 @@ mod callgraph_format_tests {
             false,
         );
 
-        assert!(rendered.starts_with("at least 7 paths · 2 entry points"));
+        assert!(rendered.starts_with("at least 7 paths · roots: main, 1 public API function"));
         assert!(rendered.contains("Next: at least 7 paths"));
     }
 
@@ -5019,14 +5181,69 @@ mod callgraph_format_tests {
             "trace_to",
             &json!({
                 "total_paths": 1,
-                "entry_points_found": 1,
+                "root_counts": {"no_caller_found": 1},
                 "paths": []
             }),
             false,
         );
 
-        assert!(rendered.starts_with("1 path · 1 entry point"));
+        assert!(rendered.starts_with("1 path · roots: 1 function with no caller found"));
         assert!(!rendered.contains("at least"));
+    }
+
+    /// A path's first hop carries its root's kind; an exported function
+    /// further along is marked exported and does not end the path.
+    #[test]
+    fn trace_to_renders_root_kinds_and_exported_hops() {
+        let rendered = format_callgraph(
+            "trace_to",
+            &json!({
+                "total_paths": 2,
+                "root_counts": {"main": 1, "attribute": 1},
+                "max_depth_reached": false,
+                "truncated_paths": 0,
+                "paths": [
+                    {"root": "main", "hops": [
+                        {"symbol": "main", "file": "src/main.rs", "line": 1},
+                        {"symbol": "run", "file": "src/lib.rs", "line": 3, "exported": true},
+                        {"symbol": "leaf", "file": "src/lib.rs", "line": 9}
+                    ]},
+                    {"root": "attribute", "attribute": "no_mangle", "hops": [
+                        {"symbol": "ffi_entry", "file": "src/ffi.rs", "line": 2, "exported": true},
+                        {"symbol": "leaf", "file": "src/lib.rs", "line": 9}
+                    ]}
+                ]
+            }),
+            false,
+        );
+        assert_eq!(
+            rendered,
+            "2 paths · roots: main, 1 function with an entry attribute\nPath 1\n  ↳ main [root: main] [src/main.rs:1]\n    ↳ run [exported] [src/lib.rs:3]\n      ↳ leaf [src/lib.rs:9]\nPath 2\n  ↳ ffi_entry [root: attribute no_mangle] [src/ffi.rs:2]\n    ↳ leaf [src/lib.rs:9]"
+        );
+    }
+
+    /// Impact tags the callers that are roots and sums the roots up.
+    #[test]
+    fn impact_renders_root_tags_and_summary() {
+        let rendered = format_callgraph(
+            "impact",
+            &json!({
+                "total_affected": 2,
+                "affected_files": 2,
+                "depth_limited": false,
+                "truncated": 0,
+                "root_counts": {"main": 1, "public_api": 1},
+                "callers": [
+                    {"caller_symbol": "main", "caller_file": "src/main.rs", "line": 4, "root": "main", "parameters": []},
+                    {"caller_symbol": "api", "caller_file": "src/lib.rs", "line": 7, "root": "public_api", "parameters": []}
+                ]
+            }),
+            false,
+        );
+        assert_eq!(
+            rendered,
+            "2 affected call sites · 2 files\nReaches main, 1 public API function\nsrc/main.rs:4\n  ↳ main [root: main]\nsrc/lib.rs:7\n  ↳ api [root: public API]"
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
         aft,
         &dir,
         user_config(serde_json::json!({
-            "experimental": { "bash": { "background": true } }
+            "bash": { "rewrite": false, "compress": false, "background": true }
         })),
     );
     dir
@@ -86,7 +86,7 @@ fn configure_restricted_background(aft: &mut AftProcess) -> (tempfile::TempDir, 
             "storage_dir": storage.path(),
             "config": user_config(serde_json::json!({
                 "restrict_to_project_root": true,
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),
@@ -759,7 +759,7 @@ fn assert_background_artifact_search_access(command: &str) {
                 "storage_dir": storage.path(),
                 "config": user_config(json!({
                     "restrict_to_project_root": restricted,
-                    "experimental": { "bash": { "background": true } }
+                    "bash": { "rewrite": false, "compress": false, "background": true }
                 }))
             })
             .to_string(),
@@ -1975,7 +1975,7 @@ fn replay_does_not_return_acknowledged_completion_after_restart() {
             "project_root": dir.path(),
             "storage_dir": dir.path().join("aft-storage"),
             "config": user_config(serde_json::json!({
-                "experimental": { "bash": { "background": true } }
+                "bash": { "rewrite": false, "compress": false, "background": true }
             })),
         })
         .to_string(),

@@ -916,3 +916,27 @@ async function runCargoBuild(): Promise<{ ok: boolean; output: string }> {
     });
   });
 }
+
+/**
+ * Runs an aft_search call, retrying while AFT refuses it with
+ * search_lanes_unavailable. A freshly bound project's text index builds in the
+ * background, and until it is ready aft_search answers "Retry shortly or use
+ * grep", which is the designed reply. Tests about what a ready search returns
+ * retry that one refusal; any other error is thrown at once.
+ */
+export async function searchWhenIndexReady<T>(
+  run: () => Promise<T>,
+  timeoutMs = 20_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return await run();
+    } catch (error) {
+      if (!String(error).includes("search_lanes_unavailable") || Date.now() > deadline) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+}

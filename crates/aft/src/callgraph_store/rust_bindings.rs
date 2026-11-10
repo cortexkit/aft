@@ -1,9 +1,13 @@
 //! In-memory Rust declaration and lexical-binding indexes. Graph producers
 //! reuse their existing return and receiver fact fields; no index is serialized.
 
-use std::collections::{HashMap, HashSet};
+// Every map here is looked up, never iterated in an order that shows in
+// the output, so a fast hash serves them.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ops::Range;
 use tree_sitter::Node;
+
+use super::join::syntax_index::Nav;
 
 #[derive(Clone, Debug)]
 pub(super) struct Declaration {
@@ -11,9 +15,6 @@ pub(super) struct Declaration {
     pub owner: Option<String>,
     pub return_type: Option<String>,
     pub bytes: Range<usize>,
-    pub line: u32,
-    pub has_self: bool,
-    pub trait_name: Option<String>,
 }
 
 pub(super) fn has_self_parameter(node: Node<'_>, source: &str) -> bool {
@@ -34,8 +35,8 @@ pub(super) fn has_self_parameter(node: Node<'_>, source: &str) -> bool {
 
 #[derive(Clone, Debug)]
 pub(super) enum Initializer {
-    Call { callee: String, bytes: Range<usize> },
-    Nominal(String, bool),
+    Call { callee: String },
+    Nominal(String),
 }
 
 #[derive(Clone, Debug)]
@@ -75,23 +76,25 @@ fn names(pattern: Node<'_>, source: &str) -> Vec<String> {
     names
 }
 
-fn identity(
-    node: Node<'_>,
+fn identity<'tree>(
+    node: Node<'tree>,
     source: &str,
     types: &HashSet<String>,
+    nav: impl Nav<'tree>,
 ) -> Option<(String, Option<String>)> {
     let name = text(node.child_by_field_name("name")?, source);
     let mut scope = Vec::new();
     let mut owner = None;
-    let mut parent = node.parent();
+    let mut parent = nav.parent(node);
     let mut implementation = false;
     let mut qualify = false;
     while let Some(ancestor) = parent {
-        if ancestor.kind() == "impl_item" && !implementation {
+        let ancestor_kind = nav.kind(ancestor);
+        if ancestor_kind == "impl_item" && !implementation {
             let ty = text(ancestor.child_by_field_name("type")?, source);
             let base = ty.split('<').next().unwrap_or(ty);
             let local = types.contains(&crate::callgraph::rust_module_qualified_name(
-                ancestor, source, base,
+                ancestor, source, base, nav,
             ));
             qualify = local
                 || ancestor
@@ -102,7 +105,7 @@ fn identity(
                             .next()
                             .unwrap_or_default();
                         types.contains(&crate::callgraph::rust_module_qualified_name(
-                            ancestor, source, name,
+                            ancestor, source, name, nav,
                         ))
                     });
             let generic =
@@ -118,7 +121,7 @@ fn identity(
                             })
                     });
             owner = (local && !generic)
-                .then(|| crate::callgraph::rust_module_qualified_name(ancestor, source, ty));
+                .then(|| crate::callgraph::rust_module_qualified_name(ancestor, source, ty, nav));
             scope.push(
                 if let Some(trait_node) = ancestor.child_by_field_name("trait") {
                     format!("{} for {ty}", text(trait_node, source))
@@ -127,21 +130,21 @@ fn identity(
                 },
             );
             implementation = true;
-            parent = ancestor.parent();
+            parent = nav.parent(ancestor);
             continue;
         }
-        if ancestor.kind() == "mod_item" && (!implementation || qualify)
-            || ancestor.kind() == "trait_item" && !implementation
+        if ancestor_kind == "mod_item" && (!implementation || qualify)
+            || ancestor_kind == "trait_item" && !implementation
         {
             let name = text(ancestor.child_by_field_name("name")?, source).to_string();
-            if ancestor.kind() == "trait_item" {
+            if ancestor_kind == "trait_item" {
                 owner = Some(crate::callgraph::rust_module_qualified_name(
-                    ancestor, source, &name,
+                    ancestor, source, &name, nav,
                 ));
             }
             scope.push(name);
         }
-        parent = ancestor.parent();
+        parent = nav.parent(ancestor);
     }
     scope.reverse();
     scope.push(name.to_string());
@@ -149,13 +152,23 @@ fn identity(
 }
 
 impl RustBindings {
+    #[cfg(test)]
     pub fn new(source: &str, root: Node<'_>) -> Self {
+        Self::new_with(source, root, super::join::syntax_index::Direct)
+    }
+
+    #[cfg(test)]
+    pub fn unit_struct(&self, symbol: &str) -> bool {
+        self.unit_structs.get(symbol).copied() == Some(true)
+    }
+
+    /// [`RustBindings::new`], walking and looking up with `nav`.
+    pub fn new_with<'tree>(source: &str, root: Node<'tree>, nav: impl Nav<'tree>) -> Self {
         let mut result = Self::default();
-        let mut types = HashSet::new();
-        let mut pending = vec![root];
-        while let Some(node) = pending.pop() {
+        let mut types = HashSet::default();
+        nav.walk_named(root, |node, kind| {
             if matches!(
-                node.kind(),
+                kind,
                 "struct_item" | "enum_item" | "trait_item" | "type_item"
             ) {
                 if let Some(name) = node.child_by_field_name("name") {
@@ -163,24 +176,26 @@ impl RustBindings {
                         node,
                         source,
                         text(name, source),
+                        nav,
                     ));
                 }
             }
-            pending.extend(node.named_children(&mut node.walk()));
-        }
+            true
+        });
         let mut stack = vec![(root, None, root.byte_range())];
         while let Some((node, mut callable, mut scope)) = stack.pop() {
-            if node.kind() == "struct_item" {
+            let kind = nav.kind(node);
+            if kind == "struct_item" {
                 if let Some(name) = node.child_by_field_name("name") {
                     let mut parts = vec![text(name, source).to_string()];
-                    let mut parent = node.parent();
+                    let mut parent = nav.parent(node);
                     while let Some(ancestor) = parent {
-                        if ancestor.kind() == "mod_item" {
+                        if nav.kind(ancestor) == "mod_item" {
                             if let Some(name) = ancestor.child_by_field_name("name") {
                                 parts.push(text(name, source).to_string());
                             }
                         }
-                        parent = ancestor.parent();
+                        parent = nav.parent(ancestor);
                     }
                     parts.reverse();
                     result
@@ -190,7 +205,7 @@ impl RustBindings {
                         .or_insert(node.child_by_field_name("body").is_none());
                 }
             }
-            if matches!(node.kind(), "function_item" | "closure_expression") {
+            if matches!(kind, "function_item" | "closure_expression") {
                 callable = Some(node.start_byte());
                 scope = node.byte_range();
                 if let Some(parameters) = node.child_by_field_name("parameters") {
@@ -226,9 +241,9 @@ impl RustBindings {
                         }
                     }
                 }
-                let mut parent = node.parent();
+                let mut parent = nav.parent(node);
                 while let Some(ancestor) = parent {
-                    if ancestor.kind() == "impl_item" {
+                    if nav.kind(ancestor) == "impl_item" {
                         if let Some(parameters) = ancestor.child_by_field_name("type_parameters") {
                             result.generic_functions.insert(node.start_byte());
                             for parameter in parameters.named_children(&mut parameters.walk()) {
@@ -248,14 +263,14 @@ impl RustBindings {
                         }
                         break;
                     }
-                    parent = ancestor.parent();
+                    parent = nav.parent(ancestor);
                 }
             }
-            if node.kind() == "block" {
+            if kind == "block" {
                 scope = node.byte_range();
             }
-            if matches!(node.kind(), "function_item" | "function_signature_item") {
-                if let Some((symbol, owner)) = identity(node, source, &types) {
+            if matches!(kind, "function_item" | "function_signature_item") {
+                if let Some((symbol, owner)) = identity(node, source, &types, nav) {
                     let declaration = Declaration {
                         symbol: symbol.clone(),
                         owner,
@@ -263,22 +278,6 @@ impl RustBindings {
                             .child_by_field_name("return_type")
                             .map(|n| text(n, source).to_string()),
                         bytes: node.byte_range(),
-                        line: node.start_position().row as u32 + 1,
-                        has_self: has_self_parameter(node, source),
-                        trait_name: {
-                            let mut parent = node.parent();
-                            let mut trait_name = None;
-                            while let Some(ancestor) = parent {
-                                if ancestor.kind() == "impl_item" {
-                                    trait_name = ancestor
-                                        .child_by_field_name("trait")
-                                        .map(|name| text(name, source).to_string());
-                                    break;
-                                }
-                                parent = ancestor.parent();
-                            }
-                            trait_name
-                        },
                     };
                     let position = result.records.len();
                     result.symbols.insert(node.start_byte(), position);
@@ -291,10 +290,10 @@ impl RustBindings {
                 }
             }
             if let Some(callable) = callable {
-                if node.kind() == "call_expression" {
+                if kind == "call_expression" {
                     result.calls.insert(node.start_byte(), callable);
                 }
-                if node.kind() == "let_declaration" || node.kind() == "parameter" {
+                if kind == "let_declaration" || kind == "parameter" {
                     if let Some(pattern) = node.child_by_field_name("pattern") {
                         let simple = matches!(pattern.kind(), "identifier" | "mut_pattern");
                         let initializer = simple
@@ -303,11 +302,9 @@ impl RustBindings {
                             .and_then(|value| match value.kind() {
                                 "call_expression" => Some(Initializer::Call {
                                     callee: crate::calls::extract_full_callee(&value, source)?,
-                                    bytes: value.byte_range(),
                                 }),
                                 "struct_expression" => Some(Initializer::Nominal(
                                     text(value.child_by_field_name("name")?, source).to_string(),
-                                    false,
                                 )),
                                 "identifier"
                                     if text(value, source)
@@ -315,10 +312,7 @@ impl RustBindings {
                                         .next()
                                         .is_some_and(char::is_uppercase) =>
                                 {
-                                    Some(Initializer::Nominal(
-                                        text(value, source).to_string(),
-                                        true,
-                                    ))
+                                    Some(Initializer::Nominal(text(value, source).to_string()))
                                 }
                                 _ => None,
                             });
@@ -338,15 +332,15 @@ impl RustBindings {
                                 .push(binding.clone());
                         }
                     }
-                } else if !matches!(node.kind(), "function_item" | "closure_expression") {
+                } else if !matches!(kind, "function_item" | "closure_expression") {
                     if let Some(pattern) = node.child_by_field_name("pattern") {
                         let mut binding_scope = node;
-                        if node.kind() == "let_condition" {
+                        if kind == "let_condition" {
                             while !matches!(
-                                binding_scope.kind(),
+                                nav.kind(binding_scope),
                                 "if_expression" | "while_expression"
                             ) {
-                                let Some(parent) = binding_scope.parent() else {
+                                let Some(parent) = nav.parent(binding_scope) else {
                                     break;
                                 };
                                 binding_scope = parent;
@@ -367,10 +361,7 @@ impl RustBindings {
                     }
                 }
             }
-            stack.extend(
-                node.named_children(&mut node.walk())
-                    .map(|child| (child, callable, scope.clone())),
-            );
+            nav.for_each_named_child(node, |child| stack.push((child, callable, scope.clone())));
         }
         for bindings in result.bindings.values_mut() {
             bindings.sort_by_key(|b| b.start);
@@ -420,17 +411,6 @@ impl RustBindings {
         self.calls
             .get(&call_byte)
             .is_some_and(|callable| self.generic_functions.contains(callable))
-    }
-
-    pub fn unit_struct(&self, symbol: &str) -> bool {
-        self.unit_structs.get(symbol).copied() == Some(true)
-    }
-
-    pub fn type_parameter_in(&self, symbol: &str, name: &str) -> bool {
-        self.declaration(symbol).is_some_and(|declaration| {
-            self.parameters
-                .contains(&(declaration.bytes.start, name.to_string()))
-        })
     }
 }
 

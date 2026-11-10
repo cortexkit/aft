@@ -381,7 +381,7 @@ impl WatcherBatchMetadata {
         let mut head_paths = BTreeSet::new();
         #[cfg(test)]
         crate::search_index::audit_record(|work| work.watcher_head += 1);
-        if let Ok(metadata) = crate::alias::capture_git_head_metadata(
+        if let Ok(metadata) = crate::git_head::capture_git_head_metadata(
             &config.project_root,
             config.git_common_dir.as_deref(),
         ) {
@@ -2132,8 +2132,8 @@ const WATCHER_OBSERVATION_STATE_PREFIX: &str = "watcher.observed_exclusion_prefi
 /// persisted observation becomes the next bind's ranking for every sibling.
 fn watcher_observation_state_key(root: &Path) -> String {
     let repository_key = crate::root_cache::configured_artifact_key(root)
-        .or_else(|| crate::search_index::artifact_cache_key_memoized_only(root))
-        .unwrap_or_else(|| crate::search_index::artifact_cache_key_for_build(root));
+        .or_else(|| crate::root_identity::key::artifact_cache_key_memoized_only(root))
+        .unwrap_or_else(|| crate::root_identity::key::artifact_cache_key_for_build(root));
     format!("{WATCHER_OBSERVATION_STATE_PREFIX}:{repository_key}")
 }
 
@@ -2311,10 +2311,6 @@ pub fn run_watcher_thread<W, E, F>(
                 return;
             }
             crate::slog_info!("watcher started: {}", root_path.display());
-            let _subscription = crate::watcher_backend::subscription::start(
-                &root_path,
-                crate::watcher_backend::initial_coverage_of(&_watcher),
-            );
             let mut filter = WatcherFilterThread::new(
                 config,
                 matcher,
@@ -2981,9 +2977,6 @@ impl WatcherFilterThread {
         let paths = filtered.changed.into_iter().collect::<Vec<_>>();
         let content_only = paths.iter().all(|path| content_only_paths.contains(path));
         let path_count = paths.len();
-        // A parent folder session follows its child repositories through
-        // this watcher; it only queues the paths for its own worker.
-        crate::views::parent::note_changed_paths(&paths);
         let event = if content_only {
             WatcherDispatchEvent::ContentOnlyPaths(paths)
         } else {
@@ -5634,8 +5627,8 @@ mod tests {
             crate::path_identity::project_scope_key(&sibling)
         );
         assert_eq!(
-            crate::search_index::artifact_cache_key(&main),
-            crate::search_index::artifact_cache_key(&sibling)
+            crate::root_identity::key::artifact_cache_key(&main),
+            crate::root_identity::key::artifact_cache_key(&sibling)
         );
 
         let db = Arc::new(Mutex::new(

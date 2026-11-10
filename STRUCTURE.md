@@ -8,6 +8,7 @@ it stays current and this document does not list them.
 
 ```text
 crates/aft/            Rust engine: the `aft` binary, command handlers, indexes, integration tests
+crates/aft-store/      Index store formats: segments, family lifecycle, text, content records, call graph, vectors
 crates/aft-tokenizer/  Standalone Claude token-counting library
 crates/secret-rules/   Secret placeholder grammar, key location rules, response scrubbing
 crates/aft-fake-lsp/   Fake language server used by LSP tests
@@ -27,27 +28,25 @@ assets/                Repository images
 ## `crates/aft/src/`
 
 Top-level `.rs` files are shared engine modules (parser, edit, config,
-context, search and semantic indexes, and so on). A folder with the same name
+context, search and semantic search, and so on). A folder with the same name
 as a top-level file holds that module's submodules (`edit/`, `backup/`,
 `run_tool_call/`, `sandbox_spawn/`, `subc_translate/`, ...). The other folders:
 
 ```text
 agent_data/        Session undo and checkpoint data carried through engram's session door
-alias/             Git blob-id aliases and byte-exact manifest path identities
 bash_background/   Background, PTY and remote task registry, watchdog, pattern watches, persistence
 bash_db_hints/     Schema hints when a database CLI fails on an unknown table or column
 bash_permissions/  Permission scan of parsed bash commands
 bash_rewrite/      Rewrites simple bash commands into AFT tool calls
 bin/               Auxiliary binaries (hashline schema artifact generator)
-blob_store/        Content-addressed per-plane blob storage for index views
-callgraph_store/   Persisted SQLite callgraph: build, refresh, queries, dead-code projection
+callgraph_store/   Call-graph resolver: extraction, binding, dispatch, facts, query contract, dead-code projection
 cli/               Native `aft` subcommands (setup, index, warmup, profile, fix-config, backups, cache cleanup, sandbox launch)
 commands/          One handler per protocol command; `tool_call.rs` is the agent tool entry
 compress/          Bash output compressors, TOML filter engine, builtin filters, filter trust
+data_layer/        AFT's side of the index store: checkouts, runtime pools, incremental call graph, meaning fill, tool adapters
 db/                aft.db stores (backups, bash tasks and watches, call ledger, access grants, GitHub cache, ...)
 exec_remote/       Client for the daemon's remote execution capability (`runon`)
 executor/          Per-root actor scheduler, lanes, job classes, cancellation
-gc/                Mark-and-sweep for view blob stores
 gh_shim_relay/     Daemon-side relay for governed `gh` bot writes
 gh_shim_speech/    Launch-bound bot-write authority
 github_read/       `issue://` and `pr://` fetch, normalize, render, fallback cache
@@ -55,17 +54,12 @@ hashline/          Hashline edit engine: scan, snapshot, syntax, apply, transact
 imports/           Per-language import engines for `aft_import`
 inspect/           `aft_inspect` categories, scanners, Oxc liveness engine, tier-2 scheduler
 lsp/               Language-server client, registry, roots, diagnostics, child processes
-migration/         One-way import of legacy semantic snapshots into views
 page_collect/      Page and referenced-file snapshots for sealed HTML page bundles
 patch/             `apply_patch` parser, matcher, applier
-path_status/       Pending or failed path annotations for view generations
-pins/              Generation pins held while a view is assembled or read
-refresh/           Plane-worker refresh coordination for views
 search_b2/         `aft_search` query router, lane plans, token variants, readiness
 secret/            Secret vault seam and its consent adapter
 secret_proxy/      Command-private proxy that releases resolved secrets to one command
 subc/              Subc daemon edge: binds, trust, tool-provider role, scopes, code mode, consent, push, drain, health
-views/             Per-checkout view manifests and generation publication
 watcher/           Project file watcher
 watcher_backend/   Native watcher backends (FSEvents, inotify, Windows)
 ```
@@ -121,6 +115,8 @@ tests are `*.test.ts`.
 - **List truncation surface:** `crates/aft/src/list_surfaces/[surface].rs`, registered in `list_surfaces.rs`.
 - **Build breaker domain:** `crates/aft/src/build_breaker.rs`.
 - **Semantic embedding backend:** `crates/aft/src/semantic_index.rs`, `synapse_embed.rs`, and the backend config in `config.rs`.
+- **Index store format (a section, record or lifecycle rule):** `crates/aft-store/src/`. How AFT builds, refreshes or reads it: `crates/aft/src/data_layer/`; a tool's read path: `data_layer/tools/`.
+- **Call-graph resolution rule:** `crates/aft/src/callgraph_store/` (dispatch, bindings, facts); bump `EXTRACTOR_VERSION` in `data_layer/content.rs` when stored records change.
 - **Standing root keys:** `scoped_key.rs` and `db/standing_roots.rs`.
 - **Windows path normalization:** `crates/aft/src/windows_path.rs`.
 - **Bridge export:** `packages/aft-bridge/src/[module].ts`, re-exported from `src/index.ts`.

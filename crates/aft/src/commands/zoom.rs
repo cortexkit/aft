@@ -1846,17 +1846,14 @@ fn zoom_one_symbol_inner(
 /// counts as that first use and can start the build.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     use crate::feature_status::{observe_callgraph_query, IndexEffective};
+    // With the data layer on, its call graph is the one the call-graph
+    // commands answer from, so its readiness decides the field.
+    if let Some(field) = crate::data_layer::surfaces::zoom_callgraph_field(ctx) {
+        return field;
+    }
     // Timing hooks for the read-bound test. Unconfigured test contexts have no
     // cache root, so the hooks are skipped there instead of panicking.
-    #[cfg(test)]
-    if let Some(root) = ctx.canonical_cache_root_opt() {
-        crate::storage_retention::test_hook(&root, "cg-timing:zoom-observe-begin");
-    }
     let observation = observe_callgraph_query(ctx);
-    #[cfg(test)]
-    if let Some(root) = ctx.canonical_cache_root_opt() {
-        crate::storage_retention::test_hook(&root, "cg-timing:zoom-observe-return");
-    }
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",
@@ -4168,13 +4165,13 @@ def local():
 
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], true, "zoom should succeed: {:?}", json);
-        // No callgraph index is observed here: the file-local call lists
+        // No index-store checkout is bound here: the file-local call lists
         // below are still returned, alongside an explicit callgraph status.
         assert_eq!(json["callgraph"]["status"], "unavailable");
         assert_eq!(json["callgraph"]["code"], "callgraph_unavailable");
         assert_eq!(
             json["callgraph"]["index"],
-            serde_json::json!({"status": "unavailable", "reason": "runtime_not_observed"})
+            serde_json::json!({"status": "off", "reason": "not_bound"})
         );
 
         let calls_out = json["annotations"]["calls_out"]

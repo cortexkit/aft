@@ -3621,8 +3621,15 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(on).toContain("foreground");
     expect(on).toContain("wait: true");
     expect(on).toContain("auto-promote can remind you while you work");
-    // Demote background: true to the parallel-work-only case.
-    expect(on).toContain("other useful work to do while it runs");
+    // Demote background: true to the parallel-work-only case, where any work
+    // that doesn't need the command's result counts as parallel work.
+    expect(on).toContain(
+      "other work to do while it runs, and any work that doesn't need this command's result counts",
+    );
+    // A long command ends the turn only once everything left needs its result.
+    expect(on).toContain(
+      "first do the work that doesn't need this result, end the turn only when everything left needs it",
+    );
     // Name the exact anti-pattern this description previously caused.
     expect(on).toContain("never background a command and immediately bash_watch it");
     // Still forbid the bash_status polling loop.
@@ -3646,7 +3653,10 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(desc).toContain(
       "in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting",
     );
-    expect(desc).toContain("bash({background:true})");
+    expect(desc).toContain(
+      "first do the work that doesn't need the result, end the turn only when everything left needs it",
+    );
+    expect(desc).toContain("bash({wait:true})");
     expect(desc).toContain("Never loop bash_status");
   });
 

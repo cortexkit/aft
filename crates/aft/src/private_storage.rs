@@ -26,11 +26,11 @@ pub(crate) fn ancestor_dir_flags() -> libc::c_int {
 
 pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
-    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+    if let Some(access) = crate::cache_location::pin_cache_path(path)? {
         access.directory(true)?;
         return Ok(());
     }
-    crate::root_cache::refuse_new_durable_cache_entry(path)?;
+    crate::cache_location::refuse_new_durable_cache_entry(path)?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -42,12 +42,12 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
-    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+    if let Some(access) = crate::cache_location::pin_cache_path(path)? {
         let (parent, name) = access.parent()?;
         let child = parent.repair_create_dir(&name)?;
         return child.repair_check_boundary(&access.root, &[]);
     }
-    crate::root_cache::refuse_new_durable_cache_entry(path)?;
+    crate::cache_location::refuse_new_durable_cache_entry(path)?;
     #[allow(unused_mut)]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -81,7 +81,7 @@ pub(crate) fn executable_options() -> OpenOptions {
 }
 
 pub(crate) fn write_executable(path: &Path, contents: &[u8]) -> io::Result<()> {
-    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+    if let Some(access) = crate::cache_location::pin_cache_path(path)? {
         let (parent, name) = access.parent()?;
         let mut file = parent.repair_create_file(&name)?;
         #[cfg(unix)]
@@ -100,11 +100,11 @@ pub(crate) fn write_executable(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 pub fn create(path: impl AsRef<Path>) -> io::Result<File> {
-    if let Some(access) = crate::root_cache::pin_cache_path(path.as_ref())? {
+    if let Some(access) = crate::cache_location::pin_cache_path(path.as_ref())? {
         let (parent, name) = access.parent()?;
         return parent.repair_create_file(&name);
     }
-    crate::root_cache::refuse_new_durable_cache_entry(path.as_ref())?;
+    crate::cache_location::refuse_new_durable_cache_entry(path.as_ref())?;
     options().write(true).create(true).truncate(true).open(path)
 }
 
@@ -115,7 +115,7 @@ pub fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<(
 /// std::fs::copy copies source permissions too, which would expose snapshots of
 /// public files. Stream into an owner-only destination instead on Unix.
 pub(crate) fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
-    if let Some(access) = crate::root_cache::pin_cache_path(to.as_ref())? {
+    if let Some(access) = crate::cache_location::pin_cache_path(to.as_ref())? {
         let (parent, name) = access.parent()?;
         return io::copy(
             &mut File::open(from)?,
@@ -344,7 +344,7 @@ fn prepare_sqlite_file(
     let access = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY) {
         None
     } else {
-        crate::root_cache::pin_cache_path(path)
+        crate::cache_location::pin_cache_path(path)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
     };
     if let Some(access) = access {
@@ -375,13 +375,13 @@ fn prepare_sqlite_file(
         })();
         return result.map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
     }
-    crate::root_cache::check_cache_access(path)
+    crate::cache_location::check_cache_access(path)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     if flags.intersects(
         rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
     ) && !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY)
     {
-        crate::root_cache::refuse_durable_cache_write(path)
+        crate::cache_location::refuse_durable_cache_write(path)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     }
     #[cfg(unix)]

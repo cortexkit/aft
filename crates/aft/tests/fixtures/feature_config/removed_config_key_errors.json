@@ -9,8 +9,8 @@
         }
       },
       "errors": [
-        "removed_config_key:opencode.server_url; run aft doctor --fix",
-        "removed_config_key:opencode.server_password_env; run aft doctor --fix"
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:opencode.server_password_env; run npx @cortexkit/aft doctor --fix"
       ]
     },
     {
@@ -26,8 +26,8 @@
         }
       },
       "errors": [
-        "removed_config_key:harnesses.opencode.opencode.server_url; run aft doctor --fix",
-        "removed_config_key:harnesses.opencode.opencode.server_password_env; run aft doctor --fix"
+        "removed_config_key:harnesses.opencode.opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.opencode.opencode.server_password_env; run npx @cortexkit/aft doctor --fix"
       ]
     },
     {
@@ -44,6 +44,213 @@
               }
             }
           }
+        }
+      },
+      "errors": []
+    },
+    {
+      "name": "data-layer keys before the refusing release",
+      "release": "0.64.9",
+      "doc": {
+        "opencode": {
+          "server_url": "http://127.0.0.1:4096"
+        },
+        "views": {
+          "enabled": true,
+          "callgraph_copies": 2,
+          "idle_checkout_hours": 5
+        },
+        "worktree": {
+          "ram_overlay": false
+        },
+        "harnesses": {
+          "pi": {
+            "views": {
+              "enabled": false
+            },
+            "worktree": {
+              "ram_overlay": true
+            }
+          }
+        }
+      },
+      "errors": [
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix"
+      ]
+    },
+    {
+      "name": "data-layer keys from the refusing release",
+      "release": "0.65.0",
+      "doc": {
+        "opencode": {
+          "server_url": "http://127.0.0.1:4096"
+        },
+        "views": {
+          "enabled": true,
+          "callgraph_copies": 2,
+          "idle_checkout_hours": 5
+        },
+        "worktree": {
+          "ram_overlay": false
+        },
+        "harnesses": {
+          "pi": {
+            "views": {
+              "enabled": false
+            },
+            "worktree": {
+              "ram_overlay": true
+            }
+          }
+        }
+      },
+      "errors": [
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.callgraph_copies; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:worktree.ram_overlay; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.worktree.ram_overlay; run npx @cortexkit/aft doctor --fix"
+      ]
+    },
+    {
+      "name": "data-layer keys in a later major release",
+      "release": "1.0.0",
+      "doc": {
+        "opencode": {
+          "server_url": "http://127.0.0.1:4096"
+        },
+        "views": {
+          "enabled": true,
+          "callgraph_copies": 2,
+          "idle_checkout_hours": 5
+        },
+        "worktree": {
+          "ram_overlay": false
+        },
+        "harnesses": {
+          "pi": {
+            "views": {
+              "enabled": false
+            },
+            "worktree": {
+              "ram_overlay": true
+            }
+          }
+        }
+      },
+      "errors": [
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.callgraph_copies; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:worktree.ram_overlay; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.worktree.ram_overlay; run npx @cortexkit/aft doctor --fix"
+      ]
+    },
+    {
+      "name": "data-layer keys inside an unrelated block are not settings",
+      "release": "0.65.0",
+      "doc": {
+        "bash": {
+          "views": {
+            "enabled": true
+          }
+        },
+        "idle": {
+          "checkout_hours": 5
+        }
+      },
+      "errors": []
+    },
+    {
+      "name": "names retired in 0.62 or earlier",
+      "doc": {
+        "disabled_tools": [
+          "aft_read",
+          "aft_zoom",
+          "aft_read",
+          "aft_bash"
+        ],
+        "search_index": false,
+        "tool_surface": "minimal",
+        "opencode": {
+          "server_url": "http://127.0.0.1:4096"
+        },
+        "gh_shim": {
+          "enabled": false,
+          "binary_path": "/opt/aft/bin/aft"
+        },
+        "experimental": {
+          "lsp_ty": true,
+          "bash": {
+            "long_running_reminder_enabled": false
+          }
+        },
+        "idle": {
+          "lsp_ttl_minutes": 10
+        },
+        "bridge": {
+          "hang_threshold": 2
+        },
+        "harnesses": {
+          "pi": {
+            "sandbox": {
+              "enabled": true
+            },
+            "inspect": {
+              "max_drill_down_items": 20
+            }
+          }
+        }
+      },
+      "errors": [
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:tool_surface; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:search_index; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:gh_shim.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:experimental.bash; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:idle.lsp_ttl_minutes; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:aft_read; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:aft_bash; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.sandbox.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.inspect.max_drill_down_items; run npx @cortexkit/aft doctor --fix"
+      ]
+    },
+    {
+      "name": "current keys and the binary override are not retired names",
+      "doc": {
+        "disabled_tools": [
+          "read",
+          "aft_zoom"
+        ],
+        "indexes": {
+          "trigram": false
+        },
+        "gh_shim": {
+          "binary_path": "/opt/aft/bin/aft"
+        },
+        "github": {
+          "shim": false
+        },
+        "sandbox": {
+          "profile": {
+            "worker": "strict"
+          }
+        },
+        "bash": {
+          "enabled": false
+        },
+        "experimental": {
+          "lsp_ty": true
+        },
+        "bridge": {
+          "hang_threshold": 2
+        },
+        "views": {
+          "idle_checkout_hours": 5
         }
       },
       "errors": []

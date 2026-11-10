@@ -1,1 +1,0 @@
-- A busy project now refuses a new connection with the retryable `bind_busy` code (reason `reader`, `writer` or `configure`), so clients wait and retry instead of treating it as a failure.

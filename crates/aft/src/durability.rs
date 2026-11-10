@@ -23,11 +23,18 @@ thread_local! {
 /// device after every file. The caller must finish the group before unlinking
 /// any source or acknowledging a durable backup. Dropping an unfinished group
 /// abandons its device barriers; it is only safe when no source was removed.
+///
+/// A group opened while another is open on the same thread joins it: its syncs
+/// wait for the enclosing group's commit, and its own `finish` flushes
+/// nothing. An `aft_delete` snapshots every entry inside one group, and each
+/// snapshot opens a group of its own for its metadata; joining keeps that to
+/// one device flush before the first unlink, and none when the delete gives
+/// up and drops its group.
 pub(crate) struct SyncGroup {
+    /// Whether this group opened the thread's pending set and so flushes it,
+    /// rather than joining an enclosing group's.
     #[cfg(unix)]
-    previous: Option<PendingSyncs>,
-    #[cfg(unix)]
-    active: bool,
+    owner: bool,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -35,31 +42,34 @@ impl SyncGroup {
     pub(crate) fn new() -> Self {
         Self {
             #[cfg(unix)]
-            previous: SYNC_GROUP.with(|group| group.replace(Some(PendingSyncs::default()))),
-            #[cfg(unix)]
-            active: true,
+            owner: SYNC_GROUP.with(|group| {
+                let mut group = group.borrow_mut();
+                if group.is_some() {
+                    return false;
+                }
+                *group = Some(PendingSyncs::default());
+                true
+            }),
             _thread: std::marker::PhantomData,
         }
     }
 
     #[cfg(unix)]
     fn detach(&mut self) -> PendingSyncs {
-        self.active = false;
-        SYNC_GROUP.with(|group| {
-            group
-                .replace(self.previous.take())
-                .expect("active sync group")
-        })
+        self.owner = false;
+        SYNC_GROUP.with(|group| group.take().expect("active sync group"))
     }
 
     pub(crate) fn finish(mut self) -> io::Result<()> {
         #[cfg(unix)]
-        for (_, (file, path)) in self.detach().devices {
-            #[cfg(test)]
-            if FAIL_GROUP_SYNC.with(|fail| fail.replace(false)) {
-                return Err(io::Error::other("injected backup group sync failure"));
+        if self.owner {
+            for (_, (file, path)) in self.detach().devices {
+                #[cfg(test)]
+                if FAIL_GROUP_SYNC.with(|fail| fail.replace(false)) {
+                    return Err(io::Error::other("injected backup group sync failure"));
+                }
+                full_sync(&file, &path)?;
             }
-            full_sync(&file, &path)?;
         }
         #[cfg(not(unix))]
         let _ = &mut self;
@@ -70,7 +80,7 @@ impl SyncGroup {
 impl Drop for SyncGroup {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if self.active {
+        if self.owner {
             self.detach();
         }
     }

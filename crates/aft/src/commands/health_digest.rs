@@ -51,7 +51,6 @@ pub struct DigestCurrentValues {
     pub complexity_over_threshold: Option<TicketedCurrent<u64>>,
     pub todos: Option<TicketedCurrent<u64>>,
     pub watcher_events: Option<TicketedCurrent<u64>>,
-    pub views: Option<TicketedCurrent<crate::context::ViewHealthSnapshot>>,
 }
 
 /// Render only independently verified current values. The caller owns source
@@ -77,7 +76,6 @@ pub fn render_current_values(values: &DigestCurrentValues) -> Value {
         "watcher_events",
         values.watcher_events.as_ref(),
     );
-    insert_ticketed(&mut fields, "views", values.views.as_ref());
     Value::Object(fields)
 }
 
@@ -101,7 +99,7 @@ fn insert_ticketed<T: Serialize>(
 /// Handle the management operation without starting analyzers, waiting for
 /// quiescence, or constructing inspection work. Existing caches do not expose
 /// the required freshness tickets yet, so every category is omitted here.
-pub fn handle_health_digest(req: &RawRequest, ctx: &AppContext) -> Response {
+pub fn handle_health_digest(req: &RawRequest, _ctx: &AppContext) -> Response {
     // `project_root` is the management-wire spelling; `root` remains accepted
     // for the standalone handler's original contract.
     let _conceptual_inputs = (
@@ -111,33 +109,10 @@ pub fn handle_health_digest(req: &RawRequest, ctx: &AppContext) -> Response {
         req.params.get("since"),
     );
 
-    let views = ticket_current_view(
-        ctx.view_health_snapshot(),
-        ctx.view_runtime_snapshot().map(|view| view.scope),
-    );
     Response::success(
         &req.id,
-        render_current_values(&DigestCurrentValues {
-            views,
-            ..DigestCurrentValues::default()
-        }),
+        render_current_values(&DigestCurrentValues::default()),
     )
-}
-
-fn ticket_current_view(
-    value: Option<crate::context::ViewHealthSnapshot>,
-    identity: Option<String>,
-) -> Option<TicketedCurrent<crate::context::ViewHealthSnapshot>> {
-    let value = value.filter(|value| value.generation > 0)?;
-    let identity = identity.filter(|identity| !identity.is_empty())?;
-    let generation = value.generation;
-    Some(TicketedCurrent::new(
-        value,
-        FreshnessTicket::ArtifactGeneration {
-            identity,
-            generation,
-        },
-    ))
 }
 
 /// Preserve the operation's structured failure when its requested root has no
@@ -158,8 +133,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        handle_health_digest, render_current_values, ticket_current_view, DigestCurrentValues,
-        FreshnessTicket, TicketedCurrent, HEALTH_DIGEST_OPERATION,
+        handle_health_digest, render_current_values, DigestCurrentValues, FreshnessTicket,
+        TicketedCurrent, HEALTH_DIGEST_OPERATION,
     };
     use crate::config::Config;
     use crate::context::AppContext;
@@ -172,27 +147,6 @@ mod tests {
             "command": HEALTH_DIGEST_OPERATION,
         }))
         .expect("digest request is valid")
-    }
-
-    #[test]
-    fn missing_view_identity_omits_the_ticket_instead_of_substituting_an_empty_name() {
-        let snapshot = crate::context::ViewHealthSnapshot {
-            generation: 7,
-            pinned: true,
-            pending_paths: 0,
-            failed_paths: 0,
-            skipped_paths: Default::default(),
-            skipped_path_sample: Vec::new(),
-            cold_builds: Default::default(),
-            publication_failure: None,
-            callgraph_readiness_deferred: None,
-        };
-        assert_eq!(ticket_current_view(Some(snapshot.clone()), None), None);
-        assert_eq!(
-            ticket_current_view(Some(snapshot.clone()), Some(String::new())),
-            None
-        );
-        assert!(ticket_current_view(Some(snapshot), Some("view-scope".to_string())).is_some());
     }
 
     #[test]
@@ -275,7 +229,6 @@ mod tests {
         let ctx = AppContext::new(Box::new(StubProvider), config);
         let request = request();
         let server_count_before = ctx.lsp().server_count();
-        let cold_build_count_before = ctx.callgraph_cold_build_spawn_count_for_test();
         let started = Instant::now();
 
         let response = handle_health_digest(&request, &ctx);
@@ -285,10 +238,6 @@ mod tests {
             "a passive digest must not wait for quiescence"
         );
         assert_eq!(ctx.lsp().server_count(), server_count_before);
-        assert_eq!(
-            ctx.callgraph_cold_build_spawn_count_for_test(),
-            cold_build_count_before
-        );
         assert_eq!(response.data, json!({}));
         assert!(response.data.get("diagnostics").is_none());
     }

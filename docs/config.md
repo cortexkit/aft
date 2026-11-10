@@ -226,46 +226,13 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // off or building index instead of disappearing.
   "indexes": {
     // Trigram index for indexed grep/glob and the lexical aft_search lane.
+    // With false, no text index is built, and grep and glob walk the folder.
     "trigram": true,
     // Semantic index for the semantic aft_search lane. The local default backend
     // may download an ONNX runtime and model and use CPU.
     "semantic": true,
     // Persisted call-graph store for aft_callgraph and enrichment.
     "callgraph": true
-  },
-
-  // Borrow-only checkout reconciliation and RAM overlay. Default: true.
-  // A linked worktree, or a clone or copy of a repository whose live checkout
-  // owns the shared indexes, borrows that checkout's search index read-only.
-  // With this on, the borrowed index is compared with this checkout's own files
-  // before search reports ready, and this checkout's file-watcher events go to
-  // private in-RAM search and semantic deltas (and invalidate the symbol cache)
-  // so search sees local edits. Semantic embeddings are created only for files
-  // changed after bind; corpus catch-up remains disabled. RAM cost scales with
-  // the number of files that differ. The shared indexes are never written, and
-  // the callgraph stays frozen. Setting it false serves the borrowed index as
-  // it is, so glob and search can list the live checkout's files instead of
-  // this one's; it is kept only as an escape hatch. User and project tiers may
-  // both set this.
-  "worktree": {
-    "ram_overlay": true
-  },
-
-  // Content-addressed index views. When enabled, semantic and callgraph artifacts
-  // are assembled from reusable per-file blobs behind an atomic manifest.
-  // User and project tiers may both set these; each tier sets only the keys it
-  // names.
-  "views": {
-    // Default: false.
-    "enabled": false,
-    // How many checkouts of one repository keep their own call graph, besides
-    // the main checkout. Another checkout reads the main checkout's graph, and
-    // its call-graph answers say which of its files differ. 0 makes every other
-    // checkout read the main checkout's graph. Default: 4.
-    "callgraph_copies": 4,
-    // Hours without use after which a checkout's view can be evicted.
-    // Default: 168 (7 days), minimum 1.
-    "idle_checkout_hours": 168
   },
 
   // When project_root is exactly $HOME, every index is force-disabled because the
@@ -308,7 +275,8 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
                                          // With the default max 64 and no successful latency sample, a
                                          // never-answering backend reaches the one-item verdict within 11
                                          // timeout_ms floors (275 s), plus scheduler overhead.
-    "max_files": 20000,                 // max files indexed (default 20000); raise for remote backends
+    "max_files": 20000,                 // most files embedded (default 20000): a limit on embedding
+                                         // cost; files past it are not embedded. Raise for remote backends
     // "max_input_tokens": 512          // advanced: per-row token budget for remote backends; widens the
                                         // symbol-body slice each chunk embeds (default keeps the 512-safe
                                         // caps; fastembed ignores it). Changing it rebuilds the index.
@@ -477,7 +445,6 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // it but cannot lower it, so a repository cannot silently reduce another
     // consumer's diagnostic completeness.
     "diagnostics_timeout_ms": 120000,
-    "tier2_idle_minutes": 5,      // debounce before idle-triggered Tier 2 background scans
     // Computation switches, all true by default. Projects can turn categories
     // off, never restore a category the user turned off. Applies live.
     "categories": {
@@ -493,13 +460,18 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     }
   },
 
-  // Idle reclamation. User and project tiers. Values outside the documented
-  // ranges are clamped with a warning; non-integers are dropped with a warning.
-  // Reclaimed indexes rebuild on the next request.
+  // Idle reclamation. User and project tiers, each setting only the keys it
+  // names. Values outside the documented ranges are clamped with a warning;
+  // non-integers are dropped with a warning. Reclaimed indexes rebuild on the
+  // next request.
   "idle": {
     // Minutes without tool traffic before an unbound root's artifacts are
     // evicted. Default 30; clamped to 5..=30.
-    "root_ttl_minutes": 30
+    "root_ttl_minutes": 30,
+    // Hours without use after which a checkout counts as idle and drops its
+    // in-memory index state; its state on disk stays. Default 168 (7 days);
+    // clamped to 1..=8760. Replaces views.idle_checkout_hours. Applies live.
+    "checkout_hours": 168
   },
 
   // Automatic undo snapshots. Existing-file mutations larger than 64 MiB and
@@ -644,7 +616,7 @@ The user-only `github` block controls the complete GitHub surface. `shim` defaul
 
 `github.write: true` implies read: with `github.read` absent or `false`, read is still enabled and a warning names both keys. This prevents edits from addressing a comment ordinal the agent cannot inspect. Untrusted MCP and forced-restrict binds treat every GitHub integration as disabled regardless of user configuration.
 
-AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to governed child processes. The shim routes eligible commands through the existing manifest, identity, classification, and refusal path before calling the first real `gh` later on `PATH`; the operator's shell startup files and terminal `PATH` are never changed. The advanced `gh_shim.binary_path` setting still selects an absolute development or deployed AFT image; a `gh_shim` block containing only `binary_path` loads normally. The retired `gh_read` block and the `gh_shim.enabled` leaf are rejected immediately with `removed_config_key:gh_read:use:github.read` and `removed_config_key:gh_shim:use:github.shim`; the whole configuration is then not used until `npx @cortexkit/aft doctor --fix` rewrites them.
+AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to governed child processes. The shim routes eligible commands through the existing manifest, identity, classification, and refusal path before calling the first real `gh` later on `PATH`; the operator's shell startup files and terminal `PATH` are never changed. The advanced `gh_shim.binary_path` setting still selects an absolute development or deployed AFT image; a `gh_shim` block containing only `binary_path` loads normally. The retired `gh_read` block and the `gh_shim.enabled` leaf are refused with `removed_config_key:gh_read; run npx @cortexkit/aft doctor --fix` and `removed_config_key:gh_shim.enabled; run npx @cortexkit/aft doctor --fix`; the whole configuration is then not used until `npx @cortexkit/aft doctor --fix` rewrites them to `github.read` and `github.shim`.
 
 When reads are enabled, `read`, `aft_outline`, and `aft_zoom` accept `issue://NUMBER` and `pr://NUMBER`, including `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`. When writes are enabled, `write` on a base resource publishes a conversation comment after the host's edit-class permission prompt displays the exact body. `edit` accepts only an `edits[]` find/replace request on `issue://.../comments/K` or `pr://.../comments/K`; it fetches the live body, applies the normal matcher, and then attempts an id-addressed edit through the governed shim. Review-thread comments are not supported. GitHub comment mutations do not create aft_safety snapshots and cannot be undone through aft_safety.
 
@@ -687,7 +659,7 @@ After a Location reload or host restart, AFT restores subscriptions in the backg
 
 The AFT sidebar and the OpenCode 2 prompt footer read their display settings from the `aft` entry of OpenCode's shared `tui-preferences.jsonc`, not from `aft.jsonc`. The file is `$OPENCODE_CONFIG_DIR/tui-preferences.jsonc` when that variable is set, otherwise `$XDG_CONFIG_HOME/opencode/tui-preferences.jsonc` (default `~/.config/opencode/tui-preferences.jsonc`); `OPENCODE_TUI_PREFERENCES_FILE` names a different file. Edits take effect while OpenCode is running, without a restart.
 
-`footer` (default `true`) controls the AFT health line in the OpenCode 2 prompt footer (`AFT E0 W0 | D0 U0 C1 | T0`). Set it to `false` to remove the line; the sidebar and `/aft-status` are unaffected. A value other than `true` or `false` is ignored and the line stays on. OpenCode 1 has no AFT footer line, so the key has no effect there.
+`footer` (default `true`) controls the AFT health line in the OpenCode 2 prompt footer (`AFT E0 W0 | T0`). Set it to `false` to remove the line; the sidebar and `/aft-status` are unaffected. A value other than `true` or `false` is ignored and the line stays on. OpenCode 1 has no AFT footer line, so the key has no effect there.
 
 ```jsonc
 {
@@ -706,6 +678,10 @@ Whole-line `runon` additionally requires `bash.runon_enabled: true` in the user 
 `remote_exec.enabled: true` in your user config offers bash's `runon` argument to OpenCode and Pi sessions running in subc mode on macOS or Linux: a call with `runon: "linux"` runs its whole command line on the remote Linux build server instead of this machine (see [bash](tools.md#bash)). Standalone NDJSON sessions never register the parameter, even with this setting enabled. Remote-build guidance is shown only alongside an available parameter; default catalogs show neither. Provider availability is checked at call time, and a missing provider is refused by name without a local run. Nothing runs remotely unless a call asks for it. `remote_exec.default_demand` names the runner demand a `runon` call without specifics runs under; it never makes a call remote by itself.
 
 Both keys are honored only in user config. A project config may set `remote_exec.enabled: false` to turn remote runs off for that project, and then a `runon` call there is refused with `remote runs are off for this project`; a project value of `true`, or any `default_demand`, is ignored with a warning. Whether `runon` is offered is decided when the session starts, so a change takes effect after a restart. Broca workers take the same two fields from their plan's `remote_exec` item instead of this config; an older plan's `remote_exec.commands` list is accepted and ignored.
+
+## Saved folder access
+
+When an agent's tool reaches a folder outside what its session may use, AFT asks you through a folder-access card in the CortexKit apps. An answer you save there is kept for that agent or worker until its session ends. Under the daemon, the apps' Permissions pages list these saved answers (one row per folder per agent or worker) and can revoke them. A revoke takes effect at once: the next tool call asks again, and shell commands still running with that folder in their sandbox are stopped and end as `killed (folder access revoked)`. Commands running on a build server (`runon`) work on a copy of the checkout outside this machine's sandbox and are not stopped. Grants saved before AFT recorded grant times show the time of the upgrade instead.
 
 ## Native command sandbox
 
@@ -773,7 +749,7 @@ Windows has no OS sandbox backend. `relaxed` runs with full user rights and repo
 
 ### Retired `sandbox.enabled`
 
-Loading translates this retired key in memory, and `doctor --fix` uses the same translation while preserving JSONC comments and unrelated keys. User config can be automatically migrated with a backup; shared project config is not rewritten automatically.
+From v0.64 a config file that still sets this key is refused with `removed_config_key:sandbox.enabled; run npx @cortexkit/aft doctor --fix`. `doctor --fix` rewrites it as below while preserving JSONC comments and unrelated keys. AFT rewrites the user file the same way, with a backup, when it loads it; shared project config is not rewritten automatically.
 
 - `true` becomes `{ "worker": "strict", "head": "strict" }`.
 - `false` (or an absent key) uses the new defaults, `{ "worker": "relaxed", "head": "off" }`.
@@ -783,30 +759,56 @@ Heads previously ran without an OS sandbox unless `sandbox.enabled: true` was se
 
 ## Config schema migration
 
+### One index store per repository (v0.64)
+
+v0.64 keeps one index store per repository, shared by all its checkouts, and
+retires the settings that chose between the old index routes:
+
+| Key | What happens |
+| --- | --- |
+| `views.idle_checkout_hours` | Renamed to `idle.checkout_hours` (same default, 168, and range, 1..=8760). Translated like the retired keys below: the user file is rewritten on load, a project file gets a notice. |
+| `views.enabled` | Removed: AFT always uses the one store. |
+| `views.callgraph_copies` | Removed: no checkout borrows another checkout's call graph. |
+| `worktree.ram_overlay` | Removed: every worktree has its own index state, so there is no borrowed index to patch in memory. |
+
+The removed keys no longer do anything. AFT ignores them and shows a notice
+naming the file once, for the user file and for a project file alike; it never
+rewrites a file on its own for them. `npx @cortexkit/aft doctor --fix` deletes
+them. From v0.65.0 a config file that still sets any of these four keys is
+refused with `removed_config_key:<key>; run aft doctor --fix`.
+
+`indexes.trigram`, `indexes.semantic` and `indexes.callgraph` stay. With
+`indexes.trigram: false` no text index is built, and grep and glob walk the
+folder. `semantic.max_files` stays as a limit on embedding cost.
+
 ### Feature-based configuration (v0.58)
 
 v0.58 replaces surface levels with one rule — a tool is registered unless it is
 in `disabled_tools` — and makes the background indexes first-class
 (`indexes.trigram`, `indexes.semantic`, `indexes.callgraph`, all default on).
-Retired keys are never refused. On every load AFT translates them into their
-current equivalents, and those then follow the usual user/project rules:
+From v0.64 AFT no longer reads the retired keys in the table below except
+`bridge.hang_threshold`: they were retired in v0.62 or earlier, and a config
+file that still sets one, in its base or in a `harnesses` block, is refused with
+`removed_config_key:<key>; run npx @cortexkit/aft doctor --fix` (for an
+`aft_`-prefixed name in `disabled_tools`, `<key>` is that name, for example
+`aft_read`). `npx @cortexkit/aft doctor --fix` rewrites each one to its
+current equivalent:
 
 - **User file** (`~/.config/cortexkit/aft.jsonc`): AFT rewrites the file to the
   current keys the first time it reads it, with the same comment-preserving
   migration `npx @cortexkit/aft doctor --fix` performs. The previous text is
   kept beside it as `aft.jsonc.bak-<unix seconds>`, and one notice says the
-  file was updated. A read-only file, or one AFT cannot write, is left alone:
-  the keys are translated in memory and the notice says why the file was not
-  updated.
+  file was updated. A read-only file, or one AFT cannot write, is left alone
+  and refused.
 - **Project file** (`<project>/.cortexkit/aft.jsonc`, including its
   `harnesses` blocks): it is shared through the repository, so AFT never
-  writes it. The keys are translated in memory with the same limits a project
-  config has for the current key (for example, a project's `gh_read` becomes
-  `github.read`, which a project cannot set, so it is ignored), and one notice
-  names the file and its retired keys. Run `npx @cortexkit/aft doctor --fix`
-  in the project to update the file.
+  writes it, and it is refused until you run `npx @cortexkit/aft doctor --fix`
+  in the project.
 
-| Retired input | Replacement |
+`bridge.hang_threshold`, retired in v0.63, is still read: AFT drops it with a
+notice, and `doctor --fix` deletes it.
+
+| Retired input | What `doctor --fix` writes |
 | --- | --- |
 | `tool_surface`, `hoist_builtin_tools`, `enabled` | `disabled_tools` |
 | `search_index`, `experimental_search_index` | `indexes.trigram` |
@@ -817,9 +819,10 @@ current equivalents, and those then follow the usual user/project rules:
 | `idle.lsp_ttl_minutes` | `lsp.idle_minutes` |
 | `inspect.tier2_soft_deadline_ms`, `inspect.max_drill_down_items` | removed (they had no effect) |
 | `bridge.hang_threshold` | removed (no effect: see [Bridge request timeouts](#bridge-request-timeouts)) |
+| `inspect.tier2_idle_minutes` | removed (no effect: whole-repository analyses run only when `aft_inspect` is called) |
 | `aft_read`, `aft_write`, `aft_edit`, `aft_apply_patch`, `aft_grep`, `aft_glob`, `aft_bash` in `disabled_tools` | `read`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `bash` |
 
-Translation rules: an explicit `tool_surface` in the user base is a complete
+Rewrite rules: an explicit `tool_surface` in the user base is a complete
 registration choice (`"all"` → `[]`, `"recommended"` → `["aft_callgraph",
 "aft_delete", "aft_move"]`, `"minimal"` → everything except `aft_outline`,
 `aft_zoom` and `aft_safety`); without one, the default `["aft_move",
@@ -878,10 +881,18 @@ The original file is rewritten in place (both `.jsonc` and `.json` candidates ar
 JSONC comments are preserved. Both user-level and project-level configs are migrated
 independently. The migration is idempotent — running again is a no-op.
 
-**v0.27.2** further graduated the bash flags out of `experimental`. A config still using
-`experimental.bash.{rewrite,compress,background}` is read transparently as a fallback, but the
-canonical shape is the top-level `bash` block shown above. `experimental` now holds only
-`lsp_ty`.
+**v0.27.2** further graduated the bash flags out of `experimental`. The canonical shape is the
+top-level `bash` block shown above, and `experimental` now holds only `lsp_ty`.
+
+From v0.64 a config that still sets one of the flat `experimental_*` keys or an
+`experimental.bash` block is refused like the keys in
+[Feature-based configuration](#feature-based-configuration-v058).
+`npx @cortexkit/aft doctor --fix` moves them to `experimental.lsp_ty`,
+`indexes` and top-level `bash`. A block that sets any of `rewrite`, `compress`
+or `background` becomes a `bash` block with the flags it left out set to
+`false`, as the old block treated them; a block with only the
+`long_running_reminder_*` settings moves them to `bash` and leaves the flags at
+their defaults.
 
 ## Language servers (LSP)
 
@@ -906,7 +917,7 @@ until reconnect; trusted user edits may change the user budget in either directi
 to `true`. A false category is not scanned, built or refreshed, for scoped or
 unscoped inspections; it emits only e.g. `dead code: off (inspect.categories.dead_code)`.
 It cannot make the header PARTIAL and does not show a cached findings count.
-Status bars use **`○` for off** (e.g. `D○`), distinct from `?` for unknown and
+Status bars use **`○` for off** (e.g. `T○`), distinct from `?` for unknown and
 `0` for verified clean. Metrics remains internal and always computed for scoped
 file counts; it is not a configurable or rendered category. Project config can
 turn categories off, but cannot turn on a category the user turned off. Category
@@ -916,13 +927,11 @@ changes apply live; work already admitted retains its pinned configuration.
 `idle.lsp_ttl_minutes` is replaced by `lsp.idle_minutes`.
 `inspect.tier2_soft_deadline_ms` and `inspect.max_drill_down_items` were inert and
 are removed (`inspect.tier2_pass_timeout_ms` and `aft_inspect.topK` are what they
-used to approximate). These old keys are retired like the ones in
+used to approximate). These old keys are refused like the ones in
 [Feature-based configuration](#feature-based-configuration-v058), including inside
-harness blocks: loading moves the old idle value to `lsp.idle_minutes`, clamped
-to the new range (an existing canonical value wins, and a project file may still
-only shorten the window), and drops the two inert inspect keys. The user file is
-rewritten that way automatically; `npx @cortexkit/aft doctor --fix` rewrites a
-project file.
+harness blocks. `npx @cortexkit/aft doctor --fix`, and the automatic rewrite of
+the user file, move the old idle value to `lsp.idle_minutes`, clamped to the new
+range (an existing canonical value wins), and drop the two inert inspect keys.
 
 AFT runs language servers in-process for post-edit diagnostics and on-demand `lsp_diagnostics`
 calls. Servers are spawned lazily — only when a file matching their extensions is touched, and
@@ -1082,10 +1091,9 @@ tool (`read`, `outline`, `zoom`, `grep`, `glob`, `search`, `callgraph`,
 `inspect`) cut off by that restart is retried once, unless it was cancelled.
 
 `bridge.hang_threshold` used to count timeouts toward that restart and no longer
-does anything. It is retired like the keys in
-[Feature-based configuration](#feature-based-configuration-v058): loading drops
-it with a one-line notice, the user file is rewritten automatically, and
-`npx @cortexkit/aft doctor --fix` removes it from a project file.
+does anything. It is retired: loading drops it with a one-line notice, the
+user file is rewritten automatically, and `npx @cortexkit/aft doctor --fix`
+removes it from a project file.
 
 ## Durable logs and performance ticks
 
@@ -1117,7 +1125,8 @@ features guard against unbounded work to keep the bridge responsive:
 
 - **Call-graph ops** (`callers`, `trace_to`, `trace_data`, `impact`) use the persisted store and
   are not capped by the removed legacy in-memory reverse-index limit.
-- **Semantic indexing** is capped at `semantic.max_files` source files (default 20,000). Raise it
+- **Semantic indexing** embeds at most `semantic.max_files` source files (default 20,000), a
+  limit on embedding cost and time; files past it are not embedded. Raise it
   when using a remote backend that embeds server-side, or lower it on memory-constrained machines.
 - **`grep`, `glob`, `read`, `edit`, and other tools** work at any size.
 

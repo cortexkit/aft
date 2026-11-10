@@ -1,1 +1,0 @@
-- Settling a tool call no longer reads and parses every stored late result of its owner, so a large call ledger no longer causes multi-core CPU bursts.

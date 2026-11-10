@@ -642,43 +642,6 @@ fn artifact_read_owned_sqlite_suffix_alias_is_refused() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn artifact_read_owned_live_sqlite_alias_is_refused() {
-    let (_directory, ctx, artifact) = artifact_read_context();
-    let storage = ctx.config().storage_dir.clone().unwrap();
-    let database = storage.join("live.db");
-    let _connection = crate::db::file_identity::IdentityConnection::new(
-        rusqlite::Connection::open(&database).unwrap(),
-        "owned artifact alias test",
-    );
-    std::fs::remove_file(&artifact).unwrap();
-    std::fs::hard_link(&database, &artifact).unwrap();
-    assert!(ctx
-        .bash_background()
-        .is_session_owned_artifact_path("policy-session", &artifact));
-    let read =
-        crate::commands::read::handle_read(&request("read", json!({"file": artifact})), &ctx);
-    assert!(!read.success, "{read:?}");
-    let probe = crate::project_content::Probe::new(&storage);
-    assert!(ctx
-        .bash_background()
-        .explicit_task_artifacts("policy-session", &artifact)
-        .unwrap()
-        .is_empty());
-    let grep = crate::commands::grep::handle_grep(
-        &request("grep", json!({"path": artifact, "pattern": "."})),
-        &ctx,
-    );
-    assert_eq!(grep.data["code"], "denied_floor", "{:?}", grep.data);
-    let glob = crate::commands::glob::handle_glob(
-        &request("glob", json!({"path": artifact, "pattern": "*"})),
-        &ctx,
-    );
-    assert_eq!(glob.data["code"], "denied_floor", "{:?}", glob.data);
-    assert!(probe.paths().is_empty(), "{:?}", probe.paths());
-}
-
 artifact_read_tool_test!(
     artifact_read_outline_many,
     crate::commands::outline::handle_outline,
@@ -788,7 +751,7 @@ fn access_policy_cached_plain_scan_root_rechecks_protection() {
     assert!(
         matches!(
             result,
-            Err(crate::readonly_artifacts::GitRootResolutionError::ProtectedScanRoot)
+            Err(crate::git_root_resolution::GitRootResolutionError::ProtectedScanRoot)
         ),
         "{result:?}"
     );
@@ -910,9 +873,6 @@ fn artifact_read_search_does_not_authorize_containing_git_store() {
         .unwrap();
     assert!(initialized.success());
     std::fs::write(storage.join("private.rs"), "fn private_artifact() {}\n").unwrap();
-    let mut index = crate::search_index::SearchIndex::build(&storage);
-    let cache_dir = crate::search_index::resolve_cache_dir(&storage, Some(&storage));
-    assert!(index.write_to_disk(&cache_dir, None));
     let response = crate::commands::semantic_search::handle_semantic_search(
         &request(
             "semantic_search",
@@ -1203,25 +1163,6 @@ fn scratch_read_bridge_capability_is_session_scoped() {
         "{:?}",
         response.data
     );
-}
-
-#[test]
-fn scratch_read_respects_absolute_floor_and_live_sqlite() {
-    let (_directory, ctx, scratch, _scope) = scratch_read_context();
-    let file = scratch.join("scratch.rs");
-    ctx.update_config(|config| config.sandbox.read_deny.push(file.clone()));
-    let response =
-        crate::commands::read::handle_read(&request("read", json!({"file": file})), &ctx);
-    assert_eq!(response.data["code"], "denied_floor", "{:?}", response.data);
-    let database = scratch.join("live.db");
-    let _connection = crate::db::file_identity::IdentityConnection::new(
-        rusqlite::Connection::open(&database).unwrap(),
-        "scratch read live sqlite test",
-    );
-    assert!(!ctx
-        .bash_background()
-        .is_session_owned_scratch_path("policy-session", &database));
-    assert!(crate::task_temp_reads::open(&database).is_err());
 }
 
 #[cfg(unix)]

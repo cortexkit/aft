@@ -31,7 +31,7 @@ pub(super) enum UnboundRetention {
     ArtifactEvictionFailed,
 }
 
-const UNBOUND_RETENTION_KINDS: usize = 14;
+const UNBOUND_RETENTION_KINDS: usize = 13;
 
 const UNBOUND_RETENTION_LABELS: [&str; UNBOUND_RETENTION_KINDS] = [
     "bash_waits",
@@ -45,7 +45,6 @@ const UNBOUND_RETENTION_LABELS: [&str; UNBOUND_RETENTION_KINDS] = [
     "inspect_tier2",
     "bash_running",
     "pending_reconciliation",
-    "search_delta_unpersisted",
     "artifact_eviction_failed",
     "lock_contended",
 ];
@@ -64,9 +63,8 @@ impl UnboundRetention {
             Self::Artifact(ArtifactEvictionBlocker::InspectTier2) => 8,
             Self::Artifact(ArtifactEvictionBlocker::BashRunning) => 9,
             Self::Artifact(ArtifactEvictionBlocker::PendingReconciliation) => 10,
-            Self::Artifact(ArtifactEvictionBlocker::SearchDeltaUnpersisted) => 11,
-            Self::ArtifactEvictionFailed => 12,
-            Self::Artifact(ArtifactEvictionBlocker::LockContended) => 13,
+            Self::ArtifactEvictionFailed => 11,
+            Self::Artifact(ArtifactEvictionBlocker::LockContended) => 12,
         }
     }
 
@@ -559,6 +557,7 @@ struct FrameOperation {
 
 pub(super) struct DispatchPathMetrics {
     pub(super) watch_delivery: Arc<super::watch_delivery::WatchDelivery>,
+    pub(super) completion_delivery: super::push::CompletionDelivery,
     unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
@@ -634,6 +633,7 @@ impl DispatchPathMetrics {
     pub(super) fn new() -> Self {
         Self {
             watch_delivery: Arc::default(),
+            completion_delivery: Default::default(),
             unanswered_tools: StdMutex::new(HashMap::new()),
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
@@ -1434,6 +1434,8 @@ impl DispatchPathMetrics {
             .map(|bind| duration_millis_u64(now.saturating_duration_since(bind.started_at)))
             .max();
         let last_tick_age_ms = duration_millis_u64(self.frame_loop_progress_age());
+        let mut reliable_push = self.watch_delivery.health();
+        reliable_push["completions"] = self.completion_delivery.health();
         json!({
             "frame_loop": {
                 "last_tick_age_ms": last_tick_age_ms,
@@ -1450,7 +1452,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
-            "reliable_push": self.watch_delivery.health(),
+            "reliable_push": reliable_push,
             "tool_call_presets": self.tool_call_preset_snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
@@ -1459,7 +1461,6 @@ impl DispatchPathMetrics {
                 "bash_poll_touch": self.bash_poll_touch_queued.load(Ordering::Relaxed),
             },
             "deferred_bash_waits_in_flight": self.deferred_bash_waits_in_flight.load(Ordering::Relaxed),
-            "off_lane_jobs": crate::executor::view_publication::health_snapshot(),
             "budget_deferrals": {
                 "reliable_push": self.reliable_push_budget_deferrals.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_budget_deferrals.load(Ordering::Relaxed),
@@ -1858,7 +1859,9 @@ const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL
 const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
 const HEALTH_RETENTION_COUNT_MAX_AGE_MS: u64 = 30_000;
-const HEALTH_ALLOCATOR_MAX_AGE_MS: u64 = 30_000;
+/// The rollup reuses its allocator observation for at least this long, and
+/// longer when the walk that produced it was expensive.
+const HEALTH_ALLOCATOR_MIN_REUSE_MS: u64 = 30_000;
 /// How long the health rollup carries the full memory census forward while
 /// no `memory.census` read asked for a new one. Measuring it renders an
 /// uncapped row for every actor root, and only `memory.census` reads it; the
@@ -1950,50 +1953,6 @@ fn compact_write_ledger_root_ids(metrics: &mut serde_json::Map<String, Value>) {
     }
 }
 
-fn retention_report_totals(
-    reports: &std::collections::BTreeMap<String, crate::storage_retention::SweepReport>,
-) -> Value {
-    let mut totals = serde_json::Map::from_iter([("reports".into(), json!(reports.len()))]);
-    let mut trash = crate::storage_retention::TrashReport {
-        at_ms: crate::pins::now_ms(),
-        ..Default::default()
-    };
-    for report in reports.values() {
-        let census = &report.trash;
-        trash.entries = trash.entries.saturating_add(census.entries);
-        trash.bytes_estimate = trash.bytes_estimate.saturating_add(census.bytes_estimate);
-        trash.removed_entries = trash.removed_entries.saturating_add(census.removed_entries);
-        trash.incomplete |= census.incomplete || census.at_ms == 0;
-        if let Some(age) = census.oldest_age_ms {
-            let age = age.saturating_add(trash.at_ms.saturating_sub(census.at_ms));
-            trash.oldest_age_ms = Some(trash.oldest_age_ms.unwrap_or(0).max(age));
-        }
-        for (reason, count) in &census.kept_by_reason {
-            let total = trash.kept_by_reason.entry(reason.clone()).or_default();
-            *total = total.saturating_add(*count);
-        }
-        for (field, value) in serde_json::to_value(report).unwrap().as_object().unwrap() {
-            let (key, count) = match value {
-                Value::Number(number) if field != "at_ms" => {
-                    (field.clone(), number.as_u64().unwrap_or(0))
-                }
-                Value::Bool(value) => (format!("{field}_reports"), u64::from(*value)),
-                Value::Array(entries) if field == "errors" || field == "incomplete" => {
-                    (field.clone(), entries.len() as u64)
-                }
-                _ => continue,
-            };
-            let total = totals.get(&key).and_then(Value::as_u64).unwrap_or(0);
-            totals.insert(key, json!(total.saturating_add(count)));
-        }
-    }
-    // Detail reports can be omitted by the health payload budget; keep the
-    // trash backlog and counts of entries retained by reason in the aggregate
-    // that survives trimming.
-    totals.insert("trash".into(), serde_json::to_value(trash).unwrap());
-    Value::Object(totals)
-}
-
 fn ordinary_ready_health_root(root: &Value) -> bool {
     root["abbreviated"] != true
         && root["standing"] != true
@@ -2003,18 +1962,18 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
             .as_object()
             .is_none_or(serde_json::Map::is_empty)
         && root["state"] == "ready"
+        // `off` is the data layer's plane on a root nothing has queried yet:
+        // settled, with nothing built or pending.
         && ["search_index", "semantic_index", "callgraph_store", "tier2"]
             .iter()
             .all(|component| {
                 matches!(
                     root[component]["status"].as_str(),
-                    Some("ready" | "disabled")
+                    Some("ready" | "disabled" | "off")
                 )
             })
+        && root["data_store"]["failure"].is_null()
         && root["suspended_domains"]
-            .as_array()
-            .is_none_or(Vec::is_empty)
-        && root["tier2"]["retry_paused"]
             .as_array()
             .is_none_or(Vec::is_empty)
         && root["bash"]["project_replay_failures"]
@@ -2099,6 +2058,7 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
                 | "callgraph_store"
                 | "tier2"
                 | "bash"
+                | "data_store"
         )
     });
     for field in ["project_root", "root_id", "standing_entry"] {
@@ -2265,9 +2225,6 @@ struct HealthDiagnosticRollup {
     /// `memory_census` answers: every request numbered up to this one was
     /// made before the rollup that measured it started.
     memory_census_answers: u64,
-    /// Per-step timing of the rollup that produced this snapshot.
-    #[cfg(test)]
-    tick: Value,
 }
 
 impl HealthDiagnosticRollup {
@@ -2304,8 +2261,6 @@ impl HealthDiagnosticRollup {
                 "disk_sweeps": serde_json::to_value(crate::bash_background::persisted_gc_health())
                     .unwrap_or(Value::Null),
             },
-            "storage_retention": Value::Null,
-            "storage_retention_totals": Value::Null,
             "storage_retention_reports_omitted": Value::Null,
             "bash_db_schema_hints": Value::Null,
             "bash_task_refusals": Value::Null,
@@ -2323,8 +2278,6 @@ impl HealthDiagnosticRollup {
             memory_census: Arc::new(placeholder_memory_census()),
             memory_census_at_ms: None,
             memory_census_answers: 0,
-            #[cfg(test)]
-            tick: Value::Null,
         }
     }
 }
@@ -2352,6 +2305,17 @@ struct PlaneTiming {
     progress_signature: String,
 }
 
+/// The rollup's last allocator observation, reused across refreshes until it
+/// is older than `reuse_ms`.
+struct CachedAllocatorObservation {
+    /// Cache clock time when the walk finished.
+    cached_at_ms: u64,
+    /// How long this observation may be reused: longer when its walk was
+    /// expensive (see `crate::memory::allocator_reuse_window_ms`).
+    reuse_ms: u64,
+    observation: crate::memory::AllocatorObservation,
+}
+
 struct RetentionCountSample {
     database: std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>,
     measured_at_ms: u64,
@@ -2376,10 +2340,12 @@ pub(super) struct HealthRollupCache {
     #[cfg(test)]
     root_details_assembled: AtomicUsize,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
-    breakers:
-        std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
-    allocator: std::sync::Mutex<Option<(u64, crate::memory::AllocatorObservation)>>,
+    allocator: std::sync::Mutex<Option<CachedAllocatorObservation>>,
+    /// Replaces the measured duration of the rollup's allocator walk when not
+    /// `u64::MAX`, so tests can model an expensive walk.
+    #[cfg(test)]
+    allocator_walk_ms_for_test: AtomicU64,
     retention_count: std::sync::Mutex<Option<RetentionCountSample>>,
     #[cfg(test)]
     retention_count_reads: AtomicU64,
@@ -2449,9 +2415,10 @@ impl HealthRollupCache {
             #[cfg(test)]
             root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
-            breakers: std::sync::Mutex::new(HashMap::new()),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
             allocator: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            allocator_walk_ms_for_test: AtomicU64::new(u64::MAX),
             retention_count: std::sync::Mutex::new(None),
             #[cfg(test)]
             retention_count_reads: AtomicU64::new(0),
@@ -2470,20 +2437,35 @@ impl HealthRollupCache {
             .allocator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((cached_at_ms, observation)) = cached.as_ref() {
-            let elapsed_ms = self.now_ms().saturating_sub(*cached_at_ms);
+        if let Some(cached) = cached.as_ref() {
+            let observation = &cached.observation;
+            let elapsed_ms = self.now_ms().saturating_sub(cached.cached_at_ms);
             let age_ms = observation.age_ms.unwrap_or(0).saturating_add(elapsed_ms);
-            if age_ms <= HEALTH_ALLOCATOR_MAX_AGE_MS {
+            if age_ms <= cached.reuse_ms {
                 let mut reused = observation.clone();
                 // Unsupported platforms keep a null age, not a measured zero.
                 reused.age_ms = observation.age_ms.map(|_| age_ms);
                 return reused;
             }
         }
+        let walk_started = Instant::now();
         let observation = crate::memory::AllocatorObservation::measure();
+        let walk_ms = duration_millis_u64(walk_started.elapsed());
+        #[cfg(test)]
+        let walk_ms = match self.allocator_walk_ms_for_test.load(Ordering::Relaxed) {
+            u64::MAX => walk_ms,
+            stubbed => stubbed,
+        };
         // The observation already includes time spent walking the allocator.
         // Start the reuse clock after that walk so its duration is not counted twice.
-        *cached = Some((self.now_ms(), observation.clone()));
+        *cached = Some(CachedAllocatorObservation {
+            cached_at_ms: self.now_ms(),
+            reuse_ms: crate::memory::allocator_reuse_window_ms(
+                HEALTH_ALLOCATOR_MIN_REUSE_MS,
+                walk_ms,
+            ),
+            observation: observation.clone(),
+        });
         observation
     }
 
@@ -2598,64 +2580,6 @@ impl HealthRollupCache {
         self.root_details_assembled.load(Ordering::Relaxed)
     }
 
-    fn refresh_build_suspensions(
-        &self,
-        ctx: &AppContext,
-        project_root: &std::path::Path,
-        project_key: Option<&str>,
-        cache_dir: &std::path::Path,
-    ) -> Option<&'static str> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        // The caller resolved the cache root once for the whole tick; the
-        // breaker database lives under it for every context sharing the root.
-        let Some(path) = crate::context::build_breaker_path_for_health(cache_dir, project_key)
-        else {
-            ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-            return Some("breaker_location_unknown");
-        };
-        let breaker = {
-            let mut breakers = self
-                .breakers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(breaker) = breakers.get(&path) {
-                Arc::clone(breaker)
-            } else {
-                match crate::build_breaker::BuildDeathBreaker::open(&path) {
-                    Ok(breaker) => {
-                        let breaker = Arc::new(breaker);
-                        breakers.insert(path, Arc::clone(&breaker));
-                        breaker
-                    }
-                    Err(error) => {
-                        log::debug!("health breaker open failed; retrying next rollup: {error}");
-                        ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-                        return Some("breaker_open_failed");
-                    }
-                }
-            }
-        };
-        match breaker.active_suspensions_for_root_at(&project_root.display().to_string(), now_ms) {
-            Ok(suspensions) => {
-                ctx.publish_build_suspensions_for_health(suspensions, now_ms);
-                None
-            }
-            Err(error) => {
-                log::debug!("health breaker read failed; reopening next rollup: {error}");
-                self.breakers
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .retain(|_, cached| !Arc::ptr_eq(cached, &breaker));
-                ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-                Some("breaker_read_failed")
-            }
-        }
-    }
-
     fn now_ms(&self) -> u64 {
         #[cfg(test)]
         {
@@ -2713,13 +2637,8 @@ impl HealthRollupCache {
                 .unwrap_or("unknown")
                 .to_string();
             let key = (root.to_string(), plane);
-            if plane == "tier2" && status == "stale" {
-                timings.remove(&key);
-                component.remove("since_ms");
-                component.remove("last_progress_at_ms");
-                continue;
-            }
             let reported_since_ms = component.get("since_ms").and_then(Value::as_u64);
+            let reported_progress_ms = component.get("last_progress_at_ms").and_then(Value::as_u64);
             let progress_signature = serde_json::to_string(component).unwrap_or_default();
             let timing = timings.entry(key).or_insert_with(|| PlaneTiming {
                 status: status.clone(),
@@ -2736,10 +2655,18 @@ impl HealthRollupCache {
                 timing.last_progress_at_ms = now_ms;
                 timing.progress_signature = progress_signature;
             }
-            component.insert("since_ms".to_string(), json!(timing.since_ms));
+            // A plane that dates itself (the data layer's meaning fill
+            // records when it started and when it last stored) is reported
+            // as it says. The times kept here stand in for a plane that does
+            // not: when health first saw its status, and when its object
+            // last changed.
+            component.insert(
+                "since_ms".to_string(),
+                json!(reported_since_ms.unwrap_or(timing.since_ms)),
+            );
             component.insert(
                 "last_progress_at_ms".to_string(),
-                json!(timing.last_progress_at_ms),
+                json!(reported_progress_ms.unwrap_or(timing.last_progress_at_ms)),
             );
         }
     }
@@ -3185,8 +3112,6 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
             "rss_bytes": Value::Null,
             "phys_footprint_bytes": Value::Null,
             "total_attributed_bytes": Value::Null,
-            "semantic_arena_bytes": Value::Null,
-            "semantic_resident_chunks": Value::Null,
             "sqlite_bytes": Value::Null,
             "allocator_slack_bytes": Value::Null,
             "allocator_slack_kind": ALLOCATOR_SLACK_KIND,
@@ -3236,10 +3161,6 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
         // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
-        // Views-on semantic arenas, counted once per family and included in
-        // `total_attributed_bytes`; the chunk count is one vector per chunk.
-        "semantic_arena_bytes": snapshot.process.semantic_arena_bytes,
-        "semantic_resident_chunks": snapshot.process.semantic_resident_chunks,
         "sqlite_bytes": snapshot.process.sqlite.memory_used_bytes,
     })
 }
@@ -3373,6 +3294,10 @@ fn build_health_diagnostic_rollup(
 #[path = "health_rollup_bench.rs"]
 mod rollup_bench;
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "health/rollup_stage_profile.rs"]
+mod rollup_stage_profile;
+
 macro_rules! rollup_mark {
     ($timer:ident, $step:literal) => {
         $timer.mark($step);
@@ -3460,22 +3385,6 @@ impl TickStoragePaths {
         self.cache.insert(key, resolved.clone());
         resolved
     }
-
-    fn storage_paths(&mut self, config: &crate::config::Config) -> crate::root_cache::StoragePaths {
-        crate::root_cache::StoragePaths::new(
-            self.storage_dir(config.storage_dir.as_deref()),
-            self.cache_dir(config),
-        )
-    }
-
-    fn cache_unavailable_reason(
-        &mut self,
-        ctx: &AppContext,
-        config: &crate::config::Config,
-    ) -> Option<String> {
-        let cache_dir = self.cache_dir(config);
-        ctx.cache_unavailable_reason_for_root(&cache_dir)
-    }
 }
 
 /// The unavailable code of each context whose cache location is unavailable,
@@ -3501,6 +3410,9 @@ fn build_health_diagnostic_rollup_from_actors(
     shared_app: &App,
     actor_entries: Vec<(ProjectRootId, Arc<AppContext>)>,
 ) -> HealthDiagnosticRollup {
+    // The rollup measures the memory census; the allocation tracer names it
+    // for what measuring allocates.
+    let _alloc_label = crate::alloc_trace::scope(crate::alloc_trace::Label::CENSUS, None);
     let mut timer = RollupStepTimer::new();
     struct RootCandidate {
         root_label: String,
@@ -3509,11 +3421,6 @@ fn build_health_diagnostic_rollup_from_actors(
         fully_ready: bool,
         attributed_bytes: u64,
         repair_entries_60s: Option<u64>,
-        // This field deliberately covers only already-open resident stores. A
-        // standing report is necessary because stale rows block projection by
-        // making dead-code findings disappear rather than raising an error.
-        resident_callgraph_stale_backend_rows:
-            Option<crate::callgraph_store::StalePathHealthCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
         disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
@@ -3571,17 +3478,6 @@ fn build_health_diagnostic_rollup_from_actors(
                     }),
             );
         }
-        if tick_paths
-            .cache_unavailable_reason(ctx.as_ref(), &config)
-            .is_none()
-        {
-            crate::storage_retention::schedule(
-                tick_paths.storage_paths(&config),
-                ctx.subc_lifecycle_admission(),
-                ctx.configure_generation_flag(),
-                ctx.configure_generation(),
-            );
-        }
         let root_label = root_id.as_path().display().to_string();
         let standing_index = standing_entries.iter().position(|entry| {
             entry
@@ -3612,33 +3508,16 @@ fn build_health_diagnostic_rollup_from_actors(
         let attributed_bytes = memory.attributed_bytes;
         memory_roots.insert(memory_key, memory);
 
-        let project_key = crate::search_index::artifact_cache_key_memoized_only(root_id.as_path());
+        let project_key =
+            crate::root_identity::key::artifact_cache_key_memoized_only(root_id.as_path());
         let artifact_key = standing
             .as_ref()
             .and_then(|entry| entry.artifact_key.as_deref())
             .or(project_key.as_deref());
-        // Durable breaker state is loaded during the off-path rollup, then the
-        // cached health reply reads only the context snapshot. Standing keys can
-        // be scoped or path-based, so they must not depend on the session-key memo.
-        let cache_dir = tick_paths.cache_dir(&config);
-        let breaker_error = cache.refresh_build_suspensions(
-            ctx.as_ref(),
-            root_id.as_path(),
-            artifact_key,
-            &cache_dir,
-        );
-        let repair_entries_60s = artifact_key.and_then(|key| {
+        let repair_entries_60s = artifact_key.and_then(|_| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
-            crate::callgraph_store::repair_entry_rate(key)
-                .map(|(count, _window_start)| count)
-                .filter(|count| *count > 0)
+            None::<u64>
         });
-        let resident_callgraph_stale_backend_rows =
-            ctx.callgraph_store().try_read().ok().and_then(|store| {
-                store
-                    .as_ref()
-                    .and_then(|store| store.try_stale_path_census_for_health().ok().flatten())
-            });
         let backend = ctx.semantic_backend_health_snapshot();
         if !backend.available {
             embedding_backend_available = false;
@@ -3672,7 +3551,10 @@ fn build_health_diagnostic_rollup_from_actors(
                     .map_or(backend.since_ms, |since| since.min(backend.since_ms)),
             );
         }
-        rollup_mark!(timer, "root disk probes / breaker / callgraph");
+        rollup_mark!(timer, "root disk probes / callgraph");
+        // The cache root is resolved once per tick and shared by every
+        // context on the same root.
+        let cache_dir = tick_paths.cache_dir(&config);
         let health_summary = ctx.try_health_summary_for_root(Some(&cache_dir));
         rollup_mark!(timer, "index readiness / view status");
         let busy = health_summary.is_busy();
@@ -3684,12 +3566,10 @@ fn build_health_diagnostic_rollup_from_actors(
             fully_ready,
             attributed_bytes,
             repair_entries_60s,
-            resident_callgraph_stale_backend_rows,
             watcher: Some(ctx.watcher_counters().snapshot()),
             disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
             diagnostics_evidence: json!({
-                "build_breaker_error": breaker_error,
                 "database_open_failed": ctx.database_runtime_failed(),
                 "lsp_start_failures": ctx.try_lsp().map(|lsp| lsp.cached_start_failure_counts()),
             }),
@@ -3712,7 +3592,6 @@ fn build_health_diagnostic_rollup_from_actors(
             fully_ready: false,
             attributed_bytes: 0,
             repair_entries_60s: None,
-            resident_callgraph_stale_backend_rows: None,
             watcher: None,
             standing: Some(standing),
             diagnostics_evidence: Value::Null,
@@ -3729,6 +3608,14 @@ fn build_health_diagnostic_rollup_from_actors(
         .iter()
         .filter(|candidate| !candidate.busy && !candidate.fully_ready)
         .count();
+    // Roots whose data-layer checkout could not bind, build or refresh, or
+    // whose store a newer build wrote. Present only while the data layer
+    // runs.
+    let data_store_failures =
+        DataStoreFailedRoots::collect(candidates.iter().filter_map(|candidate| {
+            let store = candidate.health.data_store.as_ref()?;
+            Some((candidate.health.project_root.as_str(), store))
+        }));
     let standing_refusals = candidates
         .iter()
         .filter(|candidate| {
@@ -3775,6 +3662,19 @@ fn build_health_diagnostic_rollup_from_actors(
                     semantic.remove("total_chunks");
                     semantic.remove("current_batch");
                     semantic.remove("total_batches");
+                    // The meaning plane's fill progress stops with the
+                    // backend too; its failure counts stay.
+                    for progress in [
+                        "files",
+                        "files_embedded",
+                        "files_pending",
+                        "files_too_large",
+                        "files_past_cap",
+                        "filling",
+                        "last_progress_at_ms",
+                    ] {
+                        semantic.remove(progress);
+                    }
                 }
             }
             cache.annotate_plane_timings(&root_label, &mut value);
@@ -3814,31 +3714,6 @@ fn build_health_diagnostic_rollup_from_actors(
                         );
                     }
                 }
-                if let Some(sample) = candidate.resident_callgraph_stale_backend_rows {
-                    let census = sample.census;
-                    object.insert(
-                        "resident_callgraph_stale_backend_rows_age_ms".to_string(),
-                        json!(sample.measured_age_ms),
-                    );
-                    object.insert(
-                        "resident_callgraph_stale_backend_rows".to_string(),
-                        json!(census.stale),
-                    );
-                    object.insert(
-                        "resident_callgraph_absent_stale_backend_rows".to_string(),
-                        json!(census.absent),
-                    );
-                    object.insert(
-                        "resident_callgraph_unreadable_stale_backend_rows".to_string(),
-                        json!(census.unreadable),
-                    );
-                    // Files the call graph left out because they are not
-                    // valid UTF-8; reported so a missing file is explainable.
-                    object.insert(
-                        "resident_callgraph_undecodable_files".to_string(),
-                        json!(census.undecodable),
-                    );
-                }
                 if let Some(watcher) = candidate.watcher {
                     object.insert("watcher".to_string(), json!(watcher));
                 }
@@ -3852,8 +3727,6 @@ fn build_health_diagnostic_rollup_from_actors(
         .collect::<Vec<_>>();
 
     let root_count = root_details_omitted.saturating_add(roots.len());
-    let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
-    let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     rollup_mark!(timer, "root JSON assembly");
     let allocator = cache.allocator_observation();
     rollup_mark!(timer, "allocator observation");
@@ -3920,23 +3793,16 @@ fn build_health_diagnostic_rollup_from_actors(
     let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
     rollup_mark!(timer, "lifecycle OS probes");
     shared_app.publish_lifecycle_census(lifecycle.clone());
-    let (status, detail) = root_health_rollup_state(
-        busy_roots,
-        standing_refusals,
-        warming_roots,
-        disk_reserve_detail,
+    let (status, detail) = with_data_store_failures(
+        root_health_rollup_state(
+            busy_roots,
+            standing_refusals,
+            warming_roots,
+            disk_reserve_detail,
+        ),
+        &data_store_failures,
     );
 
-    let storage_retention = lifecycle_contexts
-        .iter()
-        .filter_map(|ctx| {
-            let storage = tick_paths.cache_dir(&ctx.config());
-            crate::storage_retention::snapshot(&storage)
-                .map(|report| (storage.display().to_string(), report))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let storage_retention_totals = retention_report_totals(&storage_retention);
-    rollup_mark!(timer, "storage retention snapshots");
     let bash_retention = bash_task_retention_metrics(cache, shared_app);
     rollup_mark!(timer, "bash retention database count");
     // Every context normally shares one cache root, but each context may name
@@ -3964,11 +3830,11 @@ fn build_health_diagnostic_rollup_from_actors(
         "root_count": root_count,
         "warming_roots": warming_roots,
         "root_details_omitted": root_details_omitted,
-        "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
+        "callgraph_repair_entries_60s_total": 0,
         "callgraph_repair_roots_annotated": repair_roots_annotated,
         "callgraph_repair_roots_total": actor_count,
-        "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
-        "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
+        "callgraph_commits_60s_total": 0,
+        "callgraph_pages_or_bytes_written_60s_total": 0,
         "lsp_children": {
             "spawned": lifecycle.lsp.children_total,
             "cwd_gone": lifecycle.lsp.children_with_deleted_cwd,
@@ -3982,8 +3848,6 @@ fn build_health_diagnostic_rollup_from_actors(
         },
         "memory": memory,
         "bash_task_retention": bash_retention,
-        "storage_retention": storage_retention,
-        "storage_retention_totals": storage_retention_totals,
         "storage_retention_reports_omitted": 0,
         "bash_db_schema_hints": bash_db_hint_metrics(),
         "bash_task_refusals": bash_task_refusals,
@@ -3992,6 +3856,7 @@ fn build_health_diagnostic_rollup_from_actors(
         "roots": roots,
     });
     insert_lifecycle_metrics(&mut metrics, lifecycle);
+    data_store_failures.insert_into(&mut metrics);
     rollup_mark!(timer, "metrics JSON assembly");
     let tick = timer.metrics();
     if log::log_enabled!(log::Level::Debug) && cache.step_log_due() {
@@ -4023,9 +3888,143 @@ fn build_health_diagnostic_rollup_from_actors(
         memory_census,
         memory_census_at_ms,
         memory_census_answers,
-        #[cfg(test)]
-        tick,
     }
+}
+
+/// How many roots with a failed index store the health summary names, in
+/// path order; the rest are only counted.
+const HEALTH_DATA_STORE_FAILED_NAMED: usize = 5;
+/// The most bytes the failed roots' names may add to the health `detail`.
+/// The detail sits outside the metrics byte budget, in the 4 KiB SUBC keeps
+/// for the reply's envelope, so it is capped on its own.
+const HEALTH_DATA_STORE_FAILED_DETAIL_BYTES: usize = 1024;
+
+/// The reason code a root's failed index store is listed with, or `None`
+/// when its store did not fail. A store fails when its checkout could not
+/// bind, build or refresh, or when a newer build wrote it. The reason code
+/// the store reports is kept. A failed build or refresh while the previous
+/// build still answers queries reports no reason code, so its recorded
+/// failure is classified the way the store classifies one.
+fn data_store_failure_reason(
+    store: &crate::data_layer::surfaces::DataStoreHealth,
+) -> Option<&'static str> {
+    use crate::data_layer::surfaces::reason;
+    match (store.reason, &store.failure) {
+        (Some(code @ (reason::BIND_FAILED | reason::REQUIRES_NEWER_READER)), _) => Some(code),
+        (_, None) => None,
+        (
+            Some(
+                code @ (reason::BUILD_FAILED
+                | reason::REFRESH_FAILED
+                | reason::STORE_BUSY
+                | reason::DISK_RESERVE),
+            ),
+            Some(_),
+        ) => Some(code),
+        (_, Some(failure)) => Some(if crate::view_storage_reserve::is_message(&failure.error) {
+            reason::DISK_RESERVE
+        } else if failure.busy {
+            reason::STORE_BUSY
+        } else if failure.stage == "refresh" {
+            reason::REFRESH_FAILED
+        } else {
+            reason::BUILD_FAILED
+        }),
+    }
+}
+
+/// The roots whose index store failed, as the health summary reports them:
+/// how many, and the first few by path with a reason code, so an alert can
+/// say which roots are degraded and why without reading the logs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DataStoreFailedRoots {
+    count: usize,
+    /// `(project_root, reason)` in path order, at most
+    /// [`HEALTH_DATA_STORE_FAILED_NAMED`]. Long paths are abbreviated with
+    /// [`abbreviated_health_path`], as the `roots` rows abbreviate theirs.
+    named: Vec<(String, &'static str)>,
+}
+
+impl DataStoreFailedRoots {
+    fn collect<'a>(
+        roots: impl IntoIterator<Item = (&'a str, &'a crate::data_layer::surfaces::DataStoreHealth)>,
+    ) -> Self {
+        let mut failed = roots
+            .into_iter()
+            .filter_map(|(root, store)| Some((root, data_store_failure_reason(store)?)))
+            .collect::<Vec<_>>();
+        failed.sort_unstable();
+        let count = failed.len();
+        let named = failed
+            .into_iter()
+            .take(HEALTH_DATA_STORE_FAILED_NAMED)
+            .map(|(root, reason)| (abbreviated_health_path(root), reason))
+            .collect();
+        Self { count, named }
+    }
+
+    /// Adds `data_store_failed_roots` (the count), `data_store_failed` (the
+    /// named roots) and `data_store_failed_omitted` (the rest) to the
+    /// rollup's metrics; nothing while no store failed.
+    fn insert_into(&self, metrics: &mut Value) {
+        if self.count == 0 {
+            return;
+        }
+        metrics["data_store_failed_roots"] = json!(self.count);
+        metrics["data_store_failed"] = Value::Array(
+            self.named
+                .iter()
+                .map(|(root, reason)| json!({ "project_root": root, "reason": reason }))
+                .collect(),
+        );
+        metrics["data_store_failed_omitted"] = json!(self.count - self.named.len());
+    }
+
+    /// `: /a (build_failed), /b (bind_failed) and 3 more` for the health
+    /// detail, at most [`HEALTH_DATA_STORE_FAILED_DETAIL_BYTES`] long: a
+    /// name that would pass the cap is counted among the rest instead.
+    fn detail_names(&self) -> String {
+        // Leave room for the longest possible tail, so the tail never
+        // pushes the names past the cap.
+        let tail_room = format!(" and {} more", self.count).len();
+        let mut names = String::new();
+        let mut listed = 0usize;
+        for (root, reason) in &self.named {
+            let separator = if listed == 0 { ": " } else { ", " };
+            let entry = format!("{separator}{root} ({reason})");
+            if names.len() + entry.len() + tail_room > HEALTH_DATA_STORE_FAILED_DETAIL_BYTES {
+                break;
+            }
+            names.push_str(&entry);
+            listed += 1;
+        }
+        let rest = self.count - listed;
+        if listed > 0 && rest > 0 {
+            names.push_str(&format!(" and {rest} more"));
+        }
+        names
+    }
+}
+
+/// The fleet state with roots whose data-layer checkout failed: such a root
+/// is not warming, so a fleet otherwise ok (or only warming) is degraded
+/// and says why, naming the first roots. A degraded state for another
+/// reason keeps its detail.
+fn with_data_store_failures(
+    state: (HealthStatus, Option<String>),
+    failed: &DataStoreFailedRoots,
+) -> (HealthStatus, Option<String>) {
+    if failed.count == 0 || state.0 != HealthStatus::Ok {
+        return state;
+    }
+    (
+        HealthStatus::Degraded,
+        Some(format!(
+            "{} root(s) could not build or refresh their index store{}; see roots[].data_store",
+            failed.count,
+            failed.detail_names()
+        )),
+    )
 }
 
 fn root_health_rollup_state(
@@ -4093,7 +4092,6 @@ pub(super) fn build_health_report(
         dispatch_path_metrics,
         shared_app,
         crate::cold_build_limiter::progress::snapshot,
-        crate::gc::family::sweep_stats(),
     )
 }
 
@@ -4111,7 +4109,31 @@ fn build_health_report_with_snapshots(
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
     indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
-    sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
+) -> HealthReport {
+    let mut report = assemble_health_report(
+        cache,
+        executor,
+        pending_binds,
+        dispatch_path_metrics,
+        shared_app,
+        indexing_snapshot,
+    );
+    if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
+        budget_health_metrics(metrics);
+    }
+    report
+}
+
+/// The health reply before its metrics are fitted to the byte budget. The
+/// status and detail never read the metrics, so budgeting afterwards gives
+/// the same reply as budgeting first.
+fn assemble_health_report(
+    cache: &HealthRollupCache,
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    dispatch_path_metrics: &DispatchPathMetrics,
+    shared_app: &App,
+    indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
 ) -> HealthReport {
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
@@ -4233,20 +4255,10 @@ fn build_health_report_with_snapshots(
         "process_io".to_string(),
         crate::process_io::ProcessIoSnapshot::capture().to_value(),
     );
-    metrics.insert("views_work".to_string(), crate::views::io::work_snapshot());
     metrics.insert(
-        "v2_family_sweeps".to_string(),
-        json!(sweep_snapshot.details),
+        "views_work".to_string(),
+        crate::io_accounting::work_snapshot(),
     );
-    metrics.insert(
-        "v2_family_sweep_details_evicted_total".into(),
-        json!(sweep_snapshot.evicted_total),
-    );
-    metrics.insert(
-        "v2_family_sweep_details_retired_total".into(),
-        json!(sweep_snapshot.retired_total),
-    );
-    metrics.insert("v2_family_sweeps_omitted".into(), json!(0));
     metrics.insert(
         "filesystem_helpers".to_string(),
         crate::bounded_io::helper_health(),
@@ -4274,7 +4286,6 @@ fn build_health_report_with_snapshots(
         .map(|key| json!(key))
         .collect::<Vec<_>>();
     metrics.insert("headline".to_string(), json!(headline));
-    budget_health_metrics(&mut metrics);
 
     let gap_health = dispatch_path_metrics.watch_delivery.health();
     let watch_gap_unresolved = gap_health["status"] != "ok";
@@ -4645,62 +4656,6 @@ mod tests {
     }
 
     #[test]
-    fn long_running_daemon_sweeps_preserve_root_and_standing_detail() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = crate::gc::family::SweepStatsStore::default();
-        for family in 0..96 {
-            let family_dir = dir
-                .path()
-                .join(format!("family-{family:03}-{}", "p".repeat(120)));
-            std::fs::create_dir(&family_dir).unwrap();
-            // Thirty days of ten-minute passes reuse each family's counters.
-            for _ in 0..4320 {
-                store.record_stale_rows(&family_dir.join("semantic.db"), "family", 1);
-            }
-        }
-        let sweeps = store.snapshot();
-        assert_eq!(sweeps.details.len(), 64);
-        assert_eq!(sweeps.evicted_total, 32);
-        assert_eq!(sweeps.retired_total, 0);
-        assert!(
-            serde_json::to_vec(&sweeps.details).unwrap().len() > super::HEALTH_METRICS_BUDGET_BYTES
-        );
-        let cache = HealthRollupCache::new();
-        let mut rollup = HealthDiagnosticRollup::unavailable();
-        rollup.metrics = json!({
-            "root_count": 170,
-            "root_details_omitted": 168,
-            "roots": [{"root":"active-root"}, {"root":"standing-root", "standing_health":{"status":"ready"}}],
-        });
-        cache.publish(Some(rollup));
-        let executor = Executor::new();
-        let app = App::default_shared();
-        let report = super::build_health_report_with_snapshots(
-            &cache,
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-            crate::cold_build_limiter::progress::snapshot,
-            sweeps,
-        );
-        let metrics = report.metrics.unwrap();
-        assert_eq!(metrics["roots"].as_array().unwrap().len(), 2);
-        assert_eq!(metrics["roots"][1]["standing_health"]["status"], "ready");
-        assert_eq!(metrics["root_details_omitted"], 168);
-        assert_eq!(metrics["v2_family_sweep_details_evicted_total"], 32);
-        assert_eq!(metrics["v2_family_sweep_details_retired_total"], 0);
-        let kept = metrics["v2_family_sweeps"].as_array().unwrap();
-        assert!(kept.len() < 64);
-        assert_eq!(metrics["v2_family_sweeps_omitted"], 64 - kept.len());
-        assert!(kept.iter().all(|entry| entry["stale_rows_touched"] == 4320));
-        assert!(metrics["v2_family_sweeps_omitted"].as_u64().unwrap() > 0);
-        assert!(
-            metrics["metrics_bytes"].as_u64().unwrap() <= super::HEALTH_METRICS_BUDGET_BYTES as u64
-        );
-    }
-
-    #[test]
     fn health_budget_trims_every_sweep_before_root_detail() {
         let roots = json!([{
             "project_root": "standing", "state": "ready", "standing": true,
@@ -4938,7 +4893,7 @@ mod tests {
             ("/search_index/status", json!("building")),
             ("/semantic_index/status", json!("degraded")),
             ("/callgraph_store/status", json!("absent")),
-            ("/tier2/status", json!("stale")),
+            ("/tier2/status", json!("building")),
             ("/views/pinned", json!(false)),
             ("/views/pending_paths", json!(1)),
             ("/views/failed_paths", json!(1)),
@@ -4961,46 +4916,197 @@ mod tests {
     }
 
     #[test]
-    fn disk_reserve_health_survives_ready_root_filtering_and_abbreviation() {
-        let storage = tempfile::tempdir().unwrap();
-        let _low = crate::blob_store::v3::set_free_space_for_test(
-            storage.path(),
-            21 * 1024 * 1024 * 1024,
-            3_900_000_000_000,
-        );
-        crate::blob_store::v3::publish(storage.path(), &"f".repeat(64), 1, None, |_| Ok(()))
-            .unwrap_err();
-        let reserve = crate::view_storage_reserve::DiskReserveCondition::observed(
-            storage.path(),
-            "device_free_space_floor",
-        )
-        .unwrap();
-        let mut root = json!({
-            "project_root": "project", "state": "ready",
-            "search_index": {"status": "ready"}, "semantic_index": {"status": "disabled"},
-            "callgraph_store": {"status": "ready"}, "tier2": {"status": "ready"},
-        });
-        assert!(ordinary_ready_health_root(&root));
-        root["view_storage_reserve"] = json!({"trigram": reserve});
-        assert!(!ordinary_ready_health_root(&root));
-        assert!(abbreviate_health_root(&mut root));
-        assert_eq!(
-            root["view_storage_reserve"]["trigram"]["code"],
-            "device_free_space_floor"
-        );
-        assert_eq!(
-            root["view_storage_reserve"]["trigram"]["message"],
-            reserve.message
-        );
-        let (status, detail) = root_health_rollup_state(0, 0, 1, Some(reserve.message.clone()));
+    fn a_failed_data_store_degrades_the_fleet_and_keeps_its_root_in_detail() {
+        let one = DataStoreFailedRoots {
+            count: 1,
+            named: vec![("/Users/u/Documents".to_string(), "bind_failed")],
+        };
+        // Warming alone is ok; a root whose data store failed is not warming.
+        let (status, detail) =
+            with_data_store_failures(root_health_rollup_state(0, 0, 1, None), &one);
         assert_eq!(status, HealthStatus::Degraded);
-        assert_eq!(detail, Some(reserve.message));
-        let (status, detail) = root_health_rollup_state(0, 0, 1, None);
-        assert_eq!(status, HealthStatus::Ok);
         assert_eq!(
             detail.as_deref(),
-            Some("1 root(s) warming background indexes (serving normally)")
+            Some(
+                "1 root(s) could not build or refresh their index store: \
+                 /Users/u/Documents (bind_failed); see roots[].data_store"
+            )
         );
+        // A fleet already degraded for another reason keeps that reason.
+        let (status, detail) =
+            with_data_store_failures(root_health_rollup_state(2, 0, 0, None), &one);
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(
+            detail.as_deref(),
+            Some("2 root actor(s) could not be snapshotted without contention")
+        );
+        // No failure: unchanged.
+        assert_eq!(
+            with_data_store_failures(
+                root_health_rollup_state(0, 0, 0, None),
+                &DataStoreFailedRoots::default()
+            ),
+            (HealthStatus::Ok, None)
+        );
+
+        let mut root = json!({
+            "project_root": "project", "state": "ready",
+            "search_index": {"status": "off"}, "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "off"}, "tier2": {"status": "ready"},
+            "data_store": {"reason": "not_bound", "pending_edits": 0, "unparsed_files": 0},
+        });
+        assert!(ordinary_ready_health_root(&root), "not bound is settled");
+        root["callgraph_store"]["status"] = json!("ready");
+        root["data_store"]["failure"] =
+            json!({"stage": "build", "error": "x", "busy": false, "at_ms": 1});
+        assert!(
+            !ordinary_ready_health_root(&root),
+            "a recorded failure stays in detail"
+        );
+        assert!(abbreviate_health_root(&mut root));
+        assert_eq!(root["data_store"]["failure"]["stage"], "build");
+    }
+
+    fn data_store_health(
+        reason: Option<&'static str>,
+        failure: Option<(&'static str, bool)>,
+    ) -> crate::data_layer::surfaces::DataStoreHealth {
+        crate::data_layer::surfaces::DataStoreHealth {
+            reason,
+            error: None,
+            pending_edits: 0,
+            unparsed_files: 0,
+            failure: failure.map(
+                |(stage, busy)| crate::data_layer::surfaces::DataStoreFailure {
+                    stage,
+                    error: "cannot walk the root: Operation not permitted".to_string(),
+                    busy,
+                    at_ms: 1,
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn failed_index_store_roots_are_named_in_path_order_with_reasons_up_to_five() {
+        use crate::data_layer::surfaces::reason;
+        let healthy = data_store_health(None, None);
+        let not_bound = data_store_health(Some(reason::NOT_BOUND), None);
+        let bind = data_store_health(Some(reason::BIND_FAILED), None);
+        let newer = data_store_health(Some(reason::REQUIRES_NEWER_READER), None);
+        let build = data_store_health(Some(reason::BUILD_FAILED), Some(("build", false)));
+        // A failed build or refresh while the previous build still answers
+        // reports no reason code; the recorded failure decides it.
+        let busy_served = data_store_health(None, Some(("build", true)));
+        let refresh_served = data_store_health(None, Some(("refresh", false)));
+        let build_served = data_store_health(None, Some(("build", false)));
+        let failed = DataStoreFailedRoots::collect([
+            ("/r/h", &healthy),
+            ("/r/f", &build),
+            ("/r/a", &bind),
+            ("/r/nb", &not_bound),
+            ("/r/d", &refresh_served),
+            ("/r/c", &busy_served),
+            ("/r/b", &newer),
+            ("/r/e", &build_served),
+        ]);
+        assert_eq!(failed.count, 6);
+        let expected = [
+            ("/r/a", reason::BIND_FAILED),
+            ("/r/b", reason::REQUIRES_NEWER_READER),
+            ("/r/c", reason::STORE_BUSY),
+            ("/r/d", reason::REFRESH_FAILED),
+            ("/r/e", reason::BUILD_FAILED),
+        ];
+        assert_eq!(
+            failed.named,
+            expected
+                .iter()
+                .map(|(root, reason)| (root.to_string(), *reason))
+                .collect::<Vec<_>>()
+        );
+
+        let mut metrics = json!({});
+        failed.insert_into(&mut metrics);
+        assert_eq!(
+            metrics,
+            json!({
+                "data_store_failed_roots": 6,
+                "data_store_failed": expected
+                    .iter()
+                    .map(|(root, reason)| json!({"project_root": root, "reason": reason}))
+                    .collect::<Vec<_>>(),
+                "data_store_failed_omitted": 1,
+            })
+        );
+        let (status, detail) =
+            with_data_store_failures(root_health_rollup_state(0, 0, 0, None), &failed);
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "6 root(s) could not build or refresh their index store: /r/a (bind_failed), \
+                 /r/b (storage_requires_newer_reader), /r/c (store_busy), \
+                 /r/d (refresh_failed), /r/e (build_failed) and 1 more; \
+                 see roots[].data_store"
+            )
+        );
+
+        // Nothing failed: no fields and no detail.
+        let mut metrics = json!({});
+        DataStoreFailedRoots::collect([("/r/h", &healthy), ("/r/nb", &not_bound)])
+            .insert_into(&mut metrics);
+        assert_eq!(metrics, json!({}));
+    }
+
+    #[test]
+    fn failed_index_store_root_names_add_at_most_one_kib_to_the_detail() {
+        let bind = data_store_health(Some(crate::data_layer::surfaces::reason::BIND_FAILED), None);
+        let base = |count: usize| {
+            format!(
+                "{count} root(s) could not build or refresh their index store; see roots[].data_store"
+            )
+        };
+        // Five paths just short of abbreviation, five past it with a long
+        // multi-byte basename (kept to 64 characters, up to 192 bytes here),
+        // and fifty of the latter.
+        let short_enough = (0..5)
+            .map(|index| format!("/{index}{}", "p".repeat(158)))
+            .collect::<Vec<_>>();
+        let wide = (0..50)
+            .map(|index| format!("/{index:02}/{}", "文".repeat(100)))
+            .collect::<Vec<_>>();
+        for (paths, all_named) in [
+            (&short_enough[..], true),
+            (&wide[..5], false),
+            (&wide[..], false),
+        ] {
+            let failed =
+                DataStoreFailedRoots::collect(paths.iter().map(|path| (path.as_str(), &bind)));
+            assert_eq!(failed.named.len(), 5);
+            let (_, detail) =
+                with_data_store_failures(root_health_rollup_state(0, 0, 0, None), &failed);
+            let detail = detail.expect("a degraded detail");
+            let added = detail.len() - base(paths.len()).len();
+            assert!(
+                added <= HEALTH_DATA_STORE_FAILED_DETAIL_BYTES,
+                "the names added {added} bytes: {detail}"
+            );
+            let listed = failed
+                .named
+                .iter()
+                .filter(|(root, _)| detail.contains(root.as_str()))
+                .count();
+            assert!(listed > 0, "{detail}");
+            assert_eq!(listed == 5, all_named, "{detail}");
+            // Every root is either named or counted.
+            let rest = paths.len() - listed;
+            assert_eq!(
+                detail.contains(&format!(" and {rest} more;")),
+                rest > 0,
+                "{detail}"
+            );
+        }
     }
 
     #[test]
@@ -5049,25 +5155,6 @@ mod tests {
             .unwrap()
             .iter()
             .any(|finding| finding["check"] == "lsp_start_failures"));
-    }
-
-    #[test]
-    fn health_fixture_ignores_process_global_sweep_telemetry() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::gc::family::record_stale_rows(&dir.path().join("semantic.db"), "foreign-family", 1);
-        let executor = Executor::new();
-        let app = App::default_shared();
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-        );
-        let metrics = report.metrics.unwrap();
-        assert_eq!(metrics["v2_family_sweeps"], json!([]));
-        assert_eq!(metrics["v2_family_sweep_details_evicted_total"], 0);
-        assert_eq!(metrics["v2_family_sweep_details_retired_total"], 0);
-        assert_eq!(metrics["v2_family_sweeps_omitted"], 0);
     }
 
     #[test]
@@ -5487,8 +5574,14 @@ mod tests {
     }
     use serde_json::json;
 
-    // Health fixtures own their roots, not sweep observations made by other
-    // tests in the process. Production still supplies the live store snapshot.
+    // Health fixtures own their roots, not the work other tests in this
+    // process do for theirs. The reply lists rows from process-wide registries
+    // (indexing jobs, cold-build slots, view publications, write-ledger
+    // writers, stopped fleet routes) next to the root detail, and a fixture's
+    // reply sits close to its byte budget: other tests' rows can push the
+    // fixture's root detail out of it. Fixture replies keep only the rows of
+    // the executor's own roots, and no store sweep observations. Production
+    // supplies the live registries and the live sweep snapshot.
     fn build_health_report(
         cache: &HealthRollupCache,
         executor: &Executor,
@@ -5496,16 +5589,24 @@ mod tests {
         metrics: &DispatchPathMetrics,
         app: &App,
     ) -> HealthReport {
+        let roots = fixture_roots(executor);
+        let roots = roots
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect::<Vec<_>>();
         build_health_report_with_indexing(
             cache,
             executor,
             pending_binds,
             metrics,
             app,
-            crate::cold_build_limiter::progress::snapshot,
+            |warming_roots| {
+                crate::cold_build_limiter::progress::snapshot_for_roots(&roots, warming_roots)
+            },
         )
     }
 
+    /// A fixture reply whose indexing jobs the caller chooses.
     fn build_health_report_with_indexing(
         cache: &HealthRollupCache,
         executor: &Executor,
@@ -5514,15 +5615,79 @@ mod tests {
         app: &App,
         indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
     ) -> HealthReport {
-        super::build_health_report_with_snapshots(
+        fixture_health_report(
             cache,
             executor,
             pending_binds,
             metrics,
             app,
             indexing_snapshot,
-            crate::gc::family::SweepStatsSnapshot::default(),
         )
+    }
+
+    /// A fixture reply whose indexing jobs the caller chooses.
+    fn fixture_health_report(
+        cache: &HealthRollupCache,
+        executor: &Executor,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        metrics: &DispatchPathMetrics,
+        app: &App,
+        indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
+    ) -> HealthReport {
+        let roots = fixture_roots(executor);
+        let mut report = super::assemble_health_report(
+            cache,
+            executor,
+            pending_binds,
+            metrics,
+            app,
+            indexing_snapshot,
+        );
+        // Drop other tests' rows before the budget decides what fits.
+        if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
+            retain_fixture_process_rows(metrics, &roots);
+            budget_health_metrics(metrics);
+        }
+        report
+    }
+
+    /// The roots registered with a fixture's executor. A read that finds the
+    /// scheduler busy owns none, so it keeps no process-wide rows.
+    fn fixture_roots(executor: &Executor) -> Vec<std::path::PathBuf> {
+        executor
+            .try_actor_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(root, _)| root.as_path().to_path_buf())
+            .collect()
+    }
+
+    /// Keeps the rows of the process-wide work lists that name a fixture root
+    /// or a path under one, and drops the rows other tests added.
+    fn retain_fixture_process_rows(
+        metrics: &mut serde_json::Map<String, Value>,
+        roots: &[std::path::PathBuf],
+    ) {
+        let owned = |row: &Value, field: &str| {
+            row[field]
+                .as_str()
+                .is_some_and(|path| roots.iter().any(|root| Path::new(path).starts_with(root)))
+        };
+        for (section, list, field) in [
+            ("cold_build_limiter", Some("holders"), "root"),
+            ("cold_build_limiter", Some("queued"), "root"),
+            ("dispatch_path", Some("off_lane_jobs"), "root"),
+            ("write_ledger_top_10m", None, "root_id"),
+            ("stopped_routes", None, "project_root"),
+        ] {
+            let rows = metrics.get_mut(section).and_then(|value| match list {
+                Some(list) => value.get_mut(list),
+                None => Some(value),
+            });
+            if let Some(Value::Array(rows)) = rows {
+                rows.retain(|row| owned(row, field));
+            }
+        }
     }
 
     fn test_health_report(
@@ -5676,6 +5841,67 @@ mod tests {
         }
         eprintln!("SAMPLE detail: {}", report.detail.unwrap());
         eprintln!("SAMPLE indexing: {}", indexing);
+    }
+
+    #[test]
+    fn fixture_reply_lists_only_the_process_wide_work_of_its_own_roots() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("fixture-owned-process-rows");
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        // Another test's job, registered in the same process-wide registry.
+        let foreign = tempfile::tempdir().unwrap();
+        let _foreign = crate::cold_build_limiter::progress::start(
+            foreign.path(),
+            "foreign build",
+            None,
+            crate::cold_build_limiter::progress::StartLog::Quiet,
+        );
+        let _own = crate::cold_build_limiter::progress::start(
+            root.as_path(),
+            "own build",
+            None,
+            crate::cold_build_limiter::progress::StartLog::Quiet,
+        );
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+
+        let report = refresh_until_root_count(&cache, &executor, &app, 1);
+        let metrics = report.metrics.expect("health metrics");
+        let running = metrics["indexing"]["running"]
+            .as_array()
+            .expect("indexing rows")
+            .iter()
+            .map(|row| row["kind"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(running, vec![json!("own build")], "{metrics:#}");
+
+        // The registries without a root-scoped snapshot are scoped by their
+        // rows' root, keeping paths under a fixture root too.
+        let own = root.as_path().display().to_string();
+        let nested = root.as_path().join("checkpoints").display().to_string();
+        let other = foreign.path().display().to_string();
+        let mut synthetic = json!({
+            "cold_build_limiter": {
+                "holders": [{ "root": own }, { "root": other }],
+                "queued": [{ "root": other }],
+            },
+            "dispatch_path": { "off_lane_jobs": [{ "root": other }, { "root": own }] },
+            "write_ledger_top_10m": [{ "root_id": nested }, { "root_id": other }],
+            "stopped_routes": [{ "project_root": other }],
+        })
+        .as_object()
+        .expect("synthetic metrics")
+        .clone();
+        retain_fixture_process_rows(&mut synthetic, &[root.as_path().to_path_buf()]);
+        assert_eq!(
+            Value::Object(synthetic),
+            json!({
+                "cold_build_limiter": { "holders": [{ "root": own }], "queued": [] },
+                "dispatch_path": { "off_lane_jobs": [{ "root": own }] },
+                "write_ledger_top_10m": [{ "root_id": nested }],
+                "stopped_routes": [],
+            })
+        );
     }
 
     #[test]
@@ -5996,220 +6222,6 @@ mod tests {
         assert_eq!(snapshot["percentiles"]["p99_ms"], 90_000);
     }
 
-    fn view_health_fixture() -> (
-        tempfile::TempDir,
-        Executor,
-        Arc<AppContext>,
-        std::path::PathBuf,
-    ) {
-        let (dir, root) = super::super::test_support::test_root("view-health-next-tick");
-        let view_dir = dir.path().join("view");
-        let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
-        status.mark_pending(b"a.rs", "fixture", 1).unwrap();
-        drop(status);
-        let ctx = Arc::new(AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(root.as_path().into()),
-                storage_dir: Some(dir.path().join("storage")),
-                ..Default::default()
-            },
-        ));
-        ctx.update_config(|config| config.views.enabled = true);
-        ctx.install_view_runtime(
-            crate::context::ViewRuntimeSnapshot {
-                query_pin: None,
-                storage: dir.path().join("storage"),
-                family: "health-fixture".into(),
-                scope: "health-checkout".into(),
-                view_dir: view_dir.clone(),
-                generation: Some("1-fixture".into()),
-                manifest: None,
-                head_fingerprint: String::new(),
-                head_metadata: crate::alias::GitHeadMetadata {
-                    head_path: Default::default(),
-                    head_mtime: None,
-                    resolved_ref_path: None,
-                    resolved_ref_mtime: None,
-                },
-                pending_paths: Default::default(),
-                pending_inputs: Default::default(),
-            },
-            None,
-        );
-        let executor = Executor::new();
-        assert!(executor.register_actor(root, Arc::clone(&ctx)));
-        (dir, executor, ctx, view_dir)
-    }
-
-    fn rolled_up_view(cache: &HealthRollupCache, executor: &Executor, app: &App) -> Value {
-        cache.refresh_for_test(executor, app);
-        cache.snapshot().0.metrics["roots"][0]["views"].clone()
-    }
-
-    #[test]
-    fn view_health_local_batches_are_in_next_rollup_with_one_refresh() {
-        let (_dir, executor, _ctx, view_dir) = view_health_fixture();
-        let app = App::default_shared();
-        let cache = HealthRollupCache::new();
-        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
-        let before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
-        let scans = crate::path_status::HEALTH_SUMMARY_READS.with(std::cell::Cell::get);
-        {
-            let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
-            for _ in 0..20 {
-                status.mark_pending(b"a.rs", "pending", 1).unwrap();
-            }
-            status.mark_failed(b"a.rs", "missing payload", 1).unwrap();
-        }
-        assert_eq!(
-            crate::path_status::HEALTH_SUMMARY_READS.with(std::cell::Cell::get),
-            scans,
-            "local batches must not scan health on the writer"
-        );
-        let next = rolled_up_view(&cache, &executor, &app);
-        assert_eq!(
-            next["failed_paths"], 1,
-            "committed failure must show next tick"
-        );
-        assert_eq!(next["pending_paths"], 0);
-        assert_eq!(
-            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
-            before + 1,
-            "all local batches must share one refresh on the next tick"
-        );
-        assert_eq!(rolled_up_view(&cache, &executor, &app)["failed_paths"], 1);
-        assert_eq!(
-            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
-            before + 1,
-            "an unchanged tick must reuse the projection"
-        );
-    }
-
-    #[test]
-    fn view_health_external_failure_is_in_next_rollup() {
-        const CHILD_VIEW: &str = "AFT_HEALTH_EXTERNAL_WRITE_VIEW";
-        if let Some(view_dir) = std::env::var_os(CHILD_VIEW) {
-            let mut status =
-                crate::path_status::PathStatusStore::open(Path::new(&view_dir)).unwrap();
-            status
-                .mark_failed(b"a.rs", "external missing payload", 1)
-                .unwrap();
-            return;
-        }
-        let (_dir, executor, _ctx, view_dir) = view_health_fixture();
-        let app = App::default_shared();
-        let cache = HealthRollupCache::new();
-        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
-        // First make a local write and refresh health. The later child-process
-        // signature change must still trigger a fresh SQLite read.
-        {
-            let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
-            status.mark_pending(b"b.rs", "local", 1).unwrap();
-        }
-        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 2);
-        let before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "subc::health::tests::view_health_external_failure_is_in_next_rollup",
-                "--nocapture",
-            ])
-            .env(CHILD_VIEW, &view_dir)
-            .output()
-            .unwrap();
-        assert!(
-            child.status.success(),
-            "child: {}",
-            String::from_utf8_lossy(&child.stderr)
-        );
-        let next = rolled_up_view(&cache, &executor, &app);
-        assert_eq!(
-            next["failed_paths"], 1,
-            "external commit must show next tick"
-        );
-        assert_eq!(next["pending_paths"], 1);
-        assert_eq!(
-            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
-            before + 1,
-            "external signature changes must refresh the summary"
-        );
-    }
-
-    #[test]
-    fn view_health_runtime_replacement_disable_and_clear_are_in_next_rollup() {
-        let (_dir, executor, ctx, _view_dir) = view_health_fixture();
-        let app = App::default_shared();
-        let cache = HealthRollupCache::new();
-        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 1);
-        let mut next = ctx.view_runtime_snapshot().unwrap();
-        next.generation = Some("2-fixture".into());
-        ctx.install_view_runtime(next, None);
-        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 2);
-        ctx.update_config(|config| config.views.enabled = false);
-        assert!(rolled_up_view(&cache, &executor, &app).is_null());
-        ctx.update_config(|config| config.views.enabled = true);
-        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 2);
-        ctx.clear_view_runtime();
-        assert!(rolled_up_view(&cache, &executor, &app).is_null());
-    }
-
-    #[test]
-    fn view_health_runtime_drop_closes_reader_even_with_live_writer() {
-        let (_dir, executor, ctx, view_dir) = view_health_fixture();
-        let app = App::default_shared();
-        let cache = HealthRollupCache::new();
-        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
-        let writer = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
-        let path = writer.path().to_path_buf();
-        assert_eq!(crate::db::file_identity::open_connections(&path), 2);
-        ctx.clear_view_runtime();
-        assert_eq!(
-            crate::db::file_identity::open_connections(&path),
-            1,
-            "a writer must not retain the retired runtime's health connection"
-        );
-        drop(writer);
-        assert_eq!(crate::db::file_identity::open_connections(&path), 0);
-    }
-
-    #[test]
-    fn view_health_readiness_replacement_is_in_next_rollup_without_ledger_change() {
-        let (_dir, executor, ctx, _view_dir) = view_health_fixture();
-        let app = App::default_shared();
-        let cache = HealthRollupCache::new();
-        let initial = rolled_up_view(&cache, &executor, &app);
-        assert!(initial["callgraph_readiness_deferred"].is_null());
-        let reads = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
-        for reason in [
-            crate::views::read::CALLGRAPH_READINESS_BUSY,
-            crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED,
-        ] {
-            let mut next = ctx.view_runtime_snapshot().unwrap();
-            next.pending_inputs.insert(
-                b"a.rs".to_vec(),
-                crate::views::assembly::PendingInput {
-                    plane: "callgraph",
-                    reason,
-                    blob_key: None,
-                },
-            );
-            ctx.install_view_runtime(next, None);
-            let view = rolled_up_view(&cache, &executor, &app);
-            assert_eq!(view["generation"], 1);
-            assert_eq!(
-                view["callgraph_readiness_deferred"], reason,
-                "runtime readiness changes must show on the next tick"
-            );
-        }
-        let mut next = ctx.view_runtime_snapshot().unwrap();
-        next.pending_inputs.clear();
-        ctx.install_view_runtime(next, None);
-        assert!(rolled_up_view(&cache, &executor, &app)["callgraph_readiness_deferred"].is_null());
-        assert_eq!(crate::path_status::HEALTH_READS.with(std::cell::Cell::get), reads,
-            "readiness replacement must invalidate the projection without relying on a ledger change");
-    }
-
     fn refresh_until_root_count(
         cache: &HealthRollupCache,
         executor: &Executor,
@@ -6245,62 +6257,6 @@ mod tests {
         }
     }
 
-    fn install_resident_stale_callgraph(
-        ctx: &Arc<AppContext>,
-        root: &ProjectRootId,
-        file_name: &str,
-        remove_file: bool,
-    ) {
-        let project_root = root.as_path().to_path_buf();
-        let file = project_root.join(file_name);
-        std::fs::create_dir_all(file.parent().expect("fixture file parent")).unwrap();
-        std::fs::write(&file, "export function staleFixture() {}\n").unwrap();
-        let store_dir = project_root.join(".callgraph-health-test");
-        let writer =
-            crate::callgraph_store::CallGraphStore::open(store_dir.clone(), project_root.clone())
-                .unwrap();
-        writer.cold_build(std::slice::from_ref(&file)).unwrap();
-        writer
-            .mark_files_stale(std::slice::from_ref(&file))
-            .unwrap();
-        if remove_file {
-            std::fs::remove_file(&file).unwrap();
-        }
-        drop(writer);
-        let reader = crate::callgraph_store::CallGraphStore::open_readonly(store_dir, project_root)
-            .unwrap()
-            .expect("ready resident callgraph store");
-        *ctx.callgraph_store()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(reader));
-    }
-
-    #[test]
-    fn idle_rollup_reuses_resident_stale_path_censuses() {
-        let executor = Executor::new();
-        let app = crate::context::App::default_shared();
-        let mut dirs = Vec::new();
-        for index in 0..111 {
-            let (dir, root) = test_root(&format!("idle-stale-{index}"));
-            let ctx = test_ctx();
-            install_resident_stale_callgraph(&ctx, &root, "src/stale.ts", false);
-            assert!(executor.register_actor(root, ctx));
-            dirs.push(dir);
-        }
-        let cache = HealthRollupCache::new();
-        cache.refresh_for_test(&executor, &app);
-        let before = crate::callgraph_store::STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
-        for _ in 0..5 {
-            cache.refresh_for_test(&executor, &app);
-        }
-        assert_eq!(
-            crate::callgraph_store::STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get) - before,
-            0,
-            "idle ticks must not query stale rows and probe their paths again"
-        );
-        assert_eq!(cache.snapshot().0.metrics["root_count"], 111);
-    }
-
     #[test]
     fn cold_build_holder_census_renders_one_row_per_root_with_sharers() {
         let limiter = crate::cold_build_limiter::isolated_limiter(2);
@@ -6330,125 +6286,6 @@ mod tests {
         assert_eq!(holders[0]["sharers"], 2);
 
         drop((first, second));
-    }
-
-    #[test]
-    fn health_reports_resident_stale_backend_rows_with_absent_paths_distinguished() {
-        let executor = Executor::with_config(crate::executor::ExecutorConfig {
-            pool_size: 1,
-            read_cap: 1,
-            actor_cap: 2,
-            heavy_permits: 1,
-            drr_quantum: 1,
-        });
-        let (_absent_dir, absent_root) = test_root("health-stale-absent");
-        let absent_ctx = test_ctx();
-        install_resident_stale_callgraph(&absent_ctx, &absent_root, "absent.ts", true);
-        assert!(executor.register_actor(absent_root.clone(), absent_ctx.clone()));
-        let (_existing_dir, existing_root) = test_root("health-stale-existing");
-        let existing_ctx = test_ctx();
-        install_resident_stale_callgraph(&existing_ctx, &existing_root, "existing.ts", false);
-        assert!(executor.register_actor(existing_root.clone(), existing_ctx.clone()));
-
-        // Make response-budget pressure deterministic instead of depending on
-        // process-wide telemetry contributed by concurrently running tests.
-        for ctx in [&absent_ctx, &existing_ctx] {
-            *ctx.semantic_index_status().write().unwrap() =
-                crate::context::SemanticIndexStatus::Building {
-                    stage: "x".repeat(HEALTH_METRICS_BUDGET_BYTES),
-                    files: None,
-                    entries_done: None,
-                    entries_total: None,
-                };
-        }
-
-        // Assert the rollup's per-root census before building the byte-budgeted
-        // report; the oversized stages above intentionally make it omit details.
-        let app = App::default_shared();
-        let cache = HealthRollupCache::new();
-        cache.refresh_for_test(&executor, &app);
-        let (rollup, _) = cache.snapshot();
-        let metrics = &rollup.metrics;
-        let roots = metrics["roots"].as_array().expect("per-root health rows");
-        let row_for = |root: &ProjectRootId| {
-            roots
-                .iter()
-                .find(|row| row["project_root"] == root.as_path().display().to_string())
-                .unwrap_or_else(|| panic!("root health row: {metrics}"))
-        };
-        let absent = row_for(&absent_root);
-        assert_eq!(absent["resident_callgraph_stale_backend_rows"], 1);
-        assert_eq!(absent["resident_callgraph_absent_stale_backend_rows"], 1);
-        assert_eq!(
-            absent["resident_callgraph_unreadable_stale_backend_rows"],
-            0
-        );
-        let existing = row_for(&existing_root);
-        assert_eq!(existing["resident_callgraph_stale_backend_rows"], 1);
-        assert_eq!(existing["resident_callgraph_absent_stale_backend_rows"], 0);
-        assert_eq!(
-            existing["resident_callgraph_unreadable_stale_backend_rows"],
-            0
-        );
-
-        let report = build_health_report(
-            &cache,
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-        );
-        let bounded = report.metrics.expect("bounded health metrics");
-        assert_eq!(bounded["root_count"], 2);
-        assert_eq!(bounded["root_details_omitted"], 1);
-        let roots = bounded["roots"].as_array().unwrap();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0]["abbreviated"], true);
-        assert_eq!(roots[0]["semantic_index"]["status"], "building");
-        assert!(bounded["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn health_counts_unreadable_resident_stale_backend_paths_separately() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let executor = Executor::with_config(crate::executor::ExecutorConfig {
-            pool_size: 1,
-            read_cap: 1,
-            actor_cap: 1,
-            heavy_permits: 1,
-            drr_quantum: 1,
-        });
-        let (_dir, root) = test_root("health-stale-unreadable");
-        let ctx = test_ctx();
-        install_resident_stale_callgraph(&ctx, &root, "guarded/unreadable.ts", false);
-        assert!(executor.register_actor(root.clone(), ctx));
-        let guarded = root.as_path().join("guarded");
-        let original_mode = std::fs::metadata(&guarded).unwrap().permissions().mode();
-        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0)).unwrap();
-
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &App::default_shared(),
-        );
-
-        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(original_mode)).unwrap();
-        let metrics = report.metrics.expect("health metrics");
-        assert_eq!(
-            metrics["roots"][0]["resident_callgraph_stale_backend_rows"],
-            1
-        );
-        assert_eq!(
-            metrics["roots"][0]["resident_callgraph_absent_stale_backend_rows"],
-            0
-        );
-        assert_eq!(
-            metrics["roots"][0]["resident_callgraph_unreadable_stale_backend_rows"],
-            1
-        );
     }
 
     fn cached_reply_median(
@@ -6838,104 +6675,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "offline measurement of per-root rollup costs on a populated root"]
-    fn bench_health_rollup_per_root_costs() {
-        const FILES: usize = 2_000;
-        const SYMBOLS: usize = 40;
-        let (_dir, root) = test_root("rollup-per-root");
-        let ctx = test_ctx();
-        {
-            let cache = ctx.symbol_cache();
-            let mut cache = cache.write().unwrap();
-            for file in 0..FILES {
-                let symbols = (0..SYMBOLS)
-                    .map(|index| crate::symbols::Symbol {
-                        name: format!("symbol_{file}_{index}"),
-                        kind: crate::symbols::SymbolKind::Function,
-                        range: crate::symbols::Range {
-                            start_line: 0,
-                            start_col: 0,
-                            end_line: 0,
-                            end_col: 10,
-                        },
-                        signature: Some(format!("fn symbol_{file}_{index}()")),
-                        scope_chain: vec!["module".into()],
-                        exported: true,
-                        parent: None,
-                    })
-                    .collect();
-                cache.insert(
-                    root.as_path().join(format!("src/file_{file}.rs")),
-                    std::time::SystemTime::UNIX_EPOCH,
-                    1,
-                    blake3::hash(&file.to_le_bytes()),
-                    symbols,
-                );
-            }
-        }
-        let files: Vec<_> = (0..FILES)
-            .map(|file| {
-                let path = root.as_path().join(format!("src/f{file}.ts"));
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(
-                    &path,
-                    format!("export function f{file}() {{ return {file}; }}\n"),
-                )
-                .unwrap();
-                path
-            })
-            .collect();
-        let store_dir = root.as_path().join(".callgraph-bench");
-        let writer = crate::callgraph_store::CallGraphStore::open(
-            store_dir.clone(),
-            root.as_path().to_path_buf(),
-        )
-        .unwrap();
-        writer.cold_build(&files).unwrap();
-        writer.mark_files_stale(&files[..FILES / 10]).unwrap();
-        drop(writer);
-        let reader = crate::callgraph_store::CallGraphStore::open_readonly(
-            store_dir,
-            root.as_path().to_path_buf(),
-        )
-        .unwrap()
-        .expect("ready store");
-        *ctx.callgraph_store().write().unwrap() = Some(Arc::new(reader));
-        let time = |label: &str, run: &dyn Fn()| {
-            run();
-            let started = Instant::now();
-            for _ in 0..20 {
-                run();
-            }
-            println!(
-                "per-root {label}: {} us per rollup",
-                started.elapsed().as_micros() / 20
-            );
-        };
-        time("memory walk (status path, always walks)", &|| {
-            std::hint::black_box(ctx.memory_root_snapshot());
-        });
-        time("memory (rollup path, unchanged root)", &|| {
-            std::hint::black_box(ctx.memory_root_snapshot_and_rollup());
-        });
-        time("stale_path_census", &|| {
-            let store = ctx.callgraph_store().read().unwrap();
-            std::hint::black_box(store.as_ref().unwrap().try_stale_path_census().unwrap());
-        });
-        time("health_summary", &|| {
-            std::hint::black_box(ctx.try_health_summary());
-        });
-        let executor = Executor::new();
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
-        time("full rollup (1 root)", &|| {
-            cache.refresh_for_test(&executor, &app);
-            assert_eq!(cache.snapshot().0.metrics["root_count"], 1);
-        });
-    }
-
-    #[test]
     fn health_names_future_bash_tasks_without_global_shell_degradation() {
         let (dir, root) = test_root("health-task-refusal");
         let storage = dir.path().join("storage");
@@ -7284,6 +7023,9 @@ mod tests {
     #[test]
     fn rollup_allocator_remeasures_expired_observation() {
         let cache = HealthRollupCache::new();
+        // Model a cheap walk, so the reuse window stays at its 30 s floor even
+        // if a loaded test host makes the real walk slow.
+        cache.allocator_walk_ms_for_test.store(0, Ordering::Relaxed);
         cache.clock_ms.store(0, Ordering::Relaxed);
         allocator_rollup(&cache);
         let before = crate::memory::allocator_snapshot_calls_for_test();
@@ -7293,6 +7035,39 @@ mod tests {
             crate::memory::allocator_snapshot_calls_for_test() - before,
             1
         );
+    }
+
+    #[test]
+    fn rollup_allocator_reuse_window_stretches_with_walk_cost() {
+        let cache = HealthRollupCache::new();
+        let walks = || crate::memory::allocator_snapshot_calls_for_test();
+        let refresh_at = |now_ms: u64| {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            allocator_rollup(&cache);
+        };
+        // A one-second walk, as glibc takes on a fragmented multi-GiB heap:
+        // the next walk waits 200 times as long.
+        cache
+            .allocator_walk_ms_for_test
+            .store(1_000, Ordering::Relaxed);
+        let before = walks();
+        for now_ms in (0..=198_000).step_by(3_000) {
+            refresh_at(now_ms);
+        }
+        assert_eq!(
+            walks() - before,
+            1,
+            "67 refreshes over 198 s must share one expensive walk"
+        );
+        // Past the stretched window the rollup walks again; this walk is
+        // cheap, so the window drops back to its 30 s floor.
+        cache.allocator_walk_ms_for_test.store(0, Ordering::Relaxed);
+        refresh_at(200_001);
+        assert_eq!(walks() - before, 2);
+        refresh_at(227_001);
+        assert_eq!(walks() - before, 2);
+        refresh_at(230_002);
+        assert_eq!(walks() - before, 3);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -7458,7 +7233,7 @@ mod tests {
         assert!(snapshot.metrics.get("health_rollup_tick").is_none());
         assert_eq!(tick["steps"]["per-root memory census"]["calls"], 110);
         assert_eq!(tick["steps"]["lifecycle OS probes"]["calls"], 1);
-        assert_eq!(tick["steps"].as_object().unwrap().len(), 14);
+        assert_eq!(tick["steps"].as_object().unwrap().len(), 13);
         assert!(tick["elapsed_ms"].as_f64().unwrap() >= 0.0);
         let census = cache.memory_census();
         assert_eq!(census["health_rollup_tick"]["age_ms"], 0);
@@ -7551,80 +7326,6 @@ mod tests {
             census["roots"][label.as_str()]["memory_measured_age_ms"].is_u64(),
             "the census row must carry its age: {census}"
         );
-    }
-
-    fn install_arena_runs(
-        arena: &crate::views::semantic_arena::SemanticArena,
-        runs: std::ops::Range<u64>,
-        chunks: usize,
-    ) {
-        for run in runs {
-            let mut key = [0u8; 32];
-            key[..8].copy_from_slice(&run.to_le_bytes());
-            arena.install(
-                crate::blob_store::v2::FamilyKey::new(
-                    crate::blob_store::v2::FamilyPlane::Semantic,
-                    key,
-                ),
-                crate::semantic_index::SemanticVectors::synthetic_for_test(
-                    Path::new(&format!("src/run_{run}.rs")),
-                    chunks,
-                    2,
-                ),
-            );
-        }
-    }
-
-    /// The census row of one arena family, as `memory.census` reports it.
-    fn census_family_row(census: &Value, family: &str) -> Value {
-        census["process"]["semantic_arenas"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["family"] == family))
-            .cloned()
-            .unwrap_or(Value::Null)
-    }
-
-    /// Walking an arena's runs visits every vector they hold. Nothing about
-    /// the runs changes between rollups unless a run is added or dropped, so
-    /// only those two changes may walk them again, and each must show at once.
-    #[test]
-    fn arena_memory_is_walked_again_only_when_its_runs_change() {
-        let storage = tempfile::tempdir().unwrap();
-        let arena = crate::views::semantic_arena::arena_for(storage.path(), "walk-on-change");
-        install_arena_runs(&arena, 0..4, 10);
-        let walks = || arena.run_memory_walks_for_test();
-        let first = arena.memory();
-        assert_eq!((first.runs, first.chunks), (4, 40));
-        // Rollups of tests running in parallel census every live arena, so
-        // they may have walked this one between the installs above. Once the
-        // runs stop changing, each change is walked exactly once, by
-        // whichever thread reads it first.
-        let after_first = walks();
-        assert!(after_first >= 1, "the first read must walk the runs");
-        for _ in 0..5 {
-            assert_eq!(arena.memory(), first, "unchanged runs reported new totals");
-        }
-        assert_eq!(walks(), after_first, "unchanged runs were walked again");
-
-        install_arena_runs(&arena, 4..5, 10);
-        let grown = arena.memory();
-        assert_eq!(
-            (grown.runs, grown.chunks),
-            (5, 50),
-            "an added run was missed"
-        );
-        assert!(grown.bytes > first.bytes);
-        assert_eq!(walks(), after_first + 1);
-
-        // Nothing but the arena holds the runs, so trimming drops them all.
-        assert_eq!(arena.trim(), 5);
-        let trimmed = arena.memory();
-        assert_eq!(
-            (trimmed.runs, trimmed.chunks),
-            (0, 0),
-            "dropped runs were still counted"
-        );
-        assert_eq!(walks(), after_first + 2);
     }
 
     #[test]
@@ -7830,147 +7531,6 @@ mod tests {
         }
     }
 
-    /// What a rollup costs while nothing changes, counted rather than timed:
-    /// it walks no arena runs and no root index, and it measures no memory
-    /// census, however many roots and resident chunks there are. The compact
-    /// memory figures are still measured on every rollup.
-    #[test]
-    fn an_unchanged_rollup_does_constant_work_per_tick() {
-        let storage = tempfile::tempdir().unwrap();
-        let arena = crate::views::semantic_arena::arena_for(storage.path(), "constant-work");
-        install_arena_runs(&arena, 0..50, 100);
-        let executor = Executor::new();
-        let app = crate::context::App::default_shared();
-        let mut dirs = Vec::new();
-        for index in 0..20 {
-            let (dir, root) = test_root(&format!("constant-work-{index}"));
-            assert!(executor.register_actor(root, test_ctx()));
-            dirs.push(dir);
-        }
-        let cache = HealthRollupCache::new();
-        cache.clock_ms.store(0, Ordering::Relaxed);
-        let counters = || {
-            (
-                arena.run_memory_walks_for_test(),
-                crate::context::memory_estimate_walks_for_test(),
-                cache.census_builds_for_test(),
-            )
-        };
-        let before_first = counters();
-        cache.refresh_for_test(&executor, &app);
-        let after_first = counters();
-        // Parallel tests' rollups also census this arena, so the walk of its
-        // runs may have been made on another thread; it was made once.
-        assert!(after_first.0 >= 1, "no rollup walked the arena");
-        assert_eq!(
-            after_first.1 - before_first.1,
-            20,
-            "one index walk per root"
-        );
-        assert_eq!(
-            after_first.2 - before_first.2,
-            1,
-            "the first rollup measures the census"
-        );
-        // Nine more rollups, three seconds apart: 27 s, inside the census
-        // interval, with no census read in between.
-        for tick in 1..=9u64 {
-            cache.clock_ms.store(tick * 3_000, Ordering::Relaxed);
-            let before = counters();
-            cache.refresh_for_test(&executor, &app);
-            let after = counters();
-            assert_eq!(
-                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
-                (0, 0, 0),
-                "rollup {tick} redid work for unchanged inputs (arena walks, index walks, census builds)"
-            );
-            let (snapshot, age) = cache.snapshot();
-            assert_eq!(age, Some(0));
-            assert_eq!(snapshot.metrics["root_count"], 20);
-            // The rollup still times every step, including the census steps
-            // it passed through without measuring a census.
-            assert_eq!(snapshot.tick["steps"].as_object().unwrap().len(), 14);
-            assert!(
-                snapshot.metrics["memory"]["semantic_arena_bytes"]
-                    .as_u64()
-                    .unwrap()
-                    >= arena.memory().bytes,
-                "the compact memory figures must still count the arena"
-            );
-        }
-    }
-
-    /// The full census is measured when a read asks for it, when its roots
-    /// change, or when it reaches the census interval; in between the rollup
-    /// carries it, and a read reports how old it and its figures are.
-    #[test]
-    fn the_memory_census_is_measured_on_demand_and_reports_its_age() {
-        let storage = tempfile::tempdir().unwrap();
-        let family = "census-on-demand";
-        let arena = crate::views::semantic_arena::arena_for(storage.path(), family);
-        install_arena_runs(&arena, 0..2, 10);
-        let executor = Executor::new();
-        let app = crate::context::App::default_shared();
-        let (_first_dir, first_root) = test_root("census-on-demand-first");
-        assert!(executor.register_actor(first_root.clone(), test_ctx()));
-        let first_label = first_root.as_path().display().to_string();
-        let cache = HealthRollupCache::new();
-        let builds = || cache.census_builds_for_test();
-        let refresh_at = |now_ms: u64| {
-            cache.clock_ms.store(now_ms, Ordering::Relaxed);
-            let before = builds();
-            cache.refresh_for_test(&executor, &app);
-            builds() - before
-        };
-        assert_eq!(refresh_at(0), 1, "the first rollup measures the census");
-        let measured_bytes = census_family_row(&cache.memory_census(), family)["bytes"].clone();
-        assert!(measured_bytes.as_u64().is_some_and(|bytes| bytes > 0));
-        // That read asked for a fresh census; the next rollup measures it.
-        assert_eq!(refresh_at(3_000), 1, "a census read was not answered");
-        assert_eq!(refresh_at(6_000), 0, "a census was measured with no read");
-
-        // A change no read has asked about yet: the carried census still
-        // shows the old figures, and says they are 4 s old.
-        install_arena_runs(&arena, 2..3, 10);
-        cache.clock_ms.store(7_000, Ordering::Relaxed);
-        let carried = cache.memory_census();
-        assert_eq!(carried["health_rollup_tick"]["age_ms"], 4_000);
-        assert_eq!(census_family_row(&carried, family)["bytes"], measured_bytes);
-        assert!(
-            carried["roots"][&first_label]["memory_measured_age_ms"]
-                .as_u64()
-                .is_some_and(|age| age >= 4_000),
-            "a carried row must count the census age: {carried}"
-        );
-        assert_eq!(refresh_at(9_000), 1);
-        let fresh = cache.memory_census();
-        assert_eq!(fresh["health_rollup_tick"]["age_ms"], 0);
-        assert!(
-            census_family_row(&fresh, family)["bytes"].as_u64().unwrap()
-                > measured_bytes.as_u64().unwrap(),
-            "the census measured after the read missed the added run"
-        );
-
-        // A root bound since the last census is measured at once.
-        assert_eq!(refresh_at(12_000), 1, "the read above was not answered");
-        let (_second_dir, second_root) = test_root("census-on-demand-second");
-        assert!(executor.register_actor(second_root.clone(), test_ctx()));
-        assert_eq!(
-            refresh_at(15_000),
-            1,
-            "a newly bound root waited for the interval"
-        );
-        let second_label = second_root.as_path().display().to_string();
-        assert!(cache.snapshot().0.memory_census["roots"]
-            .get(&second_label)
-            .is_some());
-
-        // With no read and no root change, the census is measured again once
-        // it reaches the interval.
-        assert_eq!(refresh_at(44_999), 0);
-        assert_eq!(refresh_at(45_000), 1, "the census outlived its interval");
-    }
-
     fn census_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8067,74 +7627,12 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /// Reads add files to a root's symbol cache far more often than edits
-    /// change its trigram index, and the trigram walk visits every indexed
-    /// file. A symbol-cache change must re-walk only the symbol cache, an
-    /// edit only the trigram index, and the reported age must stay that of
-    /// the oldest walk still in use.
+    /// The call-graph build breaker under `callgraph/<key>/` belongs to the
+    /// stores AFT 0.64 no longer builds, and `aft cache prune-legacy` deletes
+    /// it. Health must not read it: a stale file would report suspended
+    /// domains for builds that never run.
     #[test]
-    fn rollup_rewalks_only_the_index_whose_shape_changed() {
-        let ctx = test_ctx();
-        let mut index = crate::search_index::SearchIndex::new();
-        index.index_file(Path::new("/rollup-split/a.rs"), b"fn a() {}");
-        *ctx.search_index().write().unwrap() = Some(index);
-        let measure = || {
-            let before = crate::context::memory_index_walks_for_test();
-            let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
-            let after = crate::context::memory_index_walks_for_test();
-            (
-                [
-                    after[0] - before[0],
-                    after[1] - before[1],
-                    after[2] - before[2],
-                ],
-                rollup.measured_age_ms.expect("rollup age"),
-            )
-        };
-        // No semantic index is installed, so there is nothing to walk there.
-        assert_eq!(
-            measure().0,
-            [0, 1, 1],
-            "the first rollup walks both indexes"
-        );
-        std::thread::sleep(Duration::from_millis(30));
-        assert_eq!(measure().0, [0, 0, 0], "an unchanged root was walked again");
-
-        ctx.symbol_cache().write().unwrap().insert(
-            std::path::PathBuf::from("/rollup-split/read.rs"),
-            std::time::SystemTime::UNIX_EPOCH,
-            1,
-            blake3::hash(b"read"),
-            Vec::new(),
-        );
-        let (walks, age) = measure();
-        assert_eq!(
-            walks,
-            [0, 0, 1],
-            "a read must re-walk only the symbol cache"
-        );
-        assert!(
-            age >= 30,
-            "the reused trigram walk is the oldest figure, got age {age}"
-        );
-
-        ctx.search_index()
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .index_file(Path::new("/rollup-split/b.rs"), b"fn b() {}");
-        let (walks, age) = measure();
-        assert_eq!(
-            walks,
-            [0, 1, 0],
-            "an edit must re-walk only the trigram index"
-        );
-        assert!(age < 30, "every walk in use is recent, got age {age}");
-    }
-
-    #[test]
-    fn rollup_reuses_breaker_connection_and_reopens_after_read_error() {
+    fn rollup_never_opens_the_legacy_callgraph_breaker() {
         let (storage, root) = test_root("health-breaker-cache");
         let mut config = crate::config::Config::default();
         config.storage_dir = Some(storage.path().join("state"));
@@ -8144,7 +7642,7 @@ mod tests {
         ));
         let executor = Executor::new();
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let key = crate::search_index::artifact_cache_key(root.as_path());
+        let key = crate::root_identity::key::artifact_cache_key(root.as_path());
         let path = ctx
             .storage_dir()
             .join("callgraph")
@@ -8159,17 +7657,8 @@ mod tests {
         cache.refresh(&executor, &app);
         assert_eq!(
             crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
-            1,
-            "consecutive rollups over the same root reuse one cached breaker"
-        );
-
-        crate::build_breaker::BuildDeathBreaker::fail_next_active_suspensions_for_test();
-        cache.refresh(&executor, &app);
-        cache.refresh(&executor, &app);
-        assert_eq!(
-            crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
-            2,
-            "a read error evicts the cached breaker and the next rollup reopens it"
+            0,
+            "the health rollup opened the legacy call-graph breaker"
         );
     }
 
@@ -8424,9 +7913,14 @@ mod tests {
             Some("1 root(s) warming background indexes (serving normally)")
         );
         let metrics = report.metrics.expect("health metrics");
-        assert_eq!(metrics["roots"][0]["search_index"]["status"], "disabled");
+        // The data layer serves the text search index and the call graph;
+        // when the configuration switches either off, health reports it
+        // "off", the word every index consumer uses
+        // (spec/feature-config/consumer-responses.json). Semantic search
+        // still reports its own index.
+        assert_eq!(metrics["roots"][0]["search_index"]["status"], "off");
         assert_eq!(metrics["roots"][0]["semantic_index"]["status"], "disabled");
-        assert_eq!(metrics["roots"][0]["callgraph_store"]["status"], "disabled");
+        assert_eq!(metrics["roots"][0]["callgraph_store"]["status"], "off");
         assert_eq!(metrics["roots"][0]["tier2"]["status"], "building");
 
         ctx.inspect_manager()
@@ -8484,20 +7978,23 @@ mod tests {
     }
 
     #[test]
-    fn disabled_callgraph_store_reports_disabled_despite_lingering_build_receiver() {
+    fn switched_off_callgraph_reports_off_not_building_in_a_contended_read() {
         let executor = Executor::new();
-        let (_dir, root) = test_root("health-callgraph-disabled-lingering-rx");
+        let (_dir, root) = test_root("health-callgraph-switched-off");
+        std::fs::write(root.as_path().join("lib.rs"), "pub fn lib() {}\n").unwrap();
         let mut config = crate::config::Config::default();
+        config.project_root = Some(root.as_path().to_path_buf());
         config.indexes.callgraph = false;
         let ctx = Arc::new(AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
-        // Reproduce the configure window in which the disabling config is
-        // already published while the previous generation's build receiver
-        // has not been retired yet.
-        let (_tx, rx) = crossbeam_channel::unbounded::<crate::context::CallGraphStoreBuildEvent>();
-        *ctx.callgraph_store_rx().lock() = Some(rx);
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        // The root's checkout is bound and builds the text search index
+        // alone: the call graph reports off because the configuration
+        // switches it off, not because nothing has bound the root yet.
+        let checkout = ctx.data_checkout().expect("the data layer binds the root");
+        assert!(!checkout.checkout().planes().callgraph);
         assert!(executor.register_actor(root.clone(), ctx));
 
         let app = crate::context::App::default_shared();
@@ -8506,7 +8003,7 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let mut reads = 0;
         let report = health_report_after_scheduler_contention(
-            "disabled_callgraph_store_reports_disabled_despite_lingering_build_receiver",
+            "switched_off_callgraph_reports_off_not_building_in_a_contended_read",
             || {
                 reads += 1;
                 let read_report =
@@ -8525,15 +8022,15 @@ mod tests {
         assert_ne!(
             report.status,
             HealthStatus::Degraded,
-            "a disabled store is not a degradation: {report:?}"
+            "a switched-off call graph is not a degradation: {report:?}"
         );
         // build_health_report reads one rollup Arc for both the verdict and
-        // the roots detail, so they describe the same moment: the component
-        // must not claim "building" for a store this config disables.
+        // the roots detail, so they describe the same moment.
         let metrics = report.metrics.expect("health metrics");
         assert_eq!(
-            metrics["roots"][0]["callgraph_store"]["status"], "disabled",
-            "a disabled store must never report building: {metrics:#}"
+            metrics["roots"][0]["callgraph_store"],
+            json!({"status": "off"}),
+            "a switched-off call graph reports off, never building: {metrics:#}"
         );
     }
 
@@ -8649,65 +8146,6 @@ mod tests {
                 "breadcrumb omitted configure phase timings: {breadcrumb}"
             );
         }
-    }
-
-    #[test]
-    fn callgraph_repair_rate_is_always_present_and_hot_root_scoped() {
-        let executor = Executor::with_config(crate::executor::ExecutorConfig {
-            pool_size: 1,
-            read_cap: 1,
-            actor_cap: 1,
-            heavy_permits: 1,
-            drr_quantum: 1,
-        });
-        let (_dir, root) = test_root("health-callgraph-repair-rate");
-        assert!(executor.register_actor(root.clone(), test_ctx()));
-        let metrics = DispatchPathMetrics::new();
-        let app = crate::context::App::default_shared();
-        // The production annotation path reads the derivation map only
-        // (never spawns git), so derive the key the way configure would —
-        // artifact_cache_key records it as a side effect.
-        let project_key = crate::search_index::artifact_cache_key(root.as_path());
-
-        let quiet = test_health_report(&executor, &HashMap::new(), &metrics, &app);
-        let quiet_metrics = quiet.metrics.expect("quiet health metrics");
-        assert_eq!(
-            quiet_metrics["callgraph_repair_entries_60s_total"].as_u64(),
-            Some(0)
-        );
-        assert!(quiet_metrics["callgraph_commits_60s_total"].is_u64());
-        assert!(quiet_metrics["callgraph_pages_or_bytes_written_60s_total"].is_u64());
-        assert!(quiet_metrics["roots"][0]
-            .get("callgraph_commits_60s")
-            .is_none());
-        assert!(quiet_metrics["roots"][0]
-            .get("callgraph_repair_entries_60s")
-            .is_none());
-
-        for _ in 0..3 {
-            crate::callgraph_store::note_repair_entry(&project_key);
-        }
-        let hot = test_health_report(&executor, &HashMap::new(), &metrics, &app);
-        let hot_metrics = hot.metrics.expect("hot health metrics");
-        assert_eq!(
-            hot_metrics["callgraph_repair_entries_60s_total"].as_u64(),
-            Some(3)
-        );
-        assert_eq!(
-            hot_metrics["roots"][0]["callgraph_repair_entries_60s"].as_u64(),
-            Some(3)
-        );
-
-        crate::callgraph_store::expire_repair_entry_window_for_test(&project_key);
-        let decayed = test_health_report(&executor, &HashMap::new(), &metrics, &app);
-        let decayed_metrics = decayed.metrics.expect("decayed health metrics");
-        assert_eq!(
-            decayed_metrics["callgraph_repair_entries_60s_total"].as_u64(),
-            Some(0)
-        );
-        assert!(decayed_metrics["roots"][0]
-            .get("callgraph_repair_entries_60s")
-            .is_none());
     }
 
     #[test]
@@ -8992,151 +8430,6 @@ mod tests {
     }
 
     #[test]
-    fn health_snapshot_fast_fails_while_mutating_job_holds_component_lock() {
-        let executor = Executor::with_config(crate::executor::ExecutorConfig {
-            pool_size: 1,
-            read_cap: 1,
-            actor_cap: 1,
-            heavy_permits: 1,
-            drr_quantum: 1,
-        });
-        let (_dir, root) = test_root("health-mutating-lock");
-        let ctx = test_ctx();
-        executor.register_actor(root.clone(), Arc::clone(&ctx));
-        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        let blocker = executor.submit(
-            root,
-            Lane::Mutating,
-            "health-lock-blocker".to_string(),
-            Box::new(move |ctx| {
-                let _index = ctx
-                    .search_index()
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                started_tx.send(()).expect("signal held health lock");
-                release_rx.recv().expect("release held health lock");
-                Response::success("health-lock-blocker", json!({ "ok": true }))
-            }),
-        );
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("mutating lock holder starts");
-
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &crate::context::App::default_shared(),
-        );
-
-        // Settle the holder before asserting so a verdict failure cannot drop the release
-        // sender and make the worker panic while the test unwinds.
-        release_tx.send(()).expect("release held health lock");
-        blocker
-            .recv_timeout(Duration::from_secs(3))
-            .expect("mutating lock holder completes");
-
-        assert_eq!(report.status, HealthStatus::Degraded);
-    }
-
-    #[test]
-    fn health_retention_incomplete_is_counted_separately_from_failures() {
-        for reason in [
-            "cache: retention deadline reached",
-            "binding_history_incomplete: examined=8192 accumulated=8192 restarted=true",
-        ] {
-            let mut reports = std::collections::BTreeMap::from([(
-                "/storage".into(),
-                crate::storage_retention::SweepReport {
-                    incomplete: vec![reason.into()],
-                    ..Default::default()
-                },
-            )]);
-            let totals = retention_report_totals(&reports);
-            assert_eq!(totals["errors"], 0);
-            assert_eq!(totals["incomplete"], 1);
-
-            reports
-                .get_mut("/storage")
-                .unwrap()
-                .errors
-                .push("removal refused".into());
-            let totals = retention_report_totals(&reports);
-            assert_eq!(totals["errors"], 1);
-            assert_eq!(totals["incomplete"], 1);
-        }
-    }
-
-    #[test]
-    fn health_retention_reports_fit_budget_with_exact_omissions_and_totals() {
-        let reports = (0..128)
-            .map(|index| {
-                (
-                    format!(
-                        "/storage/long-checkout-name-{index:04}/{}",
-                        "subdirectory/".repeat(12)
-                    ),
-                    crate::storage_retention::SweepReport {
-                        examined: 17,
-                        removed_roots: 3,
-                        removed_bytes: 4096,
-                        errors: vec!["example maintenance error".repeat(8)],
-                        incomplete: vec!["retention deadline reached".into()],
-                        trash: crate::storage_retention::TrashReport {
-                            at_ms: crate::pins::now_ms(),
-                            entries: 2,
-                            bytes_estimate: 1_500_000_000,
-                            oldest_age_ms: Some(7_200_000),
-                            removed_entries: 1,
-                            incomplete: true,
-                            kept_by_reason: std::collections::BTreeMap::from([(
-                                "witness".into(),
-                                2,
-                            )]),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let totals = retention_report_totals(&reports);
-        let mut metrics = json!({
-            "roots": [],
-            "storage_retention": reports,
-            "storage_retention_totals": totals,
-            "storage_retention_reports_omitted": 0,
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        budget_health_metrics(&mut metrics);
-        let retained = metrics["storage_retention"].as_object().unwrap().len() as u64;
-        let omitted = metrics["storage_retention_reports_omitted"]
-            .as_u64()
-            .unwrap();
-        assert!(omitted > 0, "the fixture must exceed the detail budget");
-        assert_eq!(retained + omitted, 128);
-        assert_eq!(metrics["storage_retention_totals"]["reports"], 128);
-        assert_eq!(metrics["storage_retention_totals"]["examined"], 2176);
-        assert_eq!(metrics["storage_retention_totals"]["removed_roots"], 384);
-        assert_eq!(metrics["storage_retention_totals"]["removed_bytes"], 524288);
-        assert_eq!(metrics["storage_retention_totals"]["errors"], 128);
-        assert_eq!(metrics["storage_retention_totals"]["incomplete"], 128);
-        let trash = &metrics["storage_retention_totals"]["trash"];
-        assert_eq!(trash["entries"], 256);
-        assert_eq!(trash["bytes_estimate"], 192_000_000_000_u64);
-        assert_eq!(trash["removed_entries"], 128);
-        assert_eq!(trash["kept_by_reason"]["witness"], 256);
-        assert_eq!(trash["incomplete"], true);
-        assert!(trash["oldest_age_ms"].as_u64().unwrap() >= 7_200_000);
-        let encoded = serde_json::to_vec(&metrics).unwrap();
-        assert!(encoded.len() <= 12 * 1024);
-        assert_eq!(metrics["metrics_bytes"], encoded.len());
-    }
-
-    #[test]
     fn cached_health_reply_is_fixed_cost_and_caps_root_detail_before_assembly() {
         fn fixture(root_count: usize) -> (Executor, Vec<tempfile::TempDir>) {
             let executor = Executor::with_config(crate::executor::ExecutorConfig {
@@ -9225,6 +8518,107 @@ mod tests {
             "cached reply payload scaled with roots: five={five_bytes}, fifty={fifty_bytes}"
         );
         std::hint::black_box((five_dirs, fifty_dirs));
+    }
+
+    #[test]
+    fn health_names_roots_whose_index_store_failed_within_the_reply_budgets() {
+        use crate::data_layer::surfaces::{reason, DataCheckoutProbe};
+        let app = crate::context::App::default_shared();
+        for root_count in [1usize, 50] {
+            let executor = Executor::with_config(crate::executor::ExecutorConfig {
+                pool_size: 1,
+                read_cap: 1,
+                actor_cap: 64,
+                heavy_permits: 1,
+                drr_quantum: 1,
+            });
+            let mut dirs = Vec::with_capacity(root_count);
+            let mut paths = Vec::with_capacity(root_count);
+            for index in 0..root_count {
+                let (dir, root) = test_root(&format!("store-failed-{root_count}-{index:02}"));
+                let ctx = test_ctx();
+                // The index store writes under `data` in the storage folder;
+                // a regular file there makes its bind fail, as a root the
+                // operating system keeps the daemon out of does, while the
+                // rest of the storage folder works.
+                let storage = dir.path().join("storage");
+                std::fs::create_dir(&storage).expect("create the storage folder");
+                std::fs::write(storage.join("data"), b"").expect("block the index store");
+                ctx.update_config(|config| config.storage_dir = Some(storage));
+                ctx.set_canonical_cache_root(
+                    std::fs::canonicalize(dir.path()).expect("canonical root"),
+                );
+                assert!(ctx.data_checkout().is_none(), "the bind fails");
+                assert!(matches!(
+                    ctx.probe_data_checkout(),
+                    Some(DataCheckoutProbe::BindFailed(_))
+                ));
+                paths.push(root.as_path().display().to_string());
+                assert!(executor.register_actor(root, ctx));
+                dirs.push(dir);
+            }
+            paths.sort();
+            let cache = HealthRollupCache::new();
+            let report = refresh_until_root_count(&cache, &executor, &app, root_count as u64);
+            let report_bytes = serde_json::to_vec(&report)
+                .expect("serialize health report")
+                .len();
+            assert_eq!(report.status, HealthStatus::Degraded, "{report:?}");
+            let detail = report.detail.clone().expect("a degraded detail");
+            let metrics = report.metrics.expect("health metrics");
+
+            let named = root_count.min(HEALTH_DATA_STORE_FAILED_NAMED);
+            assert_eq!(metrics["data_store_failed_roots"], json!(root_count));
+            assert_eq!(
+                metrics["data_store_failed"],
+                json!(paths[..named]
+                    .iter()
+                    .map(|path| json!({"project_root": path, "reason": reason::BIND_FAILED}))
+                    .collect::<Vec<_>>())
+            );
+            assert_eq!(
+                metrics["data_store_failed_omitted"],
+                json!(root_count - named)
+            );
+            let metrics_bytes = metrics["metrics_bytes"].as_u64().expect("metrics bytes") as usize;
+            assert_eq!(
+                metrics_bytes,
+                serde_json::to_vec(&metrics).expect("encode metrics").len()
+            );
+            assert!(
+                metrics_bytes <= HEALTH_METRICS_BUDGET_BYTES,
+                "{metrics_bytes}"
+            );
+
+            // The detail names the same roots, in the same order, and counts
+            // the rest, within its own cap.
+            let names = detail
+                .split_once("could not build or refresh their index store")
+                .and_then(|(_, rest)| rest.split_once("; see roots[].data_store"))
+                .map(|(names, _)| names)
+                .unwrap_or_else(|| panic!("the detail names no failed roots: {detail}"));
+            assert!(
+                names.len() <= HEALTH_DATA_STORE_FAILED_DETAIL_BYTES,
+                "{names}"
+            );
+            let expected = paths[..named]
+                .iter()
+                .map(|path| format!("{path} (bind_failed)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tail = if root_count > named {
+                format!(" and {} more", root_count - named)
+            } else {
+                String::new()
+            };
+            assert_eq!(names, format!(": {expected}{tail}"));
+            eprintln!(
+                "failed index stores: roots={root_count} metrics_bytes={metrics_bytes} \
+                 detail_bytes={} report_bytes={report_bytes}",
+                detail.len()
+            );
+            std::hint::black_box(dirs);
+        }
     }
 
     #[test]
@@ -9370,6 +8764,70 @@ mod tests {
             .is_none());
     }
 
+    /// A one-root reply has room for the data layer's meaning fill at its
+    /// largest: a fill that waits for another, with every count present,
+    /// large, and a failure, keeps the root's full row within the budget.
+    #[test]
+    fn one_root_reply_fits_the_meaning_fill_at_its_largest() {
+        use crate::data_layer::surfaces::{MeaningCoverage, MeaningPlane, MeaningReport};
+        let executor = Executor::new();
+        let (_dir, root) = test_root("meaning-fill-health-budget");
+        let ctx = test_ctx();
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let app = App::default_shared();
+        let dispatch = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let mut report = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
+            .metrics
+            .expect("health metrics");
+        let baseline = report["metrics_bytes"].as_u64().unwrap();
+        let fill = MeaningReport {
+            plane: MeaningPlane::Serving {
+                complete: false,
+                refreshing: false,
+                coverage: MeaningCoverage {
+                    files: 123_456,
+                    files_embedded: 100_000,
+                    files_too_large: 1_234,
+                    files_failed: 1_234,
+                    files_pending: 20_988,
+                    files_past_cap: 99_999,
+                    chunks: 9_999_999,
+                    chunks_embedded: 8_888_888,
+                    chunks_failed: 12_345,
+                },
+                error: Some("embedding backend: the request timed out after 30 s".into()),
+            },
+            filling: true,
+            waiting: true,
+            times: crate::data_layer::meaning::FillTimes {
+                started_at_ms: Some(1_790_000_000_000),
+                stored_at_ms: Some(1_790_000_600_000),
+            },
+        };
+        let fill = serde_json::to_value(fill.health()).unwrap();
+        let semantic = report["roots"][0]["semantic_index"]
+            .as_object_mut()
+            .expect("the root's semantic_index");
+        for (key, value) in fill.as_object().unwrap() {
+            semantic.insert(key.clone(), value.clone());
+        }
+        let mut metrics = report.as_object().unwrap().clone();
+        budget_health_metrics(&mut metrics);
+        let bytes = metrics["metrics_bytes"].as_u64().unwrap();
+        eprintln!(
+            "one-root health reply: {baseline} bytes; {bytes} with the meaning fill at its largest"
+        );
+        assert!(bytes <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        assert_eq!(metrics["root_details_omitted"], 0);
+        let row = &metrics["roots"][0];
+        assert!(row.get("abbreviated").is_none(), "{row}");
+        assert_eq!(row["semantic_index"]["files_pending"], 20_988);
+        assert_eq!(row["semantic_index"]["stage"], "waiting_for_another_fill");
+        assert_eq!(row["semantic_index"]["filling"], true);
+    }
+
     #[test]
     fn completed_tier2_pass_returns_plane_to_ready_and_advances_progress() {
         let executor = Executor::new();
@@ -9384,8 +8842,6 @@ mod tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
-        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
-        ctx.mark_status_bar_tier2_stale();
         ctx.inspect_manager()
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::Duplicates, true);
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
@@ -9596,7 +9052,7 @@ mod tests {
         assert_eq!(watcher["last_rescan_cost_ms"].as_u64(), Some(42));
         assert_eq!(watcher["last_rescan_rss_delta_bytes"].as_i64(), Some(-4096));
 
-        let _project_key = crate::search_index::artifact_cache_key(root.as_path());
+        let _project_key = crate::root_identity::key::artifact_cache_key(root.as_path());
         refresh_until_root_count(&cache, &executor, &app, 1);
         let measured_zero = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
             .metrics
@@ -9717,7 +9173,7 @@ mod tests {
         std::fs::write(
             &memo,
             serde_json::to_vec(&json!({ (memo_root.to_string_lossy().to_string()): {
-                "key": crate::search_index::artifact_key_from_git_identity(&commit),
+                "key": crate::root_identity::key::artifact_key_from_git_identity(&commit),
                 "git_root_commit": commit, "recorded_at_ms": 0
             }}))
             .unwrap(),
@@ -9915,69 +9371,6 @@ mod tests {
             .expect("read retained record")
             .expect("retained record exists");
         assert_eq!(after.resolved_target, before.resolved_target);
-    }
-
-    #[test]
-    fn standing_health_preserves_durable_breaker_reason() {
-        let storage = tempfile::tempdir().expect("storage directory");
-        let root = tempfile::tempdir().expect("standing root");
-        let config = standing_config(root.path(), storage.path());
-        let standing = crate::standing_roots::StandingRoots::default();
-        standing
-            .reconcile(&config)
-            .expect("pin configured standing root");
-        let entry = standing
-            .entries()
-            .into_iter()
-            .next()
-            .expect("configured standing entry");
-        let breaker_path = storage
-            .path()
-            .join("callgraph")
-            .join(&entry.artifact_key)
-            .join("build-breaker.sqlite");
-        let breaker =
-            crate::build_breaker::BuildDeathBreaker::open(breaker_path).expect("durable breaker");
-        let breaker_root = ProjectRootId::from_path(root.path()).expect("standing root identity");
-        let breaker_key = crate::build_breaker::BreakerKey::new(
-            breaker_root.as_path().display().to_string(),
-            crate::build_breaker::BuildDomain::CallgraphCold,
-            "standing-health",
-        );
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_millis() as u64;
-        for _ in 0..3 {
-            let crate::build_breaker::BreakerAdmission::Admitted(attempt) = breaker
-                .admit_at(&breaker_key, 10, now_ms)
-                .expect("breaker admission")
-            else {
-                panic!("breaker must admit before the third attributed death");
-            };
-            breaker
-                .record_attributed_death_at(&breaker_key, &attempt.attempt_id, 10, 0, now_ms)
-                .expect("record attributed death");
-        }
-
-        let app = App::default_shared();
-        let executor = Executor::new();
-        register_standing_health_actor(&executor, &app, root.path(), config);
-        let metrics = DispatchPathMetrics::new();
-        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
-        let metrics = report.metrics.expect("health metrics");
-        let root_row = metrics["roots"]
-            .as_array()
-            .and_then(|rows| {
-                rows.iter()
-                    .find(|row| row["standing_entry"] == json!(entry.literal_path))
-            })
-            .expect("standing health row");
-        assert_eq!(root_row["standing"], true);
-        assert_eq!(
-            root_row["suspended_domains"][0]["reason"],
-            "zero_credit_death_limit"
-        );
     }
 
     #[test]
@@ -10230,13 +9623,13 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         callgraph_repair_entries_60s: None,
         callgraph_commits_60s: None,
         callgraph_pages_or_bytes_written_60s: None,
-        views: None,
         view_load_failures: Default::default(),
         view_load_failure_last: None,
         view_storage_reserve: Default::default(),
         tier2: None,
         bash: None,
         suspended_domains: Vec::new(),
+        data_store: None,
     }
 }
 
@@ -10296,29 +9689,48 @@ mod plane_timing_tests {
         );
     }
 
+    /// The meaning fill dates itself: its start and its last store reach
+    /// the reply as it recorded them, however long ago, and the times
+    /// health keeps for planes that do not date themselves never replace
+    /// them.
     #[test]
-    fn stale_tier2_uses_scheduler_fields_instead_of_build_timings() {
+    fn a_plane_that_dates_itself_is_reported_as_it_says() {
         let cache = HealthRollupCache::new();
-        let mut stale = json!({
-            "tier2": {
-                "status": "stale",
-                "stale_since_ms": 10,
-                "next_refresh_at_ms": 20,
-                "pending_paths": 3,
+        let mut first = json!({
+            "semantic_index": {
+                "status": "building", "stage": "filling", "files_pending": 9,
+                "since_ms": 1_000, "last_progress_at_ms": 2_000,
             },
         });
-        cache.annotate_plane_timings("/tmp/root", &mut stale);
+        cache.annotate_plane_timings("/tmp/root", &mut first);
+        assert_eq!(first["semantic_index"]["since_ms"], 1_000);
+        assert_eq!(first["semantic_index"]["last_progress_at_ms"], 2_000);
 
-        assert_eq!(stale["tier2"]["stale_since_ms"], 10);
-        assert_eq!(stale["tier2"]["next_refresh_at_ms"], 20);
-        assert_eq!(stale["tier2"]["pending_paths"], 3);
-        assert!(stale["tier2"].get("since_ms").is_none());
-        assert!(stale["tier2"].get("last_progress_at_ms").is_none());
+        // Its counts change but it stored nothing: still 2_000, not the
+        // time health saw the change.
+        std::thread::sleep(Duration::from_millis(2));
+        let mut moved = json!({
+            "semantic_index": {
+                "status": "building", "stage": "filling", "files_pending": 8,
+                "since_ms": 1_000, "last_progress_at_ms": 2_000,
+            },
+        });
+        cache.annotate_plane_timings("/tmp/root", &mut moved);
+        assert_eq!(moved["semantic_index"]["last_progress_at_ms"], 2_000);
 
-        let mut building = json!({ "tier2": { "status": "building" } });
-        cache.annotate_plane_timings("/tmp/root", &mut building);
-        assert!(building["tier2"]["since_ms"].is_u64());
-        assert!(building["tier2"]["last_progress_at_ms"].is_u64());
+        // Before its first round it does not date itself yet: health's own
+        // times stand in.
+        let mut undated = json!({
+            "semantic_index": { "status": "building", "stage": "filling" },
+        });
+        cache.annotate_plane_timings("/tmp/other", &mut undated);
+        assert!(undated["semantic_index"]["since_ms"].as_u64().unwrap() > 2_000);
+        assert!(
+            undated["semantic_index"]["last_progress_at_ms"]
+                .as_u64()
+                .unwrap()
+                > 2_000
+        );
     }
 }
 

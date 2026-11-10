@@ -1,0 +1,327 @@
+//! A fragment: one file's call-graph resolution in one checkout, as stored.
+//!
+//! A fragment is keyed by the file's content record and its path. It holds
+//! what each reference resolved to, the method-call sites kept with their
+//! resolutions, the dispatch type targets, and everything the resolution
+//! recorded about its inputs, so another checkout can reuse it after
+//! replaying those inputs. The caller's path and record key are the
+//! fragment's key and are not repeated inside it.
+
+use std::collections::BTreeSet;
+
+use aft_store::content::codec::{Decoder, Encoder};
+use aft_store::content::DecodeError;
+
+use super::callgraph::{FileResolution, SiteResolution};
+use crate::callgraph_store::join::dispatch::{Resolution, SiteHint, Target};
+use crate::callgraph_store::join::record::{
+    decode_binding, decode_dispatch, encode_binding, encode_dispatch,
+};
+use crate::callgraph_store::join::{BlobRefKind, DerivedRow, ResolutionStatus};
+
+#[path = "fragment_strings.rs"]
+mod strings;
+
+const FORMAT: u8 = 2;
+
+const KINDS: [BlobRefKind; 9] = [
+    BlobRefKind::Construction,
+    BlobRefKind::CallbackRef,
+    BlobRefKind::Call,
+    BlobRefKind::ValueRef,
+    BlobRefKind::Import,
+    BlobRefKind::Module,
+    BlobRefKind::Reexport,
+    BlobRefKind::ExportAlias,
+    BlobRefKind::MacroMention,
+];
+
+const PROVENANCES: [&str; 4] = ["exact", "dispatch", "name_match", "type_match"];
+
+fn kind_code(kind: BlobRefKind) -> u8 {
+    KINDS
+        .iter()
+        .position(|known| *known == kind)
+        .and_then(|code| u8::try_from(code).ok())
+        .expect("every reference kind is listed")
+}
+
+/// Encodes `file`.
+///
+/// # Panics
+///
+/// When a method-call target has a provenance not listed in
+/// [`PROVENANCES`], which a resolver change must add.
+#[must_use]
+pub(crate) fn encode(file: &FileResolution) -> Vec<u8> {
+    strings::encode(&encode_expanded(file))
+}
+
+/// The string table in the format used by older builds, without a magic header.
+#[cfg(test)]
+pub(crate) fn encode_legacy(file: &FileResolution) -> Vec<u8> {
+    encode_expanded(file)
+}
+
+fn encode_expanded(file: &FileResolution) -> Vec<u8> {
+    let mut out = Encoder::default();
+    out.byte(FORMAT);
+    out.usize(file.rows.len());
+    for row in &file.rows {
+        out.u32(row.ref_ordinal);
+        out.byte(kind_code(row.kind));
+        out.bool(row.status == ResolutionStatus::Resolved);
+        out.opt_str(
+            row.target_path
+                .as_deref()
+                .map(|path| std::str::from_utf8(path).expect("checkout paths are UTF-8")),
+        );
+        out.opt_str(row.target_symbol.as_deref());
+    }
+    encode_binding(&mut out, &file.binding);
+    match &file.dispatch {
+        None => out.bool(false),
+        Some(dispatch) => {
+            out.bool(true);
+            encode_dispatch(&mut out, dispatch);
+        }
+    }
+    out.usize(file.sites.len());
+    for kept in &file.sites {
+        let site = &kept.site;
+        out.u32(site.ordinal);
+        out.opt_str(site.caller.as_deref());
+        out.u32(site.line);
+        out.opt_str(site.member.as_deref());
+        out.opt_str(site.receiver.as_deref());
+        out.bool(site.dynamic);
+        let resolution = &kept.resolution;
+        out.usize(resolution.targets.len());
+        for target in &resolution.targets {
+            out.str(&target.file);
+            out.str(&target.symbol);
+            out.byte(
+                PROVENANCES
+                    .iter()
+                    .position(|known| *known == target.provenance)
+                    .and_then(|code| u8::try_from(code).ok())
+                    .expect("every target provenance is listed"),
+            );
+        }
+        out.usize(resolution.protected.len());
+        for (file, symbol) in &resolution.protected {
+            out.str(file);
+            out.str(symbol);
+        }
+        out.usize(resolution.unresolved);
+        out.usize(resolution.external);
+        out.usize(resolution.dynamic);
+    }
+    out.usize(file.site_dependencies.len());
+    for key in &file.site_dependencies {
+        out.str(key);
+    }
+    out.finish()
+}
+
+/// Decodes a fragment of the file at `path` whose content record has the
+/// key `record_key`.
+///
+/// # Errors
+///
+/// When the bytes are not a fragment this build wrote.
+pub(crate) fn decode(
+    record_key: &str,
+    path: &str,
+    bytes: &[u8],
+) -> Result<FileResolution, DecodeError> {
+    let expanded = strings::decode(bytes)?;
+    decode_expanded(record_key, path, &expanded)
+}
+
+fn decode_expanded(
+    record_key: &str,
+    path: &str,
+    bytes: &[u8],
+) -> Result<FileResolution, DecodeError> {
+    let mut input = Decoder::new(bytes)?;
+    if input.byte()? != FORMAT {
+        return Err(DecodeError("unknown fragment format"));
+    }
+    // Each row takes at least five bytes (ordinal, kind, status and two
+    // optional strings), so a count the bytes cannot hold fails before
+    // anything is reserved.
+    let count = input.count_of(5)?;
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        let ref_ordinal = input.u32()?;
+        let kind = *KINDS
+            .get(usize::from(input.byte()?))
+            .ok_or(DecodeError("unknown reference kind"))?;
+        let status = if input.bool()? {
+            ResolutionStatus::Resolved
+        } else {
+            ResolutionStatus::Unresolved
+        };
+        rows.push(DerivedRow {
+            caller_blob_key: record_key.to_string(),
+            ref_ordinal,
+            caller_path: path.as_bytes().to_vec(),
+            kind,
+            status,
+            target_path: input.opt_string()?.map(String::into_bytes),
+            target_symbol: input.opt_string()?,
+        });
+    }
+    let binding = decode_binding(&mut input)?;
+    let dispatch = if input.bool()? {
+        Some(decode_dispatch(&mut input)?)
+    } else {
+        None
+    };
+    // At least seven bytes per site: ordinal, caller, line, member,
+    // receiver, the dynamic flag and the target count.
+    let count = input.count_of(7)?;
+    let mut sites = Vec::with_capacity(count);
+    for _ in 0..count {
+        let site = SiteHint {
+            ordinal: input.u32()?,
+            caller: input.opt_string()?,
+            line: input.u32()?,
+            member: input.opt_string()?,
+            receiver: input.opt_string()?,
+            dynamic: input.bool()?,
+        };
+        let targets = (0..input.count()?)
+            .map(|_| {
+                Ok(Target {
+                    file: input.string()?,
+                    symbol: input.string()?,
+                    provenance: PROVENANCES
+                        .get(usize::from(input.byte()?))
+                        .copied()
+                        .ok_or(DecodeError("unknown target provenance"))?,
+                })
+            })
+            .collect::<Result<_, DecodeError>>()?;
+        let protected = (0..input.count()?)
+            .map(|_| Ok((input.string()?, input.string()?)))
+            .collect::<Result<_, DecodeError>>()?;
+        sites.push(SiteResolution {
+            site,
+            resolution: Resolution {
+                targets,
+                protected,
+                unresolved: input.usize()?,
+                external: input.usize()?,
+                dynamic: input.usize()?,
+            },
+        });
+    }
+    let site_dependencies = (0..input.count()?)
+        .map(|_| input.string())
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    input.finish()?;
+    Ok(FileResolution {
+        rows,
+        binding,
+        dispatch,
+        sites,
+        site_dependencies,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragment_front_coding_roundtrip_and_every_truncation_is_rejected() {
+        let resolution = FileResolution {
+            site_dependencies: [
+                "r:src/long/path/é.rs",
+                "t:src/long/path/é.rs\tÉclair",
+                "t:src/long/path/é.rs\tÉtape",
+                "ret:src/long/path/é.rs\tmake",
+                "f:src/long/path/é.rs\tÉclair\tname",
+                "d:src/long/path\tMissing",
+                "m:run",
+                "g:",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            ..FileResolution::default()
+        };
+        let bytes = encode(&resolution);
+        assert_eq!(decode("record", "caller.rs", &bytes).unwrap(), resolution);
+        for end in 0..bytes.len() {
+            assert!(
+                decode("record", "caller.rs", &bytes[..end]).is_err(),
+                "accepted truncation at {end}"
+            );
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode("record", "caller.rs", &trailing).is_err());
+    }
+}
+
+#[cfg(test)]
+mod decode_probe {
+    use super::*;
+    use aft_store::cache::BlockCache;
+    use aft_store::graph::GraphSegment;
+    use aft_store::ids::{Digest128, FamilyId};
+    use aft_store::segment::{Segment, BLOCK_LEN};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "requires a persisted AFT_FRAGMENT_PROBE segment"]
+    fn fragment_front_coding_corpus_decode_cost() {
+        let path = std::env::var("AFT_FRAGMENT_PROBE").expect("segment path required");
+        let header = std::fs::read(&path).unwrap();
+        let family =
+            FamilyId::from_digest(Digest128::from_bytes(header[16..32].try_into().unwrap()));
+        let segment = Segment::open(
+            std::path::Path::new(&path),
+            family,
+            &super::super::graph_store::known_sections()
+                .into_iter()
+                .chain(aft_store::text::KNOWN)
+                .collect::<Vec<_>>(),
+            Arc::new(BlockCache::new(16 * BLOCK_LEN)),
+        )
+        .unwrap();
+        let graph = GraphSegment::open(&segment).unwrap().unwrap();
+        let records = (0..graph.len())
+            .map(|ordinal| {
+                let coded = graph.fragment(ordinal).unwrap();
+                let expanded = strings::decode(&coded).unwrap();
+                let original = decode_expanded("probe", "probe", &expanded).unwrap();
+                let compacted = decode("probe", "probe", &coded).unwrap();
+                assert_eq!(compacted, original);
+                (coded, expanded)
+            })
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty());
+        let mut timings = Vec::new();
+        for _ in 0..3 {
+            let started = Instant::now();
+            for (_, expanded) in &records {
+                std::hint::black_box(decode_expanded("probe", "probe", expanded).unwrap());
+            }
+            let original_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let started = Instant::now();
+            for (coded, _) in &records {
+                std::hint::black_box(decode("probe", "probe", coded).unwrap());
+            }
+            timings.push(serde_json::json!({"original_ms": original_ms, "front_coded_ms": started.elapsed().as_secs_f64() * 1000.0}));
+        }
+        println!(
+            "FRAGMENT_DECODE_COST {}",
+            serde_json::json!({"records": records.len(), "runs": timings})
+        );
+    }
+}

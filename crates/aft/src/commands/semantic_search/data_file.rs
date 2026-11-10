@@ -89,6 +89,11 @@ pub fn is_data_file(project_root: &Path, path: &Path) -> bool {
     if crate::inspect::relative_shape_is_generated(project_root, path) {
         return true;
     }
+    // A file this search request already read is judged from those bytes.
+    let files = super::request_files::current();
+    if let Some(file) = files.as_ref().and_then(|files| files.kept(path)) {
+        return file.bytes().len() as u64 >= DATA_FILE_MIN_BYTES || has_long_line(file.bytes());
+    }
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -97,13 +102,16 @@ pub fn is_data_file(project_root: &Path, path: &Path) -> bool {
     }
     // Below the size threshold the whole file is small, so reading it to
     // measure its longest line is cheap.
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    if file.read_to_end(&mut bytes).is_err() {
-        return false;
-    }
+    let read = super::request_files::read_through(files.as_deref(), path, |path| {
+        let mut file = std::fs::File::open(path)?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)?;
+        Ok((bytes, Some(super::request_files::FileStat::of(&metadata))))
+    });
+    read.is_ok_and(|fetched| has_long_line(fetched.file.bytes()))
+}
+
+fn has_long_line(bytes: &[u8]) -> bool {
     bytes
         .split(|byte| *byte == b'\n')
         .any(|line| line.len() >= DATA_FILE_LONG_LINE_CHARS)

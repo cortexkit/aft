@@ -177,10 +177,10 @@ jobs:
         # fallback silently masks the version-mismatch bug (we try to publish
         # vN, it already exists, we say success even though we wanted vN+1).
         #
-        # `agent-file-tools` depends on `aft-tokenizer` and `aft-secret-rules`
-        # by path; cargo refuses to publish a crate whose path-only dep has no
+        # `agent-file-tools` depends on `aft-tokenizer`, `aft-secret-rules` and
+        # `aft-store` by path; cargo refuses to publish a crate whose path-only dep has no
         # `version =` or isn't on crates.io. All three crates therefore declare
-        # versions (synced by version-sync.mjs) and we publish the two leaf
+        # versions (synced by version-sync.mjs) and we publish the leaf
         # crates first so `agent-file-tools` can resolve them on crates.io.
         # scripts/lib/test_native_release_workflow.py fails when a new path
         # dependency is added without a publish line here. The `--no-verify` flag on the
@@ -204,6 +204,8 @@ jobs:
             || { ec=$?; cargo publish --package aft-tokenizer --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
           cargo publish --package aft-secret-rules \
             || { ec=$?; cargo publish --package aft-secret-rules --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+          cargo publish --package aft-store \
+            || { ec=$?; cargo publish --package aft-store --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
           # Wait briefly for the new leaf crate versions to become visible on
           # crates.io's sparse index before publishing `agent-file-tools` —
           # otherwise the verify step in the second publish can race against
@@ -826,7 +828,7 @@ jobs:
       # Cargo's local registry overlay, without needing unpublished siblings on
       # crates.io. Stable Cargo >=1.90 supports this selection mode.
       - name: Rehearse crates.io publishing
-        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p agent-file-tools
+        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p agent-file-tools
 
       # Mirrors the inline 10 MiB check in scripts/release.sh (crates.io package
       # sizes). A publish dry run does not enforce the registry's upload limit.
@@ -844,7 +846,7 @@ jobs:
           # Multi-package publish stages archives in tmp-crate and tmp-registry;
           # single-package packaging leaves them directly in the package folder.
           crates = sorted(crate_dir.rglob("*.crate"))
-          expected = {"aft-tokenizer", "aft-secret-rules", "agent-file-tools"}
+          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools"}
           filenames = {crate.name for crate in crates}
           found = {
               package["name"] for package in metadata["packages"]

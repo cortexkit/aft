@@ -78,6 +78,12 @@ pub struct ExecRemoteClient {
     consumer: Arc<SubcConsumer>,
     route: subc_client_rs::RouteHandle,
     module_id: String,
+    /// The capabilities the daemon catalog lists for `module_id`, read by the
+    /// first capability check and reused by every later check on this route
+    /// (one submission makes several). Recovery after a failed call opens a
+    /// new route ([`Self::reopen_route`]) or connection, whose first check
+    /// reads the catalog again.
+    provided: Arc<std::sync::OnceLock<Arc<[String]>>>,
 }
 
 impl ExecRemoteClient {
@@ -129,6 +135,7 @@ impl ExecRemoteClient {
             consumer,
             route,
             module_id,
+            provided: Arc::default(),
         })
     }
 
@@ -137,6 +144,21 @@ impl ExecRemoteClient {
     }
 
     pub(crate) async fn run_with_diagnostics(
+        &self,
+        request: &RunRequest,
+        diagnostics: Option<RunDiagnostics<'_>>,
+    ) -> Result<RemoteStream, Error> {
+        // Submitting is when the job's inputs are captured, so the
+        // allocation tracer names that step for whatever it allocates.
+        crate::alloc_trace::future(
+            crate::alloc_trace::Label::REMOTE_INPUT_CAPTURE,
+            None,
+            self.submit_run(request, diagnostics),
+        )
+        .await
+    }
+
+    async fn submit_run(
         &self,
         request: &RunRequest,
         mut diagnostics: Option<RunDiagnostics<'_>>,
@@ -220,20 +242,9 @@ impl ExecRemoteClient {
     }
 
     pub(crate) async fn supports_submission_key(&self) -> Result<bool, Error> {
-        let catalog = self
-            .consumer
-            .catalog_list()
+        self.advertises(SUBMISSION_KEY_CAPABILITY)
             .await
-            .map_err(Error::Transport)?;
-        Ok(catalog.modules.iter().any(|module| {
-            module.module_id == self.module_id
-                && module.capabilities.as_ref().is_some_and(|capabilities| {
-                    capabilities
-                        .provides
-                        .iter()
-                        .any(|capability| capability == SUBMISSION_KEY_CAPABILITY)
-                })
-        }))
+            .map_err(Error::Transport)
     }
 
     #[cfg(unix)]
@@ -244,16 +255,35 @@ impl ExecRemoteClient {
     /// Whether the module serving this route advertises `capability` in the
     /// daemon catalog.
     async fn advertises(&self, capability: &str) -> Result<bool, subc_client_rs::CallError> {
+        Ok(self
+            .provided()
+            .await?
+            .iter()
+            .any(|provided| provided == capability))
+    }
+
+    /// The capabilities the catalog lists for this route's module, read once
+    /// per route (see the `provided` field).
+    async fn provided(&self) -> Result<Arc<[String]>, subc_client_rs::CallError> {
+        if let Some(provided) = self.provided.get() {
+            return Ok(Arc::clone(provided));
+        }
         let catalog = self.consumer.catalog_list().await?;
-        Ok(catalog.modules.iter().any(|module| {
-            module.module_id == self.module_id
-                && module.capabilities.as_ref().is_some_and(|capabilities| {
-                    capabilities
-                        .provides
-                        .iter()
-                        .any(|provided| provided == capability)
-                })
-        }))
+        let mut listed = false;
+        let provided: Arc<[String]> = catalog
+            .modules
+            .iter()
+            .filter(|module| module.module_id == self.module_id)
+            .inspect(|_| listed = true)
+            .filter_map(|module| module.capabilities.as_ref())
+            .flat_map(|capabilities| capabilities.provides.iter().cloned())
+            .collect();
+        if !listed {
+            // The module is missing from this listing (it may be registering
+            // again): it advertises nothing now, and the next check looks again.
+            return Ok(provided);
+        }
+        Ok(Arc::clone(self.provided.get_or_init(|| provided)))
     }
 
     /// Resume from the last durably delivered seq, not from the last received
@@ -387,8 +417,9 @@ pub enum StreamProgress {
     Complete(Verdict),
 }
 
-/// One held-open run/attach call. Dropping it sends Cancel (SDK semantics), not
-/// a detach. Persist its resume point before dropping when recovery is needed.
+/// One held-open run/attach observation. Dropping it sends request-level Cancel
+/// (SDK semantics), which detaches at the executor, unlike `exec.cancel` by job
+/// ID. Persist its resume point before dropping when recovery is needed.
 pub struct RemoteStream {
     subscription: Subscription,
     consumer: StreamConsumer,

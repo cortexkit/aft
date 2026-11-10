@@ -92,7 +92,7 @@ fn synthetic_bound_roots() {
             }
             std::fs::write(root.join(format!("file_{file}.rs")), source).unwrap();
         }
-        let mut config = crate::config::Config {
+        let config = crate::config::Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             format_on_edit: false,
@@ -100,7 +100,6 @@ fn synthetic_bound_roots() {
             experimental_bash_background: true,
             ..Default::default()
         };
-        config.views.enabled = true;
         let ctx = Arc::new(AppContext::from_app(app.clone(), config));
         ctx.mark_subc_bound();
         let req = serde_json::from_value(json!({
@@ -205,8 +204,6 @@ fn synthetic_bound_roots() {
                 if ctx.watcher_drain_has_work() {
                     crate::runtime_drain::drain_watcher_events(ctx);
                 }
-                crate::runtime_drain::drain_search_index_events(ctx);
-                crate::runtime_drain::drain_callgraph_store_events(ctx);
             }
             std::thread::sleep(Duration::from_millis(250));
         }

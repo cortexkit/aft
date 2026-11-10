@@ -15,7 +15,6 @@ use serde_json::Value;
 
 #[derive(Deserialize)]
 struct CounterCases {
-    zero_embedding_queries: Vec<String>,
     semantic_controls: Vec<String>,
 }
 
@@ -138,38 +137,6 @@ fn start_embedding_server(expected_calls: usize) -> (String, thread::JoinHandle<
         }
     });
     (format!("http://{address}"), handle)
-}
-
-#[test]
-fn non_semantic_public_rows_never_reach_the_embedding_boundary() {
-    let (project, _) = project();
-    let ctx = AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config {
-            project_root: Some(project.path().to_path_buf()),
-            ..Config::default()
-        }),
-    )
-    .with_test_checkpoint_store();
-    // aft_search refuses when no index lane is ready; serve these rows from a
-    // ready trigram lane.
-    *ctx.search_index()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(aft::search_index::SearchIndex::build(project.path()));
-
-    for (index, query) in cases().zero_embedding_queries.iter().enumerate() {
-        for pass in ["cold", "warm"] {
-            let id = format!("counter-zero-{index}-{pass}");
-            let response = response_value(handle_semantic_search(&request(&id, query), &ctx));
-            assert_eq!(response["success"], true, "query {query:?}: {response:?}");
-            assert_eq!(
-                response_counts(&response),
-                EmbedCounts::default(),
-                "query {query:?} must not look up or request an embedding on {pass}"
-            );
-        }
-    }
 }
 
 #[test]

@@ -12,8 +12,8 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use crate::commands::semantic_search::comparator::{CandidateResult, SymbolOffsetRange};
 use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
+use crate::native_stat::{now_ns, NativeStat};
 use crate::search_index::ExactEvidenceScope;
-use crate::views::verification::{now_ns, NativeStat};
 
 const MAX_EXACT_MEMO_ENTRIES: usize = 128;
 const MAX_EXACT_MEMO_BYTES: usize = 8 * 1024 * 1024;
@@ -85,12 +85,17 @@ fn regular_file_stat(path: &Path) -> Option<NativeStat> {
     Some(stat)
 }
 
-fn read_digest(path: &Path) -> Result<String, PathBuf> {
+fn read_digest(
+    path: &Path,
+    request_files: Option<&super::request_files::RequestFiles>,
+) -> Result<String, PathBuf> {
     #[cfg(test)]
     crate::search_hot_path_measurements::record_memo_file_read(path);
-    fs::read(path)
-        .map(|bytes| compute_content_digest(&bytes))
-        .map_err(|_| path.to_path_buf())
+    super::waits::timed(super::waits::SearchWait::FileRead, || {
+        super::request_files::read_through(request_files, path, |path| Ok((fs::read(path)?, None)))
+    })
+    .map(|fetched| compute_content_digest(fetched.file.bytes()))
+    .map_err(|_| path.to_path_buf())
 }
 
 /// Whether some file holds a code literal's whole text, as one search settled
@@ -692,7 +697,8 @@ impl ExactMemoStore {
         file_digests: &HashMap<PathBuf, String>,
     ) -> Result<(), PathBuf> {
         Self::check_page_digests(page, file_digests, |path, expected| {
-            if read_digest(path)? != expected {
+            let request_files = super::request_files::current();
+            if read_digest(path, request_files.as_deref())? != expected {
                 return Err(path.to_path_buf());
             }
             Ok(())
@@ -728,12 +734,22 @@ impl ExactMemoStore {
         before_read: impl FnOnce(),
         after_read: impl FnOnce(),
     ) -> Result<(), PathBuf> {
+        // A file this search request already read is checked from those
+        // bytes: every phase of one request sees the same version of a file.
+        let request_files = super::request_files::current();
+        if let Some(file) = request_files.as_ref().and_then(|files| files.kept(path)) {
+            return if file.digest().to_hex().as_str() == expected {
+                Ok(())
+            } else {
+                Err(path.to_path_buf())
+            };
+        }
         // Windows can preserve both last-write and change time across an
         // immediate same-length rewrite. Even an old, apparently stable stamp
         // cannot certify unchanged content there, so always hash the bytes.
         if cfg!(windows) {
             before_read();
-            let digest = read_digest(path)?;
+            let digest = read_digest(path, request_files.as_deref())?;
             after_read();
             return if digest == expected {
                 Ok(())
@@ -761,13 +777,26 @@ impl ExactMemoStore {
         #[cfg(test)]
         crate::search_hot_path_measurements::record_memo_file_read(path);
         before_read();
+        let read_wait = super::waits::time(super::waits::SearchWait::FileRead);
         let mut file = fs::File::open(path).map_err(|_| path.to_path_buf())?;
         let opened = NativeStat::read_open_file(&file, path).ok();
+        let read_stat = file
+            .metadata()
+            .ok()
+            .map(|metadata| super::request_files::FileStat::of(&metadata));
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|_| path.to_path_buf())?;
+        drop(read_wait);
+        #[cfg(test)]
+        super::request_files::record_disk_read(path);
         let digest = compute_content_digest(&bytes);
         after_read();
+        // Later phases of this request (snippets, matching lines) read the
+        // same file; keep the bytes for them.
+        if let Some(files) = &request_files {
+            files.keep_read(path, bytes, read_stat);
+        }
         if digest != expected {
             return Err(path.to_path_buf());
         }
@@ -826,7 +855,9 @@ impl ExactMemoStore {
         H: FnOnce(),
     {
         // 1. Check if we have an active entry
-        let existing_entry = self.entries.read().get(key).cloned();
+        let existing_entry = super::waits::timed(super::waits::SearchWait::ExactMemo, || {
+            self.entries.read().get(key).cloned()
+        });
 
         if let Some(entry) = existing_entry {
             // Slice the requested page
@@ -880,9 +911,13 @@ impl ExactMemoStore {
         miss_hook();
         // Admission, publication and eviction share this gate. Store lock order
         // is admission -> entries -> lifecycle; disk verification holds none.
+        // Waiting for the gate, and for another request verifying the same
+        // key, is the memo wait; this request's own verifier is not.
+        let memo_wait = super::waits::time(super::waits::SearchWait::ExactMemo);
         let mut in_flight = self.in_flight.lock();
         if self.entries.read().contains_key(key) {
             drop(in_flight);
+            drop(memo_wait);
             return self.get_or_verify(key, offset, top_k, verifier);
         }
         let current_epoch = self
@@ -905,8 +940,10 @@ impl ExactMemoStore {
                     .wait_for(&mut in_flight, Duration::from_millis(25));
             }
             drop(in_flight);
+            drop(memo_wait);
             return self.get_or_verify(key, offset, top_k, verifier);
         }
+        drop(memo_wait);
         let epoch = self.allocate_epoch();
         let is_poisoned = {
             let mut lifecycle = self.lifecycle.write();
@@ -939,7 +976,9 @@ impl ExactMemoStore {
 
         // Publish before dropping the permit so same-key waiters observe the entry.
         {
-            let admission = self.in_flight.lock();
+            let admission = super::waits::timed(super::waits::SearchWait::ExactMemo, || {
+                self.in_flight.lock()
+            });
             let current_epoch = self
                 .lifecycle
                 .read()

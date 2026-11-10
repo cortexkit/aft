@@ -55,13 +55,14 @@ describe("navigate renderer", () => {
       renderNavigateResult(
         makeResult("", {
           total_paths: 1,
-          entry_points_found: 1,
+          root_counts: { public_api: 1 },
           max_depth_reached: true,
           truncated_paths: 4,
           paths: [
             {
+              root: "public_api",
               hops: [
-                { symbol: "main", file: "/repo/src/a.ts", line: 1, is_entry_point: true },
+                { symbol: "main", file: "/repo/src/a.ts", line: 1, exported: true },
                 { symbol: "run", file: "/repo/src/a.ts", line: 4 },
               ],
             },
@@ -86,9 +87,10 @@ describe("navigate renderer", () => {
               line: 7,
               call_expression: "run()",
               parameters: ["x"],
-              is_entry_point: true,
+              root: "public_api",
             },
           ],
+          root_counts: { public_api: 1 },
         }),
         { op: "impact", filePath: "src/a.ts", symbol: "run" },
         mockTheme,
@@ -122,8 +124,12 @@ describe("navigate renderer", () => {
     expect(callers).toContain("3 truncated");
     expect(traceTo).toContain("Path 1");
     expect(traceTo).toContain("4 truncated");
+    expect(traceTo).toContain("roots: 1 public API function");
+    expect(traceTo).toContain("main [root: public API]");
     expect(impact).toContain("affected call site");
     expect(impact).toContain("5 truncated");
+    expect(impact).toContain("Reaches 1 public API function");
+    expect(impact).toContain("main [root: public API]");
     expect(traceData).toContain("depth limited");
   });
 
@@ -177,7 +183,7 @@ describe("navigate renderer", () => {
     );
     const empty = renderToString(
       renderNavigateResult(
-        makeResult("", { total_paths: 0, entry_points_found: 0, paths: [] }),
+        makeResult("", { total_paths: 0, paths: [] }),
         { op: "trace_to", filePath: "src/a.ts", symbol: "run" },
         mockTheme,
         makeContext({ op: "trace_to", filePath: "src/a.ts", symbol: "run" }),
@@ -185,6 +191,6 @@ describe("navigate renderer", () => {
     );
 
     expect(error).toContain("not configured");
-    expect(empty).toContain("No entry paths found");
+    expect(empty).toContain("No paths found");
   });
 });

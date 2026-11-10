@@ -1,25 +1,16 @@
 use std::path::{Path, PathBuf};
 
-use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, BorrowedOp, SymbolLookup};
 use crate::commands::callgraph_store_adapter::{
-    ensure_symbol_resolves, index_refusal_response, note_callgraph_served, serialized_response,
-    serialized_value, store_error_response, trace_to_symbol_candidates, trace_to_symbol_result,
+    ensure_symbol_resolves, note_callgraph_served, serialized_response, serialized_value,
+    store_error_response, trace_to_symbol_candidates, trace_to_symbol_result,
 };
-use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::context::AppContext;
 use crate::inspect::job::is_test_file;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to_symbol` request.
 pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = answer_trace_to_symbol(req, ctx);
-    disclose_borrowed_answer(
-        ctx,
-        req,
-        &mut response,
-        SymbolLookup::Graph,
-        BorrowedOp::TraceToSymbol,
-    );
-    response
+    answer_trace_to_symbol(req, ctx)
 }
 
 fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -90,30 +81,16 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
 
-    let store = match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Error(error) => {
-            return store_error_response(&req.id, "trace_to_symbol", error)
-        }
-        other => return index_refusal_response(&req.id, "trace_to_symbol", ctx, &other),
-    };
-
-    for path in std::iter::once(file_path.as_path()).chain(to_file_path.as_deref()) {
-        if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
-            &req.id,
-            "trace_to_symbol",
-            ctx,
-            &store,
-            path,
-        ) {
-            return response;
-        }
-    }
-
-    // The shadowed reader retains the generation pins until this answer ends.
-    let store = match store.read_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => return store_error_response(&req.id, "trace_to_symbol", error),
+    let (store, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
+        &req.id,
+        "trace_to_symbol",
+        ctx,
+        &std::iter::once(file_path.as_path())
+            .chain(to_file_path.as_deref())
+            .collect::<Vec<_>>(),
+    ) {
+        Ok(graph) => graph,
+        Err(response) => return response,
     };
     if let Err(error) = ensure_symbol_resolves(&store, &file_path, symbol) {
         return store_error_response(&req.id, "trace_to_symbol", error);
@@ -185,7 +162,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    match trace_to_symbol_result(
+    let outcome = trace_to_symbol_result(
         &store,
         &file_path,
         symbol,
@@ -193,7 +170,15 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         to_file_path.as_deref(),
         depth,
         include_tests,
+    );
+    if let Some(response) = crate::data_layer::tools::callgraph::failed_reads(
+        &req.id,
+        "trace_to_symbol",
+        data_view.as_ref(),
     ) {
+        return response;
+    }
+    match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to_symbol", 0, "ok");
             serialized_response(&req.id, "trace_to_symbol", &result)

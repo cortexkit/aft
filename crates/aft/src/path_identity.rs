@@ -136,10 +136,10 @@ fn project_root_path_is_narrow(directory: &Path, home: &Path, volume: &Path) -> 
 /// mount point, judge it against the volume that contains the mount point
 /// instead. Other platforms keep the device walk.
 pub(crate) fn project_root_volume(canonical_root: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let (volume, _) = crate::storage_retention::volume_anchor(canonical_root)?;
+    let (volume, _) = crate::volume::volume_anchor(canonical_root)?;
     #[cfg(target_os = "linux")]
     return project_root_volume_with(canonical_root, volume, home, read_mountinfo, |path| {
-        crate::storage_retention::volume_anchor(path).map(|(volume, _)| volume)
+        crate::volume::volume_anchor(path).map(|(volume, _)| volume)
     });
     #[cfg(not(target_os = "linux"))]
     {
@@ -909,8 +909,8 @@ mod tests {
             &main,
         );
 
-        let main_artifact = crate::search_index::artifact_cache_key(&main);
-        let wt_artifact = crate::search_index::artifact_cache_key(&worktree);
+        let main_artifact = crate::root_identity::key::artifact_cache_key(&main);
+        let wt_artifact = crate::root_identity::key::artifact_cache_key(&worktree);
         let main_scope = project_scope_key(&main);
         let wt_scope = project_scope_key(&worktree);
 

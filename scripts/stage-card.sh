@@ -36,7 +36,13 @@
 # card's source (scripts/lib/card-source-gate.sh); STAGE_ACK_MISSING lists the
 # commits a card leaves out on purpose.
 #
-# Usage: scripts/stage-card.sh [--skip-build] [discriminator ...]
+# Usage: scripts/stage-card.sh [--skip-build] [--keep-current] [discriminator ...]
+#   --keep-current stage the card and its sidecars but leave ck-aft.current
+#                  naming the card it names now. Use it while a placement
+#                  window is armed for another card: the placer refuses a
+#                  card that ck-aft.current does not name, so moving it would
+#                  make the armed window refuse (and roll back). Point
+#                  ck-aft.current at this card by hand once the window is done.
 #   discriminator  a string that must be present in the new card and
 #                  absent from the running daemon image; each one is
 #                  reported both ways so a stale build is refused here
@@ -55,10 +61,12 @@ source "$REPO_ROOT/scripts/lib/card-source-gate.sh"
 STAGING="${CK_STAGING_DIR:-$HOME/.local/share/cortexkit/staging}"
 DEPLOY="${CK_DEPLOY_PATH:-$HOME/.local/share/cortexkit/bin/ck-aft}"
 SKIP_BUILD=0
+KEEP_CURRENT=0
 DISCRIMINATORS=()
 for arg in "$@"; do
   case "$arg" in
     --skip-build) SKIP_BUILD=1 ;;
+    --keep-current) KEEP_CURRENT=1 ;;
     -h|--help) sed -n '2,/^set /p' "$0" | sed 's/^# \{0,1\}//' | head -n -1; exit 0 ;;
     *) DISCRIMINATORS+=("$arg") ;;
   esac
@@ -225,7 +233,13 @@ fi
 # Owner declaration of the current card, so the placement gate reads it as
 # declared rather than inferring the newest card from mtimes. One shasum-shaped
 # line plus a UTC stamp; the gate treats it as inert if absent.
-printf '%s  %s  %s\n' "$HASH" "$CARD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STAGING/ck-aft.current"
+CURRENT_LINE="$(printf '%s  %s  %s' "$HASH" "$CARD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+if [ "$KEEP_CURRENT" -eq 1 ]; then
+  echo "==> ck-aft.current left as: $(cat "$STAGING/ck-aft.current" 2>/dev/null || echo '(absent)')"
+  echo "    to declare this card later: printf '%s\\n' '$CURRENT_LINE' > '$STAGING/ck-aft.current'"
+else
+  printf '%s\n' "$CURRENT_LINE" > "$STAGING/ck-aft.current"
+fi
 
 VERSION_BINARY="$(mktemp "$STAGING/ckdev-aft.version.XXXXXX")"
 cp "$STAGING/$CARD" "$VERSION_BINARY"

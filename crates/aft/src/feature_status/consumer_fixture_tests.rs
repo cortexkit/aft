@@ -48,7 +48,10 @@ struct Scenario {
     ctx: AppContext,
     root: tempfile::TempDir,
     _search_tx: Option<crossbeam_channel::Sender<crate::search_index::SearchIndex>>,
-    _callgraph_tx: Option<crossbeam_channel::Sender<crate::context::CallGraphStoreBuildEvent>>,
+    /// Keeps the index store's build from starting, so its text index stays
+    /// building for the whole call.
+    _build_hold: Option<crate::data_layer::runtime::BuildHold>,
+    _call_graph_hold: Option<crate::data_layer::checkout::CallGraphHold>,
 }
 
 impl Scenario {
@@ -79,8 +82,9 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             ..crate::config::Config::default()
         },
     );
-    let mut search_tx = None;
-    let mut callgraph_tx = None;
+    let search_tx = None;
+    let mut build_hold = None;
+    let mut call_graph_hold = None;
     match name {
         "off" => ctx.update_config(|config| {
             config.indexes.trigram = false;
@@ -88,28 +92,26 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             config.indexes.callgraph = false;
         }),
         "building" => {
-            let (tx, rx) = crossbeam_channel::unbounded();
-            *ctx.search_index_rx().write().unwrap() = Some(rx);
-            search_tx = Some(tx);
             *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
                 stage: "embedding".to_string(),
                 files: None,
                 entries_done: None,
                 entries_total: None,
             };
-            let (tx, rx) = crossbeam_channel::unbounded();
-            *ctx.callgraph_store_rx().lock() = Some(rx);
-            callgraph_tx = Some(tx);
+            // The index store binds and starts its first build, which waits.
+            build_hold = Some(crate::data_layer::runtime::hold_builds_for_test(
+                &project_root,
+            ));
+            crate::data_layer::surfaces::bind_for_test(&ctx);
         }
         "unavailable" => ctx.set_cache_writer_capabilities(false, true),
         "partially_ready" => {
-            let index = crate::search_index::SearchIndex::build(&project_root);
-            assert!(index.ready, "a built search index is ready");
-            *ctx.search_index().write().unwrap() = Some(index);
+            // Text serves; the call graph's build waits until the call ends.
+            call_graph_hold = Some(crate::data_layer::checkout::hold_call_graph_for_test(
+                &project_root,
+            ));
+            crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
             ctx.trip_semantic_refresh_circuit(1, "embedding backend refused the connection");
-            let (tx, rx) = crossbeam_channel::unbounded();
-            *ctx.callgraph_store_rx().lock() = Some(rx);
-            callgraph_tx = Some(tx);
         }
         other => panic!("unknown scenario {other}"),
     }
@@ -117,7 +119,8 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
         ctx,
         root,
         _search_tx: search_tx,
-        _callgraph_tx: callgraph_tx,
+        _build_hold: build_hold,
+        _call_graph_hold: call_graph_hold,
     }
 }
 
@@ -295,25 +298,64 @@ fn aft_callgraph_matches_the_shared_fixtures() {
             expected,
             "aft_callgraph/{name}"
         );
-        assert!(
-            scenario.ctx.callgraph_store().read().unwrap().is_none(),
-            "aft_callgraph/{name}: a refusal must not install a store"
-        );
     }
+}
+
+/// A context over `files` for zoom's call-graph field, with the data layer on
+/// for the calling thread and a storage folder of its own (where the data
+/// layer keeps its index store), and the root's checkout in the named
+/// scenario. Returns the project and storage folders with it, to keep them
+/// for the call.
+/// - `off`: every index configured off, so the checkout is never bound;
+/// - `unavailable`: the call graph enabled, and nothing has bound the root
+///   yet, so nothing is built;
+/// - `building` and `partially_ready`: the caller holds the checkout's slot
+///   as a bind in progress does (`AppContext::hold_data_checkout_slot_for_test`).
+///   The call graph is building in both; zoom does not read the text search
+///   index that is ready in the second.
+fn data_layer_scenario(
+    name: &str,
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+    let root = tempfile::tempdir().expect("project root");
+    let storage = tempfile::tempdir().expect("storage");
+    for (rel, content) in files {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+    }
+    let project_root = std::fs::canonicalize(root.path()).unwrap();
+    let mut config = crate::config::Config {
+        project_root: Some(project_root.clone()),
+        storage_dir: Some(storage.path().to_path_buf()),
+        ..crate::config::Config::default()
+    };
+    if name == "off" {
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
+        config.indexes.callgraph = false;
+    }
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    ctx.set_canonical_cache_root(project_root);
+    (root, storage, ctx)
 }
 
 #[test]
 fn aft_zoom_callgraph_matches_the_shared_fixtures() {
     for name in SCENARIOS {
         let expected = expected("aft_zoom.callgraph", name);
-        let scenario = scenario(name, &[EXAMPLE_FUNCTION]);
-        let file = scenario.root().join("src/example.ts");
+        let (root, _storage, ctx) = data_layer_scenario(name, &[EXAMPLE_FUNCTION]);
+        let file = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("src/example.ts");
+        let _binding = matches!(name, "building" | "partially_ready")
+            .then(|| ctx.hold_data_checkout_slot_for_test());
         let response = crate::commands::zoom::handle_zoom(
             &request(
                 "zoom",
                 json!({ "file": file, "symbol": "example", "callgraph": true }),
             ),
-            &scenario.ctx,
+            &ctx,
         );
         let actual = response_json(&response);
         assert_eq!(

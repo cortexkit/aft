@@ -246,9 +246,6 @@ describe("registerAftRpc", () => {
       status_bar: {
         errors,
         warnings: 0,
-        dead_code: 0,
-        unused_exports: 0,
-        duplicates: 0,
         todos: 0,
       },
     });
@@ -279,7 +276,7 @@ describe("registerAftRpc", () => {
     const status = await host.getStatus()({ sessionID: "ses_wt" });
     expect(status).toMatchObject({ status_bar: { errors: 1 } });
     // The V2 footer renders its counts from this same status response.
-    expect(formatAftStatusSegment(status as AftStatusSnapshot)).toBe("AFT E1 W0 | D0 U0 C0 | T0");
+    expect(formatAftStatusSegment(status as AftStatusSnapshot)).toBe("AFT E1 W0 | T0");
     expect(askedRoots).not.toContain("/work/main");
     await registered.dispose();
   });

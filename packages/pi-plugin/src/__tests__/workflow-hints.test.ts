@@ -352,7 +352,7 @@ describe("Pi applyWorkflowHints across hosts", () => {
 describe("Pi buildHintsFromConfig", () => {
   test("emits hints by default and includes hoisted bash name", () => {
     const config: AftConfig = {
-      experimental: { bash: { background: true } },
+      bash: { background: true },
     };
     const out = buildHintsFromConfig(config, new Set());
     expect(out).not.toBeNull();

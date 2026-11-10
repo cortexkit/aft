@@ -451,6 +451,25 @@ fn is_source_file_name(file_name: &str) -> bool {
 
 /// At least 2 KiB of head with at most one newline per KiB of it: lines
 /// that long are what minifiers produce and hand-written code rarely has.
+/// Whether the file at `path` with these bytes is a minified bundle: by
+/// name (`*.min.js`, `*.min.css`), or a JavaScript or CSS file whose first
+/// 8 KiB has almost no line breaks. The index store neither parses such a
+/// file for the call graph nor embeds it for meaning search, since its names
+/// are mangled and its chunks say nothing a search could use; grep still
+/// searches it.
+pub(crate) fn is_minified(path: &str, bytes: &[u8]) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if MINIFIED_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        return true;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+    MINIFIED_CANDIDATE_EXTENSIONS.contains(&extension_of(file_name))
+        && head_is_minified(&bytes[..bytes.len().min(HEAD_BYTES)])
+}
+
 fn head_is_minified(head: &[u8]) -> bool {
     head.len() >= MINIFIED_MIN_HEAD_BYTES
         && head.iter().filter(|byte| **byte == b'\n').count() <= head.len() / 1024
@@ -945,6 +964,32 @@ mod tests {
         .unwrap();
         assert_eq!(kind_of(root, "early.json").content, ContentKind::DataJson);
         assert!(read_probe::bytes_read(&early) <= JSON_HEAD_BYTES);
+    }
+
+    /// The index store's minified check agrees with the file kinds: by
+    /// name, or a JavaScript or CSS head with almost no line breaks, and
+    /// never a source file of another language however dense.
+    #[test]
+    fn is_minified_matches_the_minified_file_kind() {
+        let dense = format!("var a=1;{}", "b();".repeat(2048));
+        let lines = "export function a() {}\n".repeat(400);
+        assert!(is_minified("web/app.min.js", lines.as_bytes()));
+        assert!(is_minified("web/STYLE.MIN.CSS", b""));
+        assert!(is_minified("web/bundle.js", dense.as_bytes()));
+        assert!(!is_minified("web/app.js", lines.as_bytes()));
+        assert!(!is_minified("src/lib.rs", dense.as_bytes()));
+        assert!(!is_minified("web.min.js/app.ts", lines.as_bytes()));
+        for (path, bytes) in [
+            ("bundle.js", dense.as_bytes()),
+            ("app.js", lines.as_bytes()),
+        ] {
+            let kind = classify(Path::new("/p"), &Path::new("/p").join(path), Some(bytes));
+            assert_eq!(
+                kind.content == ContentKind::Minified,
+                is_minified(path, bytes),
+                "{path}"
+            );
+        }
     }
 
     #[test]

@@ -66,7 +66,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aft::search_index::SearchIndex;
 use aft::semantic_index::SemanticIndex;
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -788,37 +787,6 @@ fn assert_nothing_retained(scenario: &str, baseline: Sample, end: Sample) {
         small_growth as f64 / MB,
         live_growth as f64 / MB,
     );
-}
-
-/// Cold search-index rebuilds of one root, each replacing the previous index:
-/// the shape of `started search index refresh after watcher overflow`.
-#[test]
-#[ignore = "slow macOS allocator measurement; negative control for the daemon growth"]
-fn control_search_rebuild_after_overflow() {
-    let temp = tempfile::tempdir().unwrap();
-    let corpus = match std::env::var_os("AFT_REPRO_CORPUS") {
-        Some(path) => PathBuf::from(path),
-        None => {
-            let root = temp.path().join("corpus");
-            write_corpus(&root, env_usize("AFT_REPRO_FILES", 4000), 40, 7);
-            root
-        }
-    };
-    let cache_dir = temp.path().join("search-cache");
-    let baseline = sample();
-    sample_row("baseline", baseline);
-    let mut current: Option<SearchIndex> = None;
-    for iteration in 0..env_usize("AFT_REPRO_ITERS", 8) {
-        current = Some(SearchIndex::build_with_limit_to_cache_dir(
-            &corpus, 1_048_576, &cache_dir,
-        ));
-        sample_row(&format!("rebuild {iteration}"), sample());
-    }
-    drop(current);
-    let end = sample();
-    sample_row("after dropping last index", end);
-    print_footprint_categories();
-    assert_nothing_retained("control_search_rebuild_after_overflow", baseline, end);
 }
 
 /// Repeated loads of one semantic artifact, each replacing the previous copy:

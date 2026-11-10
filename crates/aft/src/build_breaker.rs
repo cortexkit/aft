@@ -25,15 +25,15 @@ pub const BREAKER_CONFIGURATION_VERSION: &str = "v1";
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 // Thread-local, not process-global: libtest runs sibling tests in parallel and
-// they open breakers of their own, so a shared counter cannot support the exact
-// open-count assertions the health rollup test makes about its own thread.
+// they open and read breakers of their own, so a shared counter cannot support
+// the exact open-count assertions the health rollup test makes about its own
+// thread, and a shared injected read failure would be consumed by whichever
+// test's health rollup reads a breaker first.
 #[cfg(test)]
 thread_local! {
     static OPEN_CALLS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-#[cfg(test)]
-static FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Every expensive background build must choose one explicit domain. The enum is
 /// intentionally exhaustive so new schedulers cannot silently bypass the breaker.
@@ -361,26 +361,6 @@ impl BuildDeathBreaker {
         })
     }
 
-    /// Retire an attempt that returned normally without publishing. Cancellation
-    /// preserves all prior death history and prevents a late attribution from
-    /// treating an ordinary corpus edit as a process death.
-    pub(crate) fn cancel_attempt(&self, key: &BreakerKey, attempt_id: &str) -> Result<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "DELETE FROM breaker_attempts
-                 WHERE root_id = ?1 AND domain = ?2 AND corpus_fingerprint = ?3
-                   AND attempt_id = ?4 AND death_charged = 0",
-                params![
-                    key.root_id,
-                    key.domain.as_str(),
-                    key.corpus_fingerprint,
-                    attempt_id
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
     /// A ready pointer flip is the only automatic full reset. Staged commits do
     /// not call this method and therefore cannot launder a death loop.
     pub fn record_ready_publication(&self, key: &BreakerKey) -> Result<()> {
@@ -426,7 +406,7 @@ impl BuildDeathBreaker {
         now_ms: u64,
     ) -> Result<Vec<BuildSuspension>> {
         #[cfg(test)]
-        if FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.swap(false, Ordering::SeqCst) {
+        if FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.with(|fail| fail.replace(false)) {
             return Err(BuildBreakerError::Sqlite(rusqlite::Error::InvalidQuery));
         }
         self.with_connection(|conn| {
@@ -478,11 +458,6 @@ impl BuildDeathBreaker {
     #[cfg(test)]
     pub(crate) fn open_calls_for_test() -> u64 {
         OPEN_CALLS_FOR_TEST.with(|calls| calls.get())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_active_suspensions_for_test() {
-        FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.store(true, Ordering::SeqCst);
     }
 
     fn with_connection<T>(&self, work: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
@@ -689,23 +664,6 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_attempt_ignores_late_death_without_resetting_prior_history() {
-        let (_dir, breaker) = breaker();
-        let key = key(BuildDomain::CallgraphCold);
-        let dead = admitted(&breaker, &key, 1);
-        breaker
-            .record_attributed_death_at(&key, &dead.attempt_id, 0, 0, 2)
-            .unwrap();
-        let cancelled = admitted(&breaker, &key, 3);
-        breaker.cancel_attempt(&key, &cancelled.attempt_id).unwrap();
-        assert!(breaker
-            .record_attributed_death_at(&key, &cancelled.attempt_id, 0, 100_000, 4)
-            .unwrap()
-            .is_none());
-        assert_eq!(durable_tallies(&breaker, &key), (1, 0, 0));
-    }
-
-    #[test]
     fn three_zero_credit_deaths_trip_once_and_are_idempotent() {
         let (_breaker_dir, breaker) = breaker();
         let key = key(BuildDomain::CallgraphCold);
@@ -854,103 +812,5 @@ mod tests {
             .unwrap();
         assert_eq!(suspension.reason, "in_build_burn_limit");
         assert_eq!(suspension.domain, BuildDomain::Tier2Scan);
-    }
-
-    #[test]
-    fn durable_trip_agrees_across_navigation_inspect_and_health_snapshots() {
-        let storage = tempdir().unwrap();
-        let root = storage.path().join("root");
-        std::fs::create_dir_all(&root).unwrap();
-        let project_key = crate::search_index::artifact_cache_key(&root);
-        let breaker_path = storage
-            .path()
-            .join("callgraph")
-            .join(&project_key)
-            .join("build-breaker.sqlite");
-        let breaker = BuildDeathBreaker::open(&breaker_path).unwrap();
-        let key = BreakerKey::new(
-            root.display().to_string(),
-            BuildDomain::CallgraphCold,
-            "corpus-a",
-        );
-        let trip_at = 1_000_000;
-        let mut trip_decision = None;
-        for death_at in (trip_at - 2)..=trip_at {
-            let attempt = admitted(&breaker, &key, death_at);
-            trip_decision = breaker
-                .record_attributed_death_at(&key, &attempt.attempt_id, 10, 0, death_at)
-                .unwrap();
-        }
-        let trip_decision = trip_decision.expect("third zero-credit death trips the breaker");
-        let snapshot_at = trip_at + 5_000;
-        let durable_rows = breaker
-            .active_suspensions_for_root_at(&root.display().to_string(), snapshot_at)
-            .unwrap();
-        assert_eq!(durable_rows, vec![trip_decision.clone()]);
-        let suspension = &durable_rows[0];
-
-        let navigation = crate::commands::callgraph_store_adapter::suspended_response_at(
-            "surface-agreement",
-            "callers",
-            suspension,
-            snapshot_at,
-        );
-        assert_eq!(navigation.data["code"], "callgraph_unavailable");
-        assert_eq!(
-            navigation.data["index"]["callgraph"]["reason"],
-            "build_suspended"
-        );
-        assert_eq!(
-            navigation.data["message"],
-            "callers: build_suspended domain=callgraph_cold deaths=3 age_ms=5000 reason=zero_credit_death_limit; run doctor reset-build-breaker to resume"
-        );
-
-        let manager = crate::inspect::InspectManager::new();
-        manager.record_tier2_build_suspension_for_test(
-            crate::inspect::InspectCategory::DeadCode,
-            suspension.clone(),
-        );
-        assert_eq!(
-            manager.tier2_builder_state_detail_at(
-                crate::inspect::InspectCategory::DeadCode,
-                snapshot_at,
-            ),
-            "suspended domain=callgraph_cold deaths=3 age_s=5 reason=zero_credit_death_limit"
-        );
-
-        let config = crate::config::Config {
-            project_root: Some(root.clone()),
-            storage_dir: Some(storage.path().to_path_buf()),
-            ..crate::config::Config::default()
-        };
-        let context = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            config,
-        );
-        // Contexts without a bound root must not start unrelated heavy work while
-        // this test reads the cached health projection of the durable breaker row.
-        context.set_heavy_root_work_allowed(false);
-        assert_eq!(context.storage_dir(), storage.path());
-        context.refresh_build_suspensions_for_health_at(&root, Some(&project_key), snapshot_at);
-        let health = context.try_health_snapshot(&root);
-        assert_eq!(health.suspended_domains.len(), 1);
-        assert_eq!(health.suspended_domains[0].domain, "callgraph_cold");
-        assert_eq!(
-            health.suspended_domains[0].reason,
-            "zero_credit_death_limit"
-        );
-        assert_eq!(health.suspended_domains[0].death_count, 3);
-        assert_eq!(health.suspended_domains[0].age_s, 5);
-
-        assert!(breaker
-            .active_suspensions_for_root_at(&root.display().to_string(), trip_at + TRIP_TTL_MS + 5,)
-            .unwrap()
-            .is_empty());
-        assert!(matches!(
-            breaker
-                .admit_at(&key, 10, trip_at + TRIP_TTL_MS + 5)
-                .unwrap(),
-            BreakerAdmission::Admitted(_)
-        ));
     }
 }

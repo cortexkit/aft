@@ -134,7 +134,7 @@ pub(crate) mod work_probe {
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
-    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
+    let _pin = false.then(|| ctx.pin_config_to(config));
     ctx.with_read_policy_snapshot(&req.id, || {
         crate::context::confinement::with_floor_disclosure(|| {
             crate::bounded_io::command(req, ctx, handle_grep_inner)
@@ -277,7 +277,9 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         None
     } else {
-        crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters, order)
+        crate::data_layer::parent_session::grep_fan_out(
+            ctx, &compiled, &scope, &params, &filters, order,
+        )
     };
     let (result, phases, parent_gaps) = match parent_answer {
         Some(answer) => answer,
@@ -473,7 +475,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
-    crate::views::parent::attach_gaps(&mut body, parent_gaps);
+    crate::data_layer::parent_session::attach_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
     if let Some(mut envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
@@ -1795,6 +1797,57 @@ mod tests {
         assert_eq!(response.data["complete"], false);
         assert_eq!(response.data["matches"].as_array().unwrap().len(), 1);
         assert_eq!(response.data["walk_stopped_by"], "file_limit");
+    }
+
+    /// While the index is still building, grep answers from a walk. The reply
+    /// must say the walk read every file, so a zero is trustworthy; a bare
+    /// "[index: building]" next to the count would leave that unknown.
+    #[test]
+    fn grep_while_index_builds_says_the_walk_searched_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for (name, body) in [
+            ("a.rs", "fn a() {}\n"),
+            ("b.rs", "fn b() {}\n"),
+            ("c.rs", "fn c() {}\n"),
+        ] {
+            std::fs::write(root.join("src").join(name), body).unwrap();
+        }
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        // The index store binds the root and its first build waits here.
+        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "grep-while-building", "command": "grep",
+            "pattern": "definitely_absent_token",
+        }))
+        .unwrap();
+        let response = handle_grep(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(
+            response.data["index_status"], "Building",
+            "{:?}",
+            response.data
+        );
+        assert_eq!(
+            response.data["text"],
+            "Found 0 matches in 0 files [index: building; searched all 3 files directly]",
+            "{:?}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], true, "{:?}", response.data);
+        assert_eq!(
+            response.data["files_read_directly"], 3,
+            "{:?}",
+            response.data
+        );
     }
 
     fn grep_match(file: &str, line: u32, line_text: &str) -> GrepMatch {

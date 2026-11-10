@@ -14,7 +14,6 @@ use crate::config::{Config, RerankConfig};
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::parser::TreeSitterProvider;
 use crate::protocol::RawRequest;
-use crate::search_index::SearchIndex;
 
 thread_local! {
     static TEST_BACKEND: RefCell<Option<SelectedBackend>> = const { RefCell::new(None) };
@@ -338,15 +337,12 @@ const PROBE_QUESTION: &str = "where is the rerank probe token handled";
 /// A lexical-only project with `count` files that all contain the probe.
 fn probe_project(count: usize) -> (tempfile::TempDir, AppContext) {
     let project = tempfile::tempdir().unwrap();
-    let mut index = SearchIndex::new();
     for number in 0..count {
         let file = project.path().join(format!("src/file_{number:02}.rs"));
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let source = format!("pub fn {PROBE}_{number:02}() {{ /* rerank probe */ }}\n");
         std::fs::write(&file, &source).unwrap();
-        index.index_file(&file, source.as_bytes());
     }
-    index.ready = true;
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         Config {
@@ -354,12 +350,10 @@ fn probe_project(count: usize) -> (tempfile::TempDir, AppContext) {
             ..Config::default()
         },
     );
-    *ctx.search_index()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
     *ctx.semantic_index_status()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+    crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
     (project, ctx)
 }
 

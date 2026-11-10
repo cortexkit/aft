@@ -74,9 +74,6 @@
       ],
       "errors": 1,
       "warnings": 2,
-      "dead_code": 3,
-      "unused_exports": 4,
-      "duplicates": 5,
       "todos": 6,
       "diagnostics": "producer_missing",
       "diagnostics_gaps": [
@@ -85,8 +82,7 @@
           "producer": "rust-analyzer",
           "root": "/project"
         }
-      ],
-      "tier2_stale": true
+      ]
     },
     "status_bar_values": {
       "disabled_categories": [
@@ -95,9 +91,6 @@
       ],
       "errors": 1,
       "warnings": 2,
-      "dead_code": 3,
-      "unused_exports": 4,
-      "duplicates": 5,
       "todos": 6,
       "diagnostics": "producer_missing",
       "diagnostics_gaps": [
@@ -106,8 +99,7 @@
           "producer": "rust-analyzer",
           "root": "/project"
         }
-      ],
-      "tier2_stale": true
+      ]
     },
     "compression": {
       "project": {
@@ -148,7 +140,7 @@
       "omitted": true,
       "read": "status",
       "reason": "serialized_body_limit",
-      "original_body_bytes": 74215
+      "original_body_bytes": 74081
     }
   }
 }

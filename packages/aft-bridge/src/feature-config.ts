@@ -3,8 +3,9 @@
  *
  * Mirrors `crates/aft/src/feature_config.rs`: the literal tool inventory, the
  * table of retired keys, the per-block translation of those keys into
- * canonical `disabled_tools` / `indexes` / `github` / `lsp` leaves (retired
- * keys are never refused),
+ * canonical `disabled_tools` / `indexes` / `github` / `lsp` / `idle` leaves
+ * (the names retired in 0.62 or earlier, and the data-layer keys from
+ * `DATA_LAYER_KEYS_REFUSED_FROM` on, are refused by `removedConfigKeyErrors`),
  * validation of a resolved configuration, and the migration-notice projection
  * digest. The config parity fixtures and the shared notice-projection fixture
  * (`crates/aft/tests/fixtures/feature_config/notice_projection.json`) keep the
@@ -12,6 +13,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 
 /** Every agent-visible tool name a registration adapter may publish (sorted). */
 export const CANONICAL_TOOLS = [
@@ -84,14 +86,146 @@ export const REMOVED_OPENCODE_PATHS = [
   "opencode.server_password_env",
 ] as const;
 
-/** Removed transport settings fail only in the base and first-level harness blocks. */
-export function removedConfigKeyErrors(value: unknown): string[] {
+/**
+ * Keys the per-repository data store leaves with nothing to do. A config file
+ * that sets one gets a notice saying it no longer does anything, and
+ * `doctor --fix` deletes it, but the automatic rewrite of the user file
+ * leaves it in place. Until the engine code that reads them (index views, and
+ * the path that serves a worktree from another checkout's indexes) is deleted,
+ * the values a file supplies still reach the engine, so translation keeps them in
+ * the document. From `DATA_LAYER_KEYS_REFUSED_FROM` a config that sets one is
+ * refused. Mirrors `REMOVED_DATA_LAYER_PATHS` in
+ * `crates/aft/src/feature_config.rs`.
+ */
+export const REMOVED_DATA_LAYER_PATHS = [
+  "views.callgraph_copies",
+  "views.enabled",
+  "worktree.ram_overlay",
+] as const;
+
+/**
+ * `views.idle_checkout_hours` and the key that replaces it. Translated like any
+ * retired key (and the user file rewritten) until
+ * `DATA_LAYER_KEYS_REFUSED_FROM`, then refused.
+ */
+export const RETIRED_IDLE_CHECKOUT_HOURS = [
+  "views.idle_checkout_hours",
+  "idle.checkout_hours",
+] as const;
+
+/**
+ * First release, as [major, minor], that refuses the keys in
+ * `DATA_LAYER_RETIRED_PATHS` with `removed_config_key`. Earlier releases
+ * translate or keep them, with a notice.
+ */
+export const DATA_LAYER_KEYS_REFUSED_FROM: readonly [number, number] = [0, 65];
+
+/** Every key the data-layer cutover retires, refused from `DATA_LAYER_KEYS_REFUSED_FROM`. */
+export const DATA_LAYER_RETIRED_PATHS = [
+  "views.callgraph_copies",
+  "views.enabled",
+  "views.idle_checkout_hours",
+  "worktree.ram_overlay",
+] as const;
+
+/**
+ * The `views` block a plugin sends to configure: the resolved block without
+ * `enabled`, or `undefined` when nothing else is left. `views.enabled` does
+ * nothing from 0.64; the file that sets it still gets the removed-key notice,
+ * but the key never reaches the resolved config, as in the Rust resolver.
+ */
+export function viewsForConfigure<T extends { enabled?: unknown }>(
+  views: T | undefined,
+): Omit<T, "enabled"> | undefined {
+  if (views === undefined) return undefined;
+  const { enabled: _enabled, ...rest } = views;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+/** `idle.checkout_hours` default and range; mirrors `crates/aft/src/config.rs`. */
+export const IDLE_CHECKOUT_HOURS_DEFAULT = 168;
+export const IDLE_CHECKOUT_HOURS_MIN = 1;
+export const IDLE_CHECKOUT_HOURS_MAX = 24 * 365;
+
+/** The [major, minor] release a version string names, ignoring patch and suffixes. */
+export function parseRelease(version: string): readonly [number, number] | undefined {
+  const match = /^(\d+)\.(\d+)(?:\.|$)/.exec(version);
+  return match ? [Number(match[1]), Number(match[2])] : undefined;
+}
+
+/** Manifests that carry this code's release: the bridge, or a bundle that inlines it. */
+const AFT_PACKAGE_NAMES = new Set([
+  "@cortexkit/aft-bridge",
+  "@cortexkit/aft-opencode",
+  "@cortexkit/aft-pi",
+  "@cortexkit/aft",
+]);
+
+/**
+ * This code's release, read from the nearest AFT package manifest above it.
+ * The bridge is also bundled into the plugins and the CLI at different
+ * depths, and every AFT package is released with the same version, so the
+ * first AFT manifest found names the release. [0, 0] when none is found,
+ * which refuses nothing.
+ */
+function readRunningRelease(): readonly [number, number] {
+  const req = createRequire(import.meta.url);
+  for (const candidate of ["../package.json", "../../package.json", "../../../package.json"]) {
+    try {
+      const manifest = req(candidate) as { name?: string; version?: string };
+      if (manifest.name && AFT_PACKAGE_NAMES.has(manifest.name) && manifest.version) {
+        return parseRelease(manifest.version) ?? [0, 0];
+      }
+    } catch {
+      // Not at this depth; try the next.
+    }
+  }
+  return [0, 0];
+}
+
+let runningRelease: readonly [number, number] | undefined;
+
+/** The [major, minor] release of this package, read once. */
+export function getRunningRelease(): readonly [number, number] {
+  runningRelease ??= readRunningRelease();
+  return runningRelease;
+}
+
+function releaseAtLeast(
+  release: readonly [number, number],
+  floor: readonly [number, number],
+): boolean {
+  return release[0] !== floor[0] ? release[0] > floor[0] : release[1] >= floor[1];
+}
+
+/** `0.65.0` for `DATA_LAYER_KEYS_REFUSED_FROM`, as notices print it. */
+function refusedFromVersion(): string {
+  return `${DATA_LAYER_KEYS_REFUSED_FROM[0]}.${DATA_LAYER_KEYS_REFUSED_FROM[1]}.0`;
+}
+
+/**
+ * Removed settings fail only in the base and first-level harness blocks. The
+ * data-layer keys fail only from `DATA_LAYER_KEYS_REFUSED_FROM`, judged by
+ * `release` (this package's own release unless a test names one). The names
+ * retired in 0.62 or earlier (`REFUSED_RETIRED_PATHS` and the prefixed tool
+ * names) fail only when `refuseRetired` is true. The plugins pass false for
+ * both files: the AFT binary rewrites the user file to current keys when it
+ * loads it, and a project file loads with a notice rather than leaving a
+ * repository without AFT. Mirrors `removed_config_key_errors` in
+ * `crates/aft/src/feature_config.rs`, which always refuses them; the binary
+ * applies it to the user file only.
+ */
+export function removedConfigKeyErrors(
+  value: unknown,
+  release: readonly [number, number] = getRunningRelease(),
+  refuseRetired = true,
+): string[] {
   if (!isRecord(value)) return [];
-  const errors = removedOpencodeKeyErrors(value);
+  const errors = removedBlockKeyErrors(value, release, refuseRetired);
   if (isRecord(value.harnesses)) {
     for (const [name, block] of Object.entries(value.harnesses)) {
       if (!isRecord(block)) continue;
-      for (const error of removedOpencodeKeyErrors(block)) {
+      for (const error of removedBlockKeyErrors(block, release, refuseRetired)) {
         errors.push(error.replace("removed_config_key:", `removed_config_key:harnesses.${name}.`));
       }
     }
@@ -99,10 +233,65 @@ export function removedConfigKeyErrors(value: unknown): string[] {
   return errors;
 }
 
-function removedOpencodeKeyErrors(value: Record<string, unknown>): string[] {
-  return REMOVED_OPENCODE_PATHS.filter((path) => hasPath(value, path)).map(
-    (path) => `removed_config_key:${path}; run aft doctor --fix`,
-  );
+function removedBlockKeyErrors(
+  value: Record<string, unknown>,
+  release: readonly [number, number],
+  refuseRetired: boolean,
+): string[] {
+  const paths: string[] = REMOVED_OPENCODE_PATHS.filter((path) => hasPath(value, path));
+  if (refuseRetired) paths.push(...refusedRetiredNames(value));
+  if (releaseAtLeast(release, DATA_LAYER_KEYS_REFUSED_FROM))
+    paths.push(...DATA_LAYER_RETIRED_PATHS.filter((path) => hasPath(value, path)));
+  return paths.map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`);
+}
+
+/**
+ * Names retired in 0.62 or earlier, refused from 0.64, in the order a refusal
+ * lists them. A config that still sets one is refused with
+ * `removed_config_key`; `doctor --fix` (or the automatic rewrite of the user
+ * file) replaces it with its current equivalent or deletes it. Names retired
+ * more recently (`bridge.hang_threshold` and the data-layer keys) are not
+ * listed: they are still translated, with a notice. Mirrors
+ * `REFUSED_RETIRED_PATHS` in `crates/aft/src/feature_config.rs`.
+ */
+export const REFUSED_RETIRED_PATHS = [
+  "sandbox.enabled",
+  "tool_surface",
+  "hoist_builtin_tools",
+  "enabled",
+  "search_index",
+  "experimental_search_index",
+  "semantic_search",
+  "experimental_semantic_search",
+  "callgraph_store",
+  "github.enabled",
+  "gh_read",
+  "gh_shim.enabled",
+  "experimental_lsp_ty",
+  "experimental_bash_rewrite",
+  "experimental_bash_compress",
+  "experimental_bash_background",
+  "experimental.bash",
+  "idle.lsp_ttl_minutes",
+  "inspect.tier2_soft_deadline_ms",
+  "inspect.max_drill_down_items",
+] as const;
+
+/**
+ * The refused retired names one block sets: the paths in
+ * `REFUSED_RETIRED_PATHS`, then each prefixed tool name (`LEGACY_TOOL_ALIASES`)
+ * its `disabled_tools` list contains, once each and by its bare name, as the
+ * retired-key notices list it.
+ */
+function refusedRetiredNames(block: Record<string, unknown>): string[] {
+  const names: string[] = REFUSED_RETIRED_PATHS.filter((path) => hasPath(block, path));
+  if (Array.isArray(block.disabled_tools)) {
+    for (const name of block.disabled_tools) {
+      if (typeof name !== "string" || !Object.hasOwn(LEGACY_TOOL_ALIASES, name)) continue;
+      if (!names.includes(name)) names.push(name);
+    }
+  }
+  return names;
 }
 
 /** Retired config paths and their replacement. */
@@ -192,6 +381,14 @@ export interface DocumentTranslation {
    * tool name inside `disabled_tools` is listed by that name.
    */
   retiredKeys: string[];
+  /**
+   * Every removed data-layer key (`REMOVED_DATA_LAYER_PATHS`) the document
+   * supplied, sorted and de-duplicated, with the same harness prefix as
+   * `retiredKeys`. Translation keeps these keys in the document and they never
+   * set `legacyInput`, so the automatic rewrite of the user file leaves them
+   * alone; they get their own notice instead.
+   */
+  removedKeys: string[];
   /**
    * True when some block set the retired top-level `enabled: false`. It is
    * translated into a disabled_tools list only, so indexes keep building;
@@ -351,10 +548,16 @@ function translateInspectLspPaths(map: JsonRecord, prefix: string, out: Document
  * dropped on load and removed by `doctor --fix`, and the notice says so.
  * `bridge.hang_threshold` counted request timeouts toward restarting the
  * bridge; a timeout now fails only its own request, and the bridge's hang
- * watchdog judges a stuck child by its silence instead. Mirrors
- * `REMOVED_NO_EFFECT_PATHS` in `crates/aft/src/feature_config.rs`.
+ * watchdog judges a stuck child by its silence instead.
+ * `inspect.tier2_idle_minutes` delayed the whole-repository analyses the
+ * OpenCode plugin started when a session went idle; those analyses now run
+ * only when `aft_inspect` is called. Mirrors `REMOVED_NO_EFFECT_PATHS` in
+ * `crates/aft/src/feature_config.rs`.
  */
-export const REMOVED_NO_EFFECT_PATHS: readonly string[] = ["bridge.hang_threshold"];
+export const REMOVED_NO_EFFECT_PATHS: readonly string[] = [
+  "bridge.hang_threshold",
+  "inspect.tier2_idle_minutes",
+];
 
 /** Drop the retired keys that no longer do anything, exactly as `doctor --fix` removes them. */
 function dropNoEffectPaths(map: JsonRecord, prefix: string, out: DocumentTranslation): void {
@@ -367,9 +570,64 @@ function dropNoEffectPaths(map: JsonRecord, prefix: string, out: DocumentTransla
 }
 
 /**
- * Translate flat experimental aliases to nested settings. Graduating
- * experimental.bash explicitly sets omitted feature flags to false;
- * otherwise the current default-on bash settings would silently enable them.
+ * The `idle.checkout_hours` value a retired `views.idle_checkout_hours` value
+ * becomes: a whole number clamped to the current range, or the default for
+ * anything else. Mirrors `retired_idle_checkout_hours` in
+ * `crates/aft/src/feature_config.rs`.
+ */
+export function retiredIdleCheckoutHours(value: unknown): number {
+  const raw =
+    typeof value === "number" && Number.isSafeInteger(value) ? value : IDLE_CHECKOUT_HOURS_DEFAULT;
+  return Math.min(IDLE_CHECKOUT_HOURS_MAX, Math.max(IDLE_CHECKOUT_HOURS_MIN, raw));
+}
+
+/**
+ * Translate the keys the data-layer cutover retires in one block:
+ * `views.idle_checkout_hours` becomes `idle.checkout_hours` (clamped to its
+ * range) unless that is already set, exactly as `doctor --fix` rewrites it.
+ * The removed keys (`REMOVED_DATA_LAYER_PATHS`) are only listed: their values
+ * stay in the document until the code that reads them is deleted.
+ */
+function translateDataLayerPaths(map: JsonRecord, prefix: string, out: DocumentTranslation): void {
+  const [retired, replacement] = RETIRED_IDLE_CHECKOUT_HOURS;
+  const hours = takeNested(map, "views", "idle_checkout_hours");
+  if (hours.found) {
+    recordRetired(out, prefix, retired);
+    if (isRecord(map.idle) && map.idle.checkout_hours !== undefined) {
+      superseded(out, `${prefix}${retired}`, `${retired} is ignored because ${replacement} is set`);
+    } else {
+      if (!Object.hasOwn(map, "idle")) map.idle = {};
+      if (isRecord(map.idle)) map.idle.checkout_hours = retiredIdleCheckoutHours(hours.value);
+    }
+  }
+  for (const path of REMOVED_DATA_LAYER_PATHS) {
+    if (hasPath(map, path)) out.removedKeys.push(`${prefix}${path}`);
+  }
+}
+
+/**
+ * Delete the removed data-layer keys from a translated document, base and
+ * harness blocks alike, emptying containers as `doctor --fix` does. Used to
+ * preview what `doctor --fix` will remove; load-time translation keeps them.
+ */
+export function dropRemovedDataLayerKeys(map: JsonRecord): void {
+  const blocks: JsonRecord[] = [map];
+  if (isRecord(map.harnesses)) {
+    for (const block of Object.values(map.harnesses)) if (isRecord(block)) blocks.push(block);
+  }
+  for (const block of blocks) {
+    for (const path of REMOVED_DATA_LAYER_PATHS) {
+      const [container, leaf] = path.split(".");
+      if (container && leaf) takeNested(block, container, leaf);
+    }
+  }
+}
+
+/**
+ * Translate flat experimental aliases to nested settings and move the
+ * `experimental.bash` block to top-level `bash`. Graduating a block that sets
+ * a feature flag explicitly sets its omitted flags to false; otherwise the
+ * current default-on bash settings would silently enable them.
  */
 function translateExperimentalPaths(
   map: JsonRecord,
@@ -408,7 +666,7 @@ function translateExperimentalPaths(
   const experimental = map.experimental;
   const legacy = experimental.bash;
   if (isRecord(legacy)) {
-    if (!["rewrite", "compress", "background"].some((leaf) => Object.hasOwn(legacy, leaf))) return;
+    if (Object.keys(legacy).length === 0) recordRetired(out, prefix, "experimental.bash");
     for (const leaf of Object.keys(legacy)) recordRetired(out, prefix, `experimental.bash.${leaf}`);
     if (Object.hasOwn(map, "bash")) {
       superseded(
@@ -417,15 +675,19 @@ function translateExperimentalPaths(
         'experimental.bash is ignored because top-level "bash" is already set',
       );
     } else {
-      const bash: JsonRecord = {
-        rewrite: legacy.rewrite === true,
-        compress: legacy.compress === true,
-        background: legacy.background === true,
-      };
+      const bash: JsonRecord = {};
+      // A block with only reminder settings never opted into the feature
+      // flags, so they keep their current defaults instead of being written
+      // as false.
+      if (["rewrite", "compress", "background"].some((leaf) => Object.hasOwn(legacy, leaf))) {
+        bash.rewrite = legacy.rewrite === true;
+        bash.compress = legacy.compress === true;
+        bash.background = legacy.background === true;
+      }
       for (const leaf of ["long_running_reminder_enabled", "long_running_reminder_interval_ms"]) {
         if (Object.hasOwn(legacy, leaf)) bash[leaf] = legacy[leaf];
       }
-      map.bash = bash;
+      if (Object.keys(bash).length > 0) map.bash = bash;
     }
   } else {
     recordRetired(out, prefix, "experimental.bash");
@@ -452,6 +714,7 @@ function translateBlock(
   const prefix = blockLabel === "base" ? "" : `${blockLabel}.`;
   translateGithubAliases(map, prefix, out);
   translateInspectLspPaths(map, prefix, out);
+  translateDataLayerPaths(map, prefix, out);
   dropNoEffectPaths(map, prefix, out);
   translateExperimentalPaths(map, prefix, out);
   if (isRecord(map.sandbox) && Object.hasOwn(map.sandbox, "enabled")) {
@@ -493,10 +756,9 @@ function translateBlock(
     });
   }
 
+  // `experimental.bash` was already recorded, leaf by leaf, and removed by
+  // `translateExperimentalPaths`.
   for (const [path] of RETIRED_PATHS) {
-    // A block with only reminder settings never opted into experimental
-    // bash features. Leave it unchanged instead of adding false flags.
-    if (path === "experimental.bash") continue;
     if (hasPath(map, path)) recordRetired(out, prefix, path);
   }
   const gates = falseRuntimeGates(map);
@@ -661,6 +923,10 @@ export const NO_EFFECT_RETIRED_NOTES: ReadonlyArray<readonly [string, string]> =
     "inspect.max_drill_down_items never had an effect, so the setting can be removed.",
   ],
   [
+    "inspect.tier2_idle_minutes",
+    "inspect.tier2_idle_minutes no longer does anything: AFT runs whole-repository analyses only when aft_inspect is called, so the setting can be removed.",
+  ],
+  [
     "inspect.tier2_soft_deadline_ms",
     "inspect.tier2_soft_deadline_ms never had an effect, so the setting can be removed.",
   ],
@@ -668,7 +934,77 @@ export const NO_EFFECT_RETIRED_NOTES: ReadonlyArray<readonly [string, string]> =
 
 /** The no-effect sentence for a retired key, which may carry a `harnesses.<id>.` prefix. */
 function noEffectNote(key: string): string | undefined {
-  return NO_EFFECT_RETIRED_NOTES.find(([path]) => key === path || key.endsWith(`.${path}`))?.[1];
+  return NO_EFFECT_RETIRED_NOTES.find(([path]) => namesPath(key, path))?.[1];
+}
+
+/** Whether `key`, which may carry a `harnesses.<id>.` prefix, is `path`. */
+function namesPath(key: string, path: string): boolean {
+  return key === path || key.endsWith(`.${path}`);
+}
+
+/**
+ * Why each removed data-layer key no longer does anything, in
+ * `REMOVED_DATA_LAYER_PATHS` order. Mirrors `REMOVED_DATA_LAYER_NOTES` in
+ * `crates/aft/src/feature_config.rs`.
+ */
+export const REMOVED_DATA_LAYER_NOTES: ReadonlyArray<readonly [string, string]> = [
+  [
+    "views.callgraph_copies",
+    "views.callgraph_copies is gone because no checkout borrows another checkout's call graph any more.",
+  ],
+  [
+    "views.enabled",
+    "views.enabled is gone because AFT now keeps one index store per repository and always uses it.",
+  ],
+  [
+    "worktree.ram_overlay",
+    "worktree.ram_overlay is gone because every worktree now has its own index state, so there is no borrowed index to patch in memory.",
+  ],
+];
+
+/**
+ * The sentence saying a file that still names `views.idle_checkout_hours` will
+ * be refused. Mirrors `retired_idle_checkout_hours_note` in
+ * `crates/aft/src/feature_config.rs`.
+ */
+export function retiredIdleCheckoutHoursNote(): string {
+  const [retired, replacement] = RETIRED_IDLE_CHECKOUT_HOURS;
+  return `${retired} is now ${replacement}; from ${refusedFromVersion()} AFT refuses a config file that still sets ${retired}.`;
+}
+
+/**
+ * The once-per-identity notice for a config file, user or project, that still
+ * sets removed data-layer keys. Empty when it sets none. The file is never
+ * rewritten for them automatically; `doctor --fix` deletes them. Mirrors
+ * `removed_keys_notice` in `crates/aft/src/feature_config.rs`.
+ */
+export function removedConfigKeysNoticeMessage(
+  configPath: string,
+  translation: Partial<Pick<DocumentTranslation, "removedKeys">>,
+): string {
+  const removed = translation.removedKeys ?? [];
+  if (removed.length === 0) return "";
+  const parts = [
+    `${configPath} sets removed keys (${removed.join(", ")}); AFT ignores them, and from ${refusedFromVersion()} it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them.`,
+  ];
+  for (const [path, note] of REMOVED_DATA_LAYER_NOTES) {
+    if (removed.some((key) => namesPath(key, path))) parts.push(note);
+  }
+  return parts.join(" ");
+}
+
+/**
+ * Identity of the user-file notice for removed data-layer keys: the set of
+ * keys it names. The rewrite of other retired keys in the same file then does
+ * not repeat it, and adding another removed key does.
+ */
+export function removedConfigKeysNoticeDigest(
+  translation: Pick<DocumentTranslation, "removedKeys">,
+): string {
+  return noticeDigest({
+    notice: "removed_data_layer_keys_v1",
+    keys: sortedUnique(translation.removedKeys),
+  });
 }
 
 /**
@@ -676,12 +1012,14 @@ function noEffectNote(key: string): string | undefined {
  * were translated in memory. The file itself is never written: it is shared
  * through its repository. Keys that no longer do anything get only their own
  * sentence, after the sentence about the keys whose current equivalents were
- * applied (omitted when there are none). Mirrors `project_retired_keys_notice`
- * in `crates/aft/src/feature_config.rs`.
+ * applied (omitted when there are none); removed data-layer keys the file
+ * sets follow with their own notice. Mirrors `project_retired_keys_notice` in
+ * `crates/aft/src/feature_config.rs`.
  */
 export function legacyConfigNoticeMessage(
   configPath: string,
-  translation: Pick<DocumentTranslation, "retiredEnabledFalse" | "retiredKeys">,
+  translation: Pick<DocumentTranslation, "retiredEnabledFalse" | "retiredKeys"> &
+    Partial<Pick<DocumentTranslation, "removedKeys">>,
 ): string {
   const equivalents = translation.retiredKeys.filter((key) => noEffectNote(key) === undefined);
   const noEffect = new Set(translation.retiredKeys.map(noEffectNote));
@@ -691,18 +1029,25 @@ export function legacyConfigNoticeMessage(
       `${configPath} uses retired keys (${equivalents.join(", ")}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
     );
     if (translation.retiredEnabledFalse) parts.push(RETIRED_ENABLED_FALSE_INDEXES_NOTE);
+    if (equivalents.some((key) => namesPath(key, RETIRED_IDLE_CHECKOUT_HOURS[0]))) {
+      parts.push(retiredIdleCheckoutHoursNote());
+    }
   }
   for (const [, note] of NO_EFFECT_RETIRED_NOTES) {
     if (noEffect.has(note)) parts.push(note);
   }
+  const removed = removedConfigKeysNoticeMessage(configPath, translation);
+  if (removed) parts.push(removed);
   return parts.join(" ");
 }
 
 /**
  * Translate every block (base plus each `harnesses.<id>`) in place. Retired
- * keys are never refused: their current equivalents then pass through the
+ * keys are not refused here: their current equivalents then pass through the
  * normal user/project trust rules, exactly as if the file had spelled them
- * out.
+ * out. (`removedConfigKeyErrors` refuses the names retired in 0.62 or earlier
+ * and the data-layer keys from `DATA_LAYER_KEYS_REFUSED_FROM`, before
+ * translation runs; `doctor --fix` still uses this translation for them.)
  *
  * Only the user file's base block receives the absent-base default
  * (`aft_move`/`aft_delete`) when its legacy keys generate disables: that
@@ -718,6 +1063,7 @@ export function translateConfigDocument(
     warnings: [],
     legacyInput: false,
     retiredKeys: [],
+    removedKeys: [],
     retiredEnabledFalse: false,
   };
   translateBlock(map, tier === "user", "base", out);
@@ -727,6 +1073,7 @@ export function translateConfigDocument(
     }
   }
   out.retiredKeys = sortedUnique(out.retiredKeys);
+  out.removedKeys = sortedUnique(out.removedKeys);
   return out;
 }
 
@@ -772,8 +1119,13 @@ function projectBlock(block: JsonRecord): JsonRecord {
   const legacyPaths: JsonRecord = {};
   // Retired keys with no replacement are projected too: otherwise adding one
   // to a file whose notice was already acknowledged would keep the old digest
-  // and the saved record would hide the new notice.
-  for (const path of [...RETIRED_PATHS.map(([retired]) => retired), ...REMOVED_NO_EFFECT_PATHS]) {
+  // and the saved record would hide the new notice. The data-layer keys are
+  // projected for the same reason.
+  for (const path of [
+    ...RETIRED_PATHS.map(([retired]) => retired),
+    ...REMOVED_NO_EFFECT_PATHS,
+    ...DATA_LAYER_RETIRED_PATHS,
+  ]) {
     const dot = path.indexOf(".");
     if (dot < 0) {
       if (Object.hasOwn(block, path)) legacyPaths[path] = block[path];

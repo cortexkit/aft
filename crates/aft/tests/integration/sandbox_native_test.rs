@@ -43,6 +43,13 @@ fn configure_native_policy(
     write_allow: &[PathBuf],
     read_deny: &[PathBuf],
 ) -> Value {
+    // `sandbox.enabled` was replaced by per-role profiles: true meant strict
+    // for both roles, false meant relaxed workers and unconfined heads.
+    let (worker, head) = if enabled {
+        ("strict", "strict")
+    } else {
+        ("relaxed", "off")
+    };
     aft.send(
         &json!({
             "id": format!("configure-native-{enabled}"),
@@ -54,7 +61,7 @@ fn configure_native_policy(
             "config": user_config(json!({
                 "bash": { "background": true, "rewrite": true },
                 "sandbox": {
-                    "enabled": enabled,
+                    "profile": { "worker": worker, "head": head },
                     "write_allow": write_allow,
                     "read_deny": read_deny,
                 }
@@ -142,7 +149,7 @@ impl CortexkitFloorFixture {
                 "bash_permissions": true,
                 "config": user_config(json!({
                     "bash": { "background": true, "rewrite": true, "shell": "/bin/bash" },
-                    "sandbox": { "enabled": true },
+                    "sandbox": { "profile": { "worker": "strict", "head": "strict" } },
                     "subc": { "connection_file": "~/daemon/connection.json" },
                 "github": { "shim": true },
                 "gh_shim": { "binary_path": shim_image },

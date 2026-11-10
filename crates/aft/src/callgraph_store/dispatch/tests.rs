@@ -17,7 +17,7 @@ fn rust_receiver_index_slices_preserve_local_preorder() {
         let tree = parser.parse(source, None).unwrap();
         let nodes = descendants(tree.root_node());
         let bindings = RustBindings::new(source, tree.root_node());
-        let index = RustReceiverIndex::new(&nodes, source, &bindings);
+        let index = RustReceiverIndex::new(&nodes, source, &bindings, Direct);
         for &function in nodes.iter().filter(|node| FUNCTIONS.contains(&node.kind())) {
             assert_eq!(
                 index
@@ -968,4 +968,126 @@ fn rust_colliding_inline_members_retain_positional_declaration_facts() {
         "duplicate binding names must not erase declaration facts"
     );
     assert!(methods.iter().all(|method| method.owner == "nested::T"));
+}
+
+/// Functions a `macro_rules!` template stamps into an impl call each other
+/// through `self`. The template is tokens in the file's tree, so the call
+/// has no call node; its site names the template's own function, and the
+/// resolver links it by that name.
+#[test]
+fn rust_template_self_call_links_the_function_its_template_defines() {
+    let parsed = parse(
+        "macro_rules! runtime_methods {\n    () => {\n        async fn poll_session(&self, id: &str) {\n            if self.handle_refusal(id).await {\n                return;\n            }\n        }\n\n        async fn handle_refusal(&self, id: &str) -> bool {\n            id.is_empty()\n        }\n    };\n}\n\npub struct Runtime;\n\nimpl Runtime {\n    runtime_methods!();\n}\n",
+        "rust",
+    );
+    let sites = parsed
+        .dispatch
+        .sites
+        .iter()
+        .filter(|site| site.member.as_deref() == Some("handle_refusal"))
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 1, "{:#?}", parsed.dispatch.sites);
+    assert_eq!(sites[0].caller.as_deref(), Some("poll_session"));
+    assert_eq!(sites[0].line, 4);
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parsed)]));
+    assert_eq!(
+        resolver.resolve("fixture", sites[0]).targets,
+        BTreeSet::from([Target {
+            file: "fixture".into(),
+            symbol: "handle_refusal".into(),
+            provenance: "name_match",
+        }])
+    );
+    // `id.is_empty()` has a receiver the template does not define: no site.
+    assert!(
+        parsed
+            .dispatch
+            .sites
+            .iter()
+            .all(|site| site.member.as_deref() != Some("is_empty")),
+        "{:#?}",
+        parsed.dispatch.sites
+    );
+}
+
+/// A `self` call to a name the template does not define is left to
+/// ordinary resolution.
+#[test]
+fn rust_template_self_call_to_a_name_the_template_lacks_has_no_site() {
+    let parsed = parse(
+        "macro_rules! m { () => { fn a(&self) { self.missing(); } }; }\nfn missing() {}\n",
+        "rust",
+    );
+    assert!(
+        parsed.dispatch.sites.iter().all(|site| !site
+            .receiver
+            .as_deref()
+            .is_some_and(|receiver| receiver.starts_with(TEMPLATE_SELF_RECEIVER))),
+        "{:#?}",
+        parsed.dispatch.sites
+    );
+}
+
+/// `obj["name"]()` calls `name` as written and is left to ordinary
+/// resolution; only an index that is not a string literal is dynamic.
+#[test]
+fn computed_member_with_a_string_literal_is_not_a_dynamic_site() {
+    for language in ["typescript", "javascript"] {
+        let parsed = parse(
+            "function method() {}\nfunction caller(obj, name) { obj[\"method\"](); obj['method'](); obj[name](); }\n",
+            language,
+        );
+        let sites = &parsed.dispatch.sites;
+        assert_eq!(sites.len(), 1, "{language}: {sites:#?}");
+        assert!(sites[0].dynamic, "{language}: {sites:#?}");
+    }
+}
+
+/// A C++ member call on a local whose declaration names its type links the
+/// one member function of that type, by its scoped name, as a type match.
+#[test]
+fn cpp_member_call_on_a_declared_local_type_matches_its_member_function() {
+    let parsed = parse(
+        "namespace api {\nclass Widget {\npublic:\n    int value() { return 42; }\n};\n}\ninline int use_widget() { api::Widget widget; return widget.value(); }\ninline int unknown(api::Widget* pointer, int other) { return other.value(); }\n",
+        "cpp",
+    );
+    assert!(
+        parsed
+            .dispatch
+            .methods
+            .iter()
+            .any(|method| method.symbol == "api::Widget::value" && method.owner == "api::Widget"),
+        "{:#?}",
+        parsed.dispatch.methods
+    );
+    let sites = parsed
+        .dispatch
+        .sites
+        .iter()
+        .filter(|site| site.member.as_deref() == Some("value"))
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 2, "{:#?}", parsed.dispatch.sites);
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parsed)]));
+    let typed = sites
+        .iter()
+        .find(|site| site.caller.as_deref() == Some("use_widget"))
+        .unwrap();
+    assert_eq!(typed.receiver.as_deref(), Some("Widget"));
+    assert_eq!(
+        resolver.resolve("fixture", typed).targets,
+        BTreeSet::from([Target {
+            file: "fixture".into(),
+            symbol: "api::Widget::value".into(),
+            provenance: "type_match",
+        }])
+    );
+    // `int other` is a type the project does not define a `value` for.
+    let other = sites
+        .iter()
+        .find(|site| site.caller.as_deref() == Some("unknown"))
+        .unwrap();
+    assert_eq!(other.receiver.as_deref(), Some("int"));
+    let resolution = resolver.resolve("fixture", other);
+    assert!(resolution.targets.is_empty());
+    assert_eq!(resolution.external, 1);
 }

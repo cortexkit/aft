@@ -301,7 +301,6 @@ export function degradedReasonLabel(reason: string): string {
 
 export interface HealthLights {
   diagnostics: HealthLightTone;
-  code: HealthLightTone;
   todos: HealthLightTone;
 }
 
@@ -317,15 +316,9 @@ export function collapsedHealthLights(statusBar: StatusBar | undefined): HealthL
         : statusBar.errors === 0 && statusBar.warnings === 0
           ? "ok"
           : "muted";
-  const codeValues = [statusBar.dead_code, statusBar.unused_exports, statusBar.duplicates];
-  const code: HealthLightTone = codeValues.some((value) => value !== undefined && value > 0)
-    ? "warn"
-    : codeValues.every((value) => value === 0)
-      ? "ok"
-      : "muted";
   const todos: HealthLightTone =
     statusBar.todos === undefined ? "muted" : statusBar.todos > 0 ? "warn" : "ok";
-  return { diagnostics, code, todos };
+  return { diagnostics, todos };
 }
 
 export interface AftSidebarPanelProps {
@@ -553,9 +546,6 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
                 >
                   ●
                 </text>
-                <text fg={toneColor(props.palette, collapsedHealthLights(statusBar())!.code)}>
-                  ●
-                </text>
                 <text fg={toneColor(props.palette, collapsedHealthLights(statusBar())!.todos)}>
                   ●
                 </text>
@@ -650,10 +640,7 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
           server proves it, rather than appearing as a clean zero. */}
           {props.prefs.sections.codeHealth && statusBar() && (
             <>
-              <SectionHeader
-                palette={props.palette}
-                title={statusBar()!.tier2_stale ? "Code Health ~" : "Code Health"}
-              />
+              <SectionHeader palette={props.palette} title="Code Health" />
               {(statusBar()!.disabled_categories ?? []).map((key) => (
                 <StatRow
                   palette={props.palette}
@@ -676,30 +663,6 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
                   label="Warnings"
                   value={formatCount(statusBar()!.warnings)}
                   tone={statusBar()!.warnings! > 0 ? "warn" : "muted"}
-                />
-              )}
-              {statusBar()!.dead_code !== undefined && (
-                <StatRow
-                  palette={props.palette}
-                  label="Dead Code"
-                  value={formatCount(statusBar()!.dead_code)}
-                  tone="muted"
-                />
-              )}
-              {statusBar()!.unused_exports !== undefined && (
-                <StatRow
-                  palette={props.palette}
-                  label="Unused Exports"
-                  value={formatCount(statusBar()!.unused_exports)}
-                  tone="muted"
-                />
-              )}
-              {statusBar()!.duplicates !== undefined && (
-                <StatRow
-                  palette={props.palette}
-                  label="Duplicates"
-                  value={formatCount(statusBar()!.duplicates)}
-                  tone="muted"
                 />
               )}
               {statusBar()!.todos !== undefined && (

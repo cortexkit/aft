@@ -1,1 +1,0 @@
-- Pi sessions hosted by CortexKit's harness module get the same trust as when a separate module hosted them, so they keep running shell commands after the move.

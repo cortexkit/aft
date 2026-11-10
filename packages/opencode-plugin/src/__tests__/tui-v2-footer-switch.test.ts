@@ -15,7 +15,7 @@ import { join } from "node:path";
  */
 
 const FRAME_SEPARATOR = "=====frame=====";
-const HEALTH_LINE = "AFT E0 W0 | D0 U0 C1 | T0";
+const HEALTH_LINE = "AFT E0 W0 | T0";
 const RENDER_PROCESS_TIMEOUT_MS = 30_000;
 const TEST_TIMEOUT_MS = 45_000;
 

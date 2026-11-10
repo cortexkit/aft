@@ -653,30 +653,61 @@ impl AnchoredLane {
             &split.retained_runs,
             include_tests,
         )?;
-        let examined = candidate_files.len();
-        if candidate_files.is_empty() {
+        Ok(verify_anchored_candidates(candidate_files, &split))
+    }
+
+    /// [`Self::execute_with_admission_report`] with the candidate files read
+    /// from the data layer's view instead of the legacy index.
+    pub(crate) fn execute_on_data_view(
+        &self,
+        text: &crate::data_layer::tools::search::DataText,
+        search_root: &Path,
+        query: &str,
+        include_tests: bool,
+    ) -> std::io::Result<(Vec<CandidateResult>, usize, usize)> {
+        let split = split_query(query);
+        if split.retained_runs.is_empty() {
             return Ok((Vec::new(), 0, 0));
         }
-        let compiled = CompiledRuns::new(&split.retained_runs);
-        let mut excluded = 0;
-        let mut results = candidate_files
-            .into_iter()
-            .filter_map(|path| {
-                match verify_file_with_alignment(&path, split.denominator, |content| {
-                    compiled.alignment(content)
-                }) {
-                    Ok(candidate) => candidate,
-                    Err(()) => {
-                        excluded += 1;
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-
-        sort_anchored_canonical(&mut results);
-        Ok((results, examined, excluded))
+        let candidate_files = crate::data_layer::tools::search::anchored_candidate_files(
+            text,
+            search_root,
+            &split.retained_runs,
+            include_tests,
+        )?;
+        Ok(verify_anchored_candidates(candidate_files, &split))
     }
+}
+
+/// Verifies each candidate file, best first: the verified candidates, how many
+/// files were examined, and how many corpus admission excluded.
+fn verify_anchored_candidates(
+    candidate_files: Vec<PathBuf>,
+    split: &QuerySplitResult,
+) -> (Vec<CandidateResult>, usize, usize) {
+    let examined = candidate_files.len();
+    if candidate_files.is_empty() {
+        return (Vec::new(), 0, 0);
+    }
+    let compiled = CompiledRuns::new(&split.retained_runs);
+    let mut excluded = 0;
+    let mut results = candidate_files
+        .into_iter()
+        .filter_map(|path| {
+            match verify_file_with_alignment(&path, split.denominator, |content| {
+                compiled.alignment(content)
+            }) {
+                Ok(candidate) => candidate,
+                Err(()) => {
+                    excluded += 1;
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    sort_anchored_canonical(&mut results);
+    (results, examined, excluded)
 }
 
 impl SearchLane for AnchoredLane {

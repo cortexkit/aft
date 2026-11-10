@@ -375,6 +375,48 @@ describe("the config migration is planned and its changes are reported", () => {
     expect(text).not.toContain("Will migrate retired keys");
     expect(text).not.toContain("Migrated");
   });
+
+  test("the plan moves views.idle_checkout_hours and deletes the removed data-layer keys", async () => {
+    writeUserConfig({
+      $schema: AFT_SCHEMA_URL,
+      views: { enabled: true, callgraph_copies: 2, idle_checkout_hours: 48 },
+      worktree: { ram_overlay: false },
+    });
+    const text = await doctorFix(getSelfVersion(), (args) => {
+      if (args[0] !== "fix-config") return { ok: false, stdout: "", stderr: "", status: 1 };
+      writeUserConfig({ $schema: AFT_SCHEMA_URL, idle: { checkout_hours: 48 } });
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          files: [{ path: userConfig, tier: "user", status: "rewritten", notes: [], error: null }],
+        }),
+        stderr: "",
+        status: 0,
+      };
+    });
+    const plan = text.slice(text.indexOf("Planned changes"), text.indexOf("Migrated"));
+    expect(plan).toContain(`Will migrate retired keys in the user config ${userConfig}:`);
+    expect(plan).toContain("removed views.enabled (was true)");
+    expect(plan).toContain("removed views.callgraph_copies (was 2)");
+    expect(plan).toContain("removed views.idle_checkout_hours (was 48)");
+    expect(plan).toContain("removed worktree.ram_overlay (was false)");
+    expect(plan).toContain("added idle.checkout_hours: 48");
+  });
+
+  test("a config whose only old keys are removed data-layer keys still plans their deletion", async () => {
+    writeUserConfig({ $schema: AFT_SCHEMA_URL, worktree: { ram_overlay: true } });
+    const text = await doctorFix(getSelfVersion(), () => ({
+      ok: true,
+      stdout: JSON.stringify({
+        files: [{ path: userConfig, tier: "user", status: "unchanged", notes: [], error: null }],
+      }),
+      stderr: "",
+      status: 0,
+    }));
+    const plan = text.slice(text.indexOf("Planned changes"));
+    expect(plan).toContain(`Will migrate retired keys in the user config ${userConfig}:`);
+    expect(plan).toContain("removed worktree.ram_overlay (was true)");
+  });
 });
 
 describe("doctor --fix ends by naming what it could not fix", () => {

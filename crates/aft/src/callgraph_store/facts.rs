@@ -1,23 +1,9 @@
 //! Membership, configuration and identity inputs for the existing resolver.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::join::CallgraphBlob;
-use crate::views::{Manifest, ManifestEntry, RelPath};
-
-#[cfg(test)]
-thread_local! {
-    static DIRECTORY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn note_directory_visit() {
-    #[cfg(test)]
-    DIRECTORY_VISITS.with(|visits| visits.set(visits.get() + 1));
-}
-
-/// Manifest planes currently store their full blob keys as strings.
+/// Immutable parse payloads are identified by their full content keys.
 pub(crate) type BlobKey = String;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,14 +20,28 @@ pub(crate) struct DirEntry {
 }
 
 pub(crate) trait ProjectFacts {
-    /// Only generation-owned view joins collect consultation provenance.
+    /// Whether the resolver should record which configuration fields it reads.
     fn records_config_facts(&self) -> bool {
+        false
+    }
+    /// Whether every checkout read is recorded with its answer (the data
+    /// layer's recorder), so a reader can record the key of a repository-wide
+    /// structure in place of the reads that build it.
+    fn records_answers(&self) -> bool {
         false
     }
     fn config_fact(&self, _rel: &[u8], _name: &str) {}
     fn memo_start(&self, _path: &Path, _kind: &str, _name: &str) {}
     fn memo_finish(&self, _path: &Path, _kind: &str, _name: &str) {}
     fn memo_replay(&self, _path: &Path, _kind: &str, _name: &str) {}
+    /// Records that the caller depends on a repository-wide structure,
+    /// named by its domain key, instead of on that structure's inputs.
+    fn record_domain(&self, _key: &str) {}
+    /// Stops recording consultations until the matching
+    /// [`ProjectFacts::resume_recording`]; for building a repository-wide
+    /// structure whose readers record its domain key instead.
+    fn pause_recording(&self) {}
+    fn resume_recording(&self) {}
     fn workspace_package(&self, _root: &Path, _name: &str) -> Option<Option<PathBuf>> {
         None
     }
@@ -69,182 +69,35 @@ pub(crate) trait ProjectFacts {
     fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry>;
 }
 
-pub(crate) struct ManifestFacts<'m> {
-    pub manifest: &'m Manifest,
-    pub blobs: &'m dyn Fn(&BlobKey) -> Option<Arc<[u8]>>,
-}
+/// Stands for "no project facts": per-file extraction binds one file's parse
+/// on its own, before it belongs to any checkout. It is not an empty checkout.
+/// Every question answers that nothing exists, and no directory visit, read
+/// or consultation is recorded.
+pub(crate) struct NoProjectFacts;
 
-impl ManifestFacts<'_> {
-    fn entry(&self, rel: &[u8]) -> Option<&ManifestEntry> {
-        self.manifest.get(&RelPath::new(rel.to_vec()).ok()?)
-    }
-}
-
-impl ProjectFacts for ManifestFacts<'_> {
-    fn is_file(&self, rel: &[u8]) -> bool {
-        matches!(self.entry(rel), Some(ManifestEntry::Regular { .. }))
+impl ProjectFacts for NoProjectFacts {
+    fn is_file(&self, _rel: &[u8]) -> bool {
+        false
     }
 
-    fn is_dir(&self, rel: &[u8]) -> bool {
-        let mut prefix = rel.to_vec();
-        if !prefix.is_empty() {
-            prefix.push(b'/');
-        }
-        self.manifest
-            .entries_from(&prefix)
-            .next()
-            .is_some_and(|(path, _)| {
-                note_directory_visit();
-                path.as_bytes().starts_with(&prefix) && path.as_bytes().len() > prefix.len()
-            })
+    fn is_dir(&self, _rel: &[u8]) -> bool {
+        false
     }
 
-    fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
-        let path = self.canonical(rel)?;
-        let ManifestEntry::Regular { planes, .. } = self.entry(&path)? else {
-            return None;
-        };
-        let bytes = (self.blobs)(planes.callgraph.as_ref()?)?;
-        match CallgraphBlob::from_bytes(&bytes).ok()? {
-            CallgraphBlob::Config(config) if config.language == "config" => {
-                Some(config.source.into())
-            }
-            _ => None,
-        }
+    fn config_bytes(&self, _rel: &[u8]) -> Option<Arc<[u8]>> {
+        None
     }
 
-    fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
-        match self.entry(rel)? {
-            ManifestEntry::Symlink { target_bytes } => Some(target_bytes.as_bytes()),
-            _ => None,
-        }
+    fn symlink_target(&self, _rel: &[u8]) -> Option<&[u8]> {
+        None
     }
 
-    fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
-        if rel.starts_with(b"/") {
-            return None;
-        }
-        let mut pending = rel
-            .split(|b| *b == b'/')
-            .map(<[u8]>::to_vec)
-            .collect::<std::collections::VecDeque<_>>();
-        let mut components = Vec::<Vec<u8>>::new();
-        let mut seen = BTreeSet::new();
-        let mut followed = 0;
-        while let Some(component) = pending.pop_front() {
-            match component.as_slice() {
-                b"" | b"." => continue,
-                b".." => {
-                    components.pop()?;
-                    continue;
-                }
-                _ => components.push(component),
-            }
-            let path = components.join(&b'/');
-            if let Some(target) = self.symlink_target(&path) {
-                // Bound expanding cycles such as a -> a/a as well as exact cycles.
-                followed += 1;
-                if target.starts_with(b"/")
-                    || followed > 40
-                    || !seen.insert((path, pending.clone()))
-                {
-                    return None;
-                }
-                components.pop();
-                for component in target.split(|b| *b == b'/').rev() {
-                    pending.push_front(component.to_vec());
-                }
-            } else if !pending.is_empty() && !self.is_dir(&path) {
-                return None;
-            }
-        }
-        let path = components.join(&b'/');
-        (self.entry(&path).is_some() || self.is_dir(&path)).then_some(path)
+    fn canonical(&self, _rel: &[u8]) -> Option<Vec<u8>> {
+        None
     }
 
-    fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {
-        let mut prefix = rel.to_vec();
-        if !prefix.is_empty() {
-            prefix.push(b'/');
-        }
-        let mut entries = BTreeMap::new();
-        for (path, entry) in self.manifest.entries_from(&prefix) {
-            note_directory_visit();
-            let Some(tail) = path.as_bytes().strip_prefix(prefix.as_slice()) else {
-                // Bytewise ordering puts all members of the prefix together.
-                break;
-            };
-            if tail.is_empty() {
-                continue;
-            }
-            if let Some(slash) = tail.iter().position(|b| *b == b'/') {
-                entries
-                    .entry(tail[..slash].to_vec())
-                    .or_insert(EntryKind::Directory);
-            } else {
-                let kind = match entry {
-                    ManifestEntry::Regular { .. } => EntryKind::Regular,
-                    ManifestEntry::Symlink { .. } => EntryKind::Symlink,
-                    // A gitlink identifies a separate tree, not files in this view.
-                    ManifestEntry::Gitlink { .. } | ManifestEntry::Synthetic { .. } => continue,
-                };
-                entries.insert(tail.to_vec(), kind);
-            }
-        }
-        entries
-            .into_iter()
-            .map(|(name, kind)| DirEntry { name, kind })
-            .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::views::RegularPlanes;
-
-    fn regular() -> ManifestEntry {
-        ManifestEntry::Regular {
-            mode: 0o100644,
-            planes: RegularPlanes {
-                semantic: None,
-                callgraph: None,
-            },
-            resolution_input: false,
-        }
-    }
-
-    #[test]
-    fn perf_audit2_manifest_directory_work_is_local_to_the_prefix() {
-        let mut entries = Vec::new();
-        for package in 0..256 {
-            for file in 0..16 {
-                entries.push((
-                    RelPath::new(format!("packages/p{package:03}/src/f{file:02}.ts").into_bytes())
-                        .unwrap(),
-                    regular(),
-                ));
-            }
-        }
-        let manifest = Manifest::new(entries).unwrap();
-        let facts = ManifestFacts {
-            manifest: &manifest,
-            blobs: &|_| None,
-        };
-        DIRECTORY_VISITS.with(|visits| visits.set(0));
-        assert!(facts.is_dir(b"packages/p255/src"));
-        assert!(!facts.is_dir(b"packages/p255/src-missing"));
-        assert_eq!(
-            facts.canonical(b"packages/p255/src/f15.ts"),
-            Some(b"packages/p255/src/f15.ts".to_vec())
-        );
-        assert_eq!(facts.list_dir(b"packages/p255/src").len(), 16);
-        let visits = DIRECTORY_VISITS.with(|visits| visits.get());
-        eprintln!("manifest directory candidates: {visits} for 4096 members");
-        assert!(
-            visits <= 24,
-            "directory probes must not scan unrelated members: {visits}"
-        );
+    fn list_dir(&self, _rel: &[u8]) -> Vec<DirEntry> {
+        Vec::new()
     }
 }
 

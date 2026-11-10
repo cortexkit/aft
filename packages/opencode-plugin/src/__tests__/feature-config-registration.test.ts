@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CANONICAL_TOOLS,
-  RETIRED_HANG_THRESHOLD_NOTE,
+  REMOVED_DATA_LAYER_NOTES,
   SEMANTIC_COST_NOTICE,
 } from "@cortexkit/aft-bridge";
 
@@ -204,24 +204,38 @@ describe("OpenCode feature-config registration", () => {
     ).toEqual([]);
   });
 
-  test("retired keys in a project file translate under project limits, with one notice and no write", () => {
+  test("project retired names translate within project limits and leave the file unwritten", () => {
     const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
     mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
     const text = JSON.stringify({
       search_index: false,
       hoist_builtin_tools: false,
       gh_read: { enabled: true },
+      disabled_tools: ["aft_grep"],
     });
     writeFileSync(projectFile, text);
     const config = loadWithUserConfig({ github: { read: false } });
-    expect(config.indexes?.trigram).toBe(false);
-    for (const host of HOSTS) expect(config.disabled_tools).not.toContain(host);
+    expect(config.indexes).toEqual({ trigram: false, semantic: true, callgraph: true });
     expect(config.github?.read).toBe(false);
+    // A project may not unregister the host's tools, so the translated
+    // aft_grep name is ignored and only the user defaults remain disabled.
+    expect(config.disabled_tools).toEqual(["aft_delete", "aft_move"]);
+    expect(v1Names(config)).toEqual(expected(["aft_delete", "aft_move"]));
+    expect(v2Names(config)).toEqual(
+      expected(["aft_delete", "aft_move"]).map(v2HostToolName).sort(),
+    );
+    expect(
+      getConfigLoadNotices().some(
+        (notice) => notice.configPath === projectFile && notice.message.includes("retired keys"),
+      ),
+    ).toBe(true);
     expect(readFileSync(projectFile, "utf8")).toBe(text);
-    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
-    expect(notices.map((notice) => notice.message)).toEqual([
-      `${projectFile} uses retired keys (gh_read, hoist_builtin_tools, search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
-    ]);
+  });
+
+  test("a user file naming retired keys still loads translated, because the binary rewrites it", () => {
+    const config = loadWithUserConfig({ search_index: false, disabled_tools: ["aft_grep"] });
+    expect(config.indexes?.trigram).toBe(false);
+    expect(config.disabled_tools).toEqual(["grep"]);
   });
 
   test("a retired bridge.hang_threshold loads cleanly; a project file gets a notice that it does nothing", () => {
@@ -240,26 +254,61 @@ describe("OpenCode feature-config registration", () => {
     ]);
   });
 
-  test("a project file mixing translated keys with bridge.hang_threshold names only the translated keys, then says the threshold does nothing", () => {
-    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
-    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
-    writeFileSync(
-      projectFile,
-      JSON.stringify({ search_index: false, bridge: { hang_threshold: 4 } }),
-    );
-    const config = loadWithUserConfig({});
-    expect(config.indexes?.trigram).toBe(false);
-    expect(getConfigValidationErrors()).toEqual([]);
-    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
-    expect(notices.map((notice) => notice.message)).toEqual([
-      `${projectFile} uses retired keys (search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${RETIRED_HANG_THRESHOLD_NOTE}`,
-    ]);
-  });
-
   test("a false runtime gate only switches its behaviour off", () => {
     expect(loadWithUserConfig({ backup: { enabled: false } }).disabled_tools).toEqual([
       "aft_delete",
       "aft_move",
+    ]);
+  });
+
+  test("idle.checkout_hours loads, clamps and merges per key with the project file", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    writeFileSync(projectFile, JSON.stringify({ idle: { root_ttl_minutes: 15 } }));
+    const config = loadWithUserConfig({ idle: { root_ttl_minutes: 20, checkout_hours: 9000 } });
+    expect(getConfigValidationErrors()).toEqual([]);
+    expect(config.idle).toEqual({ root_ttl_minutes: 15, checkout_hours: 8760 });
+    // The project file still sets root_ttl_minutes; the user's 0 clamps to 1.
+    expect(loadWithUserConfig({ idle: { checkout_hours: 0 } }).idle).toEqual({
+      root_ttl_minutes: 15,
+      checkout_hours: 1,
+    });
+  });
+
+  test("a user file's views.idle_checkout_hours becomes idle.checkout_hours; its removed keys get one notice naming only them", () => {
+    const user = {
+      views: { idle_checkout_hours: 72, enabled: true },
+      worktree: { ram_overlay: false },
+    };
+    const config = loadWithUserConfig(user);
+    expect(getConfigValidationErrors()).toEqual([]);
+    expect(config.idle).toEqual({ checkout_hours: 72 });
+    // The removed keys still reach the engine until the code reading them is deleted.
+    expect(config.views).toEqual({ enabled: true });
+    expect(config.worktree).toEqual({ ram_overlay: false });
+    const userPath = join(root, "xdg", "cortexkit", "aft.jsonc");
+    expect(readFileSync(userPath, "utf8")).toBe(JSON.stringify(user));
+    const notices = getConfigLoadNotices().filter(
+      (notice) => notice.configPath === userPath && notice.message !== SEMANTIC_COST_NOTICE,
+    );
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${userPath} sets removed keys (views.enabled, worktree.ram_overlay); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[1]?.[1]} ${REMOVED_DATA_LAYER_NOTES[2]?.[1]}`,
+    ]);
+  });
+
+  test("a project file with data-layer keys gets one notice covering the renamed and the removed keys", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    writeFileSync(
+      projectFile,
+      JSON.stringify({ views: { idle_checkout_hours: 24, callgraph_copies: 0 } }),
+    );
+    const config = loadWithUserConfig({ idle: { checkout_hours: 2 } });
+    expect(getConfigValidationErrors()).toEqual([]);
+    expect(config.idle?.checkout_hours).toBe(24);
+    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${projectFile} uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours. ${projectFile} sets removed keys (views.callgraph_copies); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
     ]);
   });
 });
