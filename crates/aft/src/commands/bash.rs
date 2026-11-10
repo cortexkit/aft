@@ -93,6 +93,21 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+    let _shell_call = crate::bash_background::shell_metadata::enter(
+        crate::bash_background::shell_metadata::ShellCall {
+            description: params.description.clone(),
+            session: req.session().to_owned(),
+            call_id: None,
+            kind: if params.pty {
+                "pty"
+            } else if params.background {
+                "background"
+            } else {
+                "foreground"
+            }
+            .into(),
+        },
+    );
     let secret_labels = crate::bash_background::secrets::labels(&params.command);
     let has_secrets = !secret_labels.is_empty();
     let sandbox_requirement =

@@ -2,6 +2,7 @@ use super::wire::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use subc_protocol::ErrorBody as Error;
 
 #[derive(Serialize)]
 struct Case<T> {
@@ -12,6 +13,10 @@ struct Case<T> {
 }
 
 fn row(task_id: &str, kind: &str, worker: bool) -> Row {
+    let command =
+        crate::log_redact::redact_command("TOKEN=fixture-secret-value cargo test").into_owned();
+    assert!(!command.contains("fixture-secret-value"));
+    assert!(command.contains(crate::log_redact::SECRET_PLACEHOLDER));
     Row {
         task_id: task_id.into(),
         revision: 1,
@@ -32,7 +37,7 @@ fn row(task_id: &str, kind: &str, worker: bool) -> Row {
         ),
         call_id: Some(format!("call-{task_id}")),
         title: Some("Run focused tests".into()),
-        command: "TOKEN=[REDACTED] cargo test".into(),
+        command,
         command_truncated: None,
         cwd: "/work/project".into(),
         kind: kind.into(),
@@ -59,6 +64,9 @@ fn ended(mut row: Row) -> Row {
         signal: None,
     });
     row.end_reason = Some("exited".into());
+    if let Some(remote) = &mut row.remote {
+        remote.phase = "ended".into();
+    }
     row
 }
 
@@ -72,27 +80,43 @@ fn status() -> Status {
             version: "0.64.0".into(),
             card: "ready".into(),
         },
-        roots: vec![RootStatus {
-            root: "/work/project".into(),
-            agent_ids: vec!["agent-alf".into()],
-            text_index: ready.clone(),
-            call_graph: Readiness {
-                state: "building".into(),
-                reason: Some("indexing".into()),
+        roots: vec![
+            RootStatus {
+                root: "/work/project".into(),
+                agent_ids: vec!["agent-alf".into()],
+                text_index: ready.clone(),
+                call_graph: Readiness {
+                    state: "building".into(),
+                    reason: Some("indexing".into()),
+                },
+                meaning: Readiness {
+                    state: "disabled".into(),
+                    reason: Some("not_configured".into()),
+                },
+                lsp: vec![Lsp {
+                    server: "rust-analyzer".into(),
+                    state: ready.state.clone(),
+                    reason: None,
+                }],
+                errors: Some(0),
+                warnings: Some(2),
+                todos: Some(3),
             },
-            meaning: Readiness {
-                state: "disabled".into(),
-                reason: Some("not_configured".into()),
+            RootStatus {
+                root: "/work/notes".into(),
+                agent_ids: vec!["agent-alf".into()],
+                text_index: ready.clone(),
+                call_graph: ready.clone(),
+                meaning: Readiness {
+                    state: "disabled".into(),
+                    reason: Some("not_configured".into()),
+                },
+                lsp: vec![],
+                errors: None,
+                warnings: None,
+                todos: Some(1),
             },
-            lsp: vec![Lsp {
-                server: "rust-analyzer".into(),
-                state: ready.state,
-                reason: None,
-            }],
-            errors: 0,
-            warnings: 2,
-            todos: 3,
-        }],
+        ],
     }
 }
 
@@ -103,21 +127,36 @@ fn bytes(value: &impl Serialize) -> Vec<u8> {
 }
 
 fn vectors() -> Vec<(&'static str, Vec<u8>)> {
-    let mut foreground = row("bg_foreground", "foreground", false);
+    let mut foreground = row("bash-0123456789abcdef", "foreground", false);
     foreground.output_bytes.stdout = 36;
-    let background = row("bg_background", "background", true);
-    let pty = row("bg_pty", "pty", true);
-    let mut remote = row("bg_remote", "remote", false);
+    let mut background = row("bash-1123456789abcdef", "background", true);
+    background.title = Some("Check the API package".into());
+    background.command = "cargo check -p api".into();
+    background.cwd = "/work/project/api".into();
+    let mut pty = row("bash-2123456789abcdef", "pty", true);
+    pty.title = Some("Inspect terminal progress".into());
+    pty.command = "watch cargo test -p terminal".into();
+    pty.cwd = "/work/project/terminal".into();
+    let mut remote = row("bash-3123456789abcdef", "remote", false);
     remote.state = "queued".into();
+    remote.title = Some("Build the Linux release".into());
+    remote.command = "cargo build --release".into();
+    remote.cwd = "/work/project/server".into();
+    remote.last_output_at_ms = None;
+    remote.output_bytes = Offsets::default();
     remote.remote = Some(Remote {
         job_id: "job-before-acceptance".into(),
-        host: "linux".into(),
+        host: None,
         phase: "queued".into(),
     });
-    let mut truncated = row("bg_long_command", "background", false);
+    let mut truncated = row("bash-4123456789abcdef", "background", false);
+    truncated.title = Some("Print a generated argument list".into());
+    truncated.cwd = "/work/project/tools".into();
     truncated.command = "x".repeat(2048);
     truncated.command_truncated = Some(true);
-    let mut unattributed = row("bg_unattributed", "background", false);
+    let mut unattributed = row("bash-5123456789abcdef", "background", false);
+    unattributed.command = "printf 'plain session\\n'".into();
+    unattributed.cwd = "/work/notes".into();
     unattributed.holder = Holder {
         kind: "unattributed".into(),
         agent_id: None,
@@ -128,22 +167,34 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
     unattributed.session = None;
     unattributed.call_id = None;
     unattributed.title = None;
-    let list = ListReply {
+    let mut placed = row("bash-6123456789abcdef", "remote", true);
+    placed.title = Some("Run remote integration tests".into());
+    placed.command = "cargo test --test integration".into();
+    placed.cwd = "/work/project/tests".into();
+    placed.remote = Some(Remote {
+        job_id: "job-running-cedar".into(),
+        host: Some("ovh-1".into()),
+        phase: "running".into(),
+    });
+    let mut list = ListReply {
         rows: vec![
             foreground.clone(),
             background.clone(),
             pty.clone(),
             remote.clone(),
+            placed,
             truncated,
             unattributed,
         ],
         next_cursor: None,
         unknown_agent_ids: None,
     };
+    list.rows = super::state::matching_rows(list.rows.iter(), &Filter::default(), None);
     let mut running = remote.clone();
     running.revision = 2;
     running.state = "running".into();
     running.remote.as_mut().unwrap().phase = "running".into();
+    running.remote.as_mut().unwrap().host = Some("ovh-1".into());
     let watch = vec![
         WatchFrame::Resync {
             reason: "initial".into(),
@@ -162,7 +213,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             cursor: Some("watch-1".into()),
         },
         WatchFrame::Upsert {
-            row: row("bg_new", "background", true),
+            row: row("bash-7123456789abcdef", "background", true),
             cursor: "watch-2".into(),
         },
         WatchFrame::Upsert {
@@ -174,7 +225,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             cursor: "watch-4".into(),
         },
         WatchFrame::Remove {
-            task_id: "bg_remote".into(),
+            task_id: "bash-3123456789abcdef".into(),
             cursor: "watch-5".into(),
         },
         WatchFrame::Status {
@@ -254,26 +305,59 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         },
         OutputFrame::End { row: ended(pty) },
     ];
-    let output = vec![
+    let mut output = vec![
         Case {
             tag: "shells-v1",
             method: "shells.output",
-            request: serde_json::json!({"task_id":"bg_foreground", "ansi":"keep", "max_chunk_bytes":16, "from_offset":{"stdout":16,"stderr":0}}),
+            request: serde_json::json!({"task_id":"bash-0123456789abcdef", "ansi":"keep", "max_chunk_bytes":64, "from_offset":{"stdout":16,"stderr":0}}),
             reply: keep,
         },
         Case {
             tag: "shells-v1",
             method: "shells.output",
-            request: serde_json::json!({"task_id":"bg_foreground", "ansi":"strip", "max_chunk_bytes":16, "from_offset":{"stdout":16,"stderr":0}}),
+            request: serde_json::json!({"task_id":"bash-0123456789abcdef", "ansi":"strip", "max_chunk_bytes":64, "from_offset":{"stdout":16,"stderr":0}}),
             reply: strip,
         },
         Case {
             tag: "shells-v1",
             method: "shells.output",
-            request: serde_json::json!({"task_id":"bg_pty"}),
+            request: serde_json::json!({"task_id":"bash-2123456789abcdef"}),
             reply: screen,
         },
     ];
+    let mut first_open = row("bash-8123456789abcdef", "background", false);
+    first_open.title = Some("Print build progress".into());
+    first_open.command = "./build-progress.sh".into();
+    first_open.output_bytes = Offsets {
+        stdout: BACKFILL_BYTES + 16,
+        stderr: 0,
+    };
+    let mut backfill = vec![OutputFrame::Start {
+        task_id: first_open.task_id.clone(),
+        ansi: "strip".into(),
+        truncated_before: Some(Offsets {
+            stdout: 16,
+            stderr: 0,
+        }),
+    }];
+    for index in 0..4 {
+        let offset = 16 + index * DEFAULT_CHUNK_BYTES as u64;
+        backfill.push(OutputFrame::Chunk {
+            stream: "stdout".into(),
+            offset,
+            end_offset: offset + DEFAULT_CHUNK_BYTES as u64,
+            text: "o\n".repeat(DEFAULT_CHUNK_BYTES / 2),
+        });
+    }
+    backfill.push(OutputFrame::End {
+        row: ended(first_open.clone()),
+    });
+    output.push(Case {
+        tag: "shells-v1",
+        method: "shells.output",
+        request: serde_json::json!({"task_id":first_open.task_id}),
+        reply: backfill,
+    });
     #[derive(Serialize)]
     struct Refusals {
         agent_scoped_route: Error,

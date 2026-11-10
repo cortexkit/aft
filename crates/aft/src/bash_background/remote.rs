@@ -1882,6 +1882,23 @@ impl OutputSink for TaskSink {
     }
 
     fn admission_progress(&mut self, progress: &exec::types::Progress) {
+        if let Some(job_id) = progress.job_id() {
+            let mut db = DeferredDbWrites::new(&self.registry, &self.task);
+            if let Ok(mut state) = self.task.lock_state() {
+                let job_id = job_id.to_string();
+                if state.metadata.shell_remote_job_id.as_ref() != Some(&job_id) {
+                    // Display a job id before acceptance without marking the
+                    // job accepted or changing the execution retry state.
+                    state.metadata.shell_remote_job_id = Some(job_id);
+                    if let Err(error) =
+                        self.registry
+                            .persist_task_locked(&self.task, &state.metadata, &mut db)
+                    {
+                        log::warn!("could not persist shell job id: {error}");
+                    }
+                }
+            }
+        }
         let Some(note) = admission_progress_line(progress) else {
             return;
         };

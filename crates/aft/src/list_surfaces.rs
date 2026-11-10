@@ -413,6 +413,30 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
     },
     ExclusionEntry {
+        file: "subc/shells/runtime.rs",
+        enclosing_item: "list, project_row, output",
+        location_or_primitive: "PAGE_SIZE, 2048, DEFAULT_CHUNK_BYTES, take_while",
+        reason: "The operator-only shells/v1 wire protocol uses next_cursor for 50-row pages, command_truncated for command previews, and raw offset/end_offset for bounded output chunks; no agent-visible list is shortened.",
+    },
+    ExclusionEntry {
+        file: "subc/shells/state.rs",
+        enclosing_item: "push, resync",
+        location_or_primitive: "HISTORY, PAGE_SIZE",
+        reason: "The provider journal has finite cursor retention; an expired position triggers a full resync. Split resync parts deliver every matching row and are applied only at final:true.",
+    },
+    ExclusionEntry {
+        file: "subc/shells/output.rs",
+        enclosing_item: "next, plan, backfill_start",
+        location_or_primitive: "max, budget, BACKFILL_BYTES",
+        reason: "Shell output is a byte-addressed subscription, not an agent list: backfill cuts are explicit in truncated_before, subsequent chunks preserve raw offset/end_offset, and oversized escapes are omitted without losing raw byte accounting.",
+    },
+    ExclusionEntry {
+        file: "bash_background/shell_registry.rs",
+        enclosing_item: "shell_masked_range",
+        location_or_primitive: "4096, take_while",
+        reason: "Internal masking windows preserve the complete requested output range; UTF-8 boundary alignment and the checked masker's source halo protect credentials without dropping a shell row or shortening an agent-visible list.",
+    },
+    ExclusionEntry {
         file: "db/call_ledger.rs",
         enclosing_item: "enforce_retention_bounds",
         location_or_primitive: "UNACKED_RESULTS_MAX (1000), EXPIRED_ENTRIES_MAX (1000), SQL OFFSET",

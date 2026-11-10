@@ -1633,8 +1633,16 @@ struct RouteIdentity(Arc<RouteIdentityData>);
 #[derive(Default)]
 struct ManagementIdentity {
     principal: Option<Principal>,
+    harness: Option<String>,
     scope: Option<subc_protocol::scope::ScopeStamp>,
     admission: ManagementAdmission,
+    shells_cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for ManagementIdentity {
+    fn drop(&mut self) {
+        self.shells_cancel.cancel();
+    }
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -1644,6 +1652,8 @@ enum ManagementAdmission {
     FlowOnly,
     /// Cingulate's route: the `permissions/v1` operations and nothing else.
     PermissionsOnly,
+    /// Phone and simulator operator routes have read-only shell authority only.
+    ShellsOnly,
     /// Tool-provider metadata and custodian feeds without a project root;
     /// grants no management authority or project-tool access.
     ProjectFree {
@@ -5458,6 +5468,7 @@ where
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
+    let shells_service = shells::Service::new(shared_app.clone(), executor.clone());
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
     // Opened by the daemon's `module.draining` notice (bounded by the drain
@@ -6039,6 +6050,17 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        if let Ok(body) = decoded.body() {
+                            if shells::is_request(body) {
+                                let result = if let Some(identity) = management_routes.get(&route) {
+                                    shells_service.dispatch(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, body).await
+                                } else {
+                                    send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, shells::operator_required()).await
+                                };
+                                if let Err(error) = result { break Err(error); }
+                                continue;
+                            }
+                        }
                         // Bind admission, not request-supplied scope data, limits
                         // flow management routes to the manifest's flow operations
                         // before any store, provider, or general tool dispatch.
@@ -6332,6 +6354,7 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
+                        if shells_service.cancel(channel, corr).await { continue; }
                         if gh_relay_requests.cancel(channel, corr) {
                             continue;
                         }
@@ -6479,7 +6502,8 @@ where
                                      }
                                  }
                                  if let Some(error) = admission_error { break Err(error); }
-                                 let ended = match end_bg_subscriptions_for_drain(
+                                  shells_service.drain().await;
+                                  let ended = match end_bg_subscriptions_for_drain(
                                     &writer_tx,
                                     &dispatch_path_metrics,
                                     &mut bg_subs,
@@ -6924,6 +6948,8 @@ where
         }
     };
 
+    shells_service.drain().await;
+    shells_service.stop();
     dispatch_path_metrics.held_bash_calls.clear_all_progress();
     a0.stop();
     let loop_result = if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
@@ -8538,6 +8564,22 @@ async fn handle_control_request(
                 matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
             schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
             if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
+                if !project_free
+                    && matches!(principal.as_ref(), Some(Principal::Reserved { module_id }) if module_id == "callosum")
+                    && !shells::operator(
+                        principal.as_ref(),
+                        Some(&identity.harness),
+                        scope.is_some(),
+                    )
+                {
+                    return send_route_bind_error_body(
+                        tx,
+                        frame,
+                        &shells::operator_required(),
+                        metrics,
+                    )
+                    .await;
+                }
                 if let Err(refusal) = if project_free {
                     Ok(())
                 } else {
@@ -8560,6 +8602,11 @@ async fn handle_control_request(
                     && !matches!(bind_trust, BindTrust::FirstParty)
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
                     && !permissions::is_cingulate(principal.as_ref())
+                    && !shells::operator(
+                        principal.as_ref(),
+                        Some(&identity.harness),
+                        scope.is_some(),
+                    )
                 {
                     return send_route_bind_error(
                         tx,
@@ -8589,6 +8636,14 @@ async fn handle_control_request(
                     .is_some_and(diagnostics_findings::is_flow_scope)
                 {
                     ManagementAdmission::FlowOnly
+                } else if matches!(principal.as_ref(), Some(Principal::Reserved { module_id }) if module_id == "callosum")
+                    && shells::operator(
+                        principal.as_ref(),
+                        Some(&identity.harness),
+                        scope.is_some(),
+                    )
+                {
+                    ManagementAdmission::ShellsOnly
                 } else if !matches!(bind_trust, BindTrust::FirstParty)
                     && permissions::is_cingulate(principal.as_ref())
                 {
@@ -8661,8 +8716,10 @@ async fn handle_control_request(
                             route: route_id,
                             identity: ManagementIdentity {
                                 principal,
+                                harness: Some(identity.harness.clone()),
                                 scope,
                                 admission,
+                                shells_cancel: tokio_util::sync::CancellationToken::new(),
                             },
                             corr: frame.header.corr,
                         },
@@ -10245,6 +10302,16 @@ fn admit_management_flow_request(
     identity: &ManagementIdentity,
     body: Option<&Value>,
 ) -> Result<(), ErrorBody> {
+    if identity.admission == ManagementAdmission::ShellsOnly {
+        return if body.is_some_and(shells::is_request) {
+            Ok(())
+        } else {
+            Err(ErrorBody::new(
+                "route_not_admitted",
+                "this operator route serves only shells/v1",
+            ))
+        };
+    }
     if identity.admission == ManagementAdmission::PermissionsOnly {
         return if body.is_some_and(permissions::is_request) {
             Ok(())

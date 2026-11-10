@@ -508,6 +508,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
                 crate::page_collect::CAPABILITY.to_string(),
                 super::permissions::CAPABILITY.to_string(),
+                super::shells::CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -657,6 +658,26 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                     ManagementOperation {
                         name: super::permissions::REVOKE_OPERATION.to_string(),
                         kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.list".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.watch".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.output".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "aft.status".into(),
+                        kind: ManagementOperationKind::Query,
                         description: None,
                     },
                 ],
@@ -911,6 +932,7 @@ mod tests {
                 "scope-workdir/v1".to_string(),
                 "page-collect/v1".to_string(),
                 "permissions/v1".to_string(),
+                "shells/v1".to_string(),
             ]
         );
         assert!(capabilities.requires.is_empty());
@@ -929,7 +951,8 @@ mod tests {
                 "worker-runs/v1",
                 "scope-workdir/v1",
                 "page-collect/v1",
-                "permissions/v1"
+                "permissions/v1",
+                "shells/v1"
             ]))
         );
     }
@@ -1024,6 +1047,10 @@ mod tests {
                     super::super::permissions::REVOKE_OPERATION,
                     &ManagementOperationKind::Mutate,
                 ),
+                ("shells.list", &ManagementOperationKind::Query),
+                ("shells.watch", &ManagementOperationKind::Query),
+                ("shells.output", &ManagementOperationKind::Query),
+                ("aft.status", &ManagementOperationKind::Query),
             ]
         );
         for operation in operations {
@@ -1237,7 +1264,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1", "shells/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

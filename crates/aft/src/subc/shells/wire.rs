@@ -4,7 +4,7 @@
 //! treating a newer provider as a protocol error. Missing facts are omitted.
 use serde::{Deserialize, Serialize};
 
-pub(super) const CAPABILITY: &str = "shells/v1";
+pub(in crate::subc) const CAPABILITY: &str = "shells/v1";
 pub(super) const PAGE_SIZE: usize = 50;
 pub(super) const RETENTION_MS: u64 = 30 * 60 * 1000;
 pub(super) const DEFAULT_CHUNK_BYTES: usize = 16 * 1024;
@@ -27,7 +27,8 @@ pub(super) struct Holder {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Remote {
     pub job_id: String,
-    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub phase: String,
 }
 
@@ -40,7 +41,7 @@ pub(super) struct Offsets {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Exit {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<i32>,
+    pub code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
 }
@@ -146,9 +147,12 @@ pub(super) struct RootStatus {
     pub call_graph: Readiness,
     pub meaning: Readiness,
     pub lsp: Vec<Lsp>,
-    pub errors: u64,
-    pub warnings: u64,
-    pub todos: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub todos: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,15 +227,6 @@ pub(super) enum OutputFrame {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct Error {
-    pub code: String,
-    pub message: String,
-}
-
-pub(super) fn error(code: &str, message: &str) -> Error {
-    Error {
-        code: code.to_owned(),
-        message: message.to_owned(),
-    }
+pub(super) fn error(code: &str, message: &str) -> subc_protocol::ErrorBody {
+    subc_protocol::ErrorBody::new(code, message.to_owned())
 }
