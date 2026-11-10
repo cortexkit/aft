@@ -338,7 +338,7 @@ async fn plain_consent_held_reply_closes_keepalive_before_approved_rerun() {
     fn progressing_read(request: RawRequest, ctx: &AppContext) -> Response {
         let response = read_dispatch(request, ctx);
         if response.success {
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
             REPORTED_RERUNS.fetch_add(1, Ordering::SeqCst);
         }
         response

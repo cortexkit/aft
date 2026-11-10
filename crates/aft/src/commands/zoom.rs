@@ -488,7 +488,7 @@ fn handle_zoom_targets(
                                 include_callgraph,
                                 &mut memo,
                             );
-                            crate::run_tool_call::progress::report();
+                            crate::tool_progress::report();
                             if matches!(
                                 response.data["code"].as_str(),
                                 Some("grammar_unavailable" | "grammar_parse_timeout")
@@ -1424,7 +1424,7 @@ fn zoom_batch_symbols(
             include_callgraph,
             &mut enrichments,
         );
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
         let json = match serde_json::to_value(&resp) {
             Ok(v) => v,
             Err(err) => {

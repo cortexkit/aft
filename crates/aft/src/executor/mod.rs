@@ -580,7 +580,7 @@ pub struct JobCancellation {
 #[derive(Debug)]
 struct JobCancellationInner {
     state: AtomicU8,
-    progress: Mutex<Option<crate::run_tool_call::progress::Progress>>,
+    progress: Mutex<Option<crate::tool_progress::Progress>>,
     wait_lock: Mutex<()>,
     wake: Condvar,
     #[cfg(test)]
@@ -613,7 +613,7 @@ impl JobCancellation {
         self
     }
 
-    pub(crate) fn set_progress(&self, progress: crate::run_tool_call::progress::Progress) {
+    pub(crate) fn set_progress(&self, progress: crate::tool_progress::Progress) {
         *self.inner.progress.lock() = Some(progress);
     }
 

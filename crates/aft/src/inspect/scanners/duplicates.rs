@@ -174,7 +174,7 @@ struct NodeDigest {
 
 pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
     let started = Instant::now();
-    let progress = crate::run_tool_call::progress::FileProgress::current();
+    let progress = crate::tool_progress::FileProgress::current();
     let file_scans = job
         .scope_files
         .par_iter()

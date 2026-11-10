@@ -2918,7 +2918,7 @@ fn outline_many_files(
         };
         match structure {
             Ok(entries) => {
-                crate::run_tool_call::progress::report();
+                crate::tool_progress::report();
                 let outline = FileOutline {
                     absolute_path: path.clone(),
                     path: rel_path,

@@ -1,6 +1,6 @@
 //! Translate work milestones into the opt-in, invisible call keepalive PUSH.
 use super::*;
-use crate::run_tool_call::progress::Progress;
+use crate::tool_progress::Progress;
 
 pub(super) fn channel(
     tx: &WriterSender,

@@ -918,7 +918,7 @@ fn cancel_child() {
     };
     let stamp: ScopeStamp =
         serde_json::from_str(&std::env::var("AFT_TEST_DISPATCH_CANCEL_SCOPE").unwrap()).unwrap();
-    assert!(crate::root_cache::acquire_speech_serving_lease(Path::new(&root)).is_err());
+    assert!(crate::cache_location::acquire_speech_serving_lease(Path::new(&root)).is_err());
     let saved = saved_task_summary(Path::new(&root));
     let reply = crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
         json!({"scope":stamp}),

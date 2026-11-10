@@ -350,7 +350,7 @@ impl HeldBashCalls {
         &self,
         route: RouteChannel,
         corr: u64,
-        progress: &crate::run_tool_call::progress::Progress,
+        progress: &crate::tool_progress::Progress,
     ) {
         if let Some(call) = self.lock().get_mut(&(route, corr)) {
             call.keepalive_key = Some(progress.key());
@@ -798,7 +798,7 @@ pub(super) fn module_draining_response(request_id: &str, what: &str) -> Response
 mod tests {
     #[test]
     fn call_keepalive_bash_stops_at_cancel_reply_claim_and_id_reuse() {
-        use crate::run_tool_call::progress::Progress;
+        use crate::tool_progress::Progress;
         let calls = super::HeldBashCalls::default();
         let route = super::RouteChannel {
             channel: 7,

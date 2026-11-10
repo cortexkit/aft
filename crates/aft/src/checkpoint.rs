@@ -697,7 +697,7 @@ impl CheckpointStore {
             match snapshot {
                 Ok(snapshot) => {
                     file_contents.insert(path.clone(), snapshot);
-                    crate::run_tool_call::progress::report();
+                    crate::tool_progress::report();
                 }
                 Err(e) => {
                     crate::slog_warn!(
@@ -992,7 +992,7 @@ impl CheckpointStore {
                 let had_pending_purge = !checkpoint.pending_purge.is_empty();
                 let (paths, failures, pending_drop) =
                     self.purge_durable_checkpoint_locked(session, &mut checkpoint, matches);
-                crate::run_tool_call::progress::report();
+                crate::tool_progress::report();
                 let removed_checkpoint_entry = checkpoint.file_contents.len() < file_count_before;
                 let finished_pending_purge =
                     had_pending_purge && checkpoint.pending_purge.is_empty();
@@ -1025,7 +1025,7 @@ impl CheckpointStore {
             let before = checkpoint.file_contents.len();
             checkpoint.file_contents.retain(|path, _| {
                 let absolute = absolute_checkpoint_path(path.clone());
-                crate::run_tool_call::progress::report();
+                crate::tool_progress::report();
                 if matches(&absolute) {
                     report.paths.push(absolute);
                     false
@@ -1087,7 +1087,7 @@ impl CheckpointStore {
             } else {
                 retained.push(file);
             }
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
         }
         let changed = retained.len() != before;
         meta.files = retained;
@@ -1113,7 +1113,7 @@ impl CheckpointStore {
             let existed = blob.exists();
             match remove_checkpoint_blob(&blob) {
                 Ok(()) => {
-                    crate::run_tool_call::progress::report();
+                    crate::tool_progress::report();
                     if existed {
                         removed.push(absolute_checkpoint_path(PathBuf::from(&file.original_path)));
                     }
@@ -1557,7 +1557,7 @@ impl CheckpointStore {
                 }
             })?;
             ledger_bytes = ledger_bytes.saturating_add(bytes.len() as u64);
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
             files.push(DiskCheckpointFileMeta {
                 original_path: path.display().to_string(),
                 blob,
@@ -2328,7 +2328,7 @@ fn restore_paths_atomically(
             }
         }
         pre_restore_snapshot.insert(path.clone(), current);
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
 
     let mut restored_paths: Vec<PathBuf> = Vec::new();
@@ -2359,7 +2359,7 @@ fn restore_paths_atomically(
                             rollback_error
                         ));
                     }
-                    crate::run_tool_call::progress::report();
+                    crate::tool_progress::report();
                 }
             }
             let dirs_rollback_ok = rollback_created_dirs(&created_dirs);
@@ -2381,7 +2381,7 @@ fn restore_paths_atomically(
             });
         }
         restored_paths.push(path.clone());
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
 
     Ok(unchanged)

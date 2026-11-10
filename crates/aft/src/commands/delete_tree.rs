@@ -255,7 +255,7 @@ impl Walk<'_> {
             self.count_entry()?;
             // `DirEntry::metadata` does not follow a symlink either.
             let identity = recorded_identity(&entry.metadata()?);
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
             if file_type.is_dir() {
                 if self.boundary.should_descend(&path)? {
                     self.manifest.entries.push(TreeEntry {
@@ -1191,7 +1191,7 @@ mod tests {
         let sent = Arc::new(AtomicU64::new(0));
         let origin = Instant::now();
         let token = crate::executor::JobCancellation::new();
-        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+        token.set_progress(crate::tool_progress::Progress::with_clock(
             {
                 let clock = clock.clone();
                 move || origin + Duration::from_secs(clock.fetch_add(30, Ordering::SeqCst))

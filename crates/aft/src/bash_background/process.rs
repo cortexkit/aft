@@ -475,7 +475,7 @@ impl ProcessIdentity {
     pub fn of(pid: u32) -> Option<Self> {
         Some(Self {
             pid,
-            started_at_ms: crate::root_cache::process_start_time_ms(pid)?,
+            started_at_ms: crate::process_identity::process_start_time_ms(pid)?,
         })
     }
 
@@ -1738,7 +1738,7 @@ pub(crate) fn recorded_process_liveness(pid: u32, task_started_at_ms: u64) -> Pr
 
 fn recorded_process_probe(pid: u32, task_started_at_ms: u64) -> (ProcessLiveness, bool) {
     recorded_process_probe_with(probe_process(pid), task_started_at_ms, || {
-        crate::root_cache::process_start_time_ms(pid)
+        crate::process_identity::process_start_time_ms(pid)
     })
 }
 
