@@ -3085,7 +3085,12 @@ async fn s2_project_free_late_results_and_ack_are_carrier_isolated_but_tools_sti
             format!("{key} output\n"),
         )
         .unwrap();
-        let result = route.raw(json!({"name":"read", "arguments":{"filePath":format!("{key}.txt")}, "call_key":key}), false).await;
+        let result = route
+            .raw(
+                json!({"name":"read", "arguments":{"path":format!("{key}.txt")}, "call_key":key}),
+                false,
+            )
+            .await;
         assert_eq!(
             response_json(&result)["isError"],
             false,
@@ -3143,7 +3148,7 @@ async fn s2_project_free_late_results_and_ack_are_carrier_isolated_but_tools_sti
         assert_eq!(foreign["entries"].as_array().unwrap().len(), 1, "{foreign}");
         assert_eq!(entries_for(&foreign, "foreign").len(), 1);
     }
-    let refusal = project_free.terminal(json!({"name":"read", "preset":"head", "arguments":{"filePath":root.join("project/own.txt")}})).await;
+    let refusal = project_free.terminal(json!({"name":"read", "preset":"head", "arguments":{"path":root.join("project/own.txt")}})).await;
     assert_eq!(refusal.header.ty, FrameType::Error);
     assert_eq!(response_json(&refusal)["code"], "project_required");
 }
