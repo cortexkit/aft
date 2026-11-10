@@ -17381,7 +17381,17 @@ impl BgTask {
             // also never started. Accepted results keep the launch task handle.
             terminal: (state.metadata.is_terminal()
                 && (!remote.accepted || remote::remote_refusal(&state.metadata).is_some()))
-            .then(|| self.snapshot_locked(state, 0)),
+            .then(|| {
+                let mut snapshot = self.snapshot_locked(state, 0);
+                // Deadline and drain replies use this projection without reading
+                // task state again. Publish the diagnostics with the status,
+                // even before the terminal output cache has been rendered.
+                if let Some(note) = rendered_execution_note(&state.metadata) {
+                    snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
+                }
+                append_remote_report(&mut snapshot.output_preview, &state.metadata);
+                snapshot
+            }),
         };
         *self.runon_launch_state.lock().unwrap() = Some(launch);
     }

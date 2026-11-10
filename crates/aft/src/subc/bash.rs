@@ -8802,7 +8802,8 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[test]
     fn runon_capture_cached_unknown_reply_before_terminal_render_keeps_advice() {
-        let fixture = crate::bash_background::registry::remote::uncaptured_unknown_before_render_for_test();
+        let fixture =
+            crate::bash_background::registry::remote::uncaptured_unknown_before_render_for_test();
         let task_id = &fixture.task.task_id;
         let launch = Response::success(
             "cached-unknown",
