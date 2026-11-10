@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
+#[cfg(test)]
+mod backup_bookkeeping_tests;
 mod cpu_time;
 #[cfg(test)]
 mod outline_wait_probe;
@@ -13,6 +15,40 @@ pub(crate) mod progress;
 pub(crate) use cpu_time::ThreadCpuSample;
 
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
+
+/// Commands that never create mutation backups or undo post-state records.
+/// Cache/index maintenance by a reader does not make it a file mutation.
+/// Keep unknown commands on the bookkeeping path, including every edit,
+/// safety operation and shell command. The standalone tool-call envelope
+/// has the same property as its named tool; its arguments cannot change it.
+pub fn is_read_only_request(request: &RawRequest) -> bool {
+    let command = if request.command == "tool_call" {
+        let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        name
+    } else {
+        &request.command
+    };
+    matches!(
+        command.strip_prefix("aft_").unwrap_or(command),
+        "outline"
+            | "zoom"
+            | "read"
+            | "grep"
+            | "glob"
+            | "search"
+            | "semantic_search"
+            | "callgraph"
+            | "callers"
+            | "call_tree"
+            | "impact"
+            | "trace_to"
+            | "trace_to_symbol"
+            | "trace_data"
+    )
+}
+
 /// Finalizes a formatted tool result. It receives the agent-visible text so the finalizer can
 /// append trailing lines (the AFT status bar) that every transport then delivers unchanged.
 pub type FinalizeFn<'a> = dyn Fn(&mut Response, &mut String) + 'a;
@@ -848,11 +884,16 @@ pub fn run_tool_call(
             // Keep these clocks on the diagnostic path, not in response text.
             let outline_started =
                 (prepared.request.command == "outline" && phase_trace.is_some()).then(Instant::now);
-            let skipped_before = app_ctx.backup().lock().latest_skipped_order(
-                ctx.session_id
-                    .as_deref()
-                    .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
-            );
+            let backup_bookkeeping = !is_read_only_request(&prepared.request);
+            let skipped_before = backup_bookkeeping
+                .then(|| {
+                    app_ctx.backup().lock().latest_skipped_order(
+                        ctx.session_id
+                            .as_deref()
+                            .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
+                    )
+                })
+                .flatten();
             let outline_backup_before = outline_started.map(|at| at.elapsed());
             let (watcher_pending, callgraph_pending) =
                 crate::response_finalize::query_pending(app_ctx, &prepared.request.command);
@@ -877,7 +918,10 @@ pub fn run_tool_call(
                 &mut response,
                 callgraph_pending.as_ref(),
             );
-            if response.success && response.data.get("backup_skipped_reason").is_none() {
+            if backup_bookkeeping
+                && response.success
+                && response.data.get("backup_skipped_reason").is_none()
+            {
                 let session = ctx
                     .session_id
                     .as_deref()
