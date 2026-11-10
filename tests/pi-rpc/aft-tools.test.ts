@@ -145,6 +145,8 @@ async function withPiTool(
   opts: {
     message: string;
     setup?: (env: PiIsolatedEnv) => Promise<void>;
+    /** Call the tool again while its reply contains this designed retry text. */
+    retryWhile?: string;
   },
 ): Promise<Record<string, unknown>> {
   const env = createPiIsolatedEnv();
@@ -152,11 +154,21 @@ async function withPiTool(
   let client: RpcClient | undefined;
   try {
     await opts.setup?.(env);
-    aimock.registerToolCallFixture({
-      predicate: () => true,
-      toolCalls: [toolCall],
-      followupText: "Done.",
-    });
+    const retryWhile = opts.retryWhile;
+    if (retryWhile) {
+      aimock.registerRetryingToolCallFixture({
+        toolCall,
+        retryWhile,
+        attempts: 60,
+        followupText: "Done.",
+      });
+    } else {
+      aimock.registerToolCallFixture({
+        predicate: () => true,
+        toolCalls: [toolCall],
+        followupText: "Done.",
+      });
+    }
     const spawned = spawnPiRpc({
       mockProviderURL: aimock.url,
       aftPluginDir: resolvePiPluginDir(),
@@ -170,7 +182,10 @@ async function withPiTool(
       true,
     );
     return await client.waitForEvent(
-      (event) => event.type === "tool_execution_end" && event.toolName === toolCall.name,
+      (event) =>
+        event.type === "tool_execution_end" &&
+        event.toolName === toolCall.name &&
+        !(retryWhile && resultText(event).includes(retryWhile)),
       30_000,
     );
   } finally {
@@ -291,6 +306,11 @@ describe("AFT Pi tools (real Pi RPC)", () => {
       },
       {
         message: "Search for needle.",
+        // A just-opened project's text index builds in the background, and
+        // until it is ready aft_search answers with search_lanes_unavailable
+        // ("Retry shortly or use grep"), its designed reply. This test is about
+        // server-rendered text passthrough, so the mock model retries that.
+        retryWhile: "search_lanes_unavailable",
         setup: async (env) => {
           await enableAllToolSurfaceWithSearch(env);
           await writeFile(
