@@ -473,12 +473,14 @@ impl BgTaskRegistry {
             )?
         };
         range = range.start - region.start..range.end - region.start;
-        let values = secrets.redact_range(&text[region], Some(&mut range));
-        let masked =
-            crate::log_redact::redact_ticket_digest_range(&values, &mut range, ticket_digest)
-                .ok()?;
-        align_watch_range(&masked, &mut range);
-        masked.get(range).map(str::to_owned)
+        // Watch matches expand to include every secret they touch. A stream
+        // instead owns a replacement only in the range containing its first
+        // raw byte; otherwise a long secret repeats its placeholder in every
+        // chunk. Stream mapping preserves unchanged header prefixes and
+        // suffixes while leaving the existing watch behavior unchanged.
+        let values = secrets.redact_stream_range(&text[region], &mut range);
+        align_watch_range(&values, &mut range);
+        crate::log_redact::shells_ticket_range(&values, range, ticket_digest).ok()
     }
 
     pub(super) fn completion_preview_for_notice(
@@ -927,6 +929,55 @@ fn mask_rendered_ticket_preview(
         }
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod shells_stream_tests {
+    use super::*;
+
+    #[test]
+    fn shells_v1_generic_header_replacement_is_owned_by_one_raw_chunk() {
+        let prefix = format!("{}\n", "x".repeat(61));
+        let spaces = " ".repeat(200);
+        let raw = format!(
+            "{prefix}Authorization:{spaces}Bearer {}\nafter",
+            "q".repeat(100)
+        );
+        let values = crate::log_redact::SecretValues::default();
+        let first = BgTaskRegistry::shell_mask_window_with_values(
+            raw.as_bytes(),
+            0..64,
+            true,
+            true,
+            false,
+            (false, false),
+            &values,
+            None,
+        )
+        .unwrap();
+        assert!(
+            first.len() <= 64,
+            "unchanged header prefixes must not expand a chunk"
+        );
+        let second = BgTaskRegistry::shell_mask_window_with_values(
+            raw.as_bytes(),
+            64..raw.len(),
+            true,
+            true,
+            false,
+            (false, false),
+            &values,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            first + &second,
+            format!(
+                "{prefix}Authorization:{spaces}Bearer {}\nafter",
+                crate::log_redact::SECRET_PLACEHOLDER
+            )
+        );
+    }
 }
 
 #[cfg(test)]

@@ -455,6 +455,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Masking inspects a byte-addressed context rather than returning a result list. Operator output uses bounded source windows with explicit withheld ranges; existing agent watch-preview limits remain unchanged.",
     },
     ExclusionEntry {
+        file: "log_redact.rs",
+        enclosing_item: "shells_ticket_range, SHELL_TICKET_RANGE_BYTES, replace_in",
+        location_or_primitive: "4 KiB ticket masking windows; take_while common prefix and suffix",
+        reason: "Every requested byte remains covered while ticket masking uses bounded overlapping source windows. This cap limits masking work per window, not rows, tool results or streamed raw offset coverage.",
+    },
+    ExclusionEntry {
         file: "db/call_ledger.rs",
         enclosing_item: "enforce_retention_bounds",
         location_or_primitive: "UNACKED_RESULTS_MAX (1000), EXPIRED_ENTRIES_MAX (1000), SQL OFFSET",

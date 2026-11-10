@@ -412,6 +412,56 @@ fn shells_v1_real_capture_complete_json_lines_remain_readable() {
     assert_eq!(text, &raw[120_000..121_000]);
 }
 
+#[test]
+fn shells_v1_real_capture_long_preserved_header_prefix_respects_chunk_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let spaces = " ".repeat(200);
+    let raw = format!("Authorization:{spaces}Bearer {}\nafter", "q".repeat(100));
+    let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), false, true);
+    let row = project_row(&snapshot, None);
+    let (mut capture, _) = super::super::capture::Capture::open(
+        reader,
+        &row,
+        OutputParams {
+            task_id: row.task_id.clone(),
+            max_chunk_bytes: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut text = String::new();
+    let mut offset = 0;
+    loop {
+        let (next, frames, finished) = capture.read(row.clone());
+        capture = next;
+        for frame in frames {
+            if let OutputFrame::Chunk {
+                offset: from,
+                end_offset,
+                text: part,
+                ..
+            } = frame
+            {
+                assert_eq!(from, offset);
+                offset = end_offset;
+                assert!(part.len() <= 64);
+                text.push_str(&part);
+            }
+        }
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(offset, raw.len() as u64);
+    assert_eq!(
+        text,
+        format!(
+            "Authorization:{spaces}Bearer {}\nafter",
+            crate::log_redact::SECRET_PLACEHOLDER
+        )
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn shells_v1_real_capture_long_known_secret_crosses_chunks_without_leaking() {

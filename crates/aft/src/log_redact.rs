@@ -98,7 +98,7 @@ static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([
 /// Mask credentials in `text`. Returns the input unchanged (borrowed) when it
 /// contains nothing to mask, so the common case allocates nothing.
 pub fn aft_redactor(text: &str) -> Cow<'_, str> {
-    redact_with_range(text, None)
+    redact_with_range(text, None, RangeMapping::Watch)
 }
 
 const SHELL_FORMAT_TRIGGERS: &[&str] = &[
@@ -810,6 +810,7 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
     // Runs first, on the command as typed: the shapes below write
     // placeholders that read as redirections to the shell-word scan.
     let mut out = mask_tool_passwords(command);
+    let mapping = RangeMapping::Watch;
     if command.contains('=') {
         out = replace_in(
             out,
@@ -827,16 +828,23 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
                     format!("{}{name}{SECRET_PLACEHOLDER}", &caps[1])
                 }
             },
+            mapping,
         );
     }
     if command.contains("--") {
-        out = replace_in(out, None, &COMMAND_SECRET_FLAG, |caps: &Captures<'_>| {
-            if command_value_is_reference(&caps[3]) {
-                caps[0].to_string()
-            } else {
-                format!("{}{}{SECRET_PLACEHOLDER}", &caps[1], &caps[2])
-            }
-        });
+        out = replace_in(
+            out,
+            None,
+            &COMMAND_SECRET_FLAG,
+            |caps: &Captures<'_>| {
+                if command_value_is_reference(&caps[3]) {
+                    caps[0].to_string()
+                } else {
+                    format!("{}{}{SECRET_PLACEHOLDER}", &caps[1], &caps[2])
+                }
+            },
+            mapping,
+        );
     }
     match aft_redactor(&out) {
         Cow::Borrowed(_) => out,
@@ -848,6 +856,48 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
 // non-hex verdict lines need no hashes and can still retain their placeholders.
 pub(crate) const TICKET_REDACTION_BYTES: usize = 50 * 1024;
 pub(crate) const TICKET_REDACTION_WINDOWS: usize = 8 * 1024;
+
+// A 4 KiB range plus both 31-byte halos remains below the existing ticket
+// scanner's byte and candidate budgets, including an all-hex source window.
+const SHELL_TICKET_RANGE_BYTES: usize = 4 * 1024;
+
+pub(crate) fn shells_ticket_range(
+    text: &str,
+    range: std::ops::Range<usize>,
+    digest: Option<&str>,
+) -> Result<String, TicketRedactionBudgetExceeded> {
+    if digest.is_none() {
+        return Ok(text[range].to_owned());
+    }
+    let mut output = String::new();
+    let mut from = range.start;
+    while from < range.end {
+        let to = crate::compress::generic::floor_char_boundary(
+            text,
+            (from + SHELL_TICKET_RANGE_BYTES).min(range.end),
+        );
+        let start = crate::compress::generic::floor_char_boundary(
+            text,
+            from.saturating_sub(TICKET_HALO_BYTES),
+        );
+        let end = crate::compress::generic::ceil_char_boundary(
+            text,
+            (to + TICKET_HALO_BYTES).min(text.len()),
+        );
+        let source = &text[start..end];
+        let mut low = (from - start)..(from - start);
+        let mut high = (to - start)..(to - start);
+        let masked = redact_ticket_digest_range(source, &mut low, digest)?;
+        let _ = redact_ticket_digest_range(source, &mut high, digest)?;
+        output.push_str(
+            masked
+                .get(low.end..high.end)
+                .ok_or(TicketRedactionBudgetExceeded)?,
+        );
+        from = to;
+    }
+    Ok(output)
+}
 pub(crate) const TICKET_HALO_BYTES: usize = 31;
 
 #[derive(Debug)]
@@ -963,16 +1013,35 @@ pub(crate) fn ticket_digest_windows(text: &str) -> usize {
         .sum()
 }
 
+#[derive(Clone, Copy)]
+enum RangeMapping {
+    Watch,
+    Stream,
+}
+
 fn redact_with_range<'a>(
     text: &'a str,
     mut range: Option<&mut std::ops::Range<usize>>,
+    mapping: RangeMapping,
 ) -> Cow<'a, str> {
     let mut out = Cow::Borrowed(text);
     if text.contains("PRIVATE KEY-----") {
-        out = replace_in(out, range.as_deref_mut(), &PRIVATE_KEY, SECRET_PLACEHOLDER);
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &PRIVATE_KEY,
+            SECRET_PLACEHOLDER,
+            mapping,
+        );
     }
     if text.contains("xox") {
-        out = replace_in(out, range.as_deref_mut(), &SLACK_TOKEN, SECRET_PLACEHOLDER);
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &SLACK_TOKEN,
+            SECRET_PLACEHOLDER,
+            mapping,
+        );
     }
     if contains_ignore_ascii_case(text, "x-api-key") {
         out = replace_in(
@@ -980,6 +1049,7 @@ fn redact_with_range<'a>(
             range.as_deref_mut(),
             &API_KEY_HEADER,
             |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}", &caps[1]),
+            mapping,
         );
     }
     if text.contains('"') {
@@ -988,6 +1058,7 @@ fn redact_with_range<'a>(
             range.as_deref_mut(),
             &SECRET_JSON_FIELD,
             |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}{}", &caps[1], &caps[3]),
+            mapping,
         );
     }
     if contains_ignore_ascii_case(text, "secret_access_key") {
@@ -996,6 +1067,7 @@ fn redact_with_range<'a>(
             range.as_deref_mut(),
             &AWS_SECRET_FIELD,
             |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}", &caps[1]),
+            mapping,
         );
     }
     if contains_ignore_ascii_case(text, "authorization") {
@@ -1004,19 +1076,38 @@ fn redact_with_range<'a>(
             range.as_deref_mut(),
             &AUTHORIZATION_HEADER,
             |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}", &caps[1]),
+            mapping,
         );
     }
     if text.contains("github_pat_") {
-        out = replace_in(out, range.as_deref_mut(), &GITHUB_PAT, SECRET_PLACEHOLDER);
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &GITHUB_PAT,
+            SECRET_PLACEHOLDER,
+            mapping,
+        );
     }
     if needs_github_token_scan(text) {
-        out = replace_in(out, range.as_deref_mut(), &GITHUB_TOKEN, SECRET_PLACEHOLDER);
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &GITHUB_TOKEN,
+            SECRET_PLACEHOLDER,
+            mapping,
+        );
     }
     if text.contains("sk-") {
-        out = replace_in(out, range.as_deref_mut(), &SK_API_KEY, SECRET_PLACEHOLDER);
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &SK_API_KEY,
+            SECRET_PLACEHOLDER,
+            mapping,
+        );
     }
     if text.contains("eyJ") {
-        out = replace_in(out, range.as_deref_mut(), &JWT, SECRET_PLACEHOLDER);
+        out = replace_in(out, range.as_deref_mut(), &JWT, SECRET_PLACEHOLDER, mapping);
     }
     if ["AKIA", "ASIA", "AGPA", "AIDA", "AROA"]
         .iter()
@@ -1027,6 +1118,7 @@ fn redact_with_range<'a>(
             range.as_deref_mut(),
             &AWS_ACCESS_KEY_ID,
             SECRET_PLACEHOLDER,
+            mapping,
         );
     }
     if text.contains("://") {
@@ -1035,6 +1127,7 @@ fn redact_with_range<'a>(
             range.as_deref_mut(),
             &URL_USERINFO,
             |caps: &Captures<'_>| format!("{}{URL_CREDENTIAL_PLACEHOLDER}@", &caps[1]),
+            mapping,
         );
     }
     if text.contains('=') && (text.contains('?') || text.contains('&')) {
@@ -1043,6 +1136,7 @@ fn redact_with_range<'a>(
             range.as_deref_mut(),
             &CREDENTIAL_QUERY,
             |caps: &Captures<'_>| format!("{}{SECRET_PLACEHOLDER}", &caps[1]),
+            mapping,
         );
         out = replace_in(
             out,
@@ -1055,6 +1149,7 @@ fn redact_with_range<'a>(
                     caps[0].to_string()
                 }
             },
+            mapping,
         );
     }
     out
@@ -1158,7 +1253,24 @@ impl SecretValues {
     pub(crate) fn redact_range<'a>(
         &self,
         text: &'a str,
+        range: Option<&mut std::ops::Range<usize>>,
+    ) -> Cow<'a, str> {
+        self.redact_range_with_mapping(text, range, RangeMapping::Watch)
+    }
+
+    pub(crate) fn redact_stream_range<'a>(
+        &self,
+        text: &'a str,
+        range: &mut std::ops::Range<usize>,
+    ) -> Cow<'a, str> {
+        self.redact_range_with_mapping(text, Some(range), RangeMapping::Stream)
+    }
+
+    fn redact_range_with_mapping<'a>(
+        &self,
+        text: &'a str,
         mut range: Option<&mut std::ops::Range<usize>>,
+        mapping: RangeMapping,
     ) -> Cow<'a, str> {
         // Exact matches run first: a format-based replacement inside an opaque
         // value must not leave the rest of that value visible.
@@ -1184,12 +1296,20 @@ impl SecretValues {
                 }
                 masked.push_str(&text[copied..start]);
                 if let Some(range) = range.as_deref_mut() {
-                    map_redacted_range(
-                        range,
-                        masked.len(),
-                        masked.len() + end - start,
-                        SECRET_PLACEHOLDER.len(),
-                    );
+                    match mapping {
+                        RangeMapping::Watch => map_redacted_range(
+                            range,
+                            masked.len(),
+                            masked.len() + end - start,
+                            SECRET_PLACEHOLDER.len(),
+                        ),
+                        RangeMapping::Stream => map_stream_range(
+                            range,
+                            masked.len(),
+                            masked.len() + end - start,
+                            SECRET_PLACEHOLDER.len(),
+                        ),
+                    }
                 }
                 masked.push_str(SECRET_PLACEHOLDER);
                 copied = end;
@@ -1197,7 +1317,7 @@ impl SecretValues {
             masked.push_str(&text[copied..]);
             Cow::Owned(masked)
         };
-        match redact_with_range(&out, range) {
+        match redact_with_range(&out, range, mapping) {
             Cow::Borrowed(_) => out,
             Cow::Owned(masked) => Cow::Owned(masked),
         }
@@ -1370,6 +1490,7 @@ fn replace_in<'a, R: Replacer>(
     mut range: Option<&mut std::ops::Range<usize>>,
     pattern: &Regex,
     mut replacer: R,
+    mapping: RangeMapping,
 ) -> Cow<'a, str> {
     // Capture storage is allocated by replace_all even when it finds no match.
     // Keep the overwhelmingly common no-secret path allocation-free.
@@ -1385,7 +1506,34 @@ fn replace_in<'a, R: Replacer>(
         replacer.replace_append(&caps, &mut masked);
         if masked[from..] != *found.as_str() {
             if let Some(range) = range.as_deref_mut() {
-                map_redacted_range(range, from, from + found.len(), masked.len() - from);
+                match mapping {
+                    RangeMapping::Watch => {
+                        map_redacted_range(range, from, from + found.len(), masked.len() - from)
+                    }
+                    RangeMapping::Stream => {
+                        let before = found.as_str();
+                        let after = &masked[from..];
+                        let prefix = before
+                            .chars()
+                            .zip(after.chars())
+                            .take_while(|(a, b)| a == b)
+                            .map(|(ch, _)| ch.len_utf8())
+                            .sum::<usize>();
+                        let suffix = before[prefix..]
+                            .chars()
+                            .rev()
+                            .zip(after[prefix..].chars().rev())
+                            .take_while(|(a, b)| a == b)
+                            .map(|(ch, _)| ch.len_utf8())
+                            .sum::<usize>();
+                        map_stream_range(
+                            range,
+                            from + prefix,
+                            from + before.len() - suffix,
+                            after.len() - prefix - suffix,
+                        );
+                    }
+                }
             }
         }
         copied = found.end();
@@ -1396,6 +1544,27 @@ fn replace_in<'a, R: Replacer>(
     } else {
         Cow::Owned(masked)
     }
+}
+
+/// Assign a replacement to the raw range containing its first changed byte.
+/// Unchanged prefix and suffix bytes keep their original stream positions.
+fn map_stream_range(
+    range: &mut std::ops::Range<usize>,
+    from: usize,
+    to: usize,
+    replacement_len: usize,
+) {
+    let position = |at: usize| {
+        if at <= from {
+            at
+        } else if at >= to {
+            at - (to - from) + replacement_len
+        } else {
+            from + replacement_len
+        }
+    };
+    range.start = position(range.start);
+    range.end = position(range.end);
 }
 
 /// Keep a watch's raw match anchored when a replacement changes byte lengths.
@@ -2087,6 +2256,21 @@ mod tests {
         ] {
             assert!(shells_may_need_format_context(input));
         }
+    }
+
+    #[test]
+    fn shells_v1_ticket_range_streams_large_chunks_without_repeating_a_placeholder() {
+        let ticket = "0123456789abcdef0123456789abcdef";
+        let digest = blake3::hash(ticket.as_bytes()).to_hex().to_string();
+        let prefix = "x".repeat(61);
+        let suffix = format!("-{}", "o".repeat(65_536 - prefix.len() - ticket.len() - 1));
+        let raw = format!("{prefix}{ticket}{suffix}");
+        let first = shells_ticket_range(&raw, 0..64, Some(&digest)).unwrap();
+        let second = shells_ticket_range(&raw, 64..raw.len(), Some(&digest)).unwrap();
+        assert_eq!(
+            first + &second,
+            format!("{prefix}{SECRET_PLACEHOLDER}{suffix}")
+        );
     }
 
     #[test]
