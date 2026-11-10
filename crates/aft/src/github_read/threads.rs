@@ -189,6 +189,15 @@ mod tests {
     }
 
     impl GhCommandRunner for FixtureRunner {
+        fn run_bounded(
+            &self,
+            _: &std::path::Path,
+            _: &[String],
+            _: usize,
+        ) -> Result<(GhCommandOutput, bool), GhCommandError> {
+            panic!("thread fixtures do not fetch diffs")
+        }
+
         fn run(
             &self,
             _: &std::path::Path,
