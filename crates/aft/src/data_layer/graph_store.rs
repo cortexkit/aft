@@ -347,8 +347,8 @@ impl<'i> SectionsWriter<'i> {
     ) -> BuiltFragment {
         let facts = super::callgraph::CheckoutFacts { inputs };
         // Publication reads each fragment's parse once. Keeping newly decoded
-        // parses in the shared input slots would hand that serialization scratch
-        // to the next engine, even after a broad refresh released it.
+        // parses in the shared input slots would retain them in the kept engine,
+        // even after a broad refresh had released its decoded parses.
         let (key, parse) = inputs
             .parses
             .read(file)
