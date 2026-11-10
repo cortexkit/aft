@@ -36,6 +36,7 @@ fn phase(name: &str, tasks: usize, run: impl FnOnce()) -> work_counts::Counts {
 fn bash_background_bookkeeping_day_probe() {
     const TASKS: usize = 300;
     const REMOTE: usize = TASKS / 2;
+    const STREAMING: usize = 10;
     const SECONDS: u64 = 180;
     let dir = tempfile::tempdir().unwrap();
     // Reuse the real remote recovery fixture's metadata shape, not its worker.
@@ -117,11 +118,15 @@ fn bash_background_bookkeeping_day_probe() {
             consumers.push(consumer);
         }
     });
-    phase("remote_stream_180s", REMOTE, || {
-        // Ten chunks per second for three minutes, without wall-clock sleeps.
+    phase("remote_stream_180s", STREAMING, || {
+        // Most jobs are quiet. A small subset streams ten chunks per second
+        // for three minutes, without wall-clock sleeps or a runner connection.
         for seq in 1..=SECONDS * 10 {
             ticks.store(seq * 100, Ordering::Relaxed);
-            for (consumer, sink) in consumers.iter_mut().zip(&mut sinks) {
+            for (consumer, sink) in consumers[..STREAMING]
+                .iter_mut()
+                .zip(&mut sinks[..STREAMING])
+            {
                 consumer
                     .consume(
                         StreamRecord::Output(Output::new(
