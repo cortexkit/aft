@@ -112,20 +112,19 @@ impl ShellReader {
         {
             return Ok(current.shell_revision);
         }
-        let updated = update_task_at(&layout, |metadata| {
-            if !metadata.is_terminal() && self.metadata.is_terminal() {
-                metadata.status = self.metadata.status.clone();
-                metadata.finished_at = self.metadata.finished_at;
-                metadata.exit_code = self.metadata.exit_code;
-                metadata.status_reason = self.metadata.status_reason.clone();
-                metadata.duration_ms = self.metadata.duration_ms;
-            }
-            if metadata.shell_fingerprint.as_deref() != Some(fingerprint) {
-                metadata.shell_revision = metadata.shell_revision.saturating_add(1);
-                metadata.shell_fingerprint = Some(fingerprint.to_owned());
-            }
-        })
-        .map_err(|error| error.to_string())?;
+        let mut updated = current;
+        if !updated.is_terminal() && self.metadata.is_terminal() {
+            updated.status = self.metadata.status.clone();
+            updated.finished_at = self.metadata.finished_at;
+            updated.exit_code = self.metadata.exit_code;
+            updated.status_reason = self.metadata.status_reason.clone();
+            updated.duration_ms = self.metadata.duration_ms;
+        }
+        if updated.shell_fingerprint.as_deref() != Some(fingerprint) {
+            updated.shell_revision = updated.shell_revision.saturating_add(1);
+            updated.shell_fingerprint = Some(fingerprint.to_owned());
+        }
+        write_task_at(&layout, &updated).map_err(|error| error.to_string())?;
         *order += 1;
         Ok(updated.shell_revision)
     }
