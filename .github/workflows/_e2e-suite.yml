@@ -431,19 +431,20 @@ jobs:
   # Windows-specific bugs at the integration level (bash spawning + timeout
   # behavior — issue #26, ONNX install via tar.exe, file URI handling, lock
   # recovery). Windows containers require a Windows Docker host and add no
-  # value over running natively on `windows-2022`.
+  # value over running natively on the dedicated Windows machine.
   # ---------------------------------------------------------------------------
   e2e-windows:
     name: E2E (Windows native)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 30
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/native-ci-state
 
       - uses: ./.github/actions/windows-ci-defender
 
@@ -452,12 +453,15 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: e2e-windows-${{ inputs.cargo_profile }}
           cache-on-failure: true
@@ -466,6 +470,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: true
 
       - name: Build AFT binary (Windows x64)
         run: cargo build --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
@@ -485,7 +490,7 @@ jobs:
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
         shell: pwsh
         env:
-          AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}\aft.exe
+          AFT_BINARY_PATH: ${{ env.CARGO_TARGET_DIR }}\x86_64-pc-windows-msvc\${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}\aft.exe
           AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
 
       - name: Collect Windows plugin log on failure
@@ -500,12 +505,18 @@ jobs:
           }
 
       - name: Upload Windows plugin log on failure
-        if: failure()
+        if: ${{ runner.environment == 'github-hosted' && (failure()) }}
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: e2e-windows-plugin-log-${{ github.run_attempt }}
           path: ${{ runner.temp }}/aft-e2e-artifacts/windows/aft-plugin.log
           if-no-files-found: warn
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   # ---------------------------------------------------------------------------
   # macOS native e2e — exercises the same OpenCode + plugin + binary stack on
@@ -517,28 +528,32 @@ jobs:
   # Catches: FSEvents watcher behavior, /var vs /private/var canonicalization,
   # broken-symlink-chain fallback, .dylib loading, and Apple Silicon codegen.
   # ---------------------------------------------------------------------------
+
   e2e-macos:
     name: E2E (macOS native)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     # Landing E2E tests exercise behavior, not release-calibrated latency.
     # Publication still tests the shipped release binary in release.yml.
     timeout-minutes: 45
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE: ${{ inputs.cargo_profile == 'stage' && 'dev' || 'release' }}
       CARGO_PROFILE_DIR: ${{ inputs.cargo_profile == 'stage' && 'debug' || 'release' }}
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/native-ci-state
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
@@ -547,6 +562,7 @@ jobs:
       # then misread argv as rustup-init). Excluding bin keeps the dependency
       # artifacts without touching shims. See _unit-suite.yml unit-macos.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: e2e-macos-${{ env.CARGO_PROFILE }}
           cache-bin: false
@@ -556,6 +572,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: true
 
       - name: Build AFT binary (macOS native)
         run: cargo build --profile "$CARGO_PROFILE" --bin aft -p agent-file-tools --timings
@@ -567,9 +584,9 @@ jobs:
       # corrupt-signature shape #238 shipped, with no exec needed.
       - name: Sign, verify, and warm the binary
         run: |
-          codesign -f -s - "target/$CARGO_PROFILE_DIR/aft"
-          codesign --verify --strict "target/$CARGO_PROFILE_DIR/aft"
-          "target/$CARGO_PROFILE_DIR/aft" --version
+          codesign -f -s - "$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/aft"
+          codesign --verify --strict "$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/aft"
+          "$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/aft" --version
 
       - name: Install workspace deps + build aft-bridge
         run: |
@@ -582,13 +599,19 @@ jobs:
       - name: Run macOS E2E suite
         run: bash tests/macos-e2e/run.sh
         env:
-          AFT_BINARY_PATH: ${{ github.workspace }}/target/${{ env.CARGO_PROFILE_DIR }}/aft
+          AFT_BINARY_PATH: ${{ env.CARGO_TARGET_DIR }}/${{ env.CARGO_PROFILE_DIR }}/aft
           AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist
 
       - name: Upload macOS plugin log on failure
-        if: failure()
+        if: ${{ runner.environment == 'github-hosted' && (failure()) }}
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: e2e-macos-plugin-log-${{ github.run_attempt }}
           path: ${{ runner.temp }}/aft-e2e-data/cortexkit/aft/logs/aft-plugin.log
           if-no-files-found: warn
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
