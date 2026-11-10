@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Union
 
 
 def run_directory(root: Path, run_id: str, attempt: str) -> Path:
@@ -77,18 +78,81 @@ def cleanup_processes(root: Path) -> None:
                 pass
 
 
+def windows_git_path_entries(exec_path: Path) -> list[Path]:
+    for candidate in (exec_path, *exec_path.parents):
+        if (candidate / "cmd/git.exe").is_file() or (candidate / "bin/bash.exe").is_file():
+            entries = [candidate / part for part in ("bin", "cmd", "ucrt64/bin", "usr/bin")]
+            missing = [str(path) for path in entries if not path.is_dir()]
+            if missing:
+                raise RuntimeError("Git for Windows PATH directories missing: " + ", ".join(missing))
+            return entries
+    raise RuntimeError(f"Cannot locate Git for Windows installation from {exec_path}")
+
+
+def publish_windows_git_path(exec_path: Path, path_file: Path) -> None:
+    entries = windows_git_path_entries(exec_path)
+    # GitHub prepends the last file entry first. Keep the hosted Git directory
+    # order so PowerShell can resolve coreutils without forcing another shell.
+    with path_file.open("a", encoding="utf-8") as paths:
+        for entry in reversed(entries):
+            print(entry.as_posix(), file=paths)
+    print("Git for Windows PATH order: " + ";".join(entry.as_posix() for entry in entries))
+
+
+def windows_rust_environment(shared_cargo: Path, rustup: Path, writable_cargo: Path) -> dict[str, Path]:
+    toolchain = rustup / "toolchains/stable-x86_64-pc-windows-msvc"
+    required = [shared_cargo, rustup, toolchain]
+    required += [shared_cargo / "bin" / f"{name}.exe" for name in (
+        "cargo", "rustc", "rustdoc", "rustup", "rustfmt", "cargo-clippy", "rust-analyzer",
+    )]
+    required += [toolchain / "bin" / f"{name}.exe" for name in ("cargo", "rustc", "rustdoc")]
+    required.append(toolchain / "lib/rustlib/src/rust/library/core/src/lib.rs")
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise RuntimeError("Read-only Rust installation is incomplete; ask the runner administrator to provision: "
+                           + ", ".join(missing))
+    if (writable_cargo.resolve().is_relative_to(shared_cargo.resolve())
+            or writable_cargo.resolve().is_relative_to(rustup.parent.resolve())):
+        raise RuntimeError(f"Cargo's writable home must be outside the shared Rust installation: {writable_cargo}")
+    (writable_cargo / "bin").mkdir(parents=True, exist_ok=True)
+    print(f"Read-only Rust shims: {shared_cargo / 'bin'}; toolchain: {toolchain}")
+    return {"CARGO_HOME": writable_cargo}
+
+
+def setup_windows_tool_paths() -> dict[str, Union[Path, str]]:
+    path_file = Path(os.environ["GITHUB_PATH"])
+    exec_path = Path(subprocess.check_output(["git", "--exec-path"], text=True).strip())
+    publish_windows_git_path(exec_path, path_file)
+    shared_cargo = Path(os.environ.get("CARGO_HOME", "C:/rust/cargo"))
+    rustup_home = os.environ.get("RUSTUP_HOME")
+    if not rustup_home:
+        raise RuntimeError("The runner must set RUSTUP_HOME to its administrator-managed Rust installation")
+    rustup = Path(rustup_home)
+    writable_cargo = Path.home() / ".cargo"
+    values: dict[str, Union[Path, str]] = dict(windows_rust_environment(shared_cargo, rustup, writable_cargo))
+    values["RUSTUP_TOOLCHAIN"] = "stable-x86_64-pc-windows-msvc"
+    # Missing toolchains must fail instead of starting rustup's automatic installer.
+    values["RUSTUP_AUTO_INSTALL"] = "0"
+    with path_file.open("a", encoding="utf-8") as paths:
+        for directory in (shared_cargo / "bin", writable_cargo / "bin"):
+            print(directory.as_posix(), file=paths)
+    return values
+
+
 def setup(root: Path, run_dir: Path) -> None:
     target = root / "target"
     target.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
     job_dir = Path(tempfile.mkdtemp(prefix=f"attempt-{attempt}-job-", dir=run_dir))
-    values = {
-        "CARGO_TARGET_DIR": target,
+    values: dict[str, Union[Path, str]] = {
+        "AFT_CI_TARGET_DIR": target,
         "AFT_CI_ARCHIVE_DIR": run_dir,
         "AFT_CI_JOB_DIR": job_dir,
         "AFT_GATE_HOME_ROOT": job_dir / "gate-home",
     }
+    if os.name == "nt":
+        values.update(setup_windows_tool_paths())
     with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
         for key, value in values.items():
             text = value.as_posix() if isinstance(value, Path) else value

@@ -442,6 +442,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -456,6 +459,7 @@ jobs:
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
@@ -478,6 +482,8 @@ jobs:
       - name: Build AFT binary (Windows x64)
         run: cargo build --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Install workspace deps + build aft-bridge
         run: |
@@ -490,10 +496,12 @@ jobs:
         shell: pwsh
 
       - name: Run Windows E2E suite
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
         shell: pwsh
         env:
-          AFT_BINARY_PATH: ${{ env.CARGO_TARGET_DIR }}\x86_64-pc-windows-msvc\${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}\aft.exe
+          AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}\x86_64-pc-windows-msvc\${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}\aft.exe
           AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
 
       - name: Collect Windows plugin log on failure
@@ -546,6 +554,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -583,6 +594,8 @@ jobs:
 
       - name: Build AFT binary (macOS native)
         run: cargo build --profile "$CARGO_PROFILE" --bin aft -p agent-file-tools --timings
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       # Ad-hoc sign + verify + exec once: an unsigned fresh binary gets
       # SIGKILLed on newer macOS, and the first exec pays a syspolicyd
@@ -591,9 +604,9 @@ jobs:
       # corrupt-signature shape #238 shipped, with no exec needed.
       - name: Sign, verify, and warm the binary
         run: |
-          codesign -f -s - "$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/aft"
-          codesign --verify --strict "$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/aft"
-          "$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/aft" --version
+          codesign -f -s - "$AFT_CI_TARGET_DIR/$CARGO_PROFILE_DIR/aft"
+          codesign --verify --strict "$AFT_CI_TARGET_DIR/$CARGO_PROFILE_DIR/aft"
+          "$AFT_CI_TARGET_DIR/$CARGO_PROFILE_DIR/aft" --version
 
       - name: Install workspace deps + build aft-bridge
         run: |
@@ -604,9 +617,11 @@ jobs:
         run: bun run --cwd packages/opencode-plugin build
 
       - name: Run macOS E2E suite
-        run: bash tests/macos-e2e/run.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          bash tests/macos-e2e/run.sh
         env:
-          AFT_BINARY_PATH: ${{ env.CARGO_TARGET_DIR }}/${{ env.CARGO_PROFILE_DIR }}/aft
+          AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/${{ env.CARGO_PROFILE_DIR }}/aft
           AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist
 
       - name: Upload macOS plugin log on failure

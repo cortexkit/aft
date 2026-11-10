@@ -4,6 +4,12 @@ inputs:
   phase:
     description: setup, cleanup, or finalize
     default: setup
+  rust-target:
+    description: Required preinstalled target on the read-only Windows toolchain
+    default: x86_64-pc-windows-msvc
+  rust-version:
+    description: Require this Rust version when consuming a release producer's bytes
+    default: ""
 runs:
   using: composite
   steps:
@@ -13,3 +19,38 @@ runs:
       run: |
         if command -v python3 >/dev/null 2>&1; then python=python3; else python=python; fi
         "$python" scripts/ci-native-state.py "$AFT_CI_PHASE"
+    - name: Verify installed Windows Rust toolchain (read-only)
+      if: runner.os == 'Windows' && runner.environment == 'self-hosted' && inputs.phase == 'setup'
+      shell: bash
+      env:
+        AFT_CI_RUST_TARGET: ${{ inputs.rust-target }}
+        AFT_CI_RUST_VERSION: ${{ inputs.rust-version }}
+      run: |
+        set -euo pipefail
+        if ! rustup show; then
+          echo "::error::The administrator-managed toolchain at $RUSTUP_HOME is unavailable; do not install or update it from CI."
+          exit 1
+        fi
+        targets="$(rustup target list --installed)"
+        printf 'Installed Rust targets:\n%s\n' "$targets"
+        if ! grep -Fxq "$AFT_CI_RUST_TARGET" <<< "$targets"; then
+          echo "::error::Missing target $AFT_CI_RUST_TARGET in $RUSTUP_HOME; ask the runner administrator to install it."
+          exit 1
+        fi
+        components="$(rustup component list --installed)"
+        printf 'Installed Rust components:\n%s\n' "$components"
+        for component in rustfmt clippy rust-analyzer rust-src; do
+          if ! grep -Eq "^${component}(-|$)" <<< "$components"; then
+            echo "::error::Missing component $component in $RUSTUP_HOME; ask the runner administrator to install it."
+            exit 1
+          fi
+        done
+        actual="$(rustc --version)"
+        printf '%s\n' "$actual"
+        cargo --version
+        actual="${actual#rustc }"
+        actual="${actual%% *}"
+        if [[ -n "$AFT_CI_RUST_VERSION" && "$actual" != "$AFT_CI_RUST_VERSION" ]]; then
+          echo "::error::Rust $actual differs from release producer $AFT_CI_RUST_VERSION; provision the matching read-only toolchain."
+          exit 1
+        fi

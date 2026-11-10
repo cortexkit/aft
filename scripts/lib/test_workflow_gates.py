@@ -196,15 +196,16 @@ class LightPREventGateTests(unittest.TestCase):
                     self.assertEqual(job["steps"], [{"uses": "actions/checkout@v5"}, step])
                 else:
                     self.assertEqual(job["steps"][0], {"uses": "actions/checkout@v5"})
-                    self.assertEqual(job["steps"][1], {"uses": "./.github/actions/native-ci-state"})
-                    self.assertEqual(job["steps"][2]["uses"], "oven-sh/setup-bun@v2")
-                    self.assertEqual(job["steps"][3]["uses"], "actions/setup-node@v5")
-                    self.assertEqual(job["steps"][4], step)
+                    self.assertEqual(job["steps"][1]["uses"], "actions/setup-python@v6")
+                    self.assertEqual(job["steps"][2], {"uses": "./.github/actions/native-ci-state"})
+                    self.assertEqual(job["steps"][3]["uses"], "oven-sh/setup-bun@v2")
+                    self.assertEqual(job["steps"][4]["uses"], "actions/setup-node@v5")
+                    self.assertEqual(job["steps"][5], step)
                     self.assertEqual(job["steps"][-1]["with"], {"phase": "cleanup"})
         action = workflow_gates.parse_workflow(str(root / ".github/actions/integration-shard/action.yml"))
         self.assertEqual(action["runs"]["using"], "composite")
         steps = action["runs"]["steps"]
-        gate_steps = [step for step in steps if step.get("run") == "./scripts/rust-test-gate.sh"]
+        gate_steps = [step for step in steps if "./scripts/rust-test-gate.sh" in step.get("run", "")]
         self.assertEqual(len(gate_steps), 2)
         self.assertEqual({step["if"] for step in gate_steps}, {"inputs.platform == 'windows'", "inputs.platform != 'windows'"})
         for step in gate_steps:
@@ -532,8 +533,8 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
                 if shared:
                     self.assertEqual(shared[0]["with"]["platform"], "windows")
                 else:
-                    self.assertEqual(direct, [4], name)
-                    self.assertNotIn("continue-on-error", steps[4])
+                    self.assertEqual(direct, [5], name)
+                    self.assertNotIn("continue-on-error", steps[5])
                     calls.append(name)
         self.assertEqual(set(calls), {
             "unit-windows-nextest-archive", "unit-windows-libtest-shard", "unit-windows-watcher",
@@ -555,13 +556,14 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
 
         for probe in ("tls", "backtrace"):
             command = f'python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe {probe}'
-            self.assertEqual(commands.count(command), 1, f"archive must run {probe} exactly once")
-            self.assertLess(build, commands.index(command))
-            self.assertLess(commands.index(command), proof)
+            matches = [i for i, script in enumerate(commands) if command in script.splitlines()]
+            self.assertEqual(len(matches), 1, f"archive must run {probe} exactly once")
+            self.assertLess(build, matches[0])
+            self.assertLess(matches[0], proof)
             for job_id in suite["jobs"]:
                 if job_id.startswith("unit-windows-") and job_id != "unit-windows-nextest-archive":
                     self.assertNotIn("ci-windows-probes.py", workflow_job(job_id))
-        self.assertFalse(any(command.startswith("cargo test ") for command in commands))
+        self.assertFalse(any(line.startswith("cargo test ") for command in commands for line in command.splitlines()))
         python = next(i for i, step in enumerate(archive["steps"]) if step.get("uses") == "actions/setup-python@v6")
         tls = next(i for i, step in enumerate(archive["steps"]) if "--probe tls" in step.get("run", ""))
         self.assertEqual(archive["steps"][python]["with"]["python-version"], "3.14")
@@ -898,7 +900,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         conformance_steps = suite["jobs"]["unit-macos-conformance"]["steps"]
         gate_index = next(
             index for index, step in enumerate(conformance_steps)
-            if step.get("run") == "./scripts/rust-test-gate.sh"
+            if "./scripts/rust-test-gate.sh" in step.get("run", "").splitlines()
             and step.get("env", {}).get("AFT_GATE_PHASES") == "conformance"
         )
         timeout_index = next(
@@ -912,8 +914,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             'test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"',
             timeout_step,
         )
-        self.assertIn('"$test_name" -- --list', timeout_step)
-        self.assertIn('"$test_name" -- --exact', timeout_step)
+        self.assertIn('"$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --list', timeout_step)
+        self.assertIn('"$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --exact', timeout_step)
         self.assertIn("expected test missing from integration inventory", timeout_step)
         self.assertIn(
             "cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation",
@@ -1036,7 +1038,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertNotIn("actions/download-artifact", conformance)
         self.assertIn("python3 scripts/check-path-deps.py", conformance)
         self.assertIn("cargo build -p agent-file-tools", conformance)
-        self.assertIn("AFT_BINARY_PATH: ${{ env.CARGO_TARGET_DIR }}/debug/aft", conformance)
+        self.assertIn("AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft", conformance)
 
 
 class NativeSelfHostedWorkflowTests(unittest.TestCase):
@@ -1070,7 +1072,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 20)
         for name, job in jobs:
             with self.subTest(job=name):
-                self.assertEqual(job["steps"][1], {"uses": "./.github/actions/native-ci-state"})
+                self.assertEqual(job["steps"][1], {"uses": "actions/setup-python@v6", "with": {"python-version": "3.14"}})
+                self.assertEqual(job["steps"][2], {"uses": "./.github/actions/native-ci-state"})
                 cleanup = job["steps"][-1]
                 self.assertEqual(cleanup["uses"], "./.github/actions/native-ci-state")
                 self.assertEqual(cleanup["if"], "always()")
@@ -1078,6 +1081,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 env = job.get("env", {})
                 self.assertNotIn("SCCACHE_GHA_ENABLED", env)
                 self.assertNotIn("RUSTC_WRAPPER", env)
+                self.assertNotIn("CARGO_TARGET_DIR", env)
+                self.assertNotIn("CARGO_BUILD_TARGET_DIR", env)
 
     def test_native_jobs_and_nested_actions_never_use_github_cache_or_artifacts(self) -> None:
         def check(steps, owner):
@@ -1090,6 +1095,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                     self.assertIn(step["with"]["no-cache"], ("true", "${{ runner.environment == 'self-hosted' }}"))
                 if action == "actions/setup-node@v5":
                     self.assertIn(step["with"]["package-manager-cache"], ("false", "${{ runner.environment == 'github-hosted' }}"))
+                if action == "actions/setup-python@v6":
+                    self.assertNotIn("cache", step.get("with", {}))
                 self.assertFalse(any(service in action for service in (
                     "actions/cache", "Swatinem/rust-cache", "sccache-action", "upload-artifact", "download-artifact",
                 )), f"{owner}: ungated remote transfer {action}")
@@ -1099,23 +1106,25 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         for name, job in self.native_jobs():
             check(job["steps"], name)
 
-    def test_native_jobs_install_host_tools_and_rust_components_before_use(self) -> None:
+    def test_native_jobs_prepare_host_tools_and_rust_components_before_use(self) -> None:
         shard = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/integration-shard/action.yml"))
         for name, job in self.native_jobs():
             with self.subTest(job=name):
                 steps = job["steps"]
-                self.assertEqual(steps[2]["uses"], "oven-sh/setup-bun@v2")
-                self.assertEqual(steps[3]["uses"], "actions/setup-node@v5")
+                self.assertEqual(steps[3]["uses"], "oven-sh/setup-bun@v2")
+                self.assertEqual(steps[4]["uses"], "actions/setup-node@v5")
                 rust = [step for step in steps if step.get("uses") == "dtolnay/rust-toolchain@stable"]
                 if not rust:
                     platform = next(step["with"]["platform"] for step in steps
                                     if step.get("uses") == "./.github/actions/integration-shard")
                     rust = [step for step in shard["runs"]["steps"]
                             if step.get("uses") == "dtolnay/rust-toolchain@stable"
-                            and step.get("if") == f"inputs.platform == '{platform}'"]
+                            and step.get("if", "").startswith(f"inputs.platform == '{platform}'")]
                 self.assertEqual(len(rust), 1)
                 self.assertEqual(set(rust[0]["with"]["components"].split(", ")),
                                  {"rustfmt", "clippy", "rust-analyzer"})
+                if job["runs-on"] == ["self-hosted", "narli"]:
+                    self.assertIn("runner.environment == 'github-hosted'", rust[0].get("if", ""))
                 if rust[0] in steps:
                     first_use = next((i for i, step in enumerate(steps)
                                       if re.search(r"\bcargo\b|scripts/check-path-deps.py", step.get("run", ""))), len(steps))
@@ -1137,12 +1146,54 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
             if "AFT_NEXTEST_ARCHIVE_FILE" in step.get("env", {}):
                 self.assertIn("env.AFT_CI_ARCHIVE_DIR || runner.temp", step["env"]["AFT_NEXTEST_ARCHIVE_FILE"])
 
+    def test_native_test_steps_clear_cargo_target_overrides_and_builds_scope_the_warm_path(self) -> None:
+        checked = 0
+        for name, job in self.native_jobs():
+            for step in job["steps"]:
+                run = step.get("run", "")
+                env = step.get("env", {})
+                if "CARGO_TARGET_DIR" in env:
+                    self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}", name)
+                    self.assertRegex(run, r"cargo (build|check|nextest (archive|list)|test)|ci-macos-integration-archive.py", name)
+                if any(command in run for command in (
+                    "rust-test-gate.sh", "ci-windows-probes.py", "bun run test:unit", "bun test ",
+                    "tests/macos-e2e/run.sh", "tests/windows-e2e/run.ps1", "cargo test",
+                )) and not ("-- --list" in run and "-- --exact" not in run):
+                    checked += 1
+                    self.assertNotIn("CARGO_TARGET_DIR", env, name)
+                    self.assertNotIn("CARGO_BUILD_TARGET_DIR", env, name)
+                    shell = step.get("shell", "pwsh" if job["runs-on"] == ["self-hosted", "narli"] else "bash")
+                    clear = ("Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR"
+                             if shell == "pwsh" else "unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR")
+                    self.assertIn(clear, run, name)
+        self.assertGreater(checked, 10)
+        action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/integration-shard/action.yml"))
+        for step in action["runs"]["steps"]:
+            if "rust-test-gate.sh" in step.get("run", ""):
+                self.assertIn("unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR", step["run"])
+
+    def test_nextest_is_on_native_path_before_install_reuse_or_cargo_invocation(self) -> None:
+        action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/setup-nextest/action.yml"))
+        steps = action["runs"]["steps"]
+        path = next(step for step in steps if step.get("name") == "Expose native cargo-nextest install on PATH")
+        install = next(step for step in steps if step.get("name") == "Download and install cargo-nextest")
+        self.assertLess(steps.index(path), steps.index(install))
+        self.assertEqual(path["if"], "runner.environment == 'self-hosted'")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path_file = home / "github-path"
+            result = subprocess.run(["bash", "-e", "-c", path["run"]], capture_output=True, text=True,
+                                    env={**os.environ, "HOME": str(home), "GITHUB_PATH": str(path_file)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(path_file.read_text().strip(), (home / ".cargo/bin").as_posix())
+
     def test_finalize_waits_for_both_suites_and_skips_prs(self) -> None:
         workflow = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/tests.yml"))
         cleanup = workflow["jobs"]["native-ci-cleanup"]
         self.assertEqual(cleanup["needs"], ["unit", "e2e"])
         self.assertEqual(cleanup["if"], "${{ always() && github.event_name != 'pull_request' }}")
         self.assertEqual(cleanup["strategy"]["matrix"]["machine"], ["rented-mac", "narli"])
+        self.assertEqual(cleanup["steps"][1], {"uses": "actions/setup-python@v6", "with": {"python-version": "3.14"}})
         self.assertEqual(cleanup["steps"][-1]["with"], {
             "phase": "${{ needs.unit.result == 'success' && needs.e2e.result == 'success' && 'finalize' || 'cleanup' }}",
         })
@@ -1151,7 +1202,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "aft-ci"
             env_file = Path(tmp) / "env"
-            with unittest.mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file)}):
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file), "GITHUB_PATH": str(Path(tmp) / "path")}), \
+                 unittest.mock.patch.object(self.state, "setup_windows_tool_paths", return_value={}):
                 first = self.state.run_directory(root, "100", "1")
                 self.state.setup(root, first)
                 archive = first / "macos-nextest.tar.zst"
@@ -1162,10 +1214,13 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 self.state.setup(root, second)
                 self.assertEqual(archive.read_bytes(), b"first run")
                 self.assertEqual(compiled.read_bytes(), b"keep")
-                self.assertIn(f"CARGO_TARGET_DIR={(root / 'target').as_posix()}", env_file.read_text())
+                self.assertIn(f"AFT_CI_TARGET_DIR={(root / 'target').as_posix()}", env_file.read_text())
                 self.assertIn(f"AFT_CI_ARCHIVE_DIR={second.as_posix()}", env_file.read_text())
+                self.assertNotIn("CARGO_TARGET_DIR=", env_file.read_text())
+                self.assertNotIn("CARGO_BUILD_TARGET_DIR=", env_file.read_text())
                 self.assertNotIn("RUSTC_WRAPPER=", env_file.read_text())
                 self.assertNotIn("SCCACHE_GHA_ENABLED=", env_file.read_text())
+                self.assertNotIn("SHELL=", env_file.read_text())
             with unittest.mock.patch.object(self.state.Path, "home", return_value=Path(tmp)), \
                  unittest.mock.patch.object(self.state, "cleanup_processes"), \
                  unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "finalize"]), \
@@ -1190,6 +1245,119 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         windows = {3: (2, "C:\\Python\\python.exe"), 2: (1, "C:\\runner\\Runner.Worker.exe"),
                    10: (2, "C:\\Users\\Runner\\aft-ci\\target\\debug\\aft.exe"), 11: (10, "C:\\Windows\\cmd.exe")}
         self.assertEqual(self.state.leaked_processes(windows, [Path("c:/users/runner/aft-ci")], 3), {10, 11})
+
+    def test_windows_git_path_matches_hosted_order_without_changing_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "custom Git install"
+            expected = [root / part for part in ("bin", "cmd", "ucrt64/bin", "usr/bin")]
+            for path in expected:
+                path.mkdir(parents=True, exist_ok=True)
+            (root / "cmd/git.exe").touch()
+            path_file = Path(tmp) / "github-path"
+            exec_path = root / "ucrt64/libexec/git-core"
+            self.assertEqual(self.state.windows_git_path_entries(exec_path), expected)
+            self.state.publish_windows_git_path(exec_path, path_file)
+            self.assertEqual(path_file.read_text().splitlines(), [path.as_posix() for path in reversed(expected)])
+            self.assertEqual(self.state.windows_git_path_entries(root / "mingw64/libexec/git-core"), expected)
+
+    def test_windows_git_path_rejects_missing_hosted_coreutils_directories(self) -> None:
+        for missing in ("bin", "cmd", "ucrt64/bin", "usr/bin"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for part in ("bin", "cmd", "ucrt64/bin", "usr/bin"):
+                    if part != missing:
+                        (root / part).mkdir(parents=True, exist_ok=True)
+                for marker in ("cmd/git.exe", "bin/bash.exe"):
+                    if (root / marker).parent.is_dir():
+                        (root / marker).touch()
+                with self.assertRaisesRegex(RuntimeError, "PATH directories missing"):
+                    self.state.windows_git_path_entries(root / "ucrt64/libexec/git-core")
+
+    @staticmethod
+    def managed_windows_rust(root):
+        cargo = root / "cargo"
+        rustup = root / "rustup"
+        toolchain = rustup / "toolchains/stable-x86_64-pc-windows-msvc"
+        for name in ("cargo", "rustc", "rustdoc", "rustup", "rustfmt", "cargo-clippy", "rust-analyzer"):
+            binary = cargo / "bin" / f"{name}.exe"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text("administrator-managed proxy")
+        for name in ("cargo", "rustc", "rustdoc"):
+            binary = toolchain / "bin" / f"{name}.exe"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text("administrator-managed toolchain")
+        source = toolchain / "lib/rustlib/src/rust/library/core/src/lib.rs"
+        source.parent.mkdir(parents=True)
+        source.write_text("administrator-managed standard library source")
+        return cargo, rustup, source
+
+    def test_windows_bootstrap_keeps_rustup_inherited_and_cargo_state_user_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cargo, rustup, _ = self.managed_windows_rust(root / "managed")
+            user = root / "user"
+            git = root / "custom Git"
+            for part in ("bin", "cmd", "ucrt64/bin", "usr/bin"):
+                (git / part).mkdir(parents=True, exist_ok=True)
+            (git / "cmd/git.exe").touch()
+            path_file = root / "github-path"
+            with unittest.mock.patch.object(self.state.Path, "home", return_value=user), \
+                 unittest.mock.patch.object(self.state.subprocess, "check_output", return_value=str(git / "ucrt64/libexec/git-core")), \
+                 unittest.mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo), "RUSTUP_HOME": str(rustup), "GITHUB_PATH": str(path_file)}):
+                values = self.state.setup_windows_tool_paths()
+                self.assertEqual(os.environ["RUSTUP_HOME"], str(rustup))
+            self.assertEqual(values, {"CARGO_HOME": user / ".cargo", "RUSTUP_TOOLCHAIN": "stable-x86_64-pc-windows-msvc",
+                                      "RUSTUP_AUTO_INSTALL": "0"})
+            self.assertTrue((user / ".cargo/bin").is_dir())
+            self.assertEqual(path_file.read_text().splitlines()[-2:], [(cargo / "bin").as_posix(), (user / ".cargo/bin").as_posix()])
+            self.assertFalse((cargo / "registry").exists())
+
+    def test_windows_bootstrap_refuses_missing_rust_or_a_writable_home_inside_the_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cargo, rustup, source = self.managed_windows_rust(root / "managed")
+            with self.assertRaisesRegex(RuntimeError, "outside the shared Rust installation"):
+                self.state.windows_rust_environment(cargo, rustup, cargo / "mutable")
+            self.assertFalse((cargo / "mutable").exists())
+            source.unlink()
+            with self.assertRaisesRegex(RuntimeError, re.escape(str(source))):
+                self.state.windows_rust_environment(cargo, rustup, root / "user-cargo")
+            self.assertFalse((root / "user-cargo").exists())
+
+    def test_windows_toolchain_probe_is_read_only_and_rejects_missing_requirements(self) -> None:
+        action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
+        probe = next(step for step in action["runs"]["steps"] if step.get("name") == "Verify installed Windows Rust toolchain (read-only)")
+        self.assertNotRegex(probe["run"], r"rustup\s+(update|install|default|toolchain\s+(install|add)|target\s+add|component\s+add)")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = {
+                "rustup": '#!/bin/sh\ncase "$*" in\nshow) echo stable-x86_64-pc-windows-msvc;;\n"target list --installed") printf "%s\\n" "$FAKE_TARGETS";;\n"component list --installed") printf "%s\\n" "$FAKE_COMPONENTS";;\n*) echo "Mutation or unexpected rustup command: $*" >&2; exit 99;;\nesac\n',
+                "rustc": '#!/bin/sh\necho "rustc 1.99.0 (fixture)"\n',
+                "cargo": '#!/bin/sh\necho "cargo 1.99.0 (fixture)"\n',
+            }
+            for name, text in scripts.items():
+                path = root / name
+                path.write_text(text)
+                path.chmod(0o755)
+            components = "rustfmt-x86_64-pc-windows-msvc\nclippy-x86_64-pc-windows-msvc\nrust-analyzer-x86_64-pc-windows-msvc\nrust-src"
+            for target, installed, available, version, error in (
+                ("x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc", components, "1.99.0", ""),
+                ("aarch64-pc-windows-msvc", "aarch64-pc-windows-msvc", components, "1.99.0", ""),
+                ("aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc", components, "", "Missing target"),
+                ("x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc", components.replace("\nrust-src", ""), "", "Missing component rust-src"),
+                ("x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc", components, "1.98.0", "differs from release producer"),
+            ):
+                with self.subTest(target=target, error=error):
+                    result = subprocess.run(["bash", "-c", probe["run"]], capture_output=True, text=True,
+                                            env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                                                 "FAKE_TARGETS": installed, "FAKE_COMPONENTS": available,
+                                                 "AFT_CI_RUST_TARGET": target, "AFT_CI_RUST_VERSION": version,
+                                                 "RUSTUP_HOME": str(root / "managed-rustup")})
+                    if error:
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn(error, result.stdout + result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_cleanup_includes_the_injected_e2e_executable_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

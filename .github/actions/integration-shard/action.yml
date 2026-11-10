@@ -22,7 +22,7 @@ runs:
       with:
         components: rustfmt, clippy, rust-analyzer
     - uses: dtolnay/rust-toolchain@stable
-      if: inputs.platform == 'windows'
+      if: inputs.platform == 'windows' && runner.environment == 'github-hosted'
       with:
         targets: x86_64-pc-windows-msvc
         components: rustfmt, clippy, rust-analyzer
@@ -74,7 +74,11 @@ runs:
     - name: Rust integration shard (nextest archive, Unix)
       if: inputs.platform != 'windows'
       shell: bash
-      run: ./scripts/rust-test-gate.sh
+      run: |
+        if [[ "$RUNNER_ENVIRONMENT" == self-hosted ]]; then
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+        fi
+        ./scripts/rust-test-gate.sh
       env:
         NEXTEST_TEST_THREADS: "num-cpus"
         AFT_GATE_PHASES: nextest
@@ -88,7 +92,11 @@ runs:
     - name: Rust integration shard (nextest archive, Windows)
       if: inputs.platform == 'windows'
       shell: bash
-      run: ./scripts/rust-test-gate.sh
+      run: |
+        if [[ "$RUNNER_ENVIRONMENT" == self-hosted ]]; then
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+        fi
+        ./scripts/rust-test-gate.sh
       env:
         AFT_TEST_DIAG: "1"
         NEXTEST_TEST_THREADS: "4"
