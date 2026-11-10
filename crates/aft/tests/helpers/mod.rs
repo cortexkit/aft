@@ -216,6 +216,7 @@ pub struct AftProcess {
     /// has semantic indexing switched off unless the request's own user config
     /// already decides it. See [`AftProcess::opt_into_semantic`].
     semantic_opt_in: bool,
+    preserve_status_bar: bool,
 }
 
 /// A test that drops its handle without `shutdown()` (including one that
@@ -243,6 +244,12 @@ impl Drop for AftProcess {
 }
 
 impl AftProcess {
+    /// Keep the asynchronous status tail for tests of status-bar delivery itself.
+    pub fn opt_into_status_bar(&mut self) -> &mut Self {
+        self.preserve_status_bar = true;
+        self
+    }
+
     pub fn cache_dir(&self) -> &Path {
         self._cache_dir.path()
     }
@@ -632,6 +639,7 @@ impl AftProcess {
             stderr_tail,
             _cache_dir: cache_dir,
             semantic_opt_in: false,
+            preserve_status_bar: false,
         }
     }
 
@@ -688,7 +696,7 @@ impl AftProcess {
         }
 
         match self.stdout_rx.recv_timeout(timeout) {
-            Ok(StdoutEvent::Json(value)) => Some(value),
+            Ok(StdoutEvent::Json(value)) => Some(self.reply_body(value)),
             Ok(StdoutEvent::Eof) => {
                 self.stdout_eof = true;
                 None
@@ -715,13 +723,20 @@ impl AftProcess {
         self.read_json_line_timeout(DEFAULT_RESPONSE_TIMEOUT, "response line")
     }
 
+    fn reply_body(&self, mut value: serde_json::Value) -> serde_json::Value {
+        if !self.preserve_status_bar {
+            strip_status_bar(&mut value);
+        }
+        value
+    }
+
     fn read_json_line_timeout(&mut self, timeout: Duration, context: &str) -> serde_json::Value {
         assert!(
             !self.stdout_eof,
             "expected {context} but stdout was already at EOF from aft"
         );
         match self.stdout_rx.recv_timeout(timeout) {
-            Ok(StdoutEvent::Json(value)) => value,
+            Ok(StdoutEvent::Json(value)) => self.reply_body(value),
             Ok(StdoutEvent::Eof) => {
                 self.stdout_eof = true;
                 panic!("expected {context} but got EOF from aft");
@@ -1184,6 +1199,52 @@ impl AftProcess {
             Ok(None) => "timeout".to_string(),
             Err(_) => "io error: try_read_next_timeout panicked; see stdout trace".to_string(),
         }
+    }
+}
+
+/// Tool-body assertions must not depend on when background TODO counts arrive.
+/// Status-bar tests opt in to the unmodified wire reply instead.
+fn strip_status_bar(response: &mut serde_json::Value) {
+    let Some(serde_json::Value::String(text)) = response.get_mut("text") else {
+        return;
+    };
+    let Some((body, bar)) = text.rsplit_once("\n\n[AFT E") else {
+        return;
+    };
+    let count = |value: &str| {
+        value == "?" || (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let Some((errors, rest)) = bar.split_once(" W") else {
+        return;
+    };
+    let Some((warnings, todos)) = rest.split_once(" | T") else {
+        return;
+    };
+    if count(errors) && count(warnings) && todos.strip_suffix(']').is_some_and(count) {
+        text.truncate(body.len());
+    }
+}
+
+#[test]
+fn strip_status_bar_only_removes_a_complete_status_tail() {
+    for bar in ["[AFT E? W? | T0]", "[AFT E12 W3 | T456]"] {
+        let mut response =
+            serde_json::json!({"text": format!("tool body\n\n{bar}"), "complete": true});
+        strip_status_bar(&mut response);
+        assert_eq!(
+            response,
+            serde_json::json!({"text": "tool body", "complete": true})
+        );
+    }
+    for text in [
+        "tool body",
+        "tool body\n\n[AFT E? W? | T1]\nmore body",
+        "tool body\n\n[AFT Example]",
+        "tool body\n\n[AFT E W? | T1]",
+    ] {
+        let mut response = serde_json::json!({"text": text});
+        strip_status_bar(&mut response);
+        assert_eq!(response["text"], text);
     }
 }
 

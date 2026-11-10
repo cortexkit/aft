@@ -557,6 +557,7 @@ pub(crate) fn cap_with_scope(
         .filter_map(serde_json::Value::as_object)
         .any(|object| object.keys().any(|key| key.ends_with("_list_envelope")));
     let envelope = native_envelope_line(&response.data, text)
+        .or_else(|| url_recovery_line(text))
         .map(|(_, line)| line)
         .unwrap_or_else(|| {
             if text_only || list_metadata {
@@ -698,15 +699,23 @@ fn render_cut_with_data(
             end = newline;
         }
     }
-    let corrected = envelope_parts(envelope).map(|(shown, tail)| {
-        let start = text.rfind(envelope).expect("rendered envelope");
-        let visible = if start <= end {
-            shown
-        } else {
-            visible_list_rows(data, text, &text[..end], tail).min(shown)
-        };
-        (start, format!("shown {visible} of {tail}"))
-    });
+    let corrected = envelope_parts(envelope)
+        .map(|(shown, tail)| {
+            let start = text.rfind(envelope).expect("rendered envelope");
+            let visible = if start <= end {
+                shown
+            } else {
+                visible_list_rows(data, text, &text[..end], tail).min(shown)
+            };
+            (start, format!("shown {visible} of {tail}"))
+        })
+        .or_else(|| {
+            let (_, tail) = url_recovery_parts(envelope)?;
+            let start = text.rfind(envelope)?;
+            // The finalizer can cut again after appending a status bar. Keep the
+            // URL's narrowing advice, but report only the source bytes still shown.
+            Some((start, format!("truncated at {end} of {tail}")))
+        });
     text.truncate(end);
     if let Some((start, _)) = &corrected {
         if *start < text.len() {
@@ -727,6 +736,23 @@ fn envelope_parts(line: &str) -> Option<(usize, &str)> {
     let (shown, tail) = line.strip_prefix("shown ")?.split_once(" of ")?;
     tail.contains(" (").then_some(())?;
     Some((shown.parse().ok()?, tail))
+}
+
+fn url_recovery_parts(line: &str) -> Option<(usize, &str)> {
+    let (shown, tail) = line.strip_prefix("truncated at ")?.split_once(" of ")?;
+    let (total, narrow) = tail.split_once(" bytes; narrow with ")?;
+    let shown = shown.parse::<usize>().ok()?;
+    (shown < total.parse::<usize>().ok()? && !narrow.is_empty()).then_some((shown, tail))
+}
+
+fn url_recovery_line(text: &str) -> Option<(usize, String)> {
+    text.rmatch_indices("\ntruncated at ")
+        .find_map(|(start, _)| {
+            let start = start + 1;
+            let line = text[start..].lines().next()?;
+            url_recovery_parts(line)?;
+            Some((start, line.to_owned()))
+        })
 }
 
 fn native_envelope_line(data: &serde_json::Value, text: &str) -> Option<(usize, String)> {
@@ -1069,6 +1095,42 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn status_bar_recapping_preserves_url_narrowing_and_visible_byte_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        ctx.update_status_bar_todos(Some(7));
+        let source = "界".repeat(17_048);
+        let original = format!(
+            "{source}\ntruncated at {} of 90000 bytes; narrow with symbols",
+            source.len()
+        );
+        assert!(original.len() <= TEXT_LIMIT);
+        assert!(original.len() + "\n\n[AFT E? W? | T7]".len() > TEXT_LIMIT);
+        let mut response = Response::success("url", json!({"text": original, "complete": false}));
+        crate::response_finalize::finalize_response_with_bg_completions(
+            &mut response,
+            &ctx,
+            "url-session",
+            "outline",
+            false,
+        );
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.len() <= TEXT_LIMIT);
+        let (visible, _) = text.split_once("\n[output cut").expect("final cap ran");
+        assert!(
+            text.ends_with(&format!(
+                "truncated at {} of 90000 bytes; narrow with symbols",
+                visible.len()
+            )),
+            "{text:?}"
+        );
+        assert_eq!(response.data["complete"], false);
+        let saved = std::fs::read_to_string(saved_path(text)).unwrap();
+        assert!(saved.ends_with("\n\n[AFT E? W? | T7]"));
+        assert!(saved.contains("of 90000 bytes; narrow with symbols"));
     }
 
     #[test]

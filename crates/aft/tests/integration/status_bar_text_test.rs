@@ -55,6 +55,7 @@ fn standalone_status_bar_trails_text_on_change_and_not_on_unchanged_result() {
     let file = project.path().join("a.ts");
     std::fs::write(&file, "// TODO: first\nexport const a = 1;\n").expect("write fixture");
     let mut aft = AftProcess::spawn();
+    aft.opt_into_status_bar();
     aft.configure(project.path());
 
     // Inspect produces the TODO count, so its own result is the change. The bar
@@ -111,6 +112,7 @@ fn inspect_right_after_an_outside_edit_counts_the_edited_todos() {
     let file = project.path().join("a.ts");
     std::fs::write(&file, "// TODO: first\nexport const a = 1;\n").expect("write fixture");
     let mut aft = AftProcess::spawn_with_real_watcher();
+    aft.opt_into_status_bar();
     aft.configure(project.path());
 
     let text = inspect(&mut aft, "inspect-before");

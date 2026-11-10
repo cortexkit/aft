@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Guard the optimized storm profile and its normal test inventory."""
 import importlib.util
+import re
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -17,15 +18,36 @@ GATE_SPEC.loader.exec_module(gates)
 
 
 class StormInventoryTests(unittest.TestCase):
+    def release_cases(self):
+        source = (ROOT / "crates/aft/tests/integration/subc_storm_test.rs").read_text()
+        names = [
+            f"subc_storm_test::{name}"
+            for attributes, name in re.findall(r"#\[test\]((?:(?!#\[test\]).)*?)\nfn (\w+)\(", source, re.S)
+            if "#[ignore" not in attributes
+        ]
+        self.assertEqual(len(names), 18)
+        return {name: {"ignored": False, "filter-match": {"status": "matches"}} for name in names}
+
     def test_inventory_rejects_missing_or_debug_ignored_traffic_storm(self):
-        names = [inventory.MAIN_TEST, inventory.ACK_TEST, inventory.READ_TEST] + [f"case{i}" for i in range(16)]
-        cases = {name: {"ignored": False, "filter-match": {"status": "matches"}} for name in names}
+        cases = self.release_cases()
         document = {"rust-suites": {"integration": {"testcases": cases}}}
         with patch("builtins.print"):
             inventory.check_inventory(document)
         cases[inventory.MAIN_TEST]["ignored"] = True
         with self.assertRaises(RuntimeError):
             inventory.check_inventory(document)
+
+    def test_inventory_rejects_a_same_count_substitution(self):
+        cases = self.release_cases()
+        cases["unrelated_replacement"] = cases.pop("subc_storm_test::rename_pair")
+        with self.assertRaisesRegex(RuntimeError, "rename_pair"):
+            inventory.check_inventory({"rust-suites": {"integration": {"testcases": cases}}})
+
+    def test_inventory_rejects_a_filtered_out_deadline_case(self):
+        cases = self.release_cases()
+        cases[inventory.ACK_TEST]["filter-match"]["status"] = "mismatch"
+        with self.assertRaisesRegex(RuntimeError, "slow_config_read"):
+            inventory.check_inventory({"rust-suites": {"integration": {"testcases": cases}}})
 
     def test_storm_profile_does_not_relax_bounds_or_change_production(self):
         manifest = (ROOT / "Cargo.toml").read_text()

@@ -690,7 +690,11 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     );
     wait_for_semantic_status(&mut owner, "owner semantic index", |response| {
         response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["entries"].as_u64().unwrap_or(0) > 0
+            && response["semantic_index"]["files_embedded"] == 1
+            && response["semantic_index"]["chunks_embedded"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
     });
     assert!(owner.shutdown().success());
     server.reset_requests();
@@ -725,7 +729,8 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     .expect("edit borrow-only source");
     wait_for_semantic_status(&mut borrower, "borrow-only semantic mask", |response| {
         response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["entries"] == 0
+            && response["semantic_index"]["files_embedded"] == 0
+            && response["semantic_index"]["chunks_embedded"] == 0
     });
 
     let storm = worktree.join("storm");
@@ -942,7 +947,9 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     assert_eq!(mid_refresh["interpreted_as"], "semantic");
     let mid_text = mid_refresh["text"].as_str().unwrap_or_default();
     assert!(
-        mid_text.contains("semantic: 1 file(s) not yet embedded: src/b.rs"),
+        mid_text
+            .replace('\\', "/")
+            .contains("semantic: 1 file(s) not yet embedded: src/b.rs"),
         "expected the refreshing file to be named, got {mid_text:?}"
     );
     assert_eq!(mid_refresh["complete"], false, "{mid_refresh:?}");
