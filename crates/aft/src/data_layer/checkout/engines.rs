@@ -43,7 +43,8 @@ pub(super) const ENGINE_BUDGET: u64 = 1 << 30;
 /// How old an engine's measured bytes may be before a refresh measures it
 /// again. Walking a large engine takes tens of milliseconds, a few percent
 /// of a refresh, and an engine grows slowly between publications; the
-/// memory census walks no more often.
+/// memory census walks no more often. Publication can measure sooner to
+/// replace an overlay measurement or account for a broad release of state.
 const MEASURE_EVERY_MS: u64 = 30_000;
 
 /// [`EngineSlot::measured_ms`] for an engine not measured yet.
@@ -258,7 +259,7 @@ impl EngineKeeper {
 
     /// Notes that `slot` keeps an engine, now that a refresh applied
     /// something to it or it moved onto a new publication, with its bytes
-    /// as the census counts them when [`Self::measure_due`] had it measured
+    /// as the census counts them when the refresh or publication measured it
     /// (the last figure stands otherwise). Lets the least recently used
     /// other engines go while all of them together hold more than the
     /// budget, and makes sure the thread that lets idle engines go is

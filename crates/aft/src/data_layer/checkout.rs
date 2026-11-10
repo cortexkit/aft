@@ -3105,7 +3105,7 @@ impl Checkout {
         slot.as_ref().map(GraphEngine::census_bytes)
     }
 
-    /// The keeper's cached size estimate, for comparing it with a fresh census.
+    /// The engine budget's cached size estimate, for comparing it with a fresh census.
     #[doc(hidden)]
     #[must_use]
     pub fn engine_budget_bytes(&self) -> u64 {
