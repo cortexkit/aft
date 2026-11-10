@@ -19,7 +19,7 @@ source, output = Path(source).resolve(), Path(output).resolve()
 output.mkdir(parents=True, exist_ok=True)
 project = output / "project"
 project.mkdir()
-for name in subprocess.check_output(["git", "ls-files", "-z"], cwd=source).decode().split("\0"):
+for name in subprocess.check_output(["git", "-c", f"safe.directory={source}", "ls-files", "-z"], cwd=source).decode().split("\0"):
     if not name:
         continue
     src, dst = source / name, project / name
