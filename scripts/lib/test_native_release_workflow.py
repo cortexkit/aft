@@ -50,7 +50,7 @@ def inline_python(job, name):
 
 
 class NativeReleaseWorkflowTests(unittest.TestCase):
-    def test_self_hosted_release_builds_install_node_and_python_before_invoking_them(self):
+    def test_self_hosted_release_builds_prepare_node_and_system_python_before_invoking_them(self):
         jobs = self.workflow("release.yml")["jobs"]
         native = {name: job for name, job in jobs.items() if "self-hosted" in job.get("runs-on", [])}
         self.assertEqual(set(native), {"build-darwin-arm64", "build-darwin-x64",
@@ -69,6 +69,13 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                     self.assertLess(setup, uses[0])
                     key = "node-version" if tool == "node" else "python-version"
                     self.assertEqual(steps[setup]["with"][key], version)
+                    if tool == "python3":
+                        self.assertEqual(steps[setup]["if"], "runner.environment == 'github-hosted'")
+                native = next(i for i, step in enumerate(steps) if step.get("uses") == "./.github/actions/native-ci-state")
+                first_use = next(i for i, step in enumerate(steps) if re.search(r"\bnode\s", step.get("run", "")))
+                self.assertLess(native, first_use)
+                if name.startswith("build-darwin-"):
+                    self.assertEqual(steps[native]["with"]["phase"], "python")
 
     def test_windows_release_jobs_reuse_narli_without_mutating_rust_or_the_artifact_contract(self):
         jobs = self.workflow("release.yml")["jobs"]
