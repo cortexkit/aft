@@ -29,6 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - uses: oven-sh/setup-bun@v2
       - name: Toolchains and machine
         run: |
           set -euo pipefail
@@ -39,6 +40,8 @@ jobs:
           python --version
           bash --version | head -1
           git --version
+          bun --version
+          echo "PATH has PowerShell 7: $(echo "$PATH" | tr ':' '\n' | grep -ci powershell/7 || true)"
           git config --get core.longpaths || echo "core.longpaths unset"
           if command -v pwsh >/dev/null; then pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; else echo "pwsh not on PATH"; fi
       - name: Cold cargo check, library and all test targets (timed)
