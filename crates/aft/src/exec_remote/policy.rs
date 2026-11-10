@@ -40,7 +40,7 @@ pub fn matches(policy: &RemoteExecPolicy, line: &str, pty: bool, stdin: bool) ->
     if !policy.enabled || pty || stdin || prefixes.iter().any(|p| !valid_prefix(p)) {
         return false;
     }
-    let Some(commands) = crate::bash_rewrite::parser::parse_top_level(line) else {
+    let Some(commands) = crate::bash_parse::parse_top_level(line) else {
         return false;
     };
     !commands.is_empty()
