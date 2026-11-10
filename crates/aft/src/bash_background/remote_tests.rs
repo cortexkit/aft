@@ -14750,7 +14750,7 @@ async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
     assert_eq!(reply.data, expected);
     let cancels = exec_cancels(&daemon);
     assert_eq!(cancels.len(), 1);
-    assert_eq!(cancels[0]["params"]["job_id"], id().to_string());
+    assert_eq!(cancels[0]["job_id"], id().to_string());
 }
 
 async fn submission_daemon(
