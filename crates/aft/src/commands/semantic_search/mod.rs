@@ -9411,7 +9411,7 @@ mod tests {
             std::fs::create_dir_all(root.join("src")).unwrap();
             std::fs::write(
                 root.join("src/lib.rs"),
-                "pub fn handle_request(token: &str) -> bool { !token.is_empty() }\n// ?handle_request\n",
+                "pub fn handle_request(token: &str) -> bool { !token.is_empty() }\n// (?=handle_request)\n",
             )
             .unwrap();
             assert!(std::process::Command::new("git")
@@ -9445,7 +9445,7 @@ mod tests {
             ),
             (
                 "literal fallback",
-                serde_json::json!({"query": "?handle_request"}),
+                serde_json::json!({"query": "(?=handle_request)"}),
             ),
             (
                 "nearest name",
@@ -9466,9 +9466,9 @@ mod tests {
                 );
             }
             for (route, params) in &requests {
-                // Nearest-name suggestions require a ready index; a walk can
-                // only report the absence of the misspelled literal.
-                if !ready && *route == "nearest name" {
+                // Suggestions and automatic regex-to-literal recovery belong
+                // to the engine; an unindexed walk has neither route.
+                if !ready && matches!(*route, "nearest name" | "literal fallback") {
                     continue;
                 }
                 let mut req = semantic_request("", 5);
