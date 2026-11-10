@@ -223,7 +223,9 @@ fn roots(mut args: impl Iterator<Item = String>) {
         // Source archives lack .git; the scanner still needs a repository boundary.
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let family = FamilyId::from_digest(Digest128::of(format!("kept root {index}").as_bytes()));
-        let checkout = Checkout::bind(Arc::clone(&layer), scratch.path(), family, &root).unwrap();
+        let store = scratch.path().join(format!("store-{index}"));
+        std::fs::create_dir_all(&store).unwrap();
+        let checkout = Checkout::bind(Arc::clone(&layer), &store, family, &root).unwrap();
         let cpu = cpu_seconds();
         let wall = Instant::now();
         peak.take();
