@@ -2944,8 +2944,8 @@ impl Checkout {
                     .map_err(DataError::Damaged)?;
             }
             // Recorded input terms can read other files' stored parses too.
-            // As in pass 4, an empty fallback after a failed read is damage,
-            // not a graph that may be committed as the next publication.
+            // An empty fallback after a failed read is damage, not a graph
+            // that may be committed as the next publication.
             let failures = published.graph.failures();
             if !failures.is_empty() {
                 return Err(DataError::Damaged(format!(
@@ -6024,6 +6024,7 @@ pub fn other() { callee(); }
     #[test]
     fn a_damaged_stored_parse_fails_publication_without_committing_or_panicking() {
         use aft_store::content::ContentSegment;
+        use aft_store::segment::{KeySpace, SectionId};
 
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
@@ -6060,7 +6061,18 @@ pub fn other() { callee(); }
             let Some(ordinal) = content.find(key).unwrap() else {
                 continue;
             };
-            let body = content.body(ordinal).unwrap();
+            assert!(!content.body(ordinal).unwrap().is_empty());
+            // Bodies can be compressed. Change the stored section bytes, not
+            // the decoded record, and leave its checksum unchanged.
+            let bodies = segment
+                .section(SectionId::new(
+                    aft_store::content::KNOWN[2].kind,
+                    KeySpace::new(0),
+                ))
+                .unwrap();
+            let body = segment
+                .read_range(bodies, 0..segment.info(bodies).len)
+                .unwrap();
             assert!(!body.is_empty());
             let mut bytes = std::fs::read(segment.path()).unwrap();
             let offsets = bytes
