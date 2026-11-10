@@ -96,6 +96,7 @@ pub struct PhaseTrace {
     intentional_wait: bool,
     arg_shape: Option<String>,
     edit_phases: Option<String>,
+    deferred_search_waits: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -231,6 +232,7 @@ impl PhaseTrace {
             intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
+            deferred_search_waits: None,
         }
     }
 
@@ -280,6 +282,27 @@ impl PhaseTrace {
         // CPU consumed by unrelated tasks while a deferred response was pending.
         self.cpu.execute_suspended = true;
         self.mark_execute_done();
+        if let Some(fields) = self.deferred_search_waits.take() {
+            if let Some(fields) = fields
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let shape = self.arg_shape.get_or_insert_with(String::new);
+                shape.push(' ');
+                shape.push_str(&fields);
+            }
+        }
+    }
+
+    /// The cold-search worker records named waits on its own thread; the
+    /// terminal response harvests them for the usual slow-call fields.
+    pub(crate) fn deferred_search_wait_fields(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<String>>> {
+        let fields = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.deferred_search_waits = Some(std::sync::Arc::clone(&fields));
+        fields
     }
 
     /// Record the argument shape the slow-call line reports for this call.
@@ -1856,6 +1879,23 @@ mod tests {
     }
 
     #[test]
+    fn first_text_index_wait_fields_cross_the_continuation_boundary() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.note_arg_shape("query:string".into());
+        let fields = trace.deferred_search_wait_fields();
+        std::thread::spawn(move || {
+            *fields.lock().unwrap() = Some("wait_readiness_ms=42".into());
+        })
+        .join()
+        .unwrap();
+        trace.mark_execute_done_after_await();
+        assert_eq!(
+            trace.arg_shape.as_deref(),
+            Some("query:string wait_readiness_ms=42")
+        );
+    }
+
+    #[test]
     fn phase_trace_reports_execution_and_writer_egress_subphases() {
         let t0 = Instant::now();
         let trace = PhaseTrace {
@@ -1875,6 +1915,7 @@ mod tests {
             intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
+            deferred_search_waits: None,
         };
 
         let phases = trace

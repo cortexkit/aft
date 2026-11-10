@@ -389,18 +389,129 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     }
 
     fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
-        if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some() {
-            return extensions::ReadinessWait::Completed;
-        }
-        // A data-layer meaning plane that serves answers the search now;
-        // waiting longer would not change what it serves.
-        if crate::data_layer::tools::search::DataSemantic::current(self.ctx)
-            .is_some_and(|data| data.serving().is_some())
-        {
-            return extensions::ReadinessWait::Completed;
-        }
-        extensions::ReadinessWait::Completed
+        wait_for_first_text_index(self.ctx)
     }
+}
+
+const FIRST_TEXT_INDEX_WAIT: Duration = Duration::from_secs(8);
+
+/// Admission uses the same predicate as the wait, so only cold searches leave
+/// the executor. A semantic lane that can already answer needs no text wait.
+pub(crate) fn first_text_index_wait_needed(ctx: &AppContext) -> bool {
+    let lanes = SearchLaneStatus::observe_current(ctx);
+    lanes.trigram.effective == IndexEffective::Building
+        && ctx
+            .data_checkout()
+            .is_some_and(|checkout| checkout.first_text_building())
+        && !lanes.semantic.is_ready()
+}
+
+fn wait_for_first_text_index(ctx: &AppContext) -> extensions::ReadinessWait {
+    // Tool-provider admission hands cold searches to a continuation. A direct
+    // executor caller must not park a worker that the index builder may need.
+    if crate::executor::current_thread_is_executor_worker() {
+        return extensions::ReadinessWait::Completed;
+    }
+    let Some(checkout) = ctx.data_checkout() else {
+        return extensions::ReadinessWait::Completed;
+    };
+    let deadline = Instant::now() + FIRST_TEXT_INDEX_WAIT;
+    let deadline =
+        crate::bounded_io::current().map_or(deadline, |budget| deadline.min(budget.deadline));
+    let mut generation = checkout.checkout().readiness_generation();
+    waits::timed(waits::SearchWait::Readiness, || loop {
+        if search_cancellation_requested() {
+            return extensions::ReadinessWait::Cancelled;
+        }
+        if Instant::now() >= deadline || !first_text_index_wait_needed(ctx) {
+            return extensions::ReadinessWait::Completed;
+        }
+        // Publication wakes this condition variable immediately. The short
+        // cap only observes the job token's cancellation checks (including a
+        // project root deleted or no longer used), which have a separate wake.
+        checkout.checkout().wait_for_readiness_change(
+            &mut generation,
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25)),
+        );
+    })
+}
+
+/// The cold-search continuation uses the existing pending-response transport,
+/// leaving the executor free to publish the index it is waiting for.
+pub(crate) fn handle_first_index_search_deferred(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    force_restrict: bool,
+    reply_deadline: Instant,
+    wait_fields: Option<Arc<std::sync::Mutex<Option<String>>>>,
+) -> crate::response_finalize::DispatchOutcome {
+    use crate::response_finalize::{DispatchOutcome, PendingResponse};
+    let request = req.clone();
+    let cancellation = crate::executor::current_job_cancellation()
+        .unwrap_or_else(crate::executor::JobCancellation::new);
+    let worker_cancellation = cancellation.clone();
+    let timeout_cancellation = cancellation.clone();
+    let (tx, rx) = crate::response_finalize::pending_response_channel();
+    let admitted_config = ctx.config();
+    let grant_scope = crate::access_policy::current_scope();
+    let ask_route = crate::access_policy::current_ask_route();
+    let io_budget = Some(
+        crate::bounded_io::current()
+            .unwrap_or_else(|| {
+                crate::bounded_io::Budget::after(
+                    reply_deadline.saturating_duration_since(Instant::now()),
+                )
+            })
+            .capped(reply_deadline),
+    );
+    std::thread::spawn(move || {
+        let _io = crate::bounded_io::enter(io_budget);
+        let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
+        let _grant_scope = crate::access_policy::scope_guard(grant_scope);
+        let _config_pin = ctx.pin_config_to(admitted_config);
+        let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
+        let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+        let search_waits = waits::begin();
+        let response = if search_cancellation_requested() {
+            cancelled_search_response(&request)
+        } else {
+            handle_semantic_search(&request, &ctx)
+        };
+        if let (Some(fields), Some(waits)) = (wait_fields, search_waits.finish()) {
+            *fields
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waits.render());
+        }
+        let _ = tx.send(crate::bounded_io::finish_response(response));
+    });
+    let terminal_id = req.id.clone();
+    let shutdown_id = req.id.clone();
+    DispatchOutcome::Deferred(
+        PendingResponse::from_receiver(
+            req.id.clone(),
+            req.session().to_string(),
+            req.command.clone(),
+            rx,
+            move |_, completion| match completion {
+                Ok(response) => Some(response),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(cancelled_search_response_from_id(&terminal_id))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) if Instant::now() >= reply_deadline => {
+                    timeout_cancellation.request_cancel();
+                    Some(cancelled_search_response_from_id(&terminal_id))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            },
+        )
+        .with_cancellation(cancellation)
+        .with_shutdown(Box::new(move |_| {
+            cancelled_search_response_from_id(&shutdown_id)
+        }))
+        .with_poll_interval(Duration::from_millis(25)),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -9368,6 +9479,307 @@ mod tests {
                 ..Config::default()
             },
         )
+    }
+
+    fn first_text_index_fixture() -> (tempfile::TempDir, PathBuf, Arc<AppContext>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(root.join("main.rs"), "pub fn first_index_needle() {}\n").unwrap();
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(dir.path().join("storage")),
+                indexes: crate::config::IndexesConfig {
+                    trigram: true,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            },
+        ));
+        (dir, root, ctx)
+    }
+
+    #[test]
+    fn first_text_index_search_returns_promptly_at_text_publication() {
+        let (_dir, root, ctx) = first_text_index_fixture();
+        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        let _graph_hold = crate::data_layer::checkout::hold_call_graph_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        assert!(first_text_index_wait_needed(&ctx));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_ctx = Arc::clone(&ctx);
+        let worker = thread::spawn(move || {
+            tx.send(handle_semantic_search(
+                &semantic_request("first_index_needle", 5),
+                &worker_ctx,
+            ))
+            .unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        let published = Instant::now();
+        assert!(ctx
+            .data_checkout()
+            .unwrap()
+            .checkout()
+            .publish_text_first()
+            .unwrap());
+        let response = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("text publication wakes search while the build is still held");
+        assert!(published.elapsed() < Duration::from_secs(1));
+        assert!(response.success, "{:?}", response.data);
+        assert!(
+            response.data["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["file"] == "main.rs"),
+            "{:?}",
+            response.data
+        );
+        assert!(!ctx.data_checkout().unwrap().first_text_building());
+        worker.join().unwrap();
+        drop(hold);
+    }
+
+    #[test]
+    fn first_text_index_search_times_out_after_eight_seconds_with_unchanged_refusal() {
+        let (_dir, root, ctx) = first_text_index_fixture();
+        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let req = semantic_request("first_index_needle", 5);
+        let expected = SearchLaneStatus::observe_current(&ctx)
+            .refusal(&req.id, &ctx)
+            .unwrap();
+        let started = Instant::now();
+        let response = handle_semantic_search(&req, &ctx);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(8),
+            "returned after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "returned after {elapsed:?}"
+        );
+        assert_eq!(response_value(response), response_value(expected));
+    }
+
+    #[test]
+    fn first_text_index_search_does_not_wait_when_disabled_or_failed() {
+        for failed in [false, true] {
+            let (_dir, root, ctx) = first_text_index_fixture();
+            let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+            if !failed {
+                ctx.update_config(|config| config.indexes.trigram = false);
+            }
+            crate::data_layer::surfaces::bind_for_test(&ctx);
+            if failed {
+                ctx.data_checkout().unwrap().note_outcome_for_test::<()>(
+                    "build",
+                    &Err(crate::data_layer::checkout::DataError::Store(
+                        "test build failed".into(),
+                    )),
+                );
+            }
+            assert!(!first_text_index_wait_needed(&ctx));
+            let started = Instant::now();
+            let response = handle_semantic_search(&semantic_request("first_index_needle", 5), &ctx);
+            assert!(!response.success, "{:?}", response.data);
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn first_text_index_search_stops_waiting_on_failure_or_cancellation() {
+        for cancel in [false, true] {
+            let (_dir, root, ctx) = first_text_index_fixture();
+            let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+            crate::data_layer::surfaces::bind_for_test(&ctx);
+            let token = crate::executor::JobCancellation::new();
+            let worker_token = token.clone();
+            let worker_ctx = Arc::clone(&ctx);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                let _cancel = crate::executor::install_job_cancellation(worker_token);
+                tx.send(handle_semantic_search(
+                    &semantic_request("first_index_needle", 5),
+                    &worker_ctx,
+                ))
+                .unwrap();
+            });
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            if cancel {
+                token.request_cancel();
+            } else {
+                ctx.data_checkout().unwrap().note_outcome_for_test::<()>(
+                    "build",
+                    &Err(crate::data_layer::checkout::DataError::Store(
+                        "test build failed".into(),
+                    )),
+                );
+            }
+            let response = rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("failure or cancellation stops the wait");
+            assert_eq!(
+                response.data["code"],
+                if cancel {
+                    "request_cancelled"
+                } else {
+                    "search_lanes_unavailable"
+                }
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn first_text_index_search_respects_request_deadline() {
+        let (_dir, root, ctx) = first_text_index_fixture();
+        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let started = Instant::now();
+        let _budget = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
+            Duration::from_millis(80),
+        )));
+        let response = handle_semantic_search(&semantic_request("first_index_needle", 5), &ctx);
+        assert_eq!(response.data["code"], "search_lanes_unavailable");
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn first_text_index_deferred_search_releases_executor_for_publication() {
+        use crate::executor::{Executor, Lane};
+        use crate::path_identity::ProjectRootId;
+        use crate::response_finalize::DispatchOutcome;
+        let (_dir, root, ctx) = first_text_index_fixture();
+        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let executor = Executor::new();
+        let root_id = ProjectRootId::from_path(&root).unwrap();
+        executor.register_actor(root_id.clone(), Arc::clone(&ctx));
+        let worker_ctx = Arc::clone(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (setup, _) = executor.submit_cancellable_async(
+            root_id.clone(),
+            Lane::HeavyInit,
+            "cold-search-setup".into(),
+            Box::new(move |_| {
+                let DispatchOutcome::Deferred(pending) = handle_first_index_search_deferred(
+                    &semantic_request("first_index_needle", 5),
+                    worker_ctx,
+                    false,
+                    Instant::now() + Duration::from_secs(5),
+                    None,
+                ) else {
+                    panic!("cold search defers");
+                };
+                tx.send(pending).ok().unwrap();
+                Response::success("cold-search-setup", serde_json::json!({}))
+            }),
+        );
+        let mut pending = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("setup leaves executor");
+        assert!(setup.blocking_recv().unwrap().success);
+        assert!((pending.poll)(&ctx).is_none());
+        let publish_ctx = Arc::clone(&ctx);
+        let published = executor.submit(
+            root_id,
+            Lane::Mutating,
+            "publish-text".into(),
+            Box::new(move |_| {
+                assert!(publish_ctx
+                    .data_checkout()
+                    .unwrap()
+                    .checkout()
+                    .publish_text_first()
+                    .unwrap());
+                Response::success("publish-text", serde_json::json!({}))
+            }),
+        );
+        assert!(
+            published
+                .recv_timeout(Duration::from_secs(1))
+                .expect("publication is not blocked by the waiting search")
+                .success
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let response = loop {
+            if let Some(response) = (pending.poll)(&ctx) {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "published search did not resolve"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(response.success, "{:?}", response.data);
+    }
+
+    #[test]
+    fn first_text_index_deferred_search_delivers_cancel_drain_and_timeout_terminals() {
+        use crate::response_finalize::{DispatchOutcome, PendingResponses};
+        for ending in ["cancel", "drain", "timeout"] {
+            let (_dir, root, ctx) = first_text_index_fixture();
+            let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+            crate::data_layer::surfaces::bind_for_test(&ctx);
+            let req = semantic_request("first_index_needle", 5);
+            let timeout = if ending == "timeout" {
+                Duration::from_millis(80)
+            } else {
+                Duration::from_secs(5)
+            };
+            let DispatchOutcome::Deferred(response) = handle_first_index_search_deferred(
+                &req,
+                Arc::clone(&ctx),
+                false,
+                Instant::now() + timeout,
+                None,
+            ) else {
+                panic!("cold search must defer");
+            };
+            let mut pending = PendingResponses::default();
+            pending.register(response).ok().unwrap();
+            assert!(pending.poll_ready(&ctx).is_empty());
+            let terminal = if ending == "drain" {
+                pending.drain_on_shutdown_with(&ctx)
+            } else {
+                if ending == "cancel" {
+                    assert!(pending.cancel_request(&req.id));
+                }
+                let limit = Instant::now() + Duration::from_secs(1);
+                loop {
+                    let ready = pending.poll_ready(&ctx);
+                    if !ready.is_empty() {
+                        break ready;
+                    }
+                    assert!(Instant::now() < limit, "no terminal for {ending}");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            };
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0].response.id, req.id);
+            assert!(!terminal[0].response.success);
+            if ending != "timeout" {
+                assert_eq!(terminal[0].response.data["code"], "request_cancelled");
+            }
+            assert!(pending.is_empty());
+            assert!(pending.poll_ready(&ctx).is_empty());
+        }
     }
 
     /// A project holding `files`, with a ready trigram index, semantic

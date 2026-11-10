@@ -12032,6 +12032,14 @@ async fn handle_tool_call_with_capabilities(
     let uses_deferred_response_seam = bare_name == "inspect"
         || bare_name == "bash_watch"
         || bare_name == "delete"
+        || (bare_name == "search"
+            && arguments
+                .get("pattern")
+                .and_then(Value::as_str)
+                .is_none_or(|pattern| pattern.trim().is_empty())
+            && executor.actor_context(&identity.root).is_some_and(|ctx| {
+                crate::commands::semantic_search::first_text_index_wait_needed(&ctx)
+            }))
         || crate::commands::lsp_navigation::is_lsp_navigation_command(&bare_name);
     if uses_deferred_response_seam {
         let Some(deferred_ctx) = executor.actor_context(&identity.root) else {
@@ -12171,6 +12179,18 @@ async fn handle_tool_call_with_capabilities(
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
                                 Some(reply_budget.deadline),
+                            )
+                        } else if bare_name_for_run == "search" {
+                            phase_trace.note_arg_shape(crate::run_tool_call::tool_call_arg_shape(
+                                &prepared.request,
+                            ));
+                            let wait_fields = phase_trace.deferred_search_wait_fields();
+                            crate::commands::semantic_search::handle_first_index_search_deferred(
+                                &prepared.request,
+                                Arc::clone(&deferred_ctx),
+                                matches!(bind_trust, BindTrust::Untrusted),
+                                reply_budget.deadline,
+                                Some(wait_fields),
                             )
                         } else if bare_name_for_run == "delete" {
                             crate::commands::delete_file::handle_delete_deferred_with_restriction(
