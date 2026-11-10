@@ -6048,7 +6048,7 @@ impl LspManager {
                 // Detached clients already have a reaping worker. Registry
                 // removal can precede its wait, so only process disappearance
                 // confirms that the worker (or the OS) has finished reaping.
-                while crate::bash_background::process::is_process_alive(pid) {
+                while crate::process_identity::is_process_alive(pid) {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 let _ = result_tx.send((None, pid, Ok(())));
@@ -7705,7 +7705,7 @@ impl LspManager {
             initialization_options,
             runtime_note,
             project_typescript,
-            storage_root: crate::bash_background::storage_dir(config.storage_dir.as_deref()),
+            storage_root: crate::storage_path::storage_dir(config.storage_dir.as_deref()),
             typescript_lookup,
         })
     }
@@ -11484,7 +11484,7 @@ mod server_exit_reap_tests {
     fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
         let started = Instant::now();
         while started.elapsed() < timeout {
-            if !crate::bash_background::process::is_process_alive(pid) {
+            if !crate::process_identity::is_process_alive(pid) {
                 return true;
             }
             thread::sleep(Duration::from_millis(20));
@@ -11632,8 +11632,8 @@ mod server_exit_reap_tests {
             assert!(
                 Instant::now() < deadline,
                 "orphans must exit after rebind reap (first alive={}, second alive={})",
-                crate::bash_background::process::is_process_alive(pid1),
-                crate::bash_background::process::is_process_alive(pid2)
+                crate::process_identity::is_process_alive(pid1),
+                crate::process_identity::is_process_alive(pid2)
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -12325,7 +12325,7 @@ while True:
 
         assert_eq!(outcome.forced, 1);
         assert_eq!(outcome.unreaped, 0);
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!crate::process_identity::is_process_alive(pid));
         assert!(!registry.pids().contains(&pid));
         assert_eq!(lines.len(), 2, "captured shutdown errors: {lines:?}");
         assert!(lines[0].starts_with("WARN "), "{}", lines[0]);

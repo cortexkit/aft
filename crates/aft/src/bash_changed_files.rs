@@ -1,7 +1,6 @@
 //! Bounded, observational shell-change reporting. No tree walk or file snapshots.
 use crate::config::BashChangedFiles;
-use crate::list_envelope::{ListEnvelope, Reason};
-use serde::Serialize;
+use crate::list_envelope::Reason;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -154,24 +153,7 @@ impl Journal {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ChangedFile {
-    pub path: String,
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub diff: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub diff_lines_list_envelope: Option<ListEnvelope>,
-}
-#[derive(Debug, Clone, Serialize)]
-pub struct Report {
-    pub text: String,
-    pub files: Vec<ChangedFile>,
-    pub incomplete: Vec<String>,
-    pub changed_files_list_envelope: ListEnvelope,
-}
+pub use crate::protocol::{ChangedFile, Report};
 
 fn render_file(file: &ChangedFile) -> String {
     let path = if file.path.chars().any(char::is_control) {

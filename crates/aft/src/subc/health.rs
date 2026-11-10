@@ -3386,7 +3386,7 @@ impl RollupStepTimer {
 /// same directories, so resolving once per distinct configuration keeps a
 /// many-root tick off realpath/getcwd instead of re-resolving once per
 /// context. The resolved values are identical to calling
-/// [`crate::bash_background::storage_dir`] and [`crate::root_cache::cache_root`]
+/// [`crate::storage_path::storage_dir`] and [`crate::root_cache::cache_root`]
 /// directly: the memo is keyed by the exact configured spellings and dropped
 /// with the tick, so a reconfiguration on the next tick resolves afresh.
 #[derive(Default)]
@@ -3401,7 +3401,7 @@ impl TickStoragePaths {
         if let Some(hit) = self.storage.get(&key) {
             return hit.clone();
         }
-        let resolved = crate::bash_background::storage_dir(configured);
+        let resolved = crate::storage_path::storage_dir(configured);
         self.storage.insert(key, resolved.clone());
         resolved
     }
@@ -7194,7 +7194,7 @@ mod tests {
         for (_, ctx) in &entries {
             assert_eq!(ctx.config().storage_dir, storage);
         }
-        crate::bash_background::reset_storage_dir_calls_for_test();
+        crate::storage_path::reset_storage_dir_calls_for_test();
         crate::project_content::reset_register_canonicalizations_for_test();
         let rollup =
             build_health_diagnostic_rollup_from_actors(&cache, &executor, &shared_app, entries);
@@ -7205,7 +7205,7 @@ mod tests {
         // One tick over 32 contexts sharing a root resolves it once (plus the
         // one standing-roots probe, which runs once per tick by construction).
         // Resolving once per context would report hundreds here.
-        let resolutions = crate::bash_background::storage_dir_calls_for_test();
+        let resolutions = crate::storage_path::storage_dir_calls_for_test();
         let canonicalizations = crate::project_content::register_canonicalizations_for_test();
         println!(
             "health tick over 32 contexts: {resolutions} storage resolutions, {canonicalizations} canonicalizations"
@@ -9513,7 +9513,7 @@ fn standing_health_entries(
     };
 
     let database_path =
-        crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
+        crate::storage_path::storage_dir(config.storage_dir.as_deref()).join("aft.db");
     let database = crate::db::open_readonly(&database_path).ok();
     let mut entries = std::collections::BTreeMap::new();
     for root in &config.index.roots {

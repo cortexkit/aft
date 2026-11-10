@@ -19,10 +19,7 @@ use std::sync::{
 };
 use std::sync::{LazyLock, Mutex};
 
-/// Environment variable that carries the ticket into a spawned command.
-pub const GH_SHIM_TICKET_ENV: &str = "AFT_GH_SHIM_TICKET";
-/// Restriction hint added only by worker launch planning. It cannot grant identity.
-pub const GH_SHIM_WORKER_ENV: &str = "AFT_GH_SHIM_WORKER";
+pub use crate::gh_shim_paths::{GH_SHIM_TICKET_ENV, GH_SHIM_WORKER_ENV};
 
 const TICKET_BYTES: usize = 16;
 
@@ -1025,8 +1022,7 @@ pub(crate) fn redeem_speech_cold(
     if !matches!(row.status.as_str(), "starting" | "running")
         || !matches!(
             metadata.status,
-            crate::bash_background::BgTaskStatus::Starting
-                | crate::bash_background::BgTaskStatus::Running
+            crate::protocol::BgTaskStatus::Starting | crate::protocol::BgTaskStatus::Running
         )
         || row.harness != stored.record.harness
         || row.session_id != stored.record.session_id

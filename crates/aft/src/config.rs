@@ -512,8 +512,8 @@ impl Default for BackupConfig {
     fn default() -> Self {
         Self {
             enabled: Some(true),
-            max_depth: Some(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
-            max_file_size: Some(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
+            max_depth: Some(DEFAULT_MAX_UNDO_DEPTH),
+            max_file_size: Some(DEFAULT_MAX_BACKUP_FILE_SIZE),
         }
     }
 }
@@ -1341,3 +1341,7 @@ mod tests {
         );
     }
 }
+
+pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
+/// Default upper bound for one automatic undo snapshot (64 MiB).
+pub const DEFAULT_MAX_BACKUP_FILE_SIZE: u64 = 64 * 1024 * 1024;

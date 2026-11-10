@@ -144,7 +144,7 @@ impl StoragePaths {
     }
     pub fn for_config(config: &crate::config::Config) -> Self {
         Self::new(
-            crate::bash_background::storage_dir(config.storage_dir.as_deref()),
+            crate::storage_path::storage_dir(config.storage_dir.as_deref()),
             cache_root(config),
         )
     }
@@ -366,13 +366,13 @@ pub fn cache_root(config: &crate::config::Config) -> PathBuf {
         .cache_dir
         .as_ref()
         .map(|root| root.join("aft"))
-        .unwrap_or_else(|| crate::bash_background::storage_dir(config.storage_dir.as_deref()));
+        .unwrap_or_else(|| crate::storage_path::storage_dir(config.storage_dir.as_deref()));
     if config.cache_dir.is_some() {
         crate::project_content::register_storage_root(&root);
         // A root that is, contains or sits inside durable storage never gets a
         // location entry: an entry denies every path under it, durable
         // writes included.
-        let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let storage = crate::storage_path::storage_dir(config.storage_dir.as_deref());
         let mut registry = STATUS
             .get_or_init(Default::default)
             .lock()
@@ -897,7 +897,7 @@ fn overlap(left: &Path, right: &Path) -> io::Result<bool> {
 pub fn prepare_cache_root(
     config: &mut crate::config::Config,
 ) -> Option<crate::config_resolve::ConfigWarning> {
-    let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+    let storage = crate::storage_path::storage_dir(config.storage_dir.as_deref());
     if let Some(reason) = &config.cache_config_unknown {
         // The cache configuration is unknown. Treat durable storage as split
         // so database and directory creation there stays blocked until a valid
@@ -2047,7 +2047,7 @@ pub fn clean_old_caches(
     clean_old_caches_resolved(
         tiers,
         storage,
-        &crate::bash_background::storage_dir(None),
+        &crate::storage_path::storage_dir(None),
         confirm,
     )
 }
@@ -2300,7 +2300,7 @@ fn acquire_pinned_storage_lease(root: PinnedDir) -> io::Result<Arc<ProcessStorag
 }
 
 pub(crate) fn ensure_config_storage_lease(config: &mut crate::config::Config) -> io::Result<()> {
-    let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+    let storage = crate::storage_path::storage_dir(config.storage_dir.as_deref());
     crate::private_storage::open_root(&storage)?;
     let root = pin_storage_root(&storage)?;
     let owner = pinned_identity(&root)?;
@@ -2319,7 +2319,7 @@ pub(crate) fn prepare_process_cache_root(
     config: &mut crate::config::Config,
 ) -> Option<crate::config_resolve::ConfigWarning> {
     if let Err(error) = ensure_config_storage_lease(config) {
-        let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let storage = crate::storage_path::storage_dir(config.storage_dir.as_deref());
         record_split_durable(&storage, true);
         config.cache_unavailable = Some(error.to_string());
         config.cache_lease = None;

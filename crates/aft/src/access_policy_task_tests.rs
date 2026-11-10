@@ -2,8 +2,8 @@ use super::*;
 use crate::bash_background::persistence::{
     create_task_layout, write_task, PersistedTask, TaskPaths,
 };
-use crate::bash_background::BgTaskStatus;
 use crate::db::access_grants::{self as scopes, ScopeKey};
+use crate::protocol::BgTaskStatus;
 use std::sync::{Arc, Mutex};
 
 struct Fixture {

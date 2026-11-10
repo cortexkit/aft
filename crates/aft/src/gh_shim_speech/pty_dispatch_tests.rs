@@ -1,5 +1,5 @@
 use super::*;
-use crate::bash_background::BgTaskStatus;
+use crate::protocol::BgTaskStatus;
 
 fn checkpoint(
     task: &str,
@@ -205,13 +205,13 @@ async fn pty_revocation_commit_failure_aborts_and_reaps_without_running_user_cod
     .unwrap();
     let (_speech, metadata) = checkpoint(&task);
     let pid = metadata.child_pid.expect("gated child identity checkpoint");
-    assert!(crate::bash_background::process::is_process_alive(pid));
+    assert!(crate::process_identity::is_process_alive(pid));
     release_tx.send(()).unwrap();
     let fixture = launch.await.unwrap();
     assert_eq!(fixture.startup_error.as_deref(),Some("task_gh_authority_unavailable: this command's bot-write permission cannot be verified (snapshot_invalid); start the command again from a live session, and tell the operator if it repeats."));
     assert!(!ran.exists());
     assert!(
-        !crate::bash_background::process::is_process_alive(pid),
+        !crate::process_identity::is_process_alive(pid),
         "an aborted PTY launch left its child alive"
     );
     fixture

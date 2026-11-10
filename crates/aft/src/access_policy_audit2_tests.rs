@@ -177,7 +177,7 @@ fn audit2_every_once_route_rechecks_file_kind_for_read_and_recursive_delete() {
 #[test]
 fn audit2_foreign_registered_scratch_cannot_be_read_written_or_deleted() {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     let f = Fixture::new();
     let storage = f.ctx.storage_dir();
     let paths = task_paths(&storage, "foreign-session", "bash-a2f0123456789012").unwrap();
@@ -497,7 +497,7 @@ impl Drop for ScratchCleanup {
 #[cfg(unix)]
 fn registered_scratch(f: &Fixture, session: &str, task: &str) -> (PathBuf, ScratchCleanup) {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     let storage = f.ctx.storage_dir();
     let paths = task_paths(&storage, session, task).unwrap();
     std::fs::create_dir_all(&paths.dir).unwrap();

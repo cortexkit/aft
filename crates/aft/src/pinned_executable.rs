@@ -55,7 +55,7 @@ pub fn initialize() -> io::Result<()> {
     if PINNED.get().is_some() {
         return Ok(());
     }
-    let storage = crate::bash_background::storage_dir(None);
+    let storage = crate::storage_path::storage_dir(None);
     let pin = prepare(&storage)?;
     PINNED
         .set(pin)
@@ -260,8 +260,8 @@ impl PinnedExecutable {
             let shim = self.directory.join("shims/gh.cmd");
             if shim.is_file() {
                 let contents = std::fs::read(&shim)?;
-                let contents = if contents == crate::agent_child_env::windows_gh_cmd(&executable) {
-                    crate::agent_child_env::windows_gh_cmd(&destination)
+                let contents = if contents == crate::gh_shim_paths::windows_gh_cmd(&executable) {
+                    crate::gh_shim_paths::windows_gh_cmd(&destination)
                 } else {
                     contents
                 };
@@ -358,8 +358,8 @@ pub(crate) fn task_environment(
             .unwrap_or_else(|_| path.to_path_buf())
     };
     for key in [
-        crate::agent_child_env::GH_SHIMS_DIR_ENV,
-        crate::agent_child_env::GH_SHIM_BINARY_ENV,
+        crate::gh_shim_paths::GH_SHIMS_DIR_ENV,
+        crate::gh_shim_paths::GH_SHIM_BINARY_ENV,
     ] {
         if let Some(value) = environment.get_mut(std::ffi::OsStr::new(key)) {
             *value = redirect(Path::new(value)).into_os_string();
@@ -586,7 +586,7 @@ pub(crate) fn shims_dir(storage: &Path) -> PathBuf {
         // A shared, mutable `shims/gh` could be retargeted by a second daemon
         // running a different build. Keep each server's PATH entry immutable.
         Some(pin) => pin.directory.join("shims"),
-        None => storage.join(crate::agent_child_env::SHIMS_DIR_NAME),
+        None => storage.join(crate::gh_shim_paths::SHIMS_DIR_NAME),
     }
 }
 
@@ -613,7 +613,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         assert_eq!(
             shims_dir(storage.path()),
-            storage.path().join(crate::agent_child_env::SHIMS_DIR_NAME)
+            storage.path().join(crate::gh_shim_paths::SHIMS_DIR_NAME)
         );
     }
 
@@ -788,11 +788,11 @@ mod tests {
                     .into_owned(),
                 ),
                 (
-                    crate::agent_child_env::GH_SHIMS_DIR_ENV.to_owned(),
+                    crate::gh_shim_paths::GH_SHIMS_DIR_ENV.to_owned(),
                     pin.directory.join("shims").to_string_lossy().into_owned(),
                 ),
                 (
-                    crate::agent_child_env::GH_SHIM_BINARY_ENV.to_owned(),
+                    crate::gh_shim_paths::GH_SHIM_BINARY_ENV.to_owned(),
                     pin.executable.to_string_lossy().into_owned(),
                 ),
             ]);
@@ -976,7 +976,7 @@ mod tests {
         std::fs::create_dir(pin.directory.join("shims")).unwrap();
         std::fs::write(
             pin.directory.join("shims/gh.cmd"),
-            crate::agent_child_env::windows_gh_cmd(&pin.executable),
+            crate::gh_shim_paths::windows_gh_cmd(&pin.executable),
         )
         .unwrap();
         let image = pin.task_image(task.path()).unwrap();
@@ -984,7 +984,7 @@ mod tests {
         assert!(!pin.directory.exists());
         assert_eq!(
             std::fs::read(image.join("shims/gh.cmd")).unwrap(),
-            crate::agent_child_env::windows_gh_cmd(&image.join("aft.exe"))
+            crate::gh_shim_paths::windows_gh_cmd(&image.join("aft.exe"))
         );
         assert!(image.join("aft.exe").is_file());
     }

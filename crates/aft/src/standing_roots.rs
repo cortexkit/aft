@@ -312,7 +312,7 @@ impl StandingRoots {
         force: bool,
     ) -> Result<StandingReconcileReport, StandingRootsError> {
         let configured_db_path =
-            crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
+            crate::storage_path::storage_dir(config.storage_dir.as_deref()).join("aft.db");
         // An empty snapshot removes entries from the last observed user-tier
         // storage namespace; it must not silently switch to the process default
         // and leave durable rows behind in the former namespace.
@@ -678,7 +678,7 @@ impl StandingRoots {
             .database_path
             .lock()
             .clone()
-            .unwrap_or_else(|| crate::bash_background::storage_dir(None).join("aft.db"));
+            .unwrap_or_else(|| crate::storage_path::storage_dir(None).join("aft.db"));
         Ok(crate::db::open(&path)?)
     }
 }
@@ -722,7 +722,7 @@ fn resolve_entries(
     config: &Config,
     force: bool,
 ) -> Result<Vec<StandingRootEntry>, StandingRootsError> {
-    let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+    let storage = crate::storage_path::storage_dir(config.storage_dir.as_deref());
     let resolved = config
         .index
         .roots

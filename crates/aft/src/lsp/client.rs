@@ -3756,11 +3756,11 @@ mod tests {
             .unwrap();
         drop(client);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
+        while crate::process_identity::is_process_alive(pid) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            !crate::bash_background::process::is_process_alive(pid),
+            !crate::process_identity::is_process_alive(pid),
             "descendant survived drop"
         );
     }
@@ -3782,7 +3782,7 @@ mod tests {
             "leader must be reaped"
         );
         drop(client);
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!crate::process_identity::is_process_alive(pid));
     }
 
     #[cfg(unix)]
@@ -3803,14 +3803,14 @@ mod tests {
             "child must be tracked before shutdown"
         );
         assert!(
-            crate::bash_background::process::is_process_alive(pid),
+            crate::process_identity::is_process_alive(pid),
             "child must still be running"
         );
         client.poison_writer_for_test();
         let result = client.shutdown();
         assert!(result.is_err(), "shutdown must return Err, got {result:?}");
         assert!(
-            !crate::bash_background::process::is_process_alive(pid),
+            !crate::process_identity::is_process_alive(pid),
             "shutdown Err must not leave a live child"
         );
         assert!(

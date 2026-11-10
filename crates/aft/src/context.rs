@@ -6815,7 +6815,7 @@ impl AppContext {
             self.finish_database_runtime_error(error.into(), false);
             return;
         };
-        let storage = crate::bash_background::storage_dir(self.config().storage_dir.as_deref());
+        let storage = crate::storage_path::storage_dir(self.config().storage_dir.as_deref());
         if let Err(error) = crate::reader_floor::refresh_refused(&storage) {
             self.finish_database_runtime_error(error.to_string(), false);
             return;
@@ -7625,7 +7625,7 @@ impl AppContext {
     }
 
     pub fn storage_dir(&self) -> PathBuf {
-        crate::bash_background::storage_dir(self.config().storage_dir.as_deref())
+        crate::storage_path::storage_dir(self.config().storage_dir.as_deref())
     }
 
     pub(crate) fn output_files(&self) -> &crate::tool_output::OutputFiles {

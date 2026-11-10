@@ -402,7 +402,7 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
     }
     let root = retry.root.clone();
     if retry.kind == RetryKind::Identity {
-        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        let storage = crate::storage_path::storage_dir(ctx.config().storage_dir.as_deref());
         if !crate::root_identity::legacy_pins_readable(&root, &storage) {
             reschedule(ctx, &root, retry, timing());
             return None;

@@ -1422,7 +1422,7 @@ pub(crate) fn recovered_bash_frame(
     String,
     Option<Vec<u8>>,
 )> {
-    if snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown {
+    if snapshot.info.status == crate::protocol::BgTaskStatus::FateUnknown {
         return Some((
             crate::db::call_ledger::not_retained(key, "unknown"),
             "unknown".into(),
@@ -13354,7 +13354,7 @@ pub(crate) mod test_support {
         path
     }
     use super::*;
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     use crate::protocol::{
         BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, ConfigureWarningsFrame,
         ProgressFrame, StatusChangedFrame,
@@ -13996,7 +13996,7 @@ pub(crate) mod test_support {
         use crate::bash_background::persistence::{
             create_task_layout, write_task_at, PersistedTask,
         };
-        use crate::bash_background::BgTaskStatus;
+        use crate::protocol::BgTaskStatus;
 
         let (dir, _) = test_root("bash-watch-producer-wake");
         let session = "watch-session";
@@ -14089,7 +14089,7 @@ pub(crate) mod test_support {
             false,
         );
         metadata.harness = Some("runner".into());
-        metadata.mark_terminal(crate::bash_background::BgTaskStatus::Failed, Some(1), None);
+        metadata.mark_terminal(crate::protocol::BgTaskStatus::Failed, Some(1), None);
         write_task_at(&task, &metadata).unwrap();
         std::fs::write(&task.paths.stdout, "scoped durable output\n").unwrap();
         std::fs::write(&task.paths.stderr, "").unwrap();
@@ -14549,7 +14549,7 @@ pub(crate) mod test_support {
                     .unwrap()
                     .info
                     .status,
-                crate::bash_background::BgTaskStatus::Running,
+                crate::protocol::BgTaskStatus::Running,
                 "hand-back must not kill the task"
             );
         }
@@ -15522,7 +15522,7 @@ mod tests {
             );
         }
     }
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
 
     #[tokio::test]
     async fn standing_tick_skips_busy_lifecycle_and_acks_another_root_bind() {
@@ -16910,7 +16910,7 @@ mod tests {
 
     fn wait_for_background_exit(pid: u32) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::process_identity::is_process_alive(pid) {
             assert!(
                 Instant::now() < deadline,
                 "background task process survived kill"
@@ -16925,7 +16925,7 @@ mod tests {
         let storage = tempfile::tempdir().expect("task storage");
         let ctx = test_ctx();
         let (task_id, pid) = spawn_background_for_root(&ctx, &root, &storage, "reclaim-session");
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
@@ -16945,7 +16945,7 @@ mod tests {
             &metrics,
         );
         assert!(first.forgotten_deleted_roots.is_empty());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         let outcome = reap_until_forgotten(
             &root,
@@ -17021,7 +17021,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(root_dir.path().exists());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
         let snapshot = ctx
             .bash_background()
             .status(
@@ -17071,7 +17071,7 @@ mod tests {
             &metrics,
         );
         assert!(second.forgotten_deleted_roots.is_empty());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
         let _ = ctx.bash_background().kill(&task_id, "restored-session");
         wait_for_background_exit(pid);
         // The test recreated the root after its TempDir was closed, so nothing
@@ -17607,7 +17607,7 @@ mod tests {
         // Retiring the actor must stop its server without either the watcher
         // drain or the process-wide orphan sweep assisting the teardown.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::process_identity::is_process_alive(pid) {
             assert!(
                 Instant::now() < deadline,
                 "retired root left LSP child {pid} running"
@@ -17653,7 +17653,7 @@ mod tests {
             1,
             "the exit sweep, not a background reap, must own the running server"
         );
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         // The exit phase of `run_subc_mode_inner`: take every client and stop
         // them under one budget, killing the server that ignores Shutdown.
@@ -17669,7 +17669,7 @@ mod tests {
         // deadline. Require eventual process exit and registry cleanup instead;
         // neither a live leaked server nor a stale registry entry may remain.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid)
+        while crate::process_identity::is_process_alive(pid)
             || ctx.lsp_child_registry().pids().contains(&pid)
         {
             assert!(
@@ -17703,7 +17703,7 @@ mod tests {
         assert_eq!(ctx.lsp().active_client_count(), 0);
         // Hang guard only: the reap waits 25 ms for Shutdown, then terminates.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid)
+        while crate::process_identity::is_process_alive(pid)
             || ctx.lsp_child_registry().pids().contains(&pid)
         {
             assert!(

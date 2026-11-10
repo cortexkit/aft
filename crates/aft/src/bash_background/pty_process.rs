@@ -391,7 +391,7 @@ fn try_spawn_pty(
         crate::privacy_spawn::spawn_pty(command, pair.master.as_ref())?
     } else {
         pair.slave.spawn_command(command).map_err(|error| {
-            crate::bash_background::format_spawn_failure(
+            crate::process_spawn::format_spawn_failure(
                 "spawn PTY command failed",
                 &spawn_program,
                 &spawn_workdir,
@@ -401,7 +401,7 @@ fn try_spawn_pty(
     };
     #[cfg(not(target_os = "macos"))]
     let child = pair.slave.spawn_command(command).map_err(|error| {
-        crate::bash_background::format_spawn_failure(
+        crate::process_spawn::format_spawn_failure(
             "spawn PTY command failed",
             &spawn_program,
             &spawn_workdir,

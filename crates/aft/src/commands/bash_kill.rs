@@ -134,9 +134,9 @@ mod tests {
 
     use super::*;
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
     use crate::config::Config;
     use crate::context::{App, AppContext};
+    use crate::protocol::BgTaskStatus;
 
     fn actor(app: &Arc<App>, project: &Path, storage: &Path) -> AppContext {
         let config = Config {

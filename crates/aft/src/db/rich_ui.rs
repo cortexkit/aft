@@ -97,7 +97,7 @@ pub(crate) fn prune_presets(conn: &Connection, now_ms: i64) -> rusqlite::Result<
 pub(crate) fn terminal_task_metadata_for_test(
     pin: Option<&str>,
 ) -> crate::bash_background::persistence::PersistedTask {
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
         "bash-0123456789abcdef".into(),
         "session".into(),

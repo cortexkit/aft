@@ -7693,7 +7693,7 @@ pub(in crate::subc) mod route_tests {
         use crate::bash_background::persistence::{
             create_task_layout, write_task_at, PersistedTask,
         };
-        use crate::bash_background::BgTaskStatus;
+        use crate::protocol::BgTaskStatus;
 
         let (dir, root) = test_support::test_root("occipital-tasks");
         let ctx = test_support::test_ctx();

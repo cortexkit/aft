@@ -65,7 +65,7 @@ pub(super) struct RelayContext {
 
 impl RelayContext {
     pub(super) fn from_process() -> Self {
-        let worker = std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_some()
+        let worker = std::env::var_os(crate::gh_shim_paths::GH_SHIM_WORKER_ENV).is_some()
             || std::env::var_os(crate::gh_shim_worker_broker::SOCKET_ENV).is_some()
             || std::env::var_os(crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV).is_some();
         Self {
@@ -78,7 +78,7 @@ impl RelayContext {
             ticket: if worker {
                 None
             } else {
-                std::env::var(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).ok()
+                std::env::var(crate::gh_shim_paths::GH_SHIM_TICKET_ENV).ok()
             },
             transient_delays: TRANSIENT_RETRY_DELAYS,
             relay_budget: relay_budget_from_process(),

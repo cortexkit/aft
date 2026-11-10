@@ -856,12 +856,12 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
             max_depth: after
                 .backup
                 .max_depth
-                .unwrap_or(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
+                .unwrap_or(crate::config::DEFAULT_MAX_UNDO_DEPTH),
             max_file_size: Some(
                 after
                     .backup
                     .max_file_size
-                    .unwrap_or(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
+                    .unwrap_or(crate::config::DEFAULT_MAX_BACKUP_FILE_SIZE),
             ),
         });
     }
@@ -880,7 +880,7 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
         ctx.reset_tier2_refresh_scheduler();
     }
     if before.git.co_author == "off" && after.git.co_author != "off" {
-        let storage_root = crate::bash_background::storage_dir(after.storage_dir.as_deref());
+        let storage_root = crate::storage_path::storage_dir(after.storage_dir.as_deref());
         if let Err(error) = crate::agent_child_env::ensure_git_hooks(&storage_root) {
             crate::slog_warn!("config reload: could not install git hooks: {}", error);
         }

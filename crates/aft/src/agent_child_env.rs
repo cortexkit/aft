@@ -14,7 +14,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 
-pub const SHIMS_DIR_NAME: &str = "shims";
 pub const GIT_HOOKS_DIR_NAME: &str = "git-hooks";
 const ALFONSO_TEST_THREADS_FILE: &str = "alfonso-test-threads";
 const DEFAULT_WORKER_TEST_THREADS: u32 = 4;
@@ -57,8 +56,6 @@ const MANAGED_GIT_HOOK_NAMES: &[&str] = &[
     "post-index-change",
     "reference-transaction",
 ];
-pub(crate) const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
-pub(crate) const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
 const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
 const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
@@ -712,7 +709,7 @@ pub fn scrub_inherited_process_markers() {
         })
         .collect();
     let mut cleaned = original.clone();
-    remove_managed_git_config(&mut cleaned, &crate::bash_background::storage_dir(None));
+    remove_managed_git_config(&mut cleaned, &crate::storage_path::storage_dir(None));
     for key in original.keys() {
         if !cleaned.contains_key(key) {
             std::env::remove_var(key);
@@ -830,18 +827,18 @@ pub fn inject(
     for key in crate::gh_shim_worker_broker::CHILD_KEYS {
         environment.remove(key);
     }
-    environment.remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+    environment.remove(crate::gh_shim_paths::GH_SHIM_WORKER_ENV);
     if crate::sandbox_spawn::worker_jail_active() {
         environment.insert(
-            crate::gh_shim_ticket::GH_SHIM_WORKER_ENV.to_string(),
+            crate::gh_shim_paths::GH_SHIM_WORKER_ENV.to_string(),
             "1".to_string(),
         );
     }
-    environment.remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
+    environment.remove(crate::gh_shim_paths::GH_SHIM_TICKET_ENV);
     if gh_enabled && !crate::sandbox_spawn::worker_jail_active() {
         if let Some(ticket) = gh_shim_ticket {
             environment.insert(
-                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.to_string(),
+                crate::gh_shim_paths::GH_SHIM_TICKET_ENV.to_string(),
                 ticket.to_string(),
             );
         }
@@ -1992,15 +1989,8 @@ fn set_executable(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to make hook executable {}: {error}", path.display()))
 }
 
-/// Render the Windows command wrapper separately so its quoting contract can be
-/// checked on every development platform; `cmd.exe` dispatch still requires
-/// the native Windows CI oracle.
-pub fn windows_gh_cmd(binary: &Path) -> Vec<u8> {
-    let rendered = binary.to_string_lossy();
-    debug_assert!(!rendered.contains('"'));
-    let rendered = rendered.replace('%', "%%");
-    format!("@echo off\r\n\"{rendered}\" gh-shim %*\r\n").into_bytes()
-}
+pub use crate::gh_shim_paths::{windows_gh_cmd, SHIMS_DIR_NAME};
+pub(crate) use crate::gh_shim_paths::{GH_SHIMS_DIR_ENV, GH_SHIM_BINARY_ENV};
 
 #[cfg(test)]
 mod tests {
@@ -2209,7 +2199,7 @@ mod tests {
         let mut config = Config::default();
         config.github.shim = true;
         config.git = GitConfig::default();
-        let ticket_key = crate::gh_shim_ticket::GH_SHIM_TICKET_ENV;
+        let ticket_key = crate::gh_shim_paths::GH_SHIM_TICKET_ENV;
 
         // An inherited ticket belongs to some other command and is dropped.
         let mut inherited = HashMap::from([(ticket_key.to_string(), "stale".to_string())]);
@@ -2416,14 +2406,6 @@ mod tests {
         assert!(
             fs::symlink_metadata(entry).is_err(),
             "a rejected candidate must not install a new gh entry"
-        );
-    }
-
-    #[test]
-    fn windows_wrapper_uses_the_explicit_gh_shim_dispatch_form() {
-        assert_eq!(
-            String::from_utf8(windows_gh_cmd(Path::new(r"C:\AFT Dev\aft.exe"))).unwrap(),
-            "@echo off\r\n\"C:\\AFT Dev\\aft.exe\" gh-shim %*\r\n"
         );
     }
 

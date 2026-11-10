@@ -712,7 +712,7 @@ fn confined_handler_golden_vectors() {
 /// with its output stored outside the pinned root, and returns its paths.
 fn owned_task_output(f: &Fixture) -> crate::bash_background::persistence::TaskPaths {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     let paths = task_paths(f.storage.path(), "designer", "bash-0123456789abcdef").unwrap();
     let mut metadata = PersistedTask::starting(
         "bash-0123456789abcdef".into(),

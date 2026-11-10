@@ -10429,7 +10429,7 @@ async fn assert_saved_pause_reply(
         .unwrap_or_else(|| panic!("{reply:?}"));
     assert!(local["remote"].is_null(), "{reply:?}");
     wait_for("the saved local command must be stopped", || {
-        (!crate::bash_background::process::is_process_alive(local_pid)).then_some(())
+        (!crate::process_identity::is_process_alive(local_pid)).then_some(())
     })
     .await;
 }

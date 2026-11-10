@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 
 use crate::bash_background::registry::remote::{RemotePhase, RemoteProgress};
 use crate::bash_background::registry::{BgTaskSnapshot, HardKillDeadline, HardKillSource};
-use crate::bash_background::BgTaskStatus;
 use crate::context::AppContext;
+use crate::protocol::BgTaskStatus;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
 
@@ -1604,7 +1604,7 @@ mod tests {
             BgTaskStatus::Completed,
             Some(0),
         );
-        task.changed_files = Some(crate::bash_changed_files::Report {
+        task.changed_files = Some(crate::protocol::Report {
             text: "Files changed while the command ran (changes by other processes may be included):\n  added new.txt".into(),
             files: vec![],
             incomplete: vec![],

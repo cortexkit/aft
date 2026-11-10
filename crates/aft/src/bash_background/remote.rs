@@ -2392,7 +2392,7 @@ fn runon_write_refusal(command: &str, request: &RunRequest) -> Option<String> {
     let returned: Vec<_> = request
         .return_paths
         .iter()
-        .map(|path| crate::bash_permissions::resolve_with_existing_ancestors(&cwd.join(path)))
+        .map(|path| crate::system_temp::resolve_with_existing_ancestors(&cwd.join(path)))
         .collect();
     let paths = crate::bash_permissions::writes::literal_write_targets(command, cwd, &|path| {
         runon_snapshot_directory_known(checkout, path, Path::new("git"), deadline)

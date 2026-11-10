@@ -3625,7 +3625,7 @@ mod tests {
             || true,
         );
         assert!(matches!(result, Err(FormatError::Timeout { .. })));
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!crate::process_identity::is_process_alive(pid));
     }
 
     #[test]

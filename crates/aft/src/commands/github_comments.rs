@@ -483,7 +483,7 @@ pub(crate) fn run_governed_gh(
     );
     if worker {
         environment.insert(
-            crate::gh_shim_ticket::GH_SHIM_WORKER_ENV.to_string(),
+            crate::gh_shim_paths::GH_SHIM_WORKER_ENV.to_string(),
             "1".to_string(),
         );
     }

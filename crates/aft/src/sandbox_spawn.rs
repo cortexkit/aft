@@ -6105,7 +6105,7 @@ pub(crate) fn completion_secrets(
             .iter()
             .filter(|(key, _)| {
                 !key.to_str().is_some_and(|key| {
-                    key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+                    key.eq_ignore_ascii_case(crate::gh_shim_paths::GH_SHIM_TICKET_ENV)
                 })
             })
             .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
@@ -6113,13 +6113,13 @@ pub(crate) fn completion_secrets(
     .is_empty();
     environment.retain(|key, _| {
         !key.to_str()
-            .is_some_and(|key| key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV))
+            .is_some_and(|key| key.eq_ignore_ascii_case(crate::gh_shim_paths::GH_SHIM_TICKET_ENV))
     });
     let ticket = memory_only_ticket(request_environment);
     let ticket_digest = ticket.map(|ticket| blake3::hash(ticket.as_bytes()).to_hex().to_string());
     if let Some(ticket) = ticket {
         environment.insert(
-            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+            crate::gh_shim_paths::GH_SHIM_TICKET_ENV.into(),
             ticket.into(),
         );
     }
@@ -6158,7 +6158,7 @@ fn sandboxed_child_environment(
         if crate::bash_env::is_preexec_hijack_env_key(key.as_str())
             || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
-            || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
+            || key == crate::gh_shim_paths::GH_SHIM_TICKET_ENV
             || key == crate::gh_shim_worker_broker::SOCKET_ENV
             || key == crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV
             || (worker_jail_active() && key == "DBUS_SESSION_BUS_ADDRESS")
@@ -6219,7 +6219,7 @@ pub(crate) fn apply_sandbox_environment(
         // shell startup hooks, and cloud credentials cannot leak around them.
         command.env_clear().envs(environment);
         if let Some(ticket) = memory_only_ticket(request_environment) {
-            command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
+            command.env(crate::gh_shim_paths::GH_SHIM_TICKET_ENV, ticket);
         }
         for key in [
             crate::gh_shim_worker_broker::SOCKET_ENV,
@@ -6260,7 +6260,7 @@ pub(crate) fn disclaim_command_for_plan(
 /// ticket must exist only in memory. It is added back here, at exec time.
 fn memory_only_ticket(request_environment: &HashMap<String, String>) -> Option<&str> {
     request_environment
-        .get(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+        .get(crate::gh_shim_paths::GH_SHIM_TICKET_ENV)
         .map(String::as_str)
 }
 
@@ -6298,7 +6298,7 @@ pub(crate) fn pty_command_for_plan(
             command.env(key, value);
         }
         if let Some(ticket) = memory_only_ticket(env) {
-            command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
+            command.env(crate::gh_shim_paths::GH_SHIM_TICKET_ENV, ticket);
         }
         for key in [
             crate::gh_shim_worker_broker::SOCKET_ENV,
@@ -6313,8 +6313,8 @@ pub(crate) fn pty_command_for_plan(
         // only request overrides. An inherited gh shim ticket is removed first:
         // it belongs to whatever started this process, and the request map
         // re-adds the child's own ticket when one was issued.
-        command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
-        command.env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+        command.env_remove(crate::gh_shim_paths::GH_SHIM_TICKET_ENV);
+        command.env_remove(crate::gh_shim_paths::GH_SHIM_WORKER_ENV);
         for (key, value) in env {
             command.env(key, value);
         }
@@ -6904,7 +6904,7 @@ pub(crate) mod environment_tests {
                 "private-control".into(),
             ),
             (
-                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+                crate::gh_shim_paths::GH_SHIM_TICKET_ENV.into(),
                 "private-ticket".into(),
             ),
         ]);

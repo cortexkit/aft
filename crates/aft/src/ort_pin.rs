@@ -230,7 +230,7 @@ fn managed_runtime_roots() -> Vec<PathBuf> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let default = crate::bash_background::storage_dir(None);
+    let default = crate::storage_path::storage_dir(None);
     if !storage_dirs.contains(&default) {
         storage_dirs.push(default);
     }

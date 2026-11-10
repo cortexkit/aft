@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::bash_background::process::{LiveDescendant, LiveDescendantsUnavailable};
-use crate::bash_background::BgTaskStatus;
 use crate::list_envelope::ListEnvelope;
 
 /// Full payload returned by the `status` command and cached by status push frames.
@@ -61,7 +60,7 @@ pub struct BashCompletedFrame {
         rename = "_bash_changed_files",
         skip_serializing_if = "Option::is_none"
     )]
-    pub changed_files: Option<crate::bash_changed_files::Report>,
+    pub changed_files: Option<Report>,
     #[serde(rename = "type")]
     pub frame_type: &'static str,
     pub task_id: String,
@@ -703,4 +702,49 @@ fn error_response_preserves_owned_extra_fields() {
     assert_eq!(value["detail"], "owned");
     assert_eq!(value["code"], "failure");
     assert_eq!(value["message"], "message");
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BgTaskStatus {
+    Starting,
+    Running,
+    Killing,
+    Completed,
+    Failed,
+    Killed,
+    TimedOut,
+    FateUnknown,
+}
+
+impl BgTaskStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            BgTaskStatus::Completed
+                | BgTaskStatus::Failed
+                | BgTaskStatus::Killed
+                | BgTaskStatus::TimedOut
+                | BgTaskStatus::FateUnknown
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_lines_list_envelope: Option<ListEnvelope>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct Report {
+    pub text: String,
+    pub files: Vec<ChangedFile>,
+    pub incomplete: Vec<String>,
+    pub changed_files_list_envelope: ListEnvelope,
 }

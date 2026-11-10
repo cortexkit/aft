@@ -813,7 +813,7 @@ pub(crate) fn bash_bodies(
     output_bytes: Option<u64>,
     streams: Option<(String, String)>,
 ) -> (Value, Value) {
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     let remote = metadata
         .remote
         .as_ref()

@@ -98,8 +98,7 @@ fn profile_rollup_root_loop_calls_over_eighty_roots() {
         let standing = standing_health_entries(&actors);
         timed("tick: standing_health_entries", t);
         let t = cpu_ns();
-        let storage =
-            crate::bash_background::storage_dir(actors[0].1.config().storage_dir.as_deref());
+        let storage = crate::storage_path::storage_dir(actors[0].1.config().storage_dir.as_deref());
         timed("tick: bash_background::storage_dir", t);
         let t = cpu_ns();
         std::hint::black_box(crate::persisted_format::refusals_under(&storage));

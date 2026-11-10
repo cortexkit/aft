@@ -3,8 +3,8 @@
 //! Rust module processes use one file per PID. That avoids cross-process rename
 //! races while preserving a single greppable directory for all AFT activity.
 
-use crate::bash_background::process::is_process_alive;
 use crate::executor::Executor;
+use crate::process_identity::is_process_alive;
 use crate::tool_progress::{ToolCallPhaseDurations, WaitingOn};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -888,7 +888,7 @@ fn init_with_stderr_mode(subc: bool) {
             .unwrap_or_else(|_| stderr_mirror::Mirror::disabled(Arc::clone(&STDERR_MIRROR_HEALTH)))
         });
     }
-    let storage_root = crate::bash_background::storage_dir(None);
+    let storage_root = crate::storage_path::storage_dir(None);
     let logs_dir = storage_root.join("logs");
     let file_name = format!("aft-{}.log", std::process::id());
     let file_path = logs_dir.join(file_name);
@@ -997,7 +997,7 @@ pub(crate) fn daemon_log_path() -> PathBuf {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .storage_root
         .clone()
-        .unwrap_or_else(|| crate::bash_background::storage_dir(None));
+        .unwrap_or_else(|| crate::storage_path::storage_dir(None));
     root.join("logs")
         .join(format!("aft-{}.log", std::process::id()))
 }
@@ -2155,7 +2155,7 @@ fn sweep_logs_now() {
         .lock()
         .ok()
         .and_then(|control| control.storage_root.clone())
-        .unwrap_or_else(|| crate::bash_background::storage_dir(None));
+        .unwrap_or_else(|| crate::storage_path::storage_dir(None));
     let logs_dir = storage_root.join("logs");
     match sweep_logs(
         &logs_dir,
@@ -3356,7 +3356,7 @@ mod tests {
         if std::env::var_os("AFT_TEST_PANIC_LOG_CHILD").is_none() {
             return;
         }
-        let path = crate::bash_background::storage_dir(None)
+        let path = crate::storage_path::storage_dir(None)
             .join("logs")
             .join(format!("aft-{}.log", std::process::id()));
         let previous = std::panic::take_hook();

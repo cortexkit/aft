@@ -326,7 +326,7 @@ fn gh_shim_broker_t6_environment_strip_pty_and_exec_reinsertion() {
     let plan = crate::sandbox_spawn::SpawnPlan::RelaxedUnenforced;
     let serialized = crate::sandbox_spawn::approved_environment_for_plan(&plan, &environment);
     for key in [
-        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+        crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
         SOCKET_ENV,
         CAPABILITY_FILE_ENV,
     ] {
@@ -369,7 +369,7 @@ fn gh_shim_broker_t6_environment_strip_pty_and_exec_reinsertion() {
         crate::agent_child_env::inject(&config, root.path(), &mut child, Some("general-ticket"))
     })
     .unwrap();
-    assert!(!child.contains_key(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV));
+    assert!(!child.contains_key(crate::gh_shim_paths::GH_SHIM_TICKET_ENV));
     assert!(!child.contains_key(SOCKET_ENV));
     assert!(!child.contains_key(CAPABILITY_FILE_ENV));
 }
@@ -1071,7 +1071,7 @@ async fn optional_worker_broker_live_service_is_still_provided() {
     assert_eq!(capability.len(), 32);
     assert!(socket.exists());
     assert!(crate::gh_shim_ticket::redeem_worker_read(&capability, &socket).is_some());
-    assert!(!environment.contains_key(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV));
+    assert!(!environment.contains_key(crate::gh_shim_paths::GH_SHIM_TICKET_ENV));
     assert!(Path::new(environment.get(STATE_ENV).unwrap()).starts_with(&temp));
     drop(ticket);
     assert!(!socket.exists());

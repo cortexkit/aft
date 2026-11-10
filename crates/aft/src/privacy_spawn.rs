@@ -152,7 +152,7 @@ pub(crate) fn spawn_pty(
         .spawn()
         .map(|child| Box::new(child) as Box<dyn portable_pty::Child + Send + Sync>)
         .map_err(|error| {
-            crate::bash_background::format_spawn_failure(
+            crate::process_spawn::format_spawn_failure(
                 "privacy disclaim unavailable: PTY spawn failed",
                 &spawn_program,
                 &spawn_workdir,
