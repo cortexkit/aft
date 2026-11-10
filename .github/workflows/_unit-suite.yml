@@ -687,6 +687,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -782,6 +783,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -887,6 +889,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -971,6 +974,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1088,6 +1092,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1120,6 +1125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1152,6 +1158,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1193,6 +1200,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1288,6 +1296,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1377,6 +1386,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1522,6 +1532,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1653,6 +1664,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1731,6 +1743,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1799,6 +1812,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1831,6 +1845,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1863,6 +1878,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1901,6 +1917,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -1990,6 +2007,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state

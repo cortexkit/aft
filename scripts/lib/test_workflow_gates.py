@@ -8,9 +8,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import unittest.mock
 
@@ -1072,7 +1074,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 20)
         for name, job in jobs:
             with self.subTest(job=name):
-                self.assertEqual(job["steps"][1], {"uses": "actions/setup-python@v6", "with": {"python-version": "3.14"}})
+                self.assertEqual(job["steps"][1], {"uses": "actions/setup-python@v6", "if": "runner.environment == 'github-hosted'",
+                                                    "with": {"python-version": "3.14"}})
                 self.assertEqual(job["steps"][2], {"uses": "./.github/actions/native-ci-state"})
                 cleanup = job["steps"][-1]
                 self.assertEqual(cleanup["uses"], "./.github/actions/native-ci-state")
@@ -1193,7 +1196,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         self.assertEqual(cleanup["needs"], ["unit", "e2e"])
         self.assertEqual(cleanup["if"], "${{ always() && github.event_name != 'pull_request' }}")
         self.assertEqual(cleanup["strategy"]["matrix"]["machine"], ["rented-mac", "narli"])
-        self.assertEqual(cleanup["steps"][1], {"uses": "actions/setup-python@v6", "with": {"python-version": "3.14"}})
+        self.assertEqual(cleanup["steps"][1], {"uses": "actions/setup-python@v6", "if": "runner.environment == 'github-hosted'",
+                                              "with": {"python-version": "3.14"}})
         self.assertEqual(cleanup["steps"][-1]["with"], {
             "phase": "${{ needs.unit.result == 'success' && needs.e2e.result == 'success' && 'finalize' || 'cleanup' }}",
         })
@@ -1358,6 +1362,110 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                         self.assertIn(error, result.stdout + result.stderr)
                     else:
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_self_hosted_workflows_validate_system_python_instead_of_running_its_installer(self) -> None:
+        suites = self.suites + [workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows" / name))
+                                for name in ("tests.yml", "release.yml")]
+        checked = 0
+        for suite in suites:
+            for name, job in suite["jobs"].items():
+                if "self-hosted" not in job.get("runs-on", []):
+                    continue
+                checked += 1
+                setup = next(i for i, step in enumerate(job["steps"])
+                             if step.get("uses") == "./.github/actions/native-ci-state")
+                for i, step in enumerate(job["steps"]):
+                    if step.get("uses") == "actions/setup-python@v6":
+                        self.assertEqual(step["if"], "runner.environment == 'github-hosted'", name)
+                    if re.search(r"\bpython(?:3)?\s", step.get("run", "")):
+                        self.assertLess(setup, i, name)
+        self.assertEqual(checked, 26)
+        action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
+        steps = action["runs"]["steps"]
+        self.assertEqual(steps[0]["name"], "Validate system Python on the native runner")
+        self.assertEqual(steps[0]["if"], "runner.environment == 'self-hosted'")
+        self.assertIn('python="$AFT_CI_PYTHON"', steps[1]["run"])
+        self.assertEqual(steps[1]["if"], "inputs.phase != 'python'")
+
+    def test_system_python_probe_rejects_313_and_accepts_314_or_newer(self) -> None:
+        match = re.search(r"probe='(.*?)'\n", self.system_python_preflight(), re.DOTALL)
+        assert match is not None
+        code = match.group(1)
+        for version, passes in (((3, 13, 9), False), ((3, 14, 0), True), ((3, 15, 0), True)):
+            with self.subTest(version=version):
+                result = subprocess.run([sys.executable, "-B", "-c",
+                                         f"import sys; sys.version_info = {version!r}\n" + code],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, passes, result.stdout + result.stderr)
+                if not passes:
+                    self.assertIn("older than required 3.14", result.stderr)
+
+    @staticmethod
+    def system_python_preflight():
+        # The small workflow parser strips nested scalar indentation. Execute
+        # the literal YAML body so Python's indented version check is preserved.
+        source = (REPO_ROOT / ".github/actions/native-ci-state/action.yml").read_text()
+        match = re.search(r"      run: \|\n((?:        [^\n]*\n|\n)+)", source)
+        assert match is not None
+        return textwrap.dedent(match.group(1))
+
+    def run_system_python_preflight(self, mode):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = root / "tools"
+            installation = root / "system Python"
+            tools.mkdir()
+            installation.mkdir()
+            (installation / "Scripts").mkdir()
+            command_directory = installation if mode == "launcher" else tools
+            for name in ("python3.14", "python", "python3"):
+                if mode == "launcher" and name == "python3.14":
+                    continue
+                path = command_directory / name
+                prefix = "another installation" if mode == "mismatched" and name == "python3" else "same installation"
+                identity = (root / prefix).as_posix()
+                executable = (installation / "python.exe").as_posix() if mode == "launcher" else path.as_posix()
+                text = "#!/bin/sh\n"
+                if mode == "old":
+                    text += 'echo "Python 3.13.9 is older than required 3.14" >&2\nexit 1\n'
+                elif mode == "missing" and name == "python3":
+                    continue
+                else:
+                    text += "printf '%s\\r\\n' " + " ".join(shlex.quote(part) for part in (
+                        executable, identity, "3.14.1 (administrator-managed build)",
+                    )) + "\n"
+                path.write_text(text)
+                path.chmod(0o755)
+            if mode == "launcher":
+                launcher = tools / "py"
+                launcher.write_text("#!/bin/sh\nprintf '%s\\n' " + " ".join(shlex.quote(part) for part in (
+                    (installation / "python.exe").as_posix(), (root / "same installation").as_posix(),
+                    "3.14.1 (administrator-managed build)",
+                )) + "\n")
+                launcher.chmod(0o755)
+            env_file, path_file = root / "github-env", root / "github-path"
+            result = subprocess.run(["/bin/bash", "-c", self.system_python_preflight()],
+                                    capture_output=True, text=True,
+                                    env={**os.environ, "PATH": str(tools), "RUNNER_OS": "Windows" if mode == "launcher" else "macOS",
+                                         "GITHUB_ENV": str(env_file), "GITHUB_PATH": str(path_file)})
+            return result, env_file.read_text() if env_file.exists() else "", path_file.read_text() if path_file.exists() else ""
+
+    def test_system_python_preflight_publishes_validated_aliases_or_fails_before_exporting(self) -> None:
+        for mode, error in (("matching", ""), ("launcher", ""), ("old", "System Python 3.14+ is required"),
+                            ("missing", "Missing python3"), ("mismatched", "different Python installation or build")):
+            with self.subTest(mode=mode):
+                result, env, path = self.run_system_python_preflight(mode)
+                if error:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(error, result.stdout + result.stderr)
+                    self.assertEqual(env, "")
+                    self.assertEqual(path, "")
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("AFT_CI_PYTHON=", env)
+                    self.assertTrue(path.strip())
+                    self.assertIn("System python:", result.stdout)
+                    self.assertIn("System python3:", result.stdout)
 
     def test_cleanup_includes_the_injected_e2e_executable_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

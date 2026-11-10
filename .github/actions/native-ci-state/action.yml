@@ -2,7 +2,7 @@ name: Native CI state
 description: Keep native build outputs outside checkout and clean leaked test processes
 inputs:
   phase:
-    description: setup, cleanup, or finalize
+    description: setup, cleanup, finalize, or python (interpreter validation only)
     default: setup
   rust-target:
     description: Required preinstalled target on the read-only Windows toolchain
@@ -13,11 +13,76 @@ inputs:
 runs:
   using: composite
   steps:
-    - shell: bash
+    - name: Validate system Python on the native runner
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        set -euo pipefail
+        probe='import os, sys
+        if sys.version_info < (3, 14):
+            raise SystemExit("Python " + sys.version.split()[0] + " is older than required 3.14")
+        print(sys.executable.replace("\\", "/"))
+        print(os.path.normcase(os.path.realpath(sys.base_prefix)).replace("\\", "/"))
+        print(sys.version.replace("\n", " "))'
+        report=""
+        failures=""
+        for candidate in python3.14 python3 python; do
+          if command -v "$candidate" >/dev/null 2>&1; then
+            if report="$("$candidate" -B -c "$probe" 2>&1)"; then
+              break
+            fi
+            failures="${failures}${candidate}: ${report}; "
+            report=""
+          fi
+        done
+        if [[ -z "$report" && "$RUNNER_OS" == Windows ]] && command -v py >/dev/null 2>&1; then
+          if ! report="$(py -3.14 -B -c "$probe" 2>&1)"; then
+            failures="${failures}py -3.14: ${report}; "
+            report=""
+          fi
+        fi
+        if [[ -z "$report" ]]; then
+          echo "::error::System Python 3.14+ is required. Ask the runner administrator to install it with matching python and python3 aliases. Found: ${failures:-no Python command on PATH}"
+          exit 1
+        fi
+        report="${report//$'\r'/}"
+        executable="${report%%$'\n'*}"
+        identity="${report#*$'\n'}"
+        directory="${executable%/*}"
+        export PATH="$directory:$PATH"
+        for alias in python python3; do
+          if ! command -v "$alias" >/dev/null 2>&1; then
+            echo "::error::Missing $alias beside $executable; the administrator must provide python and python3 for the same Python 3.14+ installation."
+            exit 1
+          fi
+          if ! actual="$("$alias" -B -c "$probe" 2>&1)"; then
+            echo "::error::$alias does not run Python 3.14+: $actual. Ask the administrator to repair the system Python aliases."
+            exit 1
+          fi
+          actual="${actual//$'\r'/}"
+          if [[ "${actual#*$'\n'}" != "$identity" ]]; then
+            echo "::error::$alias resolves to a different Python installation or build than $executable. Ask the administrator to repair the system Python aliases."
+            exit 1
+          fi
+          printf 'System %s: %s\n' "$alias" "$actual"
+        done
+        if [[ -d "$directory/Scripts" ]]; then
+          printf '%s\n' "$directory/Scripts" >> "$GITHUB_PATH"
+        fi
+        printf '%s\n' "$directory" >> "$GITHUB_PATH"
+        printf 'AFT_CI_PYTHON=%s\n' "$executable" >> "$GITHUB_ENV"
+    - if: inputs.phase != 'python'
+      shell: bash
       env:
         AFT_CI_PHASE: ${{ inputs.phase }}
       run: |
-        if command -v python3 >/dev/null 2>&1; then python=python3; else python=python; fi
+        if [[ -n "${AFT_CI_PYTHON:-}" ]]; then
+          python="$AFT_CI_PYTHON"
+        elif command -v python3 >/dev/null 2>&1; then
+          python=python3
+        else
+          python=python
+        fi
         "$python" scripts/ci-native-state.py "$AFT_CI_PHASE"
     - name: Verify installed Windows Rust toolchain (read-only)
       if: runner.os == 'Windows' && runner.environment == 'self-hosted' && inputs.phase == 'setup'

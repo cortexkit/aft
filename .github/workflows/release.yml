@@ -246,12 +246,16 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/native-ci-state
+        with:
+          phase: python
 
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
           package-manager-cache: false
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
 
@@ -327,6 +331,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/native-ci-state
+        with:
+          phase: python
 
       - uses: actions/setup-node@v5
         with:
@@ -503,6 +510,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -610,6 +618,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
@@ -770,6 +779,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
