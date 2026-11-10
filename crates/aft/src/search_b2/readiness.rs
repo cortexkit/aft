@@ -3,7 +3,7 @@ use crate::commands::semantic_search::extensions::{
     SemanticReadiness, SymbolIndexStatus, SymbolReadiness, TrigramReadiness,
 };
 use crate::commands::semantic_search::plan_table::SearchLaneKind;
-use crate::context::SemanticIndexStatus;
+use crate::data_layer::status::SemanticIndexStatus;
 use crate::search_index::IndexStatus;
 
 const SEMANTIC_REASON: &str = "semantic:";

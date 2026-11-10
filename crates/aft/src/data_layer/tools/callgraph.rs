@@ -109,10 +109,10 @@ pub(crate) fn ops_graph(
     ctx: &AppContext,
     files: &[&Path],
 ) -> Result<(OpsGraph, Option<CheckoutView>), crate::protocol::Response> {
+    use crate::callgraph_store::access::CallgraphStoreAccess;
     use crate::commands::callgraph_store_adapter::{
         index_refusal_response, not_indexed_response, store_error_response,
     };
-    use crate::context::CallgraphStoreAccess;
     #[cfg(not(feature = "wasm-grammars"))]
     for file in files {
         if let Err(error) = super::super::grammar::prepare(ctx, file) {

@@ -4,6 +4,7 @@
 //! the reader contract used by navigation commands. The retired SQLite store
 //! no longer owns builds, generations, readers, or refresh workers here.
 
+pub mod access;
 pub(crate) mod disk_facts;
 pub(crate) mod fact_answers;
 pub(crate) mod facts;

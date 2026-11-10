@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::commands::semantic_search::waits::{self, SearchWait};
-use crate::context::{AppContext, SemanticIndexStatus};
+use crate::context::AppContext;
 use crate::data_layer::meaning::{self, FillFailure, MeaningState};
+use crate::data_layer::status::SemanticIndexStatus;
 use crate::data_layer::vectors::{Coverage, MeaningSnapshot};
 use crate::semantic_index::{SemanticIndex, SemanticResult, SemanticSkipReason};
 

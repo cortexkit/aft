@@ -11,7 +11,8 @@
 
 use serde_json::{json, Value};
 
-use crate::context::{AppContext, SemanticIndexStatus};
+use crate::context::AppContext;
+use crate::data_layer::status::SemanticIndexStatus;
 
 /// One background index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -391,9 +392,9 @@ pub const fn local_semantic_platform_supported() -> bool {
 /// same state it acted on.
 pub fn callgraph_access_observation(
     ctx: &AppContext,
-    access: &crate::context::CallgraphStoreAccess,
+    access: &crate::callgraph_store::access::CallgraphStoreAccess,
 ) -> IndexObservation {
-    use crate::context::CallgraphStoreAccess;
+    use crate::callgraph_store::access::CallgraphStoreAccess;
     match access {
         CallgraphStoreAccess::Off => IndexObservation::off(),
         CallgraphStoreAccess::Building => IndexObservation::building(),

@@ -375,7 +375,7 @@ pub(crate) fn grep_fan_out(
                         return (
                             has_files,
                             crate::grep_executor::failed_index_grep(std::io::Error::other(
-                                crate::context::view_load_failure_message(error),
+                                crate::data_layer::status::view_load_failure_message(error),
                             )),
                             crate::search_index::GrepQueryPhaseTimings::default(),
                         );

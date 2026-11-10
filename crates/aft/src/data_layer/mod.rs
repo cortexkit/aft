@@ -52,6 +52,7 @@ mod site_records_tests;
 pub(crate) mod slice;
 pub(crate) mod slice_cache;
 pub mod standing;
+pub mod status;
 pub(crate) mod subjects;
 pub mod surfaces;
 pub mod symbol_prewarm_measure;
