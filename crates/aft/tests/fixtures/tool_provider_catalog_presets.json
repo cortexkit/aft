@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "dd96eb1c9179a49d674054f1997e34fa543690a5ce084659bd407de47fe317d1",
-      "catalog_digest": "dd96eb1c9179a49d674054f1997e34fa543690a5ce084659bd407de47fe317d1",
+      "generation": "dc34c0ff86e4b70b218748650092b14f1398a7ac76cf6f6348f4da49ddb18cb4",
+      "catalog_digest": "dc34c0ff86e4b70b218748650092b14f1398a7ac76cf6f6348f4da49ddb18cb4",
       "tools": [
         {
           "name": "status",
@@ -1279,8 +1279,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "8b4648b0c63815887f24c5a080de69e0455c51e173aaea95aea60ba4b2a543ee",
-      "catalog_digest": "8b4648b0c63815887f24c5a080de69e0455c51e173aaea95aea60ba4b2a543ee",
+      "generation": "b555e10152d579801d410523c02b7d29faa8c1e5c035c2151f32426b8943a5d2",
+      "catalog_digest": "b555e10152d579801d410523c02b7d29faa8c1e5c035c2151f32426b8943a5d2",
       "tools": [
         {
           "name": "status",
@@ -3530,8 +3530,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "f035817d61cf54ba09841e2e5d003300c4f618daebe239fd91048c78d14bb607",
-      "catalog_digest": "f035817d61cf54ba09841e2e5d003300c4f618daebe239fd91048c78d14bb607",
+      "generation": "1ec29b24c35b04e0ab5997f5c7d35313b8d16e223d6078968f80325e5e046a5e",
+      "catalog_digest": "1ec29b24c35b04e0ab5997f5c7d35313b8d16e223d6078968f80325e5e046a5e",
       "tools": [
         {
           "name": "status",
@@ -4812,8 +4812,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "7e1f417e335ba9a6c8e7656f6d0270df534a93edd9c7a8a8ef2d95088b769660",
-      "catalog_digest": "7e1f417e335ba9a6c8e7656f6d0270df534a93edd9c7a8a8ef2d95088b769660",
+      "generation": "f3c86d99fa2e7db07f6518745cefde2fabf74380e12a0809c7139a6ff7b35a40",
+      "catalog_digest": "f3c86d99fa2e7db07f6518745cefde2fabf74380e12a0809c7139a6ff7b35a40",
       "tools": [
         {
           "name": "status",
