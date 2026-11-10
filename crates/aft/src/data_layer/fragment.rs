@@ -19,7 +19,10 @@ use crate::callgraph_store::join::record::{
 };
 use crate::callgraph_store::join::{BlobRefKind, DerivedRow, ResolutionStatus};
 
-const FORMAT: u8 = 1;
+#[path = "fragment_strings.rs"]
+mod strings;
+
+const FORMAT: u8 = 2;
 
 const KINDS: [BlobRefKind; 9] = [
     BlobRefKind::Construction,
@@ -108,7 +111,7 @@ pub(crate) fn encode(file: &FileResolution) -> Vec<u8> {
     for key in &file.site_dependencies {
         out.str(key);
     }
-    out.finish()
+    strings::encode(&out.finish())
 }
 
 /// Decodes a fragment of the file at `path` whose content record has the
@@ -118,6 +121,15 @@ pub(crate) fn encode(file: &FileResolution) -> Vec<u8> {
 ///
 /// When the bytes are not a fragment this build wrote.
 pub(crate) fn decode(
+    record_key: &str,
+    path: &str,
+    bytes: &[u8],
+) -> Result<FileResolution, DecodeError> {
+    let expanded = strings::decode(bytes)?;
+    decode_expanded(record_key, path, &expanded)
+}
+
+fn decode_expanded(
     record_key: &str,
     path: &str,
     bytes: &[u8],
@@ -207,4 +219,96 @@ pub(crate) fn decode(
         sites,
         site_dependencies,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragment_front_coding_roundtrip_and_every_truncation_is_rejected() {
+        let resolution = FileResolution {
+            site_dependencies: [
+                "r:src/long/path/é.rs",
+                "t:src/long/path/é.rs\tÉclair",
+                "t:src/long/path/é.rs\tÉtape",
+                "ret:src/long/path/é.rs\tmake",
+                "f:src/long/path/é.rs\tÉclair\tname",
+                "d:src/long/path\tMissing",
+                "m:run",
+                "g:",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            ..FileResolution::default()
+        };
+        let bytes = encode(&resolution);
+        assert_eq!(decode("record", "caller.rs", &bytes).unwrap(), resolution);
+        for end in 0..bytes.len() {
+            assert!(
+                decode("record", "caller.rs", &bytes[..end]).is_err(),
+                "accepted truncation at {end}"
+            );
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode("record", "caller.rs", &trailing).is_err());
+    }
+}
+
+#[cfg(test)]
+mod decode_probe {
+    use super::*;
+    use aft_store::cache::BlockCache;
+    use aft_store::graph::GraphSegment;
+    use aft_store::ids::{Digest128, FamilyId};
+    use aft_store::segment::{Segment, BLOCK_LEN};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "requires a persisted AFT_FRAGMENT_PROBE segment"]
+    fn fragment_front_coding_corpus_decode_cost() {
+        let path = std::env::var("AFT_FRAGMENT_PROBE").expect("segment path required");
+        let header = std::fs::read(&path).unwrap();
+        let family =
+            FamilyId::from_digest(Digest128::from_bytes(header[16..32].try_into().unwrap()));
+        let segment = Segment::open(
+            std::path::Path::new(&path),
+            family,
+            &super::super::graph_store::known_sections(),
+            Arc::new(BlockCache::new(16 * BLOCK_LEN)),
+        )
+        .unwrap();
+        let graph = GraphSegment::open(&segment).unwrap().unwrap();
+        let records = (0..graph.len())
+            .map(|ordinal| {
+                let coded = graph.fragment(ordinal).unwrap();
+                let expanded = strings::decode(&coded).unwrap();
+                let original = decode_expanded("probe", "probe", &expanded).unwrap();
+                let compacted = decode("probe", "probe", &coded).unwrap();
+                assert_eq!(compacted, original);
+                (coded, expanded)
+            })
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty());
+        let mut timings = Vec::new();
+        for _ in 0..3 {
+            let started = Instant::now();
+            for (_, expanded) in &records {
+                std::hint::black_box(decode_expanded("probe", "probe", expanded).unwrap());
+            }
+            let original_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let started = Instant::now();
+            for (coded, _) in &records {
+                std::hint::black_box(decode("probe", "probe", coded).unwrap());
+            }
+            timings.push(serde_json::json!({"original_ms": original_ms, "front_coded_ms": started.elapsed().as_secs_f64() * 1000.0}));
+        }
+        println!(
+            "FRAGMENT_DECODE_COST {}",
+            serde_json::json!({"records": records.len(), "runs": timings})
+        );
+    }
 }
