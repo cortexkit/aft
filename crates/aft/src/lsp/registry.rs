@@ -327,6 +327,14 @@ pub struct ServerDef {
 }
 
 impl ServerDef {
+    pub(crate) fn has_configured_typescript_binary(&self, config: &Config) -> bool {
+        self.kind == ServerKind::TypeScript
+            && config
+                .lsp_servers
+                .iter()
+                .any(|server| server.id == "typescript" && !server.binary.is_empty())
+    }
+
     /// Return executable names in preference order. Docker's upstream server
     /// takes precedence over the older npm server, which remains the fallback.
     pub fn binary_candidates(&self) -> Vec<String> {
@@ -1424,9 +1432,12 @@ fn select_typescript_server(
     config: &Config,
     mode: RootPathMode,
 ) -> ServerDef {
-    // Only the built-in program is swapped: a user who pointed the
-    // `typescript` server at another binary has chosen their own server.
-    if server.kind != ServerKind::TypeScript || server.binary != TYPESCRIPT_LANGUAGE_SERVER {
+    // An explicit binary remains user-managed even when its name is the same
+    // as the built-in default.
+    if server.kind != ServerKind::TypeScript
+        || server.binary != TYPESCRIPT_LANGUAGE_SERVER
+        || server.has_configured_typescript_binary(config)
+    {
         return server;
     }
     let project_root = config.project_root.as_deref();
@@ -1880,6 +1891,81 @@ mod tests {
         assert_eq!(server_root("cli"), root);
         assert_eq!(server_root("plugin"), root);
         assert_eq!(server_root("old"), root.join("packages/old"));
+    }
+
+    #[test]
+    fn typescript_server_sharing_compares_sdk_not_shim_versions() {
+        for (root_sdk, nested_sdk, nested_shim, share) in [
+            ("6.0.3", None, "6.0.9", true),
+            ("6.0.3", Some("6.0.3"), "6.0.9", true),
+            ("6.0.3", Some("6.0.4"), "6.0.2", false),
+            ("next", None, "6.0.2", true),
+            ("next", Some("next"), "6.0.2", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::inspect::job::canonicalize_normalized(temp.path());
+            let nested = root.join("nested");
+            for (package, shim_version) in [(&root, "6.0.2"), (&nested, nested_shim)] {
+                write_file(&package.join("package.json"), "{}");
+                write_file(&package.join("index.ts"), "");
+                write_file(
+                    &package.join("node_modules").join("typescript").join("package.json"),
+                    &serde_json::json!({"version": shim_version, "dependencies": {"legacy": "npm:typescript"}}).to_string(),
+                );
+            }
+            for (package, version) in std::iter::once((&root, root_sdk))
+                .chain(nested_sdk.map(|version| (&nested, version)))
+            {
+                let sdk = package.join("node_modules").join("legacy");
+                write_file(
+                    &sdk.join("package.json"),
+                    &serde_json::json!({"version": version}).to_string(),
+                );
+                write_file(&sdk.join("lib").join("tsserver.js"), "");
+            }
+            let config = Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            };
+            let file = nested.join("index.ts");
+            let server = typescript_server(&file, &config).unwrap();
+            assert_eq!(server.kind, ServerKind::TypeScript);
+            assert_eq!(
+                server.workspace_root_for_file_with_project_root(&file, Some(&root)),
+                Some(if share { root } else { nested })
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typescript_shims_share_an_unversioned_sdk_through_distinct_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let nested = root.join("nested");
+        let sdk = root.join("sdk");
+        write_file(&sdk.join("package.json"), "{}");
+        write_file(&sdk.join("lib").join("tsserver.js"), "");
+        for package in [&root, &nested] {
+            write_file(&package.join("package.json"), "{}");
+            write_file(&package.join("index.ts"), "");
+            let modules = package.join("node_modules");
+            write_file(
+                &modules.join("typescript").join("package.json"),
+                r#"{"version":"6.0.2","dependencies":{"legacy":"npm:typescript"}}"#,
+            );
+            std::os::unix::fs::symlink(&sdk, modules.join("legacy")).unwrap();
+        }
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let file = nested.join("index.ts");
+        let server = typescript_server(&file, &config).unwrap();
+        assert_eq!(
+            server.workspace_root_for_file_with_project_root(&file, Some(&root)),
+            Some(root)
+        );
     }
 
     /// One parse serves every file of a walk, including a configuration above

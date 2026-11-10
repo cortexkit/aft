@@ -15,20 +15,20 @@
 //! the installed compiler.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use super::environmental::TS_NATIVE_NO_TSSERVER;
 
 thread_local! {
-    /// How many `node_modules/typescript/package.json` reads this thread has
+    /// How many installed TypeScript package reads this thread has
     /// attempted. Per thread so a test can count its own lookups while other
     /// tests run in parallel.
     static PACKAGE_JSON_READS: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Attempted `node_modules/typescript/package.json` reads on this thread.
+/// Attempted installed TypeScript package reads on this thread.
 #[cfg(test)]
 pub(crate) fn package_json_reads_on_this_thread() -> u64 {
     PACKAGE_JSON_READS.with(Cell::get)
@@ -42,13 +42,13 @@ pub(crate) const NATIVE_SERVER_INFO_NAME: &str = "typescript-go";
 /// The mode is not listed in `tsc --help`, but `tsc --lsp --help` documents it.
 pub(crate) const NATIVE_SERVER_ARGS: [&str; 2] = ["--lsp", "--stdio"];
 
-/// The TypeScript package a project has installed, read from the nearest
-/// `node_modules/typescript/package.json`.
+/// An installed TypeScript package, either the project's direct dependency
+/// or the SDK behind a shim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectTypeScript {
     /// The package.json `version`, or "unknown" when it has none.
     pub(crate) version: String,
-    /// The `node_modules/typescript` directory.
+    /// The installed package directory.
     pub(crate) package_dir: PathBuf,
 }
 
@@ -79,26 +79,103 @@ impl ProjectTypeScript {
         path.is_file()
     }
 
-    /// Read the package at `package_dir` (a `node_modules/typescript`
-    /// directory). `None` when it has no package.json.
+    /// Find the SDK supplied by this package or its runtime TypeScript aliases.
+    pub(crate) fn resolved_tsserver(&self) -> Option<Self> {
+        // Malformed installs can contain cycles or arbitrarily long alias chains.
+        const PACKAGE_BUDGET: usize = 16;
+        let mut pending = VecDeque::from([self.package_dir.clone()]);
+        let mut visited = HashSet::new();
+        while let Some(package_dir) = pending.pop_front() {
+            if visited.len() == PACKAGE_BUDGET {
+                break;
+            }
+            super::applicability_cache::observe_path(&package_dir);
+            let real_dir = crate::inspect::job::canonicalize_normalized(&package_dir);
+            if !visited.insert(real_dir.clone()) {
+                continue;
+            }
+            super::applicability_cache::observe_path(&real_dir.join("package.json"));
+            super::applicability_cache::observe_path(&real_dir.join("lib").join("tsserver.js"));
+            let Some((package, manifest)) = Self::read_with_manifest(&package_dir) else {
+                continue;
+            };
+            if package.has_tsserver() {
+                return Some(package);
+            }
+            let Some(dependencies) = manifest
+                .get("dependencies")
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            for (name, spec) in dependencies {
+                if spec.as_str().is_some_and(|spec| {
+                    spec == "npm:typescript" || spec.starts_with("npm:typescript@")
+                }) {
+                    if let Some(dependency) = resolve_alias_dependency(&real_dir, name) {
+                        pending.push_back(dependency);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Read an installed package. `None` when its package.json cannot be read.
     pub(crate) fn read(package_dir: &Path) -> Option<Self> {
+        Self::read_with_manifest(package_dir).map(|(package, _)| package)
+    }
+
+    fn read_with_manifest(package_dir: &Path) -> Option<(Self, serde_json::Value)> {
         PACKAGE_JSON_READS.with(|reads| reads.set(reads.get() + 1));
         let path = package_dir.join("package.json");
         super::applicability_cache::observe_path(&path);
         let bytes = std::fs::read(path).ok()?;
-        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|json| {
-                json.get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
+        let manifest = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
+        let version = manifest
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
             .unwrap_or_else(|| "unknown".into());
-        Some(Self {
+        let package = Self {
             version,
             package_dir: package_dir.to_path_buf(),
-        })
+        };
+        Some((package, manifest))
     }
+}
+
+/// Node resolves dependencies relative to the real importer, not its symlink
+/// in the project's node_modules. Isolated package stores rely on this rule.
+fn resolve_alias_dependency(importer: &Path, name: &str) -> Option<PathBuf> {
+    let parts: Vec<_> = name.split('/').collect();
+    let valid = match parts.as_slice() {
+        [package] => !package.starts_with('@') && !package.is_empty(),
+        [scope, package] => scope.starts_with('@') && scope.len() > 1 && !package.is_empty(),
+        _ => false,
+    };
+    if !valid
+        || parts
+            .iter()
+            .any(|part| matches!(*part, "." | "..") || part.contains(['\\', ':']))
+    {
+        return None;
+    }
+    for ancestor in importer.ancestors() {
+        if ancestor
+            .file_name()
+            .is_some_and(|name| name == "node_modules")
+        {
+            continue;
+        }
+        let candidate = ancestor.join("node_modules").join(name);
+        let manifest = candidate.join("package.json");
+        super::applicability_cache::observe_path(&manifest);
+        if manifest.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Find the project's own TypeScript package for `source_file`, walking up to
@@ -383,15 +460,17 @@ pub(crate) fn shared_typescript_server_root(
     if let Some(root) = shared_root_memo().lock().get(&key) {
         return root.clone();
     }
-    // Identifies the TypeScript installation a directory's files would load:
-    // its version, or the package path when the version is unreadable, so two
-    // unreadable installations never count as the same one.
+    // Compare the SDK that will actually be loaded, rather than a shim's
+    // version. Unreadable versions only share when their real paths match.
     let typescript_of = |dir: &Path| {
         find_project_typescript_package(&dir.join("package.json"), &project_root).map(|found| {
-            if found.version == "unknown" {
-                found.package_dir.to_string_lossy().into_owned()
+            let sdk = found.resolved_tsserver().unwrap_or(found);
+            if sdk.major().is_none() {
+                crate::inspect::job::canonicalize_normalized(&sdk.package_dir)
+                    .to_string_lossy()
+                    .into_owned()
             } else {
-                found.version
+                sdk.version
             }
         })
     };
@@ -607,6 +686,136 @@ mod tests {
     fn write(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
+    }
+
+    fn alias_package(package: &Path, version: &str, aliases: serde_json::Value) {
+        write(
+            &package.join("package.json"),
+            &serde_json::json!({"version": version, "dependencies": aliases}).to_string(),
+        );
+    }
+
+    #[test]
+    fn shim_sdk_resolution_accepts_versioned_and_versionless_runtime_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let modules = temp.path().join("node_modules");
+        let shim = modules.join("typescript");
+        let sdk = modules.join("@typescript").join("old");
+        alias_package(&sdk, "6.0.3", serde_json::json!({}));
+        write(&sdk.join("lib").join("tsserver.js"), "");
+        for spec in ["npm:typescript@6.0.3", "npm:typescript"] {
+            alias_package(&shim, "6.0.2", serde_json::json!({"@typescript/old": spec}));
+            let resolved = ProjectTypeScript::read(&shim)
+                .unwrap()
+                .resolved_tsserver()
+                .unwrap();
+            assert_eq!(resolved.package_dir, sdk);
+            assert_eq!(resolved.version, "6.0.3");
+        }
+        for spec in ["npm:typescript-other@6", "6.0.3"] {
+            alias_package(&shim, "6.0.2", serde_json::json!({"@typescript/old": spec}));
+            assert!(ProjectTypeScript::read(&shim)
+                .unwrap()
+                .resolved_tsserver()
+                .is_none());
+        }
+        write(
+            &shim.join("package.json"),
+            r#"{"version":"6.0.2","devDependencies":{"@typescript/old":"npm:typescript"}}"#,
+        );
+        assert!(ProjectTypeScript::read(&shim)
+            .unwrap()
+            .resolved_tsserver()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_shims_resolve_sdk_aliases_inside_isolated_package_stores() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        for store in [".bun", ".pnpm"] {
+            let modules = root.join(store).join("shim@6.0.2").join("node_modules");
+            let shim = modules.join("@typescript").join("typescript6");
+            alias_package(
+                &shim,
+                "6.0.2",
+                serde_json::json!({"@typescript/old": "npm:typescript@6"}),
+            );
+            let sdk = root.join(store).join("sdk@6.0.3");
+            alias_package(&sdk, "6.0.3", serde_json::json!({}));
+            write(&sdk.join("lib").join("tsserver.js"), "");
+            std::os::unix::fs::symlink(&sdk, modules.join("@typescript").join("old")).unwrap();
+            let project_modules = root.join(store).join("app").join("node_modules");
+            std::fs::create_dir_all(&project_modules).unwrap();
+            let linked_shim = project_modules.join("typescript");
+            std::os::unix::fs::symlink(&shim, &linked_shim).unwrap();
+            let resolved = ProjectTypeScript::read(&linked_shim)
+                .unwrap()
+                .resolved_tsserver()
+                .unwrap();
+            assert_eq!(std::fs::canonicalize(resolved.package_dir).unwrap(), sdk);
+            assert_eq!(resolved.version, "6.0.3");
+        }
+    }
+
+    #[test]
+    fn shim_sdk_resolution_bounds_cycles_and_long_chains() {
+        let temp = tempfile::tempdir().unwrap();
+        let modules = temp.path().join("node_modules");
+        let shim = modules.join("typescript");
+        alias_package(
+            &shim,
+            "6.0.2",
+            serde_json::json!({"legacy0": "npm:typescript"}),
+        );
+        let first = modules.join("legacy0");
+        alias_package(
+            &first,
+            "6.0.2",
+            serde_json::json!({"typescript": "npm:typescript"}),
+        );
+        let package = ProjectTypeScript::read(&shim).unwrap();
+        let before = package_json_reads_on_this_thread();
+        assert_eq!(package.resolved_tsserver(), None);
+        assert_eq!(package_json_reads_on_this_thread() - before, 2);
+
+        for i in 0..24 {
+            alias_package(
+                &modules.join(format!("legacy{i}")),
+                "6.0.2",
+                serde_json::json!({format!("legacy{}", i + 1): "npm:typescript"}),
+            );
+        }
+        let far_sdk = modules.join("legacy24");
+        alias_package(&far_sdk, "6.0.3", serde_json::json!({}));
+        write(&far_sdk.join("lib").join("tsserver.js"), "");
+        let before = package_json_reads_on_this_thread();
+        assert_eq!(package.resolved_tsserver(), None);
+        assert_eq!(package_json_reads_on_this_thread() - before, 16);
+        write(&first.join("lib").join("tsserver.js"), "");
+        assert_eq!(package.resolved_tsserver().unwrap().package_dir, first);
+    }
+
+    #[test]
+    fn shim_sdk_resolution_ignores_dependency_path_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim = temp.path().join("node_modules").join("typescript");
+        let outside = temp.path().join("outside");
+        alias_package(&outside, "6.0.3", serde_json::json!({}));
+        write(&outside.join("lib").join("tsserver.js"), "");
+        for name in [
+            "../outside",
+            "..\\outside",
+            "@scope/../../outside",
+            "C:\\outside",
+        ] {
+            alias_package(&shim, "6.0.2", serde_json::json!({name: "npm:typescript"}));
+            assert_eq!(
+                ProjectTypeScript::read(&shim).unwrap().resolved_tsserver(),
+                None
+            );
+        }
     }
 
     #[test]

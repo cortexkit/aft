@@ -2068,3 +2068,50 @@ fn applicability_walk_kept_create_records_the_inputs_it_read() {
         "removing an install the kept create read must walk again"
     );
 }
+
+#[test]
+fn applicability_walk_rechecks_missing_external_shim_sdk_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = base.join("project");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("package.json"), "{}").unwrap();
+    std::fs::write(root.join("index.ts"), "").unwrap();
+    let shim = root.join("node_modules").join("typescript");
+    std::fs::create_dir_all(&shim).unwrap();
+    std::fs::write(
+        shim.join("package.json"),
+        r#"{"version":"6.0.2","dependencies":{"legacy":"npm:typescript"}}"#,
+    )
+    .unwrap();
+    let mut config = config(&root);
+    config
+        .disabled_lsp
+        .extend(["biome".into(), "oxlint".into()]);
+    let cache = ApplicabilityCache::default();
+    let walk = || {
+        cache
+            .walk(
+                &root,
+                &config,
+                Instant::now() + Duration::from_secs(10),
+                || Ok(scan(&root, &config)),
+            )
+            .unwrap()
+    };
+    walk();
+    walk();
+    assert_eq!(cache.metrics(&root).full_walks, 1);
+
+    // Hoisted dependencies outside the watched project need stat rechecks,
+    // including paths that did not exist during the first applicability scan.
+    let sdk = base.join("node_modules").join("legacy");
+    std::fs::create_dir_all(&sdk).unwrap();
+    std::fs::write(sdk.join("package.json"), r#"{"version":"6.0.3"}"#).unwrap();
+    walk();
+    assert_eq!(cache.metrics(&root).full_walks, 2);
+    std::fs::create_dir_all(sdk.join("lib")).unwrap();
+    std::fs::write(sdk.join("lib").join("tsserver.js"), "").unwrap();
+    walk();
+    assert_eq!(cache.metrics(&root).full_walks, 3);
+}

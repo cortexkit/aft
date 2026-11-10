@@ -1,0 +1,1 @@
+- TypeScript shims now use their installed SDK dependencies, and configured TypeScript language servers can manage their own SDK discovery (#1416).
