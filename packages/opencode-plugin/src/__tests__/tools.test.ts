@@ -126,8 +126,17 @@ describe("Tool round-trips", () => {
     }
     const golden = await readFile(resolve(fixtureRoot, "structure.txt"), "utf8");
     const tools = readingTools(createPluginContext(pool));
-    expect(await tools.aft_outline.execute({ target: paths }, sdkCtx)).toBe(golden);
-    expect(await tools.aft_outline.execute({ target: directory }, sdkCtx)).toBe(golden);
+    // The status bar is appended only when a count changed since the session
+    // last saw it, for example when the background TODO count first arrives
+    // mid-test. That is timing, not outline structure; the bar has its own
+    // tests.
+    const withoutStatusBar = (text: string) => text.replace(/\n*\[AFT [^\]\n]*\]\s*$/, "\n");
+    expect(withoutStatusBar(await tools.aft_outline.execute({ target: paths }, sdkCtx))).toBe(
+      golden,
+    );
+    expect(withoutStatusBar(await tools.aft_outline.execute({ target: directory }, sdkCtx))).toBe(
+      golden,
+    );
   });
 
   test("batched zoom surfaces both successes and per-symbol failures", () => {
