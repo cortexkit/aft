@@ -40,7 +40,7 @@ jobs:
           bash --version | head -1
           git --version
           git config --get core.longpaths || echo "core.longpaths unset"
-          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          if command -v pwsh >/dev/null; then pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; else echo "pwsh not on PATH"; fi
       - name: Cold cargo check, library and all test targets (timed)
         run: |
           set -euo pipefail
