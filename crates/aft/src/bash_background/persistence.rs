@@ -3258,9 +3258,14 @@ where
         let runner_completion_offers = metadata
             .runner_completion_offers
             .max(original.runner_completion_offers);
+        let runner_completion_notice = original
+            .runner_completion_notice
+            .clone()
+            .or(metadata.runner_completion_notice);
         metadata = original;
         metadata.completion_delivered = completion_delivered;
         metadata.runner_completion_offers = runner_completion_offers;
+        metadata.runner_completion_notice = runner_completion_notice;
         metadata.schema_version = SCHEMA_VERSION;
     }
     write_task_at(task, &metadata)?;

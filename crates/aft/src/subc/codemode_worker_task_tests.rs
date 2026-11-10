@@ -17,7 +17,7 @@ fn fixture() -> Fixture {
     let (root_dir, root) = test_root("codemode-worker-background");
     let storage = tempfile::tempdir().unwrap();
     let mut carrier = caller_route(&root, "reserved:prefrontal-core", "runner");
-    let mut worker = caller_route(&root, "test:worker-runner", "runner");
+    let mut worker = caller_route(&root, "reserved:broca", "runner");
     let mut run = caller_route(&root, "reserved:prefrontal-core", "runner");
     for (route, session) in [
         (&mut carrier, "worker-session"),
@@ -207,7 +207,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
         _ => panic!("worker run must resolve its owner"),
     };
     let expected = TaskIdentity {
-        principal: Some("test:worker-runner".into()),
+        principal: Some("reserved:broca".into()),
         harness: "runner".into(),
         session: "worker-session".into(),
     };
@@ -308,7 +308,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
         panic!("the same program must be able to observe the task it launched");
     };
     assert_eq!(program_observer.task_identity(), expected);
-    let mut other_session = caller_route(&f.root, "test:worker-runner", "runner");
+    let mut other_session = caller_route(&f.root, "reserved:broca", "runner");
     let mut other_principal = caller_route(&f.root, "test:another-runner", "runner");
     for (route, session) in [
         (&mut other_session, "other-worker"),

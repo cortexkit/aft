@@ -29,6 +29,10 @@ fn runner_alias_switch_preserves_task_ownership_and_persisted_keys() {
         let identity =
             crate::bash_background::TaskIdentity::from_principal(&principal(raw)).unwrap();
         assert_eq!(identity, canonical);
+        assert_eq!(
+            super::super::tool_provider::ledger_carrier(&principal(raw)),
+            super::super::tool_provider::ledger_carrier(&principal("runner"))
+        );
         let saved: crate::bash_background::TaskIdentity = serde_json::from_value(
             json!({"principal":"reserved:broca", "harness":raw, "session":"session-7"}),
         )
@@ -236,4 +240,21 @@ fn runner_notices_only_completions_on_heads_may_start_idle_runs() {
     }
     assert!(read_reply::<SendReply>(br#"{"result":{"state":"pending"},"extra":true}"#).is_err());
     assert!(read_reply::<SendReply>(br#"{"state":"pending"}"#).is_err());
+}
+
+#[test]
+fn runner_notices_readable_sender_grant_can_disable_idle_start() {
+    use cortexkit_role_llm_runner::read::{HeadMeta, HeadSender};
+    let head = HeadMeta::empty(1, "incarnation");
+    assert_eq!(idle_start_grant(&head), None);
+    let limited = head.clone().with_sender(HeadSender::new(
+        vec!["tool_result".into(), "steer".into()],
+        false,
+    ));
+    assert_eq!(idle_start_grant(&limited), Some(false));
+    let full = head.with_sender(HeadSender::new(
+        vec!["tool_result".into(), "steer".into(), "idle_start".into()],
+        false,
+    ));
+    assert_eq!(idle_start_grant(&full), Some(true));
 }

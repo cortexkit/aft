@@ -13,21 +13,36 @@ const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const RUNNER_CARRIERS: &[&str] = &["reserved:thalamus-harness", "reserved:broca"];
 static CONNECTION: OnceLock<std::sync::RwLock<PathBuf>> = OnceLock::new();
-static ACTIVE: AtomicU64 = AtomicU64::new(0);
-
-struct Active;
-impl Drop for Active {
-    fn drop(&mut self) {
-        ACTIVE.fetch_sub(1, Ordering::AcqRel);
+fn enqueue_work(work: impl FnOnce() + Send + 'static) -> bool {
+    type Work = Box<dyn FnOnce() + Send>;
+    static QUEUE: OnceLock<Result<std::sync::mpsc::SyncSender<Work>, String>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Work>(1024);
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        for _ in 0..16 {
+            let receiver = receiver.clone();
+            std::thread::Builder::new()
+                .name("aft-runner-notice".into())
+                .spawn(move || loop {
+                    let work = receiver.lock().unwrap().recv();
+                    let Ok(work) = work else { return };
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+                        log::error!(
+                            "runner notice worker panicked; persisted completion remains pending"
+                        );
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(sender)
+    });
+    match queue {
+        Ok(sender) => sender.try_send(Box::new(work)).is_ok(),
+        Err(error) => {
+            log::error!("runner notice workers unavailable: {error}");
+            false
+        }
     }
-}
-fn reserve() -> Option<Active> {
-    ACTIVE
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < 32).then_some(active + 1)
-        })
-        .ok()
-        .map(|_| Active)
 }
 
 pub(super) fn install(path: PathBuf) {
@@ -68,10 +83,6 @@ pub(super) fn warning(
         return;
     };
     for warning in &warning.warnings {
-        let Some(active) = reserve() else {
-            log::warn!("runner warning deferred: notice workers busy");
-            return;
-        };
         let root_key = blake3::hash(root.as_path().to_string_lossy().as_bytes());
         let warning_key = blake3::hash(&serde_json::to_vec(warning).unwrap());
         let id = format!("aft:warning:{root_key}:{warning_key}");
@@ -83,23 +94,23 @@ pub(super) fn warning(
         );
         let address = address.clone();
         let path = path.clone();
-        let _ = std::thread::Builder::new()
-            .name("aft-runner-warning".into())
-            .spawn(move || {
-                let _active = active;
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                deliver(
-                    &request.send_id,
-                    0,
-                    |_| Some(runtime.block_on(send(&path, &address, &request))),
-                    std::thread::sleep,
-                );
-            });
+        if !enqueue_work(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            deliver(
+                &request.send_id,
+                0,
+                |_| Some(runtime.block_on(send(&path, &address, &request))),
+                std::thread::sleep,
+            );
+        }) {
+            log::warn!("runner warning deferred: notice queue full");
+            return;
+        }
     }
 }
 
@@ -307,11 +318,37 @@ async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome 
     if let Some(outcome) = test_endpoint::send(address, request) {
         return outcome;
     }
+    match call(path, address, envelope(request)).await {
+        Ok(bytes) => match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&bytes) {
+            Ok(_) => Outcome::Accepted,
+            Err(_) => Outcome::Retry,
+        },
+        Err(outcome) => outcome,
+    }
+}
+
+fn idle_start_grant(head: &cortexkit_role_llm_runner::read::HeadMeta) -> Option<bool> {
+    head.sender
+        .as_ref()
+        .map(|sender| sender.modes.iter().any(|mode| mode == "idle_start"))
+}
+
+async fn read_idle_start_grant(path: &Path, address: &Address) -> Option<bool> {
+    let body = serde_json::to_vec(&json!({"method":"session.head", "params":cortexkit_role_llm_runner::read::HeadRequest::default()})).ok()?;
+    let bytes = call(path, address, body).await.ok()?;
+    let head = cortexkit_role_llm_runner::wire::read_reply::<
+        cortexkit_role_llm_runner::read::HeadMeta,
+    >(&bytes)
+    .ok()?;
+    idle_start_grant(&head)
+}
+
+async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, Outcome> {
     let Some(principal) = crate::launch_nonce::consumer_identity() else {
-        return Outcome::Retry;
+        return Err(Outcome::Retry);
     };
     let Ok(consumer) = SubcConsumer::connect(path, ConsumerOptions::default()).await else {
-        return Outcome::Retry;
+        return Err(Outcome::Retry);
     };
     let target = RouteTarget::ManagementSurface {
         module_id: address.module.clone(),
@@ -343,7 +380,7 @@ async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome 
             let result = consumer
                 .request(
                     &route,
-                    envelope(request),
+                    body,
                     CallOptions {
                         timeout: Duration::from_secs(5),
                         ..CallOptions::default()
@@ -354,17 +391,13 @@ async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome 
                 .close_handle(&route, CloseRouteOptions::default())
                 .await;
             match result {
-                Ok(bytes) => match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&bytes)
-                {
-                    Ok(_) => Outcome::Accepted,
-                    Err(_) => Outcome::Retry,
-                },
-                Err(CallError::Module(error)) => refusal(&error.code),
-                Err(_) => Outcome::Retry,
+                Ok(bytes) => Ok(bytes),
+                Err(CallError::Module(error)) => Err(refusal(&error.code)),
+                Err(_) => Err(Outcome::Retry),
             }
         }
-        Err(CallError::Module(error)) => refusal(&error.code),
-        Err(_) => Outcome::Retry,
+        Err(CallError::Module(error)) => Err(refusal(&error.code)),
+        Err(_) => Err(Outcome::Retry),
     };
     let _ = consumer.close().await;
     result
@@ -387,104 +420,98 @@ pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: P
     let Some(path) = path else {
         return false;
     };
-    let Some(active) = reserve() else {
-        return false;
-    };
     let task_id = task_id.clone();
-    let spawned = std::thread::Builder::new()
-        .name("aft-runner-notice".into())
-        .spawn(move || {
-            let _active = active;
-            let _identity = crate::bash_background::task_identity_scope(Some(owner.clone()));
-            let Some(metadata) = registry.notice_metadata(&task_id) else {
-                return;
-            };
-            let raw = metadata
-                .launching_raw_harness
-                .clone()
-                .unwrap_or_else(|| owner.harness.clone());
-            let Some(address) = Address::new(&owner, raw, metadata.scope.as_ref()) else {
-                return;
-            };
-            let (id, text, completion) = match &frame {
-                PushFrame::BashCompleted(_) => {
-                    let value = serde_json::to_value(&frame).unwrap();
-                    (
-                        format!("aft:bash:{task_id}"),
-                        super::bash_notice_text::completion(&value),
-                        true,
-                    )
-                }
-                PushFrame::BashLongRunning(frame) => (
-                    format!("aft:bash-reminder:{task_id}:{}", frame.elapsed_ms),
-                    super::bash_notice_text::long_running(&serde_json::to_value(frame).unwrap()),
-                    false,
-                ),
-                PushFrame::BashPatternMatch(frame) => (
-                    format!(
-                        "aft:bash-watch:{}:{}",
-                        frame.watch_id,
-                        blake3::hash(&serde_json::to_vec(frame).unwrap())
-                    ),
-                    super::bash_notice_text::watch(&serde_json::to_value(frame).unwrap()),
-                    false,
-                ),
-                _ => unreachable!(),
-            };
-            let request = request(id, text, completion, address.worker);
-            let request = if completion {
-                match registry.freeze_runner_completion_notice(&owner.session, &task_id, request) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        log::warn!("runner notice task={task_id} could not freeze send: {error}");
-                        return;
-                    }
-                }
-            } else {
-                request
-            };
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            let first = if completion {
-                metadata.runner_completion_offers
-            } else {
-                0
-            };
-            let settled = deliver(
-                &request.send_id,
-                first,
-                |_| {
-                    if completion {
-                        let age = crate::bash_background::persistence::unix_millis()
-                            .saturating_sub(metadata.finished_at.unwrap_or(metadata.started_at));
-                        if age >= MAX_AGE_MS {
-                            return Some(Outcome::Final("expired".into()));
-                        }
-                        let Some(offers) = registry.reserve_runner_completion_offer(&task_id)
-                        else {
-                            return None;
-                        };
-                        if registry
-                            .persist_runner_completion_offer(&owner.session, &task_id, offers)
-                            .is_err()
-                        {
-                            return None;
-                        }
-                    }
-                    Some(runtime.block_on(send(&path, &address, &request)))
-                },
-                std::thread::sleep,
-            );
-            if completion && settled {
-                registry.ack_completions_for_session(Some(&owner.session), &[task_id]);
+    let queued = enqueue_work(move || {
+        let _identity = crate::bash_background::task_identity_scope(Some(owner.clone()));
+        let Some(metadata) = registry.notice_metadata(&task_id) else {
+            return;
+        };
+        let raw = metadata
+            .launching_raw_harness
+            .clone()
+            .unwrap_or_else(|| owner.harness.clone());
+        let Some(address) = Address::new(&owner, raw, metadata.scope.as_ref()) else {
+            return;
+        };
+        let (id, text, completion) = match &frame {
+            PushFrame::BashCompleted(_) => {
+                let value = serde_json::to_value(&frame).unwrap();
+                (
+                    format!("aft:bash:{task_id}"),
+                    super::bash_notice_text::completion(&value),
+                    true,
+                )
             }
-        });
-    if spawned.is_err() {
-        return false;
-    }
-    true
+            PushFrame::BashLongRunning(frame) => (
+                format!("aft:bash-reminder:{task_id}:{}", frame.elapsed_ms),
+                super::bash_notice_text::long_running(&serde_json::to_value(frame).unwrap()),
+                false,
+            ),
+            PushFrame::BashPatternMatch(frame) => (
+                format!(
+                    "aft:bash-watch:{}:{}",
+                    frame.watch_id,
+                    blake3::hash(&serde_json::to_vec(frame).unwrap())
+                ),
+                super::bash_notice_text::watch(&serde_json::to_value(frame).unwrap()),
+                false,
+            ),
+            _ => unreachable!(),
+        };
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let no_idle_grant = completion
+            && !address.worker
+            && metadata.runner_completion_notice.is_none()
+            && runtime.block_on(read_idle_start_grant(&path, &address)) == Some(false);
+        let request = request(id, text, completion, address.worker || no_idle_grant);
+        let request = if completion {
+            match registry.freeze_runner_completion_notice(&owner.session, &task_id, request) {
+                Ok(request) => request,
+                Err(error) => {
+                    log::warn!("runner notice task={task_id} could not freeze send: {error}");
+                    return;
+                }
+            }
+        } else {
+            request
+        };
+        let first = if completion {
+            metadata.runner_completion_offers
+        } else {
+            0
+        };
+        let settled = deliver(
+            &request.send_id,
+            first,
+            |_| {
+                if completion {
+                    let age = crate::bash_background::persistence::unix_millis()
+                        .saturating_sub(metadata.finished_at.unwrap_or(metadata.started_at));
+                    if age >= MAX_AGE_MS {
+                        return Some(Outcome::Final("expired".into()));
+                    }
+                    let Some(offers) = registry.reserve_runner_completion_offer(&task_id) else {
+                        return None;
+                    };
+                    if registry
+                        .persist_runner_completion_offer(&owner.session, &task_id, offers)
+                        .is_err()
+                    {
+                        return None;
+                    }
+                }
+                Some(runtime.block_on(send(&path, &address, &request)))
+            },
+            std::thread::sleep,
+        );
+        if completion && settled {
+            registry.ack_completions_for_session(Some(&owner.session), &[task_id]);
+        }
+    });
+    queued
 }
