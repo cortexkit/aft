@@ -1180,13 +1180,27 @@ pub(super) async fn answer_yielded_bash_call(
         let task = target.task_id.clone();
         let body = frame.body.clone();
         let structured = !matches!(identity.trust, BindTrust::Untrusted);
-        tokio::task::spawn_blocking(move || registry.hold_running_call(&task, &body, structured))
-            .await
-            .map_err(|_| SubcError::WriterClosed)?
-            .map_err(|error| {
-                log::warn!("runner restart hold failed: {error}");
-                SubcError::WriterClosed
-            })?;
+        let persisted = tokio::task::spawn_blocking(move || {
+            registry.hold_running_call(&task, &body, structured)
+        })
+        .await;
+        let frame = match persisted {
+            Ok(Ok(_)) => frame,
+            error => {
+                log::warn!("runner restart hold failed: {error:?}");
+                let unknown = crate::db::call_ledger::unknown_held_result();
+                Frame::build_with_version(
+                    target.ver,
+                    unknown.ty,
+                    target.flags,
+                    route.channel,
+                    route.epoch,
+                    corr,
+                    unknown.body,
+                )
+                .map_err(SubcError::FrameBuild)?
+            }
+        };
         // Keep the task foreground to avoid a session notice that would
         // duplicate the result delivered through the call ledger.
         release_wait_registration(

@@ -3133,6 +3133,7 @@ impl LedgerEdge {
         );
         let identity = identity.clone();
         tokio::spawn(async move {
+            let mut answer = answer;
             if let Some((corr, signal)) = held_watch {
                 match super::call_yield::hold_watch(
                     signal,
@@ -3154,7 +3155,10 @@ impl LedgerEdge {
                         )
                         .await;
                     }
-                    Err(error) => log::warn!("runner restart watch hold failed: {error}"),
+                    Err(error) => {
+                        log::warn!("runner restart watch hold failed: {error}");
+                        answer = YieldAnswer::NotYieldable(NotYieldable::NotWaiting);
+                    }
                 }
             }
             if let Some((corr, target)) = handed_back {

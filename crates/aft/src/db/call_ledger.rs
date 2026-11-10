@@ -2178,7 +2178,7 @@ mod tests {
         let ordinary = RecordedFrame {
             ty: FrameType::Response,
             body: serde_json::to_vec(
-                &json!({"content":[{"type":"text","text":"real command output"}]}),
+                &json!({"content":[{"type":"text","text":"real command output"}],"isError":false}),
             )
             .unwrap(),
         };
@@ -3021,7 +3021,10 @@ mod tests {
             1,
             "SQL must call the counting json_extract"
         );
-        let next = key("next");
+        let next = Key {
+            carrier: "owner".into(),
+            call_key: "next".into(),
+        };
         admit(
             &conn,
             &next,

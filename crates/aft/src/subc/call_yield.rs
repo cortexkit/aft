@@ -380,6 +380,7 @@ pub(super) async fn hold_watch(
     let frame = restart_held_frame(ver, route, corr, flags, None)?;
     let retained = frame.body.clone();
     let structured = !matches!(identity.trust, super::BindTrust::Untrusted);
+    let reset_signal = signal.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let mut state = signal.restart.lock().unwrap();
         let wait = state.wait.as_ref().ok_or("watch is no longer waiting")?;
@@ -416,6 +417,7 @@ pub(super) async fn hold_watch(
     .await
     .map_err(|_| super::SubcError::WriterClosed)?
     .map_err(|error| {
+        reset_signal.restart.lock().unwrap().reserved = false;
         log::warn!("watch hold persistence failed: {error}");
         super::SubcError::WriterClosed
     })?;
