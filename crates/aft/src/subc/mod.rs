@@ -265,6 +265,7 @@ mod retained_result;
 pub(crate) mod rich_ui;
 mod run_scope;
 mod scope_describe;
+mod shells;
 #[cfg(test)]
 mod stack_budget_tests;
 pub(crate) mod watch_delivery;
