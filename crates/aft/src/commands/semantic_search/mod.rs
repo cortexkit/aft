@@ -12022,6 +12022,46 @@ mod tests {
     }
 
     #[test]
+    fn matching_line_packed_storage_does_not_increase_cache_charge() {
+        type LegacyLine = (String, String, std::sync::OnceLock<Box<[[u8; 3]]>>);
+        for source in [
+            "",
+            " \t\r\n\n",
+            "İ café 中中中\u{2003}tail\nabc\ndef\n",
+            include_str!("mod.rs"),
+        ] {
+            let legacy = source
+                .lines()
+                .map(|line| {
+                    (
+                        exact_lane::normalize_exact_phrase(line),
+                        line.chars()
+                            .filter(|ch| ch.is_alphanumeric())
+                            .flat_map(char::to_lowercase)
+                            .collect::<String>(),
+                        std::sync::OnceLock::new(),
+                    )
+                })
+                .collect::<Vec<LegacyLine>>();
+            let legacy_bytes = std::mem::size_of::<Vec<LegacyLine>>()
+                + legacy.capacity() * std::mem::size_of::<LegacyLine>()
+                + legacy
+                    .iter()
+                    .map(|(normalized, compact, _)| {
+                        normalized.capacity()
+                            + compact.capacity()
+                            + compact.len().saturating_sub(2) * 3
+                    })
+                    .sum::<usize>();
+            let packed_bytes = MatchingSource::new(source).retained_bytes();
+            // Only the two source-wide String headers are new fixed overhead;
+            // every nonempty line saves headers and per-string spare capacity.
+            assert!(packed_bytes <= legacy_bytes + 2 * std::mem::size_of::<String>());
+            eprintln!("matching storage: {} source bytes, {legacy_bytes} legacy charge, {packed_bytes} packed charge", source.len());
+        }
+    }
+
+    #[test]
     fn matching_line_trigram_set_is_differentially_byte_identical() {
         let tie_tokens = vec!["abcxxx".to_string()];
         let tied = best_content_line("abc\nabc", &tie_tokens).expect("positive tied scores");
