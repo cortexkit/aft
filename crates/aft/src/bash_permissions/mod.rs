@@ -40,4 +40,4 @@ pub fn scan(command: &str, ctx: &AppContext) -> Vec<PermissionAsk> {
 }
 
 use crate::path_identity::lexical_normalize as normalize_path;
-pub(crate) use crate::system_temp::{is_system_temp_path, resolve_with_existing_ancestors};
+pub(crate) use crate::system_temp::is_system_temp_path;

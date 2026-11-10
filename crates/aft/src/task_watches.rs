@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use super::watch_lines::{LineBatch, LineDelivery};
+use crate::task_watch_lines::{LineBatch, LineDelivery};
 
 const MAX_WATCHES_PER_TASK: usize = 8;
 const CONTEXT_BEFORE: usize = 100;

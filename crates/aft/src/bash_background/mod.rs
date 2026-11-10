@@ -18,9 +18,9 @@ pub(crate) mod store_writes;
 pub(crate) mod task_scope;
 mod temp_cleanup;
 pub(crate) mod viewed_task;
-pub mod watch_lines;
+pub use crate::task_watch_lines as watch_lines;
 pub mod watchdog;
-pub mod watches;
+pub use crate::task_watches as watches;
 pub(crate) mod windows_waiter;
 pub(crate) mod worker_thread;
 

@@ -304,7 +304,7 @@ pub(crate) fn refresh_watch_gap_health(conn: &Connection) {
         let (mut outstanding, mut missing) = (0u64, 0u64);
         let mut uncertain = false;
         for batch in batches {
-            match serde_json::from_str::<crate::bash_background::watch_lines::LineBatch>(&batch?) {
+            match serde_json::from_str::<crate::task_watch_lines::LineBatch>(&batch?) {
                 Ok(batch) => {
                     if let Some(gap) = batch.retry_gap {
                         outstanding = outstanding.saturating_add(1);
@@ -365,7 +365,7 @@ pub(crate) fn acknowledge_delivery(
     task: &str,
     watch: &str,
     version: u64,
-    gap: Option<&crate::bash_background::watch_lines::RetryGap>,
+    gap: Option<&crate::task_watch_lines::RetryGap>,
 ) -> rusqlite::Result<()> {
     let epoch = gap
         .map(|gap| gap.eviction_epoch.as_str())
@@ -406,14 +406,15 @@ pub(crate) fn list_delivery_gaps(
         let task_id: String = row.get(1)?;
         let watch_id = row.get(2)?;
         let saved: String = row.get(3)?;
-        let batch = serde_json::from_str::<crate::bash_background::watch_lines::LineBatch>(&saved)
-            .map_err(|error| {
+        let batch = serde_json::from_str::<crate::task_watch_lines::LineBatch>(&saved).map_err(
+            |error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     3,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
-            })?;
+            },
+        )?;
         Ok(BashPatternWatchRow {
             harness: harness.into(),
             session_id,

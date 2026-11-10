@@ -657,13 +657,16 @@ pub(super) fn walk_shell_commands(
             cwd?.join(text)
         };
         let (path, next_cwd) = if physical {
-            let resolved = super::resolve_with_existing_ancestors(&joined);
+            let resolved = crate::system_temp::resolve_with_existing_ancestors(&joined);
             (resolved.clone(), resolved)
         } else {
             // Default cd follows logical PWD: fold .. before resolving symlinks
             // for the containment check, and retain that logical spelling to walk.
             let logical = super::normalize_path(&joined);
-            (super::resolve_with_existing_ancestors(&logical), logical)
+            (
+                crate::system_temp::resolve_with_existing_ancestors(&logical),
+                logical,
+            )
         };
         Some((
             DirectoryTarget {
