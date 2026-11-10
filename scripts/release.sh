@@ -226,10 +226,17 @@ cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fm
 echo "  crates.io package sizes..."
 crate_limit=$((10 * 1024 * 1024))
 crate_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/package
-for crate in aft-tokenizer aft-secret-rules aft-store agent-file-tools; do
-  cargo package -p "$crate" --no-verify --allow-dirty -q >/dev/null 2>&1 || {
-    echo "Error: cargo package -p $crate failed; run it to see why"; exit 1;
-  }
+release_crates=(aft-tokenizer aft-secret-rules aft-store agent-file-tools)
+# Package the crates in one command: a crate whose path dependency is not on
+# crates.io yet (aft-store before its first release) only packages when cargo
+# resolves that dependency from the other packages in the same run, as the
+# release workflow's `cargo publish --dry-run -p ...` does.
+package_args=()
+for crate in "${release_crates[@]}"; do package_args+=(-p "$crate"); done
+cargo package "${package_args[@]}" --no-verify --allow-dirty -q >/dev/null 2>&1 || {
+  echo "Error: cargo package ${package_args[*]} failed; run it to see why"; exit 1;
+}
+for crate in "${release_crates[@]}"; do
   crate_file=$(ls -t "$crate_dir"/"$crate"-*.crate | head -1)
   crate_bytes=$(wc -c <"$crate_file" | tr -d ' ')
   if [ "$crate_bytes" -ge "$crate_limit" ]; then
