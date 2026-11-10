@@ -28,9 +28,6 @@ pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = crate::tool_output::LIST_BODY_BY
 /// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
 /// knows the printed text is not the whole line.
 pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
-/// Text note for a grep or glob whose search path holds no searchable file.
-pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
-    "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";
 
 #[cfg(test)]
 mod contract_tests {

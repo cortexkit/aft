@@ -44,3 +44,6 @@ pub(crate) mod bound_checkouts;
 pub(crate) mod external_search;
 pub(crate) mod meaning_query;
 pub(crate) mod text_scope;
+
+pub(crate) mod dead_code_reads;
+pub mod dead_code_snapshot;

@@ -33,11 +33,11 @@ use crate::callgraph_store::{
     lang_from_label, MACRO_BODY_CALL_REF_KIND, PROVENANCE_TREESITTER, PROVENANCE_VALUE_REF,
     TOP_LEVEL_SYMBOL,
 };
-use crate::inspect::job::{
+use crate::data_layer::dead_code_reads::{record, Lookup};
+use crate::data_layer::dead_code_snapshot::DEFAULT_EXPORT_MARKER_KIND;
+use crate::data_layer::dead_code_snapshot::{
     CallgraphExport, CallgraphOutboundCall, GoInitializerGroup, DISPATCHED_CALLEE_SEPARATOR,
 };
-use crate::inspect::scanners::dead_code::reads::{record, Lookup};
-use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
 
 /// A checkout view's call graph, which a dead-code snapshot carries so the
 /// rollup reads it one file at a time.

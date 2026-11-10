@@ -21,11 +21,12 @@ use crate::callgraph_store::dead_code_projection::{
 use crate::callgraph_store::{
     lang_from_label, PROVENANCE_TREESITTER, PROVENANCE_VALUE_REF, TOP_LEVEL_SYMBOL,
 };
-use crate::inspect::job::{
-    canonicalize_normalized, CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot,
-    GoInitializerGroup, DISPATCHED_CALLEE_SEPARATOR,
+use crate::data_layer::dead_code_snapshot::DEFAULT_EXPORT_MARKER_KIND;
+use crate::data_layer::dead_code_snapshot::{
+    CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, GoInitializerGroup,
+    DISPATCHED_CALLEE_SEPARATOR,
 };
-use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
+use crate::inspect::job::canonicalize_normalized;
 
 /// The kinds of reference an outbound call can come from.
 pub(crate) const OUTBOUND_KINDS: [&str; 5] = [

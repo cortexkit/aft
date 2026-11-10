@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 
-use crate::commands::multi_path::{
+pub(crate) mod git_exclude;
+pub mod multi_path;
+
+use self::multi_path::{
     canonical_key, dedupe_nested_paths, resolve_path_or_multi, SearchPathResolution,
 };
 use crate::context::AppContext;
@@ -209,7 +212,7 @@ impl ScopeFileCounts {
         }
         if reasons.is_empty() {
             if self.examined == 0 {
-                return crate::commands::grep::NO_FILES_IN_SCOPE_NOTE.to_string();
+                return NO_FILES_IN_SCOPE_NOTE.to_string();
             }
             reasons.push(format!(
                 "{} files were examined but none were searched",
@@ -1375,7 +1378,9 @@ impl TargetIgnoreRules {
         if !global.is_empty() {
             rules.git.push(Arc::new(global));
         }
-        if let Some((repo, exclude)) = crate::commands::outline::git_info_exclude_for_target(root) {
+        if let Some((repo, exclude)) =
+            crate::grep_executor::git_exclude::git_info_exclude_for_target(root)
+        {
             Self::load(&mut rules.git, &repo, &exclude);
         }
         for ancestor in root.ancestors().collect::<Vec<_>>().into_iter().rev() {
@@ -4271,3 +4276,7 @@ mod tests {
         );
     }
 }
+
+/// Text note for a grep or glob whose search path holds no searchable file.
+pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
+    "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";

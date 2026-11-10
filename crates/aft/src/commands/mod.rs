@@ -57,7 +57,7 @@ pub mod lsp_rename;
 pub mod memory_census;
 pub mod move_file;
 pub mod move_symbol;
-pub mod multi_path;
+pub use crate::grep_executor::multi_path;
 pub mod organize_imports;
 pub mod outline;
 pub mod read;
