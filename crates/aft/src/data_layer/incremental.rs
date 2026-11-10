@@ -620,6 +620,7 @@ impl LiveCheckout {
             Ok::<_, ManifestJoinError>(stats)
         })?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        crate::slog_info!("perf data_layer incremental: {stats:?}");
         Ok(stats)
     }
 
@@ -1010,6 +1011,7 @@ impl LiveCheckout {
         {
             self.bound.bind_module_declaring(inputs)?;
         }
+        crate::slog_info!("perf data_layer module_prebind: {:.0}ms", started.elapsed().as_secs_f64() * 1000.0);
         // Most files a change reaches here keep their resolution: each file
         // whose surface answers (pass 2) or dispatch trace (pass 3) depend on
         // something that changed is replayed. Each is read once for both,
@@ -1072,6 +1074,7 @@ impl LiveCheckout {
         }
         drop(answers);
         drop(trace_answers);
+        crate::slog_info!("perf data_layer replay: {:.0}ms replayed={} traced={} resolves={}", started.elapsed().as_secs_f64() * 1000.0, stats.replayed, stats.dispatch_replayed, resolve.len());
         // Files kept whose binding was redone carry their resolution over.
         for path in &rebind {
             if resolve.contains(path) {
