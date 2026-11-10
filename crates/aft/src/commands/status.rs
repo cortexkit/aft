@@ -140,6 +140,19 @@ impl AppContext {
         Some(crate::status_push::project(self, snapshot))
     }
 
+    /// Operator status still reports index readiness when language-server
+    /// diagnostics are busy. Unknown counts stay absent on the operator wire.
+    /// Agent publishers retain their existing all-or-retry snapshot behavior.
+    pub(crate) fn build_operator_status_snapshot(&self) -> StatusPayload {
+        let counts = self.try_status_bar_count_values().unwrap_or_default();
+        let snapshot = self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Push,
+        );
+        crate::status_push::project(self, snapshot)
+    }
+
     fn build_status_snapshot_with_counts(
         &self,
         session_id: &str,

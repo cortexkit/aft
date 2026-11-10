@@ -920,9 +920,7 @@ fn collect(
     let mut degraded = false;
     let mut building = false;
     for ctx in contexts {
-        let Some(snapshot) = ctx.try_build_status_push_snapshot() else {
-            continue;
-        };
+        let snapshot = ctx.build_operator_status_snapshot();
         let Some(root) = snapshot["project_root"].as_str() else {
             continue;
         };

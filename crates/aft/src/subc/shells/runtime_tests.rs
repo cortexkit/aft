@@ -14,9 +14,13 @@ fn status_context() -> (
         Box::new(crate::language::StubProvider),
         crate::config::Config {
             project_root: Some(dir.path().to_owned()),
+            disabled_lsp: ["rust".into()].into(),
             ..Default::default()
         },
     ));
+    ctx.set_db(Arc::new(std::sync::Mutex::new(
+        crate::db::open(&dir.path().join("aft.db")).unwrap(),
+    )));
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(
         crate::path_identity::ProjectRootId::from_path(dir.path()).unwrap(),
@@ -83,6 +87,8 @@ fn shells_v1_status_refresh_skips_busy_lsp_and_releases_database_before_probes()
         "database facts must be copied before probing roots"
     );
     assert!(result.status.roots[0].lsp.is_none());
+    assert!(result.status.roots[0].errors.is_none());
+    assert!(result.status.roots[0].warnings.is_none());
     assert!(serde_json::to_value(&result.status.roots[0])
         .unwrap()
         .get("lsp")
@@ -122,9 +128,6 @@ fn shells_v1_status_refresh_does_not_wait_for_a_busy_database() {
 async fn shells_v1_status_refresh_keeps_cached_lsp_when_the_manager_is_busy() {
     use std::sync::mpsc;
     let (_dir, ctx, executor, app) = status_context();
-    ctx.update_config(|config| {
-        config.disabled_lsp.insert("rust".into());
-    });
     let service = Service::new(app, executor);
     service.refresh(false).await;
     let known = service.state.read().await.status.roots[0]
