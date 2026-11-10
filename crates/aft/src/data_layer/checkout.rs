@@ -6037,6 +6037,7 @@ pub fn other() { callee(); }
         drop(old);
         let other =
             Checkout::bind(Arc::clone(&layer), store.path(), family(), sibling.path()).unwrap();
+        other.publish_text_first().unwrap();
         other.build().unwrap();
         // The new records coexist with the old fragments in one family.
         assert!(!other
