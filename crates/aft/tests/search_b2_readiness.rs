@@ -9,9 +9,9 @@ use aft::commands::semantic_search::extensions::{
     TrigramReadiness,
 };
 use aft::commands::semantic_search::plan_table::{SearchLaneKind, SearchShape};
+use aft::commands::semantic_search::planner::readiness::selected_lane_disclosures;
 use aft::context::SemanticIndexStatus;
 use aft::parser::SymbolCache;
-use aft::search_b2::readiness::selected_lane_disclosures;
 use aft::search_index::{IndexStatus, SearchIndex};
 use aft::semantic_index::SemanticIndex;
 

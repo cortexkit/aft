@@ -208,7 +208,7 @@ pub(super) fn handle(
     } else {
         let plan = extensions.plan(
             &SearchShape::Regex,
-            &crate::search_b2::lane_plan::no_query_facts(),
+            &crate::commands::semantic_search::planner::lane_plan::no_query_facts(),
             &readiness,
         );
         let mut response = handle_grep_search(

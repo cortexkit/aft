@@ -260,7 +260,8 @@ pub(crate) fn is_prose_query(query: &str) -> bool {
     use super::plan_table::SearchShape;
     use crate::query_shape::QueryKind;
 
-    let (shape, _) = crate::search_b2::install_defaults().classify(&RawQuery::new(query));
+    let (shape, _) = crate::commands::semantic_search::planner::install_defaults()
+        .classify(&RawQuery::new(query));
     if matches!(
         shape,
         SearchShape::Identifier | SearchShape::Path | SearchShape::Regex

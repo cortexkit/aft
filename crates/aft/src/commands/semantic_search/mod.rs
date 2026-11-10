@@ -14,7 +14,8 @@ pub mod lexical_lane;
 pub mod memo;
 mod nearest_names;
 pub mod paging;
-pub mod plan_table;
+pub use crate::search_b2::plan_table;
+pub mod planner;
 pub mod provenance;
 mod recall_audit;
 mod regex_route;
@@ -855,9 +856,8 @@ fn handle_semantic_search_with_disk_fallback(
             return external_data_layer_search(req, ctx, root, &external);
         }
     }
-    // The extensions come from the search_b2 install point: A-side defaults
-    // until campaign B2 installs its router, plans, variants and readiness.
-    let extensions = crate::search_b2::install_defaults();
+    // Compose routing, plans, variants and readiness at the command boundary.
+    let extensions = crate::commands::semantic_search::planner::install_defaults();
     let import_building = false;
     let allow_disk_fallback = allow_disk_fallback || import_building;
     if let Some((pattern_text, compiled)) = pattern {
@@ -1006,8 +1006,11 @@ fn attach_not_opened_notice(
 ) {
     let would_use_semantic = ctx.config().indexes.semantic
         && !plan.contains(SearchLaneKind::Semantic)
-        && crate::search_b2::lane_plan::legal_lanes(plan.shape, &plan.query_facts)
-            .contains(&SearchLaneKind::Semantic);
+        && crate::commands::semantic_search::planner::lane_plan::legal_lanes(
+            plan.shape,
+            &plan.query_facts,
+        )
+        .contains(&SearchLaneKind::Semantic);
     if !would_use_semantic {
         return;
     }
@@ -1133,7 +1136,7 @@ fn handle_pattern_request(
         None => {
             let plan = extensions.plan(
                 &SearchShape::Regex,
-                &crate::search_b2::lane_plan::no_query_facts(),
+                &crate::commands::semantic_search::planner::lane_plan::no_query_facts(),
                 &readiness,
             );
             let semantic_status = try_read_with_budget(
@@ -10599,7 +10602,7 @@ mod tests {
         }
         let ctx = test_context(&root);
         install_ready_search_index(&ctx, &root);
-        let extensions = crate::search_b2::install_defaults();
+        let extensions = crate::commands::semantic_search::planner::install_defaults();
         let plan = split_query_plan(
             extensions,
             "needle_symbol",
@@ -13448,7 +13451,7 @@ mod tests {
             cap_protected: false,
             source: "semantic",
         };
-        let extensions = crate::search_b2::install_defaults();
+        let extensions = crate::commands::semantic_search::planner::install_defaults();
         let raw = extensions::RawQuery::new(query);
         let (shape, facts) = extensions.classify(&raw);
         assert_eq!(shape, SearchShape::NaturalLanguage);
@@ -13659,7 +13662,7 @@ mod tests {
             rank_score: 0.01,
             ..summary.clone()
         };
-        let extensions = crate::search_b2::install_defaults();
+        let extensions = crate::commands::semantic_search::planner::install_defaults();
         for (query, exact) in [
             (
                 "how does the bash watchdog kill a background task that exceeded its timeout",
@@ -15339,7 +15342,7 @@ mod split_request_tests {
             .collect::<Vec<_>>();
         let readiness = extensions::Readiness::new(false, true, true);
         let plan = split_query_plan(
-            crate::search_b2::install_defaults(),
+            crate::commands::semantic_search::planner::install_defaults(),
             "scheduler drains the work queue",
             &readiness,
         );
@@ -15355,7 +15358,7 @@ mod split_request_tests {
                 false,
                 semantic.clone(),
                 page_request,
-                crate::search_b2::install_defaults(),
+                crate::commands::semantic_search::planner::install_defaults(),
                 &plan,
                 None,
                 Some(&input),
@@ -15423,7 +15426,7 @@ mod split_request_tests {
         top_k: usize,
     ) -> Vec<PathBuf> {
         let readiness = extensions::Readiness::new(false, true, true);
-        let extensions = crate::search_b2::install_defaults();
+        let extensions = crate::commands::semantic_search::planner::install_defaults();
         let mut plan = split_query_plan(extensions, prose, &readiness);
         if split.is_none() {
             plan.selected_lanes

@@ -738,7 +738,7 @@ fn print_gate_decisions_when_asked() {
         } else {
             "skip"
         };
-        let (shape, _) = crate::search_b2::install_defaults()
+        let (shape, _) = crate::commands::semantic_search::planner::install_defaults()
             .classify(&super::super::extensions::RawQuery::new(&query));
         let kind = crate::query_shape::classify(&query).kind;
         println!(

@@ -452,8 +452,7 @@ impl PlanTable {
 /// `benchmarks/aft-search/engine-fixtures/plan-table.json`, and
 /// `engine_plan_table_test` asserts the two are byte-identical so neither can
 /// drift from the other.
-pub const PINNED_PLAN_TABLE_JSON: &str =
-    include_str!("../../../assets/search-plan-table.pinned.json");
+pub const PINNED_PLAN_TABLE_JSON: &str = include_str!("../../assets/search-plan-table.pinned.json");
 
 /// Load and verify the pinned plan table at startup against the running table.
 pub fn verify_pinned_plan_table_at_startup() -> Result<(), PlanTableError> {
