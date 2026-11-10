@@ -489,11 +489,12 @@ impl HeldBashCalls {
     /// must hand its command to the background, never kill it. Refused when
     /// the call is not sitting in its foreground wait (still starting its
     /// command, or its own wait task already answering), or when it belongs
-    /// to a delegated worker or a codemode run, which keep holding their calls.
+    /// to a delegated worker or a codemode run for a person-message handoff.
     pub(super) fn claim_for_yield(
         &self,
         route: RouteChannel,
         corr: u64,
+        restart: bool,
     ) -> Result<BashDetachTarget, super::call_yield::NotYieldable> {
         use super::call_yield::NotYieldable;
         let mut calls = self.lock();
@@ -503,7 +504,7 @@ impl HeldBashCalls {
         let Some(target) = call.detach.as_ref() else {
             return Err(NotYieldable::NotWaiting);
         };
-        if target.worker_session || target.run_scoped {
+        if !restart && (target.worker_session || target.run_scoped) {
             return Err(NotYieldable::Scope);
         }
         if !call.phase.detaches_on_drain()

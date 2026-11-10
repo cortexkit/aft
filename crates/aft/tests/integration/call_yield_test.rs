@@ -75,6 +75,27 @@ async fn bind_head(
     principal: Principal,
     consumer: &[&str],
 ) {
+    bind_scoped(
+        stream,
+        root,
+        channel,
+        session,
+        principal,
+        consumer,
+        head_stamp(),
+    )
+    .await;
+}
+
+async fn bind_scoped(
+    stream: &mut tokio::net::TcpStream,
+    root: &Path,
+    channel: u16,
+    session: &str,
+    principal: Principal,
+    consumer: &[&str],
+    scope: subc_protocol::scope::ScopeStamp,
+) {
     let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
         route_channel: channel,
         epoch: 1,
@@ -85,7 +106,7 @@ async fn bind_head(
         principal: Some(principal),
         consumer_capabilities: Some(consumer.iter().map(|cap| cap.to_string()).collect()),
         admission_facts: Default::default(),
-        scope: Some(head_stamp()),
+        scope: Some(scope),
         role_versions: Some(std::collections::BTreeMap::from([(
             "tool-provider".into(),
             "v1".into(),

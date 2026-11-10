@@ -1166,7 +1166,31 @@ pub(super) async fn answer_yielded_bash_call(
     route: RouteChannel,
     corr: u64,
     target: drain::BashDetachTarget,
+    restart: bool,
 ) -> Result<(), SubcError> {
+    if restart {
+        let frame = super::call_yield::restart_held_frame(target.ver, route, corr, target.flags)?;
+        let registry = target.registry.clone();
+        let task = target.task_id.clone();
+        let body = frame.body.clone();
+        let structured = !matches!(identity.trust, BindTrust::Untrusted);
+        tokio::task::spawn_blocking(move || registry.hold_running_call(&task, &body, structured))
+            .await
+            .map_err(|_| SubcError::WriterClosed)?
+            .map_err(|error| {
+                log::warn!("runner restart hold failed: {error}");
+                SubcError::WriterClosed
+            })?;
+        // Keep the task foreground to avoid a session notice that would
+        // duplicate the result delivered through the call ledger.
+        release_wait_registration(
+            &target.registry,
+            &target.session_id,
+            &target.task_id,
+            target.wait_mode,
+        );
+        return send_reliable_writer_frame(tx, metrics, frame, "yielded bash hold").await;
+    }
     let frame = background_handoff_frame(
         &target,
         identity,

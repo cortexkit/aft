@@ -437,7 +437,15 @@ fn has_held_reply(row: &Row) -> bool {
     })
 }
 
-fn unknown_held_result() -> RecordedFrame {
+pub(crate) fn hold_watch(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite::Result<()> {
+    let changed = conn.execute("UPDATE call_ledger SET recovered=1,frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state='DispatchStarted'", params![key.carrier, key.call_key, body])?;
+    if changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
+pub(crate) fn unknown_held_result() -> RecordedFrame {
     RecordedFrame {
         ty: FrameType::Response,
         body: serde_json::to_vec(
@@ -1246,6 +1254,14 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
         let Some(row) = get(conn, &key)? else {
             continue;
         };
+        if row.frame.as_ref().is_some_and(|frame| {
+            serde_json::from_slice::<Value>(&frame.body)
+                .is_ok_and(|body| body.get("_aft_restart_watch").is_some())
+        }) {
+            // The watched task belongs to a different call. Its saved wait is
+            // resumed by the subc layer; this recovery pass skips it.
+            continue;
+        }
         if matches!(row.state, State::Prepared | State::Authorized) {
             settle(
                 conn,

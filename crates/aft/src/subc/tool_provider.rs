@@ -553,9 +553,8 @@ fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
             let entry = |schema: Value, description: Option<String>| {
                 let mut entry = catalog_entry(&name, semantics, schema, description);
                 // A head's waiting `bash` call can be handed back with
-                // `tool.yield`; a delegated worker's keeps holding (see
-                // `call_yield::route_refusal`), so the worker preset is untagged.
-                if preset == CatalogPreset::Head && name == "bash" {
+                // `tool.yield`. Workers use held replies when their runner restarts.
+                if name == "bash" || (preset == CatalogPreset::Worker && name == "bash_watch") {
                     entry
                         .capabilities
                         .push(super::call_yield::CALL_YIELD_TOOL_TAG.into());
@@ -3036,11 +3035,9 @@ impl LedgerEdge {
     }
 
     /// Answers a `tool.yield` on a v1 route (see `call_yield` for the
-    /// contract it follows). The decision reads only in-memory call state, so
-    /// neither the answer nor an accepted call's final frame waits for the
-    /// executor or the database: the final frame of a handed-back `bash` call
-    /// is sent right here, before the answer, and a `bash_watch` thread checks
-    /// its signal at least once a second.
+    /// contract it follows). Person-message handoffs need only in-memory state.
+    /// Restart holds are persisted off the frame loop before the final frame
+    /// and acceptance are sent, so losing the runner cannot lose the result.
     fn call_yield(
         self: &std::sync::Arc<Self>,
         decoded: super::DecodedFrame,
@@ -3066,7 +3063,9 @@ impl LedgerEdge {
         // Calls are recorded under the route's attested carrier, so this key
         // finds only the caller's own calls.
         let key = Self::key(identity, &yielded.call_key);
+        let restart = yielded.reason == super::call_yield::RUNNER_RESTART;
         let mut handed_back = None;
+        let mut held_watch = None;
         let answer = {
             let mut calls = self.calls.lock().unwrap();
             match calls.iter_mut().find(|((call_route, _), call)| {
@@ -3079,18 +3078,28 @@ impl LedgerEdge {
                 // The contract never accepts a yield twice.
                 Some((_, call)) if call.yielded => YieldAnswer::UnknownCall,
                 Some((&(_, corr), call)) => {
-                    let decision = if let Some(refusal) = super::call_yield::route_refusal(identity)
-                    {
+                    let refusal = if restart {
+                        super::call_yield::restart_route_refusal(identity)
+                    } else {
+                        super::call_yield::route_refusal(identity)
+                    };
+                    let decision = if let Some(refusal) = refusal {
                         Err(refusal)
-                    } else if yielded.reason != super::call_yield::PERSON_MESSAGE {
+                    } else if !restart && yielded.reason != super::call_yield::PERSON_MESSAGE {
                         Err(NotYieldable::Reason)
                     } else {
                         match call.yieldable {
                             None => Err(NotYieldable::Tool),
                             Some(YieldableTool::Bash) => metrics
                                 .held_bash_calls
-                                .claim_for_yield(route, corr)
+                                .claim_for_yield(route, corr, restart)
                                 .map(|target| handed_back = Some((corr, target))),
+                            Some(YieldableTool::BashWatch) if restart => metrics
+                                .watch_yields
+                                .waiting(route, corr)
+                                .filter(|signal| super::call_yield::watch_can_hold(signal))
+                                .map(|signal| held_watch = Some((corr, signal)))
+                                .ok_or(NotYieldable::NotWaiting),
                             Some(YieldableTool::BashWatch) => {
                                 if metrics.watch_yields.request(route, corr) {
                                     Ok(())
@@ -3119,9 +3128,33 @@ impl LedgerEdge {
         );
         let identity = identity.clone();
         tokio::spawn(async move {
+            if let Some((corr, signal)) = held_watch {
+                match super::call_yield::hold_watch(
+                    signal,
+                    key,
+                    &identity,
+                    route,
+                    corr,
+                    request.header.ver,
+                    request.header.flags,
+                )
+                .await
+                {
+                    Ok(frame) => {
+                        let _ = super::send_reliable_writer_frame(
+                            &writer,
+                            &metrics,
+                            frame,
+                            "yielded watch hold",
+                        )
+                        .await;
+                    }
+                    Err(error) => log::warn!("runner restart watch hold failed: {error}"),
+                }
+            }
             if let Some((corr, target)) = handed_back {
                 if let Err(error) = super::bash::answer_yielded_bash_call(
-                    &writer, &identity, &metrics, route, corr, target,
+                    &writer, &identity, &metrics, route, corr, target, restart,
                 )
                 .await
                 {

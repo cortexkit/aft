@@ -208,7 +208,7 @@ mod bash;
 mod bind_candidates;
 mod bind_log;
 mod call_policy;
-mod call_yield;
+pub(crate) mod call_yield;
 mod carrier_read_only;
 #[cfg(test)]
 mod tool_result_tests;
@@ -6735,6 +6735,9 @@ where
                 );
                 if let Some(keys) = completion.unacked_bg_keys {
                     bg_unacked_keys_by_root.insert(root_id.clone(), keys);
+                    if let Some(ctx) = executor.actor_context(&root_id) {
+                        tokio::task::spawn_blocking(move || call_yield::recover_watches(ctx));
+                    }
                 }
                 if let Some(ctx) = executor.actor_context(&root_id) {
                     push::recover_registry_completions(
@@ -11543,13 +11546,10 @@ async fn handle_tool_call_with_capabilities(
             }
         }
     }
-    // A head's keyed watch on a route that opted in to `tool.yield` can be
-    // ended early; the watch thread holds the signal until it ends.
-    let watch_yield = (bare_name == "bash_watch"
-        && ledger_key.is_some()
-        && !role.is_worker()
-        && call_yield::route_refusal(&identity).is_none())
-    .then(|| metrics.watch_yields.register(route_id, frame.header.corr));
+    // A keyed watch retains its signal through a runner restart. Only heads
+    // use the separate person-message handoff.
+    let watch_yield = (bare_name == "bash_watch" && ledger_key.is_some() && identity.call_yield)
+        .then(|| metrics.watch_yields.register(route_id, frame.header.corr));
     // Decided before the arguments move into the job: slow-call logging needs
     // to know whether a person is waiting on this call.
     let caller = if manifest::is_native_plumbing_call(&bare_name, &arguments) {
