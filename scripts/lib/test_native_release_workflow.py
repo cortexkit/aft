@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -79,26 +80,31 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
         source = (ROOT / "tests/macos-e2e/run.sh").read_text()
         start = source.index('echo "── Installing GNU coreutils')
         end = source.index("# ---- Install OpenCode", start)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = root / "bin"
-            coreutils = root / "coreutils"
-            tools.mkdir()
-            (coreutils / "libexec/gnubin").mkdir(parents=True)
-            executables = {
-                tools / "gtimeout": "#!/bin/sh\nexit 0\n",
-                coreutils / "libexec/gnubin/timeout": "#!/bin/sh\nexit 0\n",
-                tools / "brew": '#!/bin/sh\nif [ "$1" = --prefix ]; then printf "%s\\n" "$COREUTILS_FIXTURE"; else echo "brew install must not run" >&2; exit 99; fi\n',
-            }
-            for path, content in executables.items():
-                path.write_text(content)
-                path.chmod(0o755)
-            result = subprocess.run(
-                ["bash", "-e", "-c", source[start:end]], capture_output=True, text=True,
-                env={**os.environ, "PATH": f"{tools}:/usr/bin:/bin", "COREUTILS_FIXTURE": str(coreutils)},
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(str(coreutils / "libexec/gnubin/timeout"), result.stdout)
+        for executable in ("timeout", "gtimeout"):
+            with self.subTest(executable=executable), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                tools = root / "bin"
+                tools.mkdir()
+                for name in ("bash", "mkdir", "ln"):
+                    installed = shutil.which(name)
+                    assert installed is not None
+                    (tools / name).symlink_to(installed)
+                executables = {
+                    tools / executable: '#!/bin/sh\nprintf "fixture timeout\\n"\n',
+                    tools / "brew": '#!/bin/sh\necho "brew must not run, even for prefix queries" >&2\nexit 99\n',
+                }
+                for path, content in executables.items():
+                    path.write_text(content)
+                    path.chmod(0o755)
+                result = subprocess.run(
+                    [str(tools / "bash"), "-e", "-c", source[start:end] + "\ntimeout --version\n"],
+                    capture_output=True, text=True,
+                    env={**os.environ, "PATH": str(tools), "RUNNER_TEMP": str(root / "runner-temp")},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("fixture timeout", result.stdout)
+                expected = tools / "timeout" if executable == "timeout" else root / "runner-temp/aft-e2e-tools/timeout"
+                self.assertIn(str(expected), result.stdout)
 
     def test_every_publish_job_requires_shipped_e2e_on_release_sha(self):
         jobs = self.workflow("release.yml")["jobs"]
