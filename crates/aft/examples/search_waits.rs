@@ -38,6 +38,9 @@
 //! With `--unique 1` (the default) each prose query gets three extra words
 //! chosen by the call's number, so its embedding misses the query cache.
 //! Prints a markdown summary to stdout and progress to stderr.
+//! Set `AFT_SEARCH_WAITS_RERANK=1` to use the loopback server as a deterministic
+//! reranker too. It returns tied scores without a model, isolating candidate
+//! preparation from inference. `--warmup 0` includes first-use contention.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
@@ -95,6 +98,7 @@ struct Args {
     phases: Vec<String>,
     samples: Option<PathBuf>,
     unique: bool,
+    warmup: bool,
 }
 
 fn parse_args() -> Args {
@@ -152,6 +156,7 @@ fn parse_args() -> Args {
             .collect(),
         samples: path("samples"),
         unique: number("unique", 1) != 0,
+        warmup: number("warmup", 1) != 0,
     }
 }
 
@@ -232,9 +237,10 @@ fn answer_embeddings(
         let mut body = vec![0u8; length];
         reader.read_exact(&mut body)?;
         counter.fetch_add(1, Ordering::Relaxed);
-        let inputs = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|body| body.get("input").cloned())
+        let body = serde_json::from_slice::<Value>(&body).unwrap();
+        let inputs = body
+            .get("input")
+            .cloned()
             .map(|input| match input {
                 Value::Array(items) => items
                     .iter()
@@ -244,13 +250,26 @@ fn answer_embeddings(
                 _ => Vec::new(),
             })
             .unwrap_or_default();
-        std::thread::sleep(latency);
+        if !request_line.contains("/rerank ") {
+            std::thread::sleep(latency);
+        }
         let data = inputs
             .iter()
             .enumerate()
             .map(|(index, text)| json!({"index": index, "embedding": fake_vector(text)}))
             .collect::<Vec<_>>();
-        let reply = json!({"data": data, "model": "search-waits-fake"}).to_string();
+        let reply = if request_line.contains("/rerank ") {
+            let results = body["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, _)| json!({"index": index, "relevance_score": 0.5}))
+                .collect::<Vec<_>>();
+            json!({"results": results}).to_string()
+        } else {
+            json!({"data": data, "model": "search-waits-fake"}).to_string()
+        };
         // One write of the whole response. Writing the header and the body
         // separately left the body waiting for the client's acknowledgement
         // of the header (TCP's Nagle algorithm against delayed ACKs), which
@@ -286,7 +305,7 @@ fn configure(root: &Path, storage: &Path, embed_base: &str, label: &str) -> Arc<
             ..Config::default()
         },
     );
-    let user = json!({
+    let mut user = json!({
         "indexes": {"trigram": true, "semantic": true, "callgraph": false},
         "semantic": {
             "backend": "openai_compatible",
@@ -294,6 +313,12 @@ fn configure(root: &Path, storage: &Path, embed_base: &str, label: &str) -> Arc<
             "model": "search-waits-fake",
         },
     });
+    if std::env::var_os("AFT_SEARCH_WAITS_RERANK").is_some() {
+        user["search"] = json!({"rerank": {
+            "backend": "remote", "endpoint": embed_base,
+            "model": "search-waits-tied", "timeout_ms": 5000,
+        }});
+    }
     let configure = request(json!({
         "id": format!("configure-{label}"),
         "command": "configure",
@@ -753,7 +778,7 @@ fn main() {
     let ready_after = wait_ready(&primary, &args.root, Duration::from_secs(1800));
     eprintln!("primary ready after {:.0} s", ready_after.as_secs_f64());
     // A first pass outside any phase so every phase starts from warm caches.
-    let warm = Mutex::new(args.queries.len());
+    let warm = Mutex::new(if args.warmup { args.queries.len() } else { 0 });
     run_searches(
         "warmup",
         &primary,

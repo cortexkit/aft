@@ -406,16 +406,21 @@ pub(crate) fn rerank_block_zero(
     let outcome = match memo().lookup(&identity) {
         Some(committed) => committed,
         None => {
+            let candidate_wait = super::waits::time(super::waits::SearchWait::RerankCandidates);
             let texts = members
                 .iter()
                 .map(|entry| candidate_text(request.project_root, &entry.result, prose))
                 .collect::<Vec<_>>();
+            drop(candidate_wait);
             let docs = texts
                 .iter()
                 .map(|text| RerankDoc { text })
                 .collect::<Vec<_>>();
             let deadline = Instant::now() + settings.timeout;
-            let computed = match selected.backend.score(prose, &docs, deadline) {
+            let scores = super::waits::timed(super::waits::SearchWait::RerankBackend, || {
+                selected.backend.score(prose, &docs, deadline)
+            });
+            let computed = match scores {
                 Ok(scores) => match validate_scores(&scores, depth) {
                     Ok(()) => CommittedOutcome::Reordered(permutation(&scores, &segments).into()),
                     Err(error) => {

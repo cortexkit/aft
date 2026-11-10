@@ -3725,11 +3725,14 @@ fn matching_line_in_text(
     let _cost = telemetry::CostPhase::start("matching_line");
     static CACHE: std::sync::OnceLock<MatchingSourceCache> = std::sync::OnceLock::new();
     let prepare_cost = telemetry::CostPhase::start("matching_prepare");
+    let prepare_wait = waits::time(waits::SearchWait::MatchingPrepare);
     let prepared = CACHE
         .get_or_init(|| MatchingSourceCache::new(32 * 1024 * 1024))
         .prepare(source);
     drop(prepare_cost);
+    drop(prepare_wait);
     let phrase_cost = telemetry::CostPhase::start("matching_phrase");
+    let phrase_wait = waits::time(waits::SearchWait::MatchingPhrase);
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
         if let Some((line_index, line)) = source.lines().enumerate().find(|(index, _)| {
@@ -3752,6 +3755,7 @@ fn matching_line_in_text(
     }
 
     drop(phrase_cost);
+    drop(phrase_wait);
     let content_tokens = query_shape::extract_content_tokens(query);
     let compact_tokens = content_tokens
         .iter()
@@ -3765,8 +3769,10 @@ fn matching_line_in_text(
         .filter(|token| token.len() >= 3)
         .collect::<Vec<_>>();
     let best_cost = telemetry::CostPhase::start("matching_best_line");
+    let best_wait = waits::time(waits::SearchWait::MatchingBestLine);
     let best = prepared.best_line(source, &compact_tokens);
     drop(best_cost);
+    drop(best_wait);
     if let Some((_, line_index, line)) = best {
         // Start the shown part of a long line at the earliest query token it
         // contains, so the window covers the region that made the line match.
@@ -3859,7 +3865,14 @@ impl MatchingSource {
                 continue;
             }
             if !missing.is_empty() {
+                let mut other_wait = prepared
+                    .trigrams
+                    .get()
+                    .is_none()
+                    .then(|| waits::time(waits::SearchWait::MatchingTrigramWait));
                 let trigrams = prepared.trigrams.get_or_init(|| {
+                    drop(other_wait.take());
+                    let _build = waits::time(waits::SearchWait::MatchingTrigrams);
                     let mut trigrams = prepared
                         .compact
                         .as_bytes()
@@ -3874,6 +3887,7 @@ impl MatchingSource {
                     trigrams.dedup();
                     trigrams.into_boxed_slice()
                 });
+                drop(other_wait);
                 for token in &missing {
                     remaining -= token.len().saturating_sub(2);
                     score += token
@@ -3979,12 +3993,15 @@ impl MatchingSourceCache {
             }
         };
         let other_wait = another_preparing.then(|| waits::time(waits::SearchWait::PrepareCache));
+        let mut source_wait = Some(waits::time(waits::SearchWait::MatchingSourceWait));
         let prepared = cell.get_or_init(|| {
+            drop(source_wait.take());
             #[cfg(test)]
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Arc::new(MatchingSource::new(source))
         });
+        drop(source_wait);
         drop(other_wait);
         let retained_bytes = prepared.retained_bytes();
         let mut state = waits::timed(waits::SearchWait::PrepareCache, || self.state.lock());

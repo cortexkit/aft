@@ -85,10 +85,26 @@ pub enum SearchWait {
     Grep,
     /// The optional cross-encoder rerank of the first page's head.
     Rerank,
+    /// Candidate text assembly, including source reads and matching-line work.
+    RerankCandidates,
+    /// The installed reranker's scoring call (including its queue or network).
+    RerankBackend,
+    /// Content-addressed matching-source lookup and normalization.
+    MatchingPrepare,
+    /// Waiting for another search to initialize the same matching source.
+    MatchingSourceWait,
+    /// The normalized exact-phrase scan before fuzzy line scoring.
+    MatchingPhrase,
+    /// Best-line scoring, including lazy line trigram preparation.
+    MatchingBestLine,
+    /// Building and sorting a line's query-independent byte trigrams.
+    MatchingTrigrams,
+    /// Waiting for another search to initialize the same line's trigrams.
+    MatchingTrigramWait,
 }
 
 impl SearchWait {
-    pub const ALL: [SearchWait; 17] = [
+    pub const ALL: [SearchWait; 25] = [
         SearchWait::CheckoutSlot,
         SearchWait::TextView,
         SearchWait::MeaningView,
@@ -106,6 +122,14 @@ impl SearchWait {
         SearchWait::Walk,
         SearchWait::Grep,
         SearchWait::Rerank,
+        SearchWait::RerankCandidates,
+        SearchWait::RerankBackend,
+        SearchWait::MatchingPrepare,
+        SearchWait::MatchingSourceWait,
+        SearchWait::MatchingPhrase,
+        SearchWait::MatchingBestLine,
+        SearchWait::MatchingTrigrams,
+        SearchWait::MatchingTrigramWait,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -127,6 +151,14 @@ impl SearchWait {
             SearchWait::Walk => "walk",
             SearchWait::Grep => "grep",
             SearchWait::Rerank => "rerank",
+            SearchWait::RerankCandidates => "rerank_candidates",
+            SearchWait::RerankBackend => "rerank_backend",
+            SearchWait::MatchingPrepare => "matching_prepare",
+            SearchWait::MatchingSourceWait => "matching_source_wait",
+            SearchWait::MatchingPhrase => "matching_phrase",
+            SearchWait::MatchingBestLine => "matching_best_line",
+            SearchWait::MatchingTrigrams => "matching_trigrams",
+            SearchWait::MatchingTrigramWait => "matching_trigram_wait",
         }
     }
 
