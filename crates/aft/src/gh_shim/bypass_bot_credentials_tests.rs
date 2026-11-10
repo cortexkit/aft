@@ -127,7 +127,22 @@ fn admin_rows(manifest: &Manifest) -> Vec<(String, Vec<OsString>)> {
     rows
 }
 
+// The full entry point classifies with this machine's platform, and the signed
+// fixture declares some admin rows only for some platforms (on Windows,
+// `pr merge` is undeclared and refused as unclassified before any bypass
+// check). The direct dispatch below always classifies as Linux, so every row is
+// still covered there; the full path checks only rows declared here.
+fn declared_on_this_platform(fixture: &Fixture, args: &[OsString]) -> bool {
+    matches!(
+        classify(args, &fixture.manifest, current_platform()),
+        Classification::Admin { .. }
+    )
+}
+
 fn assert_bot_refusal(fixture: &Fixture, args: &[OsString], presence: &str, full_dispatch: bool) {
+    if full_dispatch && !declared_on_this_platform(fixture, args) {
+        return;
+    }
     let (_sink, lines) = capture_refusals_for_test();
     let never_exec = |_: &[OsString]| panic!("bot credential bypass reached upstream: {args:?}");
     let status = if full_dispatch {
