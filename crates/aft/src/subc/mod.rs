@@ -268,6 +268,7 @@ mod run_scope;
 mod runner_notices;
 pub(crate) mod scope_background_tasks;
 mod scope_describe;
+mod shells;
 #[cfg(test)]
 mod stack_budget_tests;
 pub(crate) mod watch_delivery;
