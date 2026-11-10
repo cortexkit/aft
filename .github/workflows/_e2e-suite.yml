@@ -439,8 +439,8 @@ jobs:
     runs-on: [self-hosted, narli]
     timeout-minutes: 30
     env:
-      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
-      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
+      SCCACHE_GHA_ENABLED: "false"
+      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
@@ -537,8 +537,8 @@ jobs:
     # Publication still tests the shipped release binary in release.yml.
     timeout-minutes: 45
     env:
-      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
-      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
+      SCCACHE_GHA_ENABLED: "false"
+      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE: ${{ inputs.cargo_profile == 'stage' && 'dev' || 'release' }}
       CARGO_PROFILE_DIR: ${{ inputs.cargo_profile == 'stage' && 'debug' || 'release' }}

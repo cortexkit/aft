@@ -682,9 +682,9 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 30
     env:
-      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+      SCCACHE_GHA_ENABLED: "false"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
+      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
@@ -757,9 +757,9 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 90
     env:
-      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+      SCCACHE_GHA_ENABLED: "false"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
+      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
       # Non-incremental Cargo builds default to 16 codegen units. Split the
       # large library harness more finely without changing dependency profiles,
@@ -795,7 +795,10 @@ jobs:
         shell: bash
         run: |
           started=$SECONDS
-          trap 'printf "### macOS libtest archive\n\nRunner: rented-mac (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          report_timing() {
+            printf "### macOS libtest archive\n\nRunner: rented-mac (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap report_timing EXIT
           # Native time reports resident-memory and paging counters for the build.
           /usr/bin/time -l cargo nextest archive --features test-hooks --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
@@ -846,9 +849,9 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 25
     env:
-      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+      SCCACHE_GHA_ENABLED: "false"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
+      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
@@ -1083,8 +1086,8 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     env:
-      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
-      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
+      SCCACHE_GHA_ENABLED: "false"
+      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
@@ -1132,7 +1135,10 @@ jobs:
       - name: Rust libtest shard (nextest archive)
         run: |
           started=$SECONDS
-          trap 'printf "### macOS libtest shard %s\n\nRunner: rented-mac (%s)\n\nTest duration: %ss\n" "$AFT_NEXTEST_PARTITION" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          report_timing() {
+            printf "### macOS libtest shard %s\n\nRunner: rented-mac (%s)\n\nTest duration: %ss\n" "$AFT_NEXTEST_PARTITION" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap report_timing EXIT
           ./scripts/rust-test-gate.sh
         shell: bash
         env:
@@ -1167,8 +1173,8 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     env:
-      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
-      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
+      SCCACHE_GHA_ENABLED: "false"
+      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
@@ -1241,8 +1247,8 @@ jobs:
     # Leave room for a cold Cargo build followed by conformance and Bun tests.
     timeout-minutes: 45
     env:
-      SCCACHE_GHA_ENABLED: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
-      RUSTC_WRAPPER: ${{ runner.environment == 'github-hosted' && 'sccache' || '' }}
+      SCCACHE_GHA_ENABLED: "false"
+      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
