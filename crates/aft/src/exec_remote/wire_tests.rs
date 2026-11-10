@@ -224,6 +224,9 @@ pub(crate) enum Script {
     GatedAdmission {
         refuse: bool,
     },
+    /// Placement progress has no job id; release acceptance separately. Only
+    /// exec.cancel stops the job, and attach then confirms it never ran.
+    PlacementWait,
     /// Delay route opening before the client can submit exec.run.
     GatedRoute,
     /// Drop the connection on the first `exec.run`, before any stream record:
@@ -523,6 +526,27 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(reply(FrameType::StreamEnd, Value::Null));
                             }
                         }
+                        "exec.run" | "exec.attach" if matches!(script, Script::PlacementWait) => {
+                            if body["method"] == "exec.run" {
+                                assert_eq!(body["params"]["progress"], true);
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Progress(
+                                    Progress::new(ProgressPhase::PlacementWait, 26 * 60 * 1000, Some("waiting for a host with 8 free vCPUs".into())).unwrap()
+                                )).unwrap()));
+                                let accepted = reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap());
+                                let writer = writer.clone();
+                                let gate = server_acceptance_gate.clone();
+                                producers.push(tokio::spawn(async move {
+                                    gate.notified().await;
+                                    let _ = subc_transport::write_frame(&mut *writer.lock().await, &accepted).await;
+                                }));
+                            } else {
+                                assert_eq!(body["params"]["job_id"], id().to_string());
+                                let mut terminal = TerminalRecord::new(id(), if cancelled { Outcome::Cancelled } else { Outcome::OutcomeUnknown }, 0, 0, 0);
+                                terminal.ran = Some(Ran::None);
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap()));
+                                replies.push(reply(FrameType::StreamEnd, Value::Null));
+                            }
+                        }
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
@@ -721,7 +745,7 @@ pub(crate) async fn daemon_with_capabilities(
                         _ => panic!("unexpected caller operation {body}"),
                     }
                 },
-                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. }) => {},
+                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. } | Script::PlacementWait) => {},
                 FrameType::Cancel => {cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst);},
                 _ => {},
             }

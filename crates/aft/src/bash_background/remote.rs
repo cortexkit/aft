@@ -393,17 +393,11 @@ async fn draining_retry_sleep(_root: &Path, _now: u64, delay: u64) {
     tokio::time::sleep(Duration::from_millis(delay)).await;
 }
 
-/// Detaching a submitted call does not stop the job. Without a job id, AFT
-/// cannot send job cancellation or confirm from the runner that the job has
-/// finished.
+/// Without a job id, AFT cannot send job cancellation or confirm from the runner
+/// that the job has finished, even after the local observation ends.
 #[cfg(unix)]
-pub(crate) const PRE_ACCEPTANCE_DETACHED: &str =
-    "detached from the remote submission without cancelling the job; no job id was received, so the job may still run";
-
-/// Prefix shown, followed by `: <error>`, when detaching the submission failed.
-#[cfg(unix)]
-pub(crate) const PRE_ACCEPTANCE_CANCEL_FAILED: &str =
-    "could not detach the remote submission; no job id was received, so the job may still run";
+pub(crate) const PRE_ACCEPTANCE_CANCEL_UNCONFIRMED: &str =
+    "remote cancellation unconfirmed; no job id was received, so the job may still run";
 
 /// The remote runner AFT dispatches to; named in every remote reply header.
 #[cfg(unix)]
@@ -3173,7 +3167,14 @@ impl BgTaskRegistry {
                 let result = tests::capture_remote_launch_logs(&task, run);
                 #[cfg(not(test))]
                 let result = run();
-                if let Err(error) = result {
+                if let Err(mut error) = result {
+                    if task.state.lock().is_ok_and(|state| {
+                        state.metadata.remote.as_ref().is_some_and(|remote| {
+                            remote.cancel_requested && remote.job_id.is_none()
+                        })
+                    }) {
+                        error = format!("{PRE_ACCEPTANCE_CANCEL_UNCONFIRMED}: {error}");
+                    }
                     if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
                         task.remote_launch_ready.store(true, Ordering::Release);
                         release_worker_owed_cancel_claim(&task.task_id);
@@ -3259,9 +3260,9 @@ impl BgTaskRegistry {
         );
         let mut retry_request = None;
         let resume_submission = initial.is_none()
-            // An accepted job without a terminal was detached by an AFT restart.
+            // A known job without a terminal was detached by an AFT restart.
             // Recover its existing job ID, even if the submission also has a key.
-            && !(remote.accepted && remote.job_id.is_some() && remote.terminal.is_none())
+            && !(remote.job_id.is_some() && remote.terminal.is_none())
             && remote.resubmit_for_recovery()
             && (remote.terminal.as_ref().is_some_and(|record| {
                 exec::grade(record) == Verdict::OutcomeUnknown
@@ -3611,6 +3612,7 @@ impl BgTaskRegistry {
             }
         };
         let mut cancelled = false;
+        let mut pending_cancel_deadline = None;
         let mut keyed_recovery_error = None;
         loop {
             // Poll intent even when every stream read is immediately ready.
@@ -3624,7 +3626,13 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|r| r.cancel_requested);
             if cancel && !cancelled {
-                if let Some(point) = stream.resume_point() {
+                // A job id can be known before acceptance without proving that
+                // inputs were captured. Use it for cancellation without changing
+                // acceptance or advancing the output cursor.
+                let point = stream
+                    .resume_point()
+                    .or_else(|| task.state.lock().ok()?.metadata.remote.as_ref()?.point());
+                if let Some(point) = point {
                     // Stands in for the daemon stopping before it sent the
                     // cancellation to the runner.
                     #[cfg(test)]
@@ -3655,18 +3663,17 @@ impl BgTaskRegistry {
                     };
                     cancelled = true;
                 } else {
-                    // Before the runner accepts the submission, there is no job
-                    // ID for exec.cancel or attach. Cancel the active call instead.
-                    // The SDK closes its receiver, so this cannot prove the job stopped.
-                    let result = client
-                        .cancel_submission(&stream)
-                        .await
-                        .map_err(|error| format!("{PRE_ACCEPTANCE_CANCEL_FAILED}: {error}"));
-                    if self.finish_owner_pause_cancel(&task, result.clone()) {
-                        return Ok(());
+                    // Request-level Cancel only detaches. Keep reading until an
+                    // id arrives, then send exec.cancel before following again.
+                    // Progress must not extend the runner's queue/run allowance.
+                    let deadline =
+                        pending_cancel_deadline.get_or_insert(recovery.job_end + recovery.grace);
+                    if tokio::time::Instant::now() >= *deadline {
+                        return Err(
+                            "runner confirmation time limit passed while waiting for a job id"
+                                .into(),
+                        );
                     }
-                    result?;
-                    return Err(PRE_ACCEPTANCE_DETACHED.into());
                 }
             }
             sink.sent_at = stream.sent_at();
@@ -3901,7 +3908,7 @@ impl BgTaskRegistry {
                     // Prefer the accepted job over resubmitting the command with
                     // its key. The shorter key-recovery limit must not abandon a
                     // job that can still be queued or running on the executor.
-                    if current.resubmit_for_recovery() && !current.accepted {
+                    if current.resubmit_for_recovery() && current.job_id.is_none() {
                         keyed_recovery_error.get_or_insert_with(|| error.to_string());
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
@@ -4867,6 +4874,17 @@ impl BgTaskRegistry {
             .wait_timeout_while(state, bound, |s| !s.metadata.is_terminal())
             .map_err(|_| "task lock poisoned")?;
         if !state.metadata.is_terminal() {
+            if state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.job_id.is_none())
+            {
+                return Err(format!(
+                    "remote cancellation pending for task {}; no job id was received, so the job may still run; AFT will cancel it when its job id arrives; inspect bash_status (never rerun)",
+                    task.task_id,
+                ));
+            }
             return Err(
                 "remote cancellation requested; terminal pending; inspect bash_status (never rerun)".into(),
             );

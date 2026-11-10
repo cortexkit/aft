@@ -3383,6 +3383,86 @@ fn cancel_terminal(outcome: Outcome, killed: Option<Killed>, ran: Ran) -> Termin
     terminal
 }
 
+#[tokio::test]
+async fn remote_cancel_placement_without_job_id_expires_with_truthful_warning() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::PlacementWait,
+        &["exec-remote/v1", exec::types::PROGRESS_CAPABILITY],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_reattach_budget(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    wait_for("placement progress before cancellation", || {
+        registry
+            .task(&task_id)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .remote_admission_note
+            .clone()
+    })
+    .await;
+    let (pending, _) = timed_kill(&registry, &task_id, Some(Duration::from_millis(250))).await;
+    let pending = pending.unwrap_err();
+    assert!(pending.contains("remote cancellation pending"), "{pending}");
+    assert!(pending.contains(&task_id), "{pending}");
+    assert!(pending.contains("the job may still run"), "{pending}");
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(done.info.task_id, task_id);
+    assert_eq!(done.remote_job_id, None);
+    assert!(
+        done.output_preview
+            .contains("no job id was received, so the job may still run"),
+        "{done:?}"
+    );
+    assert!(
+        done.output_preview
+            .contains("runner confirmation time limit passed"),
+        "{done:?}"
+    );
+    assert!(cancel_requests(&daemon).is_empty());
+}
+
+#[tokio::test]
+async fn remote_cancel_restart_without_job_id_does_not_claim_cancellation() {
+    let daemon = daemon(Script::PlacementWait, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let mut saved = read_task(&paths.json).unwrap();
+    let remote = saved.remote.as_mut().unwrap();
+    remote.accepted = false;
+    remote.job_id = None;
+    remote.queue_position = None;
+    remote.cancel_requested = true;
+    original.dual_write_task(&paths, &saved);
+    drop(original);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(done.info.task_id, task_id);
+    assert!(
+        done.output_preview
+            .contains("no job id was received, so the job may still run"),
+        "{done:?}"
+    );
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.run"));
+}
+
 fn cancel_unknown_terminal() -> TerminalRecord {
     let mut terminal = crate::exec_remote::wire_tests::cancel_exit_status_unknown_terminal();
     terminal.job_id = id();

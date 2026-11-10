@@ -347,21 +347,6 @@ impl ExecRemoteClient {
         self.attach(point).await
     }
 
-    /// Attempt call-key cancellation even before Accepted assigns a job ID.
-    /// Unsubscribe closes the local receiver and sends Cancel best-effort;
-    /// a subsequent status round trip keeps the transport alive to send it
-    /// before the task's runtime shuts down. Neither sending Cancel nor receiving
-    /// the status reply proves termination.
-    /// Without a job ID, terminal recovery still has to report unknown.
-    #[cfg(unix)]
-    pub(crate) async fn cancel_submission(&self, stream: &RemoteStream) -> Result<(), Error> {
-        stream
-            .subscription
-            .unsubscribe()
-            .map_err(Error::Transport)?;
-        self.status().await.map(|_| ())
-    }
-
     /// Idempotent cancellation by job ID after a caller restart or detach.
     /// The acknowledgement is not a terminal; follow it with `attach`.
     pub async fn cancel_job(&self, job_id: Uuid) -> Result<CancelReply, Error> {
