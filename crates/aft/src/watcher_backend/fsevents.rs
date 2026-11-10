@@ -110,7 +110,7 @@ impl ProjectWatcher {
         // matcher at this generation, so the generation is captured beside it
         // rather than on the backend thread after spawn.
         let generation = matcher_generation.load(Ordering::Acquire);
-        let counters = crate::context::watcher_counters_for_root(&root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&root);
         let flush_rx = counters.bash_flush.register_native();
         let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
         let outcome = planning
@@ -410,13 +410,13 @@ impl Drop for ProjectWatcher {
 pub(crate) struct DirectoryWatcher {
     stream: Option<FsEventsStream>,
     sender: NativeEventSender,
-    counters: Arc<crate::context::WatcherCounters>,
+    counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
 }
 
 impl DirectoryWatcher {
     pub(crate) fn new(
         sender: mpsc::Sender<notify::Result<Event>>,
-        counters: Arc<crate::context::WatcherCounters>,
+        counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> Self {
         Self {
             stream: None,
@@ -496,7 +496,7 @@ impl FsEventsStream {
             since_when,
             last_delivered_id,
             None,
-            crate::context::watcher_counters_for_root(root),
+            crate::watcher_backend::counters::watcher_counters_for_root(root),
         )
     }
 
@@ -507,7 +507,7 @@ impl FsEventsStream {
         since_when: fs::FSEventStreamEventId,
         last_delivered_id: Arc<AtomicU64>,
         nonrecursive_paths: Option<Vec<PathBuf>>,
-        counters: Arc<crate::context::WatcherCounters>,
+        counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> notify::Result<Self> {
         let watched_paths = create_cf_path_array(paths)?;
         let context_info = Box::into_raw(Box::new(CallbackContext {
@@ -1050,10 +1050,12 @@ mod tests {
         let source = foo.join("source.rs");
         std::fs::write(&source, "pub fn before() {}\n").unwrap();
         wait_for_raw_path(&rx, &foo);
-        assert!(!crate::context::watcher_counters_for_root(&root)
-            .backend_exclusions()
-            .paths
-            .contains(&foo));
+        assert!(
+            !crate::watcher_backend::counters::watcher_counters_for_root(&root)
+                .backend_exclusions()
+                .paths
+                .contains(&foo)
+        );
         // Drain creation events and journal replay before writing again. A
         // queued event for the first write must not satisfy the assertion
         // that the second write is reported.
@@ -1073,10 +1075,12 @@ mod tests {
         std::fs::remove_file(&foo).unwrap();
         std::os::unix::fs::symlink(second.path(), &foo).unwrap();
         wait_for_raw_path(&rx, &foo);
-        assert!(crate::context::watcher_counters_for_root(&root)
-            .backend_exclusions()
-            .paths
-            .contains(&foo));
+        assert!(
+            crate::watcher_backend::counters::watcher_counters_for_root(&root)
+                .backend_exclusions()
+                .paths
+                .contains(&foo)
+        );
     }
 
     #[test]
@@ -1087,10 +1091,12 @@ mod tests {
         std::fs::remove_dir(&foo).unwrap();
         std::os::unix::fs::symlink(external.path(), &foo).unwrap();
         wait_for_raw_path(&rx, &foo);
-        assert!(crate::context::watcher_counters_for_root(&root)
-            .backend_exclusions()
-            .paths
-            .contains(&foo));
+        assert!(
+            crate::watcher_backend::counters::watcher_counters_for_root(&root)
+                .backend_exclusions()
+                .paths
+                .contains(&foo)
+        );
     }
 
     struct LinkedWorktree {
@@ -1269,7 +1275,7 @@ mod tests {
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let matcher = Arc::new(RwLock::new(None));
         let generation = Arc::new(AtomicU64::new(1));
-        let counters = crate::context::watcher_counters_for_root(&root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&root);
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let backend_matcher = Arc::clone(&matcher);
@@ -1385,10 +1391,12 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         )
         .unwrap();
-        assert!(crate::context::watcher_counters_for_root(&root)
-            .backend_exclusions()
-            .paths
-            .contains(&target));
+        assert!(
+            crate::watcher_backend::counters::watcher_counters_for_root(&root)
+                .backend_exclusions()
+                .paths
+                .contains(&target)
+        );
         let events: Vec<_> = (0..EVENTS)
             .map(|index| {
                 Ok(Event::new(EventKind::Create(CreateKind::File))
@@ -1642,7 +1650,7 @@ mod tests {
         let target = canonical_root.join("target");
         let matcher: SharedGitignore = Arc::new(RwLock::new(None));
         let generation = Arc::new(AtomicU64::new(0));
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         let (tx, rx) = mpsc::channel();
         let watcher = ProjectWatcher::create(
             canonical_root.clone(),
@@ -1878,7 +1886,7 @@ mod tests {
         let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
         let generation = Arc::new(AtomicU64::new(1));
         let config = WatcherFilterConfig::new(canonical_root.clone(), None);
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let backend_matcher = Arc::clone(&matcher);

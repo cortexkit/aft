@@ -947,7 +947,7 @@ fn execute_root_from_view(
             ctx.note_view_load_failure("trigram", &error);
             return Some((
                 failed_index_grep(std::io::Error::other(
-                    crate::context::view_load_failure_message(error),
+                    crate::data_layer::status::view_load_failure_message(error),
                 )),
                 GrepExecutionPhaseTimings::default(),
             ));

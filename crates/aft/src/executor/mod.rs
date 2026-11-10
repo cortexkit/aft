@@ -1,3 +1,4 @@
+pub(crate) mod root_lifecycle;
 mod single_flight;
 
 #[cfg(test)]
@@ -574,7 +575,7 @@ pub struct BindBlockerSnapshot {
 pub struct JobCancellation {
     inner: Arc<JobCancellationInner>,
     root: Option<Arc<std::path::PathBuf>>,
-    lifecycle: Option<crate::context::SubcLifecycleAdmission>,
+    lifecycle: Option<crate::executor::root_lifecycle::SubcLifecycleAdmission>,
 }
 
 #[derive(Debug)]
@@ -636,7 +637,7 @@ impl JobCancellation {
 
     pub(crate) fn with_lifecycle(
         mut self,
-        lifecycle: crate::context::SubcLifecycleAdmission,
+        lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
     ) -> Self {
         self.lifecycle = Some(lifecycle);
         self

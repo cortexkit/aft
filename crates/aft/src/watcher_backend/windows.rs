@@ -118,7 +118,7 @@ impl ProjectWatcher {
         // instruction must be observed as new work, not mistaken for the state
         // used to create the watch.
         let observed_generation = matcher_generation.load(Ordering::Acquire);
-        let counters = crate::context::watcher_counters_for_root(&root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(observed_generation, Vec::new(), Vec::new());
         let targets = project_watch_targets(&root, extra_watch_paths);
         Self::start(
@@ -142,7 +142,7 @@ impl ProjectWatcher {
         tx: mpsc::Sender<notify::Result<Event>>,
         matcher_generation: Arc<AtomicU64>,
         observed_generation: u64,
-        counters: Arc<crate::context::WatcherCounters>,
+        counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> notify::Result<Self> {
         let completion_port = CompletionPort::create()?;
         let thread_port = Arc::clone(&completion_port);
@@ -246,7 +246,7 @@ pub(crate) struct DirectoryWatcher {
 impl DirectoryWatcher {
     pub(crate) fn new(
         sender: mpsc::Sender<notify::Result<Event>>,
-        _counters: Arc<crate::context::WatcherCounters>,
+        _counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> Self {
         Self {
             sender,
@@ -278,7 +278,7 @@ impl DirectoryWatcher {
             // watcher's backend state for the same root.
             Arc::new(AtomicU64::new(0)),
             0,
-            Arc::new(crate::context::WatcherCounters::default()),
+            Arc::new(crate::watcher_backend::counters::WatcherCounters::default()),
         )?);
         Ok(())
     }
@@ -418,7 +418,7 @@ fn run_completion_loop(
     matcher_generation: Arc<AtomicU64>,
     mut observed_generation: u64,
     observed_generation_out: Arc<AtomicU64>,
-    counters: Arc<crate::context::WatcherCounters>,
+    counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     start_tx: mpsc::SyncSender<notify::Result<()>>,
 ) -> notify::Result<()> {
     let mut watches = match open_watches(completion_port, targets, buffer_size) {
@@ -1046,7 +1046,7 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         let matcher = Arc::new(RwLock::new(None));
         let generation = Arc::new(AtomicU64::new(1));
         let create_generation = Arc::clone(&generation);

@@ -400,7 +400,7 @@ struct Holder {
     /// Upgradeable while the context lives: the context owns the only
     /// long-lived strong reference to its configure-generation counter.
     alive: Weak<AtomicU64>,
-    lifecycle: crate::context::SubcLifecycleAdmission,
+    lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
 }
 
 impl Holder {
@@ -555,7 +555,7 @@ struct ChildLoadFailures {
     /// Keyed `parent_<plane>:<cause>`, like a context's own view load counts.
     by_cause: std::collections::BTreeMap<String, u64>,
     total: u64,
-    last: Option<crate::context::ViewLoadFailure>,
+    last: Option<crate::data_layer::status::ViewLoadFailure>,
     /// Last error-level log per plane and the repeats suppressed since.
     logged: HashMap<&'static str, (Option<Instant>, u64)>,
 }
@@ -580,7 +580,7 @@ fn record_child_failure(
             .insert(child_reserve_key(child, plane), reserve);
         return;
     }
-    let cause = crate::context::view_load_cause(error);
+    let cause = crate::data_layer::status::view_load_cause(error);
     let error = format!("{child}: {error}");
     let now = Instant::now();
     let (count, suppressed) = {
@@ -595,7 +595,7 @@ fn record_child_failure(
             *slot
         };
         failures.total = failures.total.saturating_add(1);
-        failures.last = Some(crate::context::ViewLoadFailure {
+        failures.last = Some(crate::data_layer::status::ViewLoadFailure {
             plane: plane.to_string(),
             cause: cause.to_string(),
             error: error.clone(),
@@ -606,10 +606,9 @@ fn record_child_failure(
                 .map_or(0, |elapsed| elapsed.as_millis() as u64),
         });
         let entry = failures.logged.entry(plane).or_default();
-        if entry
-            .0
-            .is_some_and(|last| now.duration_since(last) < crate::context::VIEW_LOAD_LOG_INTERVAL)
-        {
+        if entry.0.is_some_and(|last| {
+            now.duration_since(last) < crate::data_layer::status::VIEW_LOAD_LOG_INTERVAL
+        }) {
             entry.1 = entry.1.saturating_add(1);
             (count, None)
         } else {

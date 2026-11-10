@@ -640,7 +640,7 @@ impl MeaningReport {
 /// How `checkout`'s meaning plane stands; `None` while semantic search is
 /// off for the checkout.
 fn meaning_report(checkout: &DataCheckout) -> Option<MeaningReport> {
-    use crate::context::SemanticIndexStatus;
+    use crate::data_layer::status::SemanticIndexStatus;
     use crate::data_layer::tools::search::DataSemantic;
     let semantic = DataSemantic::of_checkout(checkout)?;
     let filling = checkout.filling();
@@ -1281,7 +1281,7 @@ pub fn fill_root(
 /// the checkout and starts its fill. Ready only once every file meaning
 /// search applies to is filled: a partial plane is still pending.
 pub fn warm_meaning(ctx: &AppContext) -> Option<WarmState> {
-    use crate::context::SemanticIndexStatus;
+    use crate::data_layer::status::SemanticIndexStatus;
     use crate::data_layer::tools::search::DataSemantic;
     if !ctx.data_layer_serves_meaning() {
         return None;

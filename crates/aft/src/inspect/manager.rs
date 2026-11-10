@@ -920,7 +920,10 @@ impl InspectManager {
             .request_cancel();
     }
 
-    pub(crate) fn set_root_lifecycle(&self, lifecycle: crate::context::SubcLifecycleAdmission) {
+    pub(crate) fn set_root_lifecycle(
+        &self,
+        lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
+    ) {
         let mut token = self
             .root_work_cancellation
             .lock()

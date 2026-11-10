@@ -107,10 +107,10 @@ pub(crate) fn ops_graph(
     ctx: &AppContext,
     files: &[&Path],
 ) -> Result<(OpsGraph, Option<CheckoutView>), crate::protocol::Response> {
+    use crate::callgraph_store::access::CallgraphStoreAccess;
     use crate::commands::callgraph_store_adapter::{
         index_refusal_response, not_indexed_response, store_error_response,
     };
-    use crate::context::CallgraphStoreAccess;
     match access(ctx) {
         Access::Building => Err(index_refusal_response(
             req_id,
