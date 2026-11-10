@@ -26,6 +26,11 @@
 //! PROBE_WARM_DIFF
 //! and PROBE_WARM_PATHS name a real refactor patch and its changed-path list;
 //! the patch is applied only to copies of this repository before the visits.
+//!
+//! `paired <copy> <edit-path>` accepts `cold <sequence>`, `edit <sequence>` and
+//! `census <sequence>` lines on stdin, replying with one JSON line per command.
+//! A coordinator can keep base and candidate binaries alive and alternate them
+//! after every edit. Each `cold` command uses a fresh data layer and store.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
@@ -465,11 +470,104 @@ fn roots(mut args: impl Iterator<Item = String>) {
     peak.stop.store(true, Ordering::Release);
 }
 
+/// A line-driven probe lets a coordinator alternate two persistent binaries
+/// after each edit rather than comparing long runs at different host loads.
+fn paired(mut args: impl Iterator<Item = String>) {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .target(env_logger::Target::Stderr)
+        .init();
+    let root = std::fs::canonicalize(args.next().unwrap()).unwrap();
+    let path = args.next().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let original = std::fs::read_to_string(root.join(&path)).unwrap();
+    let mut current = None;
+    let mut store = None;
+    for line in std::io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let mut words = line.split_whitespace();
+        let command = words.next().unwrap();
+        let sequence = words.next().unwrap().parse::<usize>().unwrap();
+        match command {
+            "cold" => {
+                drop(current.take());
+                drop(store.take());
+                aft::memory::relieve_allocator_pressure();
+                std::fs::write(root.join(&path), &original).unwrap();
+                store = Some(tempfile::tempdir().unwrap());
+                let layer = Arc::new(DataLayer::new(256 << 20, 8));
+                layer.set_engine_budget(u64::MAX);
+                let family = FamilyId::from_digest(Digest128::of(b"paired probe"));
+                let checkout =
+                    Checkout::bind(layer, store.as_ref().unwrap().path(), family, &root).unwrap();
+                let cpu = cpu_seconds();
+                let wall = Instant::now();
+                let report = checkout.build().unwrap();
+                let wall = wall.elapsed().as_secs_f64();
+                let cpu = cpu_seconds() - cpu;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "paired_cold", "sequence": sequence,
+                        "cpu_s": cpu, "wall_s": wall, "files": report.files, "parsed": report.parsed_files,
+                    })
+                );
+                current = Some(checkout);
+                aft::memory::relieve_allocator_pressure();
+            }
+            "edit" => {
+                let checkout = current.as_ref().expect("build first");
+                std::fs::write(
+                    root.join(&path),
+                    format!("{original}\n// paired probe edit {sequence}\n"),
+                )
+                .unwrap();
+                let cpu = cpu_seconds();
+                let wall = Instant::now();
+                checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
+                let record_wall = wall.elapsed().as_secs_f64();
+                let record_cpu = cpu_seconds() - cpu;
+                let cpu = cpu_seconds();
+                let wall = Instant::now();
+                assert!(checkout.refresh_callgraph().unwrap().is_some());
+                let refresh_wall = wall.elapsed().as_secs_f64();
+                let refresh_cpu = cpu_seconds() - cpu;
+                let cpu = cpu_seconds();
+                let wall = Instant::now();
+                assert!(checkout.publish_changes().unwrap().is_some());
+                let publish_wall = wall.elapsed().as_secs_f64();
+                let publish_cpu = cpu_seconds() - cpu;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "paired_edit", "sequence": sequence,
+                        "record_cpu_s": record_cpu, "record_wall_s": record_wall,
+                        "refresh_cpu_s": refresh_cpu, "refresh_wall_s": refresh_wall,
+                        "publish_cpu_s": publish_cpu, "publish_wall_s": publish_wall,
+                    })
+                );
+                aft::memory::relieve_allocator_pressure();
+            }
+            "census" => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "paired_census", "sequence": sequence,
+                        "engine": components(current.as_ref().expect("build first")),
+                    })
+                );
+            }
+            _ => panic!("unknown paired command {command}"),
+        }
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("replay") => replay(args),
         Some("roots") => roots(args),
+        Some("paired") => paired(args),
         _ => panic!("usage: engine_keep_probe replay <pack.jsonl.gz> [publish_every] [threads]; roots <budget_mib> <rounds> <idle_seconds> <root> <edit_path> ..."),
     }
 }
