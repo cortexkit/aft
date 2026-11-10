@@ -2064,6 +2064,31 @@ impl Drop for UncapturedTerminalBeforeRenderForTest {
 pub(crate) fn uncaptured_terminal_before_render_for_test(
     refused: bool,
 ) -> UncapturedTerminalBeforeRenderForTest {
+    let verdict = if refused {
+        Verdict::RunLocally {
+            reason: RefusalReason::Unreachable,
+            refusal_detail: None,
+        }
+    } else {
+        Verdict::Signalled { signal: 9 }
+    };
+    uncaptured_verdict_before_render_for_test(
+        verdict,
+        refused.then(|| "runon refused: remote refused: unreachable; command was not run".into()),
+    )
+}
+
+pub(crate) fn uncaptured_unknown_before_render_for_test() -> UncapturedTerminalBeforeRenderForTest {
+    uncaptured_verdict_before_render_for_test(
+        Verdict::OutcomeUnknown,
+        Some("remote route interrupted before acceptance".into()),
+    )
+}
+
+fn uncaptured_verdict_before_render_for_test(
+    verdict: Verdict,
+    error: Option<String>,
+) -> UncapturedTerminalBeforeRenderForTest {
     let dir = tempfile::tempdir().unwrap();
     let (registry, task_id, _) =
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
@@ -2092,21 +2117,7 @@ pub(crate) fn uncaptured_terminal_before_render_for_test(
         let registry = registry.clone();
         let task = task.clone();
         std::thread::spawn(move || {
-            let verdict = if refused {
-                Verdict::RunLocally {
-                    reason: RefusalReason::Unreachable,
-                    refusal_detail: None,
-                }
-            } else {
-                Verdict::Signalled { signal: 9 }
-            };
-            registry.remote_terminal(
-                &task,
-                verdict,
-                refused.then(|| {
-                    "runon refused: remote refused: unreachable; command was not run".into()
-                }),
-            );
+            registry.remote_terminal(&task, verdict, error);
         })
     };
     let fixture = UncapturedTerminalBeforeRenderForTest {

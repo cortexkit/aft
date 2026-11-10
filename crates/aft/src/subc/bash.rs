@@ -8796,6 +8796,43 @@ mod grant_path_tests {
         }
     }
 
+    /// A deadline or drain can use the launch projection before terminal output
+    /// rendering finishes. Hold that rendering so the reply must get the saved
+    /// unknown-outcome advice from the same publication as the terminal status.
+    #[cfg(unix)]
+    #[test]
+    fn runon_capture_cached_unknown_reply_before_terminal_render_keeps_advice() {
+        let fixture = crate::bash_background::registry::remote::uncaptured_unknown_before_render_for_test();
+        let task_id = &fixture.task.task_id;
+        let launch = Response::success(
+            "cached-unknown",
+            json!({"task_id": task_id, "status": "starting", "output": ""}),
+        );
+        // The worker is held after metadata publication but before the canonical
+        // output cache is built; no task or artifact reads may rescue this reply.
+        let _state = fixture.task.state.lock().unwrap();
+        let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        for background in [false, true] {
+            let reply = cached_runon_launch_reply(
+                &fixture.registry,
+                task_id,
+                "session",
+                &launch,
+                background,
+            )
+            .unwrap();
+            let result = bash_result_from_response(reply, &Default::default());
+            assert_eq!(result.response.data["status"], "fate_unknown");
+            assert!(
+                result.text.contains("remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe"),
+                "{}",
+                result.text
+            );
+            assert!(!result.text.contains(REMOTE_INPUT_CAPTURE_WARNING));
+            assert!(result.text.ends_with(&format!("[task {task_id}]")));
+        }
+    }
+
     /// A ready reply finalized while its task looked live can turn out to
     /// describe a task that finished before the runner sent Accepted. Its
     /// replacement shows the saved outcome but keeps what finalization added:

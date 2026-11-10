@@ -6114,4 +6114,5 @@ pub(crate) use tests::{assert_siblings_submit_refused_before_connect, submit_run
 #[cfg(all(test, unix))]
 pub(crate) use tests::{
     captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
+    uncaptured_unknown_before_render_for_test,
 };
