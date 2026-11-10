@@ -277,7 +277,10 @@ mod decode_probe {
         let segment = Segment::open(
             std::path::Path::new(&path),
             family,
-            &super::super::graph_store::known_sections(),
+            &super::super::graph_store::known_sections()
+                .into_iter()
+                .chain(aft_store::text::KNOWN)
+                .collect::<Vec<_>>(),
             Arc::new(BlockCache::new(16 * BLOCK_LEN)),
         )
         .unwrap();
