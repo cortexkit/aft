@@ -221,7 +221,85 @@ fn module_addition_replays_only_changed_parent_targets() {
     );
     assert_eq!(stats.rebound, 3, "{stats:?}");
     assert_eq!(stats.resolved, 3, "{stats:?}");
-    assert!(stats.replayed <= 1, "unrelated crate replayed: {stats:?}");
+    assert_eq!(
+        stats.replayed, 0,
+        "unchanged module names replayed: {stats:?}"
+    );
+}
+
+#[test]
+fn module_name_keys_include_absent_crate_super_and_self_lookups() {
+    for (call, declaring) in [
+        ("crate::named::value()", "src/lib.rs"),
+        ("super::named::value()", "src/lib.rs"),
+        ("self::named::value()", "src/caller.rs"),
+    ] {
+        let caller = format!("pub fn call() {{ {call}; }}");
+        let root = "pub mod caller;";
+        let before = [
+            ("src/lib.rs", root),
+            ("src/caller.rs", caller.as_str()),
+            ("src/external.rs", "pub fn value() {}"),
+        ];
+        let new_root = format!("{root}\n#[path = \"external.rs\"] pub mod named;");
+        let new_caller = format!("{caller}\n#[path = \"external.rs\"] pub mod named;");
+        let mut after = before.to_vec();
+        for (path, content) in &mut after {
+            if *path == declaring {
+                *content = if declaring == "src/lib.rs" {
+                    &new_root
+                } else {
+                    &new_caller
+                };
+            }
+        }
+        let (_, cold) = update_checked(checkout(&before, &[]), checkout(&after, &[]), &[declaring]);
+        assert!(
+            cold["src/caller.rs"]
+                .rows
+                .iter()
+                .any(|row| row.target_path.as_deref() == Some(b"src/external.rs")),
+            "{call}: {:?}",
+            cold["src/caller.rs"].rows
+        );
+    }
+}
+
+#[test]
+fn module_name_keys_keep_whole_surface_fallback_for_other_changes() {
+    use crate::callgraph_store::join::rust_module_name_key;
+    let bound = |source: &str| {
+        let inputs = checkout(
+            &[("src/lib.rs", source), ("src/x.rs", "pub fn value() {}")],
+            &[],
+        );
+        super::callgraph::bind_all(&inputs, &[&"src/lib.rs".to_string()])
+            .unwrap()
+            .remove("src/lib.rs")
+            .unwrap()
+            .binding
+    };
+    let before = bound("pub fn existing() {}");
+    let modules = bound("pub fn existing() {} pub mod x;");
+    assert_eq!(
+        before.changed_surface_keys(&modules, "src/lib.rs"),
+        BTreeSet::from([rust_module_name_key("src/lib.rs", "x")])
+    );
+    assert_eq!(
+        modules.changed_surface_keys(&before, "src/lib.rs"),
+        BTreeSet::from([rust_module_name_key("src/lib.rs", "x")])
+    );
+    for after in [
+        "pub fn another() {} pub mod x;",
+        "pub fn existing() {} #[macro_use] pub mod x;",
+        "pub fn existing() {} pub mod x; pub use x::value;",
+    ] {
+        assert_eq!(
+            before.changed_surface_keys(&bound(after), "src/lib.rs"),
+            BTreeSet::from(["src/lib.rs".to_string()]),
+            "{after}"
+        );
+    }
 }
 
 #[test]

@@ -942,6 +942,7 @@ impl LiveCheckout {
             }
         }
         let mut surfaces_changed = BTreeSet::new();
+        let mut surface_keys = BTreeSet::new();
         let mut references_changed = BTreeSet::new();
         for path in &rebind {
             let new = &new_bound[path.as_str()].binding;
@@ -949,6 +950,7 @@ impl LiveCheckout {
                 Some(old) => {
                     if !old.binding.same_surface(new) {
                         surfaces_changed.insert(path.clone());
+                        surface_keys.extend(old.binding.changed_surface_keys(new, path));
                     }
                     if old.binding.references != new.references {
                         references_changed.insert(path.clone());
@@ -956,6 +958,7 @@ impl LiveCheckout {
                 }
                 None => {
                     surfaces_changed.insert(path.clone());
+                    surface_keys.insert(path.clone());
                     references_changed.insert(path.clone());
                 }
             }
@@ -964,6 +967,7 @@ impl LiveCheckout {
         let removed = removed_parses;
         for path in &removed {
             surfaces_changed.insert(path.clone());
+            surface_keys.insert(path.clone());
             self.bound.remove(path);
             self.calls.remember(
                 path,
@@ -985,14 +989,14 @@ impl LiveCheckout {
         stats.bind_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         // What a recorded answer can depend on that changed.
-        let mut changed_keys = surfaces_changed.clone();
+        let mut changed_keys = surface_keys.clone();
         changed_keys.extend(membership.iter().cloned());
         changed_keys.extend(changed_packages);
         changed_keys.extend(changed_parents);
         // Inline lookups record each candidate module-path prefix. A Rust
         // file's addition or removal changes that prefix's candidates just
         // as a content edit changes what those candidates contain.
-        for path in surfaces_changed.iter().filter(|path| path.ends_with(".rs")) {
+        for path in surface_keys.iter().filter(|path| path.ends_with(".rs")) {
             changed_keys.insert(rust_module_key_for_file(path));
         }
         if membership.iter().any(|path| path.ends_with(".go")) {

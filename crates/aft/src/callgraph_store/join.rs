@@ -1607,6 +1607,57 @@ impl ViewBindingDependencies {
         self.surface == other.surface
     }
 
+    /// Keys for the answers this surface change can affect. External Rust
+    /// module declarations have name-scoped readers, including failed
+    /// lookups. Any other change, or one with no attributable name, keeps
+    /// the whole-file invalidation used by every kind of surface reader.
+    pub(crate) fn changed_surface_keys(&self, other: &Self, file: &str) -> BTreeSet<String> {
+        if self.same_surface(other) {
+            return BTreeSet::new();
+        }
+        if let (Some(before), Some(after)) = (&self.surface, &other.surface) {
+            if before.language == "rust"
+                && after.language == "rust"
+                && before.without_declared_modules() == after.without_declared_modules()
+            {
+                let mut names = BTreeSet::new();
+                for (old, new) in [
+                    (&before.module_targets, &after.module_targets),
+                    (
+                        &before.declared_module_targets,
+                        &after.declared_module_targets,
+                    ),
+                ] {
+                    names.extend(
+                        old.keys()
+                            .chain(new.keys())
+                            .filter(|name| old.get(*name) != new.get(*name))
+                            .cloned(),
+                    );
+                }
+                for (old, new) in [
+                    (&before.node_by_scoped, &after.node_by_scoped),
+                    (&before.node_by_bare, &after.node_by_bare),
+                ] {
+                    names.extend(
+                        old.keys()
+                            .chain(new.keys())
+                            .filter(|name| old.get(*name) != new.get(*name))
+                            .cloned(),
+                    );
+                }
+                names.extend(before.exports.symmetric_difference(&after.exports).cloned());
+                if !names.is_empty() {
+                    return names
+                        .iter()
+                        .map(|name| rust_module_name_key(file, name))
+                        .collect();
+                }
+            }
+        }
+        BTreeSet::from([file.to_string()])
+    }
+
     /// True when every surface query this resolution asked that depends on
     /// one of `changed` still has the answer it recorded in `index`. A query
     /// depending on nothing in `changed` reads only index entries that are
@@ -1735,6 +1786,36 @@ struct ViewFileSurface {
 }
 
 impl ViewFileSurface {
+    /// The part an external module declaration cannot change. Keep macro-use
+    /// and reexport state: either can affect readers beyond the module name.
+    fn without_declared_modules(&self) -> Self {
+        let mut rest = self.clone();
+        let module_nodes = self
+            .node_by_scoped
+            .iter()
+            .filter_map(|(name, id)| {
+                let bare = name.rsplit("::").next().unwrap_or(name);
+                (self.declared_module_targets.contains_key(bare)
+                    && self
+                        .node_kind_by_id
+                        .get(id)
+                        .is_some_and(|kind| kind == "module"))
+                .then_some(id)
+            })
+            .collect::<BTreeSet<_>>();
+        rest.node_by_scoped
+            .retain(|_, id| !module_nodes.contains(id));
+        rest.node_by_bare.retain(|_, id| !module_nodes.contains(id));
+        rest.node_kind_by_id
+            .retain(|id, _| !module_nodes.contains(id));
+        rest.exports
+            .retain(|name| !self.declared_module_targets.contains_key(name));
+        rest.module_targets
+            .retain(|name, _| !self.declared_module_targets.contains_key(name));
+        rest.declared_module_targets.clear();
+        rest
+    }
+
     fn capture(language: &str, index: &super::DbFileIndex) -> Self {
         Self {
             language: language.into(),
@@ -2494,6 +2575,11 @@ pub(crate) fn rust_module_key_for_file(path: &str) -> String {
         &super::rust_module_segments_for_rel(path),
     )
 }
+
+/// One module-name lookup in its declaring file, including an absent name.
+pub(crate) fn rust_module_name_key(file: &str, name: &str) -> String {
+    format!("\0view:rust-module-name:{file}\0{name}")
+}
 /// Recorded by every Go package file listing. A listing reads the directory,
 /// not the files in it, so a file added to the package is no recorded
 /// dependency of the callers that listed it; the owner rechecks this domain
@@ -2526,6 +2612,9 @@ pub(crate) fn rust_crate_key(name: &str) -> String {
 impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {
         match self {
+            Self::Module(file, name) | Self::Node(file, name) | Self::Export(file, name) => {
+                vec![file.clone(), rust_module_name_key(file, name)]
+            }
             // Both crate keys: today's views set the map's key, the data
             // layer the looked-up name's.
             Self::Crate(name) => vec![
@@ -2570,12 +2659,9 @@ impl ViewSurfaceQuery {
             }
             Self::Language(file)
             | Self::MacroUse(file)
-            | Self::Module(file, _)
             | Self::Reexports(file)
-            | Self::Node(file, _)
             | Self::Callable(file, _)
             | Self::Alias(file, _)
-            | Self::Export(file, _)
             | Self::Default(file)
             | Self::Contains(file) => vec![file.clone()],
         }
@@ -2587,6 +2673,9 @@ impl ViewSurfaceQuery {
     /// every file it replays, most of them naming one file.
     fn depends_on_any(&self, changed: &BTreeSet<String>) -> bool {
         match self {
+            Self::Module(file, name) | Self::Node(file, name) | Self::Export(file, name) => {
+                changed.contains(file) || changed.contains(&rust_module_name_key(file, name))
+            }
             Self::Parent(file) => {
                 changed.contains(file) || changed.contains(VIEW_RUST_MODULE_DOMAIN)
             }
@@ -2595,12 +2684,9 @@ impl ViewSurfaceQuery {
             }
             Self::Language(file)
             | Self::MacroUse(file)
-            | Self::Module(file, _)
             | Self::Reexports(file)
-            | Self::Node(file, _)
             | Self::Callable(file, _)
             | Self::Alias(file, _)
-            | Self::Export(file, _)
             | Self::Default(file)
             | Self::Contains(file) => changed.contains(file),
             Self::Crate(..) | Self::CrateRoot(..) | Self::Inline(..) => self
