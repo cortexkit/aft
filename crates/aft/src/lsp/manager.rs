@@ -7605,7 +7605,7 @@ impl LspManager {
             initialization_options_for_spawn(def, source_file, root, &resolution_config)?;
         let has_binary_override = self.binary_overrides.contains_key(&def.kind)
             || env_binary_override(&def.kind).is_some()
-            || def.has_configured_binary(config);
+            || (def.kind == ServerKind::TypeScript && def.has_configured_binary(config));
         let mut runtime_note = None;
         let mut project_typescript = None;
         let mut typescript_lookup = None;
@@ -12078,6 +12078,48 @@ exit 1
                 reads
             );
         }
+    }
+
+    #[test]
+    fn custom_native_server_id_does_not_override_project_platform_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let package_dir = root.join("node_modules/typescript");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join("package.json"), r#"{"version":"7.0.2"}"#).unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        let file = root.join("index.ts");
+        std::fs::write(&file, "").unwrap();
+        let fallback = root.join("node_modules/.bin/tsc");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(&fallback, "").unwrap();
+        let config = Config {
+            project_root: Some(root.clone()),
+            lsp_servers: vec![crate::config::UserServerDef {
+                id: "typescript-native".into(),
+                binary: "unrelated-server".into(),
+                extensions: vec!["probe".into()],
+                ..crate::config::UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+        let def = crate::lsp::registry::servers_for_file(&file, &config)
+            .into_iter()
+            .find(|server| matches!(server.kind, ServerKind::TypeScriptNative(_)))
+            .unwrap();
+        assert_eq!(
+            resolve_server_binary(&def, Some(&root), &config),
+            Some(fallback)
+        );
+        let error = match LspManager::new().prepare_spawn(&def, &root, &file, &config) {
+            Ok(_) => panic!("a custom server must not enable a native compiler fallback"),
+            Err(error) => error,
+        };
+        let LspError::ServerNotReady(reason) = error else {
+            panic!("expected a native installation gap, got {error}");
+        };
+        assert!(reason.contains("optional dependency"), "{reason}");
+        assert!(reason.contains("was not found from"), "{reason}");
     }
 
     #[test]

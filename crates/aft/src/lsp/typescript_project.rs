@@ -22,13 +22,13 @@ use std::sync::OnceLock;
 use super::environmental::TS_NATIVE_NO_TSSERVER;
 
 thread_local! {
-    /// How many `node_modules/typescript/package.json` reads this thread has
-    /// attempted. Per thread so a test can count its own lookups while other
-    /// tests run in parallel.
+    /// How many installed TypeScript package.json reads this thread has attempted.
+    /// Per thread so a test can count its own lookups while other tests run in
+    /// parallel.
     static PACKAGE_JSON_READS: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Attempted `node_modules/typescript/package.json` reads on this thread.
+/// Attempted TypeScript package.json reads on this thread.
 #[cfg(test)]
 pub(crate) fn package_json_reads_on_this_thread() -> u64 {
     PACKAGE_JSON_READS.with(Cell::get)
@@ -42,13 +42,13 @@ pub(crate) const NATIVE_SERVER_INFO_NAME: &str = "typescript-go";
 /// The mode is not listed in `tsc --help`, but `tsc --lsp --help` documents it.
 pub(crate) const NATIVE_SERVER_ARGS: [&str; 2] = ["--lsp", "--stdio"];
 
-/// The TypeScript package a project has installed, read from the nearest
-/// `node_modules/typescript/package.json`.
+/// An installed TypeScript package. Project lookup starts at the nearest
+/// `node_modules/typescript/package.json`; a shim's SDK can be a dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectTypeScript {
     /// The package.json `version`, or "unknown" when it has none.
     pub(crate) version: String,
-    /// The `node_modules/typescript` directory.
+    /// The installed package directory.
     pub(crate) package_dir: PathBuf,
 }
 
@@ -78,8 +78,8 @@ impl ProjectTypeScript {
         find_tsserver_lib_dir(&self.package_dir, &mut HashSet::new())
     }
 
-    /// Read the package at `package_dir` (a `node_modules/typescript`
-    /// directory). `None` when it has no package.json.
+    /// Read an installed TypeScript package at `package_dir`. `None` when its
+    /// package.json cannot be read.
     pub(crate) fn read(package_dir: &Path) -> Option<Self> {
         PACKAGE_JSON_READS.with(|reads| reads.set(reads.get() + 1));
         let path = package_dir.join("package.json");
@@ -125,7 +125,8 @@ fn find_tsserver_lib_dir(package_dir: &Path, visited: &mut HashSet<PathBuf>) -> 
         .filter_map(|section| json.get(section)?.as_object())
         .flatten()
         .find_map(|(name, spec)| {
-            if !spec.as_str()?.starts_with("npm:typescript@")
+            let spec = spec.as_str()?;
+            if (spec != "npm:typescript" && !spec.starts_with("npm:typescript@"))
                 || visited.len() >= MAX_TSSERVER_PACKAGES
             {
                 return None;
@@ -446,17 +447,28 @@ pub(crate) fn shared_typescript_server_root(
     if let Some(root) = shared_root_memo().lock().get(&key) {
         return root.clone();
     }
-    // Identifies the TypeScript installation a directory's files would load:
-    // its version, or the package path when the version is unreadable, so two
+    // Identifies the TypeScript SDK a directory's files would load: its version,
+    // or its canonical package path when the version is unreadable, so different
     // unreadable installations never count as the same one.
     let typescript_of = |dir: &Path| {
-        find_project_typescript_package(&dir.join("package.json"), &project_root).map(|found| {
-            if found.version == "unknown" {
-                found.package_dir.to_string_lossy().into_owned()
-            } else {
-                found.version
-            }
-        })
+        find_project_typescript_package(&dir.join("package.json"), &project_root).map(
+            |mut found| {
+                if let Some(lib) = found.tsserver_lib_dir() {
+                    let package_dir = lib.parent().unwrap().to_path_buf();
+                    found = ProjectTypeScript::read(&package_dir).unwrap_or(ProjectTypeScript {
+                        version: "unknown".into(),
+                        package_dir,
+                    });
+                }
+                if found.major().is_none() {
+                    crate::inspect::job::canonicalize_normalized(&found.package_dir)
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    found.version
+                }
+            },
+        )
     };
     let own = typescript_of(nearest);
     let mut chosen = nearest.to_path_buf();
@@ -742,6 +754,26 @@ mod tests {
         let project = ProjectTypeScript::read(&package_dir).unwrap();
         assert_eq!(project.tsserver_lib_dir(), Some(lib));
         assert_eq!(project.version, "6.0.2");
+    }
+
+    #[test]
+    fn tsserver_is_found_in_a_versionless_alias_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let modules =
+            crate::inspect::job::canonicalize_normalized(temp.path()).join("node_modules");
+        let package_dir = modules.join("typescript");
+        write(
+            &package_dir.join("package.json"),
+            r#"{"version":"6.0.2","dependencies":{"legacy":"npm:typescript"}}"#,
+        );
+        let lib = modules.join("legacy/lib");
+        write(
+            &lib.parent().unwrap().join("package.json"),
+            r#"{"version":"6.0.3"}"#,
+        );
+        write(&lib.join("tsserver.js"), "");
+        let project = ProjectTypeScript::read(&package_dir).unwrap();
+        assert_eq!(project.tsserver_lib_dir(), Some(lib));
     }
 
     #[cfg(unix)]

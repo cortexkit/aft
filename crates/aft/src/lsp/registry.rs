@@ -1894,6 +1894,77 @@ mod tests {
         assert_eq!(server_root("old"), root.join("packages/old"));
     }
 
+    #[test]
+    fn typescript_shim_roots_follow_the_resolved_sdk_versions() {
+        for (root_version, nested_version, share) in [
+            (Some("6.0.3"), Some("6.0.2"), false),
+            (Some("6.0.3"), Some("6.0.3"), true),
+            (None, None, false),
+            (Some("next"), Some("next"), false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::inspect::job::canonicalize_normalized(temp.path());
+            let nested = root.join("nested");
+            for (package, version) in [(&root, root_version), (&nested, nested_version)] {
+                write_file(&package.join("package.json"), "{}");
+                write_file(&package.join("index.ts"), "");
+                write_file(
+                    &package.join("node_modules/typescript/package.json"),
+                    r#"{"version":"6.0.2","dependencies":{"legacy":"npm:typescript@^6"}}"#,
+                );
+                write_file(
+                    &package.join("node_modules/legacy/package.json"),
+                    &serde_json::json!({"version": version}).to_string(),
+                );
+                write_file(&package.join("node_modules/legacy/lib/tsserver.js"), "");
+            }
+            let config = Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            };
+            let server_root = |package: &Path| {
+                let file = package.join("index.ts");
+                let server = typescript_server(&file, &config).unwrap();
+                assert_eq!(server.kind, ServerKind::TypeScript);
+                server
+                    .workspace_root_for_file_with_project_root(&file, Some(&root))
+                    .unwrap()
+            };
+            assert_eq!(server_root(&root), root);
+            assert_eq!(server_root(&nested), if share { root } else { nested });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typescript_shims_share_one_unversioned_target_by_its_real_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let nested = root.join("nested");
+        let sdk = root.join("sdk");
+        write_file(&sdk.join("package.json"), "{}");
+        write_file(&sdk.join("lib/tsserver.js"), "");
+        for package in [&root, &nested] {
+            write_file(&package.join("package.json"), "{}");
+            write_file(&package.join("index.ts"), "");
+            write_file(
+                &package.join("node_modules/typescript/package.json"),
+                r#"{"version":"6.0.2","dependencies":{"legacy":"npm:typescript@^6"}}"#,
+            );
+            std::os::unix::fs::symlink(&sdk, package.join("node_modules/legacy")).unwrap();
+        }
+        let file = nested.join("index.ts");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let server = typescript_server(&file, &config).unwrap();
+        assert_eq!(
+            server.workspace_root_for_file_with_project_root(&file, Some(&root)),
+            Some(root)
+        );
+    }
+
     /// One parse serves every file of a walk, including a configuration above
     /// the project root, and replacing the file is still noticed.
     #[test]
