@@ -1,6 +1,6 @@
-use crate::bash_background::watches::WatchPattern;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
+use crate::task_watches::WatchPattern;
 use serde::Deserialize;
 use serde_json::json;
 

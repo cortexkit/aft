@@ -21,7 +21,6 @@ use serde_json::{json, Value};
 
 use crate::bash_background::persistence::{BgMode, TaskArtifact};
 use crate::bash_background::registry::BgTaskSnapshot;
-use crate::bash_background::watch_lines::EACH_LINE_NEEDS_BACKGROUND;
 use crate::bash_background::{BgTaskRegistry, BgTaskStatus};
 use crate::commands::bash_orchestrate::{
     format_wait_limit, kill_deadline_sentence, worker_kill_deadline_within_handoff_margin,
@@ -32,6 +31,7 @@ use crate::commands::bash_status::{
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
+use crate::task_watch_lines::EACH_LINE_NEEDS_BACKGROUND;
 
 /// The wait a primary session's watch gets when it passes no timeout. Mirrors
 /// `DEFAULT_PRIMARY_WATCH_TIMEOUT_MS` in `packages/aft-bridge/src/bash-hints.ts`.

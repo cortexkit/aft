@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::watches::WatchPattern;
+use crate::task_watches::WatchPattern;
 
 pub const MAX_LINES_PER_NOTIFICATION: usize = 50;
 pub const MAX_NOTIFICATIONS_PER_MINUTE: usize = 12;

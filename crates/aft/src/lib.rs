@@ -214,6 +214,8 @@ pub mod symbols;
 pub mod synapse_embed;
 pub(crate) mod system_temp;
 pub(crate) mod task_temp_reads;
+pub mod task_watch_lines;
+pub mod task_watches;
 #[cfg(test)]
 pub(crate) mod test_storage;
 pub mod tool_gate;

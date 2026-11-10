@@ -9801,8 +9801,8 @@ mod watch_gap_tests {
 
     #[test]
     fn retry_overflow_health_keeps_evictions_separate_and_clears_after_ack() {
-        use crate::bash_background::watch_lines::{LineBatch, RetryGap};
         use crate::db::bash_watches::*;
+        use crate::task_watch_lines::{LineBatch, RetryGap};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aft.db");
         let conn = crate::db::open(&path).unwrap();

@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::bash_background::process::{LiveDescendant, LiveDescendantsUnavailable};
 use crate::list_envelope::ListEnvelope;
 
 /// Full payload returned by the `status` command and cached by status push frames.
@@ -143,7 +142,7 @@ pub struct BashPatternMatchFrame {
     pub once: bool,
     pub reason: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch: Option<crate::bash_background::watch_lines::LineBatch>,
+    pub batch: Option<crate::task_watch_lines::LineBatch>,
 }
 
 /// Pushed after configure has completed, when the deferred file walk and
@@ -747,4 +746,60 @@ pub struct Report {
     pub files: Vec<ChangedFile>,
     pub incomplete: Vec<String>,
     pub changed_files_list_envelope: ListEnvelope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveDescendant {
+    pub pid: u32,
+    pub comm: String,
+    /// The first word of the process's first argument (normally the program
+    /// path it was started as), or its command name when that argument cannot
+    /// be read. Never any later argument.
+    pub argv0: String,
+    /// Name of the user that owns the process (its real user ID), or the
+    /// numeric ID when the account has no name. Absent when it could not be
+    /// read, and on records written before AFT recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The process's executable name, followed by `…` when it was started
+    /// with arguments. The arguments themselves are never kept: they can hold
+    /// a credential (`--token "$DEPLOY_TOKEN"`, a value read from a file) that
+    /// no pattern can recognise, and this field reaches the task record, the
+    /// status reply and the completion notice. Absent on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// Why a task has no list of surviving process-group members. A list, even an
+/// empty one, always means AFT checked; this says why it could not.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveDescendantsUnavailable {
+    /// This platform has no process-group listing AFT can use (Windows, and
+    /// Unix systems other than Linux and macOS).
+    UnsupportedPlatform,
+    /// The task has no recorded process group.
+    NoProcessGroup,
+    /// Listing the group's members failed, for example because `/proc`
+    /// could not be read.
+    ListingFailed,
+    /// The listing could not account for every process that may belong to the
+    /// group: some were hidden or unreadable, for example because `/proc` is
+    /// mounted with `hidepid`. Any members it did identify are still listed;
+    /// others may also be running.
+    ListingIncomplete,
+    /// AFT did not check this task's group: a remote job, a pseudoterminal
+    /// task that ended on its own, or a record written by an older AFT.
+    NotChecked,
+}
+
+impl LiveDescendantsUnavailable {
+    /// The reason to record when a task has no process group to list.
+    pub fn without_group() -> Self {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            Self::NoProcessGroup
+        } else {
+            Self::UnsupportedPlatform
+        }
+    }
 }

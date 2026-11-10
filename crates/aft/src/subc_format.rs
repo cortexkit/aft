@@ -5875,17 +5875,17 @@ mod executed_outline_mode_tests {
 /// Render a bounded line batch; offsets refer to the original, unmasked stream.
 pub fn format_watch_line_batch(
     task_id: &str,
-    batch: &crate::bash_background::watch_lines::LineBatch,
+    batch: &crate::task_watch_lines::LineBatch,
 ) -> String {
     let mut text = String::new();
     for line in &batch.lines {
         let body = if line.unavailable {
-            crate::bash_background::watch_lines::unavailable_match_text(
+            crate::task_watch_lines::unavailable_match_text(
                 line.count,
                 batch
                     .masking_limit_bytes
                     .map(|limit| limit as usize)
-                    .unwrap_or(crate::bash_background::watch_lines::MASKING_LINE_CAP_BYTES),
+                    .unwrap_or(crate::task_watch_lines::MASKING_LINE_CAP_BYTES),
             )
         } else {
             line.text.clone()
@@ -5935,7 +5935,7 @@ pub fn format_watch_line_batch(
 #[cfg(test)]
 mod watch_line_format_tests {
     use super::format_watch_line_batch;
-    use crate::bash_background::watch_lines::{LineBatch, RetryGap, WatchLine};
+    use crate::task_watch_lines::{LineBatch, RetryGap, WatchLine};
 
     #[test]
     fn retry_gap_wording_golden() {

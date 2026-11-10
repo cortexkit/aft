@@ -8133,7 +8133,7 @@ mod tests {
             include_str!("registry.rs"),
             include_str!("process.rs"),
             include_str!("pty_process.rs"),
-            include_str!("watches.rs"),
+            include_str!("../task_watches.rs"),
             include_str!("watchdog.rs"),
             include_str!("../commands/bash_status.rs"),
         ];
