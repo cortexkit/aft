@@ -70,3 +70,8 @@ crates/aft/tests/fixtures/callgraph/** -text
 # These full-file inputs are also copied into the frozen language corpus.
 crates/aft/tests/fixtures/sample.* -text
 crates/aft/tests/fixtures/imports_ts.ts -text
+# The secret-rules Public Suffix List snapshot and multi-host vectors are
+# checked against sha256 digests of their LF bytes, so they must stay LF on
+# Windows too.
+crates/secret-rules/src/scope/public_suffix_list.dat text eol=lf
+crates/secret-rules/tests/vectors/** text eol=lf

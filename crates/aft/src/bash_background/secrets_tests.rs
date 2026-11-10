@@ -558,7 +558,17 @@ fn secret_bash_nonqualifying_plans_precede_scope_and_rewrite() {
             })
         });
         assert_eq!(code(&reply), Some("secrets_sandbox_required"));
-        assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but the resolved plan has no strict native launcher. No command was started.");
+        // Windows has no strict sandbox at all, so the platform reason comes
+        // before any plan is considered.
+        let reason = if cfg!(windows) {
+            "this platform has no strict native sandbox (Windows is unsupported)"
+        } else {
+            "the resolved plan has no strict native launcher"
+        };
+        assert_eq!(
+            reply.data["message"],
+            format!("This command needs the strict sandbox because it uses a vault key, but {reason}. No command was started.")
+        );
         assert!(!root.path().join("must-not-be-rewritten").exists());
     }
     assert_eq!(vault.resolves.load(Ordering::SeqCst), 0);

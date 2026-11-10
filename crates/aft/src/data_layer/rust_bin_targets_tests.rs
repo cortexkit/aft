@@ -14,7 +14,7 @@ struct ResolvedRows {
 #[test]
 fn rust_crate_roots_resolve_bin_and_other_target_module_trees() {
     let root =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/callgraph/rust_bin_targets");
+        crate::test_support::manifest_dir().join("tests/fixtures/callgraph/rust_bin_targets");
     let (inputs, blobs) = checkout_fixture(&root);
     let joined = ResolvedRows {
         rows: resolve_checkout(&inputs, 1)

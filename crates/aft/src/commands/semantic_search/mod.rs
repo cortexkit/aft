@@ -3888,7 +3888,7 @@ impl MatchingSource {
                     .is_none()
                     .then(|| waits::time(waits::SearchWait::MatchingTrigramWait));
                 let trigrams = prepared.trigrams.get_or_init(|| {
-                    drop(other_wait.take());
+                    other_wait = None;
                     let _build = waits::time(waits::SearchWait::MatchingTrigrams);
                     let mut trigrams = compact
                         .as_bytes()
@@ -4016,7 +4016,7 @@ impl MatchingSourceCache {
         let other_wait = another_preparing.then(|| waits::time(waits::SearchWait::PrepareCache));
         let mut source_wait = Some(waits::time(waits::SearchWait::MatchingSourceWait));
         let prepared = cell.get_or_init(|| {
-            drop(source_wait.take());
+            source_wait = None;
             let _normalize = waits::time(waits::SearchWait::MatchingNormalize);
             #[cfg(test)]
             self.preparations
