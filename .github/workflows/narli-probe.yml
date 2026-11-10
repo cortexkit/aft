@@ -1,6 +1,6 @@
-# One-off probe for the self-hosted Windows runner "narli": proves the runner
-# picks up AFT jobs, reports its toolchains, and times a cold Rust check and a
-# small test run so they can be compared with GitHub's windows-2022 runners.
+# One-off probe for the self-hosted runners: times downloading a 180 MiB
+# workflow artifact (GitHub's Azure storage) on narli and on rented-mac, to
+# decide whether CI may pass test archives between jobs there.
 # Runs only on pushes to ci/narli-probe; delete the branch when done.
 name: narli probe
 
@@ -10,49 +10,34 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  probe:
-    runs-on: [self-hosted, narli]
-    timeout-minutes: 90
+  download:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [narli, rented-mac]
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
-    env:
-      CARGO_INCREMENTAL: "0"
-      CARGO_TERM_COLOR: never
-      # Outside the checkout, so actions/checkout's clean does not delete it and
-      # a second run shows the warm-build time narli can keep between jobs.
-      CARGO_TARGET_DIR: C:\actions-runner\_work\aft-target
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Start time
+        id: t0
+        run: echo "t=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
         with:
-          targets: x86_64-pc-windows-msvc
-      - uses: oven-sh/setup-bun@v2
-      - name: Toolchains and machine
+          name: macos-libtest-archive
+          run-id: 42875717846
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/artifact-probe
+      - name: Report download time
         run: |
           set -euo pipefail
-          echo "runner: $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH), cores: ${NUMBER_OF_PROCESSORS:-?}"
-          rustup show
-          cargo --version
-          python3 --version
-          python --version
-          bash --version | head -1
-          git --version
-          bun --version
-          echo "PATH has PowerShell 7: $(echo "$PATH" | tr ':' '\n' | grep -ci powershell/7 || true)"
-          git config --get core.longpaths || echo "core.longpaths unset"
-          if command -v pwsh >/dev/null; then pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; else echo "pwsh not on PATH"; fi
-      - name: Cold cargo check, library and all test targets (timed)
-        run: |
-          set -euo pipefail
-          start=$(date +%s)
-          cargo check -p agent-file-tools --all-targets --features test-hooks --locked
-          echo "cold check took $(( $(date +%s) - start )) s"
-      - name: Small library test run (timed)
-        run: |
-          set -euo pipefail
-          start=$(date +%s)
-          cargo test -p agent-file-tools --lib --features test-hooks --locked -- windows_path
-          echo "build and test took $(( $(date +%s) - start )) s"
+          t1=$(date +%s)
+          bytes=$(du -sk "$RUNNER_TEMP/artifact-probe" | cut -f1)
+          secs=$(( t1 - ${{ steps.t0.outputs.t }} ))
+          echo "runner=$RUNNER_NAME kib=$bytes seconds=$secs kib_per_s=$(( bytes / (secs > 0 ? secs : 1) ))"
+          rm -rf "$RUNNER_TEMP/artifact-probe"
