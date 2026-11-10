@@ -330,16 +330,17 @@ fn render_selected_discussion(
     })?;
 
     let mut output = String::new();
-    if document.kind == GithubDocumentKind::PullRequest {
-        output.push_str(&super::thread_text::summary(document));
-        output.push('\n');
-    }
     for (index, item) in items.into_iter().enumerate() {
         let ordinal = index + 1;
         if !resolved.contains(ordinal) {
             continue;
         }
+        let first_item = output.is_empty();
         render_item_heading(&mut output, ordinal, item.author(), item.date());
+        if first_item && document.kind == GithubDocumentKind::PullRequest {
+            output.push_str(&super::thread_text::summary(document));
+            output.push('\n');
+        }
         if let Some(event) = item.event() {
             render_timeline_event_body(&mut output, event);
             continue;

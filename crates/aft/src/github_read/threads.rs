@@ -359,6 +359,7 @@ mod tests {
     #[test]
     fn github_read_thread_comment_id_budget_discloses_omissions() {
         let mut first = fixture()["threadsPage2"].clone();
+        first["data"]["repository"]["pullRequest"]["reviewThreads"]["totalCount"] = json!(1);
         let comments = &mut first["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]
             ["comments"];
         *comments = json!({"totalCount":12,"pageInfo":{"hasNextPage":true,"endCursor":"c0"},"nodes":[{"id":"C0"}]});
