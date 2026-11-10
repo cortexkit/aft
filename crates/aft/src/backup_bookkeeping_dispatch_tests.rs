@@ -1,4 +1,5 @@
 use super::*;
+use std::path::PathBuf;
 use std::sync::mpsc;
 
 fn request(command: &str, params: serde_json::Value) -> RawRequest {
