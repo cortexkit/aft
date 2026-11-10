@@ -6051,6 +6051,49 @@ fn persist_accepted_with_snapshot(
     persist_accepted_with_snapshot_cap(dir, connection, command, None)
 }
 
+#[test]
+fn shells_v1_remote_acceptance_persists_only_a_reported_placement_host() {
+    use exec::types::Placement;
+    for (placement, expected) in [
+        (
+            Some(Placement::new("first_party").with_host("ovh-1")),
+            Some("ovh-1"),
+        ),
+        (Some(Placement::new("overflow")), None),
+        (None, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task_id, paths) = persist_accepted_with_snapshot(
+            dir.path(),
+            dir.path().join("connection.json"),
+            "printf host",
+        );
+        let task = registry.task(&task_id).unwrap();
+        task.state.lock().unwrap().metadata.shell_remote_host = Some("previous-host".into());
+        let mut sink = TaskSink::new(&registry, task).unwrap();
+        let mut accepted = serde_json::to_value(Accepted::new(id(), 1)).unwrap();
+        if let Some(placement) = placement {
+            accepted["placement"] = serde_json::to_value(placement).unwrap();
+        }
+        let accepted: Accepted = serde_json::from_value(accepted).unwrap();
+        sink.accepted(&accepted).unwrap();
+        let layout = resolve_task_layout(&paths.session_dir, &task_id).unwrap();
+        let saved = read_task_at(&layout).unwrap();
+        assert_eq!(saved.shell_remote_host.as_deref(), expected);
+        assert_eq!(
+            registry.shell_snapshots()[0]
+                .metadata
+                .shell_remote_host
+                .as_deref(),
+            expected
+        );
+        assert!(serde_json::to_value(&saved)
+            .unwrap()
+            .get("provider")
+            .is_none());
+    }
+}
+
 fn persist_accepted_with_snapshot_cap(
     dir: &Path,
     connection: PathBuf,

@@ -29,6 +29,7 @@ pub(in crate::subc) struct Service {
     executor: Arc<Executor>,
     state: RwLock<state::State>,
     sources: RwLock<HashMap<String, ShellReader>>,
+    db_facts: RwLock<DbFacts>,
     changed: watch::Sender<u64>,
     refresh_gate: Mutex<()>,
     subscriptions: Mutex<HashMap<(RouteChannel, u64), Subscription>>,
@@ -53,6 +54,7 @@ impl Service {
             executor,
             state: RwLock::new(state::State::new(blake3::hash(&epoch).to_hex().to_string())),
             sources: RwLock::new(HashMap::new()),
+            db_facts: RwLock::new(DbFacts::default()),
             changed: watch::channel(0).0,
             refresh_gate: Mutex::new(()),
             subscriptions: Mutex::new(HashMap::new()),
@@ -97,18 +99,31 @@ impl Service {
         let _refresh = self.refresh_gate.lock().await;
         let executor = self.executor.clone();
         let db = self.app.db();
+        let previous = self.db_facts.read().await.clone();
         let collected =
-            tokio::task::spawn_blocking(move || collect(&executor, db.as_deref(), rows)).await;
-        let Ok((incoming, status, sources)) = collected else {
+            tokio::task::spawn_blocking(move || collect(&executor, db.as_deref(), rows, previous))
+                .await;
+        let Ok(mut collected) = collected else {
             return;
         };
+        *self.db_facts.write().await = collected.db;
         let mut state = self.state.write().await;
+        for root in &mut collected.status.roots {
+            if root.lsp.is_none() {
+                root.lsp = state
+                    .status
+                    .roots
+                    .iter()
+                    .find(|old| old.root == root.root)
+                    .and_then(|old| old.lsp.clone());
+            }
+        }
         let before = state.sequence;
-        if rows {
-            state.replace(incoming, status);
-            *self.sources.write().await = sources;
+        if rows && collected.db_available {
+            state.replace(collected.rows, collected.status);
+            *self.sources.write().await = collected.sources;
         } else {
-            state.update_status(status);
+            state.update_status(collected.status);
         }
         state.expire(now());
         if before != state.sequence {
@@ -534,6 +549,13 @@ fn holder(
                 .flatten()
         })
     });
+    resolved_holder(resolved, metadata)
+}
+
+fn resolved_holder(
+    resolved: Option<GrantHolder>,
+    metadata: &crate::bash_background::persistence::PersistedTask,
+) -> Holder {
     match resolved {
         Some(GrantHolder::Agent {
             agent_id: Some(agent_id),
@@ -631,7 +653,7 @@ fn project_row(
                 .or_else(|| metadata.shell_remote_job_id.clone())
                 .map(|job_id| Remote {
                     job_id,
-                    host: None,
+                    host: metadata.shell_remote_host.clone(),
                     phase: phase.unwrap_or("queued").into(),
                 })
         }),
@@ -679,50 +701,124 @@ fn readiness(value: &Value) -> Readiness {
     }
 }
 
+#[derive(Clone, Default)]
+struct DbFacts {
+    root_agents: BTreeMap<String, Vec<String>>,
+    holders: HashMap<ScopeKey, GrantHolder>,
+    saved: Vec<crate::db::bash_tasks::BashTaskRow>,
+}
+
+struct Collected {
+    rows: Vec<Row>,
+    status: Status,
+    sources: HashMap<String, ShellReader>,
+    db: DbFacts,
+    db_available: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_DB_FACTS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn read_db_facts(
+    db: Option<&std::sync::Mutex<crate::db::TrackedConnection>>,
+    include_rows: bool,
+    previous: DbFacts,
+) -> (DbFacts, bool) {
+    let Some(db) = db else {
+        return (previous, true);
+    };
+    let Ok(conn) = db.try_lock() else {
+        return (previous, false);
+    };
+    // Copy only database facts under this guard. Context, registry, file and
+    // language-server locks are acquired only after this function returns.
+    let loaded = (|| -> rusqlite::Result<DbFacts> {
+        let mut facts = DbFacts::default();
+        let mut scopes = conn.prepare("SELECT owner,scope_ref,epoch FROM access_scope_agents")?;
+        for entry in scopes.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (owner, scope_ref, epoch) = entry?;
+            let Ok(epoch) = epoch.parse() else {
+                continue;
+            };
+            let key = ScopeKey {
+                owner,
+                scope_ref,
+                epoch,
+            };
+            if let Some(holder) = crate::db::access_grant_rows::holder_for_scope(&conn, &key)? {
+                facts.holders.insert(key, holder);
+            }
+        }
+        let mut launches = conn.prepare(
+            "SELECT DISTINCT project_root,owner,scope_ref,epoch FROM access_launch_params",
+        )?;
+        for entry in launches.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })? {
+            let (root, owner, scope_ref, epoch) = entry?;
+            let Ok(epoch) = epoch.parse() else {
+                continue;
+            };
+            if let Some(agent) = facts
+                .holders
+                .get(&ScopeKey {
+                    owner,
+                    scope_ref,
+                    epoch,
+                })
+                .and_then(GrantHolder::agent_id)
+            {
+                facts
+                    .root_agents
+                    .entry(root)
+                    .or_default()
+                    .push(agent.to_owned());
+            }
+        }
+        facts.saved = if include_rows {
+            crate::db::bash_tasks::operator_shell_rows(&conn, now().saturating_sub(RETENTION_MS))?
+        } else {
+            previous.saved.clone()
+        };
+        Ok(facts)
+    })();
+    match loaded {
+        Ok(facts) => (facts, true),
+        Err(_) => (previous, false),
+    }
+}
+
 fn collect(
     executor: &Executor,
     db: Option<&std::sync::Mutex<crate::db::TrackedConnection>>,
     include_rows: bool,
-) -> (Vec<Row>, Status, HashMap<String, ShellReader>) {
+    previous: DbFacts,
+) -> Collected {
+    let (facts, db_available) = read_db_facts(db, include_rows, previous);
+    let include_rows = include_rows && db_available;
+    #[cfg(test)]
+    AFTER_DB_FACTS.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let contexts = executor.actor_contexts();
-    let db_guard = db.and_then(|db| db.lock().ok());
-    let conn = db_guard.as_deref().map(|conn| &**conn);
     let mut rows = Vec::new();
     let mut sources = HashMap::new();
-    let mut root_agents = BTreeMap::<String, Vec<String>>::new();
-    if let Some(conn) = conn {
-        if let Ok(mut statement) = conn
-            .prepare("SELECT DISTINCT project_root,owner,scope_ref,epoch FROM access_launch_params")
-        {
-            if let Ok(entries) = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            }) {
-                for entry in entries.flatten() {
-                    let (root, owner, scope_ref, epoch) = entry;
-                    let Ok(epoch) = epoch.parse() else {
-                        continue;
-                    };
-                    if let Ok(Some(holder)) = crate::db::access_grant_rows::holder_for_scope(
-                        conn,
-                        &ScopeKey {
-                            owner,
-                            scope_ref,
-                            epoch,
-                        },
-                    ) {
-                        if let Some(agent) = holder.agent_id() {
-                            root_agents.entry(root).or_default().push(agent.to_owned());
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let mut root_agents = facts.root_agents.clone();
     for ctx in &contexts {
         let root = ctx
             .config()
@@ -733,7 +829,16 @@ fn collect(
         if include_rows {
             let registry = ctx.bash_background();
             for snapshot in registry.shell_snapshots() {
-                let mut row = project_row(&snapshot, conn);
+                let mut row = project_row(&snapshot, None);
+                row.holder = resolved_holder(
+                    snapshot
+                        .metadata
+                        .scope
+                        .as_ref()
+                        .and_then(|scope| facts.holders.get(&ScopeKey::from_stamp(scope)))
+                        .cloned(),
+                    &snapshot.metadata,
+                );
                 if !state::retained(&row, now()) {
                     continue;
                 }
@@ -752,41 +857,44 @@ fn collect(
         }
     }
     if include_rows {
-        if let Some(conn) = conn {
-            for saved in
-                crate::db::bash_tasks::operator_shell_rows(conn, now().saturating_sub(RETENTION_MS))
-                    .unwrap_or_default()
-            {
-                if sources.contains_key(&saved.task_id) {
+        for saved in facts.saved.iter().cloned() {
+            if sources.contains_key(&saved.task_id) {
+                continue;
+            }
+            if let Some((snapshot, reader)) = ShellReader::persisted(saved) {
+                let mut row = project_row(&snapshot, None);
+                row.holder = resolved_holder(
+                    snapshot
+                        .metadata
+                        .scope
+                        .as_ref()
+                        .and_then(|scope| facts.holders.get(&ScopeKey::from_stamp(scope)))
+                        .cloned(),
+                    &snapshot.metadata,
+                );
+                if !state::retained(&row, now()) {
                     continue;
                 }
-                if let Some((snapshot, reader)) = ShellReader::persisted(saved) {
-                    let mut row = project_row(&snapshot, Some(conn));
-                    if !state::retained(&row, now()) {
-                        continue;
-                    }
-                    if let Some(agent) = &row.holder.agent_id {
-                        root_agents
-                            .entry(
-                                snapshot
-                                    .metadata
-                                    .project_root
-                                    .as_ref()
-                                    .unwrap_or(&snapshot.metadata.workdir)
-                                    .display()
-                                    .to_string(),
-                            )
-                            .or_default()
-                            .push(agent.clone());
-                    }
-                    row.revision = snapshot.metadata.shell_revision;
-                    sources.insert(row.task_id.clone(), reader);
-                    rows.push(row);
+                if let Some(agent) = &row.holder.agent_id {
+                    root_agents
+                        .entry(
+                            snapshot
+                                .metadata
+                                .project_root
+                                .as_ref()
+                                .unwrap_or(&snapshot.metadata.workdir)
+                                .display()
+                                .to_string(),
+                        )
+                        .or_default()
+                        .push(agent.clone());
                 }
+                row.revision = snapshot.metadata.shell_revision;
+                sources.insert(row.task_id.clone(), reader);
+                rows.push(row);
             }
         }
     }
-    drop(db_guard);
     for row in &mut rows {
         let mut fingerprint_row = row.clone();
         fingerprint_row.revision = 0;
@@ -840,32 +948,36 @@ fn collect(
         building |= [&text_index, &call_graph, &meaning]
             .iter()
             .any(|plane| plane.state == "building");
-        let mut lsp: Vec<_> = ctx
-            .lsp()
-            .operator_server_states()
-            .into_iter()
-            .map(|(server, state, reason)| Lsp {
-                server,
-                state,
-                reason,
-            })
-            .collect();
-        let config = ctx.config();
-        for server in config.disabled_lsp.iter().chain(
-            config
-                .lsp_servers
-                .iter()
-                .filter(|server| server.disabled)
-                .map(|server| &server.id),
-        ) {
-            lsp.retain(|entry| &entry.server != server);
-            lsp.push(Lsp {
-                server: server.clone(),
-                state: "disabled".into(),
-                reason: Some("configured_disabled".into()),
-            });
-        }
-        lsp.sort_by(|a, b| a.server.cmp(&b.server));
+        let lsp = ctx
+            .try_lsp()
+            .map(|manager| manager.operator_server_states());
+        let lsp = lsp.map(|servers| {
+            let mut lsp: Vec<_> = servers
+                .into_iter()
+                .map(|(server, state, reason)| Lsp {
+                    server,
+                    state,
+                    reason,
+                })
+                .collect();
+            let config = ctx.config();
+            for server in config.disabled_lsp.iter().chain(
+                config
+                    .lsp_servers
+                    .iter()
+                    .filter(|server| server.disabled)
+                    .map(|server| &server.id),
+            ) {
+                lsp.retain(|entry| &entry.server != server);
+                lsp.push(Lsp {
+                    server: server.clone(),
+                    state: "disabled".into(),
+                    reason: Some("configured_disabled".into()),
+                });
+            }
+            lsp.sort_by(|a, b| a.server.cmp(&b.server));
+            lsp
+        });
         roots.push(RootStatus {
             root: root.into(),
             agent_ids: agents,
@@ -903,16 +1015,16 @@ fn collect(
             text_index: readiness.clone(),
             call_graph: readiness.clone(),
             meaning: readiness,
-            lsp: vec![],
+            lsp: None,
             errors: None,
             warnings: None,
             todos: None,
         });
     }
     roots.sort_by(|a, b| a.root.cmp(&b.root));
-    (
+    Collected {
         rows,
-        Status {
+        status: Status {
             aft: Aft {
                 version: env!("CARGO_PKG_VERSION").into(),
                 card: if degraded {
@@ -927,7 +1039,9 @@ fn collect(
             roots,
         },
         sources,
-    )
+        db: facts,
+        db_available,
+    }
 }
 
 #[cfg(test)]

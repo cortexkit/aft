@@ -93,11 +93,11 @@ fn status() -> Status {
                     state: "disabled".into(),
                     reason: Some("not_configured".into()),
                 },
-                lsp: vec![Lsp {
+                lsp: Some(vec![Lsp {
                     server: "rust-analyzer".into(),
                     state: ready.state.clone(),
                     reason: None,
-                }],
+                }]),
                 errors: Some(0),
                 warnings: Some(2),
                 todos: Some(3),
@@ -111,7 +111,7 @@ fn status() -> Status {
                     state: "disabled".into(),
                     reason: Some("not_configured".into()),
                 },
-                lsp: vec![],
+                lsp: Some(vec![]),
                 errors: None,
                 warnings: None,
                 todos: Some(1),

@@ -1,6 +1,156 @@
 use super::*;
 use crate::bash_background::persistence::TaskArtifact;
 
+fn status_context() -> (
+    tempfile::TempDir,
+    Arc<crate::context::AppContext>,
+    Arc<Executor>,
+    Arc<App>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::default_shared();
+    let ctx = Arc::new(crate::context::AppContext::with_app_and_provider(
+        app.clone(),
+        Box::new(crate::language::StubProvider),
+        crate::config::Config {
+            project_root: Some(dir.path().to_owned()),
+            ..Default::default()
+        },
+    ));
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(
+        crate::path_identity::ProjectRootId::from_path(dir.path()).unwrap(),
+        ctx.clone()
+    ));
+    (dir, ctx, executor, app)
+}
+
+#[test]
+fn shells_v1_status_refresh_skips_busy_lsp_and_releases_database_before_probes() {
+    use std::sync::mpsc;
+    let (_dir, ctx, executor, app) = status_context();
+    let db = app.db().unwrap();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_lsp, lsp_release) = mpsc::channel();
+    let locked = std::thread::spawn(move || {
+        let _lsp = ctx.lsp();
+        held_tx.send(()).unwrap();
+        let _ = lsp_release.recv();
+    });
+    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (phase_tx, phase_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let db_for_refresh = db.clone();
+    let refresh = std::thread::spawn(move || {
+        // Pause a real refresh after its SQL copy, not before it starts. A
+        // writer must complete while root probing is still pending.
+        AFTER_DB_FACTS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                phase_tx.send(()).unwrap();
+                let _ = continue_rx.recv();
+            }))
+        });
+        assert!(result_tx
+            .send(collect(
+                &executor,
+                Some(&db_for_refresh),
+                true,
+                DbFacts::default()
+            ))
+            .is_ok());
+    });
+    phase_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (written_tx, written_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let result=db.try_lock().map_err(|_| "refresh retained aft.db".to_owned()).and_then(|conn| conn.execute_batch("CREATE TABLE IF NOT EXISTS shells_lock_probe(value INTEGER); INSERT INTO shells_lock_probe VALUES (1)").map_err(|error| error.to_string()));
+        written_tx.send(result).unwrap();
+    });
+    let written = written_rx.recv_timeout(Duration::from_millis(250));
+    continue_tx.send(()).unwrap();
+    let result = result_rx.recv_timeout(Duration::from_millis(250));
+    release_lsp.send(()).unwrap();
+    locked.join().unwrap();
+    writer.join().unwrap();
+    refresh.join().unwrap();
+    written
+        .expect("a refresh held aft.db outside its SQL phase")
+        .unwrap();
+    let result = result.expect("refresh waited behind the language server mutex");
+    assert_eq!(result.status.roots.len(), 1);
+    assert!(
+        result.db_available,
+        "database facts must be copied before probing roots"
+    );
+    assert!(result.status.roots[0].lsp.is_none());
+    assert!(serde_json::to_value(&result.status.roots[0])
+        .unwrap()
+        .get("lsp")
+        .is_none());
+}
+
+#[test]
+fn shells_v1_status_refresh_does_not_wait_for_a_busy_database() {
+    use std::sync::mpsc;
+    let (_dir, _ctx, executor, app) = status_context();
+    let db = app.db().unwrap();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let db_to_hold = db.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = db_to_hold.lock().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (result_tx, result_rx) = mpsc::channel();
+    let refresh = std::thread::spawn(move || {
+        assert!(result_tx
+            .send(collect(&executor, Some(&db), true, DbFacts::default()))
+            .is_ok())
+    });
+    let result = result_rx.recv_timeout(Duration::from_millis(250));
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    refresh.join().unwrap();
+    let result = result.expect("status refresh waited for the shared database mutex");
+    assert!(!result.db_available);
+    assert_eq!(result.status.roots.len(), 1);
+}
+
+#[tokio::test]
+async fn shells_v1_status_refresh_keeps_cached_lsp_when_the_manager_is_busy() {
+    use std::sync::mpsc;
+    let (_dir, ctx, executor, app) = status_context();
+    ctx.update_config(|config| {
+        config.disabled_lsp.insert("rust".into());
+    });
+    let service = Service::new(app, executor);
+    service.refresh(false).await;
+    let known = service.state.read().await.status.roots[0]
+        .lsp
+        .clone()
+        .unwrap();
+    assert!(known
+        .iter()
+        .any(|entry| entry.server == "rust" && entry.state == "disabled"));
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = ctx.lsp();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let refreshed = tokio::time::timeout(Duration::from_millis(250), service.refresh(false)).await;
+    let cached = service.state.read().await.status.roots[0].lsp.clone();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    service.stop();
+    refreshed.expect("cached status waited for LSP");
+    assert_eq!(cached, Some(known));
+}
+
 fn stamp(reference: &str, worker: bool) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
         "owner":{"kind":"reserved","module_id":"prefrontal-core"},
@@ -50,6 +200,22 @@ fn shells_v1_holder_resolution_uses_registered_head_and_worker_parent() {
     assert_eq!(resolved.kind, "unattributed");
     assert_eq!(resolved.harness.as_deref(), Some("opencode"));
     assert!(resolved.agent_id.is_none());
+    let db = std::sync::Mutex::new(conn);
+    let (facts, available) = read_db_facts(Some(&db), true, DbFacts::default());
+    assert!(available);
+    assert_eq!(
+        facts.holders.get(&head_key),
+        Some(&GrantHolder::Agent {
+            agent_id: Some("agent-alf".into())
+        })
+    );
+    assert_eq!(
+        facts.holders.get(&worker_key),
+        Some(&GrantHolder::Worker {
+            agent_id: Some("agent-alf".into()),
+            scope_ref: "worker".into()
+        })
+    );
 }
 
 #[test]
@@ -106,7 +272,7 @@ fn shells_v1_status_unknown_counts_are_omitted_individually() {
         text_index: ready.clone(),
         call_graph: ready.clone(),
         meaning: ready,
-        lsp: vec![],
+        lsp: Some(vec![]),
         errors: None,
         warnings: None,
         todos: Some(7),
@@ -206,6 +372,20 @@ fn shells_v1_remote_without_live_registry_keeps_durable_pending_state() {
     let unchanged = read_task_at(&task).unwrap();
     assert_eq!(unchanged.status, BgTaskStatus::Running);
     assert!(unchanged.finished_at.is_none());
+}
+
+#[test]
+fn shells_v1_remote_row_emits_only_the_persisted_optional_placement_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut snapshot, _, _task) = captured(dir.path(), b"", false, false);
+    snapshot.metadata.remote=Some(serde_json::from_value(json!({"harness":"test","session":"plain-session","job_id":"0b816da2-78cb-4fef-8abc-0123456789ab","stdout_len":0,"stderr_len":0,"cancel_requested":false})).unwrap());
+    for host in [Some("ovh-1"), None] {
+        snapshot.metadata.shell_remote_host = host.map(str::to_owned);
+        let row = serde_json::to_value(project_row(&snapshot, None)).unwrap();
+        assert_eq!(row["remote"].get("host").and_then(Value::as_str), host);
+        assert_eq!(row["remote"].get("host").is_some(), host.is_some());
+        assert!(row["remote"].get("provider").is_none());
+    }
 }
 
 #[tokio::test]

@@ -146,7 +146,8 @@ pub(super) struct RootStatus {
     pub text_index: Readiness,
     pub call_graph: Readiness,
     pub meaning: Readiness,
-    pub lsp: Vec<Lsp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp: Option<Vec<Lsp>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

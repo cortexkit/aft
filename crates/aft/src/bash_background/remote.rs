@@ -1958,6 +1958,10 @@ impl OutputSink for TaskSink {
         if accepted.env_not_forwarded.is_some() {
             r.env_not_forwarded = accepted.env_not_forwarded.clone();
         }
+        state.metadata.shell_remote_host = accepted
+            .placement()
+            .and_then(|placement| placement.host())
+            .map(str::to_owned);
         // The job id and the execution note below are saved in one record
         // write: a restart needs only the job id, and the note is derived
         // from the same acceptance.

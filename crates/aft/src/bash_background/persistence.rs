@@ -1769,6 +1769,8 @@ pub struct PersistedTask {
     pub(crate) shell_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) shell_remote_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_remote_host: Option<String>,
     /// Storage namespace captured at spawn, independent of later route binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
@@ -1995,6 +1997,7 @@ impl PersistedTask {
             shell_revision: 0,
             shell_fingerprint: None,
             shell_remote_job_id: None,
+            shell_remote_host: None,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
             launching_identity: super::TaskIdentity::current(),
             launching_raw_harness: match crate::sandbox_spawn::current_authenticated_principal() {
@@ -2180,6 +2183,7 @@ impl From<BashTaskRow> for PersistedTask {
             shell_revision: 0,
             shell_fingerprint: None,
             shell_remote_job_id: None,
+            shell_remote_host: None,
             task_id: row.task_id,
             session_id: row.session_id,
             launching_identity: None,
