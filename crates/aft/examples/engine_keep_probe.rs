@@ -266,6 +266,13 @@ fn roots(mut args: impl Iterator<Item = String>) {
             if !root.join("crates/aft/src/lib.rs").exists() {
                 continue;
             }
+            // A real boundary prevents git apply from finding the enclosing checkout.
+            assert!(std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&*root)
+                .status()
+                .unwrap()
+                .success());
             assert!(std::process::Command::new("git")
                 .arg("apply")
                 .arg(&diff)
@@ -274,11 +281,16 @@ fn roots(mut args: impl Iterator<Item = String>) {
                 .unwrap()
                 .success());
             checkout.record_paths(&paths).unwrap();
+            let changed_paths = checkout.changed_paths();
+            assert!(
+                changed_paths > 50,
+                "the refactor must change many indexed paths"
+            );
             let cpu = cpu_seconds();
             let wall = Instant::now();
             let rss_before = rss_bytes();
             peak.take();
-            checkout.refresh_callgraph().unwrap();
+            assert!(checkout.refresh_callgraph().unwrap().is_some());
             let wall = wall.elapsed().as_secs_f64();
             let cpu = cpu_seconds() - cpu;
             let peak_rss = peak.take();
@@ -287,7 +299,7 @@ fn roots(mut args: impl Iterator<Item = String>) {
             println!(
                 "{}",
                 serde_json::json!({
-                    "event": "semantic_warmup", "root": index, "paths": paths.len(),
+                    "event": "semantic_warmup", "root": index, "paths": paths.len(), "changed_paths": changed_paths,
                     "cpu_s": cpu, "wall_s": wall, "rss_before_bytes": rss_before,
                     "peak_rss_bytes": peak_rss, "before_publish": before,
                     "after_publish": components(checkout),
