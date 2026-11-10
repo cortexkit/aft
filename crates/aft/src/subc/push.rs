@@ -25,29 +25,97 @@ impl ReplayKey {
     }
 }
 
-/// Connection-local deduplication complements the durable registry ack. An
-/// enqueue is not an ack: a new subc connection may offer the task again.
+/// Deduplicate offers while any recipient route remains open. Enqueue is not
+/// an ack: after every recipient closes, the registry may offer the task again.
 #[derive(Debug, Default)]
 pub(super) struct CompletionDelivery {
-    admitted: std::sync::Mutex<HashSet<(ProjectRootId, String)>>,
-    unacked: std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, usize>>>,
+    state: std::sync::Mutex<CompletionOffers>,
+    unacked: std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, HashSet<String>>>>,
     buffered: AtomicU64,
     dropped: AtomicU64,
 }
 
+#[derive(Debug, Default)]
+struct CompletionOffers {
+    admitted: HashSet<(ProjectRootId, String)>,
+    recipients: HashMap<(ProjectRootId, String), HashSet<RouteChannel>>,
+    retry_copies: HashMap<(ProjectRootId, String), usize>,
+}
+
 impl CompletionDelivery {
     fn admit(&self, root: &ProjectRootId, task: &str) -> bool {
-        self.admitted
+        self.state
             .lock()
             .unwrap()
+            .admitted
             .insert((root.clone(), task.into()))
     }
 
     fn forget(&self, root: &ProjectRootId, task: &str) {
-        self.admitted
-            .lock()
-            .unwrap()
-            .remove(&(root.clone(), task.into()));
+        let mut state = self.state.lock().unwrap();
+        let key = (root.clone(), task.into());
+        // A failed copy must not re-offer to another route while a successful
+        // recipient is still open. Its durable record still awaits an ack.
+        if !state.recipients.contains_key(&key) && !state.retry_copies.contains_key(&key) {
+            state.admitted.remove(&key);
+        }
+    }
+
+    fn retry_queued(&self, key: &ReplayKey, frame: &PushFrame) {
+        if let Some(task) = completed_task_id(frame) {
+            *self
+                .state
+                .lock()
+                .unwrap()
+                .retry_copies
+                .entry((key.root.clone(), task.into()))
+                .or_default() += 1;
+        }
+    }
+
+    fn retry_finished(&self, key: &ReplayKey, frame: &PushFrame) {
+        if let Some(task) = completed_task_id(frame) {
+            let mut state = self.state.lock().unwrap();
+            let task_key = (key.root.clone(), task.into());
+            if let Some(copies) = state.retry_copies.get_mut(&task_key) {
+                *copies -= 1;
+                if *copies == 0 {
+                    state.retry_copies.remove(&task_key);
+                }
+            }
+        }
+    }
+
+    fn offered(&self, key: &ReplayKey, task: &str, channel: RouteChannel) {
+        let mut state = self.state.lock().unwrap();
+        let task_key = (key.root.clone(), task.into());
+        state.admitted.insert(task_key.clone());
+        state
+            .recipients
+            .entry(task_key)
+            .or_default()
+            .insert(channel);
+    }
+
+    pub(super) fn route_closed(&self, channel: RouteChannel) {
+        let mut state = self.state.lock().unwrap();
+        let mut released = Vec::new();
+        state.recipients.retain(|key, recipients| {
+            if recipients.remove(&channel) && recipients.is_empty() {
+                released.push(key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for (root, task) in released {
+            let key = (root.clone(), task.clone());
+            if state.retry_copies.contains_key(&key) {
+                continue;
+            }
+            state.admitted.remove(&key);
+            log::info!("subc completion push: task={task} outcome=eligible_for_replay root={} closed_route={channel} reason=all_previously_offered_routes_closed; registry ack decides whether replay is needed", root.as_path().display());
+        }
     }
 
     pub(super) fn health(&self) -> serde_json::Value {
@@ -55,9 +123,9 @@ impl CompletionDelivery {
         let sessions: Vec<_> = unacked
             .iter()
             .flat_map(|(root, sessions)| {
-                sessions.iter().map(move |(session, count)| {
+                sessions.iter().map(move |(session, tasks)| {
                     json!({
-                        "root": root.as_path(), "session": session, "unacked": count,
+                        "root": root.as_path(), "session": session, "unacked": tasks.len(),
                     })
                 })
             })
@@ -66,7 +134,7 @@ impl CompletionDelivery {
             "buffered_total": self.buffered.load(Ordering::Relaxed),
             "dropped_total": self.dropped.load(Ordering::Relaxed),
             "unacked_by_session": sessions,
-            "unacked_total": unacked.values().flat_map(|sessions| sessions.values()).sum::<usize>(),
+            "unacked_total": unacked.values().flat_map(|sessions| sessions.values()).map(HashSet::len).sum::<usize>(),
         })
     }
 }
@@ -99,8 +167,36 @@ fn completion_dropped(
             .fetch_add(1, Ordering::Relaxed);
         metrics.completion_delivery.forget(&key.root, task);
         log::info!("subc completion push: task={task} outcome=dropped key={key:?} reason={reason}");
-        log::warn!("subc completion push dropped: task={task} key={key:?} reason={reason}; unacked registry completion remains eligible for recovery");
+        log::warn!("subc completion push dropped: task={task} key={key:?} reason={reason}; check unacked registry state for recovery");
     }
+}
+
+pub(super) fn purge_completion_root(
+    metrics: &DispatchPathMetrics,
+    root: &ProjectRootId,
+    push_buffer: &HashMap<ReplayKey, VecDeque<PushFrame>>,
+    retry_buffer: &RetryBuffer,
+) {
+    for (key, queue) in push_buffer.iter().filter(|(key, _)| &key.root == root) {
+        for frame in queue {
+            completion_dropped(metrics, key, frame, "root_reclaimed");
+        }
+    }
+    for queue in retry_buffer.values() {
+        for (key, frame) in queue.iter().filter(|(key, _)| &key.root == root) {
+            completion_dropped(metrics, key, frame, "root_reclaimed");
+        }
+    }
+    let mut state = metrics.completion_delivery.state.lock().unwrap();
+    state.admitted.retain(|(key, _)| key != root);
+    state.recipients.retain(|(key, _), _| key != root);
+    state.retry_copies.retain(|(key, _), _| key != root);
+    metrics
+        .completion_delivery
+        .unacked
+        .lock()
+        .unwrap()
+        .remove(root);
 }
 
 /// Deferred configure maintenance can recover tasks after the bind ack. Call
@@ -120,7 +216,7 @@ pub(super) fn recover_registry_completions(
         .unacked
         .lock()
         .unwrap()
-        .insert(root.clone(), registry.pending_completion_counts());
+        .insert(root.clone(), registry.pending_completion_ids());
     let identities: HashSet<_> = routes
         .values()
         .filter(|route| &route.root == root && route.trust.allows_bash_observation())
@@ -822,9 +918,11 @@ pub(super) fn buffer_retry_frame(
     frame: PushFrame,
 ) {
     completion_buffered(metrics, &key, &frame, "writer_backpressure_or_retry_fifo");
+    metrics.completion_delivery.retry_queued(&key, &frame);
     if let Some((key, frame)) =
         bounded_push_back(retry_buffer.entry(channel).or_default(), (key, frame))
     {
+        metrics.completion_delivery.retry_finished(&key, &frame);
         completion_dropped(metrics, &key, &frame, "retry_buffer_eviction");
         metrics.watch_delivery.evicted(key, frame);
     }
@@ -841,6 +939,7 @@ pub(super) fn migrate_retry_buffer_to_push_buffer(
     };
     let migrated = frames.len();
     for (key, frame) in frames {
+        metrics.completion_delivery.retry_finished(&key, &frame);
         buffer_push_frame(metrics, push_buffer, key, frame);
     }
     migrated
@@ -900,6 +999,7 @@ pub(super) fn replay_buffered_push_frames(
                 PushSendOutcome::Sent => {
                     sent += 1;
                     if let Some(task) = completed_task_id(&frame) {
+                        metrics.completion_delivery.offered(key, task, channel);
                         log::info!("subc completion push: task={task} outcome=replayed key={key:?} route={channel}");
                     }
                     if let (Some(probe), Some(task_id), Some(session_id)) = (
@@ -954,7 +1054,9 @@ fn drain_retry_buffer_for_channel(
             match try_send_push_frame(writer_tx, metrics, channel, &frame) {
                 PushSendOutcome::Sent => {
                     sent += 1;
+                    metrics.completion_delivery.retry_finished(&key, &frame);
                     if let Some(task) = completed_task_id(&frame) {
+                        metrics.completion_delivery.offered(&key, task, channel);
                         log::info!("subc completion push: task={task} outcome=replayed key={key:?} route={channel} source=retry");
                     }
                 }
@@ -963,6 +1065,7 @@ fn drain_retry_buffer_for_channel(
                     break;
                 }
                 PushSendOutcome::PermanentFailure => {
+                    metrics.completion_delivery.retry_finished(&key, &frame);
                     completion_dropped(metrics, &key, &frame, "permanent_retry_send_failure");
                     log::warn!(
                         "subc attach: dropping retry-buffered reliable Push for route {channel} root {} harness {} session {} after permanent send failure",
@@ -1294,7 +1397,12 @@ fn fan_out_reliable_push_frame(
         }
 
         match try_send_push_frame(writer_tx, metrics, channel, frame) {
-            PushSendOutcome::Sent => sent_frames += 1,
+            PushSendOutcome::Sent => {
+                sent_frames += 1;
+                if let Some(task) = completed_task_id(frame) {
+                    metrics.completion_delivery.offered(&key, task, channel);
+                }
+            }
             PushSendOutcome::Backpressure => {
                 buffer_retry_frame(metrics, retry_buffer, channel, key, frame.clone());
             }
@@ -1347,8 +1455,22 @@ fn process_reliable_push_frame(
     let durable_bg_session = durable_bg_session_key(&root, &frame);
     if let Some(task_id) = completed_task_id(&frame) {
         completed_tasks.remember(task_id);
+        // A root with no open routes need not run maintenance until a caller
+        // reconnects. Count its pending task as soon as the completion arrives.
+        if let Some(session) = frame_session(&frame) {
+            metrics
+                .completion_delivery
+                .unacked
+                .lock()
+                .unwrap()
+                .entry(root.clone())
+                .or_default()
+                .entry(session.into())
+                .or_default()
+                .insert(task_id.into());
+        }
         if !metrics.completion_delivery.admit(&root, task_id) {
-            log::info!("subc completion push: task={task_id} outcome=deduplicated root={} reason=already_admitted_on_connection", root.as_path().display());
+            log::info!("subc completion push: task={task_id} outcome=deduplicated root={} reason=already_queued_or_live_recipient", root.as_path().display());
             return durable_bg_session;
         }
     }

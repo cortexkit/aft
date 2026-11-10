@@ -11788,14 +11788,16 @@ impl BgTaskRegistry {
             .unwrap_or_default()
     }
 
-    pub(crate) fn pending_completion_counts(&self) -> HashMap<String, usize> {
-        let mut counts = HashMap::new();
+    pub(crate) fn pending_completion_ids(&self) -> HashMap<String, HashSet<String>> {
+        let mut ids: HashMap<String, HashSet<String>> = HashMap::new();
         if let Ok(completions) = self.inner.completions.lock() {
             for completion in completions.iter() {
-                *counts.entry(completion.session_id.clone()).or_default() += 1;
+                ids.entry(completion.session_id.clone())
+                    .or_default()
+                    .insert(completion.task_id.clone());
             }
         }
-        counts
+        ids
     }
 
     fn remove_pending_completion(&self, task_id: &str) -> Option<BgCompletion> {

@@ -3086,6 +3086,7 @@ fn purge_deleted_root_residents(
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
 ) -> Vec<Frame> {
+    push::purge_completion_root(metrics, root_id, push_buffer, retry_buffer);
     let mut terminals = Vec::new();
     let mut push_terminal = |built: Result<Frame, SubcError>| match built {
         Ok(frame) => terminals.push(frame),
@@ -4242,6 +4243,7 @@ async fn teardown_installed_route(
     // cannot run before the route is removed and a completion is recorded for replay.
     delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
+        metrics.completion_delivery.route_closed(channel);
         sync_bg_live_delivery_sessions(executor, routes, Some(&identity.root), Some(metrics));
         if let Some(probe) = lifecycle_probe {
             probe.route_detached(channel, &identity.session);

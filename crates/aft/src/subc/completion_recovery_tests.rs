@@ -71,6 +71,7 @@ fn opencode2_completion_churn_recovers_from_registry_once_per_connection() {
     );
     assert!(output.try_recv().is_err());
     assert_eq!(buffered[&ReplayKey::from_identity(&owner)].len(), 1);
+    assert_eq!(metrics.completion_delivery.health()["unacked_total"], 1);
     recover_registry_completions(
         &writer,
         &metrics,
@@ -348,4 +349,197 @@ fn completion_buffer_and_drop_health_counts_transport_outcomes() {
     let health = metrics.snapshot(&HashMap::new());
     assert_eq!(health["reliable_push"]["completions"]["buffered_total"], 1);
     assert_eq!(health["reliable_push"]["completions"]["dropped_total"], 1);
+    buffer_push_frame(
+        &metrics,
+        &mut buffered,
+        key,
+        completion_frame_with_session(TASK, SESSION),
+    );
+    purge_completion_root(&metrics, &root, &buffered, &RetryBuffer::new());
+    assert_eq!(metrics.completion_delivery.health()["dropped_total"], 2);
+    assert!(metrics
+        .completion_delivery
+        .state
+        .lock()
+        .unwrap()
+        .admitted
+        .is_empty());
+}
+
+#[test]
+fn unacked_completion_reoffers_only_after_every_recipient_route_closes() {
+    let (_dir, root) = test_root("completion-offered-route-lifetime");
+    let storage = tempfile::tempdir().unwrap();
+    let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
+    persisted_completion(storage.path(), &root, &owner);
+    let registry = BgTaskRegistry::default();
+    registry.replay_session(storage.path(), SESSION).unwrap();
+    let completion = {
+        let _scope = crate::bash_background::task_identity_scope(Some(owner.task_identity()));
+        registry
+            .pending_completions_for_session(SESSION)
+            .pop()
+            .unwrap()
+            .into_push_frame()
+    };
+    let metrics = DispatchPathMetrics::new();
+    let (writer, mut output) = mpsc::channel(8);
+    let first = route_key(1, 1);
+    let second = route_key(2, 1);
+    let next = route_key(3, 1);
+    let mut routes = HashMap::from([(first, owner.clone()), (second, owner.clone())]);
+    let mut channels = HashMap::from([(root.clone(), HashSet::from([first, second]))]);
+    let mut buffered = HashMap::new();
+    process_reliable_push_frame(
+        &writer,
+        &metrics,
+        &routes,
+        &channels,
+        &HashMap::new(),
+        &mut RetryBuffer::new(),
+        &mut buffered,
+        &mut CompletedTaskIds::default(),
+        root.clone(),
+        completion,
+        None,
+    );
+    let sent = HashSet::from([
+        output.try_recv().unwrap().header.channel,
+        output.try_recv().unwrap().header.channel,
+    ]);
+    assert_eq!(sent, HashSet::from([1, 2]));
+    insert_route_channel(&mut routes, &mut channels, next, owner.clone());
+    for closing in [first, second] {
+        recover_registry_completions(
+            &writer,
+            &metrics,
+            &registry,
+            &routes,
+            &channels,
+            &mut buffered,
+            &root,
+            None,
+        );
+        assert!(output.try_recv().is_err(), "an old recipient is still open");
+        remove_route_channel(&mut routes, &mut channels, closing);
+        metrics.completion_delivery.route_closed(closing);
+    }
+    for _ in 0..2 {
+        recover_registry_completions(
+            &writer,
+            &metrics,
+            &registry,
+            &routes,
+            &channels,
+            &mut buffered,
+            &root,
+            None,
+        );
+    }
+    assert_eq!(output.try_recv().unwrap().header.channel, 3);
+    assert!(output.try_recv().is_err());
+    {
+        let _scope = crate::bash_background::task_identity_scope(Some(owner.task_identity()));
+        assert_eq!(
+            registry.ack_completions_for_session(Some(SESSION), &[TASK.into()]),
+            vec![TASK]
+        );
+    }
+    remove_route_channel(&mut routes, &mut channels, next);
+    metrics.completion_delivery.route_closed(next);
+    insert_route_channel(&mut routes, &mut channels, route_key(3, 2), owner);
+    recover_registry_completions(
+        &writer,
+        &metrics,
+        &registry,
+        &routes,
+        &channels,
+        &mut buffered,
+        &root,
+        None,
+    );
+    assert!(
+        output.try_recv().is_err(),
+        "acked task must not reoffer on a new epoch"
+    );
+    registry.detach();
+}
+
+#[test]
+fn closing_recipient_does_not_duplicate_an_outstanding_retry_copy() {
+    let (_dir, root) = test_root("completion-closing-recipient-retry");
+    let storage = tempfile::tempdir().unwrap();
+    let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
+    persisted_completion(storage.path(), &root, &owner);
+    let registry = BgTaskRegistry::default();
+    registry.replay_session(storage.path(), SESSION).unwrap();
+    let completion = {
+        let _scope = crate::bash_background::task_identity_scope(Some(owner.task_identity()));
+        registry
+            .pending_completions_for_session(SESSION)
+            .pop()
+            .unwrap()
+            .into_push_frame()
+    };
+    let metrics = DispatchPathMetrics::new();
+    let (writer, mut output) = mpsc::channel(1);
+    let mut routes = HashMap::from([
+        (route_key(1, 1), owner.clone()),
+        (route_key(2, 1), owner.clone()),
+    ]);
+    let mut channels = HashMap::from([(
+        root.clone(),
+        HashSet::from([route_key(1, 1), route_key(2, 1)]),
+    )]);
+    let mut buffered = HashMap::new();
+    let mut retry = RetryBuffer::new();
+    process_reliable_push_frame(
+        &writer,
+        &metrics,
+        &routes,
+        &channels,
+        &HashMap::new(),
+        &mut retry,
+        &mut buffered,
+        &mut CompletedTaskIds::default(),
+        root.clone(),
+        completion,
+        None,
+    );
+    let sent = output.try_recv().unwrap();
+    let closing = route_key(sent.header.channel, sent.header.epoch);
+    remove_route_channel(&mut routes, &mut channels, closing);
+    metrics.completion_delivery.route_closed(closing);
+    insert_route_channel(&mut routes, &mut channels, route_key(3, 1), owner);
+    recover_registry_completions(
+        &writer,
+        &metrics,
+        &registry,
+        &routes,
+        &channels,
+        &mut buffered,
+        &root,
+        None,
+    );
+    assert!(
+        output.try_recv().is_err(),
+        "registry duplicated the queued retry"
+    );
+    assert_eq!(
+        drain_retry_buffers_for_bound_routes(&writer, &metrics, &routes, &mut retry),
+        1
+    );
+    assert_ne!(output.try_recv().unwrap().header.channel, 3);
+    recover_registry_completions(
+        &writer,
+        &metrics,
+        &registry,
+        &routes,
+        &channels,
+        &mut buffered,
+        &root,
+        None,
+    );
+    assert!(output.try_recv().is_err());
+    registry.detach();
 }
