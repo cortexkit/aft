@@ -2533,6 +2533,11 @@ impl BgTaskRegistry {
             .write()
             .unwrap_or_else(|error| error.into_inner()) = path;
         if let Ok(connection) = conn.lock() {
+            if let Err(error) =
+                crate::db::state::runner_completion_delivery_cutover(&connection, unix_millis())
+            {
+                log::warn!("could not record runner completion delivery cutover: {error}");
+            }
             crate::db::bash_watches::refresh_watch_gap_health(&connection);
         }
         if let Ok(mut slot) = self.inner.db_pool.write() {
@@ -11593,17 +11598,14 @@ impl BgTaskRegistry {
         }
         let requested_task_ids = task_ids.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut completion_sessions = HashMap::new();
-        if let Ok(mut completions) = self.inner.completions.lock() {
-            completions.retain(|completion| {
+        if let Ok(completions) = self.inner.completions.lock() {
+            for completion in completions.iter() {
                 let session_matches = completion_matches_session(completion, session_id);
                 if session_matches && requested_task_ids.contains(completion.task_id.as_str()) {
                     completion_sessions
                         .insert(completion.task_id.clone(), completion.session_id.clone());
-                    false
-                } else {
-                    true
                 }
-            });
+            }
         }
 
         let mut delivered = Vec::new();
@@ -11647,6 +11649,7 @@ impl BgTaskRegistry {
                 self.clear_task_watch_state(task_id);
                 // Retain the process-local erased marker so later status calls still
                 // distinguish this task from an ID that never existed.
+                let _ = self.remove_pending_completion(task_id);
                 delivered.push(task_id.clone());
                 continue;
             }
@@ -11699,6 +11702,7 @@ impl BgTaskRegistry {
                 if terminal {
                     self.mark_persisted_completion_delivered(session_id, task_id);
                 }
+                let _ = self.remove_pending_completion(task_id);
                 delivered.push(task_id.clone());
             }
         }
@@ -11772,6 +11776,23 @@ impl BgTaskRegistry {
         if let Ok(mut registry) = self.inner.watch_registry.lock() {
             registry.reconcile_watch_ids(task_id, &remaining, has_pending_match);
         }
+    }
+
+    pub(crate) fn runner_completion_delivery_cutover(&self) -> Result<u64, String> {
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .map_err(|error| error.to_string())?
+            .clone()
+            .ok_or("background task database is not attached")?;
+        let conn = pool.lock().map_err(|error| error.to_string())?;
+        crate::db::state::runner_completion_delivery_cutover(&conn, unix_millis())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn completion_finished_at(&self, task_id: &str) -> Option<u64> {
+        self.task(task_id)?.lock_state().ok()?.metadata.finished_at
     }
 
     pub fn pending_completions_for_session(&self, session_id: &str) -> Vec<BgCompletion> {
