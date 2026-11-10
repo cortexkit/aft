@@ -1,6 +1,20 @@
 //! Verified capture reads and the checked masker used by the operator surface.
 use super::*;
 
+// One default output chunk of context covers ordinary credential headers and
+// complete log lines without buffering an arbitrarily long line or key block.
+// Longer undecidable formats are withheld; exact secrets add their full length.
+const SHELL_MASK_CONTEXT_BYTES: usize = 16 * 1024;
+pub(crate) const SHELL_MASK_WITHHELD: &str = "[output withheld: masking context unavailable]";
+
+#[derive(Default)]
+struct FormatScan {
+    length: u64,
+    possible: bool,
+    quotes: bool,
+    private_key: bool,
+}
+
 pub(crate) struct ShellSnapshot {
     pub metadata: PersistedTask,
     pub stdout: u64,
@@ -14,9 +28,19 @@ pub(crate) struct ShellReader {
     metadata: PersistedTask,
     paths: TaskPaths,
     order: Arc<DbWriteOrder>,
+    format_scans: Arc<Mutex<HashMap<TaskArtifact, FormatScan>>>,
+    stop: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ShellReader {
+    pub(crate) fn with_stop(mut self, stop: tokio_util::sync::CancellationToken) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.as_ref().is_some_and(|stop| stop.is_cancelled())
+    }
     pub(crate) fn is_persisted(&self) -> bool {
         self.live.is_none()
     }
@@ -82,6 +106,8 @@ impl ShellReader {
             order: DbWriteOrder::for_task(&metadata.session_id, &metadata.task_id),
             metadata: metadata.clone(),
             paths: task.paths,
+            format_scans: Default::default(),
+            stop: None,
         };
         metadata.command = if metadata.has_safe_completion_redaction_after_restart() {
             crate::log_redact::redact_command(&metadata.command).into_owned()
@@ -136,6 +162,9 @@ impl ShellReader {
         from: u64,
         limit: u64,
     ) -> Result<Vec<u8>, String> {
+        if self.stopped() {
+            return Err("shell output read cancelled".into());
+        }
         let mut file =
             open_task_artifact(&self.paths, artifact).map_err(|error| error.to_string())?;
         file.read_range(from, limit)
@@ -145,7 +174,7 @@ impl ShellReader {
     pub(crate) fn shell_longest_secret(&self, task_id: &str) -> usize {
         self.live
             .as_ref()
-            .map_or(crate::log_redact::TICKET_HALO_BYTES, |live| {
+            .map_or(crate::log_redact::TICKET_HALO_BYTES + 1, |live| {
                 live.shell_longest_secret(task_id)
             })
     }
@@ -161,50 +190,112 @@ impl ShellReader {
         from: u64,
         to: u64,
     ) -> String {
-        let mut text = String::new();
-        let mut start = from;
-        while start < to {
-            let mut end = (start + 4096).min(to);
-            if end < to {
-                let edge = self
-                    .shell_read(task_id, artifact, end, 4)
-                    .unwrap_or_default();
-                end = (end + edge.iter().take_while(|byte| **byte & 0xc0 == 0x80).count() as u64)
-                    .min(to);
-            }
-            text.push_str(&self.masked_part(task_id, artifact, start, end));
-            start = end;
-        }
-        text
-    }
-
-    fn masked_part(&self, task_id: &str, artifact: TaskArtifact, from: u64, to: u64) -> String {
-        if let Some(live) = &self.live {
-            return live.shell_masked_range(task_id, artifact, from, to);
-        }
         let masked = (|| {
-            if !self.metadata.has_safe_completion_redaction_after_restart() {
+            if self.stopped() {
                 return None;
             }
             let mut file = open_task_artifact(&self.paths, artifact).ok()?;
-            let length = file.len().ok()? as usize;
-            let source =
-                completion_preview::watch_preview_source_range(from as usize..to as usize, length)?;
-            let bytes = file
-                .read_range(source.start as u64, source.len() as u64)
-                .ok()?;
-            BgTaskRegistry::mask_window_with_values(
-                &bytes,
-                from as usize - source.start..to as usize - source.start,
-                source.start == 0,
-                source.end == length,
-                &crate::log_redact::SecretValues::default(),
-                self.metadata.completion_ticket_digest.as_deref(),
-            )
-            .ok()
-            .map(|masked| masked.0)
+            let length = file.len().ok()?;
+            if from > to || to > length {
+                return None;
+            }
+            let (possible, quotes, private_key) =
+                self.format_context_possible(artifact, length).ok()?;
+            let no_format_context = !possible;
+            let context = self
+                .shell_longest_secret(task_id)
+                .max(SHELL_MASK_CONTEXT_BYTES) as u64;
+            let start = from.saturating_sub(context);
+            let end = to.saturating_add(context).min(length);
+            let bytes = file.read_range(start, end - start).ok()?;
+            let range = (from - start) as usize..(to - start) as usize;
+            if let Some(live) = &self.live {
+                let task = live.task(task_id)?;
+                let digest = task
+                    .lock_state()
+                    .ok()?
+                    .metadata
+                    .completion_ticket_digest
+                    .clone();
+                let values = task.completion_secrets.lock().ok()?;
+                BgTaskRegistry::shell_mask_window_with_values(
+                    &bytes,
+                    range,
+                    start == 0,
+                    end == length,
+                    no_format_context,
+                    (quotes && start > 0, private_key && start > 0),
+                    values.as_ref()?,
+                    digest.as_deref(),
+                )
+            } else {
+                if !self.metadata.has_safe_completion_redaction_after_restart() {
+                    return None;
+                }
+                BgTaskRegistry::shell_mask_window_with_values(
+                    &bytes,
+                    range,
+                    start == 0,
+                    end == length,
+                    no_format_context,
+                    (quotes && start > 0, private_key && start > 0),
+                    &crate::log_redact::SecretValues::default(),
+                    self.metadata.completion_ticket_digest.as_deref(),
+                )
+            }
         })();
-        masked.unwrap_or_else(|| crate::log_redact::SECRET_PLACEHOLDER.into())
+        masked.unwrap_or_else(|| SHELL_MASK_WITHHELD.into())
+    }
+
+    fn format_context_possible(
+        &self,
+        artifact: TaskArtifact,
+        length: u64,
+    ) -> Result<(bool, bool, bool), String> {
+        let mut scans = self
+            .format_scans
+            .try_lock()
+            .map_err(|_| "mask scan unavailable")?;
+        let scan = scans.entry(artifact).or_default();
+        if length < scan.length {
+            *scan = FormatScan::default();
+        }
+        if scan.quotes && scan.private_key {
+            return Ok((true, true, true));
+        }
+        let overlap = crate::log_redact::shells_format_scan_overlap() as u64;
+        let mut offset = scan.length.saturating_sub(overlap);
+        let mut file =
+            open_task_artifact(&self.paths, artifact).map_err(|error| error.to_string())?;
+        while offset < length {
+            if self.stopped() {
+                return Err("shell output read cancelled".into());
+            }
+            let bytes = file
+                .read_range(
+                    offset,
+                    (SHELL_MASK_CONTEXT_BYTES as u64).min(length - offset),
+                )
+                .map_err(|error| error.to_string())?;
+            if bytes.is_empty() {
+                return Err("capture changed during masking scan".into());
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            scan.possible |= crate::log_redact::shells_may_need_format_context(&text);
+            scan.quotes |= text.contains('"');
+            scan.private_key |= text.contains("PRIVATE KEY-----");
+            if scan.quotes && scan.private_key {
+                scan.length = length;
+                return Ok((true, true, true));
+            }
+            let next = offset + bytes.len() as u64;
+            if next == length {
+                break;
+            }
+            offset = next.saturating_sub(overlap);
+        }
+        scan.length = length;
+        Ok((scan.possible, scan.quotes, scan.private_key))
     }
 }
 
@@ -217,6 +308,8 @@ impl BgTaskRegistry {
             metadata: state.metadata.clone(),
             paths: task.paths.clone(),
             order: task.db_write_order.clone(),
+            format_scans: Default::default(),
+            stop: None,
         })
     }
     pub(crate) fn shell_snapshots(&self) -> Vec<ShellSnapshot> {
@@ -269,7 +362,10 @@ impl BgTaskRegistry {
                         crate::log_redact::redact_command(&secrets.redact(&metadata.command))
                             .into_owned()
                     }
-                    None => crate::log_redact::redact_command(&metadata.command).into_owned(),
+                    None if metadata.has_safe_completion_redaction_after_restart() => {
+                        crate::log_redact::redact_command(&metadata.command).into_owned()
+                    }
+                    None => crate::log_redact::SECRET_PLACEHOLDER.into(),
                 };
                 Some(ShellSnapshot {
                     metadata,
@@ -304,17 +400,6 @@ impl BgTaskRegistry {
                 })
             })
             .unwrap_or(0)
-            .max(crate::log_redact::TICKET_HALO_BYTES)
-    }
-
-    pub(crate) fn shell_masked_range(
-        &self,
-        task_id: &str,
-        artifact: TaskArtifact,
-        from: u64,
-        to: u64,
-    ) -> String {
-        self.masked_watch_range_checked(task_id, artifact, from, to)
-            .unwrap_or_else(|_| crate::log_redact::SECRET_PLACEHOLDER.to_owned())
+            .max(crate::log_redact::TICKET_HALO_BYTES + 1)
     }
 }

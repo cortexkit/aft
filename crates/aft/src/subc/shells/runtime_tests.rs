@@ -1,4 +1,5 @@
 use super::*;
+use crate::bash_background::persistence::TaskArtifact;
 
 fn stamp(reference: &str, worker: bool) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
@@ -210,7 +211,7 @@ fn shells_v1_remote_without_live_registry_keeps_durable_pending_state() {
 #[tokio::test]
 async fn shells_v1_output_real_files_default_backfill_exact_resume_and_end_record() {
     let dir = tempfile::tempdir().unwrap();
-    let raw = "o\n".repeat(35_000);
+    let raw = "o".repeat(70_000);
     let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), false, true);
     let row = project_row(&snapshot, None);
     let service = Service::new(App::default_shared(), Arc::new(Executor::new()));
@@ -322,14 +323,229 @@ async fn shells_v1_output_real_files_default_backfill_exact_resume_and_end_recor
             resumed.push_str(&text);
         }
     }
-    assert_eq!(resumed, "o\n");
+    assert_eq!(resumed, "oo");
     service.stop();
+}
+
+#[test]
+fn shells_v1_real_capture_harmless_long_line_is_not_replaced_by_a_preview_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = "o".repeat(150_000);
+    let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), false, true);
+    let text = reader.shell_masked_range(
+        &snapshot.metadata.task_id,
+        TaskArtifact::Stdout,
+        70_000,
+        85_000,
+    );
+    assert_eq!(text, "o".repeat(15_000));
+}
+
+#[test]
+fn shells_v1_real_capture_private_key_opening_outside_window_is_withheld() {
+    let dir = tempfile::tempdir().unwrap();
+    for body in ["A".repeat(64), "private prose that is not base64".into()] {
+        let raw = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}-----END PRIVATE KEY-----\n",
+            format!("{body}\n").repeat(10_000)
+        );
+        let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), false, true);
+        let text = reader.shell_masked_range(
+            &snapshot.metadata.task_id,
+            TaskArtifact::Stdout,
+            120_000,
+            121_000,
+        );
+        assert!(text.contains("withheld"), "{text}");
+        assert!(!text.contains(&body));
+    }
+}
+
+#[test]
+fn shells_v1_real_capture_unbounded_authorization_value_is_withheld_not_leaked() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = format!(
+        "{}\nAuthorization: Bearer {}\n",
+        "o".repeat(DEFAULT_CHUNK_BYTES - 7),
+        "r".repeat(150_000)
+    );
+    let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), false, true);
+    let text = reader.shell_masked_range(
+        &snapshot.metadata.task_id,
+        TaskArtifact::Stdout,
+        70_000,
+        85_000,
+    );
+    assert!(text.contains("withheld"), "{text}");
+    assert!(!text.contains(&"r".repeat(32)));
+}
+
+#[test]
+fn shells_v1_real_capture_json_opening_outside_window_is_withheld() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = format!(
+        "\"password\":\"{}\"\n",
+        "private secret body\n".repeat(10_000)
+    );
+    let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), false, true);
+    let text = reader.shell_masked_range(
+        &snapshot.metadata.task_id,
+        TaskArtifact::Stdout,
+        120_000,
+        121_000,
+    );
+    assert!(text.contains("withheld"), "{text}");
+    assert!(!text.contains("private secret body"));
+}
+
+#[test]
+fn shells_v1_real_capture_complete_json_lines_remain_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = "{\"status\":\"ready\"}\n".repeat(10_000);
+    let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), false, true);
+    let text = reader.shell_masked_range(
+        &snapshot.metadata.task_id,
+        TaskArtifact::Stdout,
+        120_000,
+        121_000,
+    );
+    assert_eq!(text, &raw[120_000..121_000]);
+}
+
+#[cfg(unix)]
+#[test]
+fn shells_v1_real_capture_long_known_secret_crosses_chunks_without_leaking() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = crate::bash_background::BgTaskRegistry::default();
+    let secret = "q".repeat(2048);
+    let prefix = "x".repeat(61);
+    let suffix = " suffix";
+    let command = format!("printf '%s' '{prefix}' \"$SHELLS_V1_TOKEN\" '{suffix}'");
+    let session = "shells-secret-test";
+    let task_id = registry
+        .spawn(
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            &command,
+            session.into(),
+            dir.path().to_owned(),
+            HashMap::from([("SHELLS_V1_TOKEN".into(), secret.clone())]),
+            crate::bash_background::HardKill::After(Duration::from_secs(10)),
+            None,
+            dir.path().to_owned(),
+            10,
+            true,
+            false,
+            Some(dir.path().to_owned()),
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !registry.wait_target_finished(&task_id, session) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture command did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snapshot = registry
+        .shell_snapshots()
+        .into_iter()
+        .find(|snapshot| snapshot.metadata.task_id == task_id)
+        .unwrap();
+    let row = project_row(&snapshot, None);
+    let reader = registry.shell_reader(&task_id).unwrap();
+    assert!(reader.shell_longest_secret(&task_id) >= secret.len());
+    let (mut capture, _) = super::super::capture::Capture::open(
+        reader,
+        &row,
+        OutputParams {
+            task_id,
+            max_chunk_bytes: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut text = String::new();
+    let mut offset = 0;
+    let mut count = 0;
+    loop {
+        let (next, frames, finished) = capture.read(row.clone());
+        capture = next;
+        for frame in frames {
+            if let OutputFrame::Chunk {
+                stream,
+                offset: from,
+                end_offset,
+                text: part,
+            } = frame
+            {
+                assert_eq!(stream, "stdout");
+                assert_eq!(from, offset);
+                offset = end_offset;
+                assert!(part.len() <= 64);
+                assert!(!part.contains(&"q".repeat(32)));
+                text.push_str(&part);
+                count += 1;
+            }
+        }
+        if finished {
+            break;
+        }
+        assert!(count < 100, "capture made no terminal progress");
+    }
+    assert!(count > 2);
+    assert_eq!(offset, (prefix.len() + secret.len() + suffix.len()) as u64);
+    assert_eq!(
+        text,
+        format!("{prefix}{}{suffix}", crate::log_redact::SECRET_PLACEHOLDER)
+    );
+}
+
+#[tokio::test]
+async fn shells_v1_real_capture_missing_secret_list_marks_and_advances_the_chunk() {
+    use crate::bash_background::persistence::{read_task_at, write_task_at};
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, task) = captured(dir.path(), b"opaque original secret", false, true);
+    let mut metadata = read_task_at(&task).unwrap();
+    metadata.completion_has_env_secrets = Some(true);
+    metadata.completion_has_non_ticket_env_secrets = Some(true);
+    write_task_at(&task, &metadata).unwrap();
+    let (snapshot, reader) =
+        ShellReader::persisted(metadata.to_bash_task_row("test", &task.paths).unwrap()).unwrap();
+    let row = project_row(&snapshot, None);
+    let (capture, _) = super::super::capture::Capture::open(
+        reader,
+        &row,
+        OutputParams {
+            task_id: row.task_id.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (_, frames, finished) = capture.read(row.clone());
+    assert!(finished);
+    let OutputFrame::Chunk {
+        offset,
+        end_offset,
+        text,
+        ..
+    } = &frames[0]
+    else {
+        panic!("{frames:?}")
+    };
+    assert_eq!((*offset, *end_offset), (0, row.output_bytes.stdout));
+    assert!(text.contains("withheld"));
+    assert!(!text.contains("opaque original secret"));
+    assert!(matches!(frames.last(), Some(OutputFrame::End { .. })));
 }
 
 #[tokio::test]
 async fn shells_v1_output_pty_screen_uses_masked_renderer_and_cursor() {
     let dir = tempfile::tempdir().unwrap();
-    let (snapshot, reader, _task) = captured(dir.path(), b"hello\rworld\n", true, true);
+    let raw = format!(
+        "{}\x1b[2J\x1b[Hhello\rworld\n",
+        "o\n".repeat(DEFAULT_CHUNK_BYTES - 20)
+    );
+    let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), true, true);
     let row = project_row(&snapshot, None);
     let service = Service::new(App::default_shared(), Arc::new(Executor::new()));
     service
@@ -369,6 +585,7 @@ async fn shells_v1_output_pty_screen_uses_masked_renderer_and_cursor() {
         .await
         .unwrap();
     let mut screen = None;
+    let mut screens = 0;
     while let Ok(frame) = output.try_recv() {
         if let OutputFrame::Screen {
             rows,
@@ -377,10 +594,15 @@ async fn shells_v1_output_pty_screen_uses_masked_renderer_and_cursor() {
             cursor,
         } = serde_json::from_slice(frame.body()).unwrap()
         {
+            screens += 1;
             screen = Some((rows, cols, lines, cursor));
         }
     }
     let (rows, cols, lines, cursor) = screen.unwrap();
+    assert!(
+        screens >= 2,
+        "the final screen must not be lost to coalescing"
+    );
     assert_eq!((rows, cols), (3, 20));
     assert_eq!(lines, vec!["world".to_owned()]);
     assert_eq!((cursor.row, cursor.col), (1, 5));
@@ -669,6 +891,18 @@ async fn shells_v1_real_route_refusals_unknown_agent_watch_cancel_and_drain() {
     assert_eq!(
         serde_json::from_slice::<Value>(&initial.body).unwrap()["type"],
         "resync"
+    );
+    let duplicate = request(
+        &mut daemon,
+        41,
+        3,
+        json!({"method":"shells.watch","params":{}}),
+    )
+    .await;
+    assert_eq!(duplicate.header.ty, FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&duplicate.body).unwrap()["code"],
+        "invalid_params"
     );
     write(&mut daemon, FrameType::Cancel, 41, 3, json!({})).await;
     assert_eq!(

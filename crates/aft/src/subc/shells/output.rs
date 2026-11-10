@@ -69,7 +69,7 @@ impl Chunker {
     }
 
     pub(super) fn resume_escape(&mut self, prefix: &[u8]) {
-        let mut escape = None;
+        let mut escape = self.dropping;
         for byte in prefix {
             if let Some(state) = escape {
                 escape = Escape::byte(state, *byte);
@@ -78,6 +78,27 @@ impl Chunker {
             }
         }
         self.dropping = escape;
+    }
+
+    pub(super) fn withhold_to(
+        &mut self,
+        stream: &str,
+        end: u64,
+        text: &str,
+    ) -> Option<OutputFrame> {
+        if end <= self.offset {
+            return None;
+        }
+        let offset = self.offset;
+        self.offset = end;
+        self.pending.clear();
+        self.dropping = None;
+        Some(OutputFrame::Chunk {
+            stream: stream.into(),
+            offset,
+            end_offset: end,
+            text: text.into(),
+        })
     }
 
     /// The mask callback reads surrounding bytes from the task's own file. Holding
@@ -107,6 +128,14 @@ impl Chunker {
                     self.offset + range.start as u64,
                     self.offset + range.end as u64,
                 )?);
+            }
+            // Redaction can remove an escape terminator if it is part of a
+            // secret. Do not hand a newly unterminated control sequence to a
+            // terminal client; explicitly withhold that raw range instead.
+            let mut escapes = Self::new(0, self.max, true);
+            escapes.resume_escape(text.as_bytes());
+            if escapes.dropping.is_some() {
+                text = crate::bash_background::registry::SHELL_MASK_WITHHELD.into();
             }
             if text.len() > self.max && budget > 1 {
                 budget = (budget / 2).max(1);
@@ -218,6 +247,35 @@ pub(super) fn backfill_start(length: u64, from: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shells_v1_output_masked_escape_terminator_never_emits_a_partial_escape() {
+        let raw = "prefix\x1b]0;secret\x07suffix";
+        let mut chunker = Chunker::new(0, 64, true);
+        chunker.append(raw.as_bytes());
+        let frame = chunker
+            .next("stdout", true, 0, |from, to| {
+                Ok::<_, ()>(
+                    raw[from as usize..to as usize]
+                        .replace("secret\x07", crate::log_redact::SECRET_PLACEHOLDER),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let OutputFrame::Chunk {
+            offset,
+            end_offset,
+            text,
+            ..
+        } = frame
+        else {
+            panic!()
+        };
+        assert_eq!((offset, end_offset), (0, raw.len() as u64));
+        assert!(text.contains("withheld"));
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains("secret"));
+    }
 
     fn chunks(bytes: &[u8], keep: bool, max: usize) -> Vec<OutputFrame> {
         let mut chunker = Chunker::new(0, max, keep);

@@ -1,5 +1,6 @@
 //! Read-only operator views of AFT's shell registry.
 mod admission;
+mod capture;
 mod output;
 mod runtime;
 mod state;
