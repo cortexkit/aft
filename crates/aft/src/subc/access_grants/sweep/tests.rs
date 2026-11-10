@@ -219,8 +219,11 @@ async fn saved_grant_sweep_permissions_list_size_1650() {
             )
             .unwrap();
         }
-        tx.execute("UPDATE access_grants SET granted_at_ms=1794234135000", [])
-            .unwrap();
+        tx.execute(
+            "UPDATE access_grants SET granted_at_ms=1794234135000,source=NULL",
+            [],
+        )
+        .unwrap();
         tx.commit().unwrap();
     }
     let before = listed(&db);

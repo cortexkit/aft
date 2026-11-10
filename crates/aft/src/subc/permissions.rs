@@ -216,7 +216,7 @@ pub(super) fn row_json(row: &GrantRow, homes: &[PathBuf]) -> Value {
         SOURCE_FIELD.into(),
         json!(row.source.map_or("unknown", |source| source.as_str())),
     );
-    if row.source.is_none() && row.card_ref.is_none() {
+    if row.source.is_none() {
         object.insert(TIME_BOUND_FIELD.into(), json!("at_or_before"));
     }
     if let Some(agent_id) = row.holder.agent_id() {

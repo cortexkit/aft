@@ -41,9 +41,10 @@ Head agent `agent-alf` owns worker scope `scope:wkr-7f3a`.
 - `source`: `person`, `head_grant`, `head_policy` or `unknown`; all live grants
   remain visible and revocable regardless of source. Readers treat unrecognized
   source values as `unknown`.
-- `granted_at_ms` is always present. Legacy rows without a recorded source or
-  card carry `granted_at_bound: "at_or_before"`: the stored time is an upper
-  bound, not an exact grant time. Card-linked legacy times remain exact.
+- `granted_at_ms` is always present. Legacy rows with no stored source carry
+  `granted_at_bound: "at_or_before"`: the stored time is a truthful upper bound,
+  not a claim of an exact grant time. New grants with unknown lineage store
+  the literal source `unknown` and have an exact time, so they omit the bound.
 
 `provider-list-grant-sources.json` and `.jcs` are copied unchanged from
 Cingulate tag `permissions-grant-sources-v1`, commit

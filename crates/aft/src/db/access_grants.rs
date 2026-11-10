@@ -367,7 +367,13 @@ pub fn insert_from_card(
     grant: &AccessGrant,
     card_ref: Option<&str>,
 ) -> rusqlite::Result<()> {
-    insert_with_source(conn, key, grant, card_ref, None)
+    insert_with_source(
+        conn,
+        key,
+        grant,
+        card_ref,
+        Some(super::access_grant_rows::GrantSource::Unknown),
+    )
 }
 
 /// Record provenance with the same row identity and widening rules as grants.

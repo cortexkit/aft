@@ -34,7 +34,7 @@ pub(crate) fn migrate_source(conn: &Connection) -> rusqlite::Result<()> {
         .iter()
         .any(|column| column == "source");
     if !exists {
-        conn.execute_batch("ALTER TABLE access_grants ADD COLUMN source TEXT CHECK(source IN ('person','head_grant','head_policy'))")?;
+        conn.execute_batch("ALTER TABLE access_grants ADD COLUMN source TEXT CHECK(source IN ('person','head_grant','head_policy','unknown'))")?;
     }
     Ok(())
 }
@@ -44,6 +44,7 @@ pub enum GrantSource {
     Person,
     HeadGrant,
     HeadPolicy,
+    Unknown,
 }
 
 impl GrantSource {
@@ -52,6 +53,7 @@ impl GrantSource {
             Self::Person => "person",
             Self::HeadGrant => "head_grant",
             Self::HeadPolicy => "head_policy",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -219,7 +221,9 @@ fn raw_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
                 Some("person") => Some(GrantSource::Person),
                 Some("head_grant") => Some(GrantSource::HeadGrant),
                 Some("head_policy") => Some(GrantSource::HeadPolicy),
-                _ => None,
+                Some("unknown") => Some(GrantSource::Unknown),
+                Some(_) => Some(GrantSource::Unknown),
+                None => None,
             },
         },
         role: r.get(9)?,

@@ -114,7 +114,7 @@ fn grants_answer_source_does_not_change_head_authority() {
         assert_eq!(policy.head_policy(&grant), HeadPolicy::Allow);
         assert_eq!(
             answer_source(&conn, &worker, false, Some(&policy), &grant).unwrap(),
-            source.map(|_| GrantSource::HeadGrant)
+            Some(source.map_or(GrantSource::Unknown, |_| GrantSource::HeadGrant))
         );
         assert_eq!(
             policy.head_policy(&grant),

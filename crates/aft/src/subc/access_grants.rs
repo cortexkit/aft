@@ -29,7 +29,9 @@ pub(super) fn answer_source(
             return Ok(Some(GrantSource::HeadGrant));
         }
     }
-    Ok(None)
+    // Unknown lineage is different from a pre-schema-28 row: a new answer
+    // still has an exact grant time, even when its head's authority is older.
+    Ok(Some(GrantSource::Unknown))
 }
 use crate::access_policy::{
     policy_path, AccessGrant, AccessOperation, AccessPolicy, GrantKind, HeadPolicy,

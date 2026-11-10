@@ -274,10 +274,10 @@ fn permissions_list_all_live_sources_have_times_and_remain_revocable() {
 }
 
 #[test]
-fn permissions_legacy_card_time_is_exact_despite_unknown_source() {
+fn permissions_legacy_null_source_time_is_an_upper_bound_even_with_card() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(dir.path());
-    store::insert_from_card(
+    store::insert_with_source(
         &db.lock().unwrap(),
         &worker(),
         &grant(
@@ -286,12 +286,13 @@ fn permissions_legacy_card_time_is_exact_despite_unknown_source() {
             AccessOperation::Read,
         ),
         Some("acc_legacy"),
+        None,
     )
     .unwrap();
     let rows = list_all(&db);
     assert_eq!(rows[0]["source"], "unknown");
     assert!(rows[0]["granted_at_ms"].is_i64());
-    assert!(rows[0].get("granted_at_bound").is_none());
+    assert_eq!(rows[0]["granted_at_bound"], "at_or_before");
 }
 
 #[test]
