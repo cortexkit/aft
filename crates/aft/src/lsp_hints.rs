@@ -41,7 +41,7 @@ fn rooted_path(file: &str, project_root: &Path) -> Option<PathBuf> {
 }
 
 fn normalized_path(path: &Path) -> PathBuf {
-    crate::inspect::job::normalize_path(
+    crate::path_identity::normalize_path(
         &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
     )
 }

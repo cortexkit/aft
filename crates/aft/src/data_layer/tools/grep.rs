@@ -250,7 +250,7 @@ fn in_scope(scope: &[u8], path: &[u8]) -> bool {
 /// `None` when it is outside it. The root is compared in its canonical
 /// form, as today's index compares a search root with its files.
 fn checkout_path(root: &Path, search_root: &Path) -> Option<Vec<u8>> {
-    let normalize = crate::inspect::job::normalize_path;
+    let normalize = crate::path_identity::normalize_path;
     let root = normalize(root);
     let canonical = crate::bounded_io::canonicalize(search_root)
         .map(|path| normalize(&path))

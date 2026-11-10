@@ -52,8 +52,8 @@ fn resolve_git_root_from_user_path_with_homes(
     // Windows is a verbatim (`\\?\C:\...`) path. Normalize before comparing the
     // requested directory with the configured root so aliases such as `.` and
     // symlinks remain local without requiring the workspace itself to be Git.
-    let existing = crate::inspect::job::canonicalize_normalized(&existing);
-    if existing == crate::inspect::job::canonicalize_normalized(project_root) {
+    let existing = crate::path_identity::canonicalize_normalized(&existing);
+    if existing == crate::path_identity::canonicalize_normalized(project_root) {
         return Ok(project_root.to_path_buf());
     }
 
@@ -285,7 +285,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root,
-            crate::inspect::job::canonicalize_normalized(folder.path())
+            crate::path_identity::canonicalize_normalized(folder.path())
         );
     }
 
@@ -308,7 +308,7 @@ mod tests {
                 resolve_git_root_from_user_path(project.path(), &path.to_string_lossy(), |root| {
                     assert_eq!(
                         root,
-                        crate::inspect::job::canonicalize_normalized(folder.path())
+                        crate::path_identity::canonicalize_normalized(folder.path())
                     );
                     policy.decide(
                         crate::access_policy::AccessOperation::Read,
@@ -342,7 +342,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             root,
-            crate::inspect::job::canonicalize_normalized(folder.path())
+            crate::path_identity::canonicalize_normalized(folder.path())
         );
     }
 

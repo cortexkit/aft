@@ -1477,7 +1477,7 @@ mod tests {
         use crate::commands::semantic_search::waits::{self, SearchWait};
 
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
@@ -1561,7 +1561,7 @@ mod tests {
         });
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
@@ -1615,7 +1615,7 @@ mod tests {
     #[test]
     fn plain_edit_target_never_reaches_path_validation_during_prepare() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let file = root.join("plain-target.ts");
         assert!(
             !crate::commands::edit_match::is_glob_pattern(&file.display().to_string()),
@@ -1666,7 +1666,7 @@ mod tests {
         // `\\?\C:\...` path, whose `?` makes the edit translator treat the
         // target as a possible glob and route the call to `edit_match`
         // instead of `batch`, which this test pins.
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let file = root.join("private-name.ts");
         assert!(
             !crate::commands::edit_match::is_glob_pattern(&file.display().to_string()),

@@ -160,7 +160,7 @@ impl OutputFiles {
                 let _ = std::fs::remove_file(&path);
                 return Err(io::Error::other("tool result file identity unavailable"));
             }
-            let path = crate::inspect::job::normalize_path(&path);
+            let path = crate::path_identity::normalize_path(&path);
             files.insert(
                 path.clone(),
                 Artifact {
@@ -171,7 +171,7 @@ impl OutputFiles {
             if let (Some(raw), Some(canonical)) = (scope.directory.parent(), dir.parent()) {
                 self.roots.lock().insert(
                     raw.to_path_buf(),
-                    crate::inspect::job::normalize_path(canonical),
+                    crate::path_identity::normalize_path(canonical),
                 );
             }
             if let Some(harness) = scope.directory.parent().and_then(Path::parent) {
@@ -185,7 +185,7 @@ impl OutputFiles {
         if !generated_name(path) {
             return None;
         }
-        let path = crate::inspect::job::normalize_path(path);
+        let path = crate::path_identity::normalize_path(path);
         self.files
             .lock()
             .get(&path)
@@ -206,7 +206,7 @@ impl OutputFiles {
         let Ok(path) = self.canonicalize(path) else {
             return;
         };
-        let path = crate::inspect::job::normalize_path(&path);
+        let path = crate::path_identity::normalize_path(&path);
         if self.owner(&path).is_some() || !generated_name(&path) {
             return;
         }
@@ -253,7 +253,7 @@ impl OutputFiles {
         if let Some(canonical) = roots.get(&root) {
             return Some(canonical.clone());
         }
-        let canonical = crate::inspect::job::normalize_path(&self.canonicalize(&root).ok()?);
+        let canonical = crate::path_identity::normalize_path(&self.canonicalize(&root).ok()?);
         roots.insert(root, canonical.clone());
         Some(canonical)
     }
@@ -268,7 +268,7 @@ impl OutputFiles {
         if !generated_name(path) {
             return None;
         }
-        let path = crate::inspect::job::normalize_path(path);
+        let path = crate::path_identity::normalize_path(path);
         let artifact = self.files.lock().get(&path)?.clone();
         Some((|| {
             if artifact.session != session {
@@ -320,7 +320,7 @@ fn open_verified(
         .map_err(|error| io::Error::other(format!("tool result open refused: {error:?}")))?;
     check_metadata(&file.metadata()?)?;
     if FileIdentity::of_file(&file) != identity
-        || crate::inspect::job::normalize_path(&crate::commands::file_read_exact::opened_location(
+        || crate::path_identity::normalize_path(&crate::commands::file_read_exact::opened_location(
             &file,
         )?) != path
     {

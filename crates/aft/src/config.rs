@@ -408,8 +408,8 @@ impl InspectCategories {
         "complexity",
     ];
 
-    pub fn enabled(&self, category: crate::inspect::InspectCategory) -> bool {
-        use crate::inspect::InspectCategory::*;
+    pub fn enabled(&self, category: crate::inspect_category::InspectCategory) -> bool {
+        use crate::inspect_category::InspectCategory::*;
         match category {
             Diagnostics => self.diagnostics,
             Todos => self.todos,
@@ -427,7 +427,7 @@ impl InspectCategories {
 }
 
 impl InspectConfig {
-    pub fn category_enabled(&self, category: crate::inspect::InspectCategory) -> bool {
+    pub fn category_enabled(&self, category: crate::inspect_category::InspectCategory) -> bool {
         self.enabled && self.categories.enabled(category)
     }
 }

@@ -9620,7 +9620,7 @@ mod tests {
                 .unwrap();
             let scope = crate::inspect::JobScope::for_project(root.as_path().to_path_buf());
             let key = crate::inspect::JobKey::for_category_scope(
-                crate::inspect::InspectCategory::Diagnostics,
+                crate::inspect_category::InspectCategory::Diagnostics,
                 &scope,
             );
             inspect
@@ -9654,7 +9654,7 @@ mod tests {
             .unwrap();
         let scope = crate::inspect::JobScope::for_project(root.as_path().to_path_buf());
         let key = crate::inspect::JobKey::for_category_scope(
-            crate::inspect::InspectCategory::Diagnostics,
+            crate::inspect_category::InspectCategory::Diagnostics,
             &scope,
         );
         inspect
@@ -9705,7 +9705,7 @@ mod tests {
                 cache
                     .store_aggregated(
                         crate::inspect::JobKey::for_project_category(
-                            crate::inspect::InspectCategory::Todos,
+                            crate::inspect_category::InspectCategory::Todos,
                         ),
                         json!({"items": ["fixed peer diagnostic".repeat(30 * (index + 1))]}),
                     )
@@ -9781,14 +9781,15 @@ mod tests {
             );
         };
         assert_parity();
-        let project =
-            crate::inspect::JobKey::for_project_category(crate::inspect::InspectCategory::Todos);
+        let project = crate::inspect::JobKey::for_project_category(
+            crate::inspect_category::InspectCategory::Todos,
+        );
         for revision in 0..140 {
             inspect.store_aggregated(project.clone(), json!({"items": [{"message": "warning".repeat(revision + 1), "revision": revision}]})).unwrap();
             inspect
                 .store_aggregated(
                     crate::inspect::JobKey {
-                        category: crate::inspect::InspectCategory::Todos,
+                        category: crate::inspect_category::InspectCategory::Todos,
                         scope_hash: Some(format!("scope-{revision}")),
                     },
                     json!({"nested": [{"unicode": "λ", "values": [null, false, revision]}]}),
@@ -10150,7 +10151,7 @@ mod tests {
             config,
         ));
         ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
+            .set_tier2_in_flight_for_test(crate::inspect_category::InspectCategory::DeadCode, true);
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
 
         // Health reads try-locks by design and reports "could not be snapshotted
@@ -10192,8 +10193,10 @@ mod tests {
         assert_eq!(metrics["roots"][0]["callgraph_store"]["status"], "off");
         assert_eq!(metrics["roots"][0]["tier2"]["status"], "building");
 
-        ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, false);
+        ctx.inspect_manager().set_tier2_in_flight_for_test(
+            crate::inspect_category::InspectCategory::DeadCode,
+            false,
+        );
     }
 
     #[test]
@@ -11486,8 +11489,10 @@ mod tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
-        ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::Duplicates, true);
+        ctx.inspect_manager().set_tier2_in_flight_for_test(
+            crate::inspect_category::InspectCategory::Duplicates,
+            true,
+        );
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let app = App::default_shared();
         let dispatch = DispatchPathMetrics::new();
@@ -11504,7 +11509,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(2));
         ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
-            crate::inspect::InspectCategory::Duplicates,
+            crate::inspect_category::InspectCategory::Duplicates,
             crate::inspect::JobOutcome::Fresh {
                 payload: json!({ "count": 3 }),
             },

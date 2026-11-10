@@ -1092,7 +1092,7 @@ fn unlink_pinned(req: &RawRequest, ctx: &AppContext, path: &Path) -> Result<(), 
     #[cfg(test)]
     unlink_seam(UnlinkStage::AfterAuthorize);
     // The handle must still be at the location the policy judged.
-    if crate::inspect::job::normalize_path(&judged) != located
+    if crate::path_identity::normalize_path(&judged) != located
         || location(&entry).ok().as_deref() != Some(located.as_path())
     {
         return Err(changed());

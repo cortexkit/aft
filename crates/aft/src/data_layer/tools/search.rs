@@ -153,7 +153,7 @@ impl DataText {
         admit_relative: impl Fn(&[u8]) -> bool,
         matches: impl Fn(&Path) -> bool,
     ) -> Option<Vec<PathBuf>> {
-        use crate::inspect::job::canonicalize_normalized;
+        use crate::path_identity::canonicalize_normalized;
         if self.view.rescanning()
             || canonicalize_normalized(&self.root) != canonicalize_normalized(root)
             || walk_uses_other_ignore_settings(root)
@@ -904,14 +904,14 @@ pub(crate) fn anchored_candidate_files(
 /// canonical form for scope checks, without a Windows verbatim prefix.
 fn canonicalize_for_search_membership(path: &Path) -> PathBuf {
     crate::bounded_io::run(path, None, |path| {
-        Ok(crate::inspect::job::canonicalize_normalized(&path))
+        Ok(crate::path_identity::canonicalize_normalized(&path))
     })
-    .unwrap_or_else(|_| crate::inspect::job::normalize_path(path))
+    .unwrap_or_else(|_| crate::path_identity::normalize_path(path))
 }
 
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
-    crate::inspect::job::normalize_path(path)
-        .starts_with(crate::inspect::job::normalize_path(search_root))
+    crate::path_identity::normalize_path(path)
+        .starts_with(crate::path_identity::normalize_path(search_root))
 }
 
 /// A repository outside the configured root that `aft_search` was given as

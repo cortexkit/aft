@@ -536,7 +536,7 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
             // normalized root, so look the todos result up under the same form.
             let todos = ctx.inspect_manager().latest_project_todos_count(
                 ctx.inspect_dir(),
-                crate::inspect::job::canonicalize_normalized(&project_root),
+                crate::path_identity::canonicalize_normalized(&project_root),
             );
             ctx.update_status_bar_todos(todos);
             ctx.signal_status_changed();

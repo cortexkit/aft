@@ -951,7 +951,7 @@ fn parse_severity_filter(value: Option<&str>) -> Result<SeverityFilter, String> 
 fn normalize_query_path(path: &Path) -> PathBuf {
     // Same normalized form as the LSP subsystem's storage keys; a bare
     // canonicalize would query with Windows verbatim spellings and miss.
-    crate::inspect::job::canonicalize_normalized(path)
+    crate::path_identity::canonicalize_normalized(path)
 }
 
 #[cfg(test)]

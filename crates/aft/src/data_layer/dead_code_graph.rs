@@ -463,12 +463,12 @@ fn resolve_store_path(
         .resolve(store_path);
     }
     let mut path = canonical_root
-        .get_or_init(|| crate::inspect::job::canonicalize_normalized(root))
+        .get_or_init(|| crate::path_identity::canonicalize_normalized(root))
         .clone();
     for segment in store_path.split('/') {
         path.push(segment);
     }
-    crate::inspect::job::normalize_path(&path)
+    crate::path_identity::normalize_path(&path)
 }
 
 /// Whether `path` is a relative path of plain segments: none empty, `.`,

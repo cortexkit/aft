@@ -1272,7 +1272,7 @@ mod tests {
             let source = project.join(format!("src_{index}.ts"));
             std::fs::write(&source, format!("export const value{index} = {index};\n")).unwrap();
             upserts.push(crate::inspect::job::FileContribution::new(
-                crate::inspect::job::InspectCategory::DeadCode,
+                crate::inspect_category::InspectCategory::DeadCode,
                 source.clone(),
                 crate::cache_freshness::collect(&source).unwrap(),
                 serde_json::json!({
@@ -1284,7 +1284,7 @@ mod tests {
         }
         let (hash, _) = cache
             .apply_contribution_updates_for_config(
-                crate::inspect::job::InspectCategory::DeadCode,
+                crate::inspect_category::InspectCategory::DeadCode,
                 crate::inspect::cache::Tier2ContributionUpdates {
                     upserts,
                     ..Default::default()
@@ -1295,7 +1295,7 @@ mod tests {
         cache
             .store_tier2_aggregate(
                 crate::inspect::job::JobKey::for_project_category(
-                    crate::inspect::job::InspectCategory::DeadCode,
+                    crate::inspect_category::InspectCategory::DeadCode,
                 ),
                 &hash,
                 serde_json::json!({ "count": 0, "items": [], "padding": "y".repeat(4096) }),

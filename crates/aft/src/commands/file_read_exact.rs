@@ -41,8 +41,9 @@ fn read_with(
     _hooks: ReadHooks,
 ) -> Result<ExactRead, ReadExactRefusal> {
     let joined = root.join(path);
-    let resolved = crate::inspect::job::normalize_path(&joined.canonicalize().map_err(open_error)?);
-    let bind_root = crate::inspect::job::normalize_path(&root.canonicalize().map_err(open_error)?);
+    let resolved =
+        crate::path_identity::normalize_path(&joined.canonicalize().map_err(open_error)?);
+    let bind_root = crate::path_identity::normalize_path(&root.canonicalize().map_err(open_error)?);
     // Delegation is narrower than head authority: flow files must stay in its checkout.
     if !resolved.starts_with(&bind_root) {
         return Err(ReadExactRefusal::AccessDenied);
@@ -78,7 +79,7 @@ fn read_with(
     // Where the open file really is, asked of the handle, must still be inside
     // the checkout and allowed by the policy, like the requested path above.
     let opened = opened_location(&file).map_err(|_| ReadExactRefusal::IoError)?;
-    let opened = crate::inspect::job::normalize_path(&opened);
+    let opened = crate::path_identity::normalize_path(&opened);
     if !opened.starts_with(&bind_root)
         || policy.decide(AccessOperation::Read, &opened, false) != AccessDecision::Allow
         || crate::project_content::is_excluded(&opened)
@@ -843,8 +844,8 @@ mod tests {
                 .arg("/C")
                 .arg("mklink")
                 .arg("/J")
-                .arg(crate::inspect::job::normalize_path(link))
-                .arg(crate::inspect::job::normalize_path(target))
+                .arg(crate::path_identity::normalize_path(link))
+                .arg(crate::path_identity::normalize_path(target))
                 .stdout(std::process::Stdio::null())
                 .status()
                 .unwrap();
