@@ -147,6 +147,24 @@ fn answer(
     )
 }
 
+fn authorize(params: &Value, principal: Option<&Principal>) -> Result<(), Response> {
+    let params = serde_json::from_value::<Params>(params.clone()).map_err(|error| {
+        Response::error(
+            "management-scope-background-tasks",
+            "invalid_params",
+            error.to_string(),
+        )
+    })?;
+    if principal != Some(&params.scope.owner) {
+        return Err(Response::error(
+            "management-scope-background-tasks",
+            "scope_owner_mismatch",
+            "scope.background_tasks requires the scope's owner",
+        ));
+    }
+    Ok(())
+}
+
 fn scan_saved(
     storage: &Path,
     scope: &Selector,
@@ -155,6 +173,53 @@ fn scan_saved(
     deadline: Instant,
 ) -> Result<(), String> {
     use crate::bash_background::persistence::{read_task_at, resolve_task_layout};
+    let database = storage.join("aft.db");
+    if database
+        .try_exists()
+        .map_err(|error| format!("store_read_failed: {error}"))?
+    {
+        let conn = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| format!("store_read_failed: {error}"))?;
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|error| error.to_string())?;
+        let mut statement = conn
+            .prepare("SELECT task_id, metadata FROM bash_tasks WHERE completed_at IS NULL LIMIT ?1")
+            .map_err(|error| format!("store_read_failed: {error}"))?;
+        let mut rows = statement
+            .query([(*remaining + 1) as i64])
+            .map_err(|error| error.to_string())?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("store_read_failed: {error}"))?
+        {
+            if *remaining == 0 {
+                return Err("walk_limit_reached".into());
+            }
+            if Instant::now() >= deadline {
+                return Err("time_budget_exceeded".into());
+            }
+            *remaining -= 1;
+            let task_id: String = row.get(0).map_err(|error| error.to_string())?;
+            if known.contains(&task_id) {
+                continue;
+            }
+            let json: String = row.get(1).map_err(|error| error.to_string())?;
+            let metadata: crate::bash_background::persistence::PersistedTask =
+                serde_json::from_str(&json)
+                    .map_err(|error| format!("store_read_failed: {error}"))?;
+            if metadata
+                .scope
+                .as_ref()
+                .is_some_and(|stamp| scope.matches(stamp))
+                && !metadata.is_terminal()
+            {
+                return Err("registry_not_loaded".into());
+            }
+        }
+    }
     fn entries(path: &Path) -> Result<Option<std::fs::ReadDir>, String> {
         match std::fs::read_dir(path) {
             Ok(entries) => Ok(Some(entries)),
@@ -246,6 +311,10 @@ pub(super) fn spawn(
     let metrics = metrics.clone();
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&metrics);
+        if let Err(response) = authorize(&params, principal.as_ref()) {
+            let _ = send_management_response(&tx, &frame, OPERATION, response, &metrics).await;
+            return;
+        }
         let registries = metrics
             .completion_delivery
             .registries
@@ -279,4 +348,290 @@ pub(super) fn spawn(
             log::warn!("scope.background_tasks: could not queue reply: {error}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn selector() -> Selector {
+        Selector {
+            owner: Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            scope_ref: "worker-7".into(),
+            epoch: 3,
+        }
+    }
+
+    #[test]
+    fn scope_background_tasks_serializer_vectors_do_not_drift() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-vectors/scope-background-tasks-v1");
+        let params = Params { scope: selector() };
+        let request = json!({"op": OPERATION, "params": params});
+        let mut sums = String::new();
+        let cases = [
+            (
+                "running",
+                Response::success(
+                    "management-scope-background-tasks",
+                    serde_json::to_value(Reply {
+                        running: vec![Running {
+                            task_id: "bash-0000000000000001".into(),
+                            title: "cargo test".into(),
+                            command: "cargo test".into(),
+                            started_at_ms: 1730000000000,
+                            remote: Some(Remote {
+                                job_id: "00000000-0000-4000-8000-000000000007".into(),
+                            }),
+                            command_truncated: false,
+                        }],
+                        complete: true,
+                        reason: None,
+                    })
+                    .unwrap(),
+                ),
+            ),
+            (
+                "empty",
+                Response::success(
+                    "management-scope-background-tasks",
+                    serde_json::to_value(Reply {
+                        running: vec![],
+                        complete: true,
+                        reason: None,
+                    })
+                    .unwrap(),
+                ),
+            ),
+            (
+                "incomplete",
+                Response::success(
+                    "management-scope-background-tasks",
+                    serde_json::to_value(Reply::incomplete("registry_not_loaded")).unwrap(),
+                ),
+            ),
+            (
+                "refused",
+                authorize(&request["params"], Some(&Principal::Direct {})).unwrap_err(),
+            ),
+        ];
+        let update = std::env::var_os("UPDATE_AFT_SCOPE_VECTORS").is_some();
+        if update {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        for (name, response) in cases {
+            for (suffix, value) in [
+                ("request", request.clone()),
+                ("response", management_response_body(OPERATION, response)),
+            ] {
+                let file = format!("{name}.{suffix}.json");
+                let bytes = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());
+                if update {
+                    std::fs::write(dir.join(&file), &bytes).unwrap();
+                }
+                assert_eq!(
+                    std::fs::read_to_string(dir.join(&file)).unwrap(),
+                    bytes,
+                    "serializer drift in {file}"
+                );
+                sums.push_str(&format!("{:x}  {file}\n", Sha256::digest(bytes.as_bytes())));
+            }
+        }
+        if update {
+            std::fs::write(dir.join("SHA256SUMS"), &sums).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap(),
+            sums
+        );
+    }
+
+    #[test]
+    fn scope_background_tasks_refuses_non_owner_before_reading_store() {
+        let params = serde_json::to_value(Params { scope: selector() }).unwrap();
+        for principal in [
+            None,
+            Some(Principal::Direct {}),
+            Some(Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+        ] {
+            let reply = answer(
+                params.clone(),
+                principal.as_ref(),
+                &[],
+                Path::new("/not-a-task-store"),
+            );
+            assert!(!reply.success);
+            assert_eq!(reply.data["code"], "scope_owner_mismatch");
+        }
+    }
+
+    #[test]
+    fn scope_background_tasks_masks_and_caps_commands_on_utf8_boundaries() {
+        let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
+            "bash-test".into(),
+            "s".into(),
+            format!("TOKEN=secret {}", "é".repeat(3000)),
+            PathBuf::from("."),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.command = format!(
+            "curl -H 'Authorization: Bearer ghp_{}' {}",
+            "X".repeat(36),
+            "é".repeat(3000)
+        );
+        let row = running(&metadata);
+        assert!(row.command_truncated);
+        assert!(row.command.len() <= COMMAND_BYTES);
+        assert!(!row.command.contains(&"X".repeat(36)));
+        assert_eq!(row.command, row.title);
+    }
+
+    #[test]
+    fn scope_background_tasks_store_errors_are_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("not-a-directory");
+        std::fs::write(&storage, "x").unwrap();
+        let scope = selector();
+        let reply = answer(json!({"scope":scope}), Some(&scope.owner), &[], &storage);
+        assert!(reply.success);
+        assert_eq!(reply.data["complete"], false);
+        assert!(reply.data["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("store_read_failed"));
+    }
+
+    #[test]
+    fn scope_background_tasks_unloaded_scope_registry_is_not_empty_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = selector();
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            selected.owner.clone(),
+            selected.scope_ref.clone(),
+            selected.epoch,
+            subc_protocol::scope::ScopeKind::Worker,
+        );
+        let task = crate::bash_background::persistence::create_task_layout(
+            dir.path(),
+            "session",
+            "bash-0000000000000001",
+        )
+        .unwrap();
+        let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
+            "bash-0000000000000001".into(),
+            "session".into(),
+            "sleep 30".into(),
+            dir.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.scope = Some(stamp);
+        crate::bash_background::persistence::write_task_at(&task, &metadata).unwrap();
+        let reply = answer(
+            json!({"scope": selected}),
+            Some(&selected.owner),
+            &[],
+            dir.path(),
+        );
+        assert_eq!(reply.data["complete"], false);
+        assert_eq!(reply.data["reason"], "registry_not_loaded");
+        let wrong_epoch = Selector {
+            epoch: 4,
+            ..selector()
+        };
+        let reply = answer(
+            json!({"scope": wrong_epoch}),
+            Some(&wrong_epoch.owner),
+            &[],
+            dir.path(),
+        );
+        assert_eq!(reply.data["complete"], true);
+        assert_eq!(reply.data["running"], json!([]));
+    }
+
+    #[test]
+    fn scope_background_tasks_remote_rows_include_job_identity() {
+        let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
+            "bash-remote".into(),
+            "session".into(),
+            "cargo test".into(),
+            PathBuf::from("."),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.remote = Some(serde_json::from_value(json!({"harness":"runner", "session":"session", "stdout_len":0, "stderr_len":0, "cancel_requested":false, "job_id":"00000000-0000-4000-8000-000000000007"})).unwrap());
+        assert_eq!(
+            serde_json::to_value(running(&metadata)).unwrap()["remote"]["job_id"],
+            "00000000-0000-4000-8000-000000000007"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_background_tasks_lists_live_tasks_without_waiting_for_busy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::bash_background::BgTaskRegistry::default();
+        let selected = selector();
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            selected.owner.clone(),
+            selected.scope_ref.clone(),
+            selected.epoch,
+            subc_protocol::scope::ScopeKind::Worker,
+        );
+        let id = crate::bash_background::registry::with_scope_spawn(Some(stamp), || {
+            registry.spawn_with_shell_in_slot(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "sleep 30",
+                crate::bash_background::BashShell::Bash,
+                crate::bash_background::registry::resolve_posix_shell(),
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                dir.path().into(),
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(dir.path().into()),
+            )
+        })
+        .unwrap();
+        let reply = answer(
+            json!({"scope":selected}),
+            Some(&selected.owner),
+            &[registry.clone()],
+            dir.path(),
+        );
+        assert_eq!(reply.data["complete"], true, "{reply:?}");
+        assert_eq!(reply.data["running"][0]["task_id"], id);
+        assert_eq!(reply.data["running"][0]["command"], "sleep 30");
+        let task = registry.task_for_test(&id).unwrap();
+        let locked = task.state.lock().unwrap();
+        let start = Instant::now();
+        let reply = answer(
+            json!({"scope":selected}),
+            Some(&selected.owner),
+            &[registry.clone()],
+            dir.path(),
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(reply.data["complete"], false);
+        assert_eq!(reply.data["reason"], "task_busy");
+        drop(locked);
+        registry.kill(&id, "session").unwrap();
+        registry.shutdown();
+    }
 }

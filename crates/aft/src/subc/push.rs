@@ -427,6 +427,12 @@ pub(super) fn recover_registry_completions(
             }
             if super::runner_notices::is_runner(&identity) {
                 let task_id = completion.task_id.clone();
+                if super::runner_notices::retired(&identity) {
+                    if metrics.completion_delivery.settle(&key, &task_id) {
+                        log::info!("runner notice task={task_id} delivered-as-unsendable: thalamus-pi was retired");
+                    }
+                    continue;
+                }
                 if metrics.completion_delivery.admit(root, &task_id)
                     && !super::runner_notices::enqueue(
                         registry.clone(),
@@ -1192,9 +1198,19 @@ pub(super) fn replay_buffered_push_frames(
     trust: BindTrust,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> usize {
+    let runner = super::runner_notices::is_runner(&crate::bash_background::TaskIdentity {
+        principal: key.principal.clone(),
+        harness: key.harness.clone(),
+        session: key.session.clone(),
+    });
+    if runner {
+        if let Some(queue) = push_buffer.get_mut(key) {
+            queue.retain(|frame| matches!(frame, PushFrame::Progress(_)));
+        }
+    }
     // Tasks saved without launching_identity can still replay within the same
     // root, harness and session without matching the caller's principal.
-    if trust.allows_bash_observation() {
+    if trust.allows_bash_observation() && !runner {
         let legacy_keys: Vec<_> = push_buffer
             .keys()
             .filter(|candidate| {
@@ -1394,7 +1410,11 @@ fn matching_route_channels(
         if routes
             .get(channel)
             .is_some_and(super::runner_notices::runner_route)
-            && (frame_is_bash_observation(frame) || root_broadcast_kind(frame).is_some())
+            && (frame_is_bash_observation(frame)
+                || matches!(
+                    frame,
+                    PushFrame::StatusChanged(_) | PushFrame::ConfigureWarnings(_)
+                ))
         {
             return false;
         }
@@ -1504,6 +1524,14 @@ fn fan_out_lossy_push_frame(
     root: &ProjectRootId,
     frame: &PushFrame,
 ) -> FanOutResult {
+    if let PushFrame::BashLongRunning(_) = frame {
+        if frame_task_identity(frame).is_some_and(super::runner_notices::is_runner) {
+            if let Some(registry) = metrics.completion_delivery.registry(root) {
+                super::runner_notices::enqueue(registry, frame.clone());
+            }
+            return FanOutResult::default();
+        }
+    }
     let matching_channels = matching_route_channels(routes, root_channels, root, frame);
     let matched_channels = matching_channels.len();
     if matched_channels == 0 {
@@ -1628,6 +1656,18 @@ fn fan_out_reliable_push_frame(
     frame: &PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> FanOutResult {
+    if let PushFrame::ConfigureWarnings(warning) = frame {
+        for route in routes.values().filter(|route| {
+            &route.root == root
+                && super::runner_notices::runner_route(route)
+                && warning
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|session| &route.session == session)
+        }) {
+            super::runner_notices::warning(route, root, warning);
+        }
+    }
     let matching_channels = matching_route_channels(routes, root_channels, root, frame);
     let matched_channels = matching_channels.len();
     if matched_channels == 0 {
@@ -1732,6 +1772,22 @@ fn process_reliable_push_frame(
             .as_ref()
             .is_some_and(|task| !metrics.completion_delivery.admit(&root, task))
         {
+            return None;
+        }
+        if let Some(owner) =
+            frame_task_identity(&frame).filter(|owner| super::runner_notices::retired(owner))
+        {
+            if let Some(task) = &task {
+                let key = ReplayKey {
+                    root: root.clone(),
+                    principal: owner.principal.clone(),
+                    harness: owner.harness.clone(),
+                    session: owner.session.clone(),
+                };
+                if metrics.completion_delivery.settle(&key, task) {
+                    log::info!("runner notice task={task} delivered-as-unsendable: thalamus-pi was retired");
+                }
+            }
             return None;
         }
         if let Some(registry) = metrics.completion_delivery.registry(&root) {

@@ -202,6 +202,16 @@ mod tests {
     use super::{sanitize_client, Harness};
 
     #[test]
+    fn runner_alias_switch_preserves_canonical_storage_namespace() {
+        for raw in ["runner", "opencode2", "claude-code", "broca"] {
+            let harness: Harness = raw.parse().unwrap();
+            assert_eq!(harness, Harness::Runner);
+            assert_eq!(harness.storage_segment(), "runner");
+            assert_eq!(serde_json::to_string(&harness).unwrap(), "\"runner\"");
+        }
+    }
+
+    #[test]
     fn directly_constructed_fed_storage_segment_handles_invalid_utf8_boundaries() {
         for fingerprint in ["short", "0123456789abcde€rest"] {
             let harness = Harness::Fed {

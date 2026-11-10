@@ -118,6 +118,34 @@ fn wrap(label: &str, body: &str) -> String {
     format!("<system-reminder>\n[{label}]\n{body}\n</system-reminder>")
 }
 
+pub(super) fn warning(value: &Value) -> String {
+    let hint = string(value, "hint");
+    let kind = string(value, "kind");
+    if matches!(kind, "config_key_dropped" | "config_migrated") {
+        return format!("🔧 AFT: ⚠️ {hint}");
+    }
+    let title = match kind {
+        "formatter_not_installed" => "Formatter is not installed",
+        "checker_not_installed" => "Checker is not installed",
+        "lsp_binary_missing" => "LSP binary is missing",
+        "config_parse_failed" => "Config failed to parse",
+        _ => "undefined",
+    };
+    let mut details = Vec::new();
+    for field in ["language", "server", "tool", "binary"] {
+        let text = string(value, field);
+        if !text.is_empty() && (field != "binary" || text != string(value, "tool")) {
+            details.push(format!("{field}: {text}"));
+        }
+    }
+    let suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    };
+    format!("🔧 AFT: ⚠️ {title}{suffix}\n  {hint}")
+}
+
 pub(super) fn long_running(value: &Value) -> String {
     let command = string(value, "command");
     let utf16 = command.encode_utf16().collect::<Vec<_>>();
@@ -174,7 +202,9 @@ fn watch_batch(task: &str, batch: &Value) -> String {
             let text = if line["unavailable"] == true {
                 crate::bash_background::watch_lines::unavailable_match_text(
                     count,
-                    batch["masking_limit_bytes"].as_u64().unwrap_or(65536) as usize,
+                    batch["masking_limit_bytes"].as_u64().unwrap_or(
+                        crate::bash_background::watch_lines::MASKING_LINE_CAP_BYTES as u64,
+                    ) as usize,
                 )
             } else {
                 string(line, "text").into()

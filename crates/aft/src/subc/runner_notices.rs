@@ -11,8 +11,24 @@ use subc_protocol::{scope::ScopeSelector, BindIdentity, RouteTarget};
 
 const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const RUNNER_CARRIERS: &[&str] = &["reserved:thalamus-harness", "reserved:broca"];
 static CONNECTION: OnceLock<std::sync::RwLock<PathBuf>> = OnceLock::new();
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+struct Active;
+impl Drop for Active {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+fn reserve() -> Option<Active> {
+    ACTIVE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < 32).then_some(active + 1)
+        })
+        .ok()
+        .map(|_| Active)
+}
 
 pub(super) fn install(path: PathBuf) {
     *CONNECTION.get_or_init(Default::default).write().unwrap() = path;
@@ -20,10 +36,71 @@ pub(super) fn install(path: PathBuf) {
 
 pub(super) fn is_runner(identity: &crate::bash_background::TaskIdentity) -> bool {
     identity.harness.parse::<crate::harness::Harness>() == Ok(crate::harness::Harness::Runner)
+        || identity
+            .principal
+            .as_deref()
+            .is_some_and(|principal| RUNNER_CARRIERS.contains(&principal))
+        || retired(identity)
+}
+
+pub(super) fn retired(identity: &crate::bash_background::TaskIdentity) -> bool {
+    identity.principal.as_deref() == Some("reserved:thalamus-pi")
 }
 
 pub(super) fn runner_route(route: &RouteIdentity) -> bool {
     is_runner(&route.task_identity())
+}
+
+pub(super) fn warning(
+    route: &RouteIdentity,
+    root: &ProjectRootId,
+    warning: &crate::protocol::ConfigureWarningsFrame,
+) {
+    let owner = route.task_identity();
+    let raw = match &route.spawn_principal {
+        AuthenticatedPrincipal::RouteBind { harness, .. } => harness.clone(),
+        _ => return,
+    };
+    let Some(address) = Address::new(&owner, raw, route.scope.as_ref()) else {
+        return;
+    };
+    let Some(path) = CONNECTION.get().map(|path| path.read().unwrap().clone()) else {
+        return;
+    };
+    for warning in &warning.warnings {
+        let Some(active) = reserve() else {
+            log::warn!("runner warning deferred: notice workers busy");
+            return;
+        };
+        let root_key = blake3::hash(root.as_path().to_string_lossy().as_bytes());
+        let warning_key = blake3::hash(&serde_json::to_vec(warning).unwrap());
+        let id = format!("aft:warning:{root_key}:{warning_key}");
+        let request = request(
+            id,
+            super::bash_notice_text::warning(warning),
+            false,
+            address.worker,
+        );
+        let address = address.clone();
+        let path = path.clone();
+        let _ = std::thread::Builder::new()
+            .name("aft-runner-warning".into())
+            .spawn(move || {
+                let _active = active;
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                deliver(
+                    &request.send_id,
+                    0,
+                    |_| Some(runtime.block_on(send(&path, &address, &request))),
+                    std::thread::sleep,
+                );
+            });
+    }
 }
 
 #[derive(Clone)]
@@ -40,6 +117,9 @@ impl Address {
         raw_harness: String,
         stamp: Option<&subc_protocol::scope::ScopeStamp>,
     ) -> Option<Self> {
+        if retired(owner) {
+            return None;
+        }
         let module = owner
             .principal
             .as_deref()?
@@ -94,6 +174,41 @@ fn refusal(code: &str) -> Outcome {
         _ => Outcome::Retry,
     }
 }
+
+fn deliver(
+    send_id: &str,
+    first: usize,
+    mut send: impl FnMut(usize) -> Option<Outcome>,
+    mut pause: impl FnMut(Duration),
+) -> bool {
+    for attempt in first..MAX_ATTEMPTS {
+        match send(attempt) {
+            Some(Outcome::Accepted) => return true,
+            Some(Outcome::Final(code)) => {
+                if code == "send_id_reuse" {
+                    log::error!("runner notice {send_id} refused: {code}");
+                } else {
+                    log::warn!("runner notice {send_id} refused: {code}");
+                }
+                return true;
+            }
+            Some(Outcome::Retry) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    pause(Duration::from_millis(
+                        (250u64 << attempt.min(8)).min(60_000),
+                    ));
+                }
+            }
+            None => return false,
+        }
+    }
+    log::warn!("runner notice {send_id} retired: retry budget exhausted");
+    true
+}
+
+#[cfg(test)]
+#[path = "runner_notices_tests.rs"]
+mod tests;
 
 async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
     let Some(principal) = crate::launch_nonce::consumer_identity() else {
@@ -172,25 +287,14 @@ pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: P
     let Some(path) = CONNECTION.get().map(|path| path.read().unwrap().clone()) else {
         return false;
     };
-    if ACTIVE
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < 32).then_some(active + 1)
-        })
-        .is_err()
-    {
+    let Some(active) = reserve() else {
         return false;
-    }
+    };
     let task_id = task_id.clone();
     let spawned = std::thread::Builder::new()
         .name("aft-runner-notice".into())
         .spawn(move || {
-            struct Active;
-            impl Drop for Active {
-                fn drop(&mut self) {
-                    ACTIVE.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-            let _active = Active;
+            let _active = active;
             let _identity = crate::bash_background::task_identity_scope(Some(owner.clone()));
             let Some(metadata) = registry.notice_metadata(&task_id) else {
                 return;
@@ -239,55 +343,36 @@ pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: P
             } else {
                 0
             };
-            let mut settled = false;
-            for attempt in first..MAX_ATTEMPTS {
-                if completion {
-                    let age = crate::bash_background::persistence::unix_millis()
-                        .saturating_sub(metadata.finished_at.unwrap_or(metadata.started_at));
-                    if age >= MAX_AGE_MS {
-                        break;
-                    }
-                    let Some(offers) = registry.reserve_runner_completion_offer(&task_id) else {
-                        break;
-                    };
-                    if registry
-                        .persist_runner_completion_offer(&owner.session, &task_id, offers)
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                match runtime.block_on(send(&path, &address, &request)) {
-                    Outcome::Accepted => {
-                        settled = true;
-                        break;
-                    }
-                    Outcome::Final(code) => {
-                        if code == "send_id_reuse" {
-                            log::error!("runner notice {} refused: {code}", request.send_id);
-                        } else {
-                            log::warn!("runner notice {} refused: {code}", request.send_id);
+            let settled = deliver(
+                &request.send_id,
+                first,
+                |_| {
+                    if completion {
+                        let age = crate::bash_background::persistence::unix_millis()
+                            .saturating_sub(metadata.finished_at.unwrap_or(metadata.started_at));
+                        if age >= MAX_AGE_MS {
+                            return Some(Outcome::Final("expired".into()));
                         }
-                        settled = true;
-                        break;
+                        let Some(offers) = registry.reserve_runner_completion_offer(&task_id)
+                        else {
+                            return None;
+                        };
+                        if registry
+                            .persist_runner_completion_offer(&owner.session, &task_id, offers)
+                            .is_err()
+                        {
+                            return None;
+                        }
                     }
-                    Outcome::Retry => std::thread::sleep(Duration::from_millis(
-                        (250u64 << attempt.min(8)).min(60_000),
-                    )),
-                }
-            }
-            if completion {
-                if !settled {
-                    log::warn!(
-                        "runner notice {} retired: retry budget exhausted",
-                        request.send_id
-                    );
-                }
+                    Some(runtime.block_on(send(&path, &address, &request)))
+                },
+                std::thread::sleep,
+            );
+            if completion && settled {
                 registry.ack_completions_for_session(Some(&owner.session), &[task_id]);
             }
         });
     if spawned.is_err() {
-        ACTIVE.fetch_sub(1, Ordering::AcqRel);
         return false;
     }
     true

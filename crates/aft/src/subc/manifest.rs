@@ -961,6 +961,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (
+                    super::super::scope_background_tasks::OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
                     crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION,
                     &ManagementOperationKind::Mutate,
                 ),
@@ -1233,7 +1237,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
@@ -1250,7 +1254,7 @@ mod tests {
         // The snapshot predates the gh shim relay operations, the backup purge
         // and the page-bundle operations, so they are appended to its
         // management operation list here.
-        // It also predates `bash.kill_scope`, which the manifest lists first.
+        // It also predates the scope task operations listed before older queries.
         let operations = management
             .get_mut("operations")
             .and_then(Value::as_array_mut)
@@ -1265,6 +1269,10 @@ mod tests {
                 "name": "diagnostics.findings", "kind": "query",
                 "description": "Read AFT's recorded health findings without scheduling work.",
             }),
+        );
+        operations.insert(
+            0,
+            json!({"name": "scope.background_tasks", "kind": "query"}),
         );
         operations.extend([
             json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
