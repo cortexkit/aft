@@ -98,20 +98,16 @@ fn backup_bookkeeping_wrapped_write_keeps_undo_entry_and_post_state() {
     );
 
     // Missing post-state would let undo adopt this external change as the
-    // writer's own result when it drains unfinished mutation records.
+    // writer's own result, so it would not save the external-change checkpoint.
     std::fs::write(&path, "pub fn external() {}\n").unwrap();
     let undo = || request("undo", serde_json::json!({"file": "small.rs"}));
-    let refused = dispatch(undo(), &ctx);
-    assert!(
-        !refused.success,
-        "undo accepted an external edit: {refused:?}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        "pub fn external() {}\n"
-    );
-    std::fs::write(&path, written).unwrap();
     let restored = dispatch(undo(), &ctx);
     assert!(restored.success, "{restored:?}");
+    assert!(
+        restored.data["external_change_checkpoint"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("external-change-small.rs-")),
+        "undo failed to preserve the external edit: {restored:?}"
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
