@@ -401,18 +401,19 @@ impl Work {
     /// waiting to be tried again. A build that fails is tried again after a
     /// wait that doubles each time, until one succeeds or the checkout is
     /// dropped; the wait is a sleeping thread, never an executor worker.
-    fn start_build(self: &Arc<Self>) {
+    /// Returns whether this call queued a build, so its cause is logged once.
+    fn start_build(self: &Arc<Self>) -> bool {
         {
             let retry = self
                 .retry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if retry.at.is_some_and(|at| Instant::now() < at) {
-                return;
+                return false;
             }
         }
         if self.building.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         let flag = ClearOnDrop(Arc::clone(&self.building));
         let work = Arc::clone(self);
@@ -459,6 +460,7 @@ impl Work {
                 Err(error) => work.retry_build_later(&error),
             }
         });
+        true
     }
 
     fn retry_build_later(self: &Arc<Self>, error: &DataError) {
@@ -628,6 +630,14 @@ impl Work {
                 self.after_publish(&report);
             }
             Ok(None) | Err(DataError::Cancelled) => {}
+            Err(error @ DataError::Damaged(_)) => {
+                if self.start_build() {
+                    crate::slog_warn!(
+                        "data layer could not publish changes for {}: {error}; rebuilding its stored call graph",
+                        self.checkout.root().display()
+                    );
+                }
+            }
             Err(error) => crate::slog_warn!(
                 "data layer could not publish changes for {}: {error}",
                 self.checkout.root().display()
@@ -992,6 +1002,26 @@ impl DataCheckout {
         quiet_period: Duration,
         settle_period: Duration,
     ) -> Result<Arc<Self>, DataError> {
+        Self::open_on_layer(
+            root,
+            storage,
+            executor,
+            planes,
+            quiet_period,
+            settle_period,
+            layer(),
+        )
+    }
+
+    fn open_on_layer(
+        root: &Path,
+        storage: &Path,
+        executor: Option<RootMaintenanceExecutor>,
+        planes: Planes,
+        quiet_period: Duration,
+        settle_period: Duration,
+        shared: Arc<DataLayer>,
+    ) -> Result<Arc<Self>, DataError> {
         {
             let failures = bind_failures()
                 .lock()
@@ -1004,7 +1034,7 @@ impl DataCheckout {
         }
         let bound = family_of(root).and_then(|family| {
             let family_dir = storage.join("data").join(family.digest().to_string());
-            Checkout::bind_planes(layer(), &family_dir, family, root, planes)
+            Checkout::bind_planes(shared, &family_dir, family, root, planes)
         });
         let checkout = match bound {
             Ok(checkout) => {
@@ -1841,6 +1871,72 @@ mod tests {
             fixture.handle.fresh_view(Duration::ZERO),
             Fresh::Ready(_)
         ));
+    }
+
+    #[test]
+    fn a_damaged_automatic_publication_rebuilds_and_becomes_current() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::write(
+            path.join("Cargo.toml"),
+            "[package]\nname='recovery'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let mut source = "mod util;\npub fn caller() { util::callee(); }\n".to_string();
+        for n in 0..2000 {
+            source.push_str(&format!("pub fn padding_function_{n}() {{}}\n"));
+        }
+        std::fs::write(path.join("src/lib.rs"), source).unwrap();
+        std::fs::write(path.join("src/util.rs"), "pub fn callee() {}\n").unwrap();
+        let handle = DataCheckout::open_on_layer(
+            &path,
+            storage.path(),
+            None,
+            Planes::ALL,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            Arc::new(DataLayer::new(64 << 10, 2)),
+        )
+        .unwrap();
+        assert!(matches!(
+            handle.fresh_view(Duration::from_secs(60)),
+            Fresh::Ready(_)
+        ));
+        wait_until(|| !handle.work.running());
+
+        // Hold the publication immediately after its refresh, before it reads
+        // stored parses, so only publication can discover the injected damage.
+        let publication = handle.work.publication_delay.lock();
+        let rebuild = hold_builds_for_test(&path);
+        let edit = path.join("src/util.rs");
+        std::fs::write(&edit, "pub fn replacement() {}\n").unwrap();
+        handle.note_paths(&[edit]);
+        wait_until(|| handle.work.publications_started.load(Ordering::SeqCst) == 1);
+        handle.checkout().damage_stored_parse_for_test("src/lib.rs");
+        drop(publication);
+        wait_until(|| handle.work.building.load(Ordering::Acquire));
+        wait_until(|| !handle.work.refreshing.load(Ordering::Acquire));
+        assert_eq!(handle.checkout().changed_paths(), 1);
+        assert!(!handle.view().unwrap().callgraph_failures().is_empty());
+
+        // The queued runtime build, not a build called by the test, repairs it.
+        drop(rebuild);
+        wait_until(|| !handle.work.running() && handle.checkout().changed_paths() == 0);
+        let Fresh::Ready(view) = handle.fresh_view(Duration::ZERO) else {
+            panic!("rebuild did not make the graph current")
+        };
+        assert!(view.callgraph_failures().is_empty());
+        assert_eq!(
+            view.probe_query("callers", "src/util.rs", "replacement"),
+            Ok(0)
+        );
+        assert!(
+            view.probe_query("callers", "src/util.rs", "callee")
+                .is_err(),
+            "the old declaration survived the rebuild"
+        );
     }
 
     #[test]

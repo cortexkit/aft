@@ -5474,6 +5474,78 @@ fn wait_while_publication_held_for_test(root: &Path) {
 }
 
 #[cfg(test)]
+impl Checkout {
+    /// Corrupts a stored parse after a refresh, without recording its failure
+    /// until publication reads it. The fixture must use a one-block cache and
+    /// enough symbol metadata to evict the old cached body.
+    pub(crate) fn damage_stored_parse_for_test(&self, file: &str) {
+        use aft_store::content::ContentSegment;
+        use aft_store::segment::{KeySpace, SectionId};
+
+        {
+            let mut slot = self.engine.lock().unwrap();
+            let engine = slot.as_mut().unwrap();
+            assert!(engine.refreshed.replaced.contains_key(file));
+            engine.live.inputs.parses.release_decoded();
+            assert_eq!(engine.live.inputs.parses.decoded_count(), 0);
+        }
+        let published = self.live.read().unwrap().published.clone().unwrap();
+        assert!(published.graph.failures().is_empty());
+        let path = published
+            .state
+            .paths()
+            .iter()
+            .find(|path| path.path == file.as_bytes())
+            .unwrap();
+        let key = RecordKey::new(path.content, &path.language, EXTRACTOR_VERSION);
+        let mut damaged = false;
+        for segment in &published.segments {
+            let Some(content) = ContentSegment::open(segment).unwrap() else {
+                continue;
+            };
+            let Some(ordinal) = content.find(key).unwrap() else {
+                continue;
+            };
+            assert!(!content.body(ordinal).unwrap().is_empty());
+            // Bodies can be compressed. Change the stored section bytes, not
+            // the decoded record, and leave its checksum unchanged.
+            let bodies = segment
+                .section(SectionId::new(
+                    aft_store::content::KNOWN[2].kind,
+                    KeySpace::new(0),
+                ))
+                .unwrap();
+            let body = segment
+                .read_range(bodies, 0..segment.info(bodies).len)
+                .unwrap();
+            assert!(!body.is_empty());
+            let mut bytes = std::fs::read(segment.path()).unwrap();
+            let offsets = bytes
+                .windows(body.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| (bytes == body.as_slice()).then_some(offset))
+                .collect::<Vec<_>>();
+            assert_eq!(offsets.len(), 1, "the body must have one location on disk");
+            bytes[offsets[0] + body.len() / 2] ^= 0x40;
+            std::fs::write(segment.path(), bytes).unwrap();
+            // Evict the old cached body without decoding the damaged parse.
+            assert!(content.surface(ordinal).unwrap().len() >= 64 << 10);
+            assert!(
+                content.body(ordinal).is_err(),
+                "the damaged body must not be cached"
+            );
+            damaged = true;
+            break;
+        }
+        assert!(damaged, "the stored parse was found");
+        assert!(
+            published.graph.failures().is_empty(),
+            "publication has not read the damaged parse yet"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use aft_store::text::plan_pattern;
@@ -6022,9 +6094,6 @@ pub fn other() { callee(); }
 
     #[test]
     fn a_damaged_stored_parse_fails_publication_without_committing_or_panicking() {
-        use aft_store::content::ContentSegment;
-        use aft_store::segment::{KeySpace, SectionId};
-
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         demo(root.path());
@@ -6042,66 +6111,8 @@ pub fn other() { callee(); }
         checkout.build().unwrap();
         edit(&checkout, "src/util.rs", "pub fn replacement() {}\n");
         checkout.refresh_callgraph().unwrap().expect("applied");
-        {
-            let mut slot = checkout.engine.lock().unwrap();
-            let engine = slot.as_mut().unwrap();
-            assert!(engine.refreshed.replaced.contains_key("src/lib.rs"));
-            engine.live.inputs.parses.release_decoded();
-            assert_eq!(engine.live.inputs.parses.decoded_count(), 0);
-        }
+        checkout.damage_stored_parse_for_test("src/lib.rs");
         let published = checkout.live.read().unwrap().published.clone().unwrap();
-        assert!(published.graph.failures().is_empty());
-        let path = published
-            .state
-            .paths()
-            .iter()
-            .find(|path| path.path == b"src/lib.rs")
-            .unwrap();
-        let key = RecordKey::new(path.content, &path.language, EXTRACTOR_VERSION);
-        let mut damaged = false;
-        for segment in &published.segments {
-            let Some(content) = ContentSegment::open(segment).unwrap() else {
-                continue;
-            };
-            let Some(ordinal) = content.find(key).unwrap() else {
-                continue;
-            };
-            assert!(!content.body(ordinal).unwrap().is_empty());
-            // Bodies can be compressed. Change the stored section bytes, not
-            // the decoded record, and leave its checksum unchanged.
-            let bodies = segment
-                .section(SectionId::new(
-                    aft_store::content::KNOWN[2].kind,
-                    KeySpace::new(0),
-                ))
-                .unwrap();
-            let body = segment
-                .read_range(bodies, 0..segment.info(bodies).len)
-                .unwrap();
-            assert!(!body.is_empty());
-            let mut bytes = std::fs::read(segment.path()).unwrap();
-            let offsets = bytes
-                .windows(body.len())
-                .enumerate()
-                .filter_map(|(offset, bytes)| (bytes == body.as_slice()).then_some(offset))
-                .collect::<Vec<_>>();
-            assert_eq!(offsets.len(), 1, "the body must have one location on disk");
-            bytes[offsets[0] + body.len() / 2] ^= 0x40;
-            std::fs::write(segment.path(), bytes).unwrap();
-            // Evict the old cached body without decoding the damaged parse.
-            assert!(content.surface(ordinal).unwrap().len() >= 64 << 10);
-            assert!(
-                content.body(ordinal).is_err(),
-                "the damaged body must not be cached"
-            );
-            damaged = true;
-            break;
-        }
-        assert!(damaged, "the stored parse was found");
-        assert!(
-            published.graph.failures().is_empty(),
-            "publication has not read the damaged parse yet"
-        );
         let before = checkout
             .family
             .snapshot()
