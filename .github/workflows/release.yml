@@ -226,12 +226,14 @@ jobs:
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
-    # The shipped-profile library compile peaks near 12 GB and swaps on this
-    # free 7 GB runner (0.63.1's ARM64 build ran past a shorter limit twice),
-    # so the limit leaves only the tag canceller's 10 minutes below GitHub's
-    # 360-minute maximum.
-    runs-on: macos-26
-    timeout-minutes: 350
+    # The macOS release jobs run on CortexKit's rented Mac (12 cores, 16 GB,
+    # one job at a time, checkouts kept warm between jobs) until the rental
+    # ends on 21 November 2026; then they move back to `macos-26`. GitHub's
+    # free 7 GB runner swaps on the shipped-profile library compile, which
+    # peaks near 12 GB, and needed close to its 360-minute maximum. The rented
+    # Mac has no Rust or Bun on its PATH, so every job installs its toolchains.
+    runs-on: [self-hosted, rented-mac]
+    timeout-minutes: 150
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
     permissions:
@@ -308,8 +310,8 @@ jobs:
   build-darwin-x64:
     name: Build macOS x64
     # Same runner and limit as the ARM64 build; see the note there.
-    runs-on: macos-26
-    timeout-minutes: 350
+    runs-on: [self-hosted, rented-mac]
+    timeout-minutes: 150
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -592,6 +594,9 @@ jobs:
   e2e-darwin-arm64:
     name: Shipped E2E (macOS ARM64)
     needs: build-darwin-arm64
+    # Stays on GitHub's runner: the rented Mac downloads the 135 MB tested
+    # bundle at about 160 KB/s (14 minutes), while the suite itself takes a
+    # few minutes here.
     runs-on: macos-26
     # v0.62.0/v0.63.3/v0.63.4: 2.4/3.0/3.4 min; 10 min covers cold setup.
     timeout-minutes: 10
