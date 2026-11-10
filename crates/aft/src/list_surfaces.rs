@@ -425,6 +425,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Shell output is a byte-addressed subscription, not an agent list: backfill cuts are explicit in truncated_before, subsequent chunks preserve raw offset/end_offset, and oversized escapes are omitted without losing raw byte accounting.",
     },
     ExclusionEntry {
+        file: "subc/shells/wire.rs",
+        enclosing_item: "PAGE_SIZE, RETENTION_MS, DEFAULT_CHUNK_BYTES, MAX_CHUNK_BYTES, BACKFILL_BYTES",
+        location_or_primitive: "shells/v1 protocol constants",
+        reason: "Operator-only wire limits use explicit continuation cursors, resync parts and raw byte offsets; they do not bound or change any agent tool reply.",
+    },
+    ExclusionEntry {
         file: "bash_background/shell_registry.rs",
         enclosing_item: "shell_masked_range",
         location_or_primitive: "4096, take_while",

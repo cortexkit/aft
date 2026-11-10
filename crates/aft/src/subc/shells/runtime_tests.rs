@@ -185,6 +185,28 @@ fn shells_v1_persisted_observation_settles_lost_without_adopting_and_keeps_revis
     assert_eq!(reader.shell_revision(&row.task_id, "changed").unwrap(), 2);
 }
 
+#[test]
+fn shells_v1_remote_without_live_registry_keeps_durable_pending_state() {
+    use crate::bash_background::persistence::{read_task_at, write_task_at};
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, task) = captured(dir.path(), b"", false, false);
+    let mut metadata = read_task_at(&task).unwrap();
+    let job = "0b816da2-78cb-4fef-8abc-0123456789ab";
+    metadata.remote=Some(serde_json::from_value(json!({"harness":"test","session":"plain-session","job_id":job,"stdout_len":0,"stderr_len":0,"cancel_requested":false})).unwrap());
+    write_task_at(&task, &metadata).unwrap();
+    let stored = metadata.to_bash_task_row("test", &task.paths).unwrap();
+    let (snapshot, reader) = ShellReader::persisted(stored).unwrap();
+    assert!(!snapshot.metadata.is_terminal());
+    let row = project_row(&snapshot, None);
+    assert_eq!(row.state, "queued");
+    assert_eq!(row.remote.unwrap().job_id, job);
+    assert!(row.end_reason.is_none());
+    reader.shell_revision(&row.task_id, "pending").unwrap();
+    let unchanged = read_task_at(&task).unwrap();
+    assert_eq!(unchanged.status, BgTaskStatus::Running);
+    assert!(unchanged.finished_at.is_none());
+}
+
 #[tokio::test]
 async fn shells_v1_output_real_files_default_backfill_exact_resume_and_end_record() {
     let dir = tempfile::tempdir().unwrap();

@@ -43,10 +43,16 @@ impl ShellReader {
         {
             return None;
         }
+        #[cfg(unix)]
+        if !metadata.is_terminal() {
+            let _ = super::super::remote::terminal_metadata_from_proof(&mut metadata);
+        }
         if !metadata.is_terminal() {
             if let Some(marker) = read_exit_marker(&task.paths).ok().flatten() {
                 metadata = terminal_metadata_from_marker(metadata, marker, None);
-            } else if !BgTaskRegistry::persisted_task_process_is_alive(&metadata) {
+            } else if metadata.remote.is_none()
+                && !BgTaskRegistry::persisted_task_process_is_alive(&metadata)
+            {
                 let reason = restart_fate_unknown_reason(&metadata, &task.paths);
                 metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(reason));
             }
