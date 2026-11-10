@@ -12,25 +12,95 @@
   ],
   "pattern_counts": {
     "followup-census:910002": {
-      "candidate_files": {"before": 3, "after": 6},
-      "files_examined": {"before": 3, "after": 6}
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
     },
     "followup-census:910003": {
-      "candidate_files": {"before": 972, "after": 860},
-      "files_examined": {"before": 972, "after": 860}
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
     },
     "followup-census:910004": {
-      "candidate_files": {"before": 972, "after": 860},
-      "files_examined": {"before": 972, "after": 860}
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
     },
     "followup-census:910005": {
-      "candidate_files": {"before": 194, "after": 141},
-      "files_examined": {"before": 194, "after": 141}
+      "candidate_files": {
+        "before": 194,
+        "after": 141
+      },
+      "files_examined": {
+        "before": 194,
+        "after": 141
+      }
     },
     "followup-census:910010": {
-      "candidate_files": {"before": 6, "after": 19},
-      "files_examined": {"before": 6, "after": 19}
+      "candidate_files": {
+        "before": 6,
+        "after": 19
+      },
+      "files_examined": {
+        "before": 6,
+        "after": 19
+      }
+    },
+    "followup-census:910011": {
+      "candidate_files": {
+        "before": 942,
+        "after": 729
+      },
+      "files_examined": {
+        "before": 942,
+        "after": 729
+      }
+    },
+    "followup-census:910012": {
+      "candidate_files": {
+        "before": 1031,
+        "after": 730
+      },
+      "files_examined": {
+        "before": 1031,
+        "after": 730
+      }
+    },
+    "followup-census:910013": {
+      "candidate_files": {
+        "before": 908,
+        "after": 45
+      },
+      "files_examined": {
+        "before": 908,
+        "after": 45
+      }
+    },
+    "followup-census:910014": {
+      "candidate_files": {
+        "before": 1011,
+        "after": 24
+      },
+      "files_examined": {
+        "before": 1011,
+        "after": 24
+      }
     }
   },
-  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/, crates/aft/src/search_b2/, crates/aft/src/search_index.rs (deleted), crates/aft/src/semantic_index.rs and crates/aft/src/lib.rs. The index store becomes the only source for aft_search's text and meaning lanes, and the old trigram index, semantic snapshot and views are deleted. Both lanes already read through data_layer::tools::search (TextIndex, MeaningIndex), and earlier slices replayed the concept, exact and real-query families through the index store with identical replies. Routing, scores and truncation are unchanged, so ranked rows must stay byte-identical to the committed reference. The one declared difference is the pattern lane's candidate count in five rows (pattern_counts): the index store's trigram planner names a different set of files to read before matching, so candidate_files and files_examined change while files_matched, ranked paths and every rendered line stay the same. A reply reports the index's true candidate count, as Ufuk approved for the cutover."
+  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/, crates/aft/src/search_b2/, crates/aft/src/search_index.rs (deleted), crates/aft/src/semantic_index.rs and crates/aft/src/lib.rs. The index store becomes the only source for aft_search's text and meaning lanes, and the old trigram index, semantic snapshot and views are deleted. Both lanes already read through data_layer::tools::search (TextIndex, MeaningIndex), and earlier slices replayed the concept, exact and real-query families through the index store with identical replies. Routing, scores and truncation are unchanged, so ranked rows must stay byte-identical to the committed reference. The one declared difference is the pattern lane's candidate count in nine rows (pattern_counts): the index store's trigram planner names a different set of files to read before matching, so candidate_files and files_examined change while files_matched, ranked paths and every rendered line stay the same. A reply reports the index's true candidate count, as Ufuk approved for the cutover."
 }
