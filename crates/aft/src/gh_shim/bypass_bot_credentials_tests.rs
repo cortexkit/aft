@@ -80,6 +80,7 @@ fn admin_rows(manifest: &Manifest) -> Vec<(String, Vec<OsString>)> {
         let tuple = row.tuple();
         let mut raw: Vec<&str> = tuple.split_whitespace().collect();
         match tuple {
+            "pr merge" => raw.extend(["7", "--squash"]),
             "label create" => raw.extend(["triage", "--color", "ff0000"]),
             "repo create" => raw.push("cortexkit/new-repo"),
             "repo rename" => raw.push("new-name"),
@@ -223,22 +224,16 @@ fn bot_credentials_also_refuse_label_and_queue_bypasses() {
             "--repo",
             "cortexkit/aft",
         ],
-        vec![
-            "pr",
-            "merge",
-            "7",
-            "--auto",
-            "--squash",
-            "--repo",
-            "cortexkit/aft",
-        ],
+        vec!["pr", "merge", "7", "--auto", "--repo", "cortexkit/aft"],
     ] {
         let args = raw.iter().map(OsString::from).collect::<Vec<_>>();
         assert!(matches!(
             classify(&args, &fixture.manifest, "linux"),
             Classification::Governed { .. }
         ));
-        assert_bot_refusal(&fixture, &args, "GH_TOKEN is present", false);
+        for full_dispatch in [true, false] {
+            assert_bot_refusal(&fixture, &args, "GH_TOKEN is present", full_dispatch);
+        }
     }
     let args = vec!["auth".into(), "token".into()];
     assert_bot_refusal(&fixture, &args, "GH_TOKEN is present", true);
@@ -246,9 +241,11 @@ fn bot_credentials_also_refuse_label_and_queue_bypasses() {
 
 #[test]
 fn bypass_reuses_manifest_detector_inventory_including_wrapper_directories() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     let bot_config = fixture.home.path().join("gh-alfonso-test");
     fs::create_dir_all(&bot_config).unwrap();
+    fixture.manifest.detectors.wrapper_config_dirs =
+        vec![bot_config.to_string_lossy().into_owned()];
     let args = vec!["pr".into(), "merge".into(), "7".into()];
     assert_bot_refusal(
         &fixture,

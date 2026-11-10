@@ -892,14 +892,18 @@ fn run_with(
         {
             return status;
         }
-        // Check admin bypasses before discovery can report governed routing as
+        // Check operator bypasses before discovery can report governed routing as
         // unavailable and hide the credential-specific refusal.
         if operator_bypass_requested()
             && !shim_disabled_by_operator()
-            && matches!(
-                classify(args, manifest, current_platform()),
-                Classification::Admin { .. }
-            )
+            && match classify(args, manifest, current_platform()) {
+                Classification::Admin { .. } => true,
+                Classification::Governed { tuple, .. } => {
+                    tuple == "pr enqueue"
+                        || is_reviewed_operator_label_tuple(manifest.manifest_version, &tuple)
+                }
+                _ => false,
+            }
         {
             if let Some(status) = refuse_bypass_bot_credentials(&manifest.detectors) {
                 return status;
