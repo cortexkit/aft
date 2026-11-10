@@ -1635,18 +1635,6 @@ impl ViewBindingDependencies {
                             .cloned(),
                     );
                 }
-                for (old, new) in [
-                    (&before.node_by_scoped, &after.node_by_scoped),
-                    (&before.node_by_bare, &after.node_by_bare),
-                ] {
-                    names.extend(
-                        old.keys()
-                            .chain(new.keys())
-                            .filter(|name| old.get(*name) != new.get(*name))
-                            .cloned(),
-                    );
-                }
-                names.extend(before.exports.symmetric_difference(&after.exports).cloned());
                 if !names.is_empty() {
                     return names
                         .iter()
@@ -1786,30 +1774,11 @@ struct ViewFileSurface {
 }
 
 impl ViewFileSurface {
-    /// The part an external module declaration cannot change. Keep macro-use
-    /// and reexport state: either can affect readers beyond the module name.
+    /// The part answered by queries other than module-target lookups. Keep
+    /// nodes, exports, macro-use and reexport state: changing any of them
+    /// requires whole-file invalidation, not just a module-name key.
     fn without_declared_modules(&self) -> Self {
         let mut rest = self.clone();
-        let module_nodes = self
-            .node_by_scoped
-            .iter()
-            .filter_map(|(name, id)| {
-                let bare = name.rsplit("::").next().unwrap_or(name);
-                (self.declared_module_targets.contains_key(bare)
-                    && self
-                        .node_kind_by_id
-                        .get(id)
-                        .is_some_and(|kind| kind == "module"))
-                .then_some(id)
-            })
-            .collect::<BTreeSet<_>>();
-        rest.node_by_scoped
-            .retain(|_, id| !module_nodes.contains(id));
-        rest.node_by_bare.retain(|_, id| !module_nodes.contains(id));
-        rest.node_kind_by_id
-            .retain(|id, _| !module_nodes.contains(id));
-        rest.exports
-            .retain(|name| !self.declared_module_targets.contains_key(name));
         rest.module_targets
             .retain(|name, _| !self.declared_module_targets.contains_key(name));
         rest.declared_module_targets.clear();
@@ -2612,7 +2581,7 @@ pub(crate) fn rust_crate_key(name: &str) -> String {
 impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {
         match self {
-            Self::Module(file, name) | Self::Node(file, name) | Self::Export(file, name) => {
+            Self::Module(file, name) => {
                 vec![file.clone(), rust_module_name_key(file, name)]
             }
             // Both crate keys: today's views set the map's key, the data
@@ -2660,8 +2629,10 @@ impl ViewSurfaceQuery {
             Self::Language(file)
             | Self::MacroUse(file)
             | Self::Reexports(file)
+            | Self::Node(file, _)
             | Self::Callable(file, _)
             | Self::Alias(file, _)
+            | Self::Export(file, _)
             | Self::Default(file)
             | Self::Contains(file) => vec![file.clone()],
         }
@@ -2673,7 +2644,7 @@ impl ViewSurfaceQuery {
     /// every file it replays, most of them naming one file.
     fn depends_on_any(&self, changed: &BTreeSet<String>) -> bool {
         match self {
-            Self::Module(file, name) | Self::Node(file, name) | Self::Export(file, name) => {
+            Self::Module(file, name) => {
                 changed.contains(file) || changed.contains(&rust_module_name_key(file, name))
             }
             Self::Parent(file) => {
@@ -2685,8 +2656,10 @@ impl ViewSurfaceQuery {
             Self::Language(file)
             | Self::MacroUse(file)
             | Self::Reexports(file)
+            | Self::Node(file, _)
             | Self::Callable(file, _)
             | Self::Alias(file, _)
+            | Self::Export(file, _)
             | Self::Default(file)
             | Self::Contains(file) => changed.contains(file),
             Self::Crate(..) | Self::CrateRoot(..) | Self::Inline(..) => self
