@@ -1,7 +1,7 @@
 //! Manual local-file outline measurement. All paths must name a disposable copy.
 
 use super::*;
-use crate::data_layer::{checkout::Checkout, DataLayer};
+use crate::data_layer::checkout::{Checkout, DataLayer};
 use aft_store::ids::{Digest128, FamilyId};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
