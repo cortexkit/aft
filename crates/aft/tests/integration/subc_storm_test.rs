@@ -336,8 +336,43 @@ pub(super) fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "subc_storm_inject_raw_paths" => inject_raw_watcher_paths(&req, ctx),
         "subc_storm_watcher_pending" => watcher_pending_response(&req, ctx),
         "subc_storm_egress_payload" => egress_payload_response(&req, ctx),
+        "subc_test_enqueue_watcher_event" => enqueue_watcher_tick(&req, ctx),
         _ => subc_bridge_test::bridge_dispatch(req, ctx),
     }
+}
+
+/// One of the storm's four tool kinds: write a file and queue its watcher
+/// event, so rebinds race the watcher drain and the index refresh it starts.
+/// The bridge test once served this command and also seeded whole-repository
+/// analysis counts on the status bar; those analyses now run only on
+/// `aft_inspect`, so the bridge test dropped the command and the storm keeps
+/// only the file write and its event.
+fn enqueue_watcher_tick(req: &RawRequest, ctx: &AppContext) -> Response {
+    let Some(root) = ctx.config().project_root.clone() else {
+        return Response::error(
+            &req.id,
+            "missing_project_root",
+            "storm root is not configured",
+        );
+    };
+    let path = root.join("subc_watcher_tick.rs");
+    if let Err(error) = std::fs::write(&path, "pub fn subc_watcher_tick() {}\n") {
+        return Response::error(
+            &req.id,
+            "watcher_test_setup_failed",
+            format!("failed to write watcher test file: {error}"),
+        );
+    }
+    let (tx, rx) = watcher_dispatch_channel();
+    tx.send(WatcherDispatchEvent::Paths(vec![path]))
+        .expect("queue watcher event");
+    *ctx.watcher_rx().lock() = Some(rx);
+    SYNTHETIC_WATCHER_SENDERS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("synthetic watcher sender lock")
+        .push(tx);
+    Response::success(&req.id, json!({ "queued": true }))
 }
 
 fn egress_payload_response(req: &RawRequest, ctx: &AppContext) -> Response {
