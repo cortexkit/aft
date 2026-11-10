@@ -698,7 +698,10 @@ mod tests {
     #[test]
     fn shim_sdk_resolution_accepts_versioned_and_versionless_runtime_aliases() {
         let temp = tempfile::tempdir().unwrap();
-        let modules = temp.path().join("node_modules");
+        // Resolution follows real paths, so compare against the canonical
+        // temp folder (macOS reaches it through a /var symlink).
+        let modules =
+            crate::inspect::job::canonicalize_normalized(temp.path()).join("node_modules");
         let shim = modules.join("typescript");
         let sdk = modules.join("@typescript").join("old");
         alias_package(&sdk, "6.0.3", serde_json::json!({}));
@@ -762,7 +765,8 @@ mod tests {
     #[test]
     fn shim_sdk_resolution_bounds_cycles_and_long_chains() {
         let temp = tempfile::tempdir().unwrap();
-        let modules = temp.path().join("node_modules");
+        let modules =
+            crate::inspect::job::canonicalize_normalized(temp.path()).join("node_modules");
         let shim = modules.join("typescript");
         alias_package(
             &shim,
