@@ -218,6 +218,26 @@ pub struct SearchWaits {
     pub files: super::request_files::RequestFilesReport,
     /// How the exact lane's prepared-text cache served this call.
     pub prepared: PreparedTextCounts,
+    /// Content-addressed code-reference answer-cache activity.
+    pub code_references: CodeReferenceCounts,
+}
+
+/// Code-reference cache lookups and the name sets built by this search.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CodeReferenceCounts {
+    pub hits: u64,
+    pub misses: u64,
+    pub names: u64,
+    pub bytes: u64,
+}
+
+impl CodeReferenceCounts {
+    const EMPTY: Self = Self {
+        hits: 0,
+        misses: 0,
+        names: 0,
+        bytes: 0,
+    };
 }
 
 /// Lookups of the exact lane's prepared-text cache during one search call.
@@ -304,6 +324,14 @@ impl SearchWaits {
                 prepared.evicted_by_bytes
             );
         }
+        let references = &self.code_references;
+        if references.hits + references.misses > 0 {
+            let _ = write!(
+                out,
+                " code_refs=hit:{},miss:{},names:{},bytes:{}",
+                references.hits, references.misses, references.names, references.bytes
+            );
+        }
         out
     }
 }
@@ -319,6 +347,7 @@ struct Collector {
     slots: [WaitSlot; KINDS],
     files: super::request_files::RequestFilesReport,
     prepared: PreparedTextCounts,
+    code_references: CodeReferenceCounts,
 }
 
 const EMPTY_SLOT: WaitSlot = WaitSlot {
@@ -338,6 +367,7 @@ thread_local! {
             slots: [EMPTY_SLOT; KINDS],
             files: super::request_files::RequestFilesReport::EMPTY,
             prepared: PreparedTextCounts::EMPTY,
+            code_references: CodeReferenceCounts::EMPTY,
         })
     };
 }
@@ -381,6 +411,7 @@ fn open(wait_cpu: bool) -> WaitScope {
         collector.slots = [EMPTY_SLOT; KINDS];
         collector.files = super::request_files::RequestFilesReport::EMPTY;
         collector.prepared = PreparedTextCounts::EMPTY;
+        collector.code_references = CodeReferenceCounts::EMPTY;
         true
     });
     WaitScope {
@@ -398,16 +429,18 @@ impl WaitScope {
             cpu_started,
             crate::run_tool_call::ThreadCpuSample::now(),
         );
-        let (slots, wait_cpu_sampled, files, prepared) = COLLECTOR.with(|collector| {
-            let mut collector = collector.borrow_mut();
-            collector.active = false;
-            (
-                collector.slots,
-                collector.wait_cpu,
-                collector.files,
-                collector.prepared,
-            )
-        });
+        let (slots, wait_cpu_sampled, files, prepared, code_references) =
+            COLLECTOR.with(|collector| {
+                let mut collector = collector.borrow_mut();
+                collector.active = false;
+                (
+                    collector.slots,
+                    collector.wait_cpu,
+                    collector.files,
+                    collector.prepared,
+                    collector.code_references,
+                )
+            });
         Some(SearchWaits {
             slots,
             wall,
@@ -415,6 +448,7 @@ impl WaitScope {
             wait_cpu_sampled,
             files,
             prepared,
+            code_references,
         })
     }
 }
@@ -482,6 +516,16 @@ pub(crate) fn record_prepared_text(update: impl FnOnce(&mut PreparedTextCounts))
         let mut collector = collector.borrow_mut();
         if collector.active {
             update(&mut collector.prepared);
+        }
+    });
+}
+
+/// Count code-reference answer-cache work in this thread's open scope.
+pub(crate) fn record_code_references(update: impl FnOnce(&mut CodeReferenceCounts)) {
+    COLLECTOR.with(|collector| {
+        let mut collector = collector.borrow_mut();
+        if collector.active {
+            update(&mut collector.code_references);
         }
     });
 }

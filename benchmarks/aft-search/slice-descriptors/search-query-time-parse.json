@@ -1,0 +1,8 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["crates/aft/src/commands/semantic_search/mod.rs"],
+  "slices": ["search-query-time-parse"],
+  "note": "Ranking-fenced semantic_search and parser code cache the existing code-reference predicate's query-independent identifier names by content digest and grammar. The cache is bounded to 2 MiB and 512 entries, with a 128 KiB per-file name limit and the original parse predicate as fallback. Exact-lane textual definition scanning, candidate selection, score, order, snippets and reply formatting are unchanged. Parser additions are test-hooks-only counters. This descriptor adds no reference count or presentation waivers. See the search-query-time-parse investigation for full real-query parity, 108-row baseline/candidate quality comparison and eight-searcher before/after measurements. No content-record format changes are made."
+}

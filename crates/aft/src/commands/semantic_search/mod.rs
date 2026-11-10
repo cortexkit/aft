@@ -4292,6 +4292,23 @@ fn identifier_has_code_reference(
     let Some(source) = file.utf8() else {
         return false;
     };
+    // Search matches may be normalized or variants. They count as code
+    // references only if the exact identifier bytes also occur in the source.
+    if !source.contains(identifier) {
+        return false;
+    }
+    if let Some(found) = code_references::cached(path, &file, source, identifier, parser) {
+        return found;
+    }
+    code_reference_in_source(path, source, identifier, parser)
+}
+
+fn code_reference_in_source(
+    path: &Path,
+    source: &str,
+    identifier: &str,
+    parser: &mut crate::parser::FileParser,
+) -> bool {
     // Parse the bytes just checked, not a fresh read of the path, so the tree
     // and the text agree even if the file changes meanwhile.
     let Ok((tree, _)) = waits::timed(waits::SearchWait::Parse, || {
@@ -4321,6 +4338,371 @@ fn identifier_has_code_reference(
         }
         true
     })
+}
+
+/// Query-time code-reference facts, not syntax trees. Content records retain
+/// definitions and call edges, but not every identifier accepted by this check
+/// (imports and bare external type names count too).
+mod code_references {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_ENTRIES: usize = 512;
+    const MAX_FILE_BYTES: usize = 128 * 1024;
+    // Includes the map slot, key, Arc, OnceLock, LRU stamp and allocator headers.
+    const ENTRY_BYTES: usize = 256;
+    type Key = (blake3::Hash, crate::parser::LangId, bool);
+    type Names = Vec<Box<str>>;
+
+    struct Entry {
+        names: Arc<OnceLock<Option<(Names, usize)>>>,
+        bytes: usize,
+        used: u64,
+    }
+
+    #[derive(Default)]
+    struct State {
+        entries: HashMap<Key, Entry>,
+        bytes: usize,
+        clock: u64,
+    }
+
+    struct Cache {
+        state: Mutex<State>,
+        max_bytes: usize,
+        max_entries: usize,
+    }
+
+    impl Cache {
+        fn new(max_bytes: usize, max_entries: usize) -> Self {
+            Self {
+                state: Mutex::new(State::default()),
+                max_bytes,
+                max_entries,
+            }
+        }
+
+        fn evict(state: &mut State) {
+            if let Some(key) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| *key)
+            {
+                if let Some(entry) = state.entries.remove(&key) {
+                    state.bytes -= entry.bytes;
+                }
+            }
+        }
+
+        fn lookup(
+            &self,
+            key: Key,
+            identifier: &str,
+            build: impl FnOnce() -> Option<Names>,
+        ) -> Option<bool> {
+            let cell = {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                state.clock = state.clock.wrapping_add(1);
+                let used = state.clock;
+                if let Some(entry) = state.entries.get_mut(&key) {
+                    entry.used = used;
+                    waits::record_code_references(|counts| counts.hits += 1);
+                    Arc::clone(&entry.names)
+                } else {
+                    waits::record_code_references(|counts| counts.misses += 1);
+                    while !state.entries.is_empty()
+                        && (state.entries.len() >= self.max_entries
+                            || state.bytes + ENTRY_BYTES > self.max_bytes)
+                    {
+                        Self::evict(&mut state);
+                    }
+                    let cell = Arc::new(OnceLock::new());
+                    state.entries.insert(
+                        key,
+                        Entry {
+                            names: Arc::clone(&cell),
+                            bytes: ENTRY_BYTES,
+                            used,
+                        },
+                    );
+                    state.bytes += ENTRY_BYTES;
+                    cell
+                }
+            };
+            let names = cell.get_or_init(|| {
+                build().map(|names| {
+                    let bytes = names_bytes(&names);
+                    (names, bytes)
+                })
+            });
+            let bytes = names.as_ref().map_or(0, |(_, bytes)| *bytes);
+            {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(entry) = state
+                    .entries
+                    .get_mut(&key)
+                    .filter(|entry| Arc::ptr_eq(&entry.names, &cell))
+                {
+                    if entry.bytes == ENTRY_BYTES {
+                        entry.bytes += bytes;
+                        state.bytes += bytes;
+                    }
+                }
+                if names.is_none()
+                    && state
+                        .entries
+                        .get(&key)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.names, &cell))
+                {
+                    if let Some(entry) = state.entries.remove(&key) {
+                        state.bytes -= entry.bytes;
+                    }
+                }
+                while state.bytes > self.max_bytes {
+                    Self::evict(&mut state);
+                }
+            }
+            names.as_ref().map(|(names, _)| {
+                names
+                    .binary_search_by(|name| name.as_ref().cmp(identifier))
+                    .is_ok()
+            })
+        }
+    }
+
+    fn names_bytes(names: &Names) -> usize {
+        names.capacity() * std::mem::size_of::<Box<str>>()
+            + names.iter().map(|name| name.len() + 16).sum::<usize>()
+    }
+
+    fn collect(tree: &tree_sitter::Tree, source: &str) -> Option<Names> {
+        let mut names = std::collections::BTreeSet::new();
+        let mut bytes = 0;
+        let mut cursor = tree.walk();
+        loop {
+            let node = cursor.node();
+            // Skipping an error or missing node's subtree prevents accepting
+            // identifiers beneath it without rewalking each identifier's parents.
+            if !node.is_error() && !node.is_missing() {
+                if node.kind() == "identifier"
+                    || node.kind().ends_with("_identifier")
+                    || node.kind() == "constant"
+                {
+                    let name = source.get(node.byte_range())?;
+                    // The old query uses the smallest node containing exactly
+                    // these bytes, not an outer identifier-shaped wrapper.
+                    let smallest = tree
+                        .root_node()
+                        .descendant_for_byte_range(node.start_byte(), node.end_byte())?;
+                    if !name.is_empty()
+                        && (smallest.kind() == "identifier"
+                            || smallest.kind().ends_with("_identifier")
+                            || smallest.kind() == "constant")
+                    {
+                        if names.insert(name) {
+                            bytes += name.len() + 16 + std::mem::size_of::<Box<str>>();
+                            if bytes > MAX_FILE_BYTES {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                if cursor.goto_first_child() {
+                    continue;
+                }
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    let names = names.into_iter().map(Box::<str>::from).collect::<Names>();
+                    return (names_bytes(&names) <= MAX_FILE_BYTES).then_some(names);
+                }
+            }
+        }
+    }
+
+    pub(super) fn cached(
+        path: &Path,
+        file: &request_files::RequestFile,
+        source: &str,
+        identifier: &str,
+        parser: &mut crate::parser::FileParser,
+    ) -> Option<bool> {
+        let language = crate::parser::language_for_extension(path)?;
+        // Headers try C, C++ and Objective-C; a .c file with the same bytes
+        // must not reuse a header's fallback grammar.
+        let key = (
+            file.digest(),
+            language,
+            path.extension().is_some_and(|extension| extension == "h"),
+        );
+        static CACHE: OnceLock<Cache> = OnceLock::new();
+        CACHE
+            .get_or_init(|| Cache::new(MAX_BYTES, MAX_ENTRIES))
+            .lookup(key, identifier, || {
+                let (tree, _) = waits::timed(waits::SearchWait::Parse, || {
+                    parser.parse_source_text(path, source)
+                })
+                .ok()?;
+                let names = collect(tree, source)?;
+                waits::record_code_references(|counts| {
+                    counts.names += names.len() as u64;
+                    counts.bytes += names_bytes(&names) as u64;
+                });
+                Some(names)
+            })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn code_reference_names_match_the_original_byte_predicate() {
+            for (extension, source) in [
+                ("rs", "use external::ConnectionReset; fn read(x: ConnectionReset) { let lower_case = x; x.ConnectionReset(); } // CommentOnly\nconst TEXT: &str = \"StringOnly\";\nfn broken( { ErrorOnly }"),
+                ("ts", "import { ConnectionReset } from 'StringOnly'; const lower_case: ConnectionReset = value; // CommentOnly\nfunction broken( { ErrorOnly"),
+                ("py", "from external import ConnectionReset\ndef lower_case(x: ConnectionReset):\n    return x\n# CommentOnly\ns = 'StringOnly'\n"),
+                ("rb", "require 'StringOnly'\nConnectionReset = ExternalType.new\n# CommentOnly\ndef lower_case; ConnectionReset; end\n"),
+                ("h", "namespace outer { class ConnectionReset {}; } // CommentOnly\n"),
+                ("rs", "fn unicode(Éclair: usize) { let lower_case = Éclair; }\n"),
+            ] {
+                let path = PathBuf::from(format!("fixture.{extension}"));
+                let mut parser = crate::parser::FileParser::new();
+                let (tree, _) = parser.parse_source_text(&path, source).unwrap();
+                let names = collect(tree, source).unwrap();
+                for identifier in ["ConnectionReset", "lower_case", "CommentOnly", "StringOnly", "ErrorOnly", "ExternalType", "Éclair", "Connection", "Reset", "value"] {
+                    let expected = code_reference_in_source(&path, source, identifier, &mut parser);
+                    assert_eq!(names.binary_search_by(|name| name.as_ref().cmp(identifier)).is_ok(), expected, "{extension}: {identifier}");
+                }
+            }
+        }
+
+        #[test]
+        fn code_reference_cache_reuses_content_but_separates_grammar_and_edits() {
+            let source = "fn CachedParseMarker(x: ExternalCacheType) { x; } // CommentCacheOnly";
+            let file = request_files::RequestFile::unshared(source.as_bytes().to_vec(), None);
+            let mut parser = crate::parser::FileParser::new();
+            let before = crate::parser::work_counters::tree_parses();
+            assert_eq!(
+                cached(
+                    Path::new("first.rs"),
+                    &file,
+                    source,
+                    "ExternalCacheType",
+                    &mut parser
+                ),
+                Some(true)
+            );
+            let after = crate::parser::work_counters::tree_parses();
+            assert_eq!(after, before + 1);
+            let mut fresh = crate::parser::FileParser::new();
+            assert_eq!(
+                cached(
+                    Path::new("second.rs"),
+                    &file,
+                    source,
+                    "CommentCacheOnly",
+                    &mut fresh
+                ),
+                Some(false)
+            );
+            assert_eq!(crate::parser::work_counters::tree_parses(), after);
+            // A Rust-looking name in a Python comment is not a Python identifier.
+            let text = "# fn CachedGrammarMarker() {}";
+            let bytes = request_files::RequestFile::unshared(text.as_bytes().to_vec(), None);
+            for extension in ["rs", "py", "h", "c"] {
+                let path = PathBuf::from(format!("same.{extension}"));
+                assert_eq!(
+                    cached(&path, &bytes, text, "CachedGrammarMarker", &mut fresh),
+                    Some(code_reference_in_source(
+                        &path,
+                        text,
+                        "CachedGrammarMarker",
+                        &mut parser
+                    ))
+                );
+            }
+            let changed = "// ExternalCacheType";
+            let bytes = request_files::RequestFile::unshared(changed.as_bytes().to_vec(), None);
+            assert_eq!(
+                cached(
+                    Path::new("first.rs"),
+                    &bytes,
+                    changed,
+                    "ExternalCacheType",
+                    &mut fresh
+                ),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn code_reference_substring_rejection_does_not_parse() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("absent.rs");
+            std::fs::write(&path, "fn unrelated() {} // connection_reset").unwrap();
+            let before = crate::parser::work_counters::tree_parses();
+            assert!(!identifier_has_code_reference(
+                &path,
+                "ConnectionReset",
+                &mut crate::parser::FileParser::new()
+            ));
+            assert_eq!(crate::parser::work_counters::tree_parses(), before);
+        }
+
+        #[test]
+        fn code_reference_cache_single_flights_and_keeps_lru_bounds() {
+            let cache = Cache::new(ENTRY_BYTES * 3, 2);
+            let builds = AtomicUsize::new(0);
+            let key = |n: u8| (blake3::hash(&[n]), crate::parser::LangId::Rust, false);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let cache = &cache;
+                    let builds = &builds;
+                    scope.spawn(move || {
+                        assert_eq!(
+                            cache.lookup(key(0), "Marker", || {
+                                builds.fetch_add(1, Ordering::SeqCst);
+                                Some(vec![Box::from("Marker")])
+                            }),
+                            Some(true)
+                        )
+                    });
+                }
+            });
+            assert_eq!(builds.load(Ordering::SeqCst), 1);
+            cache.lookup(key(1), "", || Some(Vec::new()));
+            cache.lookup(key(0), "Marker", || panic!("LRU hit must reuse names"));
+            cache.lookup(key(2), "", || Some(Vec::new()));
+            let state = cache.state.lock().unwrap();
+            assert!(state.entries.contains_key(&key(0)));
+            assert!(!state.entries.contains_key(&key(1)));
+            assert!(state.entries.len() <= 2);
+            assert!(state.bytes <= ENTRY_BYTES * 3);
+        }
+
+        #[test]
+        fn code_reference_oversized_name_sets_keep_the_original_fallback() {
+            let source = (0..6000)
+                .map(|i| format!("fn LargeMarker{i}() {{}}\n"))
+                .collect::<String>();
+            let path = Path::new("large.rs");
+            let file = request_files::RequestFile::unshared(source.as_bytes().to_vec(), None);
+            let mut parser = crate::parser::FileParser::new();
+            assert_eq!(
+                cached(path, &file, &source, "LargeMarker5999", &mut parser),
+                None
+            );
+            assert!(code_reference_in_source(
+                path,
+                &source,
+                "LargeMarker5999",
+                &mut parser
+            ));
+        }
+    }
 }
 
 fn path_scope_contains(path_scope: &HashSet<PathBuf>, path: &Path) -> bool {
