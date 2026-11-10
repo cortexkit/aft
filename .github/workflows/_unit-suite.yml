@@ -686,6 +686,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -724,14 +727,18 @@ jobs:
       - name: Build nextest archive (macOS integration suite)
         run: python3 scripts/ci-macos-integration-archive.py archive --archive-file "$MACOS_NEXTEST_ARCHIVE"
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           MACOS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-nextest.tar.zst
 
       - name: Capture integration source inventory
         run: python3 scripts/ci-macos-integration-archive.py list --output "$AFT_CI_ARCHIVE_DIR/macos-integration-inventory.json"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Capture doctest inventory
         run: cargo test --workspace --doc -- --list > "$AFT_CI_ARCHIVE_DIR/macos-doctest-inventory.txt" 2>&1
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           CARGO_TERM_COLOR: never
 
       - name: Report nextest archive size
@@ -774,6 +781,9 @@ jobs:
       LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=256
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -820,6 +830,7 @@ jobs:
           # Native time reports resident-memory and paging counters for the build.
           /usr/bin/time -l cargo nextest archive --features test-hooks --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           MACOS_LIBTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
 
       # Keep the build's timing report even when a later step fails; it is the
@@ -833,10 +844,14 @@ jobs:
           if-no-files-found: error
 
       - name: Run the serial backtrace probe with local debug objects
-        run: cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG" --target-dir "$AFT_CI_TARGET_DIR"
 
       - name: Capture lib source inventory
         run: cargo nextest list --workspace --lib --features test-hooks --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$AFT_CI_ARCHIVE_DIR/macos-libtest-inventory.json"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Report macOS libtest archive size
         run: |
@@ -871,6 +886,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -909,10 +927,13 @@ jobs:
         # the unrelated library harnesses and integration suite.
         run: cargo nextest archive --features test-hooks --workspace --bins --test sandbox_launch_probe -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           MACOS_BIN_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-nextest.tar.zst
 
       - name: Capture bin source inventory
         run: cargo nextest list --workspace --bins --features test-hooks --profile gate -T json --cargo-quiet > "$AFT_CI_ARCHIVE_DIR/macos-bin-inventory.json"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Report macOS bin archive size
         run: |
@@ -949,6 +970,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1063,6 +1087,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1092,6 +1119,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1121,6 +1151,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1159,6 +1192,9 @@ jobs:
         shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1208,6 +1244,7 @@ jobs:
 
       - name: Rust libtest shard (nextest archive)
         run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
           started=$SECONDS
           report_timing() {
             printf "### macOS libtest shard %s\n\nRunner: rented-mac (%s)\n\nTest duration: %ss\n" "$AFT_NEXTEST_PARTITION" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
@@ -1250,6 +1287,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1286,12 +1326,15 @@ jobs:
       - name: Capture watcher inventory for the split proof
         run: cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$AFT_CI_ARCHIVE_DIR/macos-watcher-inventory.txt" 2>&1
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           CARGO_TERM_COLOR: never
 
       - name: Rust watcher gate (macOS)
         # Keep FSEvents tests serial because they share fixtures and exercise
         # the platform watcher backend that the other shards exclude.
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_GATE_LOG: ${{ runner.temp }}/macos-watcher.log
@@ -1333,6 +1376,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1388,9 +1434,13 @@ jobs:
 
       - name: Cargo build (debug — needed by plugin tests)
         run: cargo build -p agent-file-tools
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Rust conformance gate (macOS)
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          ./scripts/rust-test-gate.sh
         env:
           AFT_TEST_DIAG: "1"
           AFT_GATE_PHASES: conformance
@@ -1399,10 +1449,11 @@ jobs:
       - name: Bash reply timeout contract (test-timing-hooks)
         shell: bash
         run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
           set -euo pipefail
           cargo --version
           test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
-          if ! listing="$(cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
+          if ! listing="$(cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --list 2>&1)"; then
             printf '%s\n' "$listing" >&2
             exit 1
           fi
@@ -1411,7 +1462,7 @@ jobs:
             printf 'expected test missing from integration inventory: %s\n' "$test_name" >&2
             exit 1
           fi
-          cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
+          cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --exact
 
       - name: Install GitHub CLI for pinned helper downloads
         shell: bash
@@ -1430,11 +1481,13 @@ jobs:
           echo "path=$path" >> "$GITHUB_OUTPUT"
 
       - name: Bun test (all packages)
-        run: bun run test:unit
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          bun run test:unit
         env:
           AFT_TEST_NATIVE_FIXTURE_TIMING: "1"
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
-          AFT_BINARY_PATH: ${{ env.CARGO_TARGET_DIR }}/debug/aft
+          AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
           SUBC_CORE_WIRE_VERSION: "2"
 
@@ -1468,6 +1521,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1482,6 +1538,7 @@ jobs:
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
@@ -1502,23 +1559,23 @@ jobs:
         run: cargo nextest archive --features test-hooks --workspace -E "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
         shell: pwsh
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
-
-      - uses: actions/setup-python@v6
-        with:
-          # Python's tarfile can stream the zstd archive metadata from 3.14 on.
-          python-version: "3.14"
 
       # Run the exact archive-built harness while its local PDB still exists.
       # A package-scoped cargo test changes workspace feature unification and
       # recompiles it; direct execution preserves both symbols and build reuse.
       - name: Run the serial TLS probe from the archive build
-        run: python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe tls
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe tls
         env:
           WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
 
       - name: Run the serial backtrace probe with local PDB
-        run: python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe backtrace
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe backtrace
         env:
           WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
 
@@ -1595,6 +1652,9 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1609,6 +1669,7 @@ jobs:
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
@@ -1634,7 +1695,9 @@ jobs:
         # On Windows a process a test leaks inherits the write end of every
         # pipe above it, so `tee` never saw end-of-file and the step hung past
         # a fully passing nextest summary until the job timeout.
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_GATE_LOG: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
@@ -1667,6 +1730,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1681,6 +1747,7 @@ jobs:
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
@@ -1699,7 +1766,9 @@ jobs:
         # Keep watcher tests serial because they share fixtures. The conformance
         # phase checks the provider contract and four bash-promotion/elicitation
         # cases compiled only with test-timing-hooks.
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_GATE_LOG: ${{ runner.temp }}/windows-watcher-conformance.log
@@ -1729,6 +1798,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1758,6 +1830,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1787,6 +1862,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1822,6 +1900,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1836,6 +1917,7 @@ jobs:
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
@@ -1857,12 +1939,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         shell: pwsh
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           RUSTFLAGS: "-D warnings"
 
       - name: Check feature-enabled provider conformance (deny warnings)
         run: cargo check -p agent-file-tools --features test-hooks --features test-timing-hooks --test rest
         shell: pwsh
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           RUSTFLAGS: "-D warnings"
 
       - name: Clean native test processes
@@ -1905,6 +1989,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
@@ -1919,6 +2006,7 @@ jobs:
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
           components: rustfmt, clippy, rust-analyzer
 
@@ -1942,14 +2030,18 @@ jobs:
       - name: Cargo build (debug — bash.test.ts spawns the real aft binary)
         run: cargo build -p agent-file-tools
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Bun test (bash permission flow — full bridge + plugin + Rust)
-        run: bun test src/__tests__/e2e/bash.test.ts
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          bun test src/__tests__/e2e/bash.test.ts
         working-directory: packages/opencode-plugin
         shell: pwsh
         env:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
-          AFT_BINARY_PATH: ${{ env.CARGO_TARGET_DIR }}/debug/aft.exe
+          AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft.exe
 
       - name: Clean native test processes
         if: always()

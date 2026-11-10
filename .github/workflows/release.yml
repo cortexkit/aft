@@ -247,6 +247,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -319,6 +327,11 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -479,34 +492,46 @@ jobs:
 
   build-win32-arm64:
     name: Build Windows ARM64
-    # v0.28: native ARM64 binary. Host is windows-latest (x64) which
-    # cross-compiles to aarch64-pc-windows-msvc via the MSVC ARM64 cross
-    # toolchain bundled in the Visual Studio Build Tools on the runner.
-    runs-on: windows-latest
+    # CortexKit's Windows host has 16 logical cores and retains Cargo outputs
+    # outside checkout. Rust is administrator-managed and read-only to jobs;
+    # ARM64 std and MSVC v143 ARM64 tools must be provisioned before a run.
+    runs-on: [self-hosted, narli]
     # v0.62.0/v0.63.3/v0.63.4: 100.5/84.8/50.2 min; twice the peak + margin.
     timeout-minutes: 210
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
-
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+        with:
+          rust-target: aarch64-pc-windows-msvc
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: true
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
           targets: aarch64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: release-win32-arm64
           cache-on-failure: true
@@ -517,8 +542,45 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
         shell: pwsh
 
+      - name: Verify administrator-installed MSVC ARM64 tools
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "Visual Studio discovery is missing at $vswhere; provision MSVC v143 ARM64 tools on narli"
+          }
+          $installations = & $vswhere -all -products '*' -property installationPath
+          if ($LASTEXITCODE -ne 0) { throw "Visual Studio discovery failed" }
+          $ready = $false
+          foreach ($installation in $installations) {
+            $compilers = Get-ChildItem -Path "$installation/VC/Tools/MSVC/*/bin/Hostx64/arm64/cl.exe" -ErrorAction SilentlyContinue
+            foreach ($compiler in $compilers) {
+              $toolset = $compiler.Directory.Parent.Parent.Parent.FullName
+              if ((Test-Path "$($compiler.Directory.FullName)/link.exe") -and (Test-Path "$toolset/lib/arm64/vcruntime.lib")) {
+                Write-Host "MSVC ARM64 compiler, linker and libraries: $toolset"
+                $ready = $true
+              }
+            }
+          }
+          if (-not $ready) {
+            throw "MSVC v143 ARM64 compiler/linker/libraries are missing; ask the administrator to provision Microsoft.VisualStudio.Component.VC.Tools.ARM64 on narli"
+          }
+
       - name: Build
         run: cargo build --release --target aarch64-pc-windows-msvc
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+
+      - name: Stage the built binary for the existing artifact contract
+        shell: pwsh
+        run: |
+          $source = "$env:AFT_CI_TARGET_DIR/aarch64-pc-windows-msvc/release/aft.exe"
+          $destination = Join-Path $env:GITHUB_WORKSPACE "target/aarch64-pc-windows-msvc/release/aft.exe"
+          $null = New-Item -ItemType Directory -Force -Path (Split-Path $destination)
+          Copy-Item -LiteralPath $source -Destination $destination -Force
+          if ((Get-FileHash $source).Hash -ne (Get-FileHash $destination).Hash) {
+            throw "Staged release binary differs from the compiled bytes"
+          }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -527,9 +589,15 @@ jobs:
           path: target/aarch64-pc-windows-msvc/release/aft.exe
           if-no-files-found: error
 
+      - uses: ./.github/actions/native-ci-state
+        if: always()
+        with:
+          phase: cleanup
+
   build-win32-x64:
     name: Build Windows x64
-    runs-on: windows-2022
+    # Same administrator-managed Windows host as the ARM64 build.
+    runs-on: [self-hosted, narli]
     # v0.62.0/v0.63.3/v0.63.4: 34.8/48.1/48.7 min; twice the peak + margin.
     timeout-minutes: 100
     outputs:
@@ -538,23 +606,39 @@ jobs:
       contents: read
       actions: read
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+        with:
+          rust-target: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
           targets: x86_64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: release-win32-x64
           cache-on-failure: true
@@ -568,9 +652,25 @@ jobs:
       - name: Release library codegen (shipped profile)
         run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+
       - name: Build
         run: cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+
+      - name: Stage the built binary for the existing artifact contract
+        shell: pwsh
+        run: |
+          $source = "$env:AFT_CI_TARGET_DIR/x86_64-pc-windows-msvc/release/aft.exe"
+          $destination = Join-Path $env:GITHUB_WORKSPACE "target/x86_64-pc-windows-msvc/release/aft.exe"
+          $null = New-Item -ItemType Directory -Force -Path (Split-Path $destination)
+          Copy-Item -LiteralPath $source -Destination $destination -Force
+          if ((Get-FileHash $source).Hash -ne (Get-FileHash $destination).Hash) {
+            throw "Staged release binary differs from the compiled bytes"
+          }
 
       # Execute the exact bytes being published once on Windows.
       - name: Smoke-test binary
@@ -588,6 +688,12 @@ jobs:
           path: ${{ runner.temp }}/release.tar
           compression-level: 1
           if-no-files-found: error
+
+      - uses: ./.github/actions/native-ci-state
+        if: always()
+        with:
+          phase: cleanup
+
 
   # E2E consumers never compile or mutate release binaries. They verify the
   # producer's checksum before and after testing and upload the original bundle
@@ -655,20 +761,34 @@ jobs:
   e2e-win32-x64:
     name: Shipped E2E (Windows x64)
     needs: build-win32-x64
-    runs-on: windows-2022
+    # Same administrator-managed Windows host as the ARM64 build.
+    runs-on: [self-hosted, narli]
     # v0.62.0/v0.63.3/v0.63.4: 4.8/4.6/4.6 min; twice the peak + margin.
     timeout-minutes: 10
     env:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
         with:
-          toolchain: ${{ needs.build-win32-x64.outputs.rust_version }}
-          targets: x86_64-pc-windows-msvc
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+        with:
+          rust-target: x86_64-pc-windows-msvc
+          rust-version: ${{ needs.build-win32-x64.outputs.rust_version }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
+        with:
+          toolchain: ${{ needs.build-win32-x64.outputs.rust_version }}
+          targets: x86_64-pc-windows-msvc
       - name: Sync versions from tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: node scripts/version-sync.mjs --from-tag
@@ -686,7 +806,9 @@ jobs:
           bun run --cwd packages/opencode-plugin build
         shell: pwsh
       - name: Run shipped E2E suite
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
         shell: pwsh
         env:
           AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\aft.exe
@@ -717,6 +839,11 @@ jobs:
           retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/aft-plugin.log
           if-no-files-found: warn
+
+      - uses: ./.github/actions/native-ci-state
+        if: always()
+        with:
+          phase: cleanup
 
   e2e-linux-x64:
     name: Shipped E2E (Linux x64 Docker)
@@ -820,6 +947,8 @@ jobs:
       # published. Relabel only this checkout, not the built/tested binaries.
       - name: Set an unpublished rehearsal version
         run: |
+          # Node, not the shell, expands the JavaScript template expression.
+          # shellcheck disable=SC2016
           version=$(node -p 'const [major, minor, patch] = require("./packages/aft-bridge/package.json").version.split("-")[0].split(".").map(Number); `${major}.${minor}.${patch + 1}-rehearsal.${process.env.GITHUB_RUN_NUMBER}.${process.env.GITHUB_RUN_ATTEMPT}`')
           node scripts/version-sync.mjs "$version"
           # A fresh runner has no registry index for offline lockfile refresh.

@@ -225,6 +225,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
         with:
           phase: ${{ needs.unit.result == 'success' && needs.e2e.result == 'success' && 'finalize' || 'cleanup' }}

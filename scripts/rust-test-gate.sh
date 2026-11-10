@@ -38,6 +38,11 @@ cd "$repo_root"
 # operator's real data root. Keep the whole gate hermetic, including test binaries
 # that launch child AFT processes without the shared integration helper.
 unset AFT_CACHE_DIR
+# Native CI keeps compiled outputs warm without redirecting the temporary
+# projects created by test processes. Cargo receives the path as a flag below.
+if [[ -n "${AFT_CI_TARGET_DIR:-}" ]]; then
+  unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+fi
 # Every XDG base directory gets a per-gate home, not just the data home: the
 # `aft` processes the tests spawn otherwise read the operator's user config
 # (`$XDG_CONFIG_HOME/cortexkit/aft.jsonc`, which can carry connection files,
@@ -206,6 +211,22 @@ first_test_failure=0
 # CI needs one complete failure inventory per runner allocation. Keep local
 # fail-fast behavior and every existing nextest profile/timeout unchanged.
 gate_cargo() {
+  if [[ -n "${AFT_CI_TARGET_DIR:-}" ]]; then
+    local archive_run=0 arg
+    for arg in "$@"; do
+      case "$arg" in
+        --archive-file|--archive-file=*|--cargo-metadata|--cargo-metadata=*) archive_run=1 ;;
+      esac
+    done
+    case "${1:-}" in
+      test|build|check) set -- "$1" --target-dir "$AFT_CI_TARGET_DIR" "${@:2}" ;;
+      nextest)
+        if [[ "${2:-}" == "run" && "$archive_run" == "0" ]]; then
+          set -- "$1" "$2" --target-dir "$AFT_CI_TARGET_DIR" "${@:3}"
+        fi
+        ;;
+    esac
+  fi
   if [[ -n "${CI:-}" && "${1:-}" == "nextest" && "${2:-}" == "run" ]]; then
     shift 2
     cargo nextest run --no-fail-fast "$@"
@@ -349,7 +370,7 @@ warm_macos_test_binaries() {
   # field in the build JSON — not the incremental fragments under deps/). $@ =
   # the cargo build arguments that define the profile and scope.
   local bins
-  bins="$(cargo test --features test-hooks "$@" --no-run --message-format=json 2>/dev/null | python3 -c "
+  bins="$(gate_cargo test --features test-hooks "$@" --no-run --message-format=json 2>/dev/null | python3 -c "
 import sys, json
 seen = set()
 for line in sys.stdin:
@@ -367,7 +388,7 @@ for p in sorted(seen): print(p)
 
   # The CLI is spawned by integration tests but is not a test harness, so it
   # does not appear in cargo's `executable` build messages.
-  local target_dir="${CARGO_TARGET_DIR:-target}"
+  local target_dir="${AFT_CI_TARGET_DIR:-${CARGO_TARGET_DIR:-target}}"
   local aft_binary="$target_dir/debug/aft"
   warm_macos_executable "$aft_binary" --version
 }
@@ -579,6 +600,7 @@ fi
 if phase_enabled nextest && [[ "$(uname)" == "Darwin" && -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
   run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries and target/debug/aft" \
     bash -c "$(declare -f warm_macos_executable)
+      $(declare -f gate_cargo)
       $(declare -f warm_macos_test_binaries)
       warm_macos_test_binaries --workspace"
 fi

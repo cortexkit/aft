@@ -19,6 +19,18 @@ runs:
         path: ~/.cargo/bin/cargo-nextest*
         key: cargo-nextest-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
 
+    - name: Expose native cargo-nextest install on PATH
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        bin_dir="$HOME/.cargo/bin"
+        mkdir -p "$bin_dir"
+        if command -v cygpath >/dev/null 2>&1; then
+          bin_dir="$(cygpath -m "$bin_dir")"
+        fi
+        printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
+        printf 'Native cargo-nextest PATH: %s\n' "$bin_dir"
+
     - name: Download and install cargo-nextest
       if: steps.nextest-cache.outputs.cache-hit != 'true'
       shell: bash
