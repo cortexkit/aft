@@ -1074,8 +1074,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 self.assertEqual(cleanup["with"]["phase"], "cleanup")
                 env = job.get("env", {})
                 if "SCCACHE_GHA_ENABLED" in env:
-                    self.assertEqual(env["SCCACHE_GHA_ENABLED"], "${{ runner.environment == 'github-hosted' && 'true' || 'false' }}")
-                    self.assertEqual(env["RUSTC_WRAPPER"], "${{ runner.environment == 'github-hosted' && 'sccache' || '' }}")
+                    self.assertEqual(env["SCCACHE_GHA_ENABLED"], "false")
+                    self.assertEqual(env["RUSTC_WRAPPER"], "")
 
     def test_native_jobs_and_nested_actions_never_use_github_cache_or_artifacts(self) -> None:
         def check(steps, owner):

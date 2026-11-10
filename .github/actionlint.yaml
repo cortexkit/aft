@@ -1,0 +1,5 @@
+self-hosted-runner:
+  labels:
+    - rented-mac
+    - narli
+    - mac-mini
