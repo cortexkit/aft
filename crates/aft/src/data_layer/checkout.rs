@@ -6028,8 +6028,9 @@ pub fn other() { callee(); }
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         demo(root.path());
-        // A full surface block evicts the old body from a one-block cache.
-        // Small partial blocks could otherwise all remain cached together.
+        // The added functions make the stored symbol metadata fill a cache
+        // block, evicting the old body when the metadata is read. Small
+        // partial blocks could otherwise all remain cached together.
         let mut source = std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap();
         for n in 0..2000 {
             source.push_str(&format!("pub fn padding_function_{n}() {{}}\n"));
