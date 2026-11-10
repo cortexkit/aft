@@ -37,7 +37,7 @@ enum SemanticSnapshotStorage<'a> {
     Guard(Arc<RwLockReadGuard<'a, Option<SemanticIndex>>>),
     Borrowed(Arc<SemanticIndex>),
     /// The data layer's meaning plane at the generation the sample saw.
-    Data(Arc<crate::data_layer::tools::search::DataMeaning>),
+    Data(Arc<crate::commands::data_search::DataMeaning>),
 }
 
 impl std::fmt::Debug for SemanticSnapshot<'_> {
@@ -63,7 +63,7 @@ impl<'a> SemanticSnapshot<'a> {
 
     /// The data layer's meaning plane, retained so the ranking reads the
     /// generation readiness admitted.
-    pub(crate) fn from_data(meaning: Arc<crate::data_layer::tools::search::DataMeaning>) -> Self {
+    pub(crate) fn from_data(meaning: Arc<crate::commands::data_search::DataMeaning>) -> Self {
         Self(SemanticSnapshotStorage::Data(meaning))
     }
 
@@ -76,7 +76,7 @@ impl<'a> SemanticSnapshot<'a> {
     }
 
     /// The data layer's meaning plane, when the sample read one.
-    pub(crate) fn data(&self) -> Option<&Arc<crate::data_layer::tools::search::DataMeaning>> {
+    pub(crate) fn data(&self) -> Option<&Arc<crate::commands::data_search::DataMeaning>> {
         match &self.0 {
             SemanticSnapshotStorage::Data(meaning) => Some(meaning),
             _ => None,
@@ -99,7 +99,7 @@ pub struct TrigramReadiness {
     pub status: IndexStatus,
     pub snapshot: Option<Arc<SearchIndexSnapshot>>,
     /// Whether the lanes read the data layer's view instead of `snapshot`
-    /// (see `crate::data_layer::tools::search`). The ranking takes the view
+    /// (see `crate::commands::data_search`). The ranking takes the view
     /// again when it runs, so nothing is retained for it here.
     pub data_view: bool,
     pub evicted: bool,
@@ -248,9 +248,7 @@ impl<'a> RetainedReadinessSnapshots<'a> {
 
     /// The data layer's meaning plane readiness admitted, which the ranking
     /// then reads, so both see one generation of its vectors.
-    pub(crate) fn data_meaning(
-        &self,
-    ) -> Option<&Arc<crate::data_layer::tools::search::DataMeaning>> {
+    pub(crate) fn data_meaning(&self) -> Option<&Arc<crate::commands::data_search::DataMeaning>> {
         self.semantic.as_ref().and_then(SemanticSnapshot::data)
     }
 

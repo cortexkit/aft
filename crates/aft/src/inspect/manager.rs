@@ -700,7 +700,7 @@ pub struct InspectManager {
     source_scan_files: AtomicU64,
     /// The data-layer checkouts dead code reads its call graph from while
     /// they are ready; empty unless the process runs the data layer.
-    data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources,
+    data_layer_dead_code: crate::inspect::data_sources::DeadCodeSources,
     /// When an `aft_inspect` that read the dead-code graph last finished;
     /// `None` once the graph was released, or before any such request.
     last_dead_code_request: Mutex<Option<Instant>>,
@@ -867,7 +867,7 @@ impl InspectManager {
             semantic_cold_seed_active,
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
             interactive_tier2_permits: Mutex::new(HashMap::new()),
-            data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources::default(),
+            data_layer_dead_code: crate::inspect::data_sources::DeadCodeSources::default(),
             last_dead_code_request: Mutex::new(None),
             dead_code_release_armed: AtomicBool::new(false),
             dead_code_callgraph_waits: AtomicUsize::new(0),
@@ -1759,7 +1759,7 @@ impl InspectManager {
 
     /// Lets dead code at `project_root` read its call graph from the data
     /// layer's `checkout` whenever that graph is ready, in place of today's
-    /// database (see `data_layer::tools::inspect`).
+    /// database (see `inspect::data_sources`).
     pub(crate) fn read_dead_code_from_data_layer(
         &self,
         project_root: &Path,
@@ -4058,7 +4058,7 @@ pub(crate) fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf>
     // No caller installed a census on this thread (background jobs such as
     // the status bar's TODO refresh never do): the root's bound index-store
     // checkout lists the same files without touching the disk.
-    let miss = match crate::data_layer::tools::inspect::bound_inventory(project_root) {
+    let miss = match crate::inspect::data_sources::bound_inventory(project_root) {
         Ok(inventory) => return in_scope(&inventory),
         Err(miss) => miss,
     };
@@ -4391,13 +4391,13 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
         return Err(CallGraphStoreError::Building);
     };
     match manager.data_layer_dead_code.snapshot(&job.project_root) {
-        crate::data_layer::tools::inspect::DeadCodeSnapshot::Ready(snapshot) => {
+        crate::inspect::data_sources::DeadCodeSnapshot::Ready(snapshot) => {
             Ok(Some((snapshot, DATA_LAYER_SNAPSHOT, started.elapsed())))
         }
-        crate::data_layer::tools::inspect::DeadCodeSnapshot::Building => {
+        crate::inspect::data_sources::DeadCodeSnapshot::Building => {
             Err(CallGraphStoreError::Building)
         }
-        crate::data_layer::tools::inspect::DeadCodeSnapshot::Failed(reason) => {
+        crate::inspect::data_sources::DeadCodeSnapshot::Failed(reason) => {
             Err(CallGraphStoreError::Unavailable(reason))
         }
     }
@@ -5471,7 +5471,7 @@ fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<Stri
 }
 
 fn filter_outcome_for_scope_with_contributions(
-    dead_code_sources: &crate::data_layer::tools::inspect::DeadCodeSources,
+    dead_code_sources: &crate::inspect::data_sources::DeadCodeSources,
     manager: Option<&InspectManager>,
     outcome: JobOutcome,
     snapshot: &InspectSnapshot,
@@ -6166,7 +6166,7 @@ mod guard_tests {
             "no census is installed on this thread"
         );
         // The job must not wait for the store's TODO records on a worker.
-        crate::data_layer::tools::inspect::set_todo_store_wait_for_test(&root, Duration::ZERO);
+        crate::inspect::data_sources::set_todo_store_wait_for_test(&root, Duration::ZERO);
 
         SCOPE_FILE_WALKS.with(|walks| walks.set(0));
         crate::callgraph::PROJECT_WALK_ENTRIES.with(|entries| entries.set(0));
@@ -6204,7 +6204,7 @@ mod guard_tests {
         let unbound = tempfile::tempdir().unwrap();
         let unbound = canonicalize_for_snapshot(unbound.path());
         assert_eq!(
-            crate::data_layer::tools::inspect::bound_inventory(&unbound).err(),
+            crate::inspect::data_sources::bound_inventory(&unbound).err(),
             Some(StoreListMiss::NotBound)
         );
 
@@ -6213,7 +6213,7 @@ mod guard_tests {
         let project = JobScope::for_project(root.clone());
         checkout.checkout().begin_rescan();
         assert_eq!(
-            crate::data_layer::tools::inspect::bound_inventory(&root).err(),
+            crate::inspect::data_sources::bound_inventory(&root).err(),
             Some(StoreListMiss::Rescanning)
         );
         SCOPE_FILE_WALKS.with(|walks| walks.set(0));
@@ -6333,7 +6333,7 @@ mod guard_tests {
             walk_cpu += thread_cpu_ms() - cpu;
             walk_ms += started.elapsed().as_secs_f64() * 1000.0;
 
-            if let Err(miss) = crate::data_layer::tools::inspect::bound_inventory(&root) {
+            if let Err(miss) = crate::inspect::data_sources::bound_inventory(&root) {
                 *misses.entry(miss.as_str()).or_default() += 1;
             }
             let walks = SCOPE_FILE_WALKS.with(std::cell::Cell::get);
@@ -7021,7 +7021,7 @@ mod guard_tests {
         let snapshot = tier1_snapshot(&root);
         let inspect_dir = snapshot.inspect_dir.clone();
         // The count reads the index store's records of the root.
-        let _store = crate::data_layer::tools::inspect::bind_published_for_test(&root);
+        let _store = crate::inspect::data_sources::bind_published_for_test(&root);
         let manager = InspectManager::new();
 
         assert_eq!(

@@ -1111,3 +1111,11 @@ aft_store::heap_bytes_of_fields!(MemorySlices {
     symbol_names,
     languages,
 });
+
+/// How long a call-graph command waits for recorded edits to be resolved
+/// before it answers that the call graph is still building. The call graph
+/// is refreshed lazily, so the first read after a stretch of edits pays for
+/// all of them in one update (seconds at worst on AFT's own checkout); the
+/// command waits for it rather than answering from a graph that misses
+/// them, and gives up only if the update takes far longer than that.
+pub(crate) const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(30);

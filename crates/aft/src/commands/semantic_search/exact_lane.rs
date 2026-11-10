@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use super::memo::{
     compute_content_digest, ExactMemoStore, MemoError, MemoKey, ServeOutcome, VerifiedExactSet,
 };
+use crate::commands::data_search::TextIndex;
 use crate::commands::semantic_search::comparator::{
     score_free_r3_cmp, CandidateResult, SymbolOffsetRange,
 };
@@ -13,7 +14,6 @@ use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::commands::semantic_search::plan_table::SearchLaneKind;
 use crate::commands::semantic_search::{LaneExecution, LaneInput, SearchLane};
-use crate::data_layer::tools::search::TextIndex;
 use crate::query_shape::{extract_content_tokens, minimum_content_token_window};
 use crate::search_index::{
     read_search_corpus_file, SearchCorpusEligibility, SearchIndex, SearchIndexSnapshot,

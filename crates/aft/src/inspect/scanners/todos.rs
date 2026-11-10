@@ -193,7 +193,7 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
             started.elapsed(),
         );
     }
-    let stored = match crate::data_layer::tools::inspect::stored_todos(
+    let stored = match crate::inspect::data_sources::stored_todos(
         &job.project_root,
         &job.config,
         &job.scope_files,
@@ -260,7 +260,7 @@ fn write_unindexed_gap(aggregate: &mut serde_json::Value, unindexed: &[String]) 
     }
     let reason = format!(
         "{}: {names}",
-        crate::data_layer::tools::inspect::TODOS_REPOSITORIES_NOT_INDEXED
+        crate::inspect::data_sources::TODOS_REPOSITORIES_NOT_INDEXED
     );
     aggregate["complete"] = serde_json::Value::Bool(false);
     let gap = serde_json::json!({
@@ -925,7 +925,7 @@ mod tests {
         // normalized outcome key, or the build can publish before we release it.
         let hold = crate::data_layer::runtime::hold_builds_for_test(&checkout_root);
         // A refresh that finds the store building answers pending at once.
-        crate::data_layer::tools::inspect::set_todo_store_wait_for_test(&root, Duration::ZERO);
+        crate::inspect::data_sources::set_todo_store_wait_for_test(&root, Duration::ZERO);
 
         let ctx = Arc::new(crate::context::AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -1027,16 +1027,16 @@ mod tests {
         assert_eq!(aggregate["status"], "pending", "{aggregate:#}");
         assert!(aggregate.get("count").is_none(), "{aggregate:#}");
 
-        crate::data_layer::tools::inspect::note_root(
+        crate::inspect::data_sources::note_root(
             &root,
-            crate::data_layer::tools::inspect::RootKind::Withheld,
+            crate::inspect::data_sources::RootKind::Withheld,
         );
         let result = run_todos_scan(&todos_job(&root, vec![root.join("src/lib.rs")]));
         let aggregate = result.outcome.unwrap().aggregate;
         assert_eq!(aggregate["unavailable"], true, "{aggregate:#}");
         assert_eq!(
             aggregate["gaps"][0]["reason"],
-            crate::data_layer::tools::inspect::TODOS_NO_INDEX_STORE
+            crate::inspect::data_sources::TODOS_NO_INDEX_STORE
         );
     }
 

@@ -660,7 +660,7 @@ impl AnchoredLane {
     /// from the data layer's view instead of the legacy index.
     pub(crate) fn execute_on_data_view(
         &self,
-        text: &crate::data_layer::tools::search::DataText,
+        text: &crate::commands::data_search::DataText,
         search_root: &Path,
         query: &str,
         include_tests: bool,
@@ -669,7 +669,7 @@ impl AnchoredLane {
         if split.retained_runs.is_empty() {
             return Ok((Vec::new(), 0, 0));
         }
-        let candidate_files = crate::data_layer::tools::search::anchored_candidate_files(
+        let candidate_files = crate::commands::data_search::anchored_candidate_files(
             text,
             search_root,
             &split.retained_runs,

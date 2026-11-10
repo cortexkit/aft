@@ -839,7 +839,7 @@ fn execute_root_profiled(
     }
 
     if root.use_index && !root.ignored_target {
-        if let Some(view) = crate::data_layer::tools::grep::ready_view(ctx) {
+        if let Some(view) = crate::data_layer::text_scope::ready_view(ctx) {
             if let Some(answer) = execute_root_from_view(
                 ctx,
                 view,
@@ -911,7 +911,7 @@ fn execute_root_from_view(
     order: GrepScanOrder,
 ) -> Option<(GrepResult, GrepExecutionPhaseTimings)> {
     let snapshot_started = Instant::now();
-    let scope = crate::data_layer::tools::grep::ViewScope::of(view, &root.search_root)?;
+    let scope = crate::data_layer::text_scope::ViewScope::of(view, &root.search_root)?;
     if !scope.is_whole_checkout() && !scope.has_files() {
         // The checkout holds no file under this explicitly named directory,
         // so walk it, as below when today's index lacks the directory.
@@ -3002,7 +3002,7 @@ mod tests {
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_canonical_cache_root(root.to_path_buf());
         let deadline = Instant::now() + Duration::from_secs(600);
-        while crate::data_layer::tools::grep::ready_view(&ctx).is_none() {
+        while crate::data_layer::text_scope::ready_view(&ctx).is_none() {
             assert!(
                 Instant::now() < deadline,
                 "the data layer never published the fixture's text index"

@@ -14,16 +14,14 @@
 //! filled, partial (it serves what is filled and the reply says what is
 //! missing) while a fill is under way, and building while nothing is filled.
 
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::commands::semantic_search::waits::{self, SearchWait};
 use crate::context::AppContext;
 use crate::data_layer::meaning::{self, FillFailure, MeaningState};
 use crate::data_layer::status::SemanticIndexStatus;
 use crate::data_layer::vectors::{Coverage, MeaningSnapshot};
-use crate::semantic_index::{SemanticIndex, SemanticResult, SemanticSkipReason};
+use crate::semantic_index::SemanticSkipReason;
 
 /// The stage a meaning plane reports while its checkout has published
 /// nothing yet, so there is no view to fill.
@@ -33,7 +31,7 @@ pub(crate) const DATA_LAYER_BUILD_STAGE: &str = "data_layer_build";
 /// vectors for one view, with what the last fill reported.
 #[derive(Debug)]
 pub(crate) struct DataMeaning {
-    snapshot: MeaningSnapshot,
+    pub(crate) snapshot: MeaningSnapshot,
     /// The last fill's failure, kept until a fill succeeds.
     failure: Option<FillFailure>,
 }
@@ -138,23 +136,6 @@ pub(crate) enum DataSemantic {
 }
 
 impl DataSemantic {
-    /// This root's meaning search, with the data layer on and semantic
-    /// search switched on and admitted for the root: binds the checkout if
-    /// nothing has, and starts a fill when files wait for vectors. `None`
-    /// otherwise (the root has no checkout in the data layer, or semantic
-    /// search is off), and the caller keeps reading today's index.
-    pub(crate) fn current(ctx: &AppContext) -> Option<Self> {
-        if !ctx.config().indexes.semantic {
-            return None;
-        }
-        // The context's checkout slot is held while a checkout binds (a bind
-        // scans the folder); the meaning plane's snapshot can wait for a
-        // generation reload or a member-cache build.
-        let checkout = waits::timed(SearchWait::CheckoutSlot, || ctx.data_checkout())?;
-        let _wait = waits::time(SearchWait::MeaningView);
-        Self::from_state(checkout.meaning(|| ctx.data_meaning_config()))
-    }
-
     /// As [`Self::current`] for status reads: never binds a checkout and
     /// never starts a fill.
     pub(crate) fn probe(ctx: &AppContext) -> Option<Self> {
@@ -174,7 +155,7 @@ impl DataSemantic {
         Self::from_state(checkout.meaning_status())
     }
 
-    fn from_state(state: MeaningState) -> Option<Self> {
+    pub(crate) fn from_state(state: MeaningState) -> Option<Self> {
         Some(match state {
             MeaningState::Off => return None,
             MeaningState::Unpublished => Self::NotServing(building(DATA_LAYER_BUILD_STAGE, None)),
@@ -243,50 +224,6 @@ fn blocked(failure: &FillFailure, coverage: Option<&Coverage>) -> SemanticIndexS
 /// recorded reason.
 fn files_accounted(coverage: &Coverage) -> usize {
     coverage.files_embedded + coverage.files_too_large + coverage.files_failed.len()
-}
-
-/// Where aft_search's semantic lane reads chunk vectors from.
-#[derive(Clone, Copy)]
-pub(crate) enum MeaningIndex<'a> {
-    /// Today's semantic index.
-    Snapshot(&'a SemanticIndex),
-    /// The data layer's meaning plane.
-    Data(&'a DataMeaning),
-}
-
-impl MeaningIndex<'_> {
-    /// The `top_k` chunks closest to `query` among files whose absolute
-    /// path `include` accepts, best first: `SemanticIndex::search_filtered`.
-    ///
-    /// # Errors
-    ///
-    /// When the data layer's store cannot be read; today's index never
-    /// fails.
-    pub(crate) fn search_filtered(
-        &self,
-        query: &[f32],
-        top_k: usize,
-        include: &dyn Fn(&Path) -> bool,
-    ) -> io::Result<Vec<SemanticResult>> {
-        match self {
-            Self::Snapshot(index) => Ok(waits::timed(SearchWait::VectorSearch, || {
-                index.search_filtered(query, top_k, include)
-            })),
-            Self::Data(meaning) => waits::timed(SearchWait::VectorSearch, || {
-                meaning.snapshot.search(query, top_k, include)
-            })
-            .map_err(|error| io::Error::other(error.to_string())),
-        }
-    }
-
-    /// The vector length a query must have; `None` while the index holds no
-    /// vector, when any length is let through.
-    pub(crate) fn dimension(&self) -> Option<usize> {
-        match self {
-            Self::Snapshot(index) => (index.len() > 0).then(|| index.dimension()),
-            Self::Data(meaning) => meaning.dimension(),
-        }
-    }
 }
 
 #[cfg(test)]

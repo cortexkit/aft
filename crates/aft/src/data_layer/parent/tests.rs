@@ -141,7 +141,7 @@ fn glob(ctx: &AppContext, pattern: &str) -> Value {
 
 /// A call-graph command as the parent session answers it.
 fn routed(ctx: &AppContext, req: &RawRequest) -> Response {
-    crate::data_layer::parent_session::route(req, ctx)
+    crate::commands::parent_query::route(req, ctx)
         .expect("a parent folder answers this command itself")
 }
 
@@ -736,7 +736,7 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     for name in ["alpha", "beta"] {
         init_repo(&root.join(name), name);
     }
-    let (base_url, gate) = crate::data_layer::tools::search::meaning::tests::serve("never-held");
+    let (base_url, gate) = crate::data_layer::meaning_query::tests::serve("never-held");
     gate.open();
     let semantic = SemanticBackendConfig {
         backend: SemanticBackend::OpenAiCompatible,

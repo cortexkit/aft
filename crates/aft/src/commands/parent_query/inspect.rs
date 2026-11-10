@@ -17,8 +17,8 @@ use crate::context::AppContext;
 use crate::inspect::job::{InspectCategory, JobKey};
 use crate::protocol::{RawRequest, Response};
 
-use super::query::{attach_gaps, Gaps};
-use super::{display_relative, read, ParentSession};
+use crate::data_layer::parent_session::query::{attach_gaps, Gaps};
+use crate::data_layer::parent_session::{display_relative, read, ParentSession};
 
 /// Adds `child` into `merged`: numbers are summed, arrays concatenated (with
 /// paths made parent-relative), and nested objects merged the same way.
@@ -229,4 +229,28 @@ pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     });
     attach_gaps(&mut body, gaps.into_values());
     Response::success(&req.id, body)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn inspect_merge_sums_counts_and_prefixes_item_paths() {
+        let mut merged = serde_json::Map::new();
+        let first =
+            serde_json::json!({"count": 2, "items": [{"file": "src/a.rs"}], "partial": false});
+        let second =
+            serde_json::json!({"count": 3, "items": [{"file": "lib/b.rs"}], "partial": true});
+        super::merge(&mut merged, first.as_object().unwrap(), Path::new("alpha"));
+        super::merge(&mut merged, second.as_object().unwrap(), Path::new("beta"));
+        assert_eq!(
+            serde_json::Value::Object(merged),
+            serde_json::json!({
+                "count": 5,
+                "items": [{"file": "alpha/src/a.rs"}, {"file": "beta/lib/b.rs"}],
+                "partial": true,
+            })
+        );
+    }
 }

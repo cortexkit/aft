@@ -867,7 +867,7 @@ fn handle_inspect_payload(
 
     let manager = ctx.inspect_manager();
     // Dead code reads its call graph from the root's checkout (see
-    // `data_layer::tools::inspect`).
+    // `inspect::data_sources`).
     if snapshot
         .config
         .inspect

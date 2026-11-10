@@ -295,7 +295,7 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
     // With the data layer on, its meaning plane serves the lane: ready while
     // it serves (a partial answer says so itself), and otherwise as its fill
     // stands, whatever today's index status reads.
-    if let Some(data) = crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+    if let Some(data) = crate::data_layer::meaning_query::DataSemantic::probe(ctx) {
         return match data.status() {
             SemanticIndexStatus::Failed(message) => {
                 IndexObservation::unavailable(semantic_failure_cause(ctx, &message))

@@ -34,7 +34,7 @@ use super::blocks::CanonicalList;
 use super::comparator::CandidateResult;
 use super::evidence_descriptor::EvidenceTier;
 use super::extensions::LanePlan;
-use crate::data_layer::tools::search::TextIndex;
+use crate::commands::data_search::TextIndex;
 use crate::semantic_index::SemanticResult;
 
 pub(super) const ENV_ENABLE: &str = "AFT_SEARCH_RECALL_AUDIT";

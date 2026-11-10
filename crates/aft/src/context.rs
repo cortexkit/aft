@@ -3033,9 +3033,9 @@ pub struct AppContext {
     data_children: crate::data_layer::parent::ChildCheckouts,
     /// Repositories outside this root that `aft_search` was asked about,
     /// each answered from its own checkout in the data layer, by root (see
-    /// `data_layer::tools::search::ExternalSearch`). Released when idle.
+    /// `commands::data_search::ExternalSearch`). Released when idle.
     data_external: parking_lot::Mutex<
-        std::collections::HashMap<PathBuf, Arc<crate::data_layer::tools::search::ExternalSearch>>,
+        std::collections::HashMap<PathBuf, Arc<crate::data_layer::external_search::ExternalSearch>>,
     >,
     callgraph_executor: parking_lot::Mutex<Option<crate::executor::RootMaintenanceExecutor>>,
     /// Checkout view load failures of this project (see [`ViewLoadHealth`]).
@@ -6837,8 +6837,8 @@ impl AppContext {
     pub(crate) fn external_data_search(
         &self,
         root: &Path,
-        bind: impl FnOnce() -> Option<crate::data_layer::tools::search::ExternalSearch>,
-    ) -> Option<Arc<crate::data_layer::tools::search::ExternalSearch>> {
+        bind: impl FnOnce() -> Option<crate::data_layer::external_search::ExternalSearch>,
+    ) -> Option<Arc<crate::data_layer::external_search::ExternalSearch>> {
         let mut external = self.data_external.lock();
         if let Some(search) = external.get(root) {
             return Some(Arc::clone(search));

@@ -612,7 +612,7 @@ fn glob_root(
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
     if search_scope.use_index && !ignored_target {
-        if let Some(view) = crate::data_layer::tools::grep::ready_view(ctx) {
+        if let Some(view) = crate::data_layer::text_scope::ready_view(ctx) {
             if let Some(discovery) = glob_from_view(view, project_root, &search_scope.root, pattern)
             {
                 return Ok(discovery);
@@ -699,7 +699,7 @@ fn glob_from_view(
     search_root: &Path,
     pattern: &str,
 ) -> Option<GlobDiscovery> {
-    let scope = crate::data_layer::tools::grep::ViewScope::of(view, search_root)?;
+    let scope = crate::data_layer::text_scope::ViewScope::of(view, search_root)?;
     if !scope.is_whole_checkout() && !scope.has_files() {
         // The checkout holds no file under this explicitly named directory,
         // so walk it, as today's path does when its index lacks the directory.

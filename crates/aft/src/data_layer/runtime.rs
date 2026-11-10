@@ -1090,7 +1090,7 @@ impl DataCheckout {
             memory_figure: std::sync::Mutex::new(None),
             _listener: listener,
         });
-        super::tools::inspect::note_bound(&checkout);
+        super::bound_checkouts::note_bound(&checkout);
         Ok(checkout)
     }
 
@@ -1372,7 +1372,7 @@ pub(crate) fn rebind_configured(ctx: &crate::context::AppContext) {
 /// root is unbound and nothing watches it, or just before a configure whose
 /// watcher event has not arrived yet.
 pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
-    use super::tools::inspect::{note_root, RootKind};
+    use super::bound_checkouts::{note_root, RootKind};
     if let Some(root) = ctx.canonical_cache_root_opt() {
         // A folder of repositories is checked first: configure switches its
         // own indexes off, which alone would withhold it.

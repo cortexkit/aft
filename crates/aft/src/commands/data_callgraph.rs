@@ -3,23 +3,15 @@
 //! the checkout's view when the data layer is on, through the same result
 //! builders that answer from today's store.
 
+use crate::data_layer::query::READ_WAIT;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::callgraph_store::CallGraphStoreError;
 use crate::context::AppContext;
 use crate::data_layer::checkout::CheckoutView;
 use crate::data_layer::query::{SliceReader, SliceSource};
 use crate::data_layer::runtime::Fresh;
-
-/// How long a call-graph command waits for recorded edits to be resolved
-/// before it answers that the call graph is still building. The call graph
-/// is refreshed lazily, so the first read after a stretch of edits pays for
-/// all of them in one update (seconds at worst on AFT's own checkout); the
-/// command waits for it rather than answering from a graph that misses
-/// them, and gives up only if the update takes far longer than that.
-pub(crate) const READ_WAIT: Duration = Duration::from_secs(30);
 
 /// The data layer's call-graph reader.
 pub(crate) type DataGraph = SliceReader<Arc<dyn SliceSource + Send + Sync>>;

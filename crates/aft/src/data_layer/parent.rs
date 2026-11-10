@@ -241,7 +241,7 @@ pub(crate) fn callgraph_plane(
         .view()
         .is_some_and(|view| view.status().callgraph_published);
     let wait = if published {
-        crate::data_layer::tools::callgraph::READ_WAIT
+        crate::data_layer::query::READ_WAIT
     } else {
         Duration::ZERO
     };

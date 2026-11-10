@@ -1734,7 +1734,7 @@ impl ConfigureWarningWork {
     /// one. Configure can run before the checkout publishes, so the first
     /// configure of a new root usually walks.
     fn source_files(&self) -> Vec<PathBuf> {
-        let miss = match crate::data_layer::tools::inspect::bound_inventory(&self.root) {
+        let miss = match crate::inspect::data_sources::bound_inventory(&self.root) {
             Ok(inventory) => return inventory.sources,
             Err(miss) => miss,
         };
@@ -1883,7 +1883,7 @@ fn configure_warnings_list_files_from_the_published_index_store_without_walking(
 
     // No checkout is bound yet: the pass walks, as it always has.
     assert_eq!(
-        crate::data_layer::tools::inspect::bound_inventory(&root).err(),
+        crate::inspect::data_sources::bound_inventory(&root).err(),
         Some(crate::inspect::inventory::StoreListMiss::NotBound)
     );
     let (walked, walk_entries) = warn();
@@ -1903,7 +1903,7 @@ fn configure_warnings_list_files_from_the_published_index_store_without_walking(
         },
     );
     crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
-    assert!(crate::data_layer::tools::inspect::bound_inventory(&root).is_ok());
+    assert!(crate::inspect::data_sources::bound_inventory(&root).is_ok());
     let (listed, store_entries) = warn();
     assert_eq!(store_entries, 0, "a published checkout lists the files");
     assert_eq!(listed, walked);

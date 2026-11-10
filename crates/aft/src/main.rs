@@ -1506,7 +1506,7 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
     aft::commands::tool_call::register_dispatch(dispatch);
     // A parent folder session answers index-backed commands from its child
     // repositories' own indexes (grep and glob fan out inside their handlers).
-    if let Some(response) = aft::data_layer::parent_session::route(&req, ctx) {
+    if let Some(response) = aft::commands::parent_query::route(&req, ctx) {
         return response;
     }
     match req.command.as_str() {
