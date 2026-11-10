@@ -54,6 +54,16 @@ fn kind_code(kind: BlobRefKind) -> u8 {
 /// [`PROVENANCES`], which a resolver change must add.
 #[must_use]
 pub(crate) fn encode(file: &FileResolution) -> Vec<u8> {
+    strings::encode(&encode_expanded(file))
+}
+
+/// The string table in the format used by older builds, without a magic header.
+#[cfg(test)]
+pub(crate) fn encode_legacy(file: &FileResolution) -> Vec<u8> {
+    encode_expanded(file)
+}
+
+fn encode_expanded(file: &FileResolution) -> Vec<u8> {
     let mut out = Encoder::default();
     out.byte(FORMAT);
     out.usize(file.rows.len());
@@ -111,7 +121,7 @@ pub(crate) fn encode(file: &FileResolution) -> Vec<u8> {
     for key in &file.site_dependencies {
         out.str(key);
     }
-    strings::encode(&out.finish())
+    out.finish()
 }
 
 /// Decodes a fragment of the file at `path` whose content record has the

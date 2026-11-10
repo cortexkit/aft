@@ -248,6 +248,8 @@ pub(crate) struct SectionsWriter<'i> {
     /// resolver's threads, which do not see the test's thread-local.
     #[cfg(test)]
     damaged: Option<String>,
+    #[cfg(test)]
+    legacy: bool,
 }
 
 impl<'i> SectionsWriter<'i> {
@@ -286,6 +288,8 @@ impl<'i> SectionsWriter<'i> {
             keys: BTreeMap::new(),
             #[cfg(test)]
             damaged: DAMAGED_FRAGMENT.with(|damaged| damaged.borrow().clone()),
+            #[cfg(test)]
+            legacy: LEGACY_FRAGMENTS.with(std::cell::Cell::get),
         }
     }
 
@@ -348,6 +352,12 @@ impl<'i> SectionsWriter<'i> {
         terms.extend(input_terms(resolution, &facts, subjects));
         terms.extend(method_terms(parse));
         let bytes = super::fragment::encode(resolution);
+        #[cfg(test)]
+        let bytes = if self.legacy {
+            super::fragment::encode_legacy(resolution)
+        } else {
+            bytes
+        };
         // A test stores a fragment that does not decode, as a damaged one
         // reads back.
         #[cfg(test)]
@@ -457,6 +467,7 @@ impl<'i> SectionsWriter<'i> {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static LEGACY_FRAGMENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The file whose fragment a test's build stores damaged.
     pub(crate) static DAMAGED_FRAGMENT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };

@@ -5916,6 +5916,160 @@ pub fn other() { callee(); }
         assert!(callers.contains("p/use.go"), "{callers}");
     }
 
+    /// Publishes the older string-table representation with keys from another
+    /// extractor, without running another binary or sharing process globals.
+    fn publish_legacy_graph(checkout: &Checkout) {
+        use crate::callgraph_store::join::CallgraphBlob;
+        use aft_store::content::ContentSectionsBuilder;
+        let version = "ruled-callgraph-v14-resolver-precision+record-12";
+        let sink = BuildSink::default();
+        let scanned = scan(&checkout.root, &checkout.layer.policy, None, &sink).unwrap();
+        let collected = sink.finish();
+        let mut state = scanned.state;
+        let mut parses = BTreeMap::new();
+        let mut configs = HashMap::new();
+        let mut records = HashMap::new();
+        let mut encoded = ContentSectionsBuilder::default();
+        for index in 0..state.paths().len() {
+            let path = state.paths()[index].path.clone();
+            let Some(language) = collected.languages.get(&path) else {
+                continue;
+            };
+            state.set_language(index, language.clone()).unwrap();
+            let content = state.paths()[index].content;
+            let current = RecordKey::new(content, language, EXTRACTOR_VERSION);
+            let mut record = (*collected.records[&current.digest().to_string()].1).clone();
+            record.extractor_version = version.to_string();
+            let key = RecordKey::new(content, language, version);
+            encoded.add(key, &record);
+            match super::super::content::blob_from_record(&record).unwrap() {
+                CallgraphBlob::Parse(parse) => {
+                    parses.insert(
+                        String::from_utf8(path).unwrap(),
+                        (key.digest().to_string(), Arc::new(parse)),
+                    );
+                }
+                CallgraphBlob::Config(config) => {
+                    configs.insert(path, Arc::from(config.source));
+                }
+            }
+            records.insert(key.digest().to_string(), (key, Arc::new(record)));
+        }
+        let inputs = CheckoutInputs {
+            state,
+            parses: parses.into(),
+            configs,
+        };
+        let resolved = super::super::callgraph::resolve_checkout(&inputs, 2).unwrap();
+        super::super::graph_store::LEGACY_FRAGMENTS.with(|legacy| legacy.set(true));
+        let mut sections = super::super::graph_store::SectionsWriter::new(
+            &inputs.state,
+            &records,
+            true,
+            Some(encoded),
+        );
+        super::super::graph_store::LEGACY_FRAGMENTS.with(|legacy| legacy.set(false));
+        for (path, resolution) in &resolved {
+            sections.add(&inputs, path, resolution).unwrap();
+        }
+        let mut writer = checkout.writer().unwrap();
+        let mut pending = writer.create_segment().unwrap();
+        collected.text.write(pending.writer()).unwrap();
+        let fragments = sections.finish(pending.writer(), None).unwrap();
+        let segment = writer.finish_segment(pending).unwrap();
+        let per_path = inputs
+            .state
+            .paths()
+            .iter()
+            .map(|record| {
+                std::str::from_utf8(&record.path)
+                    .ok()
+                    .and_then(|path| fragments.get(path))
+                    .map(|key| key.digest())
+            })
+            .collect();
+        let state = inputs.state.with_fragments(per_path).unwrap();
+        let written = writer
+            .write_checkout_state(checkout.checkout, &state)
+            .unwrap();
+        writer
+            .publish(&Publication {
+                add_segments: vec![segment],
+                states: vec![written],
+                ..Publication::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_legacy_publication_with_current_sibling_records_rebuilds_before_refresh() {
+        fn answers(view: &CheckoutView) -> (String, String) {
+            let callers = callers_of(view, "p/stop.go", "Stop");
+            let tree = crate::commands::callgraph_store_adapter::call_tree_result(
+                &view.callgraph(),
+                &view.root().join("p/use.go"),
+                "Use",
+                2,
+                true,
+            )
+            .unwrap();
+            (callers, format!("{tree:?}"))
+        }
+        let root = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        for dir in [root.path(), sibling.path()] {
+            write(dir, "go.mod", "module example.com/m\n");
+            write(
+                dir,
+                "p/t.go",
+                "package p\ntype T struct{}\nfunc (T) Run() {}\n",
+            );
+            write(
+                dir,
+                "p/use.go",
+                "package p\nfunc Use(t T) { t.Run(); t.Stop() }\n",
+            );
+        }
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let old = Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        publish_legacy_graph(&old);
+        drop(old);
+        let other =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), sibling.path()).unwrap();
+        other.build().unwrap();
+        // The new records coexist with the old fragments in one family.
+        assert!(!other
+            .view()
+            .unwrap()
+            .published
+            .graph
+            .parsed_files()
+            .collect::<Vec<_>>()
+            .is_empty());
+        write(root.path(), "p/stop.go", "package p\nfunc (T) Stop() {}\n");
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        assert!(checkout.changed_paths() > 0);
+        assert!(checkout.refresh_callgraph().unwrap().is_none());
+        assert_eq!(checkout.engine_starts(), 0);
+        assert!(checkout.needs_build());
+        checkout.build().unwrap();
+        assert!(!checkout.needs_build());
+        let ours = answers(&checkout.view().unwrap());
+        assert!(ours.0.contains("p/use.go"), "{ours:?}");
+        assert!(ours.1.contains("Stop"), "{ours:?}");
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold =
+            Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root.path()).unwrap();
+        cold.build().unwrap();
+        assert_eq!(ours, answers(&cold.view().unwrap()));
+        drop(checkout);
+        let reopened = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        assert!(!reopened.needs_build());
+        assert_eq!(ours, answers(&reopened.view().unwrap()));
+    }
+
     /// Editing an ignore file changes which files are members, as a cold
     /// scan would see them: at the root, and in a folder.
     #[test]
