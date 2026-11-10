@@ -67,10 +67,23 @@ pub fn exact_phrase(query: &str) -> &str {
 
 /// Normalized exact phrase for verbatim comparison.
 pub fn normalize_exact_phrase(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
+    let mut out = String::new();
+    push_normalized_exact_phrase(text, &mut out);
+    out
+}
+
+/// Appends `text`'s normalized exact phrase to `out`: its words joined by
+/// single spaces, ASCII-lowercased. Callers that normalize many lines into one
+/// buffer use this so they can't drift from [`normalize_exact_phrase`].
+pub fn push_normalized_exact_phrase(text: &str, out: &mut String) {
+    let start = out.len();
+    for word in text.split_whitespace() {
+        if out.len() > start {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out[start..].make_ascii_lowercase();
 }
 
 /// Return whether a file can possibly contain an E2 window for all query tokens.

@@ -3815,13 +3815,7 @@ impl MatchingSource {
             .lines()
             .map(|line| {
                 let normalized_start = normalized.len();
-                for word in line.split_whitespace() {
-                    if normalized.len() > normalized_start {
-                        normalized.push(' ');
-                    }
-                    normalized.push_str(word);
-                }
-                normalized[normalized_start..].make_ascii_lowercase();
+                exact_lane::push_normalized_exact_phrase(line, &mut normalized);
                 let compact_start = compact.len();
                 compact.extend(
                     line.chars()
