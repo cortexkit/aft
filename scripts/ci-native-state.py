@@ -85,8 +85,6 @@ def setup(root: Path, run_dir: Path) -> None:
     job_dir = Path(tempfile.mkdtemp(prefix=f"attempt-{attempt}-job-", dir=run_dir))
     values = {
         "CARGO_TARGET_DIR": target,
-        "RUSTC_WRAPPER": "",
-        "SCCACHE_GHA_ENABLED": "false",
         "AFT_CI_ARCHIVE_DIR": run_dir,
         "AFT_CI_JOB_DIR": job_dir,
         "AFT_GATE_HOME_ROOT": job_dir / "gate-home",

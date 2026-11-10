@@ -1076,9 +1076,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 self.assertEqual(cleanup["if"], "always()")
                 self.assertEqual(cleanup["with"]["phase"], "cleanup")
                 env = job.get("env", {})
-                if "SCCACHE_GHA_ENABLED" in env:
-                    self.assertEqual(env["SCCACHE_GHA_ENABLED"], "false")
-                    self.assertEqual(env["RUSTC_WRAPPER"], "")
+                self.assertNotIn("SCCACHE_GHA_ENABLED", env)
+                self.assertNotIn("RUSTC_WRAPPER", env)
 
     def test_native_jobs_and_nested_actions_never_use_github_cache_or_artifacts(self) -> None:
         def check(steps, owner):
@@ -1165,6 +1164,8 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 self.assertEqual(compiled.read_bytes(), b"keep")
                 self.assertIn(f"CARGO_TARGET_DIR={(root / 'target').as_posix()}", env_file.read_text())
                 self.assertIn(f"AFT_CI_ARCHIVE_DIR={second.as_posix()}", env_file.read_text())
+                self.assertNotIn("RUSTC_WRAPPER=", env_file.read_text())
+                self.assertNotIn("SCCACHE_GHA_ENABLED=", env_file.read_text())
             with unittest.mock.patch.object(self.state.Path, "home", return_value=Path(tmp)), \
                  unittest.mock.patch.object(self.state, "cleanup_processes"), \
                  unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "finalize"]), \

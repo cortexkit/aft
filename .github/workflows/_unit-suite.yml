@@ -682,9 +682,7 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 30
     env:
-      SCCACHE_GHA_ENABLED: "false"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
@@ -768,9 +766,7 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 90
     env:
-      SCCACHE_GHA_ENABLED: "false"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
       # Non-incremental Cargo builds default to 16 codegen units. Split the
       # large library harness more finely without changing dependency profiles,
@@ -871,9 +867,7 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 25
     env:
-      SCCACHE_GHA_ENABLED: "false"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
@@ -1157,8 +1151,6 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     env:
-      SCCACHE_GHA_ENABLED: "false"
-      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
@@ -1255,8 +1247,6 @@ jobs:
     runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     env:
-      SCCACHE_GHA_ENABLED: "false"
-      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
@@ -1340,8 +1330,6 @@ jobs:
     # Leave room for a cold Cargo build followed by conformance and Bun tests.
     timeout-minutes: 45
     env:
-      SCCACHE_GHA_ENABLED: "false"
-      RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
