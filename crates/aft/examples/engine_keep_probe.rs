@@ -21,7 +21,9 @@
 //! pause, plus per-refresh CPU, wall time, starts, releases and sampled RSS.
 //! Set TMPDIR to a scratch directory to isolate its temporary index store.
 //! With PROBE_COMPARE=1, first warm at 8 GiB, then visit the same checkouts
-//! at the requested budget, without repeating cold builds. PROBE_WARM_DIFF
+//! at the requested budget, without repeating cold builds. Both arms start
+//! after a broad edit and idle pause; the second arm reverses the refactor.
+//! PROBE_WARM_DIFF
 //! and PROBE_WARM_PATHS name a real refactor patch and its changed-path list;
 //! the patch is applied only to copies of this repository before the visits.
 
@@ -256,65 +258,92 @@ fn roots(mut args: impl Iterator<Item = String>) {
         checkouts.push((checkout, root, pair[1].clone(), text));
         aft::memory::relieve_allocator_pressure();
     }
-    if let Ok(diff) = std::env::var("PROBE_WARM_DIFF") {
-        let paths = std::fs::read_to_string(std::env::var("PROBE_WARM_PATHS").unwrap())
-            .unwrap()
-            .lines()
-            .map(|path| path.as_bytes().to_vec())
-            .collect::<Vec<_>>();
-        for (index, (checkout, root, path, text)) in checkouts.iter_mut().enumerate() {
-            if !root.join("crates/aft/src/lib.rs").exists() {
-                continue;
+    let warm = |checkouts: &mut Vec<(Checkout, PathBuf, String, String)>, reverse: bool| {
+        if let Ok(diff) = std::env::var("PROBE_WARM_DIFF") {
+            let paths = std::fs::read_to_string(std::env::var("PROBE_WARM_PATHS").unwrap())
+                .unwrap()
+                .lines()
+                .map(|path| path.as_bytes().to_vec())
+                .collect::<Vec<_>>();
+            for (index, (checkout, root, path, text)) in checkouts.iter_mut().enumerate() {
+                if !root.join("crates/aft/src/lib.rs").exists() {
+                    continue;
+                }
+                // A real boundary prevents git apply from finding the enclosing checkout.
+                assert!(std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(&*root)
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(std::process::Command::new("git")
+                    .arg("apply")
+                    .args(if reverse { vec!["--reverse"] } else { vec![] })
+                    .arg(&diff)
+                    .current_dir(&*root)
+                    .status()
+                    .unwrap()
+                    .success());
+                checkout.record_paths(&paths).unwrap();
+                let changed_paths = checkout.changed_paths();
+                assert!(
+                    changed_paths > 50,
+                    "the refactor must change many indexed paths"
+                );
+                let cpu = cpu_seconds();
+                let wall = Instant::now();
+                let rss_before = rss_bytes();
+                peak.take();
+                assert!(checkout.refresh_callgraph().unwrap().is_some());
+                let wall = wall.elapsed().as_secs_f64();
+                let cpu = cpu_seconds() - cpu;
+                let peak_rss = peak.take();
+                let before = components(checkout);
+                assert!(checkout.publish_changes().unwrap().is_some());
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "semantic_warmup", "reverse": reverse, "root": index, "paths": paths.len(), "changed_paths": changed_paths,
+                        "cpu_s": cpu, "wall_s": wall, "rss_before_bytes": rss_before,
+                        "peak_rss_bytes": peak_rss, "before_publish": before,
+                        "after_publish": components(checkout),
+                    })
+                );
+                *text = std::fs::read_to_string(root.join(path)).unwrap();
+                aft::memory::relieve_allocator_pressure();
             }
-            // A real boundary prevents git apply from finding the enclosing checkout.
-            assert!(std::process::Command::new("git")
-                .args(["init", "--quiet"])
-                .current_dir(&*root)
-                .status()
-                .unwrap()
-                .success());
-            assert!(std::process::Command::new("git")
-                .arg("apply")
-                .arg(&diff)
-                .current_dir(&*root)
-                .status()
-                .unwrap()
-                .success());
-            checkout.record_paths(&paths).unwrap();
-            let changed_paths = checkout.changed_paths();
-            assert!(
-                changed_paths > 50,
-                "the refactor must change many indexed paths"
-            );
-            let cpu = cpu_seconds();
-            let wall = Instant::now();
-            let rss_before = rss_bytes();
-            peak.take();
-            assert!(checkout.refresh_callgraph().unwrap().is_some());
-            let wall = wall.elapsed().as_secs_f64();
-            let cpu = cpu_seconds() - cpu;
-            let peak_rss = peak.take();
-            let before = components(checkout);
-            assert!(checkout.publish_changes().unwrap().is_some());
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "semantic_warmup", "root": index, "paths": paths.len(), "changed_paths": changed_paths,
-                    "cpu_s": cpu, "wall_s": wall, "rss_before_bytes": rss_before,
-                    "peak_rss_bytes": peak_rss, "before_publish": before,
-                    "after_publish": components(checkout),
-                })
-            );
-            *text = std::fs::read_to_string(root.join(path)).unwrap();
-            aft::memory::relieve_allocator_pressure();
         }
-    }
+    };
+    warm(&mut checkouts, false);
     let budgets = if compare {
         vec![8192, budget_mib]
     } else {
         vec![budget_mib]
     };
-    for budget_mib in budgets {
+    for (arm, budget_mib) in budgets.into_iter().enumerate() {
+        if arm > 0 {
+            layer.set_engine_budget(8192 << 20);
+            warm(&mut checkouts, true);
+        }
+        if compare {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "warm_before_idle", "budget_mib": budget_mib,
+                    "engines": checkouts.iter().map(|(c, ..)| components(c)).collect::<Vec<_>>(),
+                    "rss_bytes": rss_bytes(), "cache_bytes": layer.cache_stats().resident_bytes,
+                })
+            );
+            std::thread::sleep(Duration::from_secs(idle_seconds));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "warm_after_idle", "budget_mib": budget_mib, "seconds": idle_seconds,
+                    "engines": checkouts.iter().map(|(c, ..)| components(c)).collect::<Vec<_>>(),
+                    "rss_bytes": rss_bytes(), "cache_bytes": layer.cache_stats().resident_bytes,
+                })
+            );
+        }
         layer.set_engine_budget(budget_mib << 20);
         let starts_before = checkouts
             .iter()
