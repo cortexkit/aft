@@ -1,1 +1,1 @@
-Repeated searches reuse bounded, content-checked code-reference facts instead of reparsing unchanged candidate files, without changing search results.
+Repeated searches no longer re-parse files that have not changed. Search results are identical.

@@ -4356,6 +4356,9 @@ mod code_references {
     type Names = Vec<Box<str>>;
 
     struct Entry {
+        // None is a small negative entry: oversized or failed collection must
+        // go straight to the original predicate on later requests, rather than
+        // trying an extra parse before that predicate parses the file itself.
         names: Arc<OnceLock<Option<(Names, usize)>>>,
         bytes: usize,
         used: u64,
@@ -4448,16 +4451,6 @@ mod code_references {
                     if entry.bytes == ENTRY_BYTES {
                         entry.bytes += bytes;
                         state.bytes += bytes;
-                    }
-                }
-                if names.is_none()
-                    && state
-                        .entries
-                        .get(&key)
-                        .is_some_and(|entry| Arc::ptr_eq(&entry.names, &cell))
-                {
-                    if let Some(entry) = state.entries.remove(&key) {
-                        state.bytes -= entry.bytes;
                     }
                 }
                 while state.bytes > self.max_bytes {
@@ -4572,10 +4565,15 @@ mod code_references {
                 let mut parser = crate::parser::FileParser::new();
                 let (tree, _) = parser.parse_source_text(&path, source).unwrap();
                 let names = collect(tree, source).unwrap();
+                let mut saw_true = false;
+                let mut saw_false = false;
                 for identifier in ["ConnectionReset", "lower_case", "CommentOnly", "StringOnly", "ErrorOnly", "ExternalType", "Éclair", "Connection", "Reset", "value"] {
                     let expected = code_reference_in_source(&path, source, identifier, &mut parser);
+                    saw_true |= expected;
+                    saw_false |= !expected;
                     assert_eq!(names.binary_search_by(|name| name.as_ref().cmp(identifier)).is_ok(), expected, "{extension}: {identifier}");
                 }
+                assert!(saw_true && saw_false, "fixture.{extension} must exercise both predicate answers");
             }
         }
 
@@ -4685,22 +4683,35 @@ mod code_references {
 
         #[test]
         fn code_reference_oversized_name_sets_keep_the_original_fallback() {
-            let source = (0..6000)
+            let mut source = (0..6000)
                 .map(|i| format!("fn LargeMarker{i}() {{}}\n"))
                 .collect::<String>();
-            let path = Path::new("large.rs");
-            let file = request_files::RequestFile::unshared(source.as_bytes().to_vec(), None);
-            let mut parser = crate::parser::FileParser::new();
-            assert_eq!(
-                cached(path, &file, &source, "LargeMarker5999", &mut parser),
-                None
-            );
-            assert!(code_reference_in_source(
-                path,
-                &source,
-                "LargeMarker5999",
-                &mut parser
+            // Exceed FileParser's tree-reuse limit too, so an accidental second
+            // parse cannot be hidden by its request-local tree cache.
+            source.push_str("/*");
+            source.extend(std::iter::repeat_n(
+                ' ',
+                crate::cache_freshness::CONTENT_HASH_SIZE_CAP as usize,
             ));
+            source.push_str("*/\n");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("large.rs");
+            std::fs::write(&path, source).unwrap();
+            for lookup in 0..2 {
+                let mut parser = crate::parser::FileParser::new();
+                let before = crate::parser::work_counters::tree_parses();
+                assert!(identifier_has_code_reference(
+                    &path,
+                    "LargeMarker5999",
+                    &mut parser
+                ));
+                let parses = crate::parser::work_counters::tree_parses() - before;
+                if lookup == 0 {
+                    assert!((1..=2).contains(&parses));
+                } else {
+                    assert_eq!(parses, 1, "negative entry must skip name-set collection");
+                }
+            }
         }
     }
 }
