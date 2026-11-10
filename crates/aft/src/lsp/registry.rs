@@ -1431,7 +1431,9 @@ fn select_typescript_server(
     config: &Config,
     mode: RootPathMode,
 ) -> ServerDef {
-    // An explicit binary owns SDK selection, even when it names the built-in.
+    // Only the built-in program is swapped: a user who configured the
+    // `typescript` server's binary has chosen their own server, even if the
+    // binary's name matches the built-in program.
     if server.kind != ServerKind::TypeScript
         || server.binary != TYPESCRIPT_LANGUAGE_SERVER
         || server.has_configured_binary(config)

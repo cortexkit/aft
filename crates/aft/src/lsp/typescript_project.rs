@@ -71,8 +71,9 @@ impl ProjectTypeScript {
         self.major().is_some_and(|major| major >= 7)
     }
 
-    /// The lib directory containing tsserver.js, in this package or a runtime
-    /// dependency aliased to `typescript` by a shim package.
+    /// The lib directory containing the tsserver.js that typescript-language-server
+    /// loads, in this package or a runtime dependency aliased to `typescript` by a
+    /// shim package.
     pub(crate) fn tsserver_lib_dir(&self) -> Option<PathBuf> {
         find_tsserver_lib_dir(&self.package_dir, &mut HashSet::new())
     }
@@ -143,7 +144,8 @@ fn resolve_node_package(real_dir: &Path, name: &str) -> Option<PathBuf> {
         return None;
     }
     for ancestor in real_dir.ancestors() {
-        // Node searches a node_modules ancestor directly, not its child.
+        // Node looks in `<dir>/node_modules` for every ancestor, except that
+        // a directory that is itself named node_modules is searched directly.
         let modules = if ancestor
             .file_name()
             .is_some_and(|name| name == "node_modules")

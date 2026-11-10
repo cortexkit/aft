@@ -7866,8 +7866,12 @@ fn typescript_runtime_options(
         .filter(|p| source_file.starts_with(p))
         .unwrap_or(server_root);
     let (lib, fallback) = match find_project_typescript_package(source_file, boundary) {
-        // Never inject a cached JavaScript SDK for a native compiler project.
-        // Native-server selection normally handles these installations.
+        // The built-in server is normally swapped for the native language server
+        // before this point, and configured binaries skip this function. An install
+        // can still change between server selection and this lookup. A TypeScript
+        // 7+ project must still not be served by the cached 5.x SDK: its diagnostics
+        // would silently follow another compiler's defaults and accept options
+        // TypeScript 7 removed. Leave SDK discovery to the selected server.
         Some(project) if project.is_native_compiler() => {
             return Ok((
                 options,
@@ -7878,7 +7882,11 @@ fn typescript_runtime_options(
                 ),
             ));
         }
-        // The cached SDK would report another compiler's results for this project.
+        // Look for tsserver.js in the package or a shim's aliased dependency.
+        // An unreadable version, or TypeScript 6 or earlier without tsserver.js:
+        // typescript-language-server would fail in initialize, and serving the
+        // project with the cached SDK would report another compiler's results.
+        // Name the installation instead of spawning.
         Some(project) => {
             let lib = project
                 .major()
