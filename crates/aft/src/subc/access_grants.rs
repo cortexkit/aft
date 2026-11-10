@@ -3,9 +3,13 @@ use super::*;
 
 pub(super) mod sweep;
 
-/// Classify an already-approved answer without changing its authority. Policy
-/// that allows the path without saved grants takes precedence; otherwise only
-/// a recorded person-given head grant establishes person-derived delegation.
+/// Records where an already-approved folder answer came from, for the
+/// permissions page; it never changes the decision. A worker's ask is
+/// answered either by the person or by its head (the agent that launched the
+/// worker), passing on access the head itself has. When the head's own
+/// default policy allows the path, the source is `head_policy`. When the
+/// head's authority is a saved grant that a person gave the head, it is
+/// `head_grant`. Anything else is `unknown`.
 pub(super) fn answer_source(
     conn: &rusqlite::Connection,
     identity: &RouteIdentity,
