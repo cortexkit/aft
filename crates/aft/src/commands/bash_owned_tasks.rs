@@ -62,11 +62,11 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 mod tests {
     use super::*;
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
     use crate::config::Config;
     use crate::context::App;
     use crate::db::{bash_tasks, TrackedConnection};
     use crate::harness::Harness;
+    use crate::protocol::BgTaskStatus;
     use std::sync::{Arc, Mutex};
 
     struct Fixture {

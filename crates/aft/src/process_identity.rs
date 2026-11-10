@@ -151,3 +151,109 @@ mod tests {
         );
     }
 }
+
+/// A failed identity probe is not evidence that a task has stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessLiveness {
+    Gone,
+    Alive,
+    Unknown,
+}
+
+pub fn is_process_alive(pid: u32) -> bool {
+    probe_process(pid).1
+}
+
+// The second value is recovery's boolean: OS probe errors remain false.
+// The recorded-process probe keeps a live PID with an unreadable start time alive.
+#[cfg(unix)]
+pub(crate) fn probe_process(pid: u32) -> (ProcessLiveness, bool) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return (ProcessLiveness::Unknown, false);
+    };
+    if pid <= 0 {
+        return (ProcessLiveness::Unknown, false);
+    }
+    if unsafe { libc::kill(pid, 0) == 0 } {
+        return (ProcessLiveness::Alive, true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => (ProcessLiveness::Alive, true),
+        Some(libc::ESRCH) => (ProcessLiveness::Gone, false),
+        _ => (ProcessLiveness::Unknown, false),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn probe_process(pid: u32) -> (ProcessLiveness, bool) {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
+        fn GetExitCodeProcess(hProcess: Handle, lpExitCode: *mut u32) -> i32;
+        fn CloseHandle(hObject: Handle) -> i32;
+    }
+
+    const FALSE: i32 = 0;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 0x103;
+
+    if pid == 0 {
+        return (ProcessLiveness::Unknown, false);
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle.is_null() {
+            // Windows reports ERROR_INVALID_PARAMETER for a nonexistent PID.
+            let state = if std::io::Error::last_os_error().raw_os_error() == Some(87) {
+                ProcessLiveness::Gone
+            } else {
+                ProcessLiveness::Unknown
+            };
+            return (state, false);
+        }
+        let mut exit_code = 0;
+        let state = if GetExitCodeProcess(handle, &mut exit_code) == 0 {
+            ProcessLiveness::Unknown
+        } else if exit_code == STILL_ACTIVE {
+            ProcessLiveness::Alive
+        } else {
+            ProcessLiveness::Gone
+        };
+        let _ = CloseHandle(handle);
+        (state, state == ProcessLiveness::Alive)
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::is_process_alive;
+
+    #[test]
+    fn is_process_alive_returns_true_for_self() {
+        assert!(is_process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn is_process_alive_returns_false_for_dead_pid() {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "true"])
+            .spawn()
+            .expect("spawn true");
+
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "exit 0"])
+            .spawn()
+            .expect("spawn cmd");
+
+        let pid = child.id();
+        child.wait().expect("wait for child");
+
+        assert!(!is_process_alive(pid));
+    }
+}

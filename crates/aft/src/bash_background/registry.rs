@@ -800,7 +800,7 @@ pub struct BgCompletion {
         rename = "_bash_changed_files",
         skip_serializing_if = "Option::is_none"
     )]
-    pub changed_files: Option<crate::bash_changed_files::Report>,
+    pub changed_files: Option<crate::protocol::Report>,
     pub task_id: String,
     /// Intentionally omitted from serialized completion payloads: push frames
     /// carry `session_id` at the BashCompletedFrame envelope level for routing.
@@ -970,7 +970,7 @@ pub struct BgTaskSnapshot {
         rename = "_bash_changed_files",
         skip_serializing_if = "Option::is_none"
     )]
-    pub changed_files: Option<crate::bash_changed_files::Report>,
+    pub changed_files: Option<crate::protocol::Report>,
     #[serde(flatten)]
     pub info: BgTaskInfo,
     pub exit_code: Option<i64>,
@@ -2196,7 +2196,7 @@ impl BgTaskRegistry {
     ) -> Option<crate::bash_changed_files::BudgetGuard> {
         Some(self.task(task_id)?.changed_files.as_ref()?.budget(deadline))
     }
-    fn changed_files_report(&self, task_id: &str) -> Option<crate::bash_changed_files::Report> {
+    fn changed_files_report(&self, task_id: &str) -> Option<crate::protocol::Report> {
         let task = self.task(task_id)?;
         let mut report = task.changed_files.as_ref()?.finish().clone();
         self.mask_completion_text(task_id, &mut report.text);
@@ -28935,7 +28935,7 @@ mod tests {
         let pending = crate::gh_shim_ticket::PendingTicket::issue(session, "/project");
         let ticket = pending.value().unwrap().to_string();
         let env = HashMap::from([(
-            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.to_string(),
+            crate::gh_shim_paths::GH_SHIM_TICKET_ENV.to_string(),
             ticket.clone(),
         )]);
         let seen = project.path().join("seen-ticket");

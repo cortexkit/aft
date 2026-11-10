@@ -96,7 +96,7 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
     let foreground = tasks.start(&stamp, "foreground", "sleep 30", false);
     assert!(tasks.registry.promote(&foreground, "foreground").unwrap());
     let pid = read_pid(&pid_file);
-    assert!(crate::bash_background::process::is_process_alive(pid));
+    assert!(crate::process_identity::is_process_alive(pid));
     let reply = tasks.cancel(&stamp);
     assert!(reply.success, "{reply:?}");
     let killed = reply.data["killed"].as_array().unwrap();
@@ -125,7 +125,7 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
             .take_cancelled_call_notices(session)
             .is_empty());
     }
-    wait_for(|| !crate::bash_background::process::is_process_alive(pid));
+    wait_for(|| !crate::process_identity::is_process_alive(pid));
 }
 
 #[test]
@@ -393,9 +393,7 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
     // The module exits: its registry lets go of the tasks without stopping
     // them, and no project has bound since.
     previous.detach();
-    assert!(crate::bash_background::process::is_process_alive(
-        paused_pid
-    ));
+    assert!(crate::process_identity::is_process_alive(paused_pid));
 
     let reply = handle_bash_kill_scope_with_saved_tasks(
         json!({"scope": stamp}),
@@ -414,8 +412,8 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
         }]),
         "{reply:?}"
     );
-    wait_for(|| !crate::bash_background::process::is_process_alive(paused_pid));
-    assert!(crate::bash_background::process::is_process_alive(other_pid));
+    wait_for(|| !crate::process_identity::is_process_alive(paused_pid));
+    assert!(crate::process_identity::is_process_alive(other_pid));
 
     // The project binds later: its replay restores the task as stopped by its
     // owner, never as a running command to resume.
@@ -438,7 +436,7 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
         Some(storage.path()),
     );
     assert_eq!(other_reply.data["killed"][0]["task_id"], other_task);
-    wait_for(|| !crate::bash_background::process::is_process_alive(other_pid));
+    wait_for(|| !crate::process_identity::is_process_alive(other_pid));
 }
 
 #[test]
@@ -504,7 +502,7 @@ fn recovered_harness_scope_cancel_records_revoked_in_the_module_database() {
     );
     assert!(reply.success, "{reply:?}");
     assert_eq!(reply.data["killed"][0]["task_id"], task);
-    wait_for(|| !crate::bash_background::process::is_process_alive(pid));
+    wait_for(|| !crate::process_identity::is_process_alive(pid));
     let restarted = crate::db::gh_speech::Store::new(&db_path);
     assert_eq!(
         restarted

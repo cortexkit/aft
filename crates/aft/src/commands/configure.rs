@@ -2639,8 +2639,7 @@ fn handle_configure_inner(
     // storage resolver. This keeps AFT_STORAGE_DIR ahead of a wire value and
     // gives every artifact lane one concrete absolute root.
     ctx.begin_configure_ack_step("storage_root");
-    let resolved_storage_dir =
-        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let resolved_storage_dir = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
     if resolved_storage_dir.exists() {
         crate::reader_floor::prepare(&resolved_storage_dir);
     }
@@ -2796,7 +2795,7 @@ fn handle_configure_inner(
                         req.session().to_string(),
                     );
                 let storage_root =
-                    crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+                    crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
                 let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
                     generation: ctx.configure_generation(),
                     root_path: root_path.clone(),
@@ -3032,8 +3031,7 @@ fn handle_configure_inner(
         debug_assert!(ctx.has_configure_session_binding(&canonical_cache_root, req.session()));
         let generation = ctx.configure_generation();
         if first_session_bind || repair_artifacts {
-            let storage_root =
-                crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+            let storage_root = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
             let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
                 generation,
                 root_path: root_path.clone(),
@@ -3104,8 +3102,7 @@ fn handle_configure_inner(
     // equivalent fast paths above never need them (the configuration they
     // accept is the one already applied), so they run only here, with
     // exclusive use of the root, and still before any build worker starts.
-    let child_storage_root =
-        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let child_storage_root = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
     if let Err(error) = crate::agent_child_env::maintain(&next_config, &child_storage_root) {
         return Response::error(&req.id, "child_environment_unavailable", error);
     }
@@ -3132,7 +3129,7 @@ fn handle_configure_inner(
     let format_tool_cache_clear_needed = effective_configure_changed;
 
     let storage_root = crate::root_cache::cache_root(&next_config);
-    let durable_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let durable_root = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
     let cache_reason = crate::root_cache::cache_unavailable(&next_config);
     let cache_available = cache_reason.is_none();
     if let Some(reason) = cache_reason {
@@ -3265,7 +3262,7 @@ fn handle_configure_inner(
     ctx.begin_configure_ack_step("database_runtime");
     ctx.begin_database_runtime(
         canonical_cache_root.clone(),
-        crate::bash_background::storage_dir(next_config.storage_dir.as_deref()),
+        crate::storage_path::storage_dir(next_config.storage_dir.as_deref()),
         req.session().to_string(),
     );
     // Commit phase: no validation returns after this point.
@@ -3299,12 +3296,12 @@ fn handle_configure_inner(
             max_depth: next_config
                 .backup
                 .max_depth
-                .unwrap_or(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
+                .unwrap_or(crate::config::DEFAULT_MAX_UNDO_DEPTH),
             max_file_size: Some(
                 next_config
                     .backup
                     .max_file_size
-                    .unwrap_or(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
+                    .unwrap_or(crate::config::DEFAULT_MAX_BACKUP_FILE_SIZE),
             ),
         });
         backup.set_db_harness(harness.clone());
@@ -3537,7 +3534,7 @@ fn handle_configure_inner(
     }
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
-    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let storage_root = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
     ctx.begin_configure_ack_phase("maintenance_enqueue");
     let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
@@ -4927,11 +4924,7 @@ mod tests {
                 true,
                 true,
             );
-            metadata.mark_terminal(
-                crate::bash_background::BgTaskStatus::Completed,
-                Some(0),
-                None,
-            );
+            metadata.mark_terminal(crate::protocol::BgTaskStatus::Completed, Some(0), None);
             write_task(&paths.json, &metadata).unwrap();
             fs::write(&paths.stdout, "recovered\n").unwrap();
             fs::write(&paths.stderr, "").unwrap();
@@ -4983,7 +4976,7 @@ mod tests {
             true,
         );
         metadata.harness = Some("opencode".into());
-        metadata.status = crate::bash_background::BgTaskStatus::Running;
+        metadata.status = crate::protocol::BgTaskStatus::Running;
         metadata.completion_has_env_secrets = Some(false);
         metadata.completion_has_non_ticket_env_secrets = Some(false);
         write_task(&paths.json, &metadata).unwrap();
@@ -5047,17 +5040,14 @@ mod tests {
         assert_eq!(completions[0].task_id, task_id);
         assert_eq!(
             completions[0].status,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
         assert_eq!(completions[0].exit_code, Some(0));
         assert!(completions[0]
             .output_preview
             .contains("recovered after restart"));
         let recovered = read_task(&paths.json).unwrap();
-        assert_eq!(
-            recovered.status,
-            crate::bash_background::BgTaskStatus::Completed
-        );
+        assert_eq!(recovered.status, crate::protocol::BgTaskStatus::Completed);
         assert_eq!(recovered.exit_code, Some(0));
         assert!(runner_completions.is_empty());
         assert!(!runner_adopted, "runner adopted the opencode task");
@@ -5136,11 +5126,7 @@ mod tests {
                 true,
                 true,
             );
-            task.mark_terminal(
-                crate::bash_background::BgTaskStatus::Completed,
-                Some(0),
-                None,
-            );
+            task.mark_terminal(crate::protocol::BgTaskStatus::Completed, Some(0), None);
             write_task(&layout.paths.json, &task).unwrap();
             fs::write(&layout.paths.stdout, "recovered\n").unwrap();
             fs::write(&layout.paths.stderr, "").unwrap();
@@ -6093,7 +6079,7 @@ mod tests {
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config {
-                storage_dir: Some(crate::bash_background::storage_dir(None)),
+                storage_dir: Some(crate::storage_path::storage_dir(None)),
                 ..Config::default()
             },
         );
@@ -6714,7 +6700,7 @@ mod tests {
             "XDG_DATA_HOME",
             default_data_root.to_str().expect("temporary path is UTF-8"),
         );
-        let default_storage = crate::bash_background::storage_dir(None);
+        let default_storage = crate::storage_path::storage_dir(None);
         let project = temp.path().join("project");
         let storage = temp.path().join("configured-storage");
         init_git_fixture(&project);

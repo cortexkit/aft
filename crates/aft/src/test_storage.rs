@@ -38,7 +38,7 @@ fn live_storage_root_from(
     temporary: &[PathBuf],
     lookup: &impl Fn(&str) -> Option<OsString>,
 ) -> PathBuf {
-    crate::bash_background::storage_dir_from_test_environment(&|name| {
+    crate::storage_path::storage_dir_from_test_environment(&|name| {
         let non_temporary = || {
             lookup(name).filter(|value| {
                 !temporary
@@ -68,7 +68,7 @@ pub(crate) fn assert_context(config: &Config) {
             "test context must use an explicit isolated storage_dir, never the process default",
         );
     assert_root(configured);
-    assert_root(&crate::bash_background::storage_dir(Some(configured)));
+    assert_root(&crate::storage_path::storage_dir(Some(configured)));
 }
 
 pub(crate) fn assert_root(root: &Path) {
@@ -153,7 +153,7 @@ mod tests {
             _ => None,
         };
         let sandbox_default =
-            crate::bash_background::storage_dir_from_test_environment(&with_override);
+            crate::storage_path::storage_dir_from_test_environment(&with_override);
         let forbidden = live_storage_root_from(home.path(), None, &temporary, &with_override);
         assert!(!is_within(&sandbox_default, &forbidden));
         let expected = if cfg!(windows) {
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn test_database_allows_a_temporary_xdg_default() {
         with_temporary_xdg(|fixture| {
-            let root = crate::bash_background::storage_dir_without_overrides_for_test();
+            let root = crate::storage_path::storage_dir_without_overrides_for_test();
             assert!(root.starts_with(fixture));
             std::fs::create_dir_all(&root).unwrap();
             let _db = crate::db::open(&root.join("aft.db")).unwrap();

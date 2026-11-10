@@ -593,10 +593,8 @@ impl Fixture {
                     let _guard = crate::gh_shim_ticket::spawn_ticket_guard(Some(&raw));
                     crate::gh_shim_ticket::mark_spawn_background(background);
                     let mut environment = HashMap::new();
-                    environment.insert(
-                        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
-                        raw.clone(),
-                    );
+                    environment
+                        .insert(crate::gh_shim_paths::GH_SHIM_TICKET_ENV.into(), raw.clone());
                     let task =
                         crate::bash_background::registry::with_scope_spawn(lifecycle, || {
                             if pty {

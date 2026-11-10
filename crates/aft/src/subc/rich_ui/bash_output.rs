@@ -152,7 +152,7 @@ fn page(
     limit: usize,
 ) -> Result<Value, &'static str> {
     let terminal = data["status"].clone();
-    let terminal = serde_json::from_value::<crate::bash_background::BgTaskStatus>(terminal)
+    let terminal = serde_json::from_value::<crate::protocol::BgTaskStatus>(terminal)
         .map_err(|_| "result_schema_mismatch")?
         .is_terminal();
     let pty = data["mode"] == "pty";

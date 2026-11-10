@@ -330,7 +330,7 @@ pub fn effective_path() -> &'static OsStr {
 /// Where the probed login-shell PATH is cached between processes.
 #[cfg(unix)]
 pub(crate) fn effective_path_cache_path() -> PathBuf {
-    crate::bash_background::storage_dir(None).join("effective-path.json")
+    crate::storage_path::storage_dir(None).join("effective-path.json")
 }
 
 #[cfg(unix)]

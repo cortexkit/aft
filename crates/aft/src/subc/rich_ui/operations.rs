@@ -284,7 +284,7 @@ pub(crate) fn project_reply(operation: &Value, source: &Value) -> Value {
     if matches!(operation["id"].as_str(), Some("bash_status" | "bash_watch")) {
         let mut fields = Map::new();
         if let Some(status) = source.get("status").and_then(|value| {
-            serde_json::from_value::<crate::bash_background::BgTaskStatus>(value.clone()).ok()
+            serde_json::from_value::<crate::protocol::BgTaskStatus>(value.clone()).ok()
         }) {
             fields.insert("running".into(), json!(!status.is_terminal()));
         }

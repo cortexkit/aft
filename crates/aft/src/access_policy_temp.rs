@@ -43,7 +43,7 @@ pub(crate) fn roots_override() -> Option<Vec<PathBuf>> {
 pub(crate) fn guard_roots(overridden: Option<&[PathBuf]>) -> Vec<PathBuf> {
     match overridden {
         Some(roots) => roots.iter().map(|root| super::policy_path(root)).collect(),
-        None => crate::bash_permissions::system_temp_roots()
+        None => crate::system_temp::system_temp_roots()
             .iter()
             .map(|path| super::policy_path(path))
             .collect(),

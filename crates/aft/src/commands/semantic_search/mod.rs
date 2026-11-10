@@ -554,7 +554,7 @@ fn standing_snapshot_metadata(
     external_root: &Path,
     storage_dir: Option<&Path>,
 ) -> ExternalBorrowMetadata {
-    let db_path = crate::bash_background::storage_dir(storage_dir).join("aft.db");
+    let db_path = crate::storage_path::storage_dir(storage_dir).join("aft.db");
     if !db_path.is_file() {
         return ExternalBorrowMetadata::default();
     }

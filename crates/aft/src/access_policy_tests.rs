@@ -390,7 +390,7 @@ fn access_policy_preserved_location_resolves_parent_before_dotdot() {
 
 fn artifact_read_context() -> (tempfile::TempDir, AppContext, PathBuf) {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
 
     let directory = tempfile::tempdir().unwrap();
     let resolved = directory.path().canonicalize().unwrap();
