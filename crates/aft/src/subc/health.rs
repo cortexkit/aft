@@ -557,6 +557,7 @@ struct FrameOperation {
 
 pub(super) struct DispatchPathMetrics {
     pub(super) watch_delivery: Arc<super::watch_delivery::WatchDelivery>,
+    pub(super) completion_delivery: super::push::CompletionDelivery,
     unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
@@ -632,6 +633,7 @@ impl DispatchPathMetrics {
     pub(super) fn new() -> Self {
         Self {
             watch_delivery: Arc::default(),
+            completion_delivery: Default::default(),
             unanswered_tools: StdMutex::new(HashMap::new()),
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
@@ -1432,6 +1434,8 @@ impl DispatchPathMetrics {
             .map(|bind| duration_millis_u64(now.saturating_duration_since(bind.started_at)))
             .max();
         let last_tick_age_ms = duration_millis_u64(self.frame_loop_progress_age());
+        let mut reliable_push = self.watch_delivery.health();
+        reliable_push["completions"] = self.completion_delivery.health();
         json!({
             "frame_loop": {
                 "last_tick_age_ms": last_tick_age_ms,
@@ -1448,7 +1452,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
-            "reliable_push": self.watch_delivery.health(),
+            "reliable_push": reliable_push,
             "tool_call_presets": self.tool_call_preset_snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),

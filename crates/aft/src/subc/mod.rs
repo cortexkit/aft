@@ -72,7 +72,7 @@ const ATTACH_RETRY_JITTER_PERCENT: u64 = 20;
 const HELLO_CORR: u64 = 1;
 
 /// Per-session in-memory replay cap for must-deliver Push frames. This covers
-/// detach/re-attach while AFT stays alive; cross-restart replay is phased later.
+/// detach/re-attach while AFT stays alive; unacked registry tasks recover across restarts.
 const PUSH_BUFFER_MAX_PER_KEY: usize = 256;
 
 /// Bounded guard for control-frame sends. If the daemon stops reading and the
@@ -6734,6 +6734,12 @@ where
                 if let Some(keys) = completion.unacked_bg_keys {
                     bg_unacked_keys_by_root.insert(root_id.clone(), keys);
                 }
+                if let Some(ctx) = executor.actor_context(&root_id) {
+                    push::recover_registry_completions(
+                        &writer_tx, &dispatch_path_metrics, ctx.bash_background(),
+                        &routes, &root_channels, &mut push_buffer, &root_id, lifecycle_probe.as_ref(),
+                    );
+                }
                 record_bg_runtime_from_snapshots(
                     &dispatch_path_metrics,
                     bg_subs.len(),
@@ -7883,6 +7889,18 @@ async fn handle_route_bind_completion(
         );
     }
     queue_post_bind_configure_and_completion_maintenance(&completion.bind_root_id, live_roots);
+    if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
+        push::recover_registry_completions(
+            tx,
+            metrics,
+            ctx.bash_background(),
+            routes,
+            root_channels,
+            push_buffer,
+            &completion.bind_root_id,
+            lifecycle_probe,
+        );
+    }
     let replayed = push::replay_buffered_push_frames(
         tx,
         metrics,

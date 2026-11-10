@@ -819,6 +819,33 @@ pub struct BgCompletion {
     pub live_descendants_summary: Option<String>,
 }
 
+impl BgCompletion {
+    pub(crate) fn into_push_frame(self) -> PushFrame {
+        let mut frame = BashCompletedFrame::new(
+            self.task_id,
+            self.session_id,
+            self.status,
+            self.exit_code,
+            self.command,
+            self.output_preview,
+            self.output_truncated,
+            self.original_tokens,
+            self.compressed_tokens,
+            self.tokens_skipped,
+        );
+        frame.bash_output_list_envelope = self.bash_output_list_envelope;
+        frame.launching_identity = self.launching_identity;
+        frame.changed_files = self.changed_files;
+        frame.status_reason = self.status_reason;
+        frame.output_incomplete = self.output_incomplete;
+        frame.live_descendants = self.live_descendants;
+        frame.live_descendants_omitted = self.live_descendants_omitted;
+        frame.live_descendants_unavailable = self.live_descendants_unavailable;
+        frame.live_descendants_summary = self.live_descendants_summary;
+        PushFrame::BashCompleted(frame)
+    }
+}
+
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
@@ -11761,6 +11788,16 @@ impl BgTaskRegistry {
             .unwrap_or_default()
     }
 
+    pub(crate) fn pending_completion_counts(&self) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        if let Ok(completions) = self.inner.completions.lock() {
+            for completion in completions.iter() {
+                *counts.entry(completion.session_id.clone()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
     fn remove_pending_completion(&self, task_id: &str) -> Option<BgCompletion> {
         let mut completions = self.inner.completions.lock().ok()?;
         let idx = completions
@@ -15081,28 +15118,7 @@ impl BgTaskRegistry {
         // sender is shared behind a Mutex. It still uses the same stdout writer
         // closure as foreground progress frames, preserving the existing lock/
         // flush behavior in main.rs.
-        let mut frame = BashCompletedFrame::new(
-            completion.task_id,
-            completion.session_id,
-            completion.status,
-            completion.exit_code,
-            completion.command,
-            completion.output_preview,
-            completion.output_truncated,
-            completion.original_tokens,
-            completion.compressed_tokens,
-            completion.tokens_skipped,
-        );
-        frame.bash_output_list_envelope = completion.bash_output_list_envelope;
-        frame.launching_identity = completion.launching_identity;
-        frame.changed_files = completion.changed_files;
-        frame.status_reason = completion.status_reason;
-        frame.output_incomplete = completion.output_incomplete;
-        frame.live_descendants = completion.live_descendants;
-        frame.live_descendants_omitted = completion.live_descendants_omitted;
-        frame.live_descendants_unavailable = completion.live_descendants_unavailable;
-        frame.live_descendants_summary = completion.live_descendants_summary;
-        sender(PushFrame::BashCompleted(frame));
+        sender(completion.into_push_frame());
     }
 
     fn completion_token_counts(
