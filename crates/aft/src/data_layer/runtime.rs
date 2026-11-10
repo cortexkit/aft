@@ -905,6 +905,7 @@ impl Work {
     /// Tells the status listener, if any, that the checkout's status may
     /// have changed.
     fn notify_status_change(&self) {
+        self.checkout.notify_readiness_change();
         let listener = self
             .status_listener
             .lock()

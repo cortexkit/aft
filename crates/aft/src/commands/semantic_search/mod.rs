@@ -429,12 +429,19 @@ fn wait_for_first_text_index(ctx: &AppContext) -> extensions::ReadinessWait {
         // Publication wakes this condition variable immediately. The short
         // cap only observes the job token's cancellation checks (including a
         // project root deleted or no longer used), which have a separate wake.
-        checkout.checkout().wait_for_readiness_change(
-            &mut generation,
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(25)),
-        );
+        // Readiness itself is sampled again only when the store signals it.
+        let observed = generation;
+        while generation == observed && Instant::now() < deadline {
+            checkout.checkout().wait_for_readiness_change(
+                &mut generation,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25)),
+            );
+            if search_cancellation_requested() {
+                return extensions::ReadinessWait::Cancelled;
+            }
+        }
     })
 }
 
@@ -9540,7 +9547,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|row| row["file"] == "main.rs"),
+                .any(|row| row["file"]
+                    .as_str()
+                    .is_some_and(|file| Path::new(file) == root.join("main.rs"))),
             "{:?}",
             response.data
         );
