@@ -393,18 +393,17 @@ async fn draining_retry_sleep(_root: &Path, _now: u64, delay: u64) {
     tokio::time::sleep(Duration::from_millis(delay)).await;
 }
 
-/// Shown for a remote task cancelled after it was submitted but before the
-/// build server accepted it: with no job id, nothing can confirm whether the
-/// command ran.
+/// Detaching a submitted call does not stop the job. Without a job id, AFT
+/// cannot send job cancellation or confirm from the runner that the job has
+/// finished.
 #[cfg(unix)]
-pub(crate) const PRE_ACCEPTANCE_CANCELLED: &str =
-    "cancelled before the build server accepted the job; whether it ran is unknown";
+pub(crate) const PRE_ACCEPTANCE_DETACHED: &str =
+    "detached from the remote submission without cancelling the job; no job id was received, so the job may still run";
 
-/// Prefix shown, followed by `: <error>`, when cancelling such a task
-/// failed.
+/// Prefix shown, followed by `: <error>`, when detaching the submission failed.
 #[cfg(unix)]
 pub(crate) const PRE_ACCEPTANCE_CANCEL_FAILED: &str =
-    "could not cancel before the build server accepted the job; whether it ran is unknown";
+    "could not detach the remote submission; no job id was received, so the job may still run";
 
 /// The remote runner AFT dispatches to; named in every remote reply header.
 #[cfg(unix)]
@@ -3667,7 +3666,7 @@ impl BgTaskRegistry {
                         return Ok(());
                     }
                     result?;
-                    return Err(PRE_ACCEPTANCE_CANCELLED.into());
+                    return Err(PRE_ACCEPTANCE_DETACHED.into());
                 }
             }
             sink.sent_at = stream.sent_at();

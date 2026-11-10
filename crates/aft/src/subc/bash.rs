@@ -8156,14 +8156,14 @@ mod grant_path_tests {
     }
 
     /// A kill recorded after the runner received `exec.run` but before it
-    /// accepted the job has no job id to cancel. The worker cancels the call
-    /// itself: a call-key Cancel on the same channel, epoch and correlation as
-    /// the `exec.run`, kept alive by a status round trip so the worker's
-    /// runtime shutting down cannot drop it. Without terminal proof the task
-    /// ends as fate unknown, never as having run.
+    /// supplied a job id cannot send job cancellation. The worker sends a Cancel
+    /// frame for the observation, not an exec.cancel request for the job. A status
+    /// round trip keeps the transport alive to send the frame before shutdown.
+    /// Detaching does not stop the remote job, so the reply must warn that it may
+    /// still run and identify the local task.
     #[cfg(unix)]
     #[tokio::test]
-    async fn background_runon_kill_before_admission_cancels_submission() {
+    async fn background_runon_kill_before_admission_warns_job_may_still_run() {
         use crate::exec_remote::wire_tests::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::GatedAdmission { refuse: false }).await;
@@ -8193,6 +8193,13 @@ mod grant_path_tests {
         .expect("queued cancellation must not wait for admission")
         .unwrap();
         assert!(killed.success, "{killed:?}");
+        assert_eq!(killed.data["task_id"], task_id, "{killed:?}");
+        assert!(
+            killed.data
+                .to_string()
+                .contains("no job id was received, so the job may still run"),
+            "a detached observation is not a cancelled job: {killed:?}"
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if daemon
@@ -8236,7 +8243,7 @@ mod grant_path_tests {
             status
                 .data
                 .to_string()
-                .contains(crate::bash_background::registry::remote::PRE_ACCEPTANCE_CANCELLED),
+                .contains(crate::bash_background::registry::remote::PRE_ACCEPTANCE_DETACHED),
             "{status:?}"
         );
     }
