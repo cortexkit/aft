@@ -9,12 +9,16 @@ fields are corpus notation, not an additional wire envelope.
   before acceptance, a masked command, a 2 KiB truncated command, and an
   unattributed session.
 - `watch.json`: split initial resync, new row, queued-to-running change, end,
-  removal, status change, and lagged resync. `part` starts at zero. Only the
+  removal after the 30-minute retention window, status change, and lagged
+  resync. `part` starts at zero. Only the
   final resync part carries a cursor; the cursor is opaque to the client.
-- `output.json`: three subscriptions (ANSI kept, ANSI stripped, and PTY).
+- `output.json`: four subscriptions (ANSI kept, ANSI stripped, a pseudo-terminal
+  (PTY) screen, and default
+  backfill without a resume offset).
   The first two explicitly resume at stdout byte 16, omitting older output.
   A euro sign ends the first chunk and a complete colour escape starts the
   next. Offsets count raw UTF-8 file bytes, not the length of displayed text.
+  The default backfill contains the last 64 KiB, split into four 16 KiB chunks.
   PTY cursor coordinates are zero-based; `exit.signal`, when known, is numeric.
 - `errors.json`: the Error payload for an agent-scoped route, an empty list
   for an unknown agent, and the remaining defined Error payloads. An unknown

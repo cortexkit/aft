@@ -6167,6 +6167,52 @@ impl LspManager {
             .any(|client| client.state() == ServerState::Ready)
     }
 
+    /// Read lifecycle facts without resolving files or starting a server.
+    pub(crate) fn operator_server_states(&self) -> Vec<(String, String, Option<String>)> {
+        let mut states = std::collections::BTreeMap::<String, (String, Option<String>)>::new();
+        let rank = |state: &str| match state {
+            "degraded" => 2,
+            "building" => 1,
+            _ => 0,
+        };
+        let mut record = |server: String, state: &str, reason: Option<&str>| {
+            states
+                .entry(server)
+                .and_modify(|current| {
+                    if rank(state) > rank(&current.0)
+                        || (rank(state) == rank(&current.0)
+                            && reason.unwrap_or("") < current.1.as_deref().unwrap_or(""))
+                    {
+                        *current = (state.to_owned(), reason.map(str::to_owned));
+                    }
+                })
+                .or_insert_with(|| (state.to_owned(), reason.map(str::to_owned)));
+        };
+        for (key, client) in &self.clients {
+            let (state, reason) = match client.state() {
+                ServerState::Ready => ("ready", None),
+                ServerState::Starting | ServerState::Initializing => ("building", Some("starting")),
+                ServerState::ShuttingDown => ("degraded", Some("stopping")),
+                ServerState::Exited => ("degraded", Some("exited")),
+            };
+            record(key.kind.id_str().to_owned(), state, reason);
+        }
+        for key in self.starting.keys() {
+            record(key.kind.id_str().to_owned(), "building", Some("starting"));
+        }
+        for key in self.failed_spawns.keys() {
+            record(
+                key.kind.id_str().to_owned(),
+                "degraded",
+                Some("spawn_failed"),
+            );
+        }
+        states
+            .into_iter()
+            .map(|(server, (state, reason))| (server, state, reason))
+            .collect()
+    }
+
     /// Report the SDK selected when the server started; resolving it again
     /// could describe a different installation than the running client uses.
     pub fn runtime_notes(&self) -> Vec<String> {

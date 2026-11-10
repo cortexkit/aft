@@ -1761,6 +1761,14 @@ pub struct PersistedCompletionPreview {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedTask {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_call: Option<super::shell_metadata::ShellCall>,
+    #[serde(default)]
+    pub(crate) shell_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_remote_job_id: Option<String>,
     /// Storage namespace captured at spawn, independent of later route binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
@@ -1961,9 +1969,20 @@ impl PersistedTask {
         compressed: bool,
     ) -> Self {
         let call_key = Some(super::call_key_for_new_task(&task_id));
+        let shell_call = super::shell_metadata::current().map(|mut call| {
+            call.call_id = call_key
+                .as_ref()
+                .filter(|key| !key.minted)
+                .map(|key| key.key.clone());
+            call
+        });
         let completion_has_secret_placeholders = Some(!super::secrets::labels(&command).is_empty());
         let metadata = Self {
             schema_version: SCHEMA_VERSION,
+            shell_call,
+            shell_revision: 0,
+            shell_fingerprint: None,
+            shell_remote_job_id: None,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
             launching_identity: super::TaskIdentity::current(),
             task_id,
@@ -2137,6 +2156,10 @@ impl From<BashTaskRow> for PersistedTask {
         Self {
             schema_version: SCHEMA_VERSION,
             harness: Some(row.harness.clone()),
+            shell_call: None,
+            shell_revision: 0,
+            shell_fingerprint: None,
+            shell_remote_job_id: None,
             task_id: row.task_id,
             session_id: row.session_id,
             launching_identity: None,

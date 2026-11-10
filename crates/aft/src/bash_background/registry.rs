@@ -1240,6 +1240,9 @@ pub(crate) struct ScopeKillReport {
 
 #[path = "scratch_retention.rs"]
 mod scratch_retention;
+#[path = "shell_registry.rs"]
+mod shell_registry;
+pub(crate) use shell_registry::{ShellReader, ShellSnapshot};
 #[path = "task_image_cleanup.rs"]
 mod task_image_cleanup;
 
@@ -3660,6 +3663,7 @@ impl BgTaskRegistry {
     }
 
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
+        super::shell_metadata::changed();
         let pool = {
             let slot = self.inner.db_pool.read().ok();
             let pool = slot.as_ref().and_then(|slot| (*slot).clone());
@@ -11936,6 +11940,7 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        super::shell_metadata::changed();
         // Terminal tasks can stay in the watchdog index until their surviving
         // process group releases scratch. Only cleanup needs retrying; reading
         // their written marker again cannot change the observed outcome.

@@ -311,13 +311,6 @@ impl BgTaskRegistry {
         starts_capture: bool,
         ends_capture: bool,
     ) -> Result<(String, String), UnavailablePreview> {
-        let text = String::from_utf8_lossy(bytes);
-        // A scan window can end inside a character that is intact in the full
-        // capture. Decode the expanded source neighborhood rather than separate
-        // match prefixes, then include the whole character at either match edge.
-        let mut range = lossy_watch_offset(bytes, range.start, false)
-            ..lossy_watch_offset(bytes, range.end, true);
-        align_watch_range(&text, &mut range);
         let task = self.task(task_id);
         let ticket_digest = task.as_ref().and_then(|task| {
             task.lock_state()
@@ -332,6 +325,30 @@ impl BgTaskRegistry {
         let Some(secrets) = guard.as_deref().and_then(Option::as_ref) else {
             return Err(UnavailablePreview::restart());
         };
+        Self::mask_window_with_values(
+            bytes,
+            range,
+            starts_capture,
+            ends_capture,
+            secrets,
+            ticket_digest.as_deref(),
+        )
+    }
+
+    pub(super) fn mask_window_with_values(
+        bytes: &[u8],
+        range: std::ops::Range<usize>,
+        starts_capture: bool,
+        ends_capture: bool,
+        secrets: &crate::log_redact::SecretValues,
+        ticket_digest: Option<&str>,
+    ) -> Result<(String, String), UnavailablePreview> {
+        let text = String::from_utf8_lossy(bytes);
+        // Extra masking context may end inside a character outside the
+        // displayed range; decode the whole source neighborhood first.
+        let mut range = lossy_watch_offset(bytes, range.start, false)
+            ..lossy_watch_offset(bytes, range.end, true);
+        align_watch_range(&text, &mut range);
         if secrets.longest_value_len() > WATCH_SECRET_HALO_BYTES {
             return Err(UnavailablePreview::context(TRUNCATED_PREVIEW_WITHHELD));
         }
