@@ -1,1 +1,0 @@
-- Claude Code sessions hosted by CortexKit's harness module get the same trust as its OpenCode 2 sessions, so they can run shell commands.

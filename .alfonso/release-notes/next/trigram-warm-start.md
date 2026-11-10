@@ -1,1 +1,0 @@
-- Search is ready sooner after AFT restarts: files that haven't changed since the last check are no longer reread.

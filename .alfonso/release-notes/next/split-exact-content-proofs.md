@@ -1,1 +1,0 @@
-- A repeated exact search no longer re-reads every file behind its cached results on macOS and Linux when those files are unchanged; Windows always re-reads them.

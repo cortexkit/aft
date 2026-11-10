@@ -1,1 +1,0 @@
-- `aft_search` reads each candidate file from disk once per search instead of once per step, and works out the line that best matches the query only once per file, so searches over many matching files take less time and use less CPU. Results are unchanged.

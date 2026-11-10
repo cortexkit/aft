@@ -1,1 +1,0 @@
-- AFT's index store resolves every edited worktree's call graph on one shared set of threads instead of a set per worktree (a daemon with dozens of edited worktrees ran hundreds of resolver threads), and write, edit and apply_patch no longer parse the edited file before returning: search sees the edit at once, and the call graph parses it when it next refreshes.

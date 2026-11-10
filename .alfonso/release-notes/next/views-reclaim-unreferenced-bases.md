@@ -1,1 +1,0 @@
-- With views on, AFT reclaims stored call-graph data that no checkout uses any more; its storage cleanup no longer stalls on machines with a long project history.

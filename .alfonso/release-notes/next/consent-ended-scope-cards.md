@@ -1,1 +1,0 @@
-- macOS permission requests whose filing session has ended are left for Cingulate to settle, instead of AFT retrying their withdrawal at every start.

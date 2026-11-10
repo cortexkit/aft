@@ -1,1 +1,0 @@
-- A shell command that changes into a folder held in a variable (`cd $DIR`) no longer makes AFT's approval check treat it as the home folder; the folder is treated as unknown, so approvals never name a wrong path.

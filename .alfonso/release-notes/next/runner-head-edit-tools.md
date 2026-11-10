@@ -1,1 +1,0 @@
-- Agent heads run by the CortexKit runner now get the same AFT tools as OpenCode on the same model: `apply_patch` for GPT models, `edit` and `write` for every other model, and no `status` tool.

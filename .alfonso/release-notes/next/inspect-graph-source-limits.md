@@ -1,1 +1,0 @@
-- aft_inspect's dead-code and unused-export checks skip generated and minified JavaScript and TypeScript files and read source files only up to 4 MiB, so one huge file can no longer exhaust memory (#1337).

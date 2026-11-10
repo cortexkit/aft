@@ -1,1 +1,0 @@
-- A new worktree of a repository AFT already indexes is ready in seconds instead of re-reading and re-indexing every file, which removes the CPU spikes when agents open worktrees.

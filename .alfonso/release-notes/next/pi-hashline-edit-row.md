@@ -1,1 +1,0 @@
-- Pi: with `edit_mode: "hashline"`, the `edit` row now names the file(s) the patch changes (with the destination for a move) and shows the diff for every file, instead of an empty "…" row (#1410).

@@ -1,1 +1,0 @@
-- `aft_inspect` no longer reports a Rust file as clean when `cargo check` had found errors in it and the language server had reopened the file meanwhile.

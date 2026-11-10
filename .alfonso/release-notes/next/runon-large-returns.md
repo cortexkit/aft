@@ -1,1 +1,0 @@
-- `runon` jobs can bring back up to 128 MiB of files with `return_paths` when the build server supports it (10 MiB before). Large returned files are copied in a stream rather than read into memory.

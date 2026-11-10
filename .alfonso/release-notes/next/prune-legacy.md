@@ -1,1 +1,0 @@
-- `npx @cortexkit/aft cache prune-legacy` lists the index folders AFT used before 0.64 and their sizes; add `--yes` to delete them and free the disk space. AFT does not delete them on its own in this release.

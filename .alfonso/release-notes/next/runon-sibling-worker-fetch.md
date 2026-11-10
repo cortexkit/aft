@@ -1,1 +1,0 @@
-- A worker launched with a sibling checkout is no longer refused before it starts: the check core runs on the worker's own route now counts the grant that route just saved.

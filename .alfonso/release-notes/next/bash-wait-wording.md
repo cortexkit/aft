@@ -1,1 +1,0 @@
-- The bash and bash_watch descriptions now tell agents to finish any work that doesn't need a running command's result before waiting on it or ending the turn.

@@ -1,1 +1,0 @@
-- Meaning search's first fill after upgrading reuses the vectors the previous meaning index already computed for unchanged files with the same embedding model, instead of embedding them again.

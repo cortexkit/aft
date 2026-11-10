@@ -1,1 +1,0 @@
-- Display servers that connect without a project folder can now fetch AFT's tool views, so tool rows can render in the apps.

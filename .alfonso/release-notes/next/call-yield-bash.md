@@ -1,1 +1,0 @@
-- When you send a message while an agent waits on a long shell command in a session runner, the command keeps running in the background and the agent reads your message at once.
