@@ -25,13 +25,21 @@ impl ReplayKey {
     }
 }
 
-/// Plugin offers remain eligible until acknowledged; runner offers settle as
-/// soon as a matching route accepts the frame.
+#[path = "completion_settlement.rs"]
+mod completion_settlement;
+
+type UnackedCompletions =
+    Arc<std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, HashSet<String>>>>>;
+
+/// Plugin offers remain eligible until acknowledged; runner offers settle in
+/// memory as soon as a matching route accepts the frame, then persist off-thread.
 #[derive(Default)]
 pub(super) struct CompletionDelivery {
     state: std::sync::Mutex<CompletionOffers>,
     registries: std::sync::Mutex<HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>>,
-    unacked: std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, HashSet<String>>>>,
+    unacked: UnackedCompletions,
+    #[cfg(test)]
+    settlement_gate: std::sync::Mutex<Option<completion_settlement::TestGate>>,
     buffered: AtomicU64,
     dropped: AtomicU64,
 }
@@ -134,6 +142,14 @@ impl CompletionDelivery {
         self.registries.lock().unwrap().get(root).cloned()
     }
 
+    fn is_settled(&self, root: &ProjectRootId, task: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .settled
+            .contains(&(root.clone(), task.into()))
+    }
+
     fn settle(&self, key: &ReplayKey, task: &str) -> bool {
         {
             let mut state = self.state.lock().unwrap();
@@ -141,29 +157,32 @@ impl CompletionDelivery {
             // Retain admission even if persistence fails: reconnects in this
             // process must not repeat a completion already written to a runner.
             state.admitted.insert(task_key.clone());
-            state.settled.insert(task_key);
-        }
-        let identity = crate::bash_background::TaskIdentity {
-            principal: key.principal.clone(),
-            harness: key.harness.clone(),
-            session: key.session.clone(),
-        };
-        let _scope = crate::bash_background::task_identity_scope(Some(identity));
-        if self.registry(&key.root).is_some_and(|registry| {
-            registry
-                .ack_completions_for_session(Some(&key.session), &[task.into()])
-                .iter()
-                .any(|delivered| delivered == task)
-        }) {
-            if let Some(sessions) = self.unacked.lock().unwrap().get_mut(&key.root) {
-                if let Some(tasks) = sessions.get_mut(&key.session) {
-                    tasks.remove(task);
-                }
+            if !state.settled.insert(task_key) {
+                return false;
             }
-            true
-        } else {
-            log::warn!("subc completion push: task={task} could not durably mark runner completion delivered key={key:?}; suppressing further offers in this process");
-            false
+        }
+        // Synced task-file and SQLite writes must not block binds or live pushes.
+        // A crash before the queued mark lands may repeat the completion once
+        // after restart; that is preferable to blocking every route's bind.
+        let queued = self
+            .registry(&key.root)
+            .ok_or_else(|| "registry is not attached".to_string())
+            .and_then(|registry| {
+                completion_settlement::enqueue(completion_settlement::Settlement {
+                    registry,
+                    key: key.clone(),
+                    task: task.into(),
+                    unacked: Arc::clone(&self.unacked),
+                    #[cfg(test)]
+                    gate: self.settlement_gate.lock().unwrap().take(),
+                })
+            });
+        match queued {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("subc completion push: task={task} could not queue durable runner completion delivery key={key:?}: {error}; suppressing further offers in this process");
+                false
+            }
         }
     }
 
@@ -174,13 +193,7 @@ impl CompletionDelivery {
         if caller_acknowledges_completions(key.principal.as_deref()) {
             return CompletionSend::Send;
         }
-        if self
-            .state
-            .lock()
-            .unwrap()
-            .settled
-            .contains(&(key.root.clone(), task.into()))
-        {
+        if self.is_settled(&key.root, task) {
             return CompletionSend::Settled;
         }
         let Some(registry) = self.registry(&key.root) else {
@@ -360,6 +373,14 @@ pub(super) fn recover_registry_completions(
             if completion.launching_identity.as_ref() != Some(&identity) {
                 continue;
             }
+            // A queued mark may hold the task state lock while syncing storage.
+            // Do not inspect that task's metadata again from the route runtime.
+            if metrics
+                .completion_delivery
+                .is_settled(root, &completion.task_id)
+            {
+                continue;
+            }
             // Earlier versions pushed runner completions without recording
             // delivery. Their pre-cutover backlog has unknown delivery state;
             // retire it rather than announce potentially days-old commands again.
@@ -429,7 +450,7 @@ pub(super) fn recover_registry_completions(
         }
     }
     log::info!(
-        "subc completion recovery: root={} retired_runner_backlog={retired_backlog}",
+        "subc completion recovery: root={} queued_runner_backlog_retirements={retired_backlog}",
         root.as_path().display()
     );
 }
