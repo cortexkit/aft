@@ -34,6 +34,9 @@ Head agent `agent-alf` owns worker scope `scope:wkr-7f3a`.
   the page shows; `subject_label` is the path with the home folder as `~`.
 - No `expires_at_ms`, `group` or `methods`: a saved answer lasts until it is
   revoked or the holder's scope ends, and then the row is no longer listed.
+- `ends_with_holder: true` on every worker row: the grant also ends when that
+  worker's scope ends, so the page can say so instead of "until revoked". A
+  head's grants survive its revivals, so head rows leave the member out.
 - `card_ref`: the id of the Cingulate card whose answer saved the grant (for
   AFT, an access ask `acc_…`), when there was one; a grant from a worker's
   launch plan has none. Grants saved before AFT recorded it (aft.db schema 27) have
@@ -53,6 +56,13 @@ Cingulate tag `permissions-grant-sources-v1`, commit
 and pins the shared fields; Cingulate's app-specific fields are replaced by
 separate assertions on AFT's folder fields. AFT's own sample above pins the
 complete AFT reply, including provenance and time bounds.
+
+`provider-list-ends-with-holder.json` and `.jcs` are copied unchanged from
+Cingulate tag `permissions-ends-with-holder-v1`, commit `56fa35f2d8f1`. The
+unit test `permissions_list_matches_published_ends_with_holder_sample` checks
+both SHA256s and compares the shared fields the same way. That sample's first
+row also carries `expires_at_ms`; AFT grants have no expiry, so the test drops
+that field from the expected row.
 
 `permissions.revoke {id}` answers `{outcome: "revoked"}`, adds `stopping: true`
 when shell commands whose sandbox allowed that folder were still running (AFT

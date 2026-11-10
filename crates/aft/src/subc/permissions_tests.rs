@@ -70,7 +70,7 @@ fn revoke(db: &Mutex<crate::db::TrackedConnection>, id: &str, stopped: usize) ->
 }
 
 /// The fields a `permissions/v1` row may carry, and those it must.
-const ROW_FIELDS: [&str; 14] = [
+const ROW_FIELDS: [&str; 15] = [
     "id",
     "agent_id",
     "holder",
@@ -85,6 +85,7 @@ const ROW_FIELDS: [&str; 14] = [
     "card_ref",
     "source",
     "granted_at_bound",
+    "ends_with_holder",
 ];
 const REQUIRED_ROW_FIELDS: [&str; 7] = [
     "id",
@@ -631,12 +632,101 @@ fn permissions_list_matches_published_grant_sources_sample() {
             actual["subject_label"],
             format!("~/Work/source-{}", index + 1)
         );
+        // This sample predates `ends_with_holder`; every row here is a
+        // worker's, so each carries it. The ends-with-holder sample pins it.
+        assert_eq!(actual["ends_with_holder"], true);
+        actual.as_object_mut().unwrap().remove("ends_with_holder");
         for field in ["module", "scope", "subject_label", "scope_label"] {
             actual.as_object_mut().unwrap().remove(field);
             expected.as_object_mut().unwrap().remove(field);
         }
     }
     assert_eq!(reply, expected);
+}
+
+/// Pin `ends_with_holder` to Cingulate's tagged sample: a worker's rows carry
+/// it, a head's row does not. Cingulate's app-specific fields differ from AFT's
+/// folder fields, and its first row's `expires_at_ms` has no AFT counterpart
+/// (AFT grants never expire), so those are dropped before comparing.
+#[cfg(unix)]
+#[test]
+fn permissions_list_matches_published_ends_with_holder_sample() {
+    use crate::db::access_grant_rows::GrantSource;
+    use sha2::{Digest, Sha256};
+    const JSON: &[u8] = include_bytes!(
+        "../../../../test-vectors/permissions-v1/provider-list-ends-with-holder.json"
+    );
+    const JCS: &[u8] = include_bytes!(
+        "../../../../test-vectors/permissions-v1/provider-list-ends-with-holder.jcs"
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(JSON)),
+        "1cbd85f525dd667cc3b00c36a908db386e99c0c6a40591d492f27cadeb3dacbc"
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(JCS)),
+        "8ac482f36c188b2f8dbb3845798af763418e91cec3b505566651a8dce0c0bc81"
+    );
+    let sample: Value = serde_json::from_slice(JSON).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(JCS).unwrap(), sample);
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(dir.path());
+    let home = PathBuf::from("/Users/person");
+    let head = key("scope:head-maple", 7);
+    let worker = key("scope:wkr-maple", 3);
+    {
+        let conn = db.lock().unwrap();
+        store::register_scope(&conn, &head, None, &Config::default()).unwrap();
+        store::register_agent(&conn, &head, "agent-maple", true).unwrap();
+        store::register_scope(&conn, &worker, Some(&head), &Config::default()).unwrap();
+        store::register_worker(&conn, &worker).unwrap();
+        for (index, (holder, source)) in [
+            (&worker, GrantSource::HeadGrant),
+            (&worker, GrantSource::HeadPolicy),
+            (&head, GrantSource::Person),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected = &sample["reply"]["grants"][index];
+            let path = home.join(format!("Work/lifetime-{}", index + 1));
+            store::insert_with_source(
+                &conn,
+                holder,
+                &grant(&path, GrantKind::Subtree, AccessOperation::Read),
+                expected["card_ref"].as_str(),
+                Some(source),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE access_grants SET grant_id=?1,granted_at_ms=?2 WHERE path=?3",
+                rusqlite::params![
+                    expected["id"].as_str().unwrap(),
+                    expected["granted_at_ms"].as_i64().unwrap(),
+                    path.to_string_lossy()
+                ],
+            )
+            .unwrap();
+        }
+    }
+    let by_id = |rows: &mut Vec<Value>| {
+        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    };
+    let reply = list(&db.lock().unwrap(), None, &[home]).unwrap();
+    let mut actual = reply["grants"].as_array().unwrap().clone();
+    let mut expected = sample["reply"]["grants"].as_array().unwrap().clone();
+    assert_eq!(actual.len(), 3);
+    by_id(&mut actual);
+    by_id(&mut expected);
+    for (actual, expected) in actual.iter_mut().zip(expected.iter_mut()) {
+        assert_contract_row(actual);
+        for field in ["module", "scope", "subject_label", "scope_label"] {
+            actual.as_object_mut().unwrap().remove(field);
+            expected.as_object_mut().unwrap().remove(field);
+        }
+        expected.as_object_mut().unwrap().remove("expires_at_ms");
+    }
+    assert_eq!(actual, expected);
 }
 
 /// Cingulate is not a first-party AFT principal, so its management route is
