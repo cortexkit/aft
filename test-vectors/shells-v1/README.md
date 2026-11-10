@@ -10,11 +10,10 @@ fields are corpus notation, not an additional wire envelope.
   unattributed session.
 - `watch.json`: split initial resync, new row, queued-to-running change, end,
   removal after the 30-minute retention window, status change, and lagged
-  resync. `part` starts at zero. Only the
-  final resync part carries a cursor; the cursor is opaque to the client.
+  resync. `part` starts at zero. Only the final resync part carries a cursor;
+  the cursor is opaque to the client.
 - `output.json`: four subscriptions (ANSI kept, ANSI stripped, a pseudo-terminal
-  (PTY) screen, and default
-  backfill without a resume offset).
+  (PTY) screen, and default backfill without a resume offset).
   The first two explicitly resume at stdout byte 16, omitting older output.
   A euro sign ends the first chunk and a complete colour escape starts the
   next. Offsets count raw UTF-8 file bytes, not the length of displayed text.
@@ -30,6 +29,22 @@ are correlated StreamData payloads, followed by a reliable StreamEnd when
 the subscription finishes. Error payloads use Error frames, not Responses.
 All code-valued fields remain open strings. Unknown optional facts are
 absent, not null and not inferred.
+
+`max_chunk_bytes` accepts 64 through 65536 bytes, with a default of 16384.
+The edge samples use 64-byte chunks: raw stdout offsets advance 16 → 80 → 95
+whether ANSI is kept or stripped. If masking cannot safely decide a range,
+its chunk text is `[output withheld: masking context unavailable]`, not raw
+output. The chunk still advances the raw offsets over the withheld range.
+A stream retains a trailing buffer as long as its longest known secret, so a
+credential arriving across two chunks can be masked before either part is
+shown. That buffer and the masking context use bounded memory; uncertain
+credential formats are never emitted as raw bytes. A remote host is absent
+whenever the execution protocol has not supplied an actual placement name.
+
+With `agent_ids` supplied, `include_workers` defaults to `false`: only the
+named agents' own shells are included. `include_workers: true` also includes
+their workers. With `agent_ids` absent, every holder is included, including
+workers and unattributed sessions.
 
 Regenerate deliberately, review the changes, then commit all five artifacts:
 
