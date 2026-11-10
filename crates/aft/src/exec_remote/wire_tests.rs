@@ -224,9 +224,11 @@ pub(crate) enum Script {
     GatedAdmission {
         refuse: bool,
     },
-    /// Placement progress has no job id; release acceptance separately. Only
-    /// exec.cancel stops the job, and attach then confirms it never ran.
-    PlacementWait,
+    /// Release acceptance separately from placement progress, optionally carrying
+    /// a job id. Only exec.cancel stops the job; attach confirms it never ran.
+    PlacementWait {
+        job_id: bool,
+    },
     /// Delay route opening before the client can submit exec.run.
     GatedRoute,
     /// Drop the connection on the first `exec.run`, before any stream record:
@@ -526,11 +528,14 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(reply(FrameType::StreamEnd, Value::Null));
                             }
                         }
-                        "exec.run" | "exec.attach" if matches!(script, Script::PlacementWait) => {
+                        "exec.run" | "exec.attach" if matches!(script, Script::PlacementWait { .. }) => {
                             if body["method"] == "exec.run" {
                                 assert_eq!(body["params"]["progress"], true);
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Progress(
-                                    Progress::new(ProgressPhase::PlacementWait, 26 * 60 * 1000, Some("waiting for a host with 8 free vCPUs".into())).unwrap()
+                                    match script {
+                                        Script::PlacementWait { job_id: true } => Progress::new(ProgressPhase::PlacementWait, 0, Some("waiting for a host with 8 free vCPUs".into())).unwrap().with_job_id(id()),
+                                        _ => Progress::new(ProgressPhase::PlacementWait, 26 * 60 * 1000, Some("waiting for a host with 8 free vCPUs".into())).unwrap(),
+                                    }
                                 )).unwrap()));
                                 let accepted = reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap());
                                 let writer = writer.clone();
@@ -745,7 +750,7 @@ pub(crate) async fn daemon_with_capabilities(
                         _ => panic!("unexpected caller operation {body}"),
                     }
                 },
-                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. } | Script::PlacementWait) => {},
+                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. } | Script::PlacementWait { .. }) => {},
                 FrameType::Cancel => {cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst);},
                 _ => {},
             }

@@ -8163,7 +8163,7 @@ mod grant_path_tests {
     async fn background_runon_remote_cancel_placement_waits_for_id_and_terminal() {
         use crate::exec_remote::wire_tests::{id, Script};
         let (daemon, _dir, root, executor, ctx) = capture_fixture_with_claims(
-            Script::PlacementWait,
+            Script::PlacementWait { job_id: false },
             &[
                 "exec-remote/v1",
                 crate::exec_remote::types::PROGRESS_CAPABILITY,
@@ -8221,7 +8221,7 @@ mod grant_path_tests {
         );
         assert!(pending.contains(&task_id), "{killed:?}");
         assert!(pending.contains("the job may still run"), "{killed:?}");
-        assert_eq!(admission_status(&ctx, &task_id).data["status"], "running");
+        assert_eq!(admission_status(&ctx, &task_id).data["status"], "starting");
         assert!(
             daemon.log.lock().unwrap().iter().all(|(header, body)| {
                 header.ty != FrameType::Cancel && body["method"] != "exec.cancel"
@@ -8235,6 +8235,13 @@ mod grant_path_tests {
                 let status = admission_status(&ctx, &task_id);
                 if status.data["status"] == "killed" {
                     assert_eq!(status.data["remote_job_id"], id().to_string());
+                    assert!(
+                        status
+                            .data
+                            .to_string()
+                            .contains("command never started on ck-motor"),
+                        "{status:?}"
+                    );
                     assert!(
                         !status.data.to_string().contains("outcome unknown"),
                         "{status:?}"

@@ -470,7 +470,7 @@ impl RemoteStream {
             if let Err(error) = self.subscription.closed().await {
                 // Only this typed submit refusal proves no job was created. A
                 // record (including acceptance) rules out resubmitting the call.
-                if !self.received_frame && self.consumer.resume_point().is_none() {
+                if !self.received_frame && self.consumer.known_job_id().is_none() {
                     if let Some((client, request)) = self.return_retry.take() {
                         if let Some(maximum) = refused_return_cap(&error, &request) {
                             let request = request.with_return_max_bytes(maximum);

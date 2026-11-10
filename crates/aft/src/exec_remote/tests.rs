@@ -366,6 +366,38 @@ pub(super) struct MemorySink {
     started: Vec<Started>,
 }
 
+#[test]
+fn remote_cancel_progress_job_id_is_not_acceptance_or_an_output_cursor() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    let job_id = Uuid::from_bytes([1; 16]);
+    consumer
+        .consume(
+            StreamRecord::Progress(
+                Progress::new(ProgressPhase::Upload, 0, None)
+                    .unwrap()
+                    .with_job_id(job_id),
+            ),
+            &mut sink,
+        )
+        .unwrap();
+    assert!(consumer.resume_point().is_none());
+    assert_eq!(consumer.known_job_id(), Some(job_id));
+    assert!(sink.seqs.is_empty());
+    assert!(consumer
+        .consume(
+            StreamRecord::Accepted(Accepted::new(Uuid::from_bytes([2; 16]), 1)),
+            &mut sink
+        )
+        .is_err());
+    consumer
+        .consume(StreamRecord::Accepted(Accepted::new(job_id, 1)), &mut sink)
+        .unwrap();
+    let point = consumer.resume_point().unwrap();
+    assert_eq!(point.job_id, job_id);
+    assert_eq!(point.last_seq, None);
+}
+
 impl OutputSink for MemorySink {
     fn started(&mut self, started: &Started) -> std::io::Result<()> {
         self.seqs.push(started.seq);

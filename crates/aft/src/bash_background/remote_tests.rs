@@ -3386,7 +3386,7 @@ fn cancel_terminal(outcome: Outcome, killed: Option<Killed>, ran: Ran) -> Termin
 #[tokio::test]
 async fn remote_cancel_placement_without_job_id_expires_with_truthful_warning() {
     let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
-        Script::PlacementWait,
+        Script::PlacementWait { job_id: false },
         &["exec-remote/v1", exec::types::PROGRESS_CAPABILITY],
         1,
     )
@@ -3429,8 +3429,98 @@ async fn remote_cancel_placement_without_job_id_expires_with_truthful_warning() 
 }
 
 #[tokio::test]
+async fn remote_cancel_placement_progress_id_cancels_before_acceptance() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::PlacementWait { job_id: true },
+        &["exec-remote/v1", exec::types::PROGRESS_CAPABILITY],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    wait_for(
+        "progress must supply the job id before cancellation",
+        || {
+            registry
+                .status(&task_id, "session", None, None, 0)
+                .unwrap()
+                .remote_job_id
+        },
+    )
+    .await;
+    let task = registry.task(&task_id).unwrap();
+    let saved = read_task(&task.paths.json).unwrap();
+    let remote = saved.remote.unwrap();
+    assert_eq!(remote.job_id, Some(id()));
+    assert!(!remote.accepted);
+    assert_eq!(remote.last_seq, None);
+    let killing = registry.clone();
+    let killed_id = task_id.clone();
+    let done = tokio::task::spawn_blocking(move || killing.kill(&killed_id, "session").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    let expected_job_id = id().to_string();
+    assert_eq!(
+        done.remote_job_id.as_deref(),
+        Some(expected_job_id.as_str())
+    );
+    assert!(
+        done.output_preview
+            .contains("command never started on ck-motor"),
+        "{done:?}"
+    );
+    assert!(!done.output_preview.contains("ran remotely"), "{done:?}");
+    let requests = cancel_requests(&daemon);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["params"]["job_id"], id().to_string());
+    let saved = read_task(&task.paths.json).unwrap();
+    let remote = saved.remote.unwrap();
+    assert!(!remote.accepted, "the fake server never released Accepted");
+    assert_eq!(remote.terminal.unwrap().ran, Some(Ran::None));
+}
+
+#[tokio::test]
+async fn remote_cancel_restart_with_progress_id_cancels_before_acceptance() {
+    let daemon = daemon(Script::PlacementWait { job_id: true }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let mut saved = read_task(&paths.json).unwrap();
+    let remote = saved.remote.as_mut().unwrap();
+    remote.accepted = false;
+    remote.queue_position = None;
+    remote.cancel_requested = true;
+    write_task(&paths.json, &saved).unwrap();
+    original.dual_write_task(&paths, &saved);
+    drop(original);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert!(
+        done.output_preview
+            .contains("command never started on ck-motor"),
+        "{done:?}"
+    );
+    let requests = cancel_requests(&daemon);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["params"]["job_id"], id().to_string());
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.run"));
+}
+
+#[tokio::test]
 async fn remote_cancel_restart_without_job_id_does_not_claim_cancellation() {
-    let daemon = daemon(Script::PlacementWait, "exec-remote/v1").await;
+    let daemon = daemon(Script::PlacementWait { job_id: false }, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let (original, task_id, paths) = persist_accepted_with_snapshot(
         dir.path(),
@@ -3443,6 +3533,8 @@ async fn remote_cancel_restart_without_job_id_does_not_claim_cancellation() {
     remote.job_id = None;
     remote.queue_position = None;
     remote.cancel_requested = true;
+    saved.execution_note = None;
+    write_task(&paths.json, &saved).unwrap();
     original.dual_write_task(&paths, &saved);
     drop(original);
     let restarted = registry();
@@ -3503,6 +3595,13 @@ async fn assert_cancel_terminal(
     if expected == BgTaskStatus::Killed {
         assert_eq!(done.info.status_reason.as_deref(), Some("remote cancel"));
         assert!(!done.output_preview.contains("may still be running"));
+        if record().ran == Some(Ran::None) {
+            assert!(
+                done.output_preview
+                    .contains("command never started on ck-motor"),
+                "{done:?}"
+            );
+        }
     } else {
         assert!(done
             .info
@@ -3622,7 +3721,7 @@ async fn exec_remote_cancel_execution_ended_false_keeps_unknown_warning() {
 }
 
 const TERMINAL_PENDING: &str =
-    "remote cancellation requested; terminal pending; inspect bash_status (never rerun)";
+    "remote cancellation pending for job 0192a64a-1234-7000-8000-000000000001; the job may still run until the build server confirms it stopped; inspect bash_status (never rerun)";
 
 /// Start a remote task on a runner that confirms a cancel but sends the
 /// terminal only once the test releases `completion_gate`, and wait until the
@@ -14585,7 +14684,7 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
 }
 
 #[tokio::test]
-async fn bash_kill_scope_withdraws_submission_before_acceptance() {
+async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
     let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
@@ -14608,43 +14707,50 @@ async fn bash_kill_scope_withdraws_submission_before_acceptance() {
     });
     daemon.wait_for_requests("exec.run", 1).await;
     let pausing = registry.clone();
-    let reply = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            crate::commands::bash_kill_scope::handle_bash_kill_scope(
-                serde_json::json!({"scope":scope}),
-                Some(&scope.owner),
-                &[pausing],
-            )
-        }),
-    )
-    .await
-    .expect("withdrawal must not wait for acceptance")
-    .unwrap();
-    assert!(reply.success, "{reply:?}");
-    let mut expected = case["reply"]["data"].clone();
-    expected["killed"][0]["task_id"] = serde_json::json!(task);
-    assert_eq!(reply.data, expected);
-    wait_for("call-key Cancel must reach the runner", || {
-        daemon
-            .log
+    let operation = tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":scope}),
+            Some(&scope.owner),
+            &[pausing],
+        )
+    });
+    wait_for("owner pause intent must precede acceptance", || {
+        registry
+            .task(&task)
+            .unwrap()
+            .state
             .lock()
             .unwrap()
-            .iter()
-            .any(|(header, _)| header.ty == subc_protocol::FrameType::Cancel)
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .cancel_requested
             .then_some(())
     })
     .await;
-    assert!(
-        !daemon
-            .log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(_, body)| body["method"] == "exec.cancel"),
-        "no job ID was known for exec.cancel"
-    );
+    // Detaching a caller does not cancel the job. Retain the observation until
+    // Accepted supplies an id, then send a real exec.cancel for the owner pause.
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(header, _)| header.ty == subc_protocol::FrameType::Cancel));
+    assert!(exec_cancels(&daemon).is_empty());
     daemon.acceptance_gate.notify_one();
+    let reply = tokio::time::timeout(Duration::from_secs(2), operation)
+        .await
+        .expect("a real cancellation must settle after acceptance")
+        .unwrap();
+    assert!(reply.success, "{reply:?}");
+    let mut expected = case["reply"]["data"].clone();
+    expected["killed"][0]["task_id"] = serde_json::json!(task);
+    expected["killed"][0]["remote"]["job_id"] = serde_json::json!(id());
+    assert_eq!(reply.data, expected);
+    let cancels = exec_cancels(&daemon);
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0]["params"]["job_id"], id().to_string());
 }
 
 async fn submission_daemon(

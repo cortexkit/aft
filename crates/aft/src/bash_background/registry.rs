@@ -973,7 +973,7 @@ pub struct BgTaskSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
     /// The build server's job ID for a remote (`runon`) task, once the
-    /// runner has accepted it.
+    /// runner has supplied it in progress or acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_job_id: Option<String>,
     /// Where a live remote task is: capturing inputs, queued (and for how long),

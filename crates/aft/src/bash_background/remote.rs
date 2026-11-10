@@ -428,10 +428,19 @@ fn remote_execution_note(remote: &RemoteTask) -> String {
     if remote.requested_network {
         details.push("network".to_string());
     }
-    let mut note = if details.is_empty() {
-        format!("ran remotely on {RUNNER_ID}")
+    let execution = if remote
+        .terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.ran == Some(Ran::None))
+    {
+        format!("command never started on {RUNNER_ID}")
     } else {
-        format!("ran remotely on {RUNNER_ID} ({})", details.join(", "))
+        format!("ran remotely on {RUNNER_ID}")
+    };
+    let mut note = if details.is_empty() {
+        execution
+    } else {
+        format!("{execution} ({})", details.join(", "))
     };
     if remote.requested_network && remote.accepted && !remote.granted_network {
         note.push_str("\nOFFLINE: the runner did not grant the requested network access");
@@ -1805,6 +1814,22 @@ impl OutputSink for TaskSink {
             receiver.set_cap(cap);
         }
         Ok(true)
+    }
+
+    fn submission_job(&mut self, job_id: Uuid) -> io::Result<()> {
+        let unchanged = self
+            .task
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("task lock poisoned"))?
+            .metadata
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.job_id == Some(job_id));
+        if !unchanged {
+            self.commit(|remote| remote.job_id = Some(job_id))?;
+        }
+        Ok(())
     }
 
     fn admission_progress(&mut self, progress: &exec::types::Progress) {
@@ -4885,9 +4910,15 @@ impl BgTaskRegistry {
                     task.task_id,
                 ));
             }
-            return Err(
-                "remote cancellation requested; terminal pending; inspect bash_status (never rerun)".into(),
-            );
+            let job_id = state
+                .metadata
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.job_id)
+                .unwrap();
+            return Err(format!(
+                "remote cancellation pending for job {job_id}; the job may still run until the build server confirms it stopped; inspect bash_status (never rerun)"
+            ));
         }
         drop(state);
         Ok(self.snapshot_with_terminal_cache(task, 8 * 1024))
