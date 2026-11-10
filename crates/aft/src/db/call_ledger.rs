@@ -13,8 +13,8 @@ pub const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 pub const SWEEP_BATCH: usize = 64;
 /// The contract's retention bounds (CONTRACT.md section 7): at most this many
 /// unacked results per custodian and this many expired entries per scope
-/// owner. AFT's custodian is always the scope's owner, so both count the same
-/// column. The oldest entries are dropped first.
+/// owner. The carrier holds custody even when another principal owns the scope.
+/// The oldest entries are dropped first.
 pub const UNACKED_RESULTS_MAX: usize = 1_000;
 pub const EXPIRED_ENTRIES_MAX: usize = 1_000;
 /// Most entries one `late_results` page reads, whatever `limit` asks for, so a
@@ -71,6 +71,7 @@ pub(crate) fn record_running_update(
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
     let scope = row.scope.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let custodian = row.custodian.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     let ordinal: u64 = tx.query_row("SELECT COALESCE(MAX(ordinal),0)+1 FROM call_ledger_updates WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key], |row| row.get(0))?;
     let event_id = cortexkit_role_tool_provider::catalog::composition_digest(&json!([
         key.carrier,
@@ -86,7 +87,7 @@ pub(crate) fn record_running_update(
         &scope.owner,
         &scope.scope_ref,
         scope.scope_epoch,
-        &scope.owner,
+        &custodian,
         &key.call_key,
         format!("held-{event_id}"),
         now.max(0) as u64,
@@ -95,10 +96,10 @@ pub(crate) fn record_running_update(
     entry
         .validate()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    tx.execute("INSERT INTO call_ledger_ack(custodian,last_seq) VALUES (?1,1) ON CONFLICT(custodian) DO UPDATE SET last_seq=last_seq+1", [&scope.owner])?;
-    let seq = head_seq(&tx, &scope.owner)?;
-    tx.execute("INSERT INTO call_ledger_updates(carrier,call_key,approval_key,ordinal,custodian,seq,event_id,settled_at,entry) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![key.carrier,key.call_key,approval_key,ordinal,scope.owner,seq,entry.event_id,now,serde_json::to_string(&entry).expect("held entry is JSON")])?;
-    enforce_retention_bounds(&tx, &scope.owner)?;
+    tx.execute("INSERT INTO call_ledger_ack(custodian,last_seq) VALUES (?1,1) ON CONFLICT(custodian) DO UPDATE SET last_seq=last_seq+1", [&custodian])?;
+    let seq = head_seq(&tx, &custodian)?;
+    tx.execute("INSERT INTO call_ledger_updates(carrier,call_key,approval_key,ordinal,custodian,seq,event_id,settled_at,entry) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![key.carrier,key.call_key,approval_key,ordinal,custodian,seq,entry.event_id,now,serde_json::to_string(&entry).expect("held entry is JSON")])?;
+    enforce_retention_bounds(&tx, &custodian)?;
     tx.commit()?;
     Ok(true)
 }
@@ -154,6 +155,41 @@ CREATE TABLE IF NOT EXISTS call_ledger_ack (
 );
 "#;
 
+pub(super) const CARRIER_CUSTODY_SCHEMA_VERSION: u32 = 29;
+
+/// Relax the owner/custodian equality without changing any existing custody.
+/// Save the child rows before dropping the old table: foreign-key cascades
+/// would otherwise discard rows in `call_ledger_updates` during the rebuild.
+pub(super) fn migrate_carrier_custody(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(r#"
+        CREATE TABLE call_ledger_next (
+            carrier TEXT NOT NULL, call_key TEXT NOT NULL, digest TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('Prepared','Authorized','DispatchStarted','Settled')),
+            owner TEXT, scope_ref TEXT, scope_epoch INTEGER, custodian TEXT,
+            task_id TEXT, withdraw_answer BLOB, frame_type TEXT, frame_body BLOB,
+            outcome TEXT, event_id TEXT NOT NULL, settled_at INTEGER, seq INTEGER,
+            acked INTEGER NOT NULL DEFAULT 0, late_entry TEXT, recovered INTEGER NOT NULL DEFAULT 0,
+            tool_result_source BLOB CHECK(tool_result_source IS NULL OR
+                (typeof(tool_result_source) = 'blob' AND length(tool_result_source) > 0
+                    AND length(tool_result_source) < 3145728)),
+            PRIMARY KEY(carrier,call_key),
+            CHECK ((owner IS NULL AND scope_ref IS NULL AND scope_epoch IS NULL AND custodian IS NULL)
+                OR (owner IS NOT NULL AND scope_ref IS NOT NULL AND scope_epoch IS NOT NULL AND custodian IS NOT NULL))
+        );
+        INSERT INTO call_ledger_next SELECT carrier,call_key,digest,state,owner,scope_ref,scope_epoch,custodian,
+            task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,acked,late_entry,recovered,tool_result_source FROM call_ledger;
+        CREATE TEMP TABLE call_ledger_updates_saved AS SELECT * FROM call_ledger_updates;
+        DROP TABLE call_ledger_updates;
+        DROP TABLE call_ledger;
+        ALTER TABLE call_ledger_next RENAME TO call_ledger;
+        CREATE INDEX idx_call_ledger_retention ON call_ledger(state,settled_at);
+        CREATE INDEX idx_call_ledger_custodian ON call_ledger(custodian,seq);
+        CREATE INDEX idx_call_ledger_task ON call_ledger(task_id);
+    "#)?;
+    conn.execute_batch(HELD_UPDATES_MIGRATION)?;
+    conn.execute_batch("INSERT INTO call_ledger_updates SELECT * FROM call_ledger_updates_saved; DROP TABLE call_ledger_updates_saved;")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
     pub carrier: String,
@@ -207,6 +243,7 @@ pub struct Row {
     pub digest: String,
     pub state: State,
     pub scope: Option<ScopeIdentity>,
+    pub custodian: Option<String>,
     pub task_id: Option<String>,
     pub withdraw_answer: Option<Vec<u8>>,
     pub frame: Option<RecordedFrame>,
@@ -231,9 +268,9 @@ pub fn get(conn: &Connection, key: &Key) -> rusqlite::Result<Option<Row>> {
 
 fn get_impl(conn: &Connection, key: &Key, include_source: bool) -> rusqlite::Result<Option<Row>> {
     let sql = if include_source {
-        "SELECT digest,state,owner,scope_ref,scope_epoch,task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,late_entry,tool_result_source FROM call_ledger WHERE carrier=?1 AND call_key=?2"
+        "SELECT digest,state,owner,scope_ref,scope_epoch,task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,late_entry,custodian,tool_result_source FROM call_ledger WHERE carrier=?1 AND call_key=?2"
     } else {
-        "SELECT digest,state,owner,scope_ref,scope_epoch,task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,late_entry FROM call_ledger WHERE carrier=?1 AND call_key=?2"
+        "SELECT digest,state,owner,scope_ref,scope_epoch,task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,late_entry,custodian FROM call_ledger WHERE carrier=?1 AND call_key=?2"
     };
     conn.query_row(sql, params![key.carrier, key.call_key], |r| {
         let owner: Option<String> = r.get(2)?;
@@ -272,7 +309,8 @@ fn get_impl(conn: &Connection, key: &Key, include_source: bool) -> rusqlite::Res
             settled_at: r.get(11)?,
             seq: r.get(12)?,
             late_entry: r.get(13)?,
-            tool_result_source: if include_source { r.get(14)? } else { None },
+            custodian: r.get(14)?,
+            tool_result_source: if include_source { r.get(15)? } else { None },
         })
     })
     .optional()
@@ -332,7 +370,7 @@ pub fn admit_with_tool_result_source(
     #[cfg(test)]
     run_after_ledger_read(&tx);
     tx.execute("INSERT INTO call_ledger (carrier,call_key,digest,state,owner,scope_ref,scope_epoch,custodian,event_id)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?5,?8)",
+        VALUES (?1,?2,?3,?4,?5,?6,?7,CASE WHEN ?5 IS NULL THEN NULL ELSE ?1 END,?8)",
         params![key.carrier,key.call_key,digest,state.as_str(),scope.map(|s| &s.owner),scope.map(|s| &s.scope_ref),scope.map(|s| s.scope_epoch),new_event_id()])?;
     tx.commit()?;
     crash_point(state);
@@ -604,13 +642,17 @@ fn settle_row(
     let mut seq = None;
     let mut entry = None;
     if let Some(scope) = &row.scope {
-        tx.execute("INSERT INTO call_ledger_ack(custodian,last_seq) VALUES (?1,1) ON CONFLICT(custodian) DO UPDATE SET last_seq=last_seq+1", [&scope.owner])?;
+        let custodian = row
+            .custodian
+            .as_deref()
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        tx.execute("INSERT INTO call_ledger_ack(custodian,last_seq) VALUES (?1,1) ON CONFLICT(custodian) DO UPDATE SET last_seq=last_seq+1", [custodian])?;
         seq = Some(tx.query_row(
             "SELECT last_seq FROM call_ledger_ack WHERE custodian=?1",
-            [&scope.owner],
+            [custodian],
             |r| r.get::<_, u64>(0),
         )?);
-        let mut value = json!({"kind":if reason.is_some() {"not_started"} else {"result"},"owner":scope.owner,"ref":scope.scope_ref,"scope_epoch":scope.scope_epoch,"custodian":scope.owner,"call_key":key.call_key,"event_id":row.event_id,"settled_at":now,"reduced":outcome == "unknown"});
+        let mut value = json!({"kind":if reason.is_some() {"not_started"} else {"result"},"owner":scope.owner,"ref":scope.scope_ref,"scope_epoch":scope.scope_epoch,"custodian":custodian,"call_key":key.call_key,"event_id":row.event_id,"settled_at":now,"reduced":outcome == "unknown"});
         if let Some(reason) = reason {
             value["reason"] = json!(reason);
         } else if outcome == "unknown" {
@@ -624,7 +666,7 @@ fn settle_row(
     tx.execute("UPDATE call_ledger SET state='Settled',frame_type=?3,frame_body=?4,outcome=?5,settled_at=?6,seq=?7,late_entry=?8,withdraw_answer=COALESCE(withdraw_answer,?10),tool_result_source=?11 WHERE carrier=?1 AND call_key=?2 AND state=?9",
         params![key.carrier,key.call_key,frame.type_name(),frame.body,outcome,now,seq,entry,row.state.as_str(),never_ran_answer,tool_result_source])?;
     if let Some(scope) = &row.scope {
-        enforce_retention_bounds(tx, &scope.owner)?;
+        enforce_retention_bounds(tx, custodian)?;
     }
     Ok(())
 }
@@ -1478,6 +1520,73 @@ fn run_before_recovery_read(conn: &Connection, key: &Key) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn schema_29_preserves_schema_28_rows_and_indexes_but_allows_carrier_custody() {
+        use super::*;
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::run_migrations_supported(&mut conn, 28).unwrap();
+        conn.execute_batch("INSERT INTO call_ledger(carrier,call_key,digest,state,owner,scope_ref,scope_epoch,custodian,task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,acked,late_entry,recovered,tool_result_source)
+            VALUES ('broca','old','digest','DispatchStarted','core','worker',7,'core','task',x'0102','Response',x'0304','ok','event',123,4,1,'entry',1,x'7b7d');
+            INSERT INTO call_ledger(carrier,call_key,digest,state,event_id) VALUES ('broca','unscoped','other','Authorized','other-event');
+            INSERT INTO call_ledger_ack(custodian,through_seq,last_seq) VALUES ('core',3,5);
+            INSERT INTO call_ledger_updates(carrier,call_key,approval_key,ordinal,custodian,seq,event_id,settled_at,entry) VALUES ('broca','old','approval',1,'core',5,'update',122,'saved-update');").unwrap();
+        let snapshot = |conn: &Connection, table: &str| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+                .unwrap();
+            stmt.query_map([], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let tables = ["call_ledger", "call_ledger_updates", "call_ledger_ack"];
+        let before: Vec<_> = tables.iter().map(|table| snapshot(&conn, table)).collect();
+        crate::db::run_migrations(&mut conn).unwrap();
+        assert_eq!(crate::db::current_schema_version(&conn).unwrap(), 29);
+        for (table, before) in tables.iter().zip(before) {
+            assert_eq!(
+                snapshot(&conn, table),
+                before,
+                "{table} changed during migration"
+            );
+        }
+        let indexes: usize = conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_call_ledger_retention','idx_call_ledger_custodian','idx_call_ledger_task','idx_call_ledger_updates_cursor')", [], |row| row.get(0)).unwrap();
+        assert_eq!(indexes, 4);
+        let key = Key {
+            carrier: "broca".into(),
+            call_key: "new".into(),
+        };
+        let scope = ScopeIdentity {
+            owner: "core".into(),
+            scope_ref: "worker".into(),
+            scope_epoch: 7,
+        };
+        admit(&conn, &key, "new", Some(&scope), State::DispatchStarted).unwrap();
+        assert_eq!(
+            get(&conn, &key).unwrap().unwrap().custodian.as_deref(),
+            Some("broca")
+        );
+        assert_eq!(
+            get(
+                &conn,
+                &Key {
+                    carrier: "broca".into(),
+                    call_key: "old".into()
+                }
+            )
+            .unwrap()
+            .unwrap()
+            .custodian
+            .as_deref(),
+            Some("core")
+        );
+    }
+
+    #[test]
     fn scope_end_fences_only_matching_pre_dispatch_rows() {
         let conn = database();
         let own = scope("owner-a");
@@ -2046,6 +2155,65 @@ mod tests {
     }
 
     #[test]
+    fn runner_restart_held_shell_recovers_exact_terminal_bytes_or_explicit_unknown() {
+        let conn = database();
+        let scope = scope("core");
+        let held = serde_json::to_vec(&json!({"content":[{"type":"text","text":""}],"held":{"reason":"running","yielded":true}})).unwrap();
+        for (carrier, task) in [("broca", "live-task"), ("lost", "missing-task")] {
+            let key = key(carrier);
+            admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap();
+            link_task(&conn, &key, task).unwrap();
+            hold_running(&conn, &key, task, &held, false).unwrap();
+        }
+        let key = key("broca");
+        conn.execute("INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,started_at,metadata) VALUES('h','s','live-task','p','command','cwd','running',1,?1)", [json!({"call_key":{"requester":key.carrier,"key":key.call_key}}).to_string()]).unwrap();
+        recover(&conn).unwrap();
+        assert_eq!(
+            get(&conn, &key).unwrap().unwrap().state,
+            State::DispatchStarted
+        );
+        let lost = get(&conn, &super::tests::key("lost")).unwrap().unwrap();
+        assert_eq!(lost.state, State::Settled);
+        assert_eq!(lost.frame.unwrap().body, unknown_held_result().body);
+        let ordinary = RecordedFrame {
+            ty: FrameType::Response,
+            body: serde_json::to_vec(
+                &json!({"content":[{"type":"text","text":"real command output"}]}),
+            )
+            .unwrap(),
+        };
+        assert!(observe_task(
+            &conn,
+            &key.carrier,
+            &key.call_key,
+            "live-task",
+            Some(&ordinary),
+            "ok"
+        )
+        .unwrap());
+        assert!(!observe_task(
+            &conn,
+            &key.carrier,
+            &key.call_key,
+            "live-task",
+            Some(&ordinary),
+            "ok"
+        )
+        .unwrap());
+        let row = get(&conn, &key).unwrap().unwrap();
+        assert_eq!(row.frame.unwrap().body, ordinary.body);
+        assert_eq!(row.seq, Some(1));
+        assert_eq!(
+            page(&conn, "core", None, None, now_ms(), usize::MAX)["entries"],
+            json!([])
+        );
+        assert_eq!(
+            page(&conn, "broca", None, None, now_ms(), usize::MAX)["entries"][0]["result"],
+            serde_json::from_slice::<Value>(&ordinary.body).unwrap()
+        );
+    }
+
+    #[test]
     fn call_ledger_expiry_preserves_outcome_identity_and_frozen_answer() {
         let conn = database();
         let key = key("carrier");
@@ -2428,7 +2596,7 @@ mod tests {
     }
 
     #[test]
-    fn every_settlement_yields_its_late_entry_once_and_only_to_the_owner() {
+    fn every_settlement_yields_its_late_entry_once_and_only_to_the_carrier() {
         let conn = database();
         let scope = scope("owner");
         let stamp = Some(&scope);
@@ -2469,14 +2637,14 @@ mod tests {
             [now - RETENTION_MS],
         )
         .unwrap();
-        let reply = page(&conn, "owner", None, None, now, usize::MAX);
+        let reply = page(&conn, "carrier", None, None, now, usize::MAX);
         assert_eq!(reply["more"], false);
         let mut seen: Vec<(String, String, Option<String>, Option<bool>)> = reply["entries"]
             .as_array()
             .unwrap()
             .iter()
             .map(|entry| {
-                assert_eq!(entry["custodian"], "owner");
+                assert_eq!(entry["custodian"], "carrier");
                 assert_eq!(entry["owner"], "owner");
                 (
                     entry["call_key"].as_str().unwrap().to_owned(),
@@ -2527,16 +2695,15 @@ mod tests {
             .find(|e| e["call_key"] == "unobserved")
             .unwrap();
         assert_eq!(unobserved["outcome"], "unknown");
-        // Late entries go only to the scope's owner; a carrier that is not
-        // the owner pages an empty list.
+        // Late entries go only to the carrier; the scope's owner cannot collect them.
         assert_eq!(
-            page(&conn, "carrier", None, None, now, usize::MAX)["entries"],
+            page(&conn, "owner", None, None, now, usize::MAX)["entries"],
             json!([])
         );
         // Reading on from the cursor returns nothing again; acking drops all.
         let cursor = reply["cursor"]["seq"].as_u64().unwrap();
         assert_eq!(
-            page(&conn, "owner", Some(cursor), None, now, usize::MAX)["entries"],
+            page(&conn, "carrier", Some(cursor), None, now, usize::MAX)["entries"],
             json!([])
         );
         let through = Cursor {
@@ -2544,13 +2711,13 @@ mod tests {
             seq: cursor,
         };
         assert_eq!(
-            ack_through(&conn, "owner", "incarnation", &through)
+            ack_through(&conn, "carrier", "incarnation", &through)
                 .unwrap()
                 .unwrap(),
             7
         );
         assert_eq!(
-            page(&conn, "owner", None, None, now, usize::MAX)["entries"],
+            page(&conn, "carrier", None, None, now, usize::MAX)["entries"],
             json!([])
         );
     }
@@ -2574,19 +2741,19 @@ mod tests {
             admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap();
             settle(&conn, &key, &big(size), "ok", None, 100).unwrap();
         }
-        let full = page(&conn, "owner", None, None, 100, usize::MAX);
+        let full = page(&conn, "carrier", None, None, 100, usize::MAX);
         let encoded = |value: &Value| serde_json::to_vec(value).unwrap().len();
-        let one = page(&conn, "owner", None, Some(1), 100, usize::MAX);
+        let one = page(&conn, "carrier", None, Some(1), 100, usize::MAX);
         assert_eq!(one["more"], true);
         let limit = encoded(&one) + 100;
         // `a` fits, `a` and `b` together do not: the page stops before `b`.
-        let first = page(&conn, "owner", None, None, 100, limit);
+        let first = page(&conn, "carrier", None, None, 100, limit);
         assert_eq!(first["more"], true);
         assert_eq!(first["entries"].as_array().unwrap().len(), 1);
         assert_eq!(first["entries"][0]["call_key"], "a");
         assert!(encoded(&first) <= limit);
         let cursor = first["cursor"]["seq"].as_u64();
-        let second = page(&conn, "owner", cursor, None, 100, limit);
+        let second = page(&conn, "carrier", cursor, None, 100, limit);
         assert_eq!(second["entries"][0]["call_key"], "b");
         assert_eq!(second["more"], true);
         // Entry `c` exceeds the limit on its own: it is served with its
@@ -2594,7 +2761,7 @@ mod tests {
         // keeps only the outcome too.
         let third = page(
             &conn,
-            "owner",
+            "carrier",
             second["cursor"]["seq"].as_u64(),
             None,
             100,
@@ -2671,7 +2838,7 @@ mod tests {
             };
             let refused = late_results(
                 &conn,
-                "owner",
+                "carrier",
                 "incarnation",
                 Some(&since),
                 None,
@@ -2682,14 +2849,14 @@ mod tests {
             .unwrap_err();
             assert_eq!(refused.code, "cursor_incarnation_changed");
             assert_eq!(
-                ack_through(&conn, "owner", "incarnation", &since)
+                ack_through(&conn, "carrier", "incarnation", &since)
                     .unwrap()
                     .unwrap_err()
                     .code,
                 "cursor_incarnation_changed"
             );
         }
-        let first = page(&conn, "owner", None, None, 100, usize::MAX);
+        let first = page(&conn, "carrier", None, None, 100, usize::MAX);
         assert_eq!(
             first["entries"].as_array().unwrap().len(),
             LATE_RESULTS_PAGE_MAX as usize
@@ -2699,7 +2866,7 @@ mod tests {
         // Entries past retention are served as expired, bounded per owner.
         let expired = page(
             &conn,
-            "owner",
+            "carrier",
             None,
             Some(1),
             100 + RETENTION_MS,

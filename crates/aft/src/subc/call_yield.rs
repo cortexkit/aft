@@ -311,9 +311,25 @@ pub(crate) fn watch_finished(
     if !state.reserved {
         return false;
     }
+    state.unknown |= state.resume.is_some() && !response.success;
     if let Some((key, structured)) = state.held.take() {
         if let Some(wait) = state.wait.take() {
-            settle_watch(&wait, &key, structured, copy_watch_response(response));
+            if state.unknown {
+                if let Some(db) = wait.ctx.db() {
+                    if let Ok(conn) = db.lock() {
+                        let _ = crate::db::call_ledger::settle(
+                            &conn,
+                            &key,
+                            &crate::db::call_ledger::unknown_held_result(),
+                            "outcome_unknown",
+                            None,
+                            crate::db::call_ledger::now_ms(),
+                        );
+                    }
+                }
+            } else {
+                settle_watch(&wait, &key, structured, copy_watch_response(response));
+            }
         }
     } else {
         state.response = Some(copy_watch_response(response));
@@ -633,6 +649,232 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn recovery_context(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+    ) -> Arc<crate::context::AppContext> {
+        let ctx = Arc::new(crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.into()),
+                storage_dir: Some(storage.into()),
+                harness: Some(crate::harness::Harness::Runner),
+                experimental_bash_background: true,
+                ..Default::default()
+            },
+        ));
+        ctx.update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(db.clone());
+        ctx.bash_background()
+            .set_harness(crate::harness::Harness::Runner);
+        ctx.bash_background().set_db_pool(db);
+        ctx
+    }
+
+    #[test]
+    fn runner_restart_watch_late_result_is_byte_identical_to_an_ordinary_final_frame() {
+        use crate::db::call_ledger as ledger;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = recovery_context(dir.path(), &dir.path().join("storage"));
+        let request = serde_json::from_value(json!({"id":"watch", "command":"bash_watch", "session_id":"worker", "task_id":"bash-fixture", "timeout_ms":3000})).unwrap();
+        let wait = WatchWait::new(
+            ctx.clone(),
+            request,
+            crate::commands::blocking_wait::ReplyBudget::new(std::time::Instant::now(), None),
+            3000,
+        );
+        let key = ledger::Key {
+            carrier: "broca".into(),
+            call_key: "watch".into(),
+        };
+        let scope = ledger::ScopeIdentity {
+            owner: "core".into(),
+            scope_ref: "worker".into(),
+            scope_epoch: 1,
+        };
+        ledger::admit(
+            &ctx.db().unwrap().lock().unwrap(),
+            &key,
+            "digest",
+            Some(&scope),
+            ledger::State::DispatchStarted,
+        )
+        .unwrap();
+        let response = crate::protocol::Response::success(
+            "watch",
+            json!({"output":"real watch output", "status":"completed", "waited":{"elapsed_ms":123,"limit_ms":3000,"reason":"exited"}}),
+        );
+        let format = crate::subc_format::FormatContext::from_tool_call(
+            "bash_watch",
+            &wait.request.params,
+            dir.path(),
+        );
+        let finalizer = |response: &mut crate::protocol::Response, text: &mut String| {
+            crate::response_finalize::finalize_tool_response(
+                response,
+                text,
+                &ctx,
+                "worker",
+                "bash_watch",
+                true,
+            );
+        };
+        let ordinary = crate::run_tool_call::finish_tool_call_response(
+            "bash_watch",
+            &format,
+            copy_watch_response(&response),
+            false,
+            Some(&finalizer),
+            None,
+        );
+        let mut ordinary = super::super::build_tool_response_frame(
+            subc_protocol::PROTOCOL_VERSION,
+            super::super::route_key(1, 1),
+            1,
+            super::super::control_flags(),
+            &ordinary,
+            super::super::wire::ToolResponsePolicy::for_retention(),
+        )
+        .unwrap();
+        ordinary.project_tool_result().unwrap();
+        settle_watch(&wait, &key, true, response);
+        let row = ledger::get(&ctx.db().unwrap().lock().unwrap(), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ledger::State::Settled);
+        assert_eq!(row.frame.unwrap().body, ordinary.frame.body);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_restart_watch_reattaches_after_aft_restart_without_resetting_its_timer() {
+        use crate::db::call_ledger as ledger;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = recovery_context(&root, &storage);
+        let release = root.join("release");
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.02; done; echo restart-released",
+            release.display()
+        );
+        let req = serde_json::from_value(json!({"id":"launch", "command":"bash", "session_id":"restart-worker", "params":{"command":command,"background":true,"timeout":20000}})).unwrap();
+        let launched = crate::commands::bash::handle(&req, &old);
+        assert!(launched.success, "{launched:?}");
+        let task = launched.data["task_id"].as_str().unwrap().to_owned();
+        let metadata = crate::bash_background::persistence::read_task(
+            &old.bash_background()
+                .task_json_path(&task, "restart-worker")
+                .unwrap(),
+        )
+        .unwrap();
+        struct StopChild(i32);
+        impl Drop for StopChild {
+            fn drop(&mut self) {
+                let _ = crate::bash_background::process::terminate_pgid(self.0, None);
+            }
+        }
+        let _stop = StopChild(metadata.pgid.unwrap());
+        let watch: crate::protocol::RawRequest = serde_json::from_value(json!({"id":"watch", "command":"bash_watch", "session_id":"restart-worker", "task_id":task,"timeout_ms":3000})).unwrap();
+        let budget = crate::commands::blocking_wait::ReplyBudget {
+            received_at: std::time::Instant::now() - std::time::Duration::from_millis(750),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        };
+        let wait = WatchWait::new(old.clone(), watch, budget, 3000);
+        let key = ledger::Key {
+            carrier: "broca".into(),
+            call_key: "held-watch".into(),
+        };
+        let scope = ledger::ScopeIdentity {
+            owner: "core".into(),
+            scope_ref: "worker".into(),
+            scope_epoch: 1,
+        };
+        let mut held = json!({"content":[{"type":"text","text":""}],"held":{"reason":"running","yielded":true},"_aft_restart_watch":wait.checkpoint(),"_aft_watch_incarnation":"old-process","_aft_include_structured":true});
+        {
+            let db = old.db().unwrap();
+            let conn = db.lock().unwrap();
+            ledger::admit(
+                &conn,
+                &key,
+                "digest",
+                Some(&scope),
+                ledger::State::DispatchStarted,
+            )
+            .unwrap();
+            ledger::hold_watch(&conn, &key, &serde_json::to_vec(&held).unwrap()).unwrap();
+        }
+        old.bash_background().detach();
+        drop(wait);
+        drop(old);
+        let restarted = recovery_context(&root, &storage);
+        ledger::recover(&restarted.db().unwrap().lock().unwrap()).unwrap();
+        assert_eq!(
+            ledger::get(&restarted.db().unwrap().lock().unwrap(), &key)
+                .unwrap()
+                .unwrap()
+                .state,
+            ledger::State::DispatchStarted
+        );
+        recover_watches(restarted.clone());
+        std::fs::write(release, "").unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            let row = ledger::get(&restarted.db().unwrap().lock().unwrap(), &key)
+                .unwrap()
+                .unwrap();
+            if row.state == ledger::State::Settled {
+                break serde_json::from_slice::<Value>(&row.frame.unwrap().body).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "recovered watch did not settle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_ne!(result["isError"], true, "{result}");
+        assert!(
+            result["content"].to_string().contains("restart-released"),
+            "{result}"
+        );
+        assert!(
+            result["structuredContent"]["waited"]["elapsed_ms"]
+                .as_u64()
+                .unwrap()
+                >= 750,
+            "{result}"
+        );
+        assert_eq!(result["structuredContent"]["waited"]["limit_ms"], 3000);
+        let unknown = ledger::Key {
+            carrier: "broca".into(),
+            call_key: "expired-watch".into(),
+        };
+        held["_aft_restart_watch"]["started_ms"] = json!(ledger::now_ms() - 6000);
+        {
+            let db = restarted.db().unwrap();
+            let conn = db.lock().unwrap();
+            ledger::admit(
+                &conn,
+                &unknown,
+                "other",
+                Some(&scope),
+                ledger::State::DispatchStarted,
+            )
+            .unwrap();
+            ledger::hold_watch(&conn, &unknown, &serde_json::to_vec(&held).unwrap()).unwrap();
+        }
+        recover_watches(restarted.clone());
+        let row = ledger::get(&restarted.db().unwrap().lock().unwrap(), &unknown)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ledger::State::Settled);
+        assert_eq!(row.frame.unwrap().body, ledger::unknown_held_result().body);
+    }
 
     #[test]
     fn runner_restart_refuses_calls_that_have_not_reached_their_wait() {
