@@ -1168,9 +1168,9 @@ pub(super) struct ToolResponsePolicy {
 impl ToolResponsePolicy {
     pub(super) fn model_only_for_bind(
         principal: Option<&str>,
-        call_mode: subc_protocol::call_mode::CallMode,
+        call_mode: &subc_protocol::call_mode::CallMode,
     ) -> bool {
-        call_mode == subc_protocol::call_mode::CallMode::Classic
+        call_mode == &subc_protocol::call_mode::CallMode::Classic
             && principal.is_some_and(|id| LLM_RUNNER_PRINCIPALS.contains(&id))
     }
 
@@ -1237,7 +1237,7 @@ impl From<&super::RouteIdentity> for ToolResponsePolicy {
             tool_result_body: identity.tool_result_body,
             // Programs read arbitrary fields. Only positively identified
             // ordinary calls lose structured data; flow and unknown modes keep it.
-            model_only: Self::model_only_for_bind(principal, identity.call_mode),
+            model_only: Self::model_only_for_bind(principal, &identity.call_mode),
             output_scope: identity.output_scope.get().cloned(),
         }
     }

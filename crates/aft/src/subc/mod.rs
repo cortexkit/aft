@@ -8549,7 +8549,9 @@ async fn handle_control_request(
                         legacy_root: legacy_root.clone(),
                         model_only: wire::ToolResponsePolicy::model_only_for_bind(
                             principal_id(&principal).as_deref(),
-                            call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
+                            call_mode
+                                .as_ref()
+                                .unwrap_or(&subc_protocol::call_mode::CallMode::Classic),
                         ),
                         held_updates: cortexkit_role_tool_provider::consumer_reads_held_update_v1(
                             consumer_capabilities.as_deref(),
