@@ -5,28 +5,28 @@
   "reply": {
     "rows": [
       {
-        "task_id": "bg_foreground",
+        "task_id": "bash-0123456789abcdef",
         "revision": 1,
         "holder": {
           "kind": "agent",
           "agent_id": "agent-alf"
         },
         "session": "session-alf",
-        "call_id": "call-bg_foreground",
+        "call_id": "call-bash-0123456789abcdef",
         "title": "Run focused tests",
-        "command": "TOKEN=[REDACTED] cargo test",
+        "command": "TOKEN=<REDACTED_SECRET> cargo test",
         "cwd": "/work/project",
         "kind": "foreground",
         "state": "running",
         "started_at_ms": 1800000000000,
         "last_output_at_ms": 1800000000250,
         "output_bytes": {
-          "stdout": 36,
+          "stdout": 95,
           "stderr": 0
         }
       },
       {
-        "task_id": "bg_background",
+        "task_id": "bash-1123456789abcdef",
         "revision": 1,
         "holder": {
           "kind": "worker",
@@ -35,10 +35,10 @@
           "execution_id": "bg_worker_cedar"
         },
         "session": "bg_worker_cedar",
-        "call_id": "call-bg_background",
-        "title": "Run focused tests",
-        "command": "TOKEN=[REDACTED] cargo test",
-        "cwd": "/work/project",
+        "call_id": "call-bash-1123456789abcdef",
+        "title": "Check the API package",
+        "command": "cargo check -p api",
+        "cwd": "/work/project/api",
         "kind": "background",
         "state": "running",
         "started_at_ms": 1800000000000,
@@ -49,7 +49,7 @@
         }
       },
       {
-        "task_id": "bg_pty",
+        "task_id": "bash-2123456789abcdef",
         "revision": 1,
         "holder": {
           "kind": "worker",
@@ -58,58 +58,32 @@
           "execution_id": "bg_worker_cedar"
         },
         "session": "bg_worker_cedar",
-        "call_id": "call-bg_pty",
-        "title": "Run focused tests",
-        "command": "TOKEN=[REDACTED] cargo test",
-        "cwd": "/work/project",
+        "call_id": "call-bash-2123456789abcdef",
+        "title": "Inspect terminal progress",
+        "command": "watch cargo test -p terminal",
+        "cwd": "/work/project/terminal",
         "kind": "pty",
         "state": "running",
         "started_at_ms": 1800000000000,
         "last_output_at_ms": 1800000000250,
         "output_bytes": {
-          "stdout": 65552,
+          "stdout": 14,
           "stderr": 0
         }
       },
       {
-        "task_id": "bg_remote",
+        "task_id": "bash-4123456789abcdef",
         "revision": 1,
         "holder": {
           "kind": "agent",
           "agent_id": "agent-alf"
         },
         "session": "session-alf",
-        "call_id": "call-bg_remote",
-        "title": "Run focused tests",
-        "command": "TOKEN=[REDACTED] cargo test",
-        "cwd": "/work/project",
-        "kind": "remote",
-        "remote": {
-          "job_id": "job-before-acceptance",
-          "host": "linux",
-          "phase": "queued"
-        },
-        "state": "queued",
-        "started_at_ms": 1800000000000,
-        "last_output_at_ms": 1800000000250,
-        "output_bytes": {
-          "stdout": 65552,
-          "stderr": 0
-        }
-      },
-      {
-        "task_id": "bg_long_command",
-        "revision": 1,
-        "holder": {
-          "kind": "agent",
-          "agent_id": "agent-alf"
-        },
-        "session": "session-alf",
-        "call_id": "call-bg_long_command",
-        "title": "Run focused tests",
+        "call_id": "call-bash-4123456789abcdef",
+        "title": "Print a generated argument list",
         "command": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
         "command_truncated": true,
-        "cwd": "/work/project",
+        "cwd": "/work/project/tools",
         "kind": "background",
         "state": "running",
         "started_at_ms": 1800000000000,
@@ -120,20 +94,72 @@
         }
       },
       {
-        "task_id": "bg_unattributed",
+        "task_id": "bash-5123456789abcdef",
         "revision": 1,
         "holder": {
           "kind": "unattributed",
           "harness": "opencode"
         },
-        "command": "TOKEN=[REDACTED] cargo test",
-        "cwd": "/work/project",
+        "command": "printf 'plain session\\n'",
+        "cwd": "/work/notes",
         "kind": "background",
         "state": "running",
         "started_at_ms": 1800000000000,
         "last_output_at_ms": 1800000000250,
         "output_bytes": {
           "stdout": 65552,
+          "stderr": 0
+        }
+      },
+      {
+        "task_id": "bash-6123456789abcdef",
+        "revision": 1,
+        "holder": {
+          "kind": "worker",
+          "agent_id": "agent-alf",
+          "scope_ref": "scope:worker-cedar",
+          "execution_id": "bg_worker_cedar"
+        },
+        "session": "bg_worker_cedar",
+        "call_id": "call-bash-6123456789abcdef",
+        "title": "Run remote integration tests",
+        "command": "cargo test --test integration",
+        "cwd": "/work/project/tests",
+        "kind": "remote",
+        "remote": {
+          "job_id": "019a667b-1733-7b62-8291-e39d84af4567",
+          "host": "ovh-1",
+          "phase": "running"
+        },
+        "state": "running",
+        "started_at_ms": 1800000000000,
+        "last_output_at_ms": 1800000000250,
+        "output_bytes": {
+          "stdout": 65552,
+          "stderr": 0
+        }
+      },
+      {
+        "task_id": "bash-3123456789abcdef",
+        "revision": 1,
+        "holder": {
+          "kind": "agent",
+          "agent_id": "agent-alf"
+        },
+        "session": "session-alf",
+        "call_id": "call-bash-3123456789abcdef",
+        "title": "Build the Linux release",
+        "command": "cargo build --release",
+        "cwd": "/work/project/server",
+        "kind": "remote",
+        "remote": {
+          "job_id": "019a667b-1732-7a51-b280-e39d84af0123",
+          "phase": "queued"
+        },
+        "state": "queued",
+        "started_at_ms": 1800000000000,
+        "output_bytes": {
+          "stdout": 0,
           "stderr": 0
         }
       }
