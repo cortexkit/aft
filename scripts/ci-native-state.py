@@ -85,8 +85,9 @@ def setup(root: Path, run_dir: Path) -> None:
     }
     with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
         for key, value in values.items():
-            print(f"{key}={value.as_posix()}", file=env)
-            print(f"{key}={value.as_posix()}")
+            text = value.as_posix() if isinstance(value, Path) else value
+            print(f"{key}={text}", file=env)
+            print(f"{key}={text}")
     # Cancelled runs may never reach finalization. Keep a week's grace for queued
     # consumers, pruning only archives, never Cargo's shared build directory.
     for old in (root / "runs").iterdir():

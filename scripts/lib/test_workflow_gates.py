@@ -572,7 +572,7 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
         self.assertEqual(gate["env"]["AFT_GATE_PHASES"], "lib-shard")
         self.assertEqual(gate["env"]["AFT_UNIT_TEST_RUNNER"], "nextest")
         self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/6")
-        self.assertEqual(gate["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ runner.temp }}/windows-nextest.tar.zst")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst")
         self.assertEqual(shard["needs"], "unit-windows-nextest-archive")
 
 
