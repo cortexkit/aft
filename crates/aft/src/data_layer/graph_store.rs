@@ -346,11 +346,17 @@ impl<'i> SectionsWriter<'i> {
         subjects: &mut HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
     ) -> BuiltFragment {
         let facts = super::callgraph::CheckoutFacts { inputs };
-        let (key, parse) = &inputs.parses[file];
-        let slice = FileSlice::build(file, key, parse, resolution);
+        // Publication reads each fragment's parse once. Keeping newly decoded
+        // parses in the shared input slots would hand that serialization scratch
+        // to the next engine, even after a broad refresh released it.
+        let (key, parse) = inputs
+            .parses
+            .read(file)
+            .expect("a resolved file has a parse");
+        let slice = FileSlice::build(file, &key, &parse, resolution);
         let mut terms = slice_terms(&slice);
         terms.extend(input_terms(resolution, &facts, subjects));
-        terms.extend(method_terms(parse));
+        terms.extend(method_terms(&parse));
         let bytes = super::fragment::encode(resolution);
         #[cfg(test)]
         let bytes = if self.legacy {
@@ -373,7 +379,7 @@ impl<'i> SectionsWriter<'i> {
             .collect::<Vec<_>>();
         fact_subjects.sort_unstable();
         fact_subjects.dedup();
-        let fragment = fragment_key(key, file, &bytes, &fact_subjects);
+        let fragment = fragment_key(&key, file, &bytes, &fact_subjects);
         BuiltFragment {
             fragment,
             bytes,

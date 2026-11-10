@@ -362,6 +362,10 @@ struct GraphEngine {
     overlay: OverlaySlices<Arc<StoredSlices>>,
     /// What the overlay replaces and removes, for the dead-code snapshot.
     refreshed: Refreshed,
+    /// A refresh measured the overlay, or a broad publication discarded
+    /// substantial state. The publication must replace that size estimate;
+    /// small publications otherwise keep the ordinary measurement cadence.
+    measure_after_publication: bool,
 }
 
 impl GraphEngine {
@@ -392,13 +396,23 @@ impl GraphEngine {
         if configs != self.live.inputs.configs {
             return Err("the publication's configuration differs from the engine's".to_string());
         }
-        let live = self
+        let broad = self.applied.len() > ENGINE_DECODED_FILES
+            || self.refreshed.replaced.len() > ENGINE_DECODED_FILES;
+        let mut live = self
             .live
             .rebased(to.state.clone(), Arc::clone(&to.graph))
             .map_err(str::to_string)?;
+        // Changed parses could not be released before publication. The rebased
+        // slots now read from storage and are unshared, so the same decoded-file
+        // bound can release those too, without losing bindings or method inputs.
+        let release_parses = live.inputs.parses.decoded_count() > ENGINE_DECODED_FILES;
+        if release_parses {
+            live.inputs.parses.release_decoded();
+        }
         Ok(Self {
             published: Arc::clone(to),
             live,
+            measure_after_publication: self.measure_after_publication || broad || release_parses,
             applied: BTreeMap::new(),
             overlay: OverlaySlices::new(Arc::clone(&to.graph)),
             refreshed: Refreshed {
@@ -2535,9 +2549,12 @@ impl Checkout {
         // against the budget every checkout's engine shares.
         let kept = stats.is_some().then(|| {
             self.layer.engines.touch(&self.engine);
-            slot.as_ref()
+            slot.as_mut()
                 .filter(|_| self.layer.engines.measure_due(&self.engine))
-                .map(GraphEngine::census_bytes)
+                .map(|engine| {
+                    engine.measure_after_publication = true;
+                    engine.census_bytes()
+                })
         });
         drop(slot);
         if let Some(bytes) = kept {
@@ -3057,12 +3074,11 @@ impl Checkout {
         self.touch_memory();
         let started = Instant::now();
         match engine.rebased(to, applied) {
-            Ok(engine) => {
-                let bytes = self
-                    .layer
-                    .engines
-                    .measure_due(&self.engine)
-                    .then(|| engine.census_bytes());
+            Ok(mut engine) => {
+                let bytes = (engine.measure_after_publication
+                    || self.layer.engines.measure_due(&self.engine))
+                .then(|| engine.census_bytes());
+                engine.measure_after_publication = false;
                 *slot = Some(engine);
                 drop(slot);
                 self.layer.engines.kept(&self.engine, bytes);
@@ -3087,6 +3103,13 @@ impl Checkout {
     pub fn engine_census_bytes(&self) -> Option<u64> {
         let slot = self.engine.try_lock().ok()?;
         slot.as_ref().map(GraphEngine::census_bytes)
+    }
+
+    /// The keeper's cached size estimate, for comparing it with a fresh census.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn engine_budget_bytes(&self) -> u64 {
+        self.engine.budget_bytes()
     }
 
     /// How many call-graph engines refreshes of this checkout have started:
@@ -3342,6 +3365,7 @@ impl Checkout {
         )
         .map_err(|error| DataError::Resolve(error.to_string()))?;
         Ok(GraphEngine {
+            measure_after_publication: false,
             published: Arc::clone(published),
             live,
             applied: BTreeMap::new(),
@@ -5059,6 +5083,7 @@ impl Checkout {
                         applied,
                         overlay,
                         refreshed,
+                        measure_after_publication: _,
                     } = engine;
                     // The engine started from the publication the checkout
                     // serves, counted above, unless a newer one replaced it
@@ -5097,6 +5122,7 @@ impl Checkout {
             applied,
             overlay,
             refreshed,
+            measure_after_publication: _,
         } = engine.as_ref()?;
         let mut seen = aft_store::heap::Seen::new();
         let mut parts = resolution.memory_parts(&mut seen);
@@ -6506,6 +6532,84 @@ pub fn other() { callee(); }
             callers.contains("more") && callers.contains("third"),
             "{callers}"
         );
+    }
+
+    #[test]
+    fn a_broad_publication_bounds_decoded_parses_and_replaces_its_budget_measurement() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let files = ENGINE_DECODED_FILES + 16;
+        let source = (0..80)
+            .map(|n| format!("pub fn item_{n}() {{}}\n"))
+            .collect::<String>();
+        write(
+            root.path(),
+            "Cargo.toml",
+            "[package]\nname='broad'\nversion='0.1.0'\n",
+        );
+        let modules = (0..files)
+            .map(|n| format!("mod file_{n};\n"))
+            .collect::<String>();
+        write(root.path(), "src/lib.rs", &modules);
+        for n in 0..files {
+            write(root.path(), &format!("src/file_{n}.rs"), &source);
+        }
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        for n in 0..files {
+            edit(
+                &checkout,
+                &format!("src/file_{n}.rs"),
+                &format!("{source}\npub fn extra() {{}}\n"),
+            );
+        }
+        checkout.refresh_callgraph().unwrap().expect("applied");
+        let before = checkout.engine_budget_bytes();
+        assert!(before > 0);
+        checkout.publish_changes().unwrap().expect("published");
+        let held = checkout.engine_census_bytes().expect("kept");
+        assert_eq!(
+            checkout.engine_budget_bytes(),
+            held,
+            "must not keep the overlay's cached size"
+        );
+        let decoded = checkout
+            .inspect_engine(|engine| engine.inputs.parses.decoded_count())
+            .unwrap()
+            .unwrap();
+        assert!(
+            decoded <= ENGINE_DECODED_FILES,
+            "kept {decoded} decoded parses"
+        );
+        // Bound the whole retained heap as well as its decoded entry count;
+        // the fixture has eighty files with eighty tiny definitions each.
+        assert!(held < 8 << 20, "kept {held} bytes after publication");
+        assert!(
+            held < before,
+            "publication did not release overlay state: {before} -> {held}"
+        );
+        assert_eq!(checkout.engine_starts(), 1);
+        edit(
+            &checkout,
+            "src/file_0.rs",
+            &format!("{source}\npub fn later() {{}}\n"),
+        );
+        checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("next edit applied");
+        let estimated = checkout.engine_budget_bytes();
+        checkout
+            .publish_changes()
+            .unwrap()
+            .expect("published again");
+        assert_eq!(
+            checkout.engine_budget_bytes(),
+            estimated,
+            "a small publication inside the measurement interval must not walk again"
+        );
+        assert_eq!(checkout.engine_starts(), 1);
     }
 
     /// Waits up to ten seconds for `holds` to turn false.

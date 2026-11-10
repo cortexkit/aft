@@ -126,6 +126,11 @@ impl Drop for EngineSlot {
 }
 
 impl EngineSlot {
+    /// The cached census figure the budget currently charges to this slot.
+    pub(super) fn budget_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Acquire)
+    }
+
     /// Notes that a refresh started a new engine in this slot, which is
     /// measured when it is first kept.
     pub(super) fn note_start(&self) {

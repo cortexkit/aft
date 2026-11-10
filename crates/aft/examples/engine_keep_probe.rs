@@ -203,6 +203,7 @@ impl RssPeak {
 fn components(checkout: &Checkout) -> serde_json::Value {
     serde_json::json!({
         "census_bytes": checkout.engine_census_bytes(),
+        "budget_bytes": checkout.engine_budget_bytes(),
         "parts_bytes": checkout.engine_memory_parts().map(|parts| {
             parts.into_iter().collect::<std::collections::BTreeMap<_, _>>()
         }),
@@ -299,13 +300,18 @@ fn roots(mut args: impl Iterator<Item = String>) {
                 let cpu = cpu_seconds() - cpu;
                 let peak_rss = peak.take();
                 let before = components(checkout);
+                let publish_cpu = cpu_seconds();
+                let publish_wall = Instant::now();
                 assert!(checkout.publish_changes().unwrap().is_some());
+                let publish_wall_s = publish_wall.elapsed().as_secs_f64();
+                let publish_cpu_s = cpu_seconds() - publish_cpu;
                 println!(
                     "{}",
                     serde_json::json!({
                         "event": "semantic_warmup", "reverse": reverse, "root": index, "paths": paths.len(), "changed_paths": changed_paths,
                         "cpu_s": cpu, "wall_s": wall, "rss_before_bytes": rss_before,
                         "peak_rss_bytes": peak_rss, "before_publish": before,
+                        "publish_wall_s": publish_wall_s, "publish_cpu_s": publish_cpu_s,
                         "after_publish": components(checkout),
                     })
                 );
@@ -388,8 +394,10 @@ fn roots(mut args: impl Iterator<Item = String>) {
                 }
                 let before_publish = components(checkout);
                 let publication = Instant::now();
+                let publish_cpu = cpu_seconds();
                 let published = checkout.publish_changes().unwrap().is_some();
                 let publish_wall = publication.elapsed().as_secs_f64();
+                let publish_cpu = cpu_seconds() - publish_cpu;
                 assert!(published);
                 let released = checkouts
                     .iter()
@@ -406,7 +414,7 @@ fn roots(mut args: impl Iterator<Item = String>) {
                         "event": "refresh_publish", "budget_mib": budget_mib,
                         "round": round, "root": index, "started": started, "restarted": restarted,
                         "missing_before": missing, "released_roots": released,
-                        "wall_s": wall, "cpu_s": cpu, "publish_wall_s": publish_wall,
+                        "wall_s": wall, "cpu_s": cpu, "publish_wall_s": publish_wall, "publish_cpu_s": publish_cpu,
                         "rss_bytes": rss_bytes(), "rss_before_bytes": rss_before, "peak_rss_bytes": peak_rss,
                         "before_publish": before_publish, "after_publish": components(checkout),
                     })
