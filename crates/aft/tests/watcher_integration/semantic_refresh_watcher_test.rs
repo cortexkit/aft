@@ -701,7 +701,7 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
 
     let quiet_ms = std::ffi::OsStr::new("2000");
     let mut borrower =
-        AftProcess::spawn_with_real_watcher_env(&[("AFT_SEMANTIC_QUIET_WINDOW_MS", quiet_ms)]);
+        AftProcess::spawn_with_real_watcher_env(&[("AFT_TEST_DATA_QUIET_MS", quiet_ms)]);
     let configured = configure_semantic_openai_with_overlay(
         &mut borrower,
         &worktree,
@@ -728,9 +728,14 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     )
     .expect("edit borrow-only source");
     wait_for_semantic_status(&mut borrower, "borrow-only semantic mask", |response| {
-        response["semantic_index"]["status"] == "ready"
-            && response["semantic_index"]["files_embedded"] == 0
-            && response["semantic_index"]["chunks_embedded"] == 0
+        // Masking the sole borrowed file leaves no vectors to serve. The
+        // index store reports the semantic index's stage as filling, without
+        // scheduling a fill for a borrow-only checkout.
+        response["semantic_index"]["status"] == "building"
+            && response["semantic_index"]["stage"] == "filling"
+            && response["semantic_index"]["entries_done"] == 0
+            && response["semantic_index"]["entries_total"] == 1
+            && response["semantic_index"]["filling"] == false
     });
 
     let storm = worktree.join("storm");
@@ -753,8 +758,8 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     server.reset_requests();
     let gate = storage.path().join("semantic-quiet-gate");
     let mut overlay = AftProcess::spawn_with_real_watcher_env(&[
-        ("AFT_SEMANTIC_QUIET_WINDOW_MS", quiet_ms),
-        ("AFT_TEST_SEMANTIC_QUIET_GATE", gate.as_os_str()),
+        ("AFT_TEST_DATA_QUIET_MS", quiet_ms),
+        ("AFT_TEST_DATA_QUIET_GATE", gate.as_os_str()),
     ]);
     let configured = configure_semantic_openai_with_overlay(
         &mut overlay,
@@ -835,6 +840,11 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
         let _ = status(&mut overlay);
         thread::sleep(Duration::from_millis(10));
     }
+    wait_for_semantic_status(&mut overlay, "storm fill completed", |response| {
+        response["semantic_index"]["status"] == "ready"
+            && response["semantic_index"]["filling"] == false
+            && response["data_store"]["pending_edits"] == 0
+    });
     assert!(
         server.non_probe_requests().is_empty(),
         "overlay storm files gone inside the quiet window must not be embedded"

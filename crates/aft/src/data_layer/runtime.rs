@@ -1060,13 +1060,16 @@ impl DataCheckout {
         });
         let quiet = {
             let work = Arc::downgrade(&work);
-            Arc::new(QuietTimer::new(quiet_period, move || {
+            let timer = QuietTimer::new(quiet_period, move || {
                 if let Some(work) = work.upgrade() {
                     work.start_refresh(Publish::Always);
                     // Edited files wait for vectors of their new content.
                     work.start_fill();
                 }
-            }))
+            });
+            #[cfg(feature = "test-timing-hooks")]
+            let timer = timer.with_test_gate();
+            Arc::new(timer)
         };
         let listener: Arc<dyn WriteIntentListener> = Arc::new(EditListener {
             checkout: Arc::downgrade(&work.checkout),
@@ -1175,6 +1178,8 @@ struct QuietTimer {
     /// instead of sleeping out its deadline.
     stopped: std::sync::Mutex<bool>,
     wake: std::sync::Condvar,
+    #[cfg(feature = "test-timing-hooks")]
+    test_gate: bool,
 }
 
 impl QuietTimer {
@@ -1187,6 +1192,8 @@ impl QuietTimer {
             fire: Box::new(fire),
             stopped: std::sync::Mutex::new(false),
             wake: std::sync::Condvar::new(),
+            #[cfg(feature = "test-timing-hooks")]
+            test_gate: false,
         }
     }
 
@@ -1217,6 +1224,33 @@ impl QuietTimer {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    #[cfg(feature = "test-timing-hooks")]
+    fn with_test_gate(mut self) -> Self {
+        self.test_gate = true;
+        self
+    }
+
+    /// Hold only the semantic quiet timer, not publication's settle timer.
+    /// Changes continue moving its deadline while the integration test writes
+    /// and removes a burst; the deadline is checked again after release.
+    #[cfg(feature = "test-timing-hooks")]
+    fn hold_for_test(&self) -> Option<PathBuf> {
+        if !self.test_gate {
+            return None;
+        }
+        let gate = PathBuf::from(std::env::var_os("AFT_TEST_DATA_QUIET_GATE")?);
+        if !gate.exists() {
+            return None;
+        }
+        std::fs::write(gate.with_extension("waiting"), b"waiting").expect("signal quiet gate");
+        while gate.exists() && !gate.with_extension("release").exists() {
+            if self.sleep(Duration::from_millis(10)) {
+                return None;
+            }
+        }
+        Some(gate)
+    }
+
     /// Notes a recorded change, and starts the timer thread unless one is
     /// waiting already.
     fn changed(self: &Arc<Self>) {
@@ -1245,33 +1279,45 @@ impl QuietTimer {
         let quiet_ms = u64::try_from(self.quiet.as_millis()).unwrap_or(u64::MAX);
         let spawned = std::thread::Builder::new()
             .name("aft-data-quiet".to_string())
-            .spawn(move || loop {
-                let due = timer
-                    .last_change_ms
-                    .load(Ordering::Acquire)
-                    .saturating_add(quiet_ms);
-                let now = timer.now_ms();
-                if now < due {
-                    if timer.sleep(Duration::from_millis(due - now)) {
-                        break;
+            .spawn(move || {
+                #[cfg(feature = "test-timing-hooks")]
+                let gate = timer.hold_for_test();
+                if timer.sleep(Duration::ZERO) {
+                    return;
+                }
+                loop {
+                    let due = timer
+                        .last_change_ms
+                        .load(Ordering::Acquire)
+                        .saturating_add(quiet_ms);
+                    let now = timer.now_ms();
+                    if now < due {
+                        if timer.sleep(Duration::from_millis(due - now)) {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
+                    timer.armed.store(false, Ordering::Release);
+                    // A change recorded between the deadline check and letting
+                    // go of the flag found the timer armed and started none; if
+                    // there was one, this thread keeps waiting for it.
+                    if timer
+                        .last_change_ms
+                        .load(Ordering::Acquire)
+                        .saturating_add(quiet_ms)
+                        > timer.now_ms()
+                        && !timer.armed.swap(true, Ordering::AcqRel)
+                    {
+                        continue;
+                    }
+                    (timer.fire)();
+                    #[cfg(feature = "test-timing-hooks")]
+                    if let Some(gate) = &gate {
+                        std::fs::write(gate.with_extension("settled"), b"settled")
+                            .expect("signal quiet fire");
+                    }
+                    break;
                 }
-                timer.armed.store(false, Ordering::Release);
-                // A change recorded between the deadline check and letting
-                // go of the flag found the timer armed and started none; if
-                // there was one, this thread keeps waiting for it.
-                if timer
-                    .last_change_ms
-                    .load(Ordering::Acquire)
-                    .saturating_add(quiet_ms)
-                    > timer.now_ms()
-                    && !timer.armed.swap(true, Ordering::AcqRel)
-                {
-                    continue;
-                }
-                (timer.fire)();
-                break;
             });
         if spawned.is_err() {
             self.armed.store(false, Ordering::Release);
