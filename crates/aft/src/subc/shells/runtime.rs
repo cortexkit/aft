@@ -2,8 +2,8 @@ use super::super::{
     route_key, send_provider_error, send_reliable_writer_frame, App, DispatchPathMetrics, Executor,
     Frame, FrameType, ManagementIdentity, RouteChannel, SubcError, WriterSender,
 };
-use super::{admission, output::Chunker, state, wire::*};
-use crate::bash_background::persistence::{BgMode, TaskArtifact};
+use super::{admission, state, wire::*};
+use crate::bash_background::persistence::BgMode;
 use crate::bash_background::registry::ShellReader;
 use crate::bash_background::BgTaskStatus;
 use crate::db::access_grant_rows::GrantHolder;
@@ -145,8 +145,9 @@ impl Service {
                 let tx = tx.clone();
                 let metrics = metrics.clone();
                 let frame = frame.clone();
+                let response_guard = super::super::ResponseTaskGuard::new(&metrics);
                 tokio::spawn(async move {
-                    let _response = super::super::ResponseTaskGuard::new(&metrics);
+                    let _response = response_guard;
                     service.refresh(true).await;
                     let result = match service.list(params).await {
                         Ok(reply) => {
@@ -172,8 +173,9 @@ impl Service {
                 let tx = tx.clone();
                 let metrics = metrics.clone();
                 let frame = frame.clone();
+                let response_guard = super::super::ResponseTaskGuard::new(&metrics);
                 tokio::spawn(async move {
-                    let _response = super::super::ResponseTaskGuard::new(&metrics);
+                    let _response = response_guard;
                     service.refresh(true).await;
                     let status = state::filtered_status(
                         &service.state.read().await.status,
@@ -203,22 +205,39 @@ impl Service {
                 );
                 let cancel = CancellationToken::new();
                 let (done, completion) = watch::channel(false);
-                self.subscriptions.lock().await.insert(
+                let mut subscriptions = self.subscriptions.lock().await;
+                if subscriptions.contains_key(&key) {
+                    drop(subscriptions);
+                    return send_provider_error(
+                        tx,
+                        metrics,
+                        frame,
+                        admission::invalid("request correlation is already active"),
+                    )
+                    .await;
+                }
+                subscriptions.insert(
                     key,
                     Subscription {
                         cancel: cancel.clone(),
                         done: completion,
                     },
                 );
+                drop(subscriptions);
                 let service = self.clone();
                 let tx = tx.clone();
                 let metrics = metrics.clone();
                 let frame = frame.clone();
                 let route_cancel = identity.shells_cancel.0.clone();
+                let response_guard = super::super::ResponseTaskGuard::new(&metrics);
                 tokio::spawn(async move {
-                    let _response = super::super::ResponseTaskGuard::new(&metrics);
+                    let _response = response_guard;
                     let result = std::panic::AssertUnwindSafe(async {
-                        service.refresh(true).await;
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(true),
+                            _ = route_cancel.cancelled() => return Ok(true),
+                            _ = service.refresh(true) => {},
+                        }
                         match request {
                             admission::Request::Watch(params) => service
                                 .watch(&tx, &metrics, &frame, params, &cancel, &route_cancel)
@@ -409,8 +428,8 @@ impl Service {
         route: &CancellationToken,
     ) -> Result<bool, SubcError> {
         let initial = self.state.read().await.rows.get(&params.task_id).cloned();
-        let registry = self.sources.read().await.get(&params.task_id).cloned();
-        let (Some(mut row), Some(registry)) = (initial, registry) else {
+        let reader = self.sources.read().await.get(&params.task_id).cloned();
+        let (Some(row), Some(reader)) = (initial, reader) else {
             send_provider_error(
                 tx,
                 metrics,
@@ -420,188 +439,45 @@ impl Service {
             .await?;
             return Ok(false);
         };
-        let max = params.max_chunk_bytes.unwrap_or(DEFAULT_CHUNK_BYTES);
-        let ansi = params.ansi.unwrap_or_else(|| "strip".into());
-        let pty = row.kind == "pty";
-        let stdout_artifact = if pty {
-            TaskArtifact::Pty
-        } else {
-            TaskArtifact::Stdout
+        let stop = CancellationToken::new();
+        let _stop = stop.clone().drop_guard();
+        let task_id = params.task_id.clone();
+        let open = tokio::task::spawn_blocking(move || {
+            super::capture::Capture::open(reader.with_stop(stop), &row, params)
+        });
+        let opened = tokio::select! {
+            _ = cancel.cancelled() => return Ok(true),
+            _ = route.cancelled() => return Ok(true),
+            result = open => result.expect("shell capture reader panicked"),
         };
-        let mut starts = Offsets {
-            stdout: super::output::backfill_start(
-                row.output_bytes.stdout,
-                params.from_offset.as_ref().map(|offset| offset.stdout),
-            ),
-            stderr: super::output::backfill_start(
-                row.output_bytes.stderr,
-                params.from_offset.as_ref().map(|offset| offset.stderr),
-            ),
+        let (mut capture, start) = match opened {
+            Ok(capture) => capture,
+            Err(error) => {
+                send_provider_error(tx, metrics, frame, error).await?;
+                return Ok(false);
+            }
         };
-        if params.from_offset.as_ref().is_some_and(|offset| {
-            offset.stdout > row.output_bytes.stdout || offset.stderr > row.output_bytes.stderr
-        }) {
-            send_provider_error(
-                tx,
-                metrics,
-                frame,
-                admission::invalid("from_offset exceeds the captured stream"),
-            )
-            .await?;
-            return Ok(false);
-        }
-        for (artifact, offset) in [
-            (stdout_artifact, &mut starts.stdout),
-            (TaskArtifact::Stderr, &mut starts.stderr),
-        ] {
-            if *offset > 0 {
-                let edge = registry
-                    .shell_read(&params.task_id, artifact, *offset, 4)
-                    .unwrap_or_default();
-                let continuation = edge.iter().take_while(|byte| **byte & 0xc0 == 0x80).count();
-                if continuation > 0 && params.from_offset.is_some() {
-                    send_provider_error(
-                        tx,
-                        metrics,
-                        frame,
-                        admission::invalid("from_offset must be a UTF-8 boundary"),
-                    )
-                    .await?;
-                    return Ok(false);
-                }
-                *offset += continuation as u64;
-            }
-        }
-        let mut stdout = Chunker::new(starts.stdout, max, ansi == "keep");
-        let mut stderr = Chunker::new(starts.stderr, max, ansi == "keep");
-        for (artifact, chunker) in [
-            (stdout_artifact, &mut stdout),
-            (TaskArtifact::Stderr, &mut stderr),
-        ] {
-            if chunker.offset() > 0 {
-                let prefix = registry
-                    .shell_read(&params.task_id, artifact, 0, chunker.offset())
-                    .unwrap_or_default();
-                chunker.resume_escape(&prefix);
-            }
-        }
-        let truncated_before = (starts.stdout > 0 || starts.stderr > 0).then_some(starts);
-        send(
-            tx,
-            metrics,
-            frame,
-            FrameType::StreamData,
-            &OutputFrame::Start {
-                task_id: params.task_id.clone(),
-                ansi,
-                truncated_before,
-            },
-        )
-        .await?;
-        let mut screen_at = tokio::time::Instant::now() - Duration::from_secs(1);
-        let mut previous_screen = None;
+        send(tx, metrics, frame, FrameType::StreamData, &start).await?;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(true),
                 _ = route.cancelled() => return Ok(true),
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {},
             }
-            if let Some(current) = self.state.read().await.rows.get(&params.task_id).cloned() {
-                row = current;
-            } else {
+            let Some(row) = self.state.read().await.rows.get(&task_id).cloned() else {
                 return Ok(true);
+            };
+            let read = tokio::task::spawn_blocking(move || capture.read(row));
+            let (next, frames, finished) = tokio::select! {
+                _ = cancel.cancelled() => return Ok(true),
+                _ = route.cancelled() => return Ok(true),
+                result = read => result.expect("shell capture reader panicked"),
+            };
+            capture = next;
+            for data in frames {
+                send(tx, metrics, frame, FrameType::StreamData, &data).await?;
             }
-            let terminal = row.state == "ended";
-            let longest = registry.shell_longest_secret(&params.task_id);
-            for (stream, artifact, chunker) in [
-                ("stdout", stdout_artifact, &mut stdout),
-                ("stderr", TaskArtifact::Stderr, &mut stderr),
-            ] {
-                let pending = chunker.read_offset().saturating_sub(chunker.offset()) as usize;
-                let want = (max + longest + 8).saturating_sub(pending);
-                let bytes = registry
-                    .shell_read(
-                        &params.task_id,
-                        artifact,
-                        chunker.read_offset(),
-                        want as u64,
-                    )
-                    .unwrap_or_default();
-                chunker.append(&bytes);
-                let length = if stream == "stdout" {
-                    row.output_bytes.stdout
-                } else {
-                    row.output_bytes.stderr
-                };
-                let at_end = terminal && chunker.read_offset() >= length;
-                if let Some(data) = chunker
-                    .next(stream, at_end, longest, |from, to| {
-                        Ok::<_, std::convert::Infallible>(registry.shell_masked_range(
-                            &params.task_id,
-                            artifact,
-                            from,
-                            to,
-                        ))
-                    })
-                    .unwrap()
-                {
-                    send(tx, metrics, frame, FrameType::StreamData, &data).await?;
-                }
-            }
-            if pty && screen_at.elapsed() >= Duration::from_millis(500) {
-                if let Some((rows, cols)) = registry.shell_dimensions(&params.task_id) {
-                    let end = if terminal {
-                        stdout.read_offset()
-                    } else {
-                        stdout.read_offset().saturating_sub(longest as u64)
-                    };
-                    let mut masked = String::new();
-                    let mut from = 0;
-                    while from < end {
-                        let to = (from + DEFAULT_CHUNK_BYTES as u64).min(end);
-                        masked.push_str(&registry.shell_masked_range(
-                            &params.task_id,
-                            stdout_artifact,
-                            from,
-                            to,
-                        ));
-                        from = to;
-                    }
-                    let lines = crate::pty_render::render_screen(masked.as_bytes(), rows, cols)
-                        .split('\n')
-                        .map(str::to_owned)
-                        .collect();
-                    let mut parser = vt100::Parser::new(rows, cols, 0);
-                    parser.process(masked.as_bytes());
-                    let (cursor_row, cursor_col) = parser.screen().cursor_position();
-                    let screen = OutputFrame::Screen {
-                        rows: rows as usize,
-                        cols: cols as usize,
-                        lines,
-                        cursor: ScreenCursor {
-                            row: cursor_row as usize,
-                            col: cursor_col as usize,
-                        },
-                    };
-                    if previous_screen.as_ref() != Some(&screen) {
-                        send(tx, metrics, frame, FrameType::StreamData, &screen).await?;
-                        previous_screen = Some(screen);
-                    }
-                }
-                screen_at = tokio::time::Instant::now();
-            }
-            if terminal
-                && stdout.offset() >= row.output_bytes.stdout
-                && stderr.offset() >= row.output_bytes.stderr
-            {
-                send(
-                    tx,
-                    metrics,
-                    frame,
-                    FrameType::StreamData,
-                    &OutputFrame::End { row },
-                )
-                .await?;
+            if finished {
                 return Ok(true);
             }
         }

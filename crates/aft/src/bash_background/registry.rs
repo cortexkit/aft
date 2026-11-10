@@ -1251,7 +1251,7 @@ pub(crate) struct ScopeKillReport {
 mod scratch_retention;
 #[path = "shell_registry.rs"]
 mod shell_registry;
-pub(crate) use shell_registry::{ShellReader, ShellSnapshot};
+pub(crate) use shell_registry::{ShellReader, ShellSnapshot, SHELL_MASK_WITHHELD};
 #[path = "task_image_cleanup.rs"]
 mod task_image_cleanup;
 

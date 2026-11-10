@@ -101,6 +101,57 @@ pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     redact_with_range(text, None)
 }
 
+const SHELL_FORMAT_TRIGGERS: &[&str] = &[
+    "PRIVATE KEY-----",
+    "xox",
+    "x-api-key",
+    "\"",
+    "secret_access_key",
+    "authorization",
+    "github_pat_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "sk-",
+    "eyJ",
+    "AKIA",
+    "ASIA",
+    "AGPA",
+    "AIDA",
+    "AROA",
+    "://",
+    "?",
+    "&",
+];
+
+/// A conservative prefilter, not a second masker. A complete capture with no
+/// trigger cannot contain any format recognized by `redact_with_range`.
+pub(crate) fn shells_may_need_format_context(text: &str) -> bool {
+    SHELL_FORMAT_TRIGGERS
+        .iter()
+        .any(|trigger| contains_ignore_ascii_case(text, trigger))
+}
+
+pub(crate) fn shells_format_scan_overlap() -> usize {
+    SHELL_FORMAT_TRIGGERS
+        .iter()
+        .map(|trigger| trigger.len())
+        .max()
+        .unwrap_or(1)
+        - 1
+}
+
+static SHELL_PRIVATE_BOUNDARY: LazyLock<Regex> =
+    LazyLock::new(|| compile(r"-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----"));
+
+pub(crate) fn shells_private_boundary_before(text: &str, before: usize) -> bool {
+    SHELL_PRIVATE_BOUNDARY
+        .find_iter(text)
+        .any(|marker| marker.end() <= before)
+}
+
 // Shell-command credential shapes. These are applied only to command text
 // (see [`redact_command`]), not to every log line: AFT's own structured log
 // fields are lowercase `key=value` pairs and must stay readable.
@@ -2017,6 +2068,25 @@ mod tests {
     fn fixture() -> Fixture {
         serde_json::from_str(include_str!("../tests/fixtures/log_redaction_cases.json"))
             .expect("shared redaction fixture parses")
+    }
+
+    #[test]
+    fn shells_v1_format_context_prefilter_covers_real_redaction_corpus() {
+        for case in fixture().masked {
+            assert!(
+                shells_may_need_format_context(&case.input),
+                "{}",
+                case.input
+            );
+        }
+        assert!(!shells_may_need_format_context(&"o".repeat(70_000)));
+        for input in [
+            "-----BEGIN PRIVATE KEY-----\nbody",
+            "\"password\":\"value\"",
+            "Authorization: Bearer token",
+        ] {
+            assert!(shells_may_need_format_context(input));
+        }
     }
 
     #[test]

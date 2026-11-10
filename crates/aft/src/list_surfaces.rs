@@ -437,10 +437,22 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Operator-only wire limits use explicit continuation cursors, resync parts and raw byte offsets; they do not bound or change any agent tool reply.",
     },
     ExclusionEntry {
+        file: "subc/shells/capture.rs",
+        enclosing_item: "open, read, read_screen",
+        location_or_primitive: "DEFAULT_CHUNK_BYTES, max, take_while, 500 ms",
+        reason: "Capture reads and incremental screen rendering have bounded working memory and preserve raw offset coverage. Screen coalescing limits update rate, not the shell inventory or any agent-visible list.",
+    },
+    ExclusionEntry {
         file: "bash_background/shell_registry.rs",
-        enclosing_item: "shell_masked_range",
-        location_or_primitive: "4096, take_while",
-        reason: "Internal masking windows preserve the complete requested output range; UTF-8 boundary alignment and the checked masker's source halo protect credentials without dropping a shell row or shortening an agent-visible list.",
+        enclosing_item: "shell_masked_range, format_context_possible, SHELL_MASK_CONTEXT_BYTES",
+        location_or_primitive: "bounded file scan and masking context",
+        reason: "Internal masking windows preserve raw byte coverage; undecidable ranges carry explicit withheld text. These bounds neither drop shell rows nor shorten an agent-visible list.",
+    },
+    ExclusionEntry {
+        file: "bash_background/completion_preview.rs",
+        enclosing_item: "shell_mask_window_with_values, watch_mask_region, mask_region_from",
+        location_or_primitive: "take(range.start), line_limit",
+        reason: "Masking inspects a byte-addressed context rather than returning a result list. Operator output uses bounded source windows with explicit withheld ranges; existing agent watch-preview limits remain unchanged.",
     },
     ExclusionEntry {
         file: "db/call_ledger.rs",
