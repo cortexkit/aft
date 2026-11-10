@@ -3736,8 +3736,7 @@ fn matching_line_in_text(
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
         if let Some((line_index, line)) = source.lines().enumerate().find(|(index, _)| {
-            prepared.lines[*index]
-                .normalized
+            prepared.normalized[prepared.lines[*index].normalized.clone()]
                 .contains(&normalized_phrase)
         }) {
             // The phrase matched after whitespace normalization, so its first
@@ -3793,30 +3792,55 @@ fn matching_line_in_text(
 }
 
 struct MatchingContentLine {
-    normalized: String,
-    compact: String,
+    normalized: std::ops::Range<usize>,
+    compact: std::ops::Range<usize>,
     trigrams: std::sync::OnceLock<Box<[[u8; 3]]>>,
 }
 
 struct MatchingSource {
     lines: Vec<MatchingContentLine>,
+    normalized: String,
+    compact: String,
 }
 
 impl MatchingSource {
     fn new(source: &str) -> Self {
-        Self {
-            lines: source
-                .lines()
-                .map(|line| MatchingContentLine {
-                    normalized: exact_lane::normalize_exact_phrase(line),
-                    compact: line
-                        .chars()
+        // Two source-wide buffers avoid allocating and freeing two strings
+        // per line while concurrent searches churn the bounded content cache.
+        // Ranges keep line boundaries: neither phrase nor trigram matches may
+        // cross a newline, even though adjacent lines share an allocation.
+        let mut normalized = String::new();
+        let mut compact = String::new();
+        let lines = source
+            .lines()
+            .map(|line| {
+                let normalized_start = normalized.len();
+                for word in line.split_whitespace() {
+                    if normalized.len() > normalized_start {
+                        normalized.push(' ');
+                    }
+                    normalized.push_str(word);
+                }
+                normalized[normalized_start..].make_ascii_lowercase();
+                let compact_start = compact.len();
+                compact.extend(
+                    line.chars()
                         .filter(|ch| ch.is_alphanumeric())
-                        .flat_map(char::to_lowercase)
-                        .collect(),
+                        .flat_map(char::to_lowercase),
+                );
+                MatchingContentLine {
+                    normalized: normalized_start..normalized.len(),
+                    compact: compact_start..compact.len(),
                     trigrams: std::sync::OnceLock::new(),
-                })
-                .collect(),
+                }
+            })
+            .collect();
+        normalized.shrink_to_fit();
+        compact.shrink_to_fit();
+        Self {
+            lines,
+            normalized,
+            compact,
         }
     }
 
@@ -3825,14 +3849,12 @@ impl MatchingSource {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.lines.capacity() * std::mem::size_of::<MatchingContentLine>()
+            + self.normalized.capacity()
+            + self.compact.capacity()
             + self
                 .lines
                 .iter()
-                .map(|line| {
-                    line.normalized.capacity()
-                        + line.compact.capacity()
-                        + line.compact.len().saturating_sub(2) * 3
-                })
+                .map(|line| line.compact.len().saturating_sub(2) * 3)
                 .sum::<usize>()
     }
 
@@ -3848,11 +3870,12 @@ impl MatchingSource {
         let mut best_score = 0_usize;
         let mut missing = Vec::with_capacity(tokens.len());
         for (index, (line, prepared)) in source.lines().zip(&self.lines).enumerate() {
+            let compact = &self.compact[prepared.compact.clone()];
             missing.clear();
             let mut score = 0_usize;
             let mut remaining = 0_usize;
             for token in tokens {
-                if prepared.compact.contains(token) {
+                if compact.contains(token) {
                     score += token.len().saturating_mul(4);
                 } else {
                     missing.push(token);
@@ -3873,8 +3896,7 @@ impl MatchingSource {
                 let trigrams = prepared.trigrams.get_or_init(|| {
                     drop(other_wait.take());
                     let _build = waits::time(waits::SearchWait::MatchingTrigrams);
-                    let mut trigrams = prepared
-                        .compact
+                    let mut trigrams = compact
                         .as_bytes()
                         .windows(3)
                         .map(|trigram| {
@@ -11966,6 +11988,37 @@ mod tests {
                 (score > 0).then_some((score, line_index, line))
             })
             .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+    }
+
+    #[test]
+    fn matching_line_packed_buffers_preserve_line_boundaries_and_normalization() {
+        let source = "  Alpha\tBETA \r\n\nİ café 中中中\u{2003}tail\nabc\ndef\n";
+        let prepared = MatchingSource::new(source);
+        for (line, stored) in source.lines().zip(&prepared.lines) {
+            assert_eq!(
+                &prepared.normalized[stored.normalized.clone()],
+                exact_lane::normalize_exact_phrase(line)
+            );
+            assert_eq!(
+                &prepared.compact[stored.compact.clone()],
+                line.chars()
+                    .filter(|ch| ch.is_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>()
+            );
+        }
+        assert_eq!(prepared.normalized.capacity(), prepared.normalized.len());
+        assert_eq!(prepared.compact.capacity(), prepared.compact.len());
+        let boundary = MatchingSource::new("ab\nc");
+        assert_eq!(boundary.best_line("ab\nc", &["abc".into()]), None);
+        assert_eq!(
+            boundary
+                .lines
+                .iter()
+                .map(|line| line.compact.len())
+                .sum::<usize>(),
+            3
+        );
     }
 
     #[test]

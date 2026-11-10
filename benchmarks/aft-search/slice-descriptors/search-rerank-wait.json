@@ -1,0 +1,8 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["crates/aft/tests/integration/tool_call_parity_test.rs"],
+  "slices": ["search-rerank-wait"],
+  "note": "Ranking-fenced semantic_search code only changes log-only phase attribution and the storage layout of query-independent matching text. Two source-wide buffers replace per-line strings; ranges preserve each original line, normalization, byte-trigram membership, scoring, ties and snippets. The matching preparation cache remains bounded to 32 MiB and 1024 entries, including reserved lazy trigram storage. Real-query whole-reply parity is checked with compare_builds.py on all 6700 distinct recorded queries, and the engine_unwired quality gate retains strict ranked-row equality. No routing, score, candidate, cap or agent-visible formatting changes are intended. See the search-rerank-wait investigation for measured results and any gate limitations."
+}

@@ -41,6 +41,8 @@
 //! Set `AFT_SEARCH_WAITS_RERANK=1` to use the loopback server as a deterministic
 //! reranker too. It returns tied scores without a model, isolating candidate
 //! preparation from inference. `--warmup 0` includes first-use contention.
+//! `--requests N` bounds the idle phase to the same query sequence across builds
+//! (the phase deadline still applies).
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
@@ -99,6 +101,7 @@ struct Args {
     samples: Option<PathBuf>,
     unique: bool,
     warmup: bool,
+    requests: u64,
 }
 
 fn parse_args() -> Args {
@@ -157,6 +160,7 @@ fn parse_args() -> Args {
         samples: path("samples"),
         unique: number("unique", 1) != 0,
         warmup: number("warmup", 1) != 0,
+        requests: number("requests", u64::MAX),
     }
 }
 
@@ -406,16 +410,14 @@ fn run_searches(
     let samples = Mutex::new(Vec::new());
     let next_id = AtomicU64::new(0);
     std::thread::scope(|scope| {
-        for searcher in 0..searchers {
+        for _ in 0..searchers {
             let samples = &samples;
             let next_id = &next_id;
             scope.spawn(move || {
-                let mut turn = searcher;
                 while keep_going() {
-                    let query = turn % queries.len();
-                    turn += 1;
-                    let (text, pattern) = &queries[query];
                     let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let query = id as usize % queries.len();
+                    let (text, pattern) = &queries[query];
                     // Prose queries get three extra words chosen by the call's
                     // number, so their embeddings miss the query cache as
                     // live traffic's mostly unique queries do. Identifier
@@ -804,13 +806,17 @@ fn main() {
         let samples = match phase.as_str() {
             "idle" => {
                 let deadline = Instant::now() + args.phase;
+                let requests = AtomicU64::new(0);
                 run_searches(
                     phase,
                     &primary,
                     &args.queries,
                     args.searchers,
                     args.unique,
-                    &|| Instant::now() < deadline,
+                    &|| {
+                        Instant::now() < deadline
+                            && requests.fetch_add(1, Ordering::Relaxed) < args.requests
+                    },
                     &|| "none".to_string(),
                 )
             }
