@@ -68,6 +68,8 @@ impl fmt::Display for SandboxLaunchError {
 impl std::error::Error for SandboxLaunchError {}
 
 pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
+    #[cfg(feature = "test-hooks")]
+    aft::bash_background::trace_phase_for_test("launcher_enter", "");
     #[cfg(windows)]
     if args == [OsString::from("--support")] {
         return print_support();
@@ -110,6 +112,14 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
         } else {
             read_profile_json(args.profile_json.as_deref().expect("source count checked"))?
         };
+        #[cfg(feature = "test-hooks")]
+        aft::bash_background::trace_phase_for_test(
+            "launcher_profile_read",
+            format_args!(
+                "mode={:?} worker_jail={}",
+                profile.mode, profile.worker_jail
+            ),
+        );
         #[cfg(feature = "test-timing-hooks")]
         if let Some(gate) = args.start_gate.as_ref() {
             std::fs::write(gate.with_extension("ready"), b"ready")
@@ -126,6 +136,8 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             .canonicalize_for_launch()
             .map_err(|error| SandboxLaunchError::unavailable(error.to_string()));
         let applied = profile.and_then(|profile| {
+            #[cfg(feature = "test-hooks")]
+            aft::bash_background::trace_phase_for_test("launcher_profile_canonicalized", "");
             // Seal while still privileged: confinement must not be able to
             // block descriptor flag changes. CLOEXEC keeps this launcher’s
             // error write available but closes the channel in the target.
@@ -145,6 +157,11 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             }
             return Err(error);
         }
+        #[cfg(feature = "test-hooks")]
+        aft::bash_background::trace_phase_for_test(
+            "launcher_exec_target",
+            &args.command[0].to_string_lossy(),
+        );
         exec_target(&args.command)
     }
 }

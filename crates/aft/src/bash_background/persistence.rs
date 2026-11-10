@@ -2066,6 +2066,14 @@ impl PersistedTask {
         self.exit_code = exit_code;
         self.finished_at = Some(finished_at);
         self.duration_ms = Some(finished_at.saturating_sub(self.started_at));
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test(
+            "task_terminal",
+            format_args!(
+                "task={} status={:?} exit={exit_code:?} duration_ms={:?}",
+                self.task_id, status, self.duration_ms
+            ),
+        );
         self.child_pid = None;
         self.status_reason = reason;
         self.completion_delivered = !self.notify_on_completion;

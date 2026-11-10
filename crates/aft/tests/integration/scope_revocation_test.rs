@@ -381,14 +381,28 @@ fn call_modes_refuse_flow_writes_and_unknown_but_serve_read_and_classic() {
             );
             assert_eq!(error.detail, Some(json!({"tool":"read","mode":"future"})));
             bind_mode(&mut daemon.stream, &daemon.root1, 3, None, Some(stamp())).await;
-            call(
-                &mut daemon.stream,
-                3,
-                105,
-                json!({"command":"echo classic-ok","timeout":1000}),
-            )
-            .await;
+            let tracing = cfg!(feature = "test-hooks")
+                && std::env::var("AFT_TEST_BASH_PHASE_TRACE").as_deref() == Ok("1");
+            let mut classic_args = json!({"command":"echo classic-ok","timeout":1000});
+            if tracing {
+                classic_args["env"] = json!({"AFT_TEST_BASH_PHASE_TRACE":"1"});
+                #[cfg(feature = "test-hooks")]
+                aft::bash_background::trace_phase_for_test("test_call_begin", "classic");
+            }
+            call(&mut daemon.stream, 3, 105, classic_args).await;
             let reply = read_frame_timeout(&mut daemon.stream, "classic bash").await;
+            if tracing {
+                #[cfg(feature = "test-hooks")]
+                aft::bash_background::trace_phase_for_test("test_reply_received", "classic");
+                let value: Value = serde_json::from_slice(&reply.body).unwrap();
+                if let Some(stdout) = value["structuredContent"]["output_path"].as_str() {
+                    let stderr = Path::new(stdout).with_file_name("stderr");
+                    eprintln!(
+                        "classic task stderr: {}",
+                        std::fs::read_to_string(stderr).unwrap_or_else(|error| error.to_string())
+                    );
+                }
+            }
             let body = String::from_utf8_lossy(&reply.body);
             eprintln!("classic bash reply ({:?}): {body}", reply.header.ty);
             assert_eq!(reply.header.ty, FrameType::Response, "{body}");

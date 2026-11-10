@@ -21,14 +21,20 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 pub(super) fn apply(profile: &SandboxProfile) -> Result<(), String> {
+    #[cfg(feature = "test-hooks")]
+    aft::bash_background::trace_phase_for_test("seatbelt_render_begin", "");
     let source = render_profile(profile)?;
     let source = CString::new(source)
         .map_err(|_| "generated Seatbelt profile contains a NUL byte".to_string())?;
     let mut error_buffer = ptr::null_mut();
+    #[cfg(feature = "test-hooks")]
+    aft::bash_background::trace_phase_for_test("seatbelt_init_begin", "");
 
     // SAFETY: `source` is a live NUL-terminated string, flags=0 selects raw
     // profile mode, and `error_buffer` is a valid out-pointer.
     let result = unsafe { sandbox_init(source.as_ptr(), 0, &mut error_buffer) };
+    #[cfg(feature = "test-hooks")]
+    aft::bash_background::trace_phase_for_test("seatbelt_init_end", result);
     if result == 0 {
         return Ok(());
     }

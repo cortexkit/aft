@@ -1,0 +1,110 @@
+name: Probe classic bash on rented Mac
+
+on:
+  push:
+    branches: [probe/classic-bash-rented-mac]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  classic-bash:
+    runs-on: [self-hosted, rented-mac]
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "6"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Account and shell startup baselines
+        run: |
+          git log -1
+          sw_vers
+          id
+          cargo --version
+          rustc --version
+          python3 - <<'PY'
+          import json, os, shutil, subprocess, time
+          for key in ("HOME", "TMPDIR", "BASH", "SHELL", "PATH", "BASH_ENV", "ENV"):
+              print(f"{key}={os.environ.get(key, '<unset>')}", flush=True)
+          selected = os.environ.get("BASH")
+          if not selected or not os.path.exists(selected):
+              selected = shutil.which("bash") or shutil.which("zsh") or "/bin/sh"
+          print(f"shell_resolver_before_PATH_enrichment={selected}", flush=True)
+          for shell in dict.fromkeys(("/bin/bash", "/bin/zsh", selected)):
+              subprocess.run([shell, "--version"], check=False, timeout=20)
+              for flags, clean in (("-c", False), ("-c", True), ("-lic", False)):
+                  environment = dict(os.environ)
+                  if clean:
+                      environment.pop("BASH_ENV", None)
+                      environment.pop("ENV", None)
+                  for iteration in ("first_observed", "warm"):
+                      start = time.perf_counter()
+                      try:
+                          result = subprocess.run([shell, flags, "true"], env=environment,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+                          detail = {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+                      except subprocess.TimeoutExpired:
+                          detail = {"timed_out": True}
+                      print("AFT_SHELL_BASELINE " + json.dumps(dict(path=shell, flags=flags,
+                          clean_startup_env=clean, iteration=iteration,
+                          wall_ms=round((time.perf_counter()-start)*1000, 3), **detail)), flush=True)
+          PY
+      - name: Build only the integration target with test hooks
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          root="$PWD/target/classic-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$root"/{config,data,state,cache}
+          echo "XDG_CONFIG_HOME=$root/config" >> "$GITHUB_ENV"
+          echo "XDG_DATA_HOME=$root/data" >> "$GITHUB_ENV"
+          echo "XDG_STATE_HOME=$root/state" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$root/cache" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          nice -n 10 env -u AFT_STORAGE_DIR cargo test --features test-hooks -p agent-file-tools --test integration --no-run
+      - name: Run the unchanged one-second request three times
+        run: |
+          unset AFT_STORAGE_DIR
+          export AFT_TEST_BASH_PHASE_TRACE=1
+          python3 - <<'PY'
+          import json, os, subprocess, time
+          for key in ("HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+                      "XDG_CACHE_HOME", "AFT_STORAGE_DIR", "CARGO_HOME", "RUSTUP_HOME", "CARGO_BUILD_JOBS"):
+              print(f"{key}={os.environ.get(key, '<unset>')}", flush=True)
+          command = ["nice", "-n", "10", "cargo", "test", "--features", "test-hooks", "-p",
+              "agent-file-tools", "--test", "integration", "--",
+              "subc_bridge_test::scope_revocation_test::call_modes_refuse_flow_writes_and_unknown_but_serve_read_and_classic",
+              "--exact", "--nocapture"]
+          paths = set()
+          failures = 0
+          for iteration in range(1, 4):
+              print(f"=== classic probe {iteration}/3 ===", flush=True)
+              start = time.perf_counter()
+              try:
+                  result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+                  print(result.stdout, flush=True)
+                  failures += result.returncode != 0
+                  for line in result.stdout.splitlines():
+                      if "event=registry_begin detail=" in line:
+                          paths.add(json.loads(line.split("detail=", 1)[1])["shell_path"])
+                  print(f"probe_result iteration={iteration} exit={result.returncode} wall_ms={(time.perf_counter()-start)*1000:.3f}", flush=True)
+              except subprocess.TimeoutExpired as error:
+                  print(error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout, flush=True)
+                  print(f"probe_result iteration={iteration} outer_timeout=90s", flush=True)
+                  failures += 1
+          for shell in sorted(paths):
+              for iteration in ("first_after_AFT", "warm"):
+                  start = time.perf_counter()
+                  result = subprocess.run([shell, "-c", "true"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+                  print("AFT_EXACT_SHELL_BASELINE " + json.dumps(dict(path=shell, iteration=iteration,
+                      wall_ms=round((time.perf_counter()-start)*1000, 3), returncode=result.returncode,
+                      stdout=result.stdout, stderr=result.stderr)), flush=True)
+          print(f"probe_summary tests=3 failed={failures} actual_shells={sorted(paths)}", flush=True)
+          raise SystemExit(1 if failures else 0)
+          PY

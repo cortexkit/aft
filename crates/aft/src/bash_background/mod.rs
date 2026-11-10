@@ -435,11 +435,30 @@ pub(crate) fn changed_files_deadline_for_spawn(
 }
 
 pub(crate) fn enter_bash_startup_step(step: BashStartupStep) {
+    #[cfg(feature = "test-hooks")]
+    trace_phase_for_test("startup_step", step.label());
     CURRENT_SPAWN_RECEIPT.with(|slot| {
         if let Some(receipt) = slot.borrow().as_ref() {
             receipt.enter_startup_step(step);
         }
     });
+}
+
+/// Opt-in cross-process timestamps for diagnosing shell startup on CI machines.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn trace_phase_for_test(event: &str, detail: impl std::fmt::Display) {
+    if std::env::var("AFT_TEST_BASH_PHASE_TRACE").as_deref() != Ok("1") {
+        return;
+    }
+    let wall_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    eprintln!(
+        "AFT_BASH_PHASE wall_us={wall_us} pid={} event={event} detail={detail}",
+        std::process::id()
+    );
 }
 
 /// Called only after the starting record and every control/output file exist,

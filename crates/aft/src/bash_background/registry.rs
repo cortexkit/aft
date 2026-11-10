@@ -5523,6 +5523,13 @@ impl BgTaskRegistry {
     ) -> Result<String, RegistryError> {
         let canonical_project_root =
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test(
+            "registry_begin",
+            serde_json::json!({"shell_path": shell_path, "native": spawn_plan.is_native_launcher(),
+                "profile": spawn_plan.changed_files_read_profile().map(|profile| profile.mode),
+                "temp_dir": spawn_plan.temp_dir(), "memory_limit_mib": memory_limit_mib}),
+        );
         self.start_watchdog();
 
         #[cfg(target_os = "linux")]
@@ -5569,10 +5576,14 @@ impl BgTaskRegistry {
             (spawn_plan.with_prepared_task(prepared), task)
         };
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("payload_ready", &task_layout.paths.task_id);
         if !spawn_plan.is_native_launcher() {
             crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
                 .map_err(|error| format!("failed to retain task startup image: {error}"))?;
         }
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("startup_image_ready", &task_layout.paths.task_id);
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -5661,6 +5672,8 @@ impl BgTaskRegistry {
         }
         layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("spawn_begin", &task_id);
         let mut child = match spawn_detached_child(
             &spawn_plan,
             command,
@@ -5698,11 +5711,18 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test(
+            "spawn_returned",
+            format_args!("task={task_id} child={child_pid}"),
+        );
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
             let _ = child.wait();
             return Err(error.into());
         }
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("secret_proxy_ready", &task_id);
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
@@ -5717,12 +5737,16 @@ impl BgTaskRegistry {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .insert(task_id.clone(), monitor);
         }
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("memory_monitor_ready", &task_id);
         // The wrapper cannot execute the command until its identity is durable.
         // Keep Starting here so a failed later Running write still leaves a
         // recoverable PID checkpoint in the existing record format.
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
         metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("identity_read", &task_id);
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
             let _ = child.wait();
@@ -5740,7 +5764,11 @@ impl BgTaskRegistry {
             );
             return Err(format!("failed to persist background task metadata: {error}").into());
         }
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("identity_persisted", &task_id);
         metadata.mark_running(child_pid, child_pid as i32);
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("runtime_clock_start", &task_id);
         if crate::privacy_spawn::requested(&env) {
             crate::privacy_spawn::note_session(&session_id);
         }
@@ -5855,6 +5883,8 @@ impl BgTaskRegistry {
         drop(_admission);
         #[cfg(test)]
         self.wait_before_bootstrap_release_for_test(&task_id);
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("bootstrap_release_begin", &task_id);
         let released = {
             let mut state = task
                 .lock_state()
@@ -5877,6 +5907,11 @@ impl BgTaskRegistry {
         if released {
             bootstrap_gate.disarm();
         }
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test(
+            "bootstrap_release_end",
+            format_args!("task={task_id} released={released}"),
+        );
         #[cfg(feature = "test-timing-hooks")]
         if released {
             if let Some(gate) = std::env::var_os("AFT_TEST_BASH_AFTER_CREATE_GATE") {
@@ -5916,6 +5951,8 @@ impl BgTaskRegistry {
                 }
             }
         }
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("registry_return", &task_id);
         Ok(task_id)
     }
 
@@ -18063,6 +18100,18 @@ fn spawn_detached_child(
         child_command.current_dir(workdir);
         crate::agent_child_env::apply_to_command(&mut child_command, env);
         crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut child_command, env);
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test(
+            "posix_spawn_begin",
+            serde_json::json!({
+                "program": child_command.get_program().to_string_lossy(),
+                "environment_overrides": child_command.get_envs().filter_map(|(key, value)| {
+                    let key = key.to_str()?;
+                    matches!(key, "BASH" | "SHELL" | "PATH" | "HOME" | "BASH_ENV" | "ENV")
+                        .then(|| (key, value.map(|value| value.to_string_lossy().into_owned())))
+                }).collect::<std::collections::BTreeMap<_, _>>()
+            }),
+        );
         let child = crate::sandbox_spawn::spawn_detached_for_plan(
             spawn_plan,
             &mut child_command,
@@ -18083,6 +18132,8 @@ fn spawn_detached_child(
                 error,
             )
         });
+        #[cfg(feature = "test-hooks")]
+        super::trace_phase_for_test("posix_spawn_end", format_args!("ok={}", child.is_ok()));
         drop((payload, exit, failure, profile_handle));
         child
     }
