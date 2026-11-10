@@ -2475,8 +2475,9 @@ pub(crate) fn js_package_key(root: &str, name: &str) -> String {
     format!("{VIEW_JS_WORKSPACES_DOMAIN}\0{root}\0{name}")
 }
 /// The Rust module tree: which files exist and which modules each declares.
-/// `Parent` answers read it; a file whose module declarations change, or a
-/// Rust file added or removed, sets it.
+/// Legacy views set this broad key when module membership changes. The data
+/// layer instead sets each changed parent target's file key and each changed
+/// inline candidate's module-path key, which these queries also record.
 pub(crate) const VIEW_RUST_MODULE_DOMAIN: &str = "\0view:rust-module-index";
 
 /// The key of what Rust files at `segments` under `src_prefix` contain, for

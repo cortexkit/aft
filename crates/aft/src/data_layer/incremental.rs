@@ -29,7 +29,7 @@ use crate::callgraph_store::fact_answers::{FactAnswer, FactAnswers, FactQuestion
 use crate::callgraph_store::facts::{FactPaths, ProjectFacts};
 use crate::callgraph_store::join::{
     rust_crate_key, rust_module_key_for_file, ManifestJoinError, ViewBindingDependencies,
-    ViewBindingFacts, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
+    ViewBindingFacts, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN,
 };
 use crate::callgraph_store::{go_module_map, rust_crate_map};
 
@@ -903,29 +903,38 @@ impl LiveCheckout {
         // the engine started, a binding under the old inputs now.
         let unbound = rebind
             .iter()
+            .chain(&removed_parses)
             .filter(|path| self.bound.get(path).is_none() && old.parses.contains_key(path))
             .collect::<Vec<_>>();
         let mut old_bound = bind_all(&old, &unbound)?
             .into_iter()
             .map(|(path, bound)| (path, Arc::new(bound)))
             .collect::<HashMap<_, _>>();
-        for path in &rebind {
+        for path in rebind.iter().chain(&removed_parses) {
             if let Some(bound) = self.bound.get(path) {
                 old_bound.insert(path.clone(), bound);
             }
         }
-        // The Rust module tree changes when a Rust file is added or removed,
-        // or a rebound file declares different modules.
-        let module_tree_changed = membership.iter().any(|path| path.ends_with(".rs"))
-            || rebind.iter().any(|path| {
-                path.ends_with(".rs")
-                    && old_bound
-                        .get(path)
-                        .map(|bound| bound.surface.declared_module_targets())
-                        != new_bound
-                            .get(path)
-                            .map(|bound| bound.surface.declared_module_targets())
-            });
+        // A parent lookup records the target file's key, including when it
+        // found no parent. Only targets of changed declarations can get a
+        // different parent; setting the whole module domain would replay
+        // every Rust caller even when all existing parents stay the same.
+        // Include removed declaring files and both sides of a path override
+        // or rename, even if another declaration still names the target.
+        let mut changed_parents = BTreeSet::new();
+        for path in rebind.iter().chain(&removed_parses) {
+            let before = old_bound
+                .get(path)
+                .map(|bound| bound.surface.declared_module_targets());
+            let after = new_bound
+                .get(path)
+                .map(|bound| bound.surface.declared_module_targets());
+            if before != after {
+                for modules in before.into_iter().chain(after) {
+                    changed_parents.extend(modules.values().flatten().cloned());
+                }
+            }
+        }
         let mut surfaces_changed = BTreeSet::new();
         let mut references_changed = BTreeSet::new();
         for path in &rebind {
@@ -973,9 +982,10 @@ impl LiveCheckout {
         let mut changed_keys = surfaces_changed.clone();
         changed_keys.extend(membership.iter().cloned());
         changed_keys.extend(changed_packages);
-        if module_tree_changed {
-            changed_keys.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
-        }
+        changed_keys.extend(changed_parents);
+        // Inline lookups record each candidate module-path prefix. A Rust
+        // file's addition or removal changes that prefix's candidates just
+        // as a content edit changes what those candidates contain.
         for path in surfaces_changed.iter().filter(|path| path.ends_with(".rs")) {
             changed_keys.insert(rust_module_key_for_file(path));
         }
@@ -1011,7 +1021,10 @@ impl LiveCheckout {
         {
             self.bound.bind_module_declaring(inputs)?;
         }
-        crate::slog_info!("perf data_layer module_prebind: {:.0}ms", started.elapsed().as_secs_f64() * 1000.0);
+        crate::slog_info!(
+            "perf data_layer module_prebind: {:.0}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
         // Most files a change reaches here keep their resolution: each file
         // whose surface answers (pass 2) or dispatch trace (pass 3) depend on
         // something that changed is replayed. Each is read once for both,
@@ -1074,7 +1087,13 @@ impl LiveCheckout {
         }
         drop(answers);
         drop(trace_answers);
-        crate::slog_info!("perf data_layer replay: {:.0}ms replayed={} traced={} resolves={}", started.elapsed().as_secs_f64() * 1000.0, stats.replayed, stats.dispatch_replayed, resolve.len());
+        crate::slog_info!(
+            "perf data_layer replay: {:.0}ms replayed={} traced={} resolves={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            stats.replayed,
+            stats.dispatch_replayed,
+            resolve.len()
+        );
         // Files kept whose binding was redone carry their resolution over.
         for path in &rebind {
             if resolve.contains(path) {

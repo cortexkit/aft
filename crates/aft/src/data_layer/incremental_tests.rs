@@ -181,6 +181,79 @@ fn every_engine_resolves_on_the_one_shared_pool() {
 }
 
 #[test]
+fn module_addition_replays_only_changed_parent_targets() {
+    let root = "pub mod a; pub mod b;";
+    let a = "pub fn value() {}";
+    let b = "pub fn call() { crate::a::value(); }";
+    let before = checkout(
+        &[("src/lib.rs", root), ("src/a.rs", a), ("src/b.rs", b)],
+        &[],
+    );
+    let after = checkout(
+        &[
+            (
+                "src/lib.rs",
+                "pub mod a; pub mod b; pub mod target; pub mod caller;",
+            ),
+            ("src/a.rs", a),
+            ("src/b.rs", b),
+            ("src/target.rs", "pub fn target() {}"),
+            (
+                "src/caller.rs",
+                "pub fn caller() { crate::target::target(); }",
+            ),
+        ],
+        &[],
+    );
+    let (stats, _) = update_checked(
+        before,
+        after,
+        &["src/lib.rs", "src/target.rs", "src/caller.rs"],
+    );
+    assert_eq!(stats.rebound, 3, "{stats:?}");
+    assert_eq!(stats.resolved, 3, "{stats:?}");
+}
+
+#[test]
+fn module_parent_path_override_rename_and_removal_match_cold() {
+    let original = "#[path = \"shared.rs\"] pub mod old; pub mod caller;";
+    let renamed = "#[path = \"shared.rs\"] pub mod new; pub mod caller;";
+    let target = "pub fn value() {}";
+    let caller = "pub fn call() { crate::old::value(); crate::new::value(); }";
+    let inputs = |root| {
+        checkout(
+            &[
+                ("src/lib.rs", root),
+                ("src/shared.rs", target),
+                ("src/caller.rs", caller),
+            ],
+            &[],
+        )
+    };
+    update_checked(inputs(original), inputs(renamed), &["src/lib.rs"]);
+    update_checked(inputs(renamed), inputs("pub mod caller;"), &["src/lib.rs"]);
+}
+
+#[test]
+fn module_declaring_file_removal_matches_cold() {
+    let root = "pub mod caller;";
+    let target = "pub fn value() {}";
+    let caller = "pub fn call() { crate::alias::value(); }";
+    let files = [
+        ("src/lib.rs", root),
+        ("src/shared.rs", target),
+        ("src/caller.rs", caller),
+    ];
+    let mut before = files.to_vec();
+    before.push(("src/extra.rs", "#[path = \"shared.rs\"] pub mod alias;"));
+    update_checked(
+        checkout(&before, &[]),
+        checkout(&files, &[]),
+        &["src/extra.rs"],
+    );
+}
+
+#[test]
 fn a_symlink_retarget_resolves_like_a_cold_build() {
     let files = [
         (
