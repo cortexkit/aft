@@ -665,7 +665,7 @@ fn settle_row(
     let never_ran_answer = reason.map(|reason| answer_bytes(&never_ran_answer(reason)));
     tx.execute("UPDATE call_ledger SET state='Settled',frame_type=?3,frame_body=?4,outcome=?5,settled_at=?6,seq=?7,late_entry=?8,withdraw_answer=COALESCE(withdraw_answer,?10),tool_result_source=?11 WHERE carrier=?1 AND call_key=?2 AND state=?9",
         params![key.carrier,key.call_key,frame.type_name(),frame.body,outcome,now,seq,entry,row.state.as_str(),never_ran_answer,tool_result_source])?;
-    if let Some(scope) = &row.scope {
+    if let Some(custodian) = &row.custodian {
         enforce_retention_bounds(tx, custodian)?;
     }
     Ok(())

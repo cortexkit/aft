@@ -6529,6 +6529,7 @@ mod grant_path_tests {
                         epoch: 1
                     },
                     1,
+                    false,
                 ),
                 Err(super::super::super::call_yield::NotYieldable::Scope)
             ));
@@ -6570,16 +6571,24 @@ mod grant_path_tests {
                         let target = call
                             .metrics
                             .held_bash_calls
-                            .claim_for_yield(route, 1)
+                            .claim_for_yield(route, 1, false)
                             .unwrap();
                         let identity = super::super::super::test_support::route_identity(
                             &root,
                             "deadline-session",
                         );
                         let (tx, mut rx) = mpsc::channel(8);
-                        answer_yielded_bash_call(&tx, &identity, &call.metrics, route, 1, target)
-                            .await
-                            .unwrap();
+                        answer_yielded_bash_call(
+                            &tx,
+                            &identity,
+                            &call.metrics,
+                            route,
+                            1,
+                            target,
+                            false,
+                        )
+                        .await
+                        .unwrap();
                         let body: Value =
                             serde_json::from_slice(&rx.recv().await.unwrap().frame.body).unwrap();
                         assert_eq!(body["structuredContent"]["task_id"], call.task_id);
