@@ -37,7 +37,7 @@ use super::DEFAULT_EXPORT_MARKER_KIND;
 pub(crate) mod engine;
 pub(crate) mod index;
 pub(crate) mod kept;
-pub(crate) mod reads;
+pub(crate) use crate::data_layer::dead_code_reads as reads;
 pub(crate) mod section;
 
 use index::Index;

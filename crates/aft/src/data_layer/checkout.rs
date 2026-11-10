@@ -640,7 +640,7 @@ impl PathTextMemo {
 /// one build rather than each starting their own. A copy starts empty: a
 /// memo belongs to the call graph it was built for.
 struct DeadCodeMemo {
-    snapshot: Mutex<Option<Arc<crate::inspect::job::CallgraphSnapshot>>>,
+    snapshot: Mutex<Option<Arc<crate::data_layer::dead_code_snapshot::CallgraphSnapshot>>>,
     memory_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -660,8 +660,8 @@ impl DeadCodeMemo {
 
     fn get_or_build(
         &self,
-        build: impl FnOnce() -> Result<crate::inspect::job::CallgraphSnapshot, DataError>,
-    ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
+        build: impl FnOnce() -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError>,
+    ) -> Result<Arc<crate::data_layer::dead_code_snapshot::CallgraphSnapshot>, DataError> {
         let mut slot = self.snapshot.lock().expect("no panics while holding it");
         if let Some(snapshot) = slot.as_ref() {
             return Ok(Arc::clone(snapshot));
@@ -4416,9 +4416,9 @@ impl CheckoutView {
     /// When a stored parse cannot be read.
     pub(crate) fn dead_code_snapshot(
         &self,
-    ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
+    ) -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError> {
         self.dead_code_snapshot_shared()
-            .map(|snapshot| crate::inspect::job::CallgraphSnapshot::clone(&snapshot))
+            .map(|snapshot| crate::data_layer::dead_code_snapshot::CallgraphSnapshot::clone(&snapshot))
     }
 
     #[cfg(test)]
@@ -4433,7 +4433,7 @@ impl CheckoutView {
     /// When a stored parse cannot be read.
     pub(crate) fn dead_code_snapshot_shared(
         &self,
-    ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
+    ) -> Result<Arc<crate::data_layer::dead_code_snapshot::CallgraphSnapshot>, DataError> {
         self.dead_code_snapshot_in(None)
     }
 
@@ -4447,18 +4447,18 @@ impl CheckoutView {
     pub(crate) fn dead_code_snapshot_in(
         &self,
         section_dir: Option<PathBuf>,
-    ) -> Result<Arc<crate::inspect::job::CallgraphSnapshot>, DataError> {
+    ) -> Result<Arc<crate::data_layer::dead_code_snapshot::CallgraphSnapshot>, DataError> {
         let parts = self
             .dead_code_memo()
             .get_or_build(|| self.build_dead_code_snapshot())?;
         // The memo holds no view: a view holds its publication, which holds
         // the memo.
-        Ok(Arc::new(crate::inspect::job::CallgraphSnapshot {
+        Ok(Arc::new(crate::data_layer::dead_code_snapshot::CallgraphSnapshot {
             data_layer: Some(super::dead_code_graph::ViewCallGraph::new(
                 self.clone(),
                 section_dir,
             )),
-            ..crate::inspect::job::CallgraphSnapshot::clone(&parts)
+            ..crate::data_layer::dead_code_snapshot::CallgraphSnapshot::clone(&parts)
         }))
     }
 
@@ -4485,7 +4485,7 @@ impl CheckoutView {
 
     fn build_dead_code_snapshot(
         &self,
-    ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
+    ) -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError> {
         // The snapshot lists the files and entry points only: its exports
         // are read from the view's files by whoever needs them (see
         // `dead_code_graph::ViewCallGraph::exported_symbols_of`), so a rollup
@@ -4500,11 +4500,11 @@ impl CheckoutView {
             .filter(|file| resolved.is_entry_point(file))
             .cloned()
             .collect();
-        Ok(crate::inspect::job::CallgraphSnapshot {
+        Ok(crate::data_layer::dead_code_snapshot::CallgraphSnapshot {
             generated_at: Some(std::time::SystemTime::now()),
             files: snapshot_files,
             entry_points,
-            ..crate::inspect::job::CallgraphSnapshot::default()
+            ..crate::data_layer::dead_code_snapshot::CallgraphSnapshot::default()
         })
     }
 
@@ -4518,7 +4518,7 @@ impl CheckoutView {
     /// When a record or fragment cannot be read.
     pub(crate) fn rows_dead_code_snapshot(
         &self,
-    ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
+    ) -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError> {
         let (mut parses, mut resolved) = self
             .published
             .graph

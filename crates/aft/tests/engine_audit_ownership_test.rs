@@ -299,6 +299,8 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("crates/aft/src/data_layer/meaning_query.rs"),
                 FenceRule::Exact("crates/aft/src/data_layer/external_search.rs"),
                 FenceRule::Exact("crates/aft/src/search_b2/contracts.rs"),
+                FenceRule::Exact("crates/aft/src/grep_executor/multi_path.rs"),
+                FenceRule::Exact("crates/aft/src/grep_executor/git_exclude.rs"),
             ],
             landed_paths: vec![
                 "crates/aft/src/commands/semantic_search/planner/mod.rs",
@@ -308,6 +310,8 @@ fn slices() -> Vec<Slice> {
                 "crates/aft/src/data_layer/meaning_query.rs",
                 "crates/aft/src/data_layer/external_search.rs",
                 "crates/aft/src/search_b2/contracts.rs",
+                "crates/aft/src/grep_executor/multi_path.rs",
+                "crates/aft/src/grep_executor/git_exclude.rs",
             ],
         },
     ]
@@ -348,6 +352,8 @@ fn constraint_paths(root: &Path) -> BTreeSet<String> {
     let mut paths = BTreeSet::from([
         "crates/aft/src/search_b2/plan_table.rs".to_string(),
         "crates/aft/src/search_b2/contracts.rs".to_string(),
+        "crates/aft/src/grep_executor/multi_path.rs".to_string(),
+        "crates/aft/src/grep_executor/git_exclude.rs".to_string(),
         "crates/aft/src/commands/data_search.rs".to_string(),
         "crates/aft/src/data_layer/meaning_query.rs".to_string(),
         "crates/aft/src/data_layer/external_search.rs".to_string(),

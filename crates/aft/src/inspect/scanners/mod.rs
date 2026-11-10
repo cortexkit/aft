@@ -1,4 +1,4 @@
-pub(crate) const DEFAULT_EXPORT_MARKER_KIND: &str = "default_export";
+pub(crate) use crate::data_layer::dead_code_snapshot::DEFAULT_EXPORT_MARKER_KIND;
 
 pub mod complexity;
 pub mod cycles;

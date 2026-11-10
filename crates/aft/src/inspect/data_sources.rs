@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 
-pub(crate) use crate::data_layer::bound_checkouts::{note_root, RootKind};
+#[cfg(test)]
+pub(crate) use crate::data_layer::bound_checkouts::note_root;
+pub(crate) use crate::data_layer::bound_checkouts::RootKind;
 use crate::data_layer::bound_checkouts::{root_kind, BOUND};
 use crate::data_layer::runtime::DataCheckout;
 use crate::inspect::job::{canonicalize_normalized, normalize_path, CallgraphSnapshot};
