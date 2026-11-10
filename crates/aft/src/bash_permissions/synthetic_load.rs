@@ -68,8 +68,8 @@ fn literal_word(source: &str, node: Node<'_>) -> Option<String> {
     // parser deliberately declines all braces, but xargs/parallel commonly
     // use `{}` as their replacement marker. Escape only this literal pair
     // on the fallback path; quoted words were already decoded above it.
-    let mut parsed = crate::bash_rewrite::parser::parse(word)
-        .or_else(|| crate::bash_rewrite::parser::parse(&word.replace("{}", "\\{\\}")))?;
+    let mut parsed = crate::bash_parse::parse(word)
+        .or_else(|| crate::bash_parse::parse(&word.replace("{}", "\\{\\}")))?;
     (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
         .then(|| parsed.args.remove(0))
 }
@@ -129,7 +129,7 @@ fn executable_words(words: &Words) -> Option<(Vec<Option<String>>, bool)> {
                                 .map(|value| (value, index + 1))
                         };
                         if let Some((value, rest)) = split {
-                            let parsed = crate::bash_rewrite::parser::parse(value)?;
+                            let parsed = crate::bash_parse::parse(value)?;
                             let mut expanded = vec![Some("env".to_string())];
                             expanded.extend(parsed.args.into_iter().map(Some));
                             expanded.extend_from_slice(&words[rest..]);

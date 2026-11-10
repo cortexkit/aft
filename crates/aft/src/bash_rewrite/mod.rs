@@ -10,7 +10,7 @@ pub mod differential;
 pub mod dispatch;
 pub mod footer;
 pub mod observation;
-pub mod parser;
+pub use crate::bash_parse as parser;
 pub mod rules;
 
 use serde_json::Value;

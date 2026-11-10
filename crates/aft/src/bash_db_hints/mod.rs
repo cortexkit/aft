@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::bash_rewrite::parser::{parse, ParsedCommand};
+use crate::bash_parse::{parse, ParsedCommand};
 use crate::sandbox_spawn::SpawnPlan;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);

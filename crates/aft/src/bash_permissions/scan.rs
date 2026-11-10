@@ -499,7 +499,7 @@ pub(super) fn walk_shell_commands(
     }
 
     fn literal_word(raw: &str) -> Option<String> {
-        let mut parsed = crate::bash_rewrite::parser::parse(raw)?;
+        let mut parsed = crate::bash_parse::parse(raw)?;
         (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
             .then(|| parsed.args.remove(0))
     }
