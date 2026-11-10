@@ -2775,7 +2775,8 @@ impl Checkout {
     ///
     /// # Errors
     ///
-    /// When the store cannot be written; nothing is published then.
+    /// When stored call-graph data is damaged or the store cannot be written;
+    /// nothing is published then.
     pub fn publish_changes(&self) -> Result<Option<DeltaReport>, DataError> {
         self.publish_changes_as(false)
     }
@@ -2940,7 +2941,17 @@ impl Checkout {
             for (file, resolution) in &resolved {
                 sections
                     .add(&inputs, file, &resolution.decode(file))
-                    .map_err(DataError::Store)?;
+                    .map_err(DataError::Damaged)?;
+            }
+            // Recorded input terms can read other files' stored parses too.
+            // As in pass 4, an empty fallback after a failed read is damage,
+            // not a graph that may be committed as the next publication.
+            let failures = published.graph.failures();
+            if !failures.is_empty() {
+                return Err(DataError::Damaged(format!(
+                    "reading the stored call graph failed: {}",
+                    failures.join("; ")
+                )));
             }
             if let Some(read) = &read_by_others {
                 let left = read.leave_out(None, Some(&mut sections), |_| true);
@@ -6008,6 +6019,108 @@ pub fn other() { callee(); }
         assert!(view.callgraph_failures().is_empty());
         let callers = callers_of(&view, "p/stop.go", "Stop");
         assert!(callers.contains("p/use.go"), "{callers}");
+    }
+
+    #[test]
+    fn a_damaged_stored_parse_fails_publication_without_committing_or_panicking() {
+        use aft_store::content::ContentSegment;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        // One cached block cannot retain the parse body while its surface is
+        // read. Publication therefore reads the changed disk bytes below.
+        let layer = Arc::new(DataLayer::new(64 << 10, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        edit(&checkout, "src/util.rs", "pub fn replacement() {}\n");
+        checkout.refresh_callgraph().unwrap().expect("applied");
+        {
+            let mut slot = checkout.engine.lock().unwrap();
+            let engine = slot.as_mut().unwrap();
+            assert!(engine.refreshed.replaced.contains_key("src/lib.rs"));
+            engine.live.inputs.parses.release_decoded();
+            assert_eq!(engine.live.inputs.parses.decoded_count(), 0);
+        }
+        let published = checkout.live.read().unwrap().published.clone().unwrap();
+        assert!(published.graph.failures().is_empty());
+        let path = published
+            .state
+            .paths()
+            .iter()
+            .find(|path| path.path == b"src/lib.rs")
+            .unwrap();
+        let key = RecordKey::new(path.content, &path.language, EXTRACTOR_VERSION);
+        let mut damaged = false;
+        for segment in &published.segments {
+            let Some(content) = ContentSegment::open(segment).unwrap() else {
+                continue;
+            };
+            let Some(ordinal) = content.find(key).unwrap() else {
+                continue;
+            };
+            let body = content.body(ordinal).unwrap();
+            assert!(!body.is_empty());
+            let mut bytes = std::fs::read(segment.path()).unwrap();
+            let offsets = bytes
+                .windows(body.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| (bytes == body.as_slice()).then_some(offset))
+                .collect::<Vec<_>>();
+            assert_eq!(offsets.len(), 1, "the body must have one location on disk");
+            bytes[offsets[0] + body.len() / 2] ^= 0x40;
+            std::fs::write(segment.path(), bytes).unwrap();
+            // Evict the old cached body without decoding the damaged parse.
+            content.surface(ordinal).unwrap();
+            damaged = true;
+            break;
+        }
+        assert!(damaged, "the stored parse was found");
+        let before = checkout
+            .family
+            .snapshot()
+            .unwrap()
+            .manifest()
+            .checkout(checkout.checkout)
+            .cloned();
+        // No panic catcher: a panic from publication fails this test directly.
+        for _ in 0..2 {
+            let result = checkout.publish_changes();
+            assert!(
+                matches!(result, Err(DataError::Damaged(ref why)) if why.contains("src/lib.rs")),
+                "{result:?}"
+            );
+        }
+        assert!(!published.graph.failures().is_empty());
+        assert_eq!(
+            checkout
+                .family
+                .snapshot()
+                .unwrap()
+                .manifest()
+                .checkout(checkout.checkout),
+            before.as_ref()
+        );
+        assert_eq!(checkout.changed_paths(), 1, "the edit was not committed");
+        drop(published);
+        checkout.build().unwrap();
+        assert!(checkout.view().unwrap().callgraph_failures().is_empty());
+        edit(
+            &checkout,
+            "src/util.rs",
+            "pub fn replacement() {}\npub fn callee() {}\n",
+        );
+        checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("refreshed after rebuilding");
+        checkout
+            .publish_changes()
+            .unwrap()
+            .expect("published after rebuilding");
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(callers.contains("caller"), "{callers}");
     }
 
     /// Publishes the older string-table representation with keys from another
