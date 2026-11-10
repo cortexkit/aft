@@ -1312,6 +1312,10 @@ mod tests {
             json!({"name": crate::page_collect::RELEASE_OPERATION, "kind": "mutate"}),
             json!({"name": super::super::permissions::LIST_OPERATION, "kind": "query"}),
             json!({"name": super::super::permissions::REVOKE_OPERATION, "kind": "mutate"}),
+            json!({"name": "shells.list", "kind": "query"}),
+            json!({"name": "shells.watch", "kind": "query"}),
+            json!({"name": "shells.output", "kind": "query"}),
+            json!({"name": "aft.status", "kind": "query"}),
         ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.
