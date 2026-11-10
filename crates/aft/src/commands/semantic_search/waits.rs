@@ -101,10 +101,18 @@ pub enum SearchWait {
     MatchingTrigrams,
     /// Waiting for another search to initialize the same line's trigrams.
     MatchingTrigramWait,
+    /// Hashing source bytes for the matching preparation cache.
+    MatchingDigest,
+    /// Acquiring the matching preparation cache's map mutex.
+    MatchingCacheLock,
+    /// Normalizing and compacting a source on a matching-cache miss.
+    MatchingNormalize,
+    /// Evicting matching-cache entries, including destruction of their text.
+    MatchingEvict,
 }
 
 impl SearchWait {
-    pub const ALL: [SearchWait; 25] = [
+    pub const ALL: [SearchWait; 29] = [
         SearchWait::CheckoutSlot,
         SearchWait::TextView,
         SearchWait::MeaningView,
@@ -130,6 +138,10 @@ impl SearchWait {
         SearchWait::MatchingBestLine,
         SearchWait::MatchingTrigrams,
         SearchWait::MatchingTrigramWait,
+        SearchWait::MatchingDigest,
+        SearchWait::MatchingCacheLock,
+        SearchWait::MatchingNormalize,
+        SearchWait::MatchingEvict,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -159,6 +171,10 @@ impl SearchWait {
             SearchWait::MatchingBestLine => "matching_best_line",
             SearchWait::MatchingTrigrams => "matching_trigrams",
             SearchWait::MatchingTrigramWait => "matching_trigram_wait",
+            SearchWait::MatchingDigest => "matching_digest",
+            SearchWait::MatchingCacheLock => "matching_cache_lock",
+            SearchWait::MatchingNormalize => "matching_normalize",
+            SearchWait::MatchingEvict => "matching_evict",
         }
     }
 

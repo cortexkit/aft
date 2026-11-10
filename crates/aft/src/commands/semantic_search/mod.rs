@@ -3931,6 +3931,7 @@ struct MatchingSourceState {
 
 impl MatchingSourceState {
     fn evict_oldest(&mut self) {
+        let _evict = waits::time(waits::SearchWait::MatchingEvict);
         if let Some(digest) = self
             .entries
             .iter()
@@ -3961,11 +3962,15 @@ impl MatchingSourceCache {
     }
 
     fn prepare(&self, source: &str) -> Arc<MatchingSource> {
-        let digest = blake3::hash(source.as_bytes());
+        let digest = waits::timed(waits::SearchWait::MatchingDigest, || {
+            blake3::hash(source.as_bytes())
+        });
         // As the exact preparation cache: an unfilled placeholder found here
         // means another request is preparing the same source.
         let (cell, another_preparing) = {
-            let mut state = waits::timed(waits::SearchWait::PrepareCache, || self.state.lock());
+            let mut state = waits::timed(waits::SearchWait::MatchingCacheLock, || {
+                waits::timed(waits::SearchWait::PrepareCache, || self.state.lock())
+            });
             state.clock = state.clock.wrapping_add(1);
             let clock = state.clock;
             if let Some(entry) = state.entries.get_mut(&digest) {
@@ -3996,6 +4001,7 @@ impl MatchingSourceCache {
         let mut source_wait = Some(waits::time(waits::SearchWait::MatchingSourceWait));
         let prepared = cell.get_or_init(|| {
             drop(source_wait.take());
+            let _normalize = waits::time(waits::SearchWait::MatchingNormalize);
             #[cfg(test)]
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4004,7 +4010,9 @@ impl MatchingSourceCache {
         drop(source_wait);
         drop(other_wait);
         let retained_bytes = prepared.retained_bytes();
-        let mut state = waits::timed(waits::SearchWait::PrepareCache, || self.state.lock());
+        let mut state = waits::timed(waits::SearchWait::MatchingCacheLock, || {
+            waits::timed(waits::SearchWait::PrepareCache, || self.state.lock())
+        });
         if let Some(entry) = state.entries.get_mut(&digest) {
             if Arc::ptr_eq(&entry.source, &cell) && entry.bytes == 0 {
                 entry.bytes = retained_bytes;
