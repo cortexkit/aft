@@ -103,7 +103,8 @@ fn bytes(value: &impl Serialize) -> Vec<u8> {
 }
 
 fn vectors() -> Vec<(&'static str, Vec<u8>)> {
-    let foreground = row("bg_foreground", "foreground", false);
+    let mut foreground = row("bg_foreground", "foreground", false);
+    foreground.output_bytes.stdout = 36;
     let background = row("bg_background", "background", true);
     let pty = row("bg_pty", "pty", true);
     let mut remote = row("bg_remote", "remote", false);
@@ -257,13 +258,13 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         Case {
             tag: "shells-v1",
             method: "shells.output",
-            request: serde_json::json!({"task_id":"bg_foreground", "ansi":"keep", "max_chunk_bytes":16}),
+            request: serde_json::json!({"task_id":"bg_foreground", "ansi":"keep", "max_chunk_bytes":16, "from_offset":{"stdout":16,"stderr":0}}),
             reply: keep,
         },
         Case {
             tag: "shells-v1",
             method: "shells.output",
-            request: serde_json::json!({"task_id":"bg_foreground", "ansi":"strip", "max_chunk_bytes":16}),
+            request: serde_json::json!({"task_id":"bg_foreground", "ansi":"strip", "max_chunk_bytes":16, "from_offset":{"stdout":16,"stderr":0}}),
             reply: strip,
         },
         Case {
