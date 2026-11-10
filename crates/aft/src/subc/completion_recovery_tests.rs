@@ -594,7 +594,7 @@ fn runner_notice_recovery_retries_same_id_and_stays_delivered_after_restart() {
     let (_dir, root) = test_root("notice-restart");
     let storage = tempfile::tempdir().unwrap();
     let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
-    let task_id = format!("bash-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
+    let task_id = "bash-00000000000a0001".to_string();
     persisted_completion_at(storage.path(), &root, &owner, &task_id, None);
     let registry = BgTaskRegistry::default();
     registry.replay_session(storage.path(), SESSION).unwrap();
@@ -664,7 +664,7 @@ fn retired_thalamus_pi_completion_is_unsendable_without_frames_or_retries() {
     let (_dir, root) = test_root("retired-runner");
     let storage = tempfile::tempdir().unwrap();
     let owner = tests::caller_route(&root, "reserved:thalamus-pi", "pi");
-    let task_id = format!("bash-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
+    let task_id = "bash-00000000000a0002".to_string();
     persisted_completion_at(storage.path(), &root, &owner, &task_id, None);
     let registry = BgTaskRegistry::default();
     registry.replay_session(storage.path(), SESSION).unwrap();
