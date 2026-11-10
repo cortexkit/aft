@@ -916,9 +916,9 @@ impl LiveCheckout {
         }
         // A parent lookup records the target file's key, including when it
         // found no parent. Only targets of changed declarations can get a
-        // different parent; setting the whole module domain would replay
-        // every Rust caller even when all existing parents stay the same.
-        // Include removed declaring files and both sides of a path override
+        // different parent, so only their keys are set, never one key that
+        // every Rust caller records. Include removed declaring files and
+        // both sides of a path override
         // or rename, even if another declaration still names the target.
         let mut changed_parents = BTreeSet::new();
         for path in rebind.iter().chain(&removed_parses) {

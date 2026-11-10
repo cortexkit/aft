@@ -811,7 +811,6 @@ mod tests {
             .flat_map(ViewSurfaceQuery::dependencies)
             .collect::<BTreeSet<_>>();
         candidates.insert("crates/demo/src/other.rs".to_string());
-        candidates.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
         candidates.insert(VIEW_GO_PACKAGE_DOMAIN.to_string());
         candidates.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         for query in &queries {
@@ -2524,14 +2523,9 @@ pub(crate) const VIEW_JS_WORKSPACES_DOMAIN: &str = "\0view:js-workspaces";
 pub(crate) fn js_package_key(root: &str, name: &str) -> String {
     format!("{VIEW_JS_WORKSPACES_DOMAIN}\0{root}\0{name}")
 }
-/// The Rust module tree: which files exist and which modules each declares.
-/// Legacy views set this broad key when module membership changes. The data
-/// layer instead sets each changed parent target's file key and each changed
-/// inline candidate's module-path key, which these queries also record.
-pub(crate) const VIEW_RUST_MODULE_DOMAIN: &str = "\0view:rust-module-index";
-
 /// The key of what Rust files at `segments` under `src_prefix` contain, for
-/// inline module lookups that consult those files.
+/// inline module lookups that consult those files. A Rust file added,
+/// removed or edited sets the key of its own module path.
 pub(crate) fn rust_module_key(src_prefix: &str, segments: &[String]) -> String {
     format!("\0view:rust-module:{src_prefix}:{}", segments.join("::"))
 }
@@ -2607,15 +2601,16 @@ impl ViewSurfaceQuery {
                 }
                 dependencies
             }
-            Self::Parent(file) => vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()],
+            // A file's parent changes only when a declaration naming it does;
+            // the incremental update then sets this file's key.
+            Self::Parent(file) => vec![file.clone()],
             // An inline lookup checks the files whose module path is a
             // proper prefix of the looked-up path, in the caller's source
-            // folder. Which files those are follows from paths alone, so it
-            // changes only when Rust files are added or removed (the module
-            // domain); what they contain is keyed by their module path.
+            // folder. A file appearing at, leaving or changing one of those
+            // paths sets that path's key.
             Self::Inline(file, segments, _) => {
                 let prefix = super::rust_src_prefix(file);
-                let mut dependencies = vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()];
+                let mut dependencies = vec![file.clone()];
                 dependencies.extend(
                     (0..segments.len()).map(|len| rust_module_key(&prefix, &segments[..len])),
                 );
@@ -2647,14 +2642,12 @@ impl ViewSurfaceQuery {
             Self::Module(file, name) => {
                 changed.contains(file) || changed.contains(&rust_module_name_key(file, name))
             }
-            Self::Parent(file) => {
-                changed.contains(file) || changed.contains(VIEW_RUST_MODULE_DOMAIN)
-            }
             Self::GoPackage(..) => {
                 changed.contains(VIEW_GO_PACKAGE_DOMAIN) || changed.contains(VIEW_GO_MODULES_DOMAIN)
             }
             Self::Language(file)
             | Self::MacroUse(file)
+            | Self::Parent(file)
             | Self::Reexports(file)
             | Self::Node(file, _)
             | Self::Callable(file, _)
