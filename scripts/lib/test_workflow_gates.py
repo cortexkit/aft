@@ -502,6 +502,7 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
         steps = action["runs"]["steps"]
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0]["shell"], "pwsh")
+        self.assertEqual(steps[0]["if"], "runner.environment == 'github-hosted'")
         script = steps[0]["run"]
         self.assertIn("$env:RUNNER_ENVIRONMENT -ne 'github-hosted'", script)
         self.assertLess(script.index("throw"), script.index("Add-MpPreference"))
