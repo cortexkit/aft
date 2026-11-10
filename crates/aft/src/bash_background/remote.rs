@@ -3603,7 +3603,12 @@ impl BgTaskRegistry {
                 .is_some_and(|remote| remote.cancel_requested)
             {
                 if !self.finish_owner_pause_cancel(&task, Ok(())) {
-                    self.remote_terminal(&task, Verdict::Cancelled, None);
+                    self.remote_terminal_with_note(
+                        &task,
+                        Verdict::Cancelled,
+                        None,
+                        Some("cancelled before remote dispatch to ck-motor; command never started"),
+                    );
                 }
                 return Ok(());
             }
@@ -4704,6 +4709,16 @@ impl BgTaskRegistry {
     }
 
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
+        self.remote_terminal_with_note(task, verdict, error, None);
+    }
+
+    fn remote_terminal_with_note(
+        &self,
+        task: &Arc<BgTask>,
+        verdict: Verdict,
+        error: Option<String>,
+        execution_note: Option<&str>,
+    ) {
         // Known terminal outcomes keep their status. Unknown outcomes reach
         // this point only after recovery was unavailable or exhausted.
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
@@ -4717,12 +4732,14 @@ impl BgTaskRegistry {
             if state.metadata.is_terminal() {
                 return;
             }
-            let remote_note = state
-                .metadata
-                .remote
-                .as_ref()
-                .map(remote_execution_note)
-                .unwrap_or_else(|| format!("ran remotely on {RUNNER_ID}"));
+            let remote_note = execution_note.map(str::to_owned).unwrap_or_else(|| {
+                state
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .map(remote_execution_note)
+                    .unwrap_or_else(|| format!("ran remotely on {RUNNER_ID}"))
+            });
             if unknown {
                 if let Some(remote) = state.metadata.remote.as_ref() {
                     let job_id = remote

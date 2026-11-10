@@ -3376,6 +3376,59 @@ async fn exec_remote_bash_kill_sends_cancel_and_reports_terminal() {
         .any(|(_, b)| b["method"] == "exec.cancel"));
 }
 
+#[tokio::test]
+async fn remote_cancel_before_dispatch_reports_never_started() {
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let daemon = daemon(Script::GatedRoute, "exec-remote/v1").await;
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    wait_for("route setup must hold the job before dispatch", || {
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, body)| body["op"] == "route.open")
+            .then_some(())
+    })
+    .await;
+    let killing = registry.clone();
+    let killed_id = task_id.clone();
+    let operation =
+        tokio::task::spawn_blocking(move || killing.kill(&killed_id, "session").unwrap());
+    wait_for("kill intent must precede remote dispatch", || {
+        registry
+            .task(&task_id)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .cancel_requested
+            .then_some(())
+    })
+    .await;
+    daemon.acceptance_gate.notify_one();
+    let done = operation.await.unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert_eq!(done.remote_job_id, None);
+    assert!(
+        done.output_preview
+            .starts_with("cancelled before remote dispatch to ck-motor; command never started"),
+        "{done:?}"
+    );
+    assert!(!done.output_preview.contains("ran remotely"), "{done:?}");
+    assert!(exec_runs(&daemon).is_empty());
+    assert!(
+        cancel_requests(&daemon).is_empty(),
+        "nothing was submitted to cancel"
+    );
+}
+
 fn cancel_terminal(outcome: Outcome, killed: Option<Killed>, ran: Ran) -> TerminalRecord {
     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
     terminal.killed = killed;
