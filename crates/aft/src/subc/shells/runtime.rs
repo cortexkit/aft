@@ -46,12 +46,12 @@ fn now() -> u64 {
 
 impl Service {
     pub(in crate::subc) fn new(app: Arc<App>, executor: Arc<Executor>) -> Arc<Self> {
+        let mut epoch = [0u8; 16];
+        getrandom::fill(&mut epoch).expect("OS entropy is required for shell watch cursor epochs");
         let service = Arc::new(Self {
             app,
             executor,
-            state: RwLock::new(state::State::new(
-                crate::exec_remote::types::Uuid::new_v4().to_string(),
-            )),
+            state: RwLock::new(state::State::new(blake3::hash(&epoch).to_hex().to_string())),
             sources: RwLock::new(HashMap::new()),
             changed: watch::channel(0).0,
             refresh_gate: Mutex::new(()),
