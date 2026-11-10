@@ -106,14 +106,24 @@ if (args[0] === "--version") {
           const completion = result.installsComplete.then(() => {
             settled = true;
           });
-          if (pass === 0 && (options.observePending || options.abortWhilePending)) {
+          if (pass === 0 && options.observePending) {
             await new Promise<void>((resolve) =>
               setTimeout(() => {
                 timerSawPending = !settled;
-                if (options.abortWhilePending) void abortInFlightAutoInstalls();
                 resolve();
               }, 20),
             );
+          }
+          if (pass === 0 && options.abortWhilePending) {
+            // Abort only once the probe process has started (it records its pid first),
+            // so the shutdown really lands during the probe. A fixed delay raced the
+            // probe's own startup on loaded runners and aborted before it ran at all.
+            const deadline = Date.now() + 10_000;
+            while (readPids().length === 0 && Date.now() < deadline) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+            timerSawPending = !settled;
+            void abortInFlightAutoInstalls();
           }
           await completion;
           passCalls.push(readCalls());
