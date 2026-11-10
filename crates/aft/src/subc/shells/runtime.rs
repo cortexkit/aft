@@ -49,7 +49,9 @@ impl Service {
         let service = Arc::new(Self {
             app,
             executor,
-            state: RwLock::new(state::State::new(uuid::Uuid::new_v4().to_string())),
+            state: RwLock::new(state::State::new(
+                crate::exec_remote::types::Uuid::new_v4().to_string(),
+            )),
             sources: RwLock::new(HashMap::new()),
             changed: watch::channel(0).0,
             refresh_gate: Mutex::new(()),
@@ -212,7 +214,7 @@ impl Service {
                 let tx = tx.clone();
                 let metrics = metrics.clone();
                 let frame = frame.clone();
-                let route_cancel = identity.shells_cancel.clone();
+                let route_cancel = identity.shells_cancel.0.clone();
                 tokio::spawn(async move {
                     let _response = super::super::ResponseTaskGuard::new(&metrics);
                     let result = std::panic::AssertUnwindSafe(async {

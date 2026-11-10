@@ -45,7 +45,7 @@ impl ShellReader {
         }
         #[cfg(unix)]
         if !metadata.is_terminal() {
-            let _ = super::super::remote::terminal_metadata_from_proof(&mut metadata);
+            let _ = super::remote::terminal_metadata_from_proof(&mut metadata);
         }
         if !metadata.is_terminal() {
             if let Some(marker) = read_exit_marker(&task.paths).ok().flatten() {

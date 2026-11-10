@@ -1636,12 +1636,15 @@ struct ManagementIdentity {
     harness: Option<String>,
     scope: Option<subc_protocol::scope::ScopeStamp>,
     admission: ManagementAdmission,
-    shells_cancel: tokio_util::sync::CancellationToken,
+    shells_cancel: ShellsRouteLifetime,
 }
 
-impl Drop for ManagementIdentity {
+#[derive(Debug, Default)]
+struct ShellsRouteLifetime(tokio_util::sync::CancellationToken);
+
+impl Drop for ShellsRouteLifetime {
     fn drop(&mut self) {
-        self.shells_cancel.cancel();
+        self.0.cancel();
     }
 }
 
@@ -8719,7 +8722,7 @@ async fn handle_control_request(
                                 harness: Some(identity.harness.clone()),
                                 scope,
                                 admission,
-                                shells_cancel: tokio_util::sync::CancellationToken::new(),
+                                shells_cancel: ShellsRouteLifetime::default(),
                             },
                             corr: frame.header.corr,
                         },
