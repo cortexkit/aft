@@ -2943,9 +2943,8 @@ impl Checkout {
                     .add(&inputs, file, &resolution.decode(file))
                     .map_err(DataError::Damaged)?;
             }
-            // Recorded input terms can read other files' stored parses too.
-            // An empty fallback after a failed read is damage, not a graph
-            // that may be committed as the next publication.
+            // Input terms can read other files' stored parses. Any failed
+            // stored read must reject publication, not commit incomplete facts.
             let failures = published.graph.failures();
             if !failures.is_empty() {
                 return Err(DataError::Damaged(format!(
