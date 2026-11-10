@@ -18,6 +18,53 @@ const VECTORS: &str = include_str!("../../tests/fixtures/secret/secret-approval-
 /// The sha256 the campaign pinned for the vector file.
 const VECTORS_SHA256: &str = "efd4ba60641586e143bce81087e4f9f5aaf8a99ffede74190303da7d4495cc27";
 
+// The six agent-sender request/result examples in claustrum's wire-contract v1
+// §15, in document order. Keep their literal JSON bytes, including statement bytes.
+pub(super) const USE_GOLDENS: &str =
+    include_str!("../../tests/fixtures/secret/secret-use-v1.jsonl");
+
+#[test]
+fn every_sender_golden_round_trips_through_the_wire_types() {
+    let examples: Vec<_> = USE_GOLDENS.lines().collect();
+    assert_eq!(examples.len(), 6);
+    for (index, example) in examples.into_iter().enumerate() {
+        let value: Value = serde_json::from_str(example).unwrap();
+        let encoded = if index < 3 {
+            let request: SecretUseRequest = serde_json::from_value(value).unwrap();
+            serde_json::to_string(&request).unwrap()
+        } else {
+            let reply = parse_reply(&value).unwrap();
+            serde_json::to_string(&reply).unwrap()
+        };
+        assert_eq!(encoded, example, "sender golden {index}");
+    }
+}
+
+#[test]
+fn sender_refusals_preserve_the_contract_code_class_and_error_frame() {
+    use SecretUseRefusal::*;
+    for (code, class, refusal) in [
+        ("not_found", "permanent", NotFound),
+        ("limit_exceeded", "context_overflow", LimitExceeded),
+        ("secret_setup_incomplete", "permanent", SetupIncomplete),
+        ("pending_limit", "transient", PendingLimit),
+        ("store_error", "transient", StoreError),
+    ] {
+        let answer =
+            parse_answer(&json!({"result":{"error":{"code":code,"class":class}}})).unwrap();
+        assert_eq!(answer.refusal(), Some(refusal));
+        let SecretUseAnswer::Refused(error) = answer else {
+            panic!("result refusal")
+        };
+        assert_eq!(error.code, code);
+        assert_eq!(error.class.as_deref(), Some(class));
+    }
+    let answer =
+        parse_answer(&json!({"code":"invalid_params","message":"invalid params"})).unwrap();
+    assert_eq!(answer.refusal(), Some(InvalidParams));
+    assert!(matches!(answer, SecretUseAnswer::Rejected(_)));
+}
+
 fn vectors() -> Value {
     serde_json::from_str(VECTORS).expect("the pinned vector file is JSON")
 }

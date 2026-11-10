@@ -30,7 +30,7 @@ pub const COVERAGE_SCOPE: &str = "scope";
 pub const COVERAGE_AGENT_AND_WORKERS: &str = "agent_and_workers";
 
 /// Which approval coverage a request asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Coverage {
     /// One secret use for the asking scope (the default when omitted).
@@ -53,28 +53,35 @@ impl Coverage {
 ///
 /// Senders strip the query and fragment before calling, so a `?` or `#` in
 /// `path` is a grammar fault on the vault's side; AFT refuses to send one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiKeyTarget {
     /// `https`, the only scheme the vault accepts.
     pub scheme: String,
     /// Lowercase ASCII host.
     pub host: String,
     /// The port; omitted on the wire when it is the default 443.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_option"
+    )]
     pub port: Option<u16>,
     /// The request path, starting with `/` and carrying no query or fragment.
     pub path: String,
 }
 
 /// The target a login was asked for: `{origin}`, canonical `https://host`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoginTarget {
     /// The canonical origin, with port 443 omitted.
     pub origin: String,
 }
 
 /// The `target` member of a `secret.use` request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
 pub enum Target {
     /// An API key for one host, port and path.
     ApiKey(ApiKeyTarget),
@@ -96,17 +103,28 @@ impl Serialize for Target {
 /// The `stamp` is the daemon's `ScopeStamp` value, relayed byte for byte. AFT
 /// never rewrites it, because the vault trusts the sender to pass it through
 /// unchanged and takes the asking scope from nowhere else.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretUseRequest {
     /// The secret name (`[A-Za-z0-9][A-Za-z0-9._-]*`, 1–64 bytes).
     pub name: String,
     /// The coverage; `scope` when omitted.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_option"
+    )]
     pub coverage: Option<Coverage>,
     /// The asking call's daemon stamp, unchanged.
     pub stamp: ScopeStamp,
     /// What the key is being used for.
     pub target: Target,
+}
+
+fn present_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
 }
 
 impl SecretUseRequest {
@@ -227,7 +245,7 @@ pub enum SecretUseReply {
 }
 
 /// The vault's pending approval (§15 "Signed statement and envelope").
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct ApprovalRequest {
     /// The vault's identifier for the pending request, a 26-character ULID.
     pub request_id: String,
@@ -282,6 +300,72 @@ pub enum SecretUseAnswer {
     Refused(VaultError),
     /// A transport error frame.
     Rejected(VaultTransportError),
+}
+
+/// Refusals in the sender contract's ordered checks. A `not_found` never
+/// distinguishes caller admission, scope mapping, record, kind, or target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretUseRefusal {
+    NotFound,
+    InvalidParams,
+    LimitExceeded,
+    SetupIncomplete,
+    PendingLimit,
+    StoreError,
+}
+
+impl SecretUseAnswer {
+    /// Classify known sender refusals without discarding the original wire
+    /// code/class. Unknown future refusals remain refusals, not success.
+    pub fn refusal(&self) -> Option<SecretUseRefusal> {
+        use SecretUseRefusal::*;
+        match self {
+            Self::Rejected(error) if error.code == "invalid_params" => Some(InvalidParams),
+            Self::Refused(error) => match error.code.as_str() {
+                "not_found" => Some(NotFound),
+                "limit_exceeded" => Some(LimitExceeded),
+                "secret_setup_incomplete" => Some(SetupIncomplete),
+                "pending_limit" => Some(PendingLimit),
+                "store_error" => Some(StoreError),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for SecretUseReply {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::ReleasedApiKey(key) => {
+                let encoded = zeroize::Zeroizing::new(b64url().encode(key.material()));
+                map.serialize_entry("status", "released")?;
+                map.serialize_entry("kind", "agent_api_key")?;
+                map.serialize_entry("key_b64url", encoded.as_str())?;
+                map.serialize_entry("location", &key.location)?;
+            }
+            Self::ReleasedLogin(login) => {
+                let password = std::str::from_utf8(login.password())
+                    .map_err(|_| serde::ser::Error::custom("login password is not UTF-8"))?;
+                map.serialize_entry("status", "released")?;
+                map.serialize_entry("kind", "site_login")?;
+                map.serialize_entry("username", &login.username)?;
+                map.serialize_entry("password", password)?;
+                if let Some(totp) = &login.totp {
+                    map.serialize_entry("totp", totp)?;
+                }
+            }
+            Self::ApprovalRequired(request) => {
+                map.serialize_entry("status", "approval_required")?;
+                map.serialize_entry("request_id", &request.request_id)?;
+                map.serialize_entry("statement_b64url", &request.statement_b64url)?;
+                map.serialize_entry("expires_at_ms", &request.expires_at_ms)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// The base64url engine the contract uses: strict and unpadded.

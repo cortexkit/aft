@@ -18,6 +18,7 @@ pub mod consent;
 pub mod eligibility;
 pub mod outcome;
 pub mod scope;
+pub mod transport;
 pub mod vault;
 pub mod wire;
 
@@ -38,8 +39,8 @@ pub use vault::{
 };
 pub use wire::{
     parse_answer, parse_reply, ApiKeyTarget, ApprovalRequest, Coverage, LoginTarget,
-    ReleasedApiKey, ReleasedLogin, ReplyError, SecretUseAnswer, SecretUseReply, SecretUseRequest,
-    Target, VaultError, VaultTransportError,
+    ReleasedApiKey, ReleasedLogin, ReplyError, SecretUseAnswer, SecretUseRefusal, SecretUseReply,
+    SecretUseRequest, Target, VaultError, VaultTransportError,
 };
 
 #[cfg(any(test, feature = "secret-test-fake"))]
