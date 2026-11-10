@@ -16613,8 +16613,47 @@ fn expired_gap_unverified_line_is_the_approved_text() {
 }
 
 #[tokio::test]
-async fn runon_return_v3_keeps_default_cap_for_small_or_missing_local_files() {
-    for existing in [false, true] {
+async fn runon_return_over_cap_report_names_the_requested_cap() {
+    for (large, expected_bytes, expected_limit) in [
+        (false, 10_485_760, "10 MiB"),
+        (true, 134_217_728, "128 MiB"),
+    ] {
+        let mut claims = RETURN_CLAIMS.to_vec();
+        if large {
+            claims.push(exec::types::RETURN_LARGE_CAPABILITY);
+        }
+        let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+            Script::ReturnVector("failed-over-cap"),
+            &claims,
+            1,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let (reply, _) = orchestrated_reply(
+            &ctx,
+            &daemon,
+            return_call(&["dist/hello.txt", "dist/large.bin"]),
+        )
+        .await;
+        assert!(reply.success, "{reply:?}");
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["return_max_bytes"], expected_bytes);
+        let output = reply.data["output"].as_str().unwrap();
+        let report = format!(
+            "dist/large.bin: not returned (it would take the total past the {expected_limit} limit)"
+        );
+        assert!(output.contains(&report), "{output}");
+        let task_id = reply.data["task_id"].as_str().unwrap();
+        let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
+        assert!(remote::remote_report(&saved).unwrap().contains(&report));
+    }
+}
+
+#[tokio::test]
+async fn runon_return_v3_uses_advertised_cap_for_new_and_existing_outputs() {
+    for local_bytes in [None, Some(5), Some(5 * 1024 * 1024), Some(6 * 1024 * 1024)] {
         let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
             Script::ReturnVector("two-files-one-empty"),
             &[
@@ -16628,9 +16667,12 @@ async fn runon_return_v3_keeps_default_cap_for_small_or_missing_local_files() {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let ctx = restarted_context(dir.path());
-        if existing {
+        if let Some(bytes) = local_bytes {
             fs::create_dir(dir.path().join("dist")).unwrap();
-            fs::write(dir.path().join("dist/hello.txt"), b"hello").unwrap();
+            fs::File::create(dir.path().join("dist/hello.txt"))
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
         }
         let (reply, _) = orchestrated_reply(
             &ctx,
@@ -16641,15 +16683,15 @@ async fn runon_return_v3_keeps_default_cap_for_small_or_missing_local_files() {
         assert!(reply.success, "{reply:?}");
         let runs = exec_runs(&daemon);
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["return_max_bytes"], 10_485_760);
+        assert_eq!(runs[0]["return_max_bytes"], 134_217_728);
         let task_id = reply.data["task_id"].as_str().unwrap();
         let task = ctx.bash_background().task(task_id).unwrap();
         let saved = read_task(&task.paths.json).unwrap();
         let remote = saved.remote.unwrap();
-        assert_eq!(remote.return_max_bytes, 10_485_760);
+        assert_eq!(remote.return_max_bytes, 134_217_728);
         let restored =
             restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
-        assert_eq!(restored.return_max_bytes, Some(10_485_760));
+        assert_eq!(restored.return_max_bytes, Some(134_217_728));
     }
 }
 

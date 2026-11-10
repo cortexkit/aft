@@ -289,23 +289,3 @@ pub const RETURN_TOTAL_CAP_BYTES: u64 = 10 * 1024 * 1024;
 pub fn return_max_bytes() -> u64 {
     RETURN_TOTAL_CAP_BYTES.min(super::types::RETURN_CHUNKED_MAX_BYTES_CAP)
 }
-
-#[cfg(any(unix, test))]
-pub(crate) fn requested_return_max_bytes(request: &RunRequest, maximum: u64) -> u64 {
-    // The runner reserves the requested allowance at admission. Keep the
-    // default unless known local files need more room with 2x growth headroom;
-    // missing outputs have no known size and do not justify a larger reservation.
-    let local_bytes = request.return_paths.iter().fold(0u64, |total, path| {
-        let size = Path::new(&request.cwd)
-            .join(path)
-            .metadata()
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        total.saturating_add(size)
-    });
-    if local_bytes > RETURN_TOTAL_CAP_BYTES / 2 {
-        maximum
-    } else {
-        return_max_bytes().min(maximum)
-    }
-}

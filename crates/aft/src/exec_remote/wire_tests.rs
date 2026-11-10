@@ -2123,6 +2123,17 @@ async fn empty_attach_reports_no_frames_and_keeps_accepted_resume_point() {
 }
 
 #[tokio::test]
+async fn return_cap_defaults_to_10_mib_without_chunked_returns() {
+    let daemon = daemon(
+        Script::ReturnVector("two-files-one-empty"),
+        client::CAPABILITY,
+    )
+    .await;
+    let client = client(&daemon).await;
+    assert_eq!(client.return_max_bytes().await.unwrap(), 10_485_760);
+}
+
+#[tokio::test]
 async fn return_cap_selection_obeys_the_selected_providers_v3_claim() {
     for (claims, expected) in [
         (

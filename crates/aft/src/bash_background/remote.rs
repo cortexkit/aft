@@ -3619,9 +3619,10 @@ impl BgTaskRegistry {
                 }
             };
             if !request.return_paths.is_empty() {
-                let maximum = client.return_max_bytes().await.map_err(|e| e.to_string())?;
+                // Build outputs may not exist locally yet. Reserve the selected
+                // runner's allowance independently of the current local files.
                 request.return_max_bytes =
-                    Some(exec::requested_return_max_bytes(&request, maximum));
+                    Some(client.return_max_bytes().await.map_err(|e| e.to_string())?);
             }
             fallback = Some(local);
             if remote.explicit_runon {
