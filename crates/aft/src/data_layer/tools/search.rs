@@ -1070,8 +1070,9 @@ impl ExternalSearch {
             }
         }
         *self.engine.semantic_embedding_model().lock() = lent;
-        let response =
-            crate::commands::semantic_search::handle_parent_child_search(req, &self.engine);
+        let response = crate::commands::semantic_search::with_absolute_result_paths(|| {
+            crate::commands::semantic_search::handle_parent_child_search(req, &self.engine)
+        });
         let returned = self.engine.semantic_embedding_model().lock().take();
         let mut model = ctx.semantic_embedding_model().lock();
         if model.is_none() {

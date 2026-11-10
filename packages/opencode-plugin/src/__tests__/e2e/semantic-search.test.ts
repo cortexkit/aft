@@ -271,38 +271,28 @@ maybeDescribe("e2e semantic search tool", () => {
     );
     pools.push(pool);
 
-    await pool.getBridge(projectA).send("semantic_search", {
-      query: "handle_request",
-      hint: "literal",
-      top_k: 5,
-    });
+    const bridgeA = pool.getBridge(projectA);
+    const deadline = Date.now() + 20_000;
+    let statusA = await bridgeA.send("status");
+    while (statusA.search_index?.status !== "ready" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      statusA = await bridgeA.send("status");
+    }
+    expect(statusA.search_index?.status).toBe("ready");
 
     const tools = semanticTools(createPluginContext(pool, storageDir));
     const sdkCtx = createSdkContext(projectB);
     const expectedFile = join(projectA, "src", "lib.rs");
-    const deadline = Date.now() + 20_000;
-    let output = "";
-    let lastError: unknown;
-    while (Date.now() < deadline) {
-      try {
-        output = await tools.aft_search.execute(
-          { query: "handle_request", hint: "literal", path: projectA },
-          sdkCtx,
-        );
-        if (output.includes(expectedFile)) break;
-      } catch (error) {
-        lastError = error;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-
-    if (!output.includes(expectedFile) && lastError) throw lastError;
+    // Wait for A's publication before B binds it: an early bounded-walk hit
+    // would not exercise the borrowed engine's path presentation.
+    const output = await tools.aft_search.execute(
+      { query: "handle_request", hint: "literal", path: projectA },
+      sdkCtx,
+    );
     expect(output).toContain(expectedFile);
-    // Semantic search is off, so the hit must carry non-semantic evidence. Which
-    // kind depends on how far the borrowed trigram index has loaded when the
-    // poll first sees the file: the bounded walk renders "lexical match", the
-    // engine's phrase lane renders "[exact]" once the index is ready.
-    expect(output).toMatch(/lexical match|\[exact\]/);
+    expect(output).toContain("[exact]");
+    expect(output).toContain("trigram: ready");
+    expect(output).not.toContain("answered by a filesystem scan");
   }, 40_000);
 });
 

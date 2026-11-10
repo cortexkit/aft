@@ -388,6 +388,7 @@ impl PatternList {
         prose_found: &HashSet<PathBuf>,
         project_root: &Path,
     ) -> String {
+        let project_root = super::result_display_root(project_root);
         let pattern = &self.pattern;
         let examined = &self.examination;
         if self.files.is_empty() {

@@ -555,6 +555,35 @@ pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> 
     )
 }
 
+thread_local! {
+    static ABSOLUTE_RESULT_PATHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The borrowed engine keeps its own root for indexing and source reads, but
+/// its paths must remain absolute for a caller in another project. Rendering
+/// runs synchronously on this thread; parallel file reads finish before it.
+/// If rendering moves to another thread, pass this presentation state there
+/// explicitly or external hits will become ambiguous again.
+pub(crate) fn with_absolute_result_paths<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ABSOLUTE_RESULT_PATHS.with(|absolute| absolute.set(self.0));
+        }
+    }
+    let _restore = Restore(ABSOLUTE_RESULT_PATHS.with(|absolute| absolute.replace(true)));
+    run()
+}
+
+/// An empty prefix leaves an absolute result path intact when stripped.
+fn result_display_root(project_root: &Path) -> &Path {
+    if ABSOLUTE_RESULT_PATHS.with(std::cell::Cell::get) {
+        Path::new("")
+    } else {
+        project_root
+    }
+}
+
 fn handle_semantic_search_with_disk_fallback(
     req: &RawRequest,
     ctx: &AppContext,
@@ -7642,6 +7671,7 @@ fn format_grep_lexical_unavailable_text(
     project_root: &Path,
     footer_reason: &str,
 ) -> String {
+    let project_root = result_display_root(project_root);
     if result.matches.is_empty() {
         let retry = retry_nudge_for_unavailable_detail(detail);
         return format!(
@@ -8158,6 +8188,7 @@ fn format_grep_search_text(
     project_root: &Path,
     interpreted_as: &str,
 ) -> String {
+    let project_root = result_display_root(project_root);
     let base = crate::commands::grep::format_grep_text(result, project_root);
     format!("{base}\n[interpreted_as: {interpreted_as}]")
 }
@@ -8848,6 +8879,7 @@ fn format_result_sections_counted(
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> (String, usize) {
+    let project_root = result_display_root(project_root);
     // Results arrive sorted by fused score desc. Group by file preserving
     // first-appearance order so the most relevant file's group renders first.
     // A BTreeMap would re-sort groups alphabetically by path and scramble the
@@ -9367,6 +9399,130 @@ mod tests {
         let response = response_value(handle_semantic_search(&request, ctx));
         assert_eq!(response["success"], true, "{response}");
         response["text"].as_str().expect("text").to_string()
+    }
+
+    #[test]
+    fn external_search_paths_are_absolute_for_walk_and_ready_index() {
+        let projects = tempfile::tempdir().expect("projects");
+        let storage = tempfile::tempdir().expect("storage");
+        let external = projects.path().join("project-a");
+        let session = projects.path().join("project-b");
+        for root in [&external, &session] {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("src/lib.rs"),
+                "pub fn handle_request(token: &str) -> bool { !token.is_empty() }\n// ?handle_request\n",
+            )
+            .unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let external = std::fs::canonicalize(external).unwrap();
+        let session = std::fs::canonicalize(session).unwrap();
+        let context = |root: &Path| {
+            let ctx = test_context(root);
+            ctx.update_config(|config| {
+                config.storage_dir = Some(storage.path().to_path_buf());
+                config.indexes.semantic = false;
+            });
+            ctx
+        };
+        let caller = context(&session);
+        let indexed = context(&external);
+        let requests = [
+            (
+                "query",
+                serde_json::json!({"query": "handle_request", "hint": "literal"}),
+            ),
+            ("pattern", serde_json::json!({"pattern": "handle_request"})),
+            (
+                "split",
+                serde_json::json!({"query": "handle_request", "pattern": "handle_request"}),
+            ),
+            (
+                "literal fallback",
+                serde_json::json!({"query": "?handle_request"}),
+            ),
+            (
+                "nearest name",
+                serde_json::json!({"query": "handle_requesx"}),
+            ),
+        ];
+        for ready in [false, true] {
+            if ready {
+                crate::data_layer::surfaces::serve_text_index_for_test(&indexed);
+                assert!(
+                    crate::data_layer::tools::search::ExternalSearch::of(&caller, &external)
+                        .is_some()
+                );
+            } else {
+                assert!(
+                    crate::data_layer::tools::search::ExternalSearch::of(&caller, &external)
+                        .is_none()
+                );
+            }
+            for (route, params) in &requests {
+                // Nearest-name suggestions require a ready index; a walk can
+                // only report the absence of the misspelled literal.
+                if !ready && *route == "nearest name" {
+                    continue;
+                }
+                let mut req = semantic_request("", 5);
+                req.params = params.clone();
+                req.params["path"] = serde_json::json!(external);
+                let response = handle_semantic_search(&req, &caller);
+                assert!(response.success, "{route}, ready={ready}: {response:?}");
+                let text = response.data["text"].as_str().expect("text");
+                assert!(
+                    text.contains(&external.join("src/lib.rs").display().to_string()),
+                    "{route}, ready={ready}: {text}"
+                );
+                assert!(
+                    !text.lines().any(|line| line.starts_with("src/lib.rs")),
+                    "{route}, ready={ready}: {text}"
+                );
+                if ready {
+                    assert_eq!(
+                        response.data["fully_degraded"], false,
+                        "{route}: {response:?}"
+                    );
+                }
+                if ready && *route == "literal fallback" {
+                    assert_eq!(response.data["interpreted_as"], "literal", "{text}");
+                }
+                if *route == "split" {
+                    assert!(
+                        !text.contains("defined in src/lib.rs"),
+                        "pattern summary must also identify the external project: {text}"
+                    );
+                }
+            }
+        }
+        // An external request must not change later rendering in its own root.
+        let response = handle_semantic_search(&semantic_request("handle_request", 5), &indexed);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains("src/lib.rs"), "{text}");
+        assert!(!text.contains(&external.display().to_string()), "{text}");
+    }
+
+    #[test]
+    fn external_search_presentation_restores_after_nested_calls_and_panics() {
+        let root = Path::new("project");
+        assert_eq!(result_display_root(root), root);
+        let panic = std::panic::catch_unwind(|| {
+            with_absolute_result_paths(|| {
+                assert_eq!(result_display_root(root), Path::new(""));
+                with_absolute_result_paths(|| assert_eq!(result_display_root(root), Path::new("")));
+                assert_eq!(result_display_root(root), Path::new(""));
+                panic!("test presentation cleanup");
+            });
+        });
+        assert!(panic.is_err());
+        assert_eq!(result_display_root(root), root);
     }
 
     #[test]

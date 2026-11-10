@@ -70,6 +70,7 @@ pub struct NotFoundAnswer {
 impl NotFoundAnswer {
     /// The reply text, with paths shown relative to `display_root`.
     pub fn render(&self, display_root: &Path) -> String {
+        let display_root = super::result_display_root(display_root);
         if self.names.is_empty() {
             return format!(
                 "`{}` not found in this project, and no similar names were found.",
