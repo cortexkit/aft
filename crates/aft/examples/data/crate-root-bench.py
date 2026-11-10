@@ -26,6 +26,7 @@ for name in subprocess.check_output(["git", "-c", f"safe.directory={source}", "l
     if src.is_file():
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+subprocess.run(["git", "init", "-q", str(project)], check=True)
 store = output / "store"
 results = open(output / "results.jsonl", "w")
 
@@ -94,7 +95,9 @@ def ready(aft):
     while time.monotonic() < deadline:
         tries += 1
         reply = callers(aft)
-        if "find_all_fuzzy" in body(reply) and "building" not in body(reply)[:800]:
+        if tries == 1:
+            print(json.dumps(dict(first_callers=reply)), flush=True)
+        if "caller" in body(reply) and not any(word in body(reply)[:800] for word in ("building", "pending", "not ready", "error")):
             return reply, tries
         time.sleep(0.1)
     raise TimeoutError("callgraph ready")
