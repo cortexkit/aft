@@ -75,6 +75,31 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
         run = next(step for step in job["steps"] if step.get("run") == "bash tests/macos-e2e/run.sh")
         self.assertEqual(run["env"]["AFT_BINARY_PATH"], "${{ env.CARGO_TARGET_DIR }}/${{ env.CARGO_PROFILE_DIR }}/aft")
 
+    def test_macos_e2e_reuses_coreutils_without_write_access_to_homebrew(self):
+        source = (ROOT / "tests/macos-e2e/run.sh").read_text()
+        start = source.index('echo "── Installing GNU coreutils')
+        end = source.index("# ---- Install OpenCode", start)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = root / "bin"
+            coreutils = root / "coreutils"
+            tools.mkdir()
+            (coreutils / "libexec/gnubin").mkdir(parents=True)
+            executables = {
+                tools / "gtimeout": "#!/bin/sh\nexit 0\n",
+                coreutils / "libexec/gnubin/timeout": "#!/bin/sh\nexit 0\n",
+                tools / "brew": '#!/bin/sh\nif [ "$1" = --prefix ]; then printf "%s\\n" "$COREUTILS_FIXTURE"; else echo "brew install must not run" >&2; exit 99; fi\n',
+            }
+            for path, content in executables.items():
+                path.write_text(content)
+                path.chmod(0o755)
+            result = subprocess.run(
+                ["bash", "-e", "-c", source[start:end]], capture_output=True, text=True,
+                env={**os.environ, "PATH": f"{tools}:/usr/bin:/bin", "COREUTILS_FIXTURE": str(coreutils)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(str(coreutils / "libexec/gnubin/timeout"), result.stdout)
+
     def test_every_publish_job_requires_shipped_e2e_on_release_sha(self):
         jobs = self.workflow("release.yml")["jobs"]
         required = {f"e2e-{platform}" for platform in COVERED}

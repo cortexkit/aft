@@ -73,7 +73,11 @@ echo "  Plugin dist:  $AFT_PLUGIN_DIST"
 # and Linux has no `gtimeout` — keeping the binary name `timeout` on both
 # platforms means the shared script needs zero platform branches.
 echo "── Installing GNU coreutils (for \`timeout\`) ──"
-brew install coreutils >/dev/null
+# Dedicated runner accounts can use administrator-installed Homebrew tools but
+# cannot write to Homebrew's prefix. Reuse coreutils when it is already present.
+if ! command -v gtimeout >/dev/null 2>&1; then
+    brew install coreutils >/dev/null
+fi
 COREUTILS_GNUBIN="$(brew --prefix coreutils)/libexec/gnubin"
 if [ ! -x "$COREUTILS_GNUBIN/timeout" ]; then
     echo "Failed to locate GNU timeout under $COREUTILS_GNUBIN" >&2
