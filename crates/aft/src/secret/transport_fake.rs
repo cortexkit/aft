@@ -19,6 +19,8 @@ use super::super::wire::{Coverage, Target};
 const GOLDENS: &str = include_str!("../../tests/fixtures/secret/secret-use-v1.jsonl");
 pub(crate) const NONCE: &str = "fake-aft-launch-nonce";
 
+type PendingKey = (String, String, String, String, String);
+
 pub(crate) fn golden(index: usize) -> Value {
     serde_json::from_str(GOLDENS.lines().nth(index).unwrap()).unwrap()
 }
@@ -42,8 +44,8 @@ pub(crate) struct State {
     pub setup_incomplete: bool,
     pub other_pending_in_scope: usize,
     pub other_pending_total: usize,
-    approved: HashSet<String>,
-    pub(super) pending: HashMap<String, Value>,
+    approved: HashSet<PendingKey>,
+    pub(super) pending: HashMap<PendingKey, Value>,
 }
 
 impl State {
@@ -103,6 +105,14 @@ impl State {
         if stamp.attributes.flow_id.is_some() {
             return not_found();
         }
+        let worker_head = stamp
+            .parent
+            .as_ref()
+            .filter(|parent| {
+                stamp.parent_state == Some(ParentState::Linked)
+                    && parent.scope_epoch == stamp.scope_epoch
+            })
+            .map(|parent| (render_owner(&parent.owner), parent.scope_ref.clone()));
         let (owner, kind, reference, epoch) = match stamp.kind {
             ScopeKind::Head => (stamp.owner, "head", stamp.scope_ref, stamp.scope_epoch),
             ScopeKind::Worker => (stamp.owner, "worker", stamp.scope_ref, stamp.scope_epoch),
@@ -124,6 +134,9 @@ impl State {
         if coverage == Coverage::AgentAndWorkers && kind != "head" {
             return invalid();
         }
+        if self.store_error {
+            return refusal("store_error", "transient");
+        }
         let matches = match &params.target {
             Target::ApiKey(target) => {
                 principal == "aft"
@@ -138,20 +151,27 @@ impl State {
         if !matches {
             return not_found();
         }
-        if self.store_error {
-            return refusal("store_error", "transient");
-        }
-        let owner = match owner {
-            subc_protocol::Principal::Reserved { module_id } => format!("reserved:{module_id}"),
-            subc_protocol::Principal::Direct => "direct".into(),
-            subc_protocol::Principal::Unverified => "unverified".into(),
-        };
-        let key = format!(
-            "{}:{owner}:{kind}:{reference}:{}",
-            params.name,
-            coverage.as_str()
+        let owner = render_owner(&owner);
+        let key = (
+            params.name.clone(),
+            owner.clone(),
+            kind.into(),
+            reference.clone(),
+            coverage.as_str().into(),
         );
-        if self.approved.contains(&key) {
+        let covered = self.approved.iter().any(
+            |(name, grant_owner, grant_kind, grant_ref, grant_coverage)| {
+                name == &params.name
+                    && ((grant_owner == &owner && grant_kind == kind && grant_ref == &reference)
+                        || (kind == "worker"
+                            && grant_kind == "head"
+                            && grant_coverage == "agent_and_workers"
+                            && worker_head.as_ref().is_some_and(|(owner, reference)| {
+                                owner == grant_owner && reference == grant_ref
+                            })))
+            },
+        );
+        if covered {
             return json!({"result":golden(3)});
         }
         if self.setup_incomplete {
@@ -160,7 +180,16 @@ impl State {
         if let Some(pending) = self.pending.get(&key) {
             return json!({"result":pending});
         }
-        if self.other_pending_in_scope >= 8 || self.other_pending_total + self.pending.len() >= 64 {
+        let scope_pending = self
+            .pending
+            .keys()
+            .filter(|(_, pending_owner, pending_kind, pending_ref, _)| {
+                pending_owner == &owner && pending_kind == kind && pending_ref == &reference
+            })
+            .count();
+        if self.other_pending_in_scope + scope_pending >= 8
+            || self.other_pending_total + self.pending.len() >= 64
+        {
             return refusal("pending_limit", "transient");
         }
         let mut pending = golden(5);
@@ -182,6 +211,14 @@ impl State {
         pending["statement_b64url"] = json!(engine.encode(serde_json::to_vec(&statement).unwrap()));
         self.pending.insert(key, pending.clone());
         json!({"result":pending})
+    }
+}
+
+fn render_owner(owner: &subc_protocol::Principal) -> String {
+    match owner {
+        subc_protocol::Principal::Reserved { module_id } => format!("reserved:{module_id}"),
+        subc_protocol::Principal::Direct => "direct".into(),
+        subc_protocol::Principal::Unverified => "unverified".into(),
     }
 }
 
@@ -297,7 +334,7 @@ impl FakeClaustrum {
                             let state = Arc::clone(&served);
                             let key = key.clone();
                             tasks.spawn(async move {
-                                subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "0.39.0", Duration::from_secs(2)).await.unwrap();
+                                if subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "0.39.0", Duration::from_secs(2)).await.is_err() { return; }
                                 let mut principal = String::new();
                                 while let Ok(Some(request)) = subc_transport::read_frame(&mut stream).await {
                                     if request.header.ty == FrameType::Ping {

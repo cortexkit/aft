@@ -115,6 +115,32 @@ fn secret_use_route_maps_all_sender_refusals_without_releasing_material() {
 }
 
 #[test]
+fn secret_use_fake_grant_lookup_is_independent_of_requested_coverage_and_covers_linked_workers() {
+    let daemon = FakeClaustrum::start();
+    let transport = transport(&daemon);
+    let mut head = golden(0);
+    head["coverage"] = json!("agent_and_workers");
+    let pending = call(&transport, head);
+    daemon
+        .state
+        .lock()
+        .unwrap()
+        .approve(pending["result"]["statement_b64url"].as_str().unwrap());
+    assert_eq!(call(&transport, golden(1)), json!({"result":golden(3)}));
+    let mut worker = golden(0);
+    worker["stamp"] = golden(2)["stamp"].clone();
+    assert_eq!(
+        call(&transport, worker.clone()),
+        json!({"result":golden(3)})
+    );
+    worker["stamp"]["parent_state"] = json!("ended");
+    assert!(matches!(
+        parse_answer(&call(&transport, worker)).unwrap(),
+        SecretUseAnswer::Reply(SecretUseReply::ApprovalRequired(_))
+    ));
+}
+
+#[test]
 fn secret_use_deadline_covers_scoped_open_reply_and_disconnect_without_secret_errors() {
     for phase in ["open", "reply", "disconnect", "no-daemon"] {
         let daemon = FakeClaustrum::start();

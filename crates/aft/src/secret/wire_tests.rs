@@ -18,8 +18,9 @@ const VECTORS: &str = include_str!("../../tests/fixtures/secret/secret-approval-
 /// The sha256 the campaign pinned for the vector file.
 const VECTORS_SHA256: &str = "efd4ba60641586e143bce81087e4f9f5aaf8a99ffede74190303da7d4495cc27";
 
-// The six agent-sender request/result examples in claustrum's wire-contract v1
-// §15, in document order. Keep their literal JSON bytes, including statement bytes.
+// The six agent-sender request/result examples in claustrum's
+// docs/wire-contract-v1.md, §15 "secret.use: the sender contract", in document
+// order. Keep their literal JSON bytes, including statement bytes.
 pub(super) const USE_GOLDENS: &str =
     include_str!("../../tests/fixtures/secret/secret-use-v1.jsonl");
 
