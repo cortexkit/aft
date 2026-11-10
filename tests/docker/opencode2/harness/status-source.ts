@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 import { AftRpcClient } from "../../../../packages/opencode-plugin/src/shared/rpc-client.js";
 
-/** Query the same warm bridge as the host's status UI, without spawning AFT. */
+/** Query the existing AFT process via V1 status RPC or the V2 loopback HTTP relay. */
 export function scenarioStatusSource(options: {
   hostGeneration: "v1" | "v2";
   projectRoot: string;
