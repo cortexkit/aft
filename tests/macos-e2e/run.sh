@@ -67,23 +67,26 @@ echo "  Plugin dist:  $AFT_PLUGIN_DIST"
 # `timeout` is GNU coreutils — it ships with Linux but NOT with macOS by
 # default, and a vanilla macOS GH Actions runner without coreutils returns
 # exit 127 ("command not found") the moment the harness tries to invoke it.
-# Install coreutils via Homebrew (pre-installed on macOS-latest images) and
-# put its `gnubin` directory ahead of $PATH so `timeout` resolves to the GNU
-# version. We do NOT use `gtimeout` because the harness is shared with Linux
-# and Linux has no `gtimeout` — keeping the binary name `timeout` on both
-# platforms means the shared script needs zero platform branches.
+# The shared harness uses the same `timeout` name on Linux and macOS. When
+# coreutils is installed as `gtimeout`, expose it through a job-local symlink.
 echo "── Installing GNU coreutils (for \`timeout\`) ──"
 # Dedicated runner accounts can use administrator-installed Homebrew tools but
-# cannot write to Homebrew's prefix. Reuse coreutils when it is already present.
-if ! command -v gtimeout >/dev/null 2>&1; then
-    brew install coreutils >/dev/null
+# cannot write to Homebrew's prefix or metadata locks. Avoid even prefix queries
+# when either executable is already available.
+if ! command -v timeout >/dev/null 2>&1; then
+    if ! command -v gtimeout >/dev/null 2>&1; then
+        brew install coreutils >/dev/null
+    fi
+    GNU_TIMEOUT="$(command -v gtimeout || true)"
+    if [ -z "$GNU_TIMEOUT" ] || [ ! -x "$GNU_TIMEOUT" ]; then
+        echo "Failed to locate GNU gtimeout after coreutils setup" >&2
+        exit 2
+    fi
+    TIMEOUT_TOOLS_DIR="$RUNNER_TEMP/aft-e2e-tools"
+    mkdir -p "$TIMEOUT_TOOLS_DIR"
+    ln -sf "$GNU_TIMEOUT" "$TIMEOUT_TOOLS_DIR/timeout"
+    export PATH="$TIMEOUT_TOOLS_DIR:$PATH"
 fi
-COREUTILS_GNUBIN="$(brew --prefix coreutils)/libexec/gnubin"
-if [ ! -x "$COREUTILS_GNUBIN/timeout" ]; then
-    echo "Failed to locate GNU timeout under $COREUTILS_GNUBIN" >&2
-    exit 2
-fi
-export PATH="$COREUTILS_GNUBIN:$PATH"
 echo "  GNU timeout: $(command -v timeout)"
 
 # ---- Install OpenCode ------------------------------------------------------
