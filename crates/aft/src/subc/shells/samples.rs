@@ -127,8 +127,12 @@ fn bytes(value: &impl Serialize) -> Vec<u8> {
 }
 
 fn vectors() -> Vec<(&'static str, Vec<u8>)> {
+    let edge = format!("{}€", "a".repeat(61));
+    let colour = "\u{1b}[32mgreen\u{1b}[0m\n";
+    let edge_end = 16 + edge.len() as u64;
+    let output_end = edge_end + colour.len() as u64;
     let mut foreground = row("bash-0123456789abcdef", "foreground", false);
-    foreground.output_bytes.stdout = 36;
+    foreground.output_bytes.stdout = output_end;
     let mut background = row("bash-1123456789abcdef", "background", true);
     background.title = Some("Check the API package".into());
     background.command = "cargo check -p api".into();
@@ -137,6 +141,8 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
     pty.title = Some("Inspect terminal progress".into());
     pty.command = "watch cargo test -p terminal".into();
     pty.cwd = "/work/project/terminal".into();
+    let pty_output = "Tests passed\r\n";
+    pty.output_bytes.stdout = pty_output.len() as u64;
     let mut remote = row("bash-3123456789abcdef", "remote", false);
     remote.state = "queued".into();
     remote.title = Some("Build the Linux release".into());
@@ -145,7 +151,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
     remote.last_output_at_ms = None;
     remote.output_bytes = Offsets::default();
     remote.remote = Some(Remote {
-        job_id: "job-before-acceptance".into(),
+        job_id: "019a667b-1732-7a51-b280-e39d84af0123".into(),
         host: None,
         phase: "queued".into(),
     });
@@ -172,7 +178,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
     placed.command = "cargo test --test integration".into();
     placed.cwd = "/work/project/tests".into();
     placed.remote = Some(Remote {
-        job_id: "job-running-cedar".into(),
+        job_id: "019a667b-1733-7b62-8291-e39d84af4567".into(),
         host: Some("ovh-1".into()),
         phase: "running".into(),
     });
@@ -253,14 +259,14 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         OutputFrame::Chunk {
             stream: "stdout".into(),
             offset: 16,
-            end_offset: 21,
-            text: "ab€".into(),
+            end_offset: edge_end,
+            text: edge.clone(),
         },
         OutputFrame::Chunk {
             stream: "stdout".into(),
-            offset: 21,
-            end_offset: 36,
-            text: "\u{1b}[32mgreen\u{1b}[0m\n".into(),
+            offset: edge_end,
+            end_offset: output_end,
+            text: colour.into(),
         },
         OutputFrame::End {
             row: ended(foreground.clone()),
@@ -278,13 +284,13 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         OutputFrame::Chunk {
             stream: "stdout".into(),
             offset: 16,
-            end_offset: 21,
-            text: "ab€".into(),
+            end_offset: edge_end,
+            text: edge,
         },
         OutputFrame::Chunk {
             stream: "stdout".into(),
-            offset: 21,
-            end_offset: 36,
+            offset: edge_end,
+            end_offset: output_end,
             text: "green\n".into(),
         },
         OutputFrame::End {
@@ -297,10 +303,19 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             ansi: "strip".into(),
             truncated_before: None,
         },
+        OutputFrame::Chunk {
+            stream: "stdout".into(),
+            offset: 0,
+            end_offset: pty_output.len() as u64,
+            text: pty_output.into(),
+        },
         OutputFrame::Screen {
             rows: 2,
             cols: 20,
-            lines: vec!["Tests passed".into(), "".into()],
+            lines: crate::pty_render::render_screen(pty_output.as_bytes(), 2, 20)
+                .split('\n')
+                .map(str::to_owned)
+                .collect(),
             cursor: ScreenCursor { row: 1, col: 0 },
         },
         OutputFrame::End { row: ended(pty) },

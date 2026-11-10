@@ -3,7 +3,7 @@ use super::*;
 fn stamp(reference: &str, worker: bool) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
         "owner":{"kind":"reserved","module_id":"prefrontal-core"},
-        "ref":reference,"scope_epoch":1,"kind":if worker {"worker"} else {"session"},
+        "ref":reference,"scope_epoch":1,"kind":if worker {"worker"} else {"head"},
         "owner_authorized":true
     }))
     .unwrap()
@@ -476,7 +476,11 @@ async fn shells_v1_real_route_refusals_unknown_agent_watch_cancel_and_drain() {
             channel,
             u32::from(channel != 0),
             corr,
-            serde_json::to_vec(&body).unwrap(),
+            if ty == FrameType::Cancel {
+                Vec::new()
+            } else {
+                serde_json::to_vec(&body).unwrap()
+            },
         )
         .unwrap();
         write_frame(daemon, &frame).await.unwrap();
