@@ -11910,6 +11910,30 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    pub(crate) fn freeze_runner_completion_notice(
+        &self,
+        session: &str,
+        task_id: &str,
+        request: cortexkit_role_llm_runner::send::SendRequest,
+    ) -> std::io::Result<cortexkit_role_llm_runner::send::SendRequest> {
+        let task = self
+            .task_for_session(task_id, session)
+            .ok_or_else(|| std::io::Error::other("completion task is not owned by this session"))?;
+        self.retry_terminal_persist(&task)?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            metadata.runner_completion_notice.get_or_insert(request);
+        })?;
+        Ok(state
+            .metadata
+            .runner_completion_notice
+            .clone()
+            .expect("notice was frozen"))
+    }
+
     pub fn pending_completions_for_session(&self, session_id: &str) -> Vec<BgCompletion> {
         self.inner
             .completions

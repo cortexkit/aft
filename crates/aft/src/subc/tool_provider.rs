@@ -8804,21 +8804,22 @@ pub(in crate::subc) mod route_tests {
     }
 
     #[tokio::test]
-    async fn runner_completion_ack_tool_call_owns_tasks_and_stays_out_of_catalog() {
+    async fn plugin_completion_ack_tool_call_owns_tasks_and_stays_out_of_catalog() {
         use crate::bash_background::persistence::{
             create_task_layout, read_task_at, write_task_at, PersistedTask,
         };
         use crate::bash_background::{BgTaskStatus, TaskIdentity};
 
         let _guard = EXCHANGE_LOCK.lock().await;
-        for principal in ["reserved:thalamus-harness", "reserved:thalamus-pi"] {
-            let (dir, root) = test_support::test_root("runner-native-completion-ack");
+        for plugin_harness in ["opencode", "pi"] {
+            let principal = "direct";
+            let (dir, root) = test_support::test_root("plugin-native-completion-ack");
             let ctx = test_support::test_ctx();
             let mut identity = test_support::route_identity_with_harness(
                 &root,
                 "ack-session",
                 BindTrust::FirstParty,
-                "opencode2",
+                plugin_harness,
             );
             let data = Arc::get_mut(&mut identity.0).unwrap();
             data.role = RouteRole::ToolProviderV1;
@@ -8835,21 +8836,30 @@ pub(in crate::subc) mod route_tests {
                     "bash-0000000000000001",
                     "ack-session",
                     principal,
-                    "opencode2",
+                    plugin_harness,
                 ),
                 (
                     "bash-0000000000000002",
                     "foreign-session",
                     principal,
-                    "opencode2",
+                    plugin_harness,
                 ),
                 (
                     "bash-0000000000000003",
                     "ack-session",
                     "reserved:broca",
-                    "opencode2",
+                    plugin_harness,
                 ),
-                ("bash-0000000000000004", "ack-session", principal, "pi"),
+                (
+                    "bash-0000000000000004",
+                    "ack-session",
+                    principal,
+                    if plugin_harness == "pi" {
+                        "opencode"
+                    } else {
+                        "pi"
+                    },
+                ),
             ] {
                 let task = create_task_layout(&storage, session, task_id).unwrap();
                 let mut metadata = PersistedTask::starting(
@@ -8925,6 +8935,43 @@ pub(in crate::subc) mod route_tests {
             )
             .is_err());
             ctx.bash_background().detach();
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_completion_ack_tool_call_is_refused_before_dispatch() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for (principal, harness) in [
+            ("reserved:thalamus-harness", "opencode"),
+            ("reserved:thalamus-harness", "pi"),
+            ("reserved:broca", "broca"),
+            ("direct", "runner"),
+        ] {
+            let (_dir, root) = test_support::test_root("runner-ack-refused");
+            let mut identity = test_support::route_identity_with_harness(
+                &root,
+                "ack-session",
+                BindTrust::FirstParty,
+                harness,
+            );
+            let data = Arc::get_mut(&mut identity.0).unwrap();
+            data.role = RouteRole::ToolProviderV1;
+            if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                &mut data.spawn_principal
+            {
+                *principal_id = Some(principal.into());
+            }
+            let reply = exchange_with_actor(
+                json!({"op":"tool.call","name":"bash_ack_completions","arguments":{"task_ids":[]}}),
+                identity,
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("runner ack must not reach the native handler"),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error);
+            assert_eq!(body["code"], "completion_ack_unsupported");
         }
     }
 

@@ -1,0 +1,9 @@
+{
+  "op": "scope.background_tasks",
+  "status": "ok",
+  "data": {
+    "running": [],
+    "complete": false,
+    "reason": "registry_not_loaded"
+  }
+}

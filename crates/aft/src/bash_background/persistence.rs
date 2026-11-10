@@ -1928,6 +1928,10 @@ pub struct PersistedTask {
     /// first offer. Persisted so reconnect budgets survive daemon restarts.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) runner_completion_offers: usize,
+    /// Freeze the exact runner send before its first attempt. A restart must
+    /// reuse the same text and delivery list even if task observations change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_completion_notice: Option<cortexkit_role_llm_runner::send::SendRequest>,
     /// The saved folder grants this command's sandbox allowed, so revoking
     /// one can stop it. Persisted so a restarted AFT still knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2033,6 +2037,7 @@ impl PersistedTask {
             local_fallback_started: false,
             cancelled_call_unannounced: false,
             runner_completion_offers: 0,
+            runner_completion_notice: None,
             folder_grants: super::registry::folder_grants::for_spawn(),
         };
         crate::gh_shim_ticket::capture_spawn(&metadata);
@@ -2129,7 +2134,7 @@ impl PersistedTask {
 
 impl From<BashTaskRow> for PersistedTask {
     fn from(row: BashTaskRow) -> Self {
-        if let Ok(mut task) = serde_json::from_str::<PersistedTask>(&row.metadata) {
+        if let Ok(mut task) = decode_persisted_task(&row.metadata) {
             task.harness = Some(row.harness.clone());
             // A foreign registry acknowledges the row without rewriting its
             // metadata snapshot, so the durable column may be newer.
@@ -2207,9 +2212,49 @@ impl From<BashTaskRow> for PersistedTask {
             local_fallback_started: false,
             cancelled_call_unannounced: false,
             runner_completion_offers: 0,
+            runner_completion_notice: None,
             folder_grants: None,
         }
     }
+}
+
+fn decode_persisted_task(content: &str) -> serde_json::Result<PersistedTask> {
+    let mut value: serde_json::Value = serde_json::from_str(content)?;
+    // Older records kept the route label only inside launching_identity. Save
+    // it before TaskIdentity's decoder canonicalizes ownership to Runner.
+    if value
+        .get("launching_raw_harness")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        if let Some(raw) = value.pointer("/launching_identity/harness").cloned() {
+            value["launching_raw_harness"] = raw;
+        }
+    }
+    serde_json::from_value(value)
+}
+
+#[cfg(test)]
+#[test]
+fn bash_background_legacy_runner_identity_keeps_raw_notice_address() {
+    let metadata = PersistedTask::starting(
+        "bash-0000000000000001".into(),
+        "session".into(),
+        "echo ok".into(),
+        PathBuf::from("."),
+        None,
+        None,
+        true,
+        false,
+    );
+    let mut value = serde_json::to_value(metadata).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("launching_raw_harness");
+    value["launching_identity"] = serde_json::json!({"principal":"reserved:thalamus-harness", "harness":"opencode2", "session":"session"});
+    let restored = decode_persisted_task(&serde_json::to_string(&value).unwrap()).unwrap();
+    assert_eq!(restored.launching_raw_harness.as_deref(), Some("opencode2"));
+    assert_eq!(restored.launching_identity.unwrap().harness, "runner");
 }
 
 fn status_name(status: &BgTaskStatus) -> &'static str {
@@ -2930,7 +2975,7 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
     // different shape and must be refused, not quarantined as corrupt tasks.
     #[cfg(test)]
     work_counts::record_parse();
-    let decoded = serde_json::from_str::<PersistedTask>(&content);
+    let decoded = decode_persisted_task(&content);
     let version = match &decoded {
         Ok(task) => Some(u64::from(task.schema_version)),
         Err(_) => {

@@ -755,6 +755,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "owner-only management snapshot, not an agent result list; command_truncated identifies the UTF-8 command ceiling and complete false with a reason discloses every bounded or failed walk",
     },
     ExclusionEntry {
+        file: "db/runner_harness_keys.rs",
+        enclosing_item: "copy_aliases",
+        location_or_primitive: "SOURCE_LIMIT and SQL LIMIT",
+        reason: "startup value migration bounds source rows before copying and refuses an oversized batch atomically; no agent list is returned and original rows remain available for rollback",
+    },
+    ExclusionEntry {
         file: "bash_background/registry.rs",
         enclosing_item: "try_scope_background_tasks",
         location_or_primitive: "remaining iterator budget",

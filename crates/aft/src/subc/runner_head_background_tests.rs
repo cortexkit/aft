@@ -263,8 +263,8 @@ fn delivered_channels(
 
 /// A background launch on a Thalamus runner's head route answers at once;
 /// its task survives the call's route closing and its connection dropping,
-/// finishes on its own, and its completion is pushed to that route's
-/// launching identity and delivered to that route.
+/// finishes on its own, and its completion is sent once as a runner notice,
+/// without a completion frame on the tool route.
 async fn assert_runner_head_background_hands_back(principal: &str, harness: &str) {
     let mut fixture = Fixture::new("runner-head-background");
     let route = v1_route(&fixture.root, principal, harness, "head");
@@ -300,11 +300,66 @@ async fn assert_runner_head_background_hands_back(principal: &str, harness: &str
     assert_eq!(frame.launching_identity, Some(route.task_identity()));
     assert_eq!(frame.exit_code, Some(0));
     let owner = route_key(1, 1);
-    let routes = HashMap::from([(owner, route)]);
+    let routes = HashMap::from([(owner, route.clone())]);
+    assert!(delivered_channels(&fixture.root, &routes, &completion).is_empty());
+    let capture = super::super::runner_notices::test_endpoint::capture(&task_id, true);
+    let metrics = DispatchPathMetrics::new();
+    metrics
+        .completion_delivery
+        .registries
+        .lock()
+        .unwrap()
+        .insert(fixture.root.clone(), fixture.ctx.bash_background().clone());
+    let (writer, mut output) = mpsc::channel(8);
+    let channels = HashMap::from([(fixture.root.clone(), HashSet::from([owner]))]);
+    for _ in 0..2 {
+        process_reliable_push_frame(
+            &writer,
+            &metrics,
+            &routes,
+            &channels,
+            &HashMap::new(),
+            &mut RetryBuffer::new(),
+            &mut HashMap::new(),
+            &mut CompletedTaskIds::default(),
+            fixture.root.clone(),
+            completion.clone(),
+            None,
+        );
+    }
+    let first = capture
+        .receiver
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+    let retry = capture
+        .receiver
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(first.harness, harness);
+    assert_eq!(first.session, route.session);
     assert_eq!(
-        delivered_channels(&fixture.root, &routes, &completion),
-        vec![owner]
+        first.scope,
+        route
+            .scope
+            .as_ref()
+            .map(|scope| subc_protocol::scope::ScopeSelector::new(
+                scope.owner.clone(),
+                scope.scope_ref.clone(),
+                Some(scope.scope_epoch)
+            ))
     );
+    assert_eq!(first.request, retry.request);
+    assert_eq!(first.request["params"]["prompt"], super::super::bash_notice_text::completion(&serde_json::to_value(&completion).unwrap()), "notice rendering must not enrich the former frame with persisted duration or other metadata");
+    assert_eq!(
+        first.request["params"]["send_id"],
+        format!("aft:bash:{task_id}")
+    );
+    assert_eq!(
+        first.request["params"]["delivery"],
+        json!(["tool_result", "steer", "idle_start"])
+    );
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+    assert!(output.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -313,8 +368,8 @@ async fn thalamus_harness_head_background_answers_at_once_and_completes_to_its_r
 }
 
 #[tokio::test]
-async fn thalamus_pi_head_background_answers_at_once_and_completes_to_its_route() {
-    assert_runner_head_background_hands_back("reserved:thalamus-pi", "pi").await;
+async fn thalamus_harness_pi_head_background_answers_at_once_and_sends_a_notice() {
+    assert_runner_head_background_hands_back("reserved:thalamus-harness", "pi").await;
 }
 
 /// The completion of a runner head's handed-back task goes to routes with
@@ -353,10 +408,7 @@ async fn runner_head_completion_skips_same_session_routes_of_other_identities() 
         assert_eq!(routes[&other].session, route.session);
         assert_ne!(routes[&other].task_identity(), route.task_identity());
     }
-    assert_eq!(
-        delivered_channels(&fixture.root, &routes, &completion),
-        vec![owner]
-    );
+    assert!(delivered_channels(&fixture.root, &routes, &completion).is_empty());
 }
 
 /// A server-owned call that is not a Thalamus runner's head keeps owning its

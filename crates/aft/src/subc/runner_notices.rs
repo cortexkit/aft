@@ -156,6 +156,98 @@ fn envelope(request: &SendRequest) -> Vec<u8> {
         .expect("notice request is JSON")
 }
 
+#[cfg(test)]
+pub(super) mod test_endpoint {
+    use super::*;
+    struct Endpoint {
+        sender: std::sync::mpsc::Sender<Received>,
+        stored: std::sync::Mutex<Option<Vec<u8>>>,
+        lose_response: AtomicBool,
+        effects: Arc<AtomicU64>,
+    }
+    fn endpoints() -> &'static std::sync::Mutex<HashMap<String, Arc<Endpoint>>> {
+        static ENDPOINTS: OnceLock<std::sync::Mutex<HashMap<String, Arc<Endpoint>>>> =
+            OnceLock::new();
+        ENDPOINTS.get_or_init(Default::default)
+    }
+    pub(super) fn contains(id: &str) -> bool {
+        endpoints().lock().unwrap().contains_key(id)
+    }
+    pub(in crate::subc) struct Received {
+        pub harness: String,
+        pub session: String,
+        pub scope: Option<ScopeSelector>,
+        pub request: Value,
+    }
+    pub(in crate::subc) struct Capture {
+        key: String,
+        pub receiver: std::sync::mpsc::Receiver<Received>,
+        pub effects: Arc<AtomicU64>,
+    }
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            endpoints().lock().unwrap().remove(&self.key);
+        }
+    }
+    pub(in crate::subc) fn capture(task: &str, lose_response: bool) -> Capture {
+        let key = format!("aft:bash:{task}");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let effects = Arc::new(AtomicU64::new(0));
+        assert!(endpoints()
+            .lock()
+            .unwrap()
+            .insert(
+                key.clone(),
+                Arc::new(Endpoint {
+                    sender,
+                    stored: Default::default(),
+                    lose_response: AtomicBool::new(lose_response),
+                    effects: effects.clone()
+                })
+            )
+            .is_none());
+        Capture {
+            key,
+            receiver,
+            effects,
+        }
+    }
+    pub(super) fn send(address: &Address, request: &SendRequest) -> Option<Outcome> {
+        let endpoint = endpoints().lock().unwrap().get(&request.send_id).cloned()?;
+        let body: Value = serde_json::from_slice(&envelope(request)).unwrap();
+        assert_eq!(body["method"], "session.send");
+        assert_eq!(body.as_object().unwrap().len(), 2);
+        let decoded: SendRequest = serde_json::from_value(body["params"].clone()).unwrap();
+        decoded.check_prompt().unwrap();
+        assert_eq!(body["params"]["notice"], true);
+        let bytes = serde_json::to_vec(&decoded).unwrap();
+        let mut stored = endpoint.stored.lock().unwrap();
+        if let Some(first) = stored.as_ref() {
+            if first != &bytes {
+                return Some(refusal("send_id_reuse"));
+            }
+        } else {
+            *stored = Some(bytes);
+            endpoint.effects.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = endpoint.sender.send(Received {
+            harness: address.identity.harness.clone(),
+            session: address.identity.session.clone(),
+            scope: address.scope.clone(),
+            request: body,
+        });
+        if endpoint.lose_response.swap(false, Ordering::Relaxed) {
+            return Some(Outcome::Retry);
+        }
+        let reply = cortexkit_role_llm_runner::wire::reply_body(
+            &SendReply::new("pending").with_submission_id("notice-1"),
+        )
+        .unwrap();
+        cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&reply).unwrap();
+        Some(Outcome::Accepted)
+    }
+}
+
 #[derive(Debug)]
 enum Outcome {
     Accepted,
@@ -211,6 +303,10 @@ fn deliver(
 mod tests;
 
 async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
+    #[cfg(test)]
+    if let Some(outcome) = test_endpoint::send(address, request) {
+        return outcome;
+    }
     let Some(principal) = crate::launch_nonce::consumer_identity() else {
         return Outcome::Retry;
     };
@@ -284,7 +380,11 @@ pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: P
     let Some(owner) = owner.clone().filter(is_runner) else {
         return false;
     };
-    let Some(path) = CONNECTION.get().map(|path| path.read().unwrap().clone()) else {
+    let path = CONNECTION.get().map(|path| path.read().unwrap().clone());
+    #[cfg(test)]
+    let path =
+        path.or_else(|| test_endpoint::contains(&format!("aft:bash:{task_id}")).then(PathBuf::new));
+    let Some(path) = path else {
         return false;
     };
     let Some(active) = reserve() else {
@@ -308,8 +408,7 @@ pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: P
             };
             let (id, text, completion) = match &frame {
                 PushFrame::BashCompleted(_) => {
-                    let mut value = serde_json::to_value(&frame).unwrap();
-                    value["duration_ms"] = json!(metadata.duration_ms);
+                    let value = serde_json::to_value(&frame).unwrap();
                     (
                         format!("aft:bash:{task_id}"),
                         super::bash_notice_text::completion(&value),
@@ -323,8 +422,9 @@ pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: P
                 ),
                 PushFrame::BashPatternMatch(frame) => (
                     format!(
-                        "aft:bash-watch:{}:{}:{}",
-                        frame.watch_id, frame.match_offset, frame.reason
+                        "aft:bash-watch:{}:{}",
+                        frame.watch_id,
+                        blake3::hash(&serde_json::to_vec(frame).unwrap())
                     ),
                     super::bash_notice_text::watch(&serde_json::to_value(frame).unwrap()),
                     false,
@@ -332,6 +432,17 @@ pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: P
                 _ => unreachable!(),
             };
             let request = request(id, text, completion, address.worker);
+            let request = if completion {
+                match registry.freeze_runner_completion_notice(&owner.session, &task_id, request) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        log::warn!("runner notice task={task_id} could not freeze send: {error}");
+                        return;
+                    }
+                }
+            } else {
+                request
+            };
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

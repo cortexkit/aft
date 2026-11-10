@@ -29,6 +29,11 @@ fn runner_alias_switch_preserves_task_ownership_and_persisted_keys() {
         let identity =
             crate::bash_background::TaskIdentity::from_principal(&principal(raw)).unwrap();
         assert_eq!(identity, canonical);
+        let saved: crate::bash_background::TaskIdentity = serde_json::from_value(
+            json!({"principal":"reserved:broca", "harness":raw, "session":"session-7"}),
+        )
+        .unwrap();
+        assert_eq!(saved, canonical);
         assert_eq!(
             serde_json::to_vec(&identity).unwrap(),
             serde_json::to_vec(&canonical).unwrap()

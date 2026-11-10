@@ -11342,6 +11342,18 @@ async fn handle_tool_call_with_capabilities(
                 .await
             }
         };
+        if call.name == "bash_ack_completions" && runner_notices::runner_route(&identity) {
+            return send_provider_error(
+                tx,
+                metrics,
+                frame,
+                subc_protocol::ErrorBody::new(
+                    "completion_ack_unsupported",
+                    "runner completions are acknowledged by session.send",
+                ),
+            )
+            .await;
+        }
         match carrier_read_only::admit_operation(&identity, &call.name, &call.arguments) {
             Err(error) => {
                 let response = wire::build_carrier_response_frame(

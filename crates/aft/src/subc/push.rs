@@ -31,9 +31,8 @@ mod completion_settlement;
 type UnackedCompletions =
     Arc<std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, HashSet<String>>>>>;
 
-/// Plugin and acknowledging runner offers remain eligible until acknowledged.
-/// Offers to other runners are no longer eligible after acceptance; all durable
-/// delivery writes run off-thread.
+/// Plugin offers remain eligible until acknowledged. Runner sessions use
+/// session.send instead; durable plugin delivery writes run off-thread.
 #[derive(Default)]
 pub(super) struct CompletionDelivery {
     state: std::sync::Mutex<CompletionOffers>,
@@ -63,23 +62,8 @@ impl std::fmt::Debug for CompletionDelivery {
 }
 
 fn caller_acknowledges_completions(principal: Option<&str>) -> bool {
-    // RouteIdentity's authenticated principal (also carried in ReplayKey) is
-    // stable across reconnects. Harness names are shared by plugins and runners.
-    acknowledging_runner(principal)
-        || !principal.is_some_and(|principal| principal.starts_with("reserved:"))
+    !principal.is_some_and(|principal| principal.starts_with("reserved:"))
 }
-
-fn acknowledging_runner(principal: Option<&str>) -> bool {
-    matches!(
-        principal,
-        Some("reserved:thalamus-harness" | "reserved:thalamus-pi")
-    )
-}
-
-// Count the initial successful offer as well as rebind offers. Plugin delivery
-// is not subject to this runner-specific replay budget.
-const RUNNER_COMPLETION_MAX_OFFERS: usize = 3;
-const RUNNER_COMPLETION_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
 enum CompletionSend {
     Send,
@@ -152,14 +136,6 @@ impl CompletionDelivery {
                 return;
             }
         }
-        if acknowledging_runner(key.principal.as_deref()) {
-            if let Some(offers) = self
-                .registry(&key.root)
-                .and_then(|registry| registry.reserve_runner_completion_offer(task))
-            {
-                self.queue_write(key, task, Some(offers));
-            }
-        }
     }
 
     fn registry(&self, root: &ProjectRootId) -> Option<crate::bash_background::BgTaskRegistry> {
@@ -230,24 +206,6 @@ impl CompletionDelivery {
         let Some(registry) = self.registry(&key.root) else {
             return CompletionSend::Send;
         };
-        if acknowledging_runner(key.principal.as_deref()) {
-            let Some(state) = registry.runner_completion_state(task) else {
-                return CompletionSend::Hold;
-            };
-            if state.completion_delivered {
-                return CompletionSend::Settled;
-            }
-            let expired = state.completion_finished_at.is_none_or(|finished| {
-                crate::bash_background::persistence::unix_millis().saturating_sub(finished)
-                    >= RUNNER_COMPLETION_MAX_AGE_MS
-            });
-            if expired || state.runner_completion_offers >= RUNNER_COMPLETION_MAX_OFFERS {
-                log::info!("subc completion push: task={task} outcome=retired key={key:?} reason={} offers={}", if expired { "runner_completion_expired" } else { "runner_completion_offer_limit" }, state.runner_completion_offers);
-                self.settle(key, task);
-                return CompletionSend::Settled;
-            }
-            return CompletionSend::Send;
-        }
         if caller_acknowledges_completions(key.principal.as_deref()) {
             return CompletionSend::Send;
         }
@@ -2275,9 +2233,52 @@ mod tests {
         route
     }
 
+    #[test]
+    fn runner_routes_receive_neither_completion_frames_nor_root_broadcasts() {
+        let (_dir, root) = test_root("runner-frame-cutover");
+        let runner = caller_route(&root, "reserved:broca", "broca");
+        let plugin = caller_route(&root, "direct", "opencode");
+        let pi = caller_route(&root, "direct", "pi");
+        let routes = HashMap::from([
+            (route_key(1, 1), runner.clone()),
+            (route_key(2, 1), plugin.clone()),
+            (route_key(3, 1), pi),
+        ]);
+        let roots = HashMap::from([(
+            root.clone(),
+            HashSet::from([route_key(1, 1), route_key(2, 1), route_key(3, 1)]),
+        )]);
+        for frame in [
+            PushFrame::StatusChanged(crate::protocol::StatusChangedFrame::new(None, json!({}))),
+            PushFrame::ConfigureWarnings(crate::protocol::ConfigureWarningsFrame::new(
+                root.as_path().display().to_string(),
+                vec![],
+            )),
+        ] {
+            assert_eq!(
+                matching_route_channels(&routes, &roots, &root, &frame)
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                HashSet::from([route_key(2, 1), route_key(3, 1)])
+            );
+        }
+        let mut frame = completion_frame_with_session("owned-task", "moved-session");
+        if let PushFrame::BashCompleted(frame) = &mut frame {
+            frame.launching_identity = Some(runner.task_identity());
+        }
+        assert!(matching_route_channels(&routes, &roots, &root, &frame).is_empty());
+        if let PushFrame::BashCompleted(frame) = &mut frame {
+            frame.launching_identity = Some(plugin.task_identity());
+        }
+        assert_eq!(
+            matching_route_channels(&routes, &roots, &root, &frame),
+            vec![route_key(2, 1)]
+        );
+    }
+
     fn assert_task_notice_isolation(other_principal: &str, other_harness: &str) {
         let (_dir, root) = test_root("task-notice-caller-root");
-        let owner = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        let owner = caller_route(&root, "direct", "opencode");
         let other = caller_route(&root, other_principal, other_harness);
         let owner_channel = route_key(1, 1);
         let other_channel = route_key(2, 1);
@@ -2417,7 +2418,7 @@ mod tests {
             ),
             0
         );
-        let reconnect = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        let reconnect = caller_route(&root, "direct", "opencode");
         assert_eq!(
             replay_buffered_push_frames(
                 &writer_tx,
@@ -2466,12 +2467,12 @@ mod tests {
     }
 
     #[test]
-    fn task_notices_isolate_principals_and_reconnect() {
-        assert_task_notice_isolation("direct", "opencode");
+    fn plugin_task_notices_isolate_principals_and_reconnect() {
+        assert_task_notice_isolation("reserved:prefrontal-core", "opencode");
     }
 
     #[test]
-    fn task_notices_isolate_harnesses_and_reconnect() {
+    fn plugin_task_notices_isolate_harnesses_and_reconnect() {
         assert_task_notice_isolation("reserved:thalamus-harness", "opencode2");
     }
 
@@ -2655,17 +2656,25 @@ mod tests {
             &completion,
             None,
         );
-        assert_eq!(result.matched_channels, 1);
-        assert_eq!(result.sent_frames, 1);
-        let delivered = writer_rx.try_recv().expect("head receives completion");
-        assert_eq!((delivered.header.channel, delivered.header.epoch), (1, 1));
+        assert_eq!(result.matched_channels, 0);
+        assert_eq!(result.sent_frames, 0);
+        let capture = super::super::runner_notices::test_endpoint::capture(&task_id, false);
+        assert!(super::super::runner_notices::enqueue(
+            ctx.bash_background().clone(),
+            completion
+        ));
+        let notice = capture
+            .receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(notice.session, "head-session");
         assert_eq!(
-            push_frame_task_id(&delivered).as_deref(),
-            Some(task_id.as_str())
+            notice.request["params"]["send_id"],
+            format!("aft:bash:{task_id}")
         );
         assert!(
             writer_rx.try_recv().is_err(),
-            "run route must not receive the head's completion"
+            "neither the head nor run tool route receives a completion frame"
         );
         ctx.bash_background().shutdown();
     }

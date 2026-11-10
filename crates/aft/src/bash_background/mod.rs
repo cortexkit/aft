@@ -557,8 +557,19 @@ pub struct TaskCallKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskIdentity {
     pub principal: Option<String>,
+    #[serde(deserialize_with = "deserialize_task_harness")]
     pub harness: String,
     pub session: String,
+}
+
+fn deserialize_task_harness<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let raw = String::deserialize(deserializer)?;
+    Ok(raw
+        .parse::<crate::harness::Harness>()
+        .map(|harness| harness.wire_label())
+        .unwrap_or(raw))
 }
 
 thread_local! {

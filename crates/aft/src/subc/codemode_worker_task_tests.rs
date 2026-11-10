@@ -406,12 +406,24 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
         &completion,
         None,
     );
-    assert_eq!(result.matched_channels, 1);
-    let delivered = writer_rx.try_recv().expect("worker receives completion");
-    assert_eq!((delivered.header.channel, delivered.header.epoch), (2, 1));
+    assert_eq!(result.matched_channels, 0);
+    let capture = super::super::runner_notices::test_endpoint::capture(&task_id, false);
+    assert!(super::super::runner_notices::enqueue(
+        f.ctx.bash_background().clone(),
+        completion.clone()
+    ));
+    let notice = capture
+        .receiver
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(notice.session, "worker-session");
+    assert_eq!(
+        notice.request["params"]["delivery"],
+        json!(["tool_result", "steer"])
+    );
     assert!(
         writer_rx.try_recv().is_err(),
-        "no carrier or foreign route receives completion"
+        "runner and foreign routes receive no completion frames"
     );
     let subs = HashMap::from([
         (
