@@ -9524,6 +9524,11 @@ impl BgTaskRegistry {
         );
         snapshot.output_preview = cache.output_preview;
         snapshot.output_truncated = cache.output_truncated;
+        if snapshot.remote_oom_kill.is_some() {
+            if let Some(note) = rendered_execution_note(&metadata) {
+                snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
+            }
+        }
         Some((snapshot, resolved.paths))
     }
 
