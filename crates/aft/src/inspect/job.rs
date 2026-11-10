@@ -5,8 +5,7 @@ pub(crate) use crate::data_layer::dead_code_snapshot::{
     CALLGRAPH_PROVENANCE_REEXPORT, CALLGRAPH_PROVENANCE_TREESITTER, DISPATCHED_CALLEE_SEPARATOR,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
