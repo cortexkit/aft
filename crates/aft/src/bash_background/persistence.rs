@@ -1923,7 +1923,7 @@ pub struct PersistedTask {
     /// Successful completion offers to an acknowledging runner, including the
     /// first offer. Persisted so reconnect budgets survive daemon restarts.
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub(crate) runner_completion_offers: u64,
+    pub(crate) runner_completion_offers: usize,
     /// The saved folder grants this command's sandbox allowed, so revoking
     /// one can stop it. Persisted so a restarted AFT still knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2195,6 +2195,7 @@ impl From<BashTaskRow> for PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
+            runner_completion_offers: 0,
             folder_grants: None,
         }
     }

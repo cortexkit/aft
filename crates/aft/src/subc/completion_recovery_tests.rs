@@ -576,11 +576,26 @@ struct RunnerRecovery {
 
 impl RunnerRecovery {
     fn new(root: &ProjectRootId, principal: &str, harness: &str, capacity: usize) -> Self {
+        Self::with_cutoff(
+            root,
+            principal,
+            harness,
+            capacity,
+            crate::bash_background::persistence::unix_millis(),
+        )
+    }
+
+    fn with_cutoff(
+        root: &ProjectRootId,
+        principal: &str,
+        harness: &str,
+        capacity: usize,
+        cutoff: u64,
+    ) -> Self {
         let storage = tempfile::tempdir().unwrap();
         let owner = tests::caller_route(root, principal, harness);
         let registry = BgTaskRegistry::default();
         let db = crate::db::open(&storage.path().join("aft.db")).unwrap();
-        let cutoff = crate::bash_background::persistence::unix_millis();
         crate::db::state::set_host_state(
             &db,
             crate::db::state::RUNNER_COMPLETION_DELIVERY_CUTOVER,
@@ -1094,8 +1109,8 @@ fn thalamus_runner_unacked_completion_reoffers_are_bounded_across_restart() {
         assert!(recovery.output.try_recv().is_err());
         recovery.close(first);
         recovery.restart_registry();
-        for epoch in 2..=RUNNER_COMPLETION_MAX_OFFERS {
-            let next = route_key(1, epoch as u32);
+        for epoch in 2..=3 {
+            let next = route_key(1, epoch);
             recovery.bind(next);
             recovery.assert_frame(next, TASK);
             recovery.assert_pending();
@@ -1150,12 +1165,21 @@ fn thalamus_runner_acked_completion_never_reoffers_after_rebind_or_restart() {
 fn thalamus_runner_expired_completion_is_retired_in_live_and_recovery_paths() {
     let (_dir, root) = test_root("runner-completion-ack-expiry");
     for live in [false, true] {
-        let mut recovery = RunnerRecovery::new(&root, "reserved:thalamus-harness", "opencode2", 8);
+        let day_ms = 24 * 60 * 60 * 1000;
+        let now = crate::bash_background::persistence::unix_millis();
+        // The task timestamp is after the recovery cutoff, so cutoff-based
+        // backlog retirement cannot accidentally satisfy the expiry assertion.
+        let mut recovery = RunnerRecovery::with_cutoff(
+            &root,
+            "reserved:thalamus-harness",
+            "opencode2",
+            8,
+            now - 2 * day_ms,
+        );
         if live {
             recovery.bind(route_key(1, 1));
         }
-        let frame =
-            recovery.add_completion(TASK, recovery.cutoff - RUNNER_COMPLETION_MAX_AGE_MS - 1);
+        let frame = recovery.add_completion(TASK, now - day_ms - 1);
         if live {
             recovery.live(frame);
         } else {

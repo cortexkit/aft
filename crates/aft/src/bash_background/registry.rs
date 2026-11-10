@@ -1559,7 +1559,7 @@ pub(crate) struct BashDrainReplyCache(Arc<Mutex<BashDrainReplyState>>);
 pub(crate) struct BashDrainReplyState {
     pub(crate) completion_finished_at: Option<u64>,
     pub(crate) completion_delivered: bool,
-    pub(crate) runner_completion_offers: u64,
+    pub(crate) runner_completion_offers: usize,
     pub(crate) execution_note: Option<String>,
     pub(crate) deadline: Option<(HardKillDeadline, u64)>,
     pub(crate) inputs_captured: Option<bool>,
@@ -11822,7 +11822,7 @@ impl BgTaskRegistry {
     }
 
     /// Reserve in memory only; the completion writer persists the returned count.
-    pub(crate) fn reserve_runner_completion_offer(&self, task_id: &str) -> Option<u64> {
+    pub(crate) fn reserve_runner_completion_offer(&self, task_id: &str) -> Option<usize> {
         let task = self.task(task_id)?;
         let mut published = task.drain_reply.0.lock().ok()?;
         published.runner_completion_offers = published.runner_completion_offers.saturating_add(1);
@@ -11833,7 +11833,7 @@ impl BgTaskRegistry {
         &self,
         session: &str,
         task_id: &str,
-        offers: u64,
+        offers: usize,
     ) -> std::io::Result<()> {
         let task = self
             .task_for_session(task_id, session)

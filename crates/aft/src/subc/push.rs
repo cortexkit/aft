@@ -77,7 +77,7 @@ fn acknowledging_runner(principal: Option<&str>) -> bool {
 
 // Count the initial successful offer as well as rebind offers. Plugin delivery
 // is not subject to this runner-specific replay budget.
-const RUNNER_COMPLETION_MAX_OFFERS: u64 = 3;
+const RUNNER_COMPLETION_MAX_OFFERS: usize = 3;
 const RUNNER_COMPLETION_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
 enum CompletionSend {
@@ -187,7 +187,7 @@ impl CompletionDelivery {
         self.queue_write(key, task, None)
     }
 
-    fn queue_write(&self, key: &ReplayKey, task: &str, offers: Option<u64>) -> bool {
+    fn queue_write(&self, key: &ReplayKey, task: &str, offers: Option<usize>) -> bool {
         // Synced task-file and SQLite writes must not block binds or live pushes.
         // A crash before the queued mark lands may repeat the completion once
         // after restart; that is preferable to blocking every route's bind.

@@ -8,7 +8,7 @@ pub(super) struct Settlement {
     pub(super) key: ReplayKey,
     pub(super) task: String,
     pub(super) unacked: UnackedCompletions,
-    pub(super) offers: Option<u64>,
+    pub(super) offers: Option<usize>,
     #[cfg(test)]
     pub(super) gate: Option<TestGate>,
 }
