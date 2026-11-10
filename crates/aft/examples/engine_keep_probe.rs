@@ -20,6 +20,10 @@
 //! It reports component bytes before/after publication and after an idle
 //! pause, plus per-refresh CPU, wall time, starts, releases and sampled RSS.
 //! Set TMPDIR to a scratch directory to isolate its temporary index store.
+//! With PROBE_COMPARE=1, first warm at 8 GiB, then visit the same checkouts
+//! at the requested budget, without repeating cold builds. PROBE_WARM_DIFF
+//! and PROBE_WARM_PATHS name a real refactor patch and its changed-path list;
+//! the patch is applied only to copies of this repository before the visits.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
@@ -208,6 +212,9 @@ fn components(checkout: &Checkout) -> serde_json::Value {
 }
 
 fn roots(mut args: impl Iterator<Item = String>) {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Stderr)
+        .init();
     let budget_mib = args.next().unwrap().parse::<u64>().unwrap();
     let rounds = args.next().unwrap().parse::<usize>().unwrap();
     let idle_seconds = args.next().unwrap().parse::<u64>().unwrap();
@@ -215,7 +222,12 @@ fn roots(mut args: impl Iterator<Item = String>) {
     assert!(!paths.is_empty() && paths.len() % 2 == 0);
     let scratch = tempfile::tempdir().unwrap();
     let layer = Arc::new(DataLayer::new(256 << 20, 8));
-    layer.set_engine_budget(budget_mib * (1 << 20));
+    let compare = std::env::var_os("PROBE_COMPARE").is_some();
+    layer.set_engine_budget(if compare {
+        8192 << 20
+    } else {
+        budget_mib << 20
+    });
     let peak = RssPeak::sample();
     let mut checkouts = Vec::new();
     for (index, pair) in paths.chunks_exact(2).enumerate() {
@@ -244,96 +256,163 @@ fn roots(mut args: impl Iterator<Item = String>) {
         checkouts.push((checkout, root, pair[1].clone(), text));
         aft::memory::relieve_allocator_pressure();
     }
-    let mut releases = 0;
-    let mut restarts = 0;
-    let (mut refresh_wall, mut refresh_cpu) = (0.0, 0.0);
-    let (mut restart_wall, mut restart_cpu) = (0.0, 0.0);
-    for round in 0..rounds {
-        for (index, (checkout, root, path, text)) in checkouts.iter().enumerate() {
-            let was_started = checkout.engine_starts() != 0;
-            let missing = checkout.engine_census_bytes().is_none();
-            std::fs::write(
-                root.join(path),
-                format!("{text}\n// kept-engine probe round {round}\n"),
-            )
-            .unwrap();
-            checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
-            let held_before = checkouts
-                .iter()
-                .map(|(c, ..)| c.engine_census_bytes().is_some())
-                .collect::<Vec<_>>();
-            let starts = checkout.engine_starts();
+    if let Ok(diff) = std::env::var("PROBE_WARM_DIFF") {
+        let paths = std::fs::read_to_string(std::env::var("PROBE_WARM_PATHS").unwrap())
+            .unwrap()
+            .lines()
+            .map(|path| path.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        for (index, (checkout, root, path, text)) in checkouts.iter_mut().enumerate() {
+            if !root.join("crates/aft/src/lib.rs").exists() {
+                continue;
+            }
+            assert!(std::process::Command::new("git")
+                .arg("apply")
+                .arg(&diff)
+                .current_dir(&*root)
+                .status()
+                .unwrap()
+                .success());
+            checkout.record_paths(&paths).unwrap();
             let cpu = cpu_seconds();
             let wall = Instant::now();
+            let rss_before = rss_bytes();
             peak.take();
-            let refreshed = checkout.refresh_callgraph().unwrap();
-            assert!(refreshed.is_some(), "a recorded edit must refresh");
+            checkout.refresh_callgraph().unwrap();
             let wall = wall.elapsed().as_secs_f64();
             let cpu = cpu_seconds() - cpu;
             let peak_rss = peak.take();
-            let started = checkout.engine_starts() - starts;
-            let restarted = was_started && started > 0;
-            refresh_wall += wall;
-            refresh_cpu += cpu;
-            if restarted {
-                restarts += 1;
-                restart_wall += wall;
-                restart_cpu += cpu;
-            }
-            let before_publish = components(checkout);
-            let publication = Instant::now();
-            let published = checkout.publish_changes().unwrap().is_some();
-            let publish_wall = publication.elapsed().as_secs_f64();
-            assert!(published);
-            let released = checkouts
-                .iter()
-                .zip(&held_before)
-                .enumerate()
-                .filter_map(|(i, ((c, ..), held))| {
-                    (*held && c.engine_census_bytes().is_none()).then_some(i)
-                })
-                .collect::<Vec<_>>();
-            releases += released.len();
+            let before = components(checkout);
+            assert!(checkout.publish_changes().unwrap().is_some());
             println!(
                 "{}",
                 serde_json::json!({
-                    "event": "refresh_publish", "budget_mib": budget_mib,
-                    "round": round, "root": index, "started": started, "restarted": restarted,
-                    "missing_before": missing, "released_roots": released,
-                    "wall_s": wall, "cpu_s": cpu, "publish_wall_s": publish_wall,
-                    "rss_bytes": rss_bytes(), "peak_rss_bytes": peak_rss,
-                    "before_publish": before_publish, "after_publish": components(checkout),
+                    "event": "semantic_warmup", "root": index, "paths": paths.len(),
+                    "cpu_s": cpu, "wall_s": wall, "rss_before_bytes": rss_before,
+                    "peak_rss_bytes": peak_rss, "before_publish": before,
+                    "after_publish": components(checkout),
                 })
             );
+            *text = std::fs::read_to_string(root.join(path)).unwrap();
             aft::memory::relieve_allocator_pressure();
         }
     }
-    println!(
-        "{}",
-        serde_json::json!({
-            "event": "before_idle", "engines": checkouts.iter().map(|(c, ..)| components(c)).collect::<Vec<_>>(),
-            "rss_bytes": rss_bytes(), "cache_bytes": layer.cache_stats().resident_bytes,
-        })
-    );
-    std::thread::sleep(Duration::from_secs(idle_seconds));
-    println!(
-        "{}",
-        serde_json::json!({
-            "event": "after_idle", "seconds": idle_seconds,
-            "engines": checkouts.iter().map(|(c, ..)| components(c)).collect::<Vec<_>>(),
-            "rss_bytes": rss_bytes(), "cache_bytes": layer.cache_stats().resident_bytes,
-        })
-    );
-    println!(
-        "{}",
-        serde_json::json!({
-            "event": "summary", "budget_mib": budget_mib, "roots": checkouts.len(), "rounds": rounds,
-            "releases": releases, "restarts": restarts,
-            "starts": checkouts.iter().map(|(c, ..)| c.engine_starts()).sum::<u64>(),
-            "refresh_wall_s": refresh_wall, "refresh_cpu_s": refresh_cpu,
-            "restart_wall_s": restart_wall, "restart_cpu_s": restart_cpu,
-        })
-    );
+    let budgets = if compare {
+        vec![8192, budget_mib]
+    } else {
+        vec![budget_mib]
+    };
+    for budget_mib in budgets {
+        layer.set_engine_budget(budget_mib << 20);
+        let starts_before = checkouts
+            .iter()
+            .map(|(c, ..)| c.engine_starts())
+            .sum::<u64>();
+        let mut releases = 0;
+        let mut restarts = 0;
+        let (mut refresh_wall, mut refresh_cpu) = (0.0, 0.0);
+        let (mut restart_wall, mut restart_cpu) = (0.0, 0.0);
+        for round in 0..rounds {
+            for (index, (checkout, root, path, text)) in checkouts.iter().enumerate() {
+                let was_started = checkout.engine_starts() != 0;
+                let missing = checkout.engine_census_bytes().is_none();
+                std::fs::write(
+                    root.join(path),
+                    format!("{text}\n// kept-engine probe round {round}\n"),
+                )
+                .unwrap();
+                checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
+                let held_before = checkouts
+                    .iter()
+                    .map(|(c, ..)| c.engine_census_bytes().is_some())
+                    .collect::<Vec<_>>();
+                let starts = checkout.engine_starts();
+                let cpu = cpu_seconds();
+                let wall = Instant::now();
+                let rss_before = rss_bytes();
+                peak.take();
+                let refreshed = checkout.refresh_callgraph().unwrap();
+                assert!(refreshed.is_some(), "a recorded edit must refresh");
+                let wall = wall.elapsed().as_secs_f64();
+                let cpu = cpu_seconds() - cpu;
+                let peak_rss = peak.take();
+                let started = checkout.engine_starts() - starts;
+                let restarted = was_started && started > 0;
+                refresh_wall += wall;
+                refresh_cpu += cpu;
+                if restarted {
+                    restarts += 1;
+                    restart_wall += wall;
+                    restart_cpu += cpu;
+                }
+                let before_publish = components(checkout);
+                let publication = Instant::now();
+                let published = checkout.publish_changes().unwrap().is_some();
+                let publish_wall = publication.elapsed().as_secs_f64();
+                assert!(published);
+                let released = checkouts
+                    .iter()
+                    .zip(&held_before)
+                    .enumerate()
+                    .filter_map(|(i, ((c, ..), held))| {
+                        (*held && c.engine_census_bytes().is_none()).then_some(i)
+                    })
+                    .collect::<Vec<_>>();
+                releases += released.len();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "refresh_publish", "budget_mib": budget_mib,
+                        "round": round, "root": index, "started": started, "restarted": restarted,
+                        "missing_before": missing, "released_roots": released,
+                        "wall_s": wall, "cpu_s": cpu, "publish_wall_s": publish_wall,
+                        "rss_bytes": rss_bytes(), "rss_before_bytes": rss_before, "peak_rss_bytes": peak_rss,
+                        "before_publish": before_publish, "after_publish": components(checkout),
+                    })
+                );
+                aft::memory::relieve_allocator_pressure();
+            }
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "before_idle", "budget_mib": budget_mib,
+                "engines": checkouts.iter().map(|(c, ..)| components(c)).collect::<Vec<_>>(),
+                "rss_bytes": rss_bytes(), "cache_bytes": layer.cache_stats().resident_bytes,
+            })
+        );
+        std::thread::sleep(Duration::from_secs(idle_seconds));
+        let mut seen = aft_store::heap::Seen::new();
+        let unique_engine_bytes = checkouts
+            .iter()
+            .map(|(c, ..)| match c.memory(&mut seen).engine {
+                aft::data_layer::checkout::EngineMemory::Running {
+                    state_bytes, bytes, ..
+                } => state_bytes + bytes,
+                _ => 0,
+            })
+            .sum::<u64>();
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "after_idle", "budget_mib": budget_mib, "seconds": idle_seconds,
+                "engines": checkouts.iter().map(|(c, ..)| components(c)).collect::<Vec<_>>(),
+                "rss_bytes": rss_bytes(), "cache_bytes": layer.cache_stats().resident_bytes,
+                "unique_engine_bytes": unique_engine_bytes,
+                "sum_engine_census_bytes": checkouts.iter().filter_map(|(c, ..)| c.engine_census_bytes()).sum::<u64>(),
+            })
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "summary", "budget_mib": budget_mib, "roots": checkouts.len(), "rounds": rounds,
+                "releases": releases, "restarts": restarts,
+                "starts": checkouts.iter().map(|(c, ..)| c.engine_starts()).sum::<u64>() - starts_before,
+                "refresh_wall_s": refresh_wall, "refresh_cpu_s": refresh_cpu,
+                "restart_wall_s": restart_wall, "restart_cpu_s": restart_cpu,
+            })
+        );
+    }
     peak.stop.store(true, Ordering::Release);
 }
 
