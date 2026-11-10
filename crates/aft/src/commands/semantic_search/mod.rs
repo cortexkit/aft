@@ -9452,6 +9452,8 @@ mod tests {
                 serde_json::json!({"query": "handle_requesx"}),
             ),
         ];
+        // Rendered relative paths use this platform's separator (`src\lib.rs` on Windows).
+        let relative = Path::new("src").join("lib.rs").display().to_string();
         for ready in [false, true] {
             if ready {
                 crate::data_layer::surfaces::serve_text_index_for_test(&indexed);
@@ -9482,7 +9484,7 @@ mod tests {
                     "{route}, ready={ready}: {text}"
                 );
                 assert!(
-                    !text.lines().any(|line| line.starts_with("src/lib.rs")),
+                    !text.lines().any(|line| line.starts_with(&relative)),
                     "{route}, ready={ready}: {text}"
                 );
                 if ready {
@@ -9496,7 +9498,7 @@ mod tests {
                 }
                 if *route == "split" {
                     assert!(
-                        !text.contains("defined in src/lib.rs"),
+                        !text.contains(&format!("defined in {relative}")),
                         "pattern summary must also identify the external project: {text}"
                     );
                 }
@@ -9505,7 +9507,7 @@ mod tests {
         // An external request must not change later rendering in its own root.
         let response = handle_semantic_search(&semantic_request("handle_request", 5), &indexed);
         let text = response.data["text"].as_str().unwrap();
-        assert!(text.contains("src/lib.rs"), "{text}");
+        assert!(text.contains(&relative), "{text}");
         assert!(!text.contains(&external.display().to_string()), "{text}");
     }
 
