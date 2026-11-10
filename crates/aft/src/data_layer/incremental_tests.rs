@@ -185,8 +185,15 @@ fn module_addition_replays_only_changed_parent_targets() {
     let root = "pub mod a; pub mod b;";
     let a = "pub fn value() {}";
     let b = "pub fn call() { crate::a::value(); }";
+    let unrelated = "pub fn value() {} pub fn call() { crate::keep::value(); }";
     let before = checkout(
-        &[("src/lib.rs", root), ("src/a.rs", a), ("src/b.rs", b)],
+        &[
+            ("src/lib.rs", root),
+            ("src/a.rs", a),
+            ("src/b.rs", b),
+            ("other/src/lib.rs", "pub mod keep;"),
+            ("other/src/keep.rs", unrelated),
+        ],
         &[],
     );
     let after = checkout(
@@ -197,6 +204,8 @@ fn module_addition_replays_only_changed_parent_targets() {
             ),
             ("src/a.rs", a),
             ("src/b.rs", b),
+            ("other/src/lib.rs", "pub mod keep;"),
+            ("other/src/keep.rs", unrelated),
             ("src/target.rs", "pub fn target() {}"),
             (
                 "src/caller.rs",
@@ -212,6 +221,7 @@ fn module_addition_replays_only_changed_parent_targets() {
     );
     assert_eq!(stats.rebound, 3, "{stats:?}");
     assert_eq!(stats.resolved, 3, "{stats:?}");
+    assert!(stats.replayed <= 1, "unrelated crate replayed: {stats:?}");
 }
 
 #[test]

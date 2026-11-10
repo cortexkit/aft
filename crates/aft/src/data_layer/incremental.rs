@@ -931,7 +931,13 @@ impl LiveCheckout {
                 .map(|bound| bound.surface.declared_module_targets());
             if before != after {
                 for modules in before.into_iter().chain(after) {
-                    changed_parents.extend(modules.values().flatten().cloned());
+                    for (name, target) in modules {
+                        if before.and_then(|modules| modules.get(name))
+                            != after.and_then(|modules| modules.get(name))
+                        {
+                            changed_parents.extend(target.iter().cloned());
+                        }
+                    }
                 }
             }
         }
