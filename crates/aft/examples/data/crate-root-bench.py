@@ -108,7 +108,7 @@ t = time.monotonic()
 aft.configure()
 r, n = ready(aft)
 emit("cold", t, r, n)
-# Let the initial background publication finish before measuring edits.
+# Give background persistence of the cold checkout's index time to settle.
 time.sleep(3)
 for i, rel in enumerate(["crates/aft/src/commands/outline.rs", "crates/aft/src/edit.rs"]):
     name = f"bench_ordinary_{i}"
@@ -139,7 +139,8 @@ while time.monotonic()-t < 180:
 else:
     raise TimeoutError("module addition")
 emit("module_addition", t, r, n)
-# Kill immediately after the answer to exercise an unpublished edit on restart.
+# Kill as soon as the in-memory graph answers, so restart measures edits
+# whose refreshed graph has not yet been saved to the persistent store.
 aft.p.kill()
 aft.p.wait()
 aft.stderr.close()
