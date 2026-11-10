@@ -630,10 +630,10 @@ fn a_parent_folders_todo_count_names_the_repositories_not_indexed_yet() {
     let job = crate::inspect::InspectJob {
         job_id: 1,
         key: crate::inspect::JobKey::for_category_scope(
-            crate::inspect::InspectCategory::Todos,
+            crate::inspect_category::InspectCategory::Todos,
             &crate::inspect::JobScope::for_project(root.clone()),
         ),
-        category: crate::inspect::InspectCategory::Todos,
+        category: crate::inspect_category::InspectCategory::Todos,
         scope_files: scope,
         project_root: root.clone(),
         inspect_dir: base.join("inspect"),

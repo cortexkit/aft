@@ -574,7 +574,7 @@ impl AppContext {
             // Read only this root's LSP applicability rather than cloning
             // applicability for every root and the other lifecycle details.
             let root = config.project_root.clone().unwrap_or_default();
-            let normalized = crate::inspect::job::canonicalize_normalized(&root)
+            let normalized = crate::path_identity::canonicalize_normalized(&root)
                 .display()
                 .to_string();
             let mut roots = serde_json::Map::new();

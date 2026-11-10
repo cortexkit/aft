@@ -141,26 +141,26 @@ fn resolve_patch_input(ctx: &AppContext, path: &str) -> PathBuf {
 }
 
 fn normalize_resolved_path(path: PathBuf) -> PathBuf {
-    crate::inspect::job::canonicalize_normalized(&path)
+    crate::path_identity::canonicalize_normalized(&path)
 }
 
 fn normalize_write_location(path: PathBuf) -> PathBuf {
-    let normalized = crate::inspect::job::normalize_path(&path);
+    let normalized = crate::path_identity::normalize_path(&path);
     let Some(file_name) = normalized.file_name() else {
         return normalize_resolved_path(normalized);
     };
     let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
     let parent = normalize_resolved_path(parent.to_path_buf());
-    crate::inspect::job::normalize_path(&parent.join(file_name))
+    crate::path_identity::normalize_path(&parent.join(file_name))
 }
 
 fn relative_path(abs: &Path, root: Option<&Path>) -> String {
-    let abs = crate::inspect::job::canonicalize_normalized(abs);
+    let abs = crate::path_identity::canonicalize_normalized(abs);
     if let Some(root) = root {
         // Bare canonical paths are verbatim (`\\?\`) on Windows, while a
         // configured root can already be non-verbatim. Normalize both sides
         // before `strip_prefix` so patch responses stay project-relative.
-        let root = crate::inspect::job::canonicalize_normalized(root);
+        let root = crate::path_identity::canonicalize_normalized(root);
         if let Ok(rel) = abs.strip_prefix(&root) {
             return display_slash(rel);
         }
@@ -169,7 +169,7 @@ fn relative_path(abs: &Path, root: Option<&Path>) -> String {
         // without changing the operation's filePath or the absolute fallback.
         for ancestor in abs.ancestors().skip(1) {
             if let Ok(canonical) = fs::canonicalize(ancestor) {
-                let comparison = crate::inspect::job::normalize_path(
+                let comparison = crate::path_identity::normalize_path(
                     &canonical.join(abs.strip_prefix(ancestor).unwrap()),
                 );
                 if let Ok(rel) = comparison.strip_prefix(&root) {
@@ -213,7 +213,7 @@ fn resolve_path(
 
 fn relative_path_without_final_resolution(abs: &Path, root: Option<&Path>) -> String {
     if let Some(root) = root {
-        let root = crate::inspect::job::canonicalize_normalized(root);
+        let root = crate::path_identity::canonicalize_normalized(root);
         if let Ok(rel) = abs.strip_prefix(root) {
             return display_slash(rel);
         }
@@ -1438,7 +1438,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temporary project");
         let root = temp.path().join("project with a long name");
         fs::create_dir_all(root.join("src")).unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(&root);
+        let root = crate::path_identity::canonicalize_normalized(&root);
         #[cfg(unix)]
         let alias = {
             let alias = temp.path().join("alias");
@@ -1459,7 +1459,7 @@ mod tests {
             alias, root,
             "the fixture must exercise a distinct root spelling"
         );
-        assert_eq!(crate::inspect::job::canonicalize_normalized(&alias), root);
+        assert_eq!(crate::path_identity::canonicalize_normalized(&alias), root);
 
         fs::write(root.join("src/live.ts"), "export const value = 1;\n").unwrap();
         fs::write(root.join("src/deleted.ts"), "before\n").unwrap();
@@ -1536,7 +1536,7 @@ mod tests {
             .expect("create source directory");
         fs::write(&file, "fn main() {}\n").expect("write source file");
 
-        let normalized = crate::inspect::job::canonicalize_normalized(&file);
+        let normalized = crate::path_identity::canonicalize_normalized(&file);
         let verbatim = verbatim_path(&normalized);
 
         assert_eq!(normalize_resolved_path(verbatim), normalized);
@@ -1551,8 +1551,8 @@ mod tests {
             .expect("create source directory");
         fs::write(&file, "fn main() {}\n").expect("write source file");
 
-        let normalized_root = crate::inspect::job::canonicalize_normalized(temp.path());
-        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
+        let normalized_root = crate::path_identity::canonicalize_normalized(temp.path());
+        let normalized_file = crate::path_identity::canonicalize_normalized(&file);
 
         assert_eq!(
             relative_path(&normalized_file, Some(&verbatim_path(&normalized_root))),

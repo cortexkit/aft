@@ -625,9 +625,9 @@ fn relative_within(project_root: &Path, path: &Path) -> Option<std::path::PathBu
 
 fn test_role(relative: &Path) -> TestRole {
     let relative = relative.to_string_lossy();
-    if crate::inspect::job::is_test_file(&relative) {
+    if crate::file_kind::is_test_file(&relative) {
         TestRole::Test
-    } else if crate::inspect::job::is_test_support_file(&relative) {
+    } else if crate::file_kind::is_test_support_file(&relative) {
         TestRole::Support
     } else {
         TestRole::None
@@ -1059,5 +1059,178 @@ mod tests {
             (kind.content, kind.test),
             (ContentKind::Text, TestRole::Test)
         );
+    }
+}
+
+/// Whether a project-relative path is a test-support / standalone file that
+/// should be EXCLUDED from dead_code and unused_exports reporting. These files
+/// (test fixtures, corpora, mock data, snapshots) are consumed by file path or
+/// loaded dynamically — never imported as modules — so static reachability
+/// always reports their symbols as dead/unused. They are noise, not signal.
+///
+/// Edges FROM these files are still honored elsewhere (their imports keep
+/// product code live); only their own exported symbols are suppressed from the
+/// dead/unused lists. The match is on conventional directory names anywhere in
+/// the path, kept conservative to avoid hiding real product directories.
+pub(crate) fn is_test_support_file(relative_path: &str) -> bool {
+    let normalized = relative_path.replace('\\', "/");
+    normalized.split('/').any(is_test_support_dir_name)
+}
+
+/// Whether one path segment is a conventional test-support directory name
+/// (fixtures, corpora, mock data, snapshots). Shared by the reporting filter
+/// above and the language-server walk, which starts no server for these
+/// directories.
+pub(crate) fn is_test_support_dir_name(segment: &str) -> bool {
+    matches!(
+        segment,
+        "fixtures"
+            | "__fixtures__"
+            | "testdata"
+            | "test-data"
+            | "__mocks__"
+            | "__snapshots__"
+            | "corpora"
+    )
+}
+
+/// Whether a project-relative path is an actual automated-test file (unit /
+/// integration / spec), as opposed to product code. Search uses this to hide test
+/// files by default; inspect uses it to distinguish test-origin references from
+/// production usage without excluding the test files from analysis.
+///
+/// This is intentionally SEPARATE from `is_test_support_file`: test-support files
+/// are reporting noise excluded by path, while real tests remain scanned and can
+/// move otherwise-dead production symbols into the test-only bucket. Matching is
+/// high-precision to avoid hiding real product code.
+pub(crate) fn is_test_file(relative_path: &str) -> bool {
+    let normalized = relative_path.replace('\\', "/");
+
+    // Directory-segment conventions: `__tests__` (JS/TS) and a `tests` test root
+    // (Rust integration tests, Python). Singular `test`/`spec` are omitted —
+    // they collide with product modules and their files are caught by name below.
+    if normalized
+        .split('/')
+        .any(|segment| matches!(segment, "__tests__" | "__test__" | "tests"))
+    {
+        return true;
+    }
+
+    let file = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let lower = file.to_ascii_lowercase();
+
+    // `*.test.<ext>` / `*.spec.<ext>` — JS/TS/JSX/TSX/Vue/mjs/cjs/…
+    if lower.contains(".test.") || lower.contains(".spec.") {
+        return true;
+    }
+
+    // Per-language filename suffixes (lowercase conventions).
+    if lower.ends_with("_test.rs")
+        || lower.ends_with("_test.go")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.rb")
+        || lower.ends_with("_test.exs")
+        || lower.ends_with("_spec.rb")
+        || (lower.starts_with("test_") && lower.ends_with(".py"))
+    {
+        return true;
+    }
+
+    // CamelCase test classes — matched case-SENSITIVELY so product files like
+    // `latest.java` (which ends with "test.java" lowercased) don't false-match.
+    const CAMEL_SUFFIXES: &[&str] = &[
+        "Test.java",
+        "Tests.java",
+        "Test.kt",
+        "Tests.kt",
+        "Test.cs",
+        "Tests.cs",
+        "Test.swift",
+        "Tests.swift",
+        "Test.scala",
+        "Spec.scala",
+    ];
+    CAMEL_SUFFIXES.iter().any(|suffix| file.ends_with(suffix))
+}
+
+#[cfg(test)]
+mod test_support_tests {
+    use super::{is_test_file, is_test_support_file};
+
+    #[test]
+    fn is_test_file_matches_real_test_files() {
+        // JS/TS family: *.test.* / *.spec.*
+        for p in [
+            "src/foo.test.ts",
+            "src/foo.test.tsx",
+            "src/bar.spec.js",
+            "packages/x/component.test.jsx",
+            "app/foo.test.mjs",
+            "src/comp.spec.vue",
+        ] {
+            assert!(is_test_file(p), "{p} should be a test file");
+        }
+        // __tests__ directory and tests roots.
+        assert!(is_test_file("packages/x/__tests__/reading.ts"));
+        assert!(is_test_file("crates/aft/tests/integration/main.rs"));
+        // Per-language filename suffixes.
+        assert!(is_test_file("crates/aft/src/foo_test.rs"));
+        assert!(is_test_file("pkg/handler_test.go"));
+        assert!(is_test_file("app/test_models.py"));
+        assert!(is_test_file("app/models_test.py"));
+        assert!(is_test_file("spec/user_spec.rb"));
+        // CamelCase test classes (case-sensitive).
+        assert!(is_test_file("src/main/UserServiceTest.java"));
+        assert!(is_test_file("src/FooTests.cs"));
+        assert!(is_test_file("Sources/AppTests.swift"));
+        // Windows separators normalize.
+        assert!(is_test_file("packages\\x\\__tests__\\a.ts"));
+    }
+
+    #[test]
+    fn is_test_file_rejects_product_files() {
+        for p in [
+            "crates/aft/src/inspect/job.rs",
+            "packages/x/src/index.ts",
+            "src/contestant.ts",     // "test" substring, not a test file
+            "src/greatest.ts",       // ends with "test" stem, not ".test."
+            "src/latest.java",       // case-sensitive guard: not "Test.java"
+            "src/my_attestation.py", // not test_*/*_test
+            "src/test/helper.ts",    // singular `test` dir must not blanket-match
+        ] {
+            assert!(!is_test_file(p), "{p} must NOT be a test file");
+        }
+    }
+
+    #[test]
+    fn matches_conventional_support_dirs() {
+        assert!(is_test_support_file("crates/aft/tests/fixtures/sample.ts"));
+        assert!(is_test_support_file(
+            "packages/x/__tests__/e2e/fixtures/a.ts"
+        ));
+        assert!(is_test_support_file(
+            "benchmarks/codegraph/corpora/repo/lib.go"
+        ));
+        assert!(is_test_support_file("src/__mocks__/fs.ts"));
+        assert!(is_test_support_file("src/__snapshots__/render.snap"));
+        assert!(is_test_support_file("internal/testdata/golden.json"));
+        // Windows-style separators normalize.
+        assert!(is_test_support_file("crates\\aft\\tests\\fixtures\\x.rs"));
+    }
+
+    #[test]
+    fn does_not_match_product_or_test_files() {
+        // A real product file under src must never be excluded.
+        assert!(!is_test_support_file("crates/aft/src/inspect/job.rs"));
+        // Test FILES are not support files (they hold real assertions/roots).
+        assert!(!is_test_support_file(
+            "packages/x/__tests__/reading.test.ts"
+        ));
+        assert!(!is_test_support_file(
+            "crates/aft/tests/integration/main.rs"
+        ));
+        // Substring of a segment must not match (only whole segments).
+        assert!(!is_test_support_file("src/fixturesHelper.ts"));
+        assert!(!is_test_support_file("src/my_corpora_loader.rs"));
     }
 }

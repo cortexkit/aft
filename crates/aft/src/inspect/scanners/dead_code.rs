@@ -7002,7 +7002,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     // Delegates to the subsystem-wide normalizer: a components-only local
     // version kept Windows verbatim prefixes, so map keys built here failed
     // to join lookups built from verbatim-stripped roots.
-    crate::inspect::job::normalize_path(path)
+    crate::path_identity::normalize_path(path)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

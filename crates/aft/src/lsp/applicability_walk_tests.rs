@@ -85,19 +85,19 @@ fn canonical(walk: &ApplicabilityWalk) -> (Vec<String>, Vec<String>) {
 }
 
 fn measured<T>(f: impl FnOnce() -> T) -> (T, Vec<PathBuf>, Duration) {
-    crate::inspect::job::CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+    crate::path_identity::CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
     let start = Instant::now();
     let result = f();
     let elapsed = start.elapsed();
     let calls =
-        crate::inspect::job::CANONICALIZE_CALLS.with(|calls| calls.borrow_mut().take().unwrap());
+        crate::path_identity::CANONICALIZE_CALLS.with(|calls| calls.borrow_mut().take().unwrap());
     (result, calls, elapsed)
 }
 
 #[test]
 fn applicability_walk_plain_files_have_no_per_file_realpath() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
     std::fs::write(root.join("package.json"), "{}").unwrap();
     std::fs::write(root.join("biome.json"), r#"{"files":{"includes":["**"]}}"#).unwrap();
@@ -115,7 +115,7 @@ fn applicability_walk_plain_files_have_no_per_file_realpath() {
 #[test]
 fn applicability_walk_concurrent_binds_share_one_scan() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::write(root.join("main.py"), "").unwrap();
     let config = config(&root);
     let cache = ApplicabilityCache::default();
@@ -150,7 +150,7 @@ fn applicability_walk_concurrent_binds_share_one_scan() {
 #[test]
 fn applicability_walk_rechecks_ancestor_marker_without_watcher_event() {
     let temp = tempfile::tempdir().unwrap();
-    let parent = crate::inspect::job::canonicalize_normalized(temp.path());
+    let parent = crate::path_identity::canonicalize_normalized(temp.path());
     let root = parent.join("subdir");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("main.go"), "package main").unwrap();
@@ -179,7 +179,7 @@ fn applicability_walk_rechecks_ancestor_marker_without_watcher_event() {
 #[test]
 fn applicability_walk_equivalent_config_sets_share_one_scan() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let configs: Vec<_> = (0..8)
         .map(|rotation| {
             let mut config = config(&root);
@@ -226,7 +226,7 @@ fn applicability_walk_equivalent_config_sets_share_one_scan() {
 #[test]
 fn applicability_walk_keeps_ordered_server_arguments_in_key() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let mut first = config(&root);
     first.lsp_servers.push(crate::config::UserServerDef {
         id: "custom".into(),
@@ -256,7 +256,7 @@ fn applicability_walk_keeps_ordered_server_arguments_in_key() {
 #[test]
 fn applicability_walk_rechecks_ancestor_biome_contents_and_identity() {
     let temp = tempfile::tempdir().unwrap();
-    let parent = crate::inspect::job::canonicalize_normalized(temp.path());
+    let parent = crate::path_identity::canonicalize_normalized(temp.path());
     let root = parent.join("subdir");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("main.json"), "{}").unwrap();
@@ -286,7 +286,7 @@ fn applicability_walk_rechecks_ancestor_biome_contents_and_identity() {
 #[test]
 fn applicability_walk_manifest_change_invalidates_from_watcher() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::write(root.join("main.go"), "package main").unwrap();
     let config = config(&root);
     let before = walk_applicable_area(&root, None, &config, None).unwrap();
@@ -310,7 +310,7 @@ fn applicability_walk_manifest_change_invalidates_from_watcher() {
 #[test]
 fn applicability_walk_fifty_content_batches_do_zero_full_walks() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let source = root.join("main.py");
     std::fs::write(&source, "print(0)").unwrap();
     let config = config(&root);
@@ -357,11 +357,11 @@ fn applicability_walk_cache_cap_keeps_recently_used_snapshots() {
     // `fs::canonicalize` gives a verbatim `\\?\C:\...` root on Windows,
     // which no production caller passes.
     let warm = tempfile::tempdir().unwrap();
-    let warm_root = crate::inspect::job::canonicalize_normalized(warm.path());
+    let warm_root = crate::path_identity::canonicalize_normalized(warm.path());
     std::fs::write(warm_root.join("main.py"), "").unwrap();
     let warm_config = config(&warm_root);
     let other = tempfile::tempdir().unwrap();
-    let other_root = crate::inspect::job::canonicalize_normalized(other.path());
+    let other_root = crate::path_identity::canonicalize_normalized(other.path());
     // Each configuration is its own cache key for the same root.
     let other_config = |n: usize| {
         let mut config = config(&other_root);
@@ -409,7 +409,7 @@ fn applicability_walk_cache_cap_keeps_recently_used_snapshots() {
 #[test]
 fn applicability_walk_config_change_keeps_active_content_cache() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let source = root.join("main.py");
     std::fs::write(&source, "print(0)").unwrap();
     let base_config = config(&root);
@@ -480,7 +480,7 @@ struct WatcherWalkFixture {
 impl WatcherWalkFixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         std::fs::create_dir(root.join(".git")).unwrap();
         std::fs::write(root.join("main.py"), "print(0)").unwrap();
         std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
@@ -780,7 +780,7 @@ fn applicability_walk_replaced_symlinked_input_target_invalidates() {
 #[test]
 fn applicability_walk_invalidation_returns_uncached_result_to_parked_callers() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let config = config(&root);
     let cache = ApplicabilityCache::default();
     let scans = std::sync::atomic::AtomicUsize::new(0);
@@ -853,7 +853,7 @@ fn applicability_walk_invalidation_returns_uncached_result_to_parked_callers() {
 #[test]
 fn applicability_walk_panic_releases_flight_for_next_caller() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::write(root.join("main.py"), "").unwrap();
     let config = config(&root);
     let cache = ApplicabilityCache::default();
@@ -937,7 +937,7 @@ fn applicability_walk_entry_budget_reports_incomplete() {
 #[test]
 fn applicability_walk_incomplete_backoff_reuses_failure_and_caps_retries() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     for n in 0..10 {
         std::fs::write(root.join(format!("{n}.txt")), "").unwrap();
     }
@@ -986,7 +986,7 @@ fn applicability_walk_incomplete_backoff_reuses_failure_and_caps_retries() {
 #[test]
 fn applicability_walk_incomplete_watcher_churn_preserves_backoff_and_can_complete() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     for n in 0..10 {
         std::fs::write(root.join(format!("{n}.txt")), "").unwrap();
     }
@@ -1071,7 +1071,7 @@ fn applicability_walk_incomplete_watcher_churn_preserves_backoff_and_can_complet
 #[test]
 fn applicability_walk_incomplete_backoff_survives_invalidation_during_scan() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     for n in 0..10 {
         std::fs::write(root.join(format!("{n}.txt")), "").unwrap();
     }
@@ -1118,7 +1118,7 @@ fn applicability_walk_incomplete_backoff_survives_invalidation_during_scan() {
 #[test]
 fn applicability_walk_incomplete_backoff_does_not_cache_other_errors() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let config = config(&root);
     let cache = super::super::applicability_cache::ApplicabilityCache::default();
     for _ in 0..2 {
@@ -1160,7 +1160,7 @@ fn applicability_walk_deadline_is_checked_inside_iterator() {
 #[test]
 fn applicability_walk_matches_legacy_nested_workspaces_and_outside_symlinks() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let outside = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.join("crates/member/src")).unwrap();
     std::fs::create_dir_all(root.join("nested/src")).unwrap();
@@ -1356,7 +1356,7 @@ fn applicability_walk_mixed_registry_matches_legacy_byte_for_byte() {
     // The uncached walk keeps its root's spelling, so hand it the normalized
     // root `walk_applicable_area` would. A bare `canonicalize` is `\\?\` on
     // Windows; the entry-level test below covers that spelling.
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     write_mixed_registry_fixture(&root);
     for overrides in [false, true] {
         let config = mixed_registry_config(&root, overrides);
@@ -1430,7 +1430,7 @@ fn applicability_walk_entry_keys_match_legacy_for_canonicalized_root() {
 
 fn cost_fixture(files_per_directory: usize, directories: usize) -> (tempfile::TempDir, Config) {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::write(root.join("package.json"), "{}").unwrap();
     std::fs::write(root.join("biome.json"), r#"{"files":{"includes":["**"]}}"#).unwrap();
     for directory in 0..directories {
@@ -1448,7 +1448,7 @@ fn cost_fixture(files_per_directory: usize, directories: usize) -> (tempfile::Te
 #[test]
 fn applicability_walk_sibling_cost_does_not_rebuild_definitions_or_roots() {
     let (temp, config) = cost_fixture(512, 1);
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let (walk, allocations) = crate::test_allocations::count(|| scan(&root, &config));
     println!("sibling_files=512 allocations={allocations}");
     assert!(!walk.candidates.is_empty());
@@ -1467,7 +1467,7 @@ fn applicability_walk_repository_measurement() {
         .parent()
         .unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     let mut copied = 0;
     for entry in ignore::WalkBuilder::new(source).build() {
         let entry = entry.unwrap();
@@ -1613,7 +1613,7 @@ fn applicability_walk_incremental_batches_match_fresh_walks() {
 
 fn differential_sequence(seed: u64, batches: usize) -> (u64, u64) {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::create_dir(root.join(".git")).unwrap();
     for (name, contents) in [
         (".gitignore", "ignored/\n"),
@@ -1872,7 +1872,7 @@ fn thread_cpu_time() -> Duration {
 #[ignore = "builds a 20,000-file tree for a before/after measurement"]
 fn applicability_walk_create_remove_burst_measurement() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::create_dir(root.join(".git")).unwrap();
     std::fs::write(root.join("package.json"), "{}").unwrap();
     std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
@@ -2072,7 +2072,7 @@ fn applicability_walk_kept_create_records_the_inputs_it_read() {
 #[test]
 fn applicability_walk_rechecks_missing_external_shim_sdk_inputs() {
     let temp = tempfile::tempdir().unwrap();
-    let base = crate::inspect::job::canonicalize_normalized(temp.path());
+    let base = crate::path_identity::canonicalize_normalized(temp.path());
     let root = base.join("project");
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join("package.json"), "{}").unwrap();

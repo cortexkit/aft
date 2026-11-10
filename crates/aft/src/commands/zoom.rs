@@ -3067,7 +3067,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // Without a project root, a manifest names each file at its canonical
         // location, so build the fixture there.
-        let dir = crate::inspect::job::canonicalize_normalized(root.path());
+        let dir = crate::path_identity::canonicalize_normalized(root.path());
         let barrel = dir.join("barrel.ts");
         let secret = dir.join("secret.ts");
         let allowed = dir.join("allowed.ts");
@@ -3312,7 +3312,7 @@ mod tests {
             "export function hidden() { return 'PRIVATE_BODY'; }\n",
         )
         .unwrap();
-        let canonical = crate::inspect::job::canonicalize_normalized(&real);
+        let canonical = crate::path_identity::canonicalize_normalized(&real);
 
         // Neither a missing project root nor a root that does not contain the
         // sources may lend the request's alias spelling to the manifest.

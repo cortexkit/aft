@@ -49,8 +49,8 @@ pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
     let (Some(parent), Some(name)) = (absolute_root.parent(), absolute_root.file_name()) else {
         return Err(refused());
     };
-    let root = crate::inspect::job::normalize_path(&std::fs::canonicalize(parent)?.join(name));
-    let expected = crate::inspect::job::normalize_path(&root.join(remainder));
+    let root = crate::path_identity::normalize_path(&std::fs::canonicalize(parent)?.join(name));
+    let expected = crate::path_identity::normalize_path(&root.join(remainder));
     Ok(Some(OpenCheck { root, expected }))
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn open(path: &Path) -> io::Result<File> {
 }
 
 fn validate_opened(path: &Path, check: &OpenCheck, file: &File) -> io::Result<()> {
-    let opened = crate::inspect::job::normalize_path(
+    let opened = crate::path_identity::normalize_path(
         &crate::commands::file_read_exact::opened_location(file)?,
     );
     // Judge the descriptor, not a second canonicalization of the input: a

@@ -253,7 +253,7 @@ impl PageSource for SessionReader<'_> {
         // re-pointed since the check. The location about to be opened is the
         // one judged below, and the open refuses any symlink swapped in after.
         let resolved = match crate::bounded_io::canonicalize(&checked) {
-            Ok(resolved) => crate::inspect::job::normalize_path(&resolved),
+            Ok(resolved) => crate::path_identity::normalize_path(&resolved),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(unless_late(deadline, ReadFailure::Missing))
             }
@@ -264,7 +264,7 @@ impl PageSource for SessionReader<'_> {
         if self.floor(&resolved, deadline)? {
             return Err(ReadFailure::Denied);
         }
-        if resolved != crate::inspect::job::normalize_path(&checked)
+        if resolved != crate::path_identity::normalize_path(&checked)
             && !self.policy_allows(&resolved)
         {
             return Err(unless_late(deadline, ReadFailure::Denied));
@@ -295,7 +295,7 @@ impl PageSource for SessionReader<'_> {
             let Ok(opened) = file_read_exact::opened_location(&file) else {
                 return Ok(Err(ReadFailure::Denied));
             };
-            let opened = crate::inspect::job::normalize_path(&opened);
+            let opened = crate::path_identity::normalize_path(&opened);
             Ok(Ok::<Opened, ReadFailure>((file, metadata, opened)))
         })
         .map_err(|_| ReadFailure::Deadline)??;

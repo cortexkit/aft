@@ -180,7 +180,7 @@ impl ReadGate {
             .project_root
             .as_ref()
             .map(|root| {
-                crate::inspect::job::normalize_path(&ctx.resolved_path_restriction_root(root))
+                crate::path_identity::normalize_path(&ctx.resolved_path_restriction_root(root))
             })
             .ok_or_else(|| refusal(id, Path::new(".")))?;
         Ok(Self {
@@ -446,7 +446,7 @@ impl ConfinedIgnoreRules {
         let Some(root) = self.fence.gate.as_ref().map(|gate| gate.root.as_path()) else {
             return false;
         };
-        let ignore_root = ignore_root.map(crate::inspect::job::normalize_path);
+        let ignore_root = ignore_root.map(crate::path_identity::normalize_path);
         let root = ignore_root
             .as_deref()
             .filter(|ignore_root| ignore_root.starts_with(root))
@@ -456,7 +456,7 @@ impl ConfinedIgnoreRules {
         // that keep it. Compare, load and match in the root's spelling, or no
         // directory would count as inside the root and no rule would apply.
         // Only this local copy changes; the walk's paths stay as they are.
-        let path = crate::inspect::job::normalize_path(path);
+        let path = crate::path_identity::normalize_path(path);
         let path = path.as_path();
         let Some(parent) = path.parent() else {
             return false;

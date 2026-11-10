@@ -1258,7 +1258,7 @@ fn junction(link: &Path, target: &Path) {
 fn audit5_windows_location_names_the_opened_entry() {
     use crate::commands::delete_tree::win::{location, open_entry};
     let f = Fixture::new();
-    let root = crate::inspect::job::normalize_path(&std::fs::canonicalize(&f.root).unwrap());
+    let root = crate::path_identity::normalize_path(&std::fs::canonicalize(&f.root).unwrap());
     let target = f.root.join("target");
     std::fs::create_dir(&target).unwrap();
     let link = f.root.join("link");

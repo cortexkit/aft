@@ -4093,7 +4093,7 @@ fn forced_relative_paths(job: &InspectJob, paths: &BTreeSet<PathBuf>) -> BTreeSe
         // silently misses).
         keys.insert(relative_cache_key(
             &job.project_root,
-            &crate::inspect::job::canonicalize_normalized(&absolute),
+            &crate::path_identity::canonicalize_normalized(&absolute),
         ));
     }
     keys
@@ -4121,7 +4121,7 @@ fn downgrade_unchanged_forced_paths_with_freshness(
         // Same normalized form as forced_relative_paths; see the comment there.
         let canonical_key = Some(relative_cache_key(
             project_root,
-            &crate::inspect::job::canonicalize_normalized(&absolute),
+            &crate::path_identity::canonicalize_normalized(&absolute),
         ));
         let freshness = cached
             .get(&direct_key)
@@ -4404,7 +4404,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
 fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
     // Mirrors the projection's normalizer: snapshot paths are
     // verbatim-stripped, so test expectations must be too.
-    crate::inspect::job::canonicalize_normalized(path)
+    crate::path_identity::canonicalize_normalized(path)
 }
 
 fn load_contribution_freshness(

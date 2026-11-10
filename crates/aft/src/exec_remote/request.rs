@@ -81,7 +81,7 @@ impl FrozenParams {
                             let shown = if crate::context::confinement::for_request(request_id) {
                                 given.to_path_buf()
                             } else {
-                                crate::inspect::job::normalize_path(&path)
+                                crate::path_identity::normalize_path(&path)
                             };
                             return Err(sibling_refusal(SiblingRefusal::NotReadable, &shown));
                         }

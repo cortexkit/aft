@@ -2915,7 +2915,7 @@ fn worker_jail_grants(
     }
 
     for target in targets {
-        let target = crate::inspect::job::normalize_path(&target);
+        let target = crate::path_identity::normalize_path(&target);
         if !jail_target_allowed(&target, home, project_roots, policy) {
             log::warn!(
                 "worker sandbox: ignoring configured cargo target {}: it would contain the home, a project root, or a protected path",

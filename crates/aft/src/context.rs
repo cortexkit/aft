@@ -3291,7 +3291,7 @@ fn verified_linked_main_root(worktree: &Path, common: &Path) -> Option<PathBuf> 
     if commondir != common {
         return None;
     }
-    Some(crate::inspect::job::normalize_path(common.parent()?))
+    Some(crate::path_identity::normalize_path(common.parent()?))
 }
 
 /// Whether `location` (absolute, with at least its parent resolved) is an
@@ -4800,7 +4800,7 @@ impl AppContext {
                     // The cache root is identity-domain (bare-canonical, verbatim on
                     // Windows) while diagnostics store keys are normalized; normalize a
                     // comparison-local copy or the starts_with filter drops every diagnostic.
-                    let root = crate::inspect::job::normalize_path(&root);
+                    let root = crate::path_identity::normalize_path(&root);
                     let mut membership = self.tsconfig_membership.lock();
                     lsp.filtered_error_warning_counts_with_provisional(|file| {
                         file.starts_with(&root) && !membership.should_skip_diagnostics(file)
@@ -8807,7 +8807,7 @@ impl AppContext {
         // Normalized, not bare-canonical: scoped diagnostics compare
         // LSP-reported paths (normalized form) against this root with
         // starts_with, and a verbatim root on Windows matches nothing.
-        let project_root = crate::inspect::job::canonicalize_normalized(&project_root);
+        let project_root = crate::path_identity::canonicalize_normalized(&project_root);
         Some(InspectSnapshot::new_with_capabilities(
             project_root,
             self.inspect_dir(),
@@ -11001,7 +11001,7 @@ impl AppContext {
         reject_github_address(req_id, path)?;
         self.check_unrestored_path(
             req_id,
-            &crate::inspect::job::normalize_path(&self.resolve_relative_path(path)),
+            &crate::path_identity::normalize_path(&self.resolve_relative_path(path)),
             None,
             true,
         )?;
@@ -11164,7 +11164,7 @@ impl AppContext {
         reject_github_address(req_id, path)?;
         self.check_unrestored_path(
             req_id,
-            &crate::inspect::job::normalize_path(&self.resolve_relative_path(path)),
+            &crate::path_identity::normalize_path(&self.resolve_relative_path(path)),
             artifact_session_id,
             false,
         )?;
@@ -11435,7 +11435,7 @@ impl AppContext {
             if let Some(main) = self.linked_main_root.lock().clone() {
                 if !roots
                     .iter()
-                    .any(|root| crate::inspect::job::normalize_path(root) == main)
+                    .any(|root| crate::path_identity::normalize_path(root) == main)
                 {
                     main_roots.push(main);
                 }
@@ -11604,7 +11604,7 @@ impl AppContext {
         location: &Path,
     ) -> Result<(), crate::protocol::Response> {
         use crate::access_policy::{AccessDecision, AccessOperation};
-        let identity = crate::inspect::job::normalize_path(location);
+        let identity = crate::path_identity::normalize_path(location);
         let config = self.config();
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
@@ -11619,7 +11619,7 @@ impl AppContext {
             } else {
                 std::env::current_dir().unwrap_or_default().join(path)
             };
-            identity.starts_with(crate::inspect::job::normalize_path(&absolute))
+            identity.starts_with(crate::path_identity::normalize_path(&absolute))
         });
         let decision = self
             .access_policy(req_id)?
@@ -11742,7 +11742,7 @@ impl AppContext {
                 format!(
                     "path not found: {}; did you mean {}?",
                     original.display(),
-                    crate::inspect::job::normalize_path(&suggestion).display()
+                    crate::path_identity::normalize_path(&suggestion).display()
                 ),
             ));
         }
@@ -11873,7 +11873,7 @@ impl AppContext {
             // verbatim prefix (`\\?\C:\`) that `canonicalize` puts on the
             // root. Compare both in that same form, or nothing is in the root.
             let root = self.config().project_root.as_ref().map(|root| {
-                crate::inspect::job::normalize_path(&self.resolved_path_restriction_root(root))
+                crate::path_identity::normalize_path(&self.resolved_path_restriction_root(root))
             });
             if !root.is_some_and(|root| identity.starts_with(root))
                 || !crate::bounded_io::metadata(&identity).is_ok()
@@ -14007,7 +14007,7 @@ mod callgraph_store_for_ops_tests {
         let base = Instant::now();
         ctx.note_tier2_refresh_started_at(base);
         ctx.inspect_manager.record_tier2_attempt_outcome_for_test(
-            crate::inspect::InspectCategory::Complexity,
+            crate::inspect_category::InspectCategory::Complexity,
             crate::inspect::JobOutcome::Failed {
                 message: "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed".into(),
             },
@@ -14688,27 +14688,29 @@ mod health_warming_honesty_tests {
         // still has a live registration for this root.
         let ctx = ctx_with_config(Config::default());
         ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
+            .set_tier2_in_flight_for_test(crate::inspect_category::InspectCategory::DeadCode, true);
 
         assert_eq!(health_tier2_status(&ctx), "building");
         assert_eq!(
             ctx.inspect_manager()
-                .tier2_builder_state(crate::inspect::InspectCategory::DeadCode),
+                .tier2_builder_state(crate::inspect_category::InspectCategory::DeadCode),
             crate::inspect::InspectBuilderState::Building
         );
 
-        ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, false);
+        ctx.inspect_manager().set_tier2_in_flight_for_test(
+            crate::inspect_category::InspectCategory::DeadCode,
+            false,
+        );
 
         assert_eq!(health_tier2_status(&ctx), "ready");
         assert_eq!(
             ctx.inspect_manager()
-                .tier2_builder_state(crate::inspect::InspectCategory::DeadCode),
+                .tier2_builder_state(crate::inspect_category::InspectCategory::DeadCode),
             crate::inspect::InspectBuilderState::Absent
         );
 
         ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
-            crate::inspect::InspectCategory::DeadCode,
+            crate::inspect_category::InspectCategory::DeadCode,
             crate::inspect::JobOutcome::Fresh {
                 payload: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0),
             },
@@ -14720,12 +14722,12 @@ mod health_warming_honesty_tests {
         );
         assert_eq!(
             ctx.inspect_manager()
-                .tier2_builder_state(crate::inspect::InspectCategory::DeadCode),
+                .tier2_builder_state(crate::inspect_category::InspectCategory::DeadCode),
             crate::inspect::InspectBuilderState::Absent
         );
         assert!(
             ctx.inspect_manager()
-                .tier2_builder_state_detail(crate::inspect::InspectCategory::DeadCode)
+                .tier2_builder_state_detail(crate::inspect_category::InspectCategory::DeadCode)
                 .starts_with("last attempt failed: callgraph_unavailable (attempt 1, first at "),
             "inspect refusals must carry the failed-attempt history the health surface no longer treats as busy"
         );
@@ -14756,12 +14758,14 @@ mod health_warming_honesty_tests {
     #[test]
     fn failed_tier2_pass_returns_the_plane_to_ready() {
         let ctx = ctx_with_config(Config::default());
-        ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::Duplicates, true);
+        ctx.inspect_manager().set_tier2_in_flight_for_test(
+            crate::inspect_category::InspectCategory::Duplicates,
+            true,
+        );
         assert_eq!(health_tier2_status(&ctx), "building");
 
         ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
-            crate::inspect::InspectCategory::Duplicates,
+            crate::inspect_category::InspectCategory::Duplicates,
             crate::inspect::JobOutcome::Failed {
                 message: "scan failed".to_string(),
             },
@@ -14971,7 +14975,7 @@ mod configure_applicability_tests {
         let health = serde_json::to_value(census).unwrap();
         // The census keys roots by their normalized form, which on Windows has
         // no `\\?\` prefix; `fs::canonicalize` above returns the prefixed form.
-        let key = crate::inspect::job::canonicalize_normalized(&root)
+        let key = crate::path_identity::canonicalize_normalized(&root)
             .display()
             .to_string();
         let metrics = &health["lsp"]["applicability_by_root"][key];
@@ -15251,7 +15255,7 @@ mod status_bar_tests {
         let ctx = ctx();
         ctx.update_status_bar_todos(Some(0));
         let fixture = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
+        let root = crate::path_identity::canonicalize_normalized(fixture.path());
         let file = root.join("src/main.rs");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "fn main() {}\n").unwrap();
@@ -15328,7 +15332,7 @@ mod status_bar_tests {
 
         let ctx = ctx();
         let fixture = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
+        let root = crate::path_identity::canonicalize_normalized(fixture.path());
         ctx.set_canonical_cache_root(root.clone());
         ctx.update_status_bar_todos(Some(0));
 

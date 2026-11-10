@@ -106,7 +106,7 @@ fn real_location(path: &Path) -> Option<PathBuf> {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    crate::inspect::job::normalize_path(path)
+    crate::path_identity::normalize_path(path)
 }
 
 #[cfg(test)]
@@ -155,7 +155,7 @@ mod tests {
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("a.ts"), "export const a = 1;\n").unwrap();
-        let canonical = crate::inspect::job::canonicalize_normalized(&outside.join("a.ts"));
+        let canonical = crate::path_identity::canonicalize_normalized(&outside.join("a.ts"));
         for root in [None, Some(project)] {
             let mapper = ReadManifestPaths::for_context(&ctx_with_root(root.clone()));
             assert_eq!(mapper.map(&outside.join("a.ts")), canonical, "{root:?}");

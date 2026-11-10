@@ -908,7 +908,7 @@ mod tests {
         // where the temp folder sits behind a link (/var on macOS) or a short
         // name (Windows).
         let checkout_root = fs::canonicalize(dir.path().join("project")).unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(&checkout_root);
+        let root = crate::path_identity::canonicalize_normalized(&checkout_root);
         assert!(std::process::Command::new("git")
             .args(["init", "-q"])
             .arg(&root)
@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn a_root_without_records_is_pending_never_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        let root = crate::path_identity::canonicalize_normalized(dir.path());
         write(&root, "src/lib.rs", "// TODO: unseen\n");
         let result = run_todos_scan(&todos_job(&root, vec![root.join("src/lib.rs")]));
         let aggregate = result.outcome.unwrap().aggregate;
@@ -1047,7 +1047,7 @@ mod tests {
     #[test]
     fn counting_a_bound_checkout_opens_and_parses_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        let root = crate::path_identity::canonicalize_normalized(dir.path());
         assert!(std::process::Command::new("git")
             .args(["init", "-q"])
             .arg(&root)

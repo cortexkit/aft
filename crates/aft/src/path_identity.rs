@@ -929,3 +929,55 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 }
+
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    // Strip Windows verbatim prefixes before component normalization so paths
+    // that went through fs::canonicalize (\\?\C:\ form) compare equal to paths
+    // that never did. The oxc engine's resolver applies the same rule; the two
+    // normalizers must stay in agreement or membership/strip_prefix checks
+    // that cross the engine boundary silently miss on Windows.
+    #[cfg(windows)]
+    let path = &crate::windows_path::normalize_windows_path(path);
+
+    crate::path_identity::lexical_normalize(path)
+}
+
+/// Canonicalize a path for comparison inside the inspect subsystem.
+///
+/// Never returns the raw `fs::canonicalize` result: on Windows that is a
+/// verbatim (`\\?\C:\`) path, and mixing verbatim and non-verbatim forms in
+/// the same comparison is this subsystem's recurring bug class. Both branches
+/// route through [`normalize_path`].
+pub(crate) fn canonicalize_normalized(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|calls| {
+        if let Some(calls) = calls.borrow_mut().as_mut() {
+            calls.push(path.to_path_buf());
+        }
+    });
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => normalize_path(&canonical),
+        Err(_) => normalize_path(path),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CANONICALIZE_CALLS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    /// Unmatched leading `..` components must survive comparison normalization:
+    /// dropping them makes a path that escapes upward look like a nearby child.
+    #[test]
+    fn comparison_adapter_preserves_relative_parent_components() {
+        for (input, expected) in [("../../x", "../../x"), ("a/../../x", "../x")] {
+            assert_eq!(
+                super::normalize_path(std::path::Path::new(input)),
+                std::path::PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
+}

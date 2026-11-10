@@ -1764,7 +1764,7 @@ impl LspClient {
         !self.uses_analysis_progress()
             || (!self.uses_document_pull(Some(file))
                 && self.analysis_progress.certifies(
-                    &crate::inspect::job::normalize_path(file),
+                    &crate::path_identity::normalize_path(file),
                     epoch,
                     published_at,
                 ))
@@ -1787,7 +1787,7 @@ impl LspClient {
         published_at: Option<Instant>,
     ) {
         self.analysis_progress.published(
-            &crate::inspect::job::normalize_path(file),
+            &crate::path_identity::normalize_path(file),
             epoch,
             published_at,
         );
@@ -1821,7 +1821,7 @@ impl LspClient {
         else {
             return;
         };
-        let file = crate::inspect::job::normalize_path(&file);
+        let file = crate::path_identity::normalize_path(&file);
         if self.uses_document_pull(Some(&file)) {
             self.analysis_progress.opens.remove(&file);
             return;

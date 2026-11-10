@@ -244,7 +244,7 @@ mod tests {
         write(&root, "pkg/package.json", "{\"main\":\"one.js\"}");
         let cache =
             crate::inspect::InspectCache::open(storage.path().to_path_buf(), root.clone()).unwrap();
-        let category = crate::inspect::InspectCategory::Duplicates;
+        let category = crate::inspect_category::InspectCategory::Duplicates;
         let original = cache.contribution_set_hash(category).unwrap();
         let inventory = Arc::new(InspectInventory::collect(&root, || true));
         let guard = inventory.install();

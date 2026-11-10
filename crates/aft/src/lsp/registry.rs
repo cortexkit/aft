@@ -136,8 +136,8 @@ fn probe_node_bin_ancestors(
     workspace_root: &Path,
     project_root: &Path,
 ) -> Option<PathBuf> {
-    let workspace_root = crate::inspect::job::canonicalize_normalized(workspace_root);
-    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let workspace_root = crate::path_identity::canonicalize_normalized(workspace_root);
+    let project_root = crate::path_identity::canonicalize_normalized(project_root);
     if !workspace_root.starts_with(&project_root) {
         return None;
     }
@@ -1909,7 +1909,7 @@ mod tests {
     #[test]
     fn typescript_packages_with_the_same_version_share_one_server_root() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         write_file(&root.join("package.json"), "{}");
         install_typescript(&root, "5.9.3");
         for package in ["cli", "plugin", "old"] {
@@ -1955,7 +1955,7 @@ mod tests {
             ("next", Some("next"), "6.0.2", false),
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let root = crate::inspect::job::canonicalize_normalized(temp.path());
+            let root = crate::path_identity::canonicalize_normalized(temp.path());
             let nested = root.join("nested");
             for (package, shim_version) in [(&root, "6.0.2"), (&nested, nested_shim)] {
                 write_file(&package.join("package.json"), "{}");
@@ -1993,7 +1993,7 @@ mod tests {
     #[test]
     fn typescript_shims_share_an_unversioned_sdk_through_distinct_symlinks() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let nested = root.join("nested");
         let sdk = root.join("sdk");
         write_file(&sdk.join("package.json"), "{}");
@@ -2082,7 +2082,7 @@ mod tests {
                 assert_eq!(servers[0].kind, ServerKind::Biome);
                 assert_eq!(
                     servers[0].workspace_root_for_file(&file),
-                    Some(crate::inspect::job::canonicalize_normalized(root)),
+                    Some(crate::path_identity::canonicalize_normalized(root)),
                 );
                 std::fs::remove_file(root.join(marker)).unwrap();
             }
@@ -2094,7 +2094,7 @@ mod tests {
     #[test]
     fn biome_is_not_a_producer_for_files_its_config_excludes() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         write_file(
             &root.join("biome.json"),
             r#"{"files":{"includes":["packages/**/*.ts","!packages/gen/**"]}}"#,
@@ -2141,7 +2141,7 @@ mod tests {
     #[test]
     fn biome_pass_memo_matches_the_uncached_selection() {
         let temp = tempfile::tempdir().unwrap();
-        let top = crate::inspect::job::canonicalize_normalized(temp.path());
+        let top = crate::path_identity::canonicalize_normalized(temp.path());
         // Above the repository boundary: never governs files inside `repo`.
         write_file(&top.join("biome.json"), r#"{"files":{"includes":["**"]}}"#);
         let repo = top.join("repo");
@@ -2296,7 +2296,7 @@ mod tests {
     #[test]
     fn biome_pass_memo_probes_each_directory_once() {
         let temp = tempfile::tempdir().unwrap();
-        let repo = crate::inspect::job::canonicalize_normalized(temp.path());
+        let repo = crate::path_identity::canonicalize_normalized(temp.path());
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         write_file(&repo.join("biome.json"), "{}");
         write_file(&repo.join("pkg/package.json"), "{}");
@@ -2340,7 +2340,7 @@ mod tests {
     #[test]
     fn python_script_without_a_project_file_uses_the_project_root() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let script = root.join("scripts/report.py");
         write_file(&script, "print(1)\n");
         let config = Config {
@@ -2363,7 +2363,7 @@ mod tests {
     #[test]
     fn bash_scripts_in_nested_packages_share_the_outermost_root() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         write_file(&root.join("package.json"), "{}");
         write_file(&root.join("packages/cli/package.json"), "{}");
         let script = root.join("packages/cli/scripts/release.sh");
@@ -2394,7 +2394,7 @@ mod tests {
     #[test]
     fn typescript_7_files_get_the_native_server_keyed_by_their_typescript() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         write_file(&root.join("tsconfig.json"), "{}");
         let native_dir = install_typescript(&root.join("next"), "7.0.2");
         install_typescript(&root.join("legacy"), "5.9.3");
@@ -2435,7 +2435,7 @@ mod tests {
     #[test]
     fn typescript_server_choice_is_memoized_per_directory() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         write_file(&root.join("package.json"), "{}");
         install_typescript(&root, "7.0.2");
         let config = Config {
@@ -2465,7 +2465,7 @@ mod tests {
     #[test]
     fn typescript_server_choice_follows_an_install_after_invalidation() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         write_file(&root.join("package.json"), "{}");
         let package_dir = install_typescript(&root, "5.9.3");
         let file = root.join("index.ts");
@@ -2504,7 +2504,7 @@ mod tests {
     #[test]
     fn disabling_typescript_also_disables_the_native_server() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         write_file(&root.join("package.json"), "{}");
         install_typescript(&root, "7.0.2");
         let file = root.join("index.ts");
@@ -2527,7 +2527,7 @@ mod tests {
     #[test]
     fn user_chosen_typescript_program_is_not_swapped() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         write_file(&root.join("package.json"), "{}");
         install_typescript(&root, "7.0.2");
         let file = root.join("index.ts");
@@ -3551,7 +3551,7 @@ mod tests {
     #[test]
     fn biome_resolves_package_local_binary_in_a_per_package_workspace() {
         let tmp = tempfile::tempdir().unwrap();
-        let project = crate::inspect::job::canonicalize_normalized(tmp.path());
+        let project = crate::path_identity::canonicalize_normalized(tmp.path());
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
         let plugin = project.join("packages").join("plugin");
         let plugin_bin = plugin.join("node_modules").join(".bin");
@@ -3574,7 +3574,7 @@ mod tests {
     #[test]
     fn biome_prefers_nearest_node_modules_and_falls_back_to_the_project_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let project = crate::inspect::job::canonicalize_normalized(tmp.path());
+        let project = crate::path_identity::canonicalize_normalized(tmp.path());
         let binary_name = if cfg!(windows) { "biome.cmd" } else { "biome" };
         let root_bin = project.join("node_modules").join(".bin");
         touch_exe(&root_bin.join(binary_name));
@@ -3615,7 +3615,7 @@ mod tests {
     #[test]
     fn biome_walk_does_not_leave_the_project_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let outside = crate::inspect::job::canonicalize_normalized(tmp.path());
+        let outside = crate::path_identity::canonicalize_normalized(tmp.path());
         let binary_name = if cfg!(windows) { "biome.cmd" } else { "biome" };
         let outside_bin = outside.join("node_modules").join(".bin");
         touch_exe(&outside_bin.join(binary_name));
@@ -3679,7 +3679,7 @@ mod tests {
         };
         touch_exe(&outside_python);
 
-        let project_root = crate::inspect::job::canonicalize_normalized(&project);
+        let project_root = crate::path_identity::canonicalize_normalized(&project);
         for kind in [ServerKind::Python, ServerKind::Ty] {
             let server = builtin_servers()
                 .into_iter()

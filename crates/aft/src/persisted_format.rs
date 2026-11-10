@@ -381,7 +381,7 @@ fn canonical_scope(path: &Path) -> PathBuf {
     let resolved = crate::production_storage::canonicalized_with(&absolute, &|path| {
         std::fs::canonicalize(path).ok()
     });
-    crate::inspect::job::normalize_path(&resolved)
+    crate::path_identity::normalize_path(&resolved)
 }
 
 fn storage_roots() -> &'static std::sync::RwLock<Vec<std::sync::Arc<StorageRoot>>> {
@@ -463,15 +463,15 @@ fn registered_boundary(spelling: &Path, canonical: &Path) -> std::io::Result<Reg
         (Some(parent), Some(leaf)) => std::fs::canonicalize(parent).map(|parent| parent.join(leaf)),
         _ => std::fs::canonicalize(spelling),
     };
-    let path = crate::inspect::job::normalize_path(&observed?);
-    let normalized = crate::inspect::job::normalize_path(spelling);
+    let path = crate::path_identity::normalize_path(&observed?);
+    let normalized = crate::path_identity::normalize_path(spelling);
     // Lexical '..' cancellation is a direct spelling only when registration
     // proves it still reaches this root, rather than crossing a symlink parent.
     let normalized_spelling = if normalized != spelling {
         #[cfg(test)]
         ALIAS_VERIFICATIONS.with(|count| count.set(count.get() + 1));
         std::fs::canonicalize(&normalized)
-            .is_ok_and(|path| crate::inspect::job::normalize_path(&path) == canonical)
+            .is_ok_and(|path| crate::path_identity::normalize_path(&path) == canonical)
             .then_some(normalized)
     } else {
         None
@@ -513,7 +513,7 @@ impl RouteProbe {
 
     fn finish(&self, root: &StorageRoot, prefix: &Path) -> Option<PathBuf> {
         let relative = self.path.strip_prefix(prefix).ok()?;
-        let key = crate::inspect::job::normalize_path(&root.canonical.join(relative));
+        let key = crate::path_identity::normalize_path(&root.canonical.join(relative));
         key.starts_with(&root.canonical).then_some(key)
     }
 
@@ -545,8 +545,8 @@ impl RouteProbe {
         let Some(boundary) = root.boundary.as_ref() else {
             return false;
         };
-        let normalized = crate::inspect::job::normalize_path(&self.path);
-        let spelling = crate::inspect::job::normalize_path(&root.spelling);
+        let normalized = crate::path_identity::normalize_path(&self.path);
+        let spelling = crate::path_identity::normalize_path(&root.spelling);
         let could_outrank = [normalized.as_path(), selected_key]
             .into_iter()
             .any(|route| {
@@ -1282,7 +1282,7 @@ mod tests {
                     .unwrap()
                     .normalized_spelling
                     .as_ref(),
-                Some(&crate::inspect::job::normalize_path(&through_parent))
+                Some(&crate::path_identity::normalize_path(&through_parent))
             );
             let floor = UnsupportedPersistedFormat::floor(
                 store,
@@ -1743,7 +1743,7 @@ mod tests {
         assert_eq!(comparison_scope(&artifact), canonical_scope(&artifact));
         assert_eq!(
             comparison_scope(&artifact),
-            crate::inspect::job::normalize_path(&std::fs::canonicalize(&artifact).unwrap())
+            crate::path_identity::normalize_path(&std::fs::canonicalize(&artifact).unwrap())
         );
     }
 

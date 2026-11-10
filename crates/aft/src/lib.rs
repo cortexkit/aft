@@ -131,6 +131,7 @@ pub mod host_tool_names;
 pub mod imports;
 pub mod indent;
 pub mod inspect;
+pub mod inspect_category;
 pub(crate) mod io_accounting;
 pub mod jsonc;
 pub mod jsonc_edit;

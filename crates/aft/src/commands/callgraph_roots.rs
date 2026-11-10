@@ -28,7 +28,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::callgraph_store::StoreNode;
-use crate::inspect::job::is_test_file;
+use crate::file_kind::is_test_file;
 use crate::parser::LangId;
 
 /// The kind of a root: why a path of callers ends at it. Declared in the

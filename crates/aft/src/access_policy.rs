@@ -147,7 +147,7 @@ fn resolve_worker_rust_root(root: &Path, subtree: &str) -> Option<AccessGrant> {
     }
     let path = joined.canonicalize().ok()?;
     path.is_dir().then(|| AccessGrant {
-        path: crate::inspect::job::normalize_path(&path),
+        path: crate::path_identity::normalize_path(&path),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     })
@@ -650,7 +650,7 @@ impl AccessPolicy {
         let mut floor_rules = Vec::new();
         let roots = roots
             .into_iter()
-            .map(|root| crate::inspect::job::normalize_path(&root))
+            .map(|root| crate::path_identity::normalize_path(&root))
             .collect::<Vec<_>>();
         let shell_write_floor = [
             (".ssh", FloorRule::CredentialPath),
@@ -1316,8 +1316,8 @@ pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
             ignore_case: i32,
         ) -> i32;
     }
-    let path = crate::inspect::job::normalize_path(path);
-    let prefix = crate::inspect::job::normalize_path(prefix);
+    let path = crate::path_identity::normalize_path(path);
+    let prefix = crate::path_identity::normalize_path(prefix);
     let mut components = path.components();
     prefix.components().all(|expected| {
         let Some(actual) = components.next() else {
@@ -1418,7 +1418,7 @@ pub(crate) fn policy_path(path: &Path) -> PathBuf {
         }
         // The enclosing resolution must reject this entire policy. Do not run
         // more filesystem work after its first failure.
-        return crate::inspect::job::normalize_path(path);
+        return crate::path_identity::normalize_path(path);
     }
     resolve_policy_path(path)
 }
@@ -1474,14 +1474,14 @@ fn resolve_policy_path(path: &Path) -> PathBuf {
             for component in tail.iter().rev() {
                 canonical.push(component);
             }
-            return crate::inspect::job::normalize_path(&canonical);
+            return crate::path_identity::normalize_path(&canonical);
         }
         let Some(name) = ancestor.file_name().map(ToOwned::to_owned) else {
-            return crate::inspect::job::normalize_path(&path);
+            return crate::path_identity::normalize_path(&path);
         };
         tail.push(name);
         if !ancestor.pop() {
-            return crate::inspect::job::normalize_path(&path);
+            return crate::path_identity::normalize_path(&path);
         }
     }
 }

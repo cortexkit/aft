@@ -34,7 +34,7 @@ const RECORD_SCHEMA: u32 = 3;
 fn canonical(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path)
         .ok()
-        .map(|path| crate::inspect::job::normalize_path(&path))
+        .map(|path| crate::path_identity::normalize_path(&path))
 }
 
 struct WalkReport<'a> {

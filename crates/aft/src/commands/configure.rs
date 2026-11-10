@@ -1524,7 +1524,7 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
 #[test]
 fn lsp_warnings_probe_each_biome_folder_once_per_pass() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join("biome.json"), "{}").unwrap();
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1846,7 +1846,7 @@ fn audit01_warning_current_generation_publishes() {
 #[test]
 fn configure_warnings_list_files_from_the_published_index_store_without_walking() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     for (path, contents) in [
         ("src/main.rs", "fn main() {}\n"),
         ("web/app.ts", "export const app = 1;\n"),

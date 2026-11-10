@@ -4390,7 +4390,7 @@ mod tests {
         let (outcome, lines) = capture_index_events(|| {
             manager.tier2_run_with_reuse_blocking_fresh(
                 snapshot,
-                crate::inspect::InspectCategory::Complexity,
+                crate::inspect_category::InspectCategory::Complexity,
                 crate::inspect::JobScope::for_project(root.clone()),
             )
         });

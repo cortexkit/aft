@@ -954,7 +954,7 @@ pub(crate) mod win {
     /// names the link entry, not what it points at.
     pub(crate) fn location(entry: &File) -> io::Result<PathBuf> {
         crate::commands::file_read_exact::opened_location(entry)
-            .map(|path| crate::inspect::job::normalize_path(&path))
+            .map(|path| crate::path_identity::normalize_path(&path))
     }
 
     /// Delete the open entry through its handle: POSIX semantics where the
@@ -1044,7 +1044,7 @@ mod platform {
         let judged = authorize(&located).map_err(|response| refused(root, response))?;
         #[cfg(test)]
         crate::commands::delete_file::unlink_seam(UnlinkStage::AfterAuthorize);
-        if crate::inspect::job::normalize_path(&judged) != located
+        if crate::path_identity::normalize_path(&judged) != located
             || location(&root_handle).ok().as_deref() != Some(located.as_path())
         {
             return Err(root_changed(req_id, root));

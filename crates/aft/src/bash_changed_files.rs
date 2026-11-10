@@ -264,7 +264,7 @@ impl ReadPolicy {
     fn allows(&self, path: &Path) -> bool {
         // Compare normalized copies: Windows canonicalization can add a path
         // prefix that is absent from watcher paths. Keep launch paths unchanged.
-        let path = crate::inspect::job::normalize_path(path);
+        let path = crate::path_identity::normalize_path(path);
         self.access
             .decide(crate::access_policy::AccessOperation::Read, &path, false)
             == crate::access_policy::AccessDecision::Allow
@@ -272,13 +272,13 @@ impl ReadPolicy {
                 !data
                     .deny
                     .iter()
-                    .any(|denied| path.starts_with(crate::inspect::job::normalize_path(denied)))
+                    .any(|denied| path.starts_with(crate::path_identity::normalize_path(denied)))
                     || data.read_allow.iter().any(|allowed| {
-                        path.starts_with(crate::inspect::job::normalize_path(allowed))
+                        path.starts_with(crate::path_identity::normalize_path(allowed))
                     })
             })
             && !self.deny_prefixes.iter().any(|prefix| {
-                let prefix = crate::inspect::job::normalize_path(prefix);
+                let prefix = crate::path_identity::normalize_path(prefix);
                 path.as_os_str()
                     .to_string_lossy()
                     .starts_with(prefix.as_os_str().to_string_lossy().as_ref())

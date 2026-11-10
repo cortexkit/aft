@@ -5,7 +5,7 @@ use crate::commands::callgraph_store_adapter::{
     store_error_response, trace_to_symbol_candidates, trace_to_symbol_result,
 };
 use crate::context::AppContext;
-use crate::inspect::job::is_test_file;
+use crate::file_kind::is_test_file;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to_symbol` request.

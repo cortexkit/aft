@@ -1090,7 +1090,7 @@ impl<S: SliceSource> SliceReader<S> {
                             .and_then(|handle| slice.node(handle))
                             .and_then(|node| node.is_test())
                             .unwrap_or(false);
-                        !caller_is_test && !crate::inspect::job::is_test_file(file)
+                        !caller_is_test && !crate::file_kind::is_test_file(file)
                     });
                 if counted {
                     count += 1;

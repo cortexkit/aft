@@ -65,8 +65,8 @@ fn wait_at_metrics_gate_for_debug(project_root: &Path) {
     let Some(root) = std::env::var_os("AFT_TEST_METRICS_GATE_ROOT") else {
         return;
     };
-    if crate::inspect::job::canonicalize_normalized(Path::new(&root))
-        != crate::inspect::job::canonicalize_normalized(project_root)
+    if crate::path_identity::canonicalize_normalized(Path::new(&root))
+        != crate::path_identity::canonicalize_normalized(project_root)
     {
         return;
     }
@@ -297,7 +297,7 @@ fn bump_file_read_count(path: &Path) {
 pub fn reset_file_read_count_for_debug(project_root: &Path) {
     // Normalized like the scanned paths themselves: bare canonicalize is
     // verbatim on Windows and the starts_with filter would miss every entry.
-    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let project_root = crate::path_identity::canonicalize_normalized(project_root);
     FILE_READS.reset(project_root);
 }
 
@@ -306,7 +306,7 @@ pub fn reset_file_read_count_for_debug(project_root: &Path) {
 pub fn file_read_count_for_debug(project_root: &Path) -> usize {
     // Normalized like the scanned paths themselves: bare canonicalize is
     // verbatim on Windows and the starts_with filter would miss every entry.
-    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let project_root = crate::path_identity::canonicalize_normalized(project_root);
     FILE_READS.count(&project_root)
 }
 
