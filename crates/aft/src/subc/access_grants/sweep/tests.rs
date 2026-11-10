@@ -186,9 +186,19 @@ async fn saved_grant_sweep_deadline_and_database_failure_keep_grants() {
     let metrics = DispatchPathMetrics::new();
     report(&metrics, timeout);
     report(&metrics, failed);
-    let health = metrics.scope_descriptions.lock().unwrap().cleanup_health();
-    assert_eq!(health["saved_grant_sweep"]["timeouts"], 1);
-    assert_eq!(health["saved_grant_sweep"]["database_errors"], 1);
+    let health = metrics
+        .scope_descriptions
+        .lock()
+        .unwrap()
+        .grant_sweep_health();
+    assert_eq!(
+        health["errors"], 2,
+        "timeouts and database failures count as errors"
+    );
+    assert_eq!(health["scopes_checked"], 2);
+    assert_eq!(health["cant_tell"], 0);
+    assert!(health["last_pass_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(health.as_object().unwrap().len(), 5);
 }
 
 #[cfg(unix)]

@@ -1,7 +1,6 @@
 //! Reconcile saved grants with daemon lifecycle state, away from tool calls.
 use super::super::{readiness, scope_describe, DispatchPathMetrics, Executor};
 use crate::db::{access_grants as store, TrackedConnection};
-use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,7 +10,7 @@ const PER_TICK: usize = 4;
 const INTERVAL: Duration = Duration::from_secs(5);
 type Db = Arc<Mutex<TrackedConnection>>;
 
-#[derive(Default, Serialize)]
+#[derive(Default)]
 pub(in crate::subc) struct Stats {
     pub ticks: u64,
     pub described: u64,
@@ -22,6 +21,7 @@ pub(in crate::subc) struct Stats {
     pub errors: u64,
     pub timeouts: u64,
     pub database_errors: u64,
+    pub last_pass_at_ms: i64,
 }
 
 impl Stats {
@@ -35,6 +35,7 @@ impl Stats {
         self.errors += other.errors;
         self.timeouts += other.timeouts;
         self.database_errors += other.database_errors;
+        self.last_pass_at_ms = other.last_pass_at_ms;
     }
 }
 
@@ -173,7 +174,8 @@ pub(in crate::subc) async fn run(control: Arc<readiness::DaemonControl>, executo
     }
 }
 
-fn report(metrics: &DispatchPathMetrics, stats: Stats) {
+fn report(metrics: &DispatchPathMetrics, mut stats: Stats) {
+    stats.last_pass_at_ms = crate::db::access_grant_rows::now_ms();
     metrics
         .scope_descriptions
         .lock()
