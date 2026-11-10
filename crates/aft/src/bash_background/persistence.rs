@@ -1920,6 +1920,10 @@ pub struct PersistedTask {
     /// and clears this. Persisted so the notice survives an AFT restart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancelled_call_unannounced: bool,
+    /// Successful completion offers to an acknowledging runner, including the
+    /// first offer. Persisted so reconnect budgets survive daemon restarts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) runner_completion_offers: u64,
     /// The saved folder grants this command's sandbox allowed, so revoking
     /// one can stop it. Persisted so a restarted AFT still knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2018,6 +2022,7 @@ impl PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
+            runner_completion_offers: 0,
             folder_grants: super::registry::folder_grants::for_spawn(),
         };
         crate::gh_shim_ticket::capture_spawn(&metadata);

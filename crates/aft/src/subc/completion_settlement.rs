@@ -8,6 +8,7 @@ pub(super) struct Settlement {
     pub(super) key: ReplayKey,
     pub(super) task: String,
     pub(super) unacked: UnackedCompletions,
+    pub(super) offers: Option<u64>,
     #[cfg(test)]
     pub(super) gate: Option<TestGate>,
 }
@@ -25,6 +26,15 @@ impl Settlement {
             session: self.key.session.clone(),
         };
         let _scope = task_identity_scope(Some(identity));
+        if let Some(offers) = self.offers {
+            if let Err(error) =
+                self.registry
+                    .persist_runner_completion_offer(&self.key.session, &self.task, offers)
+            {
+                log::warn!("subc completion push: task={} could not persist runner offer count={offers} key={:?}: {error}", self.task, self.key);
+            }
+            return;
+        }
         if self
             .registry
             .ack_completions_for_session(Some(&self.key.session), std::slice::from_ref(&self.task))

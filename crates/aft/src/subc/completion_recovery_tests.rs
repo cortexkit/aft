@@ -702,6 +702,28 @@ impl RunnerRecovery {
         );
     }
 
+    fn restart_registry(&mut self) {
+        completion_settlement::wait_for_settlements();
+        self.registry.detach();
+        self.metrics = DispatchPathMetrics::new();
+        self.registry = BgTaskRegistry::default();
+        let db = crate::db::open(&self.storage.path().join("aft.db")).unwrap();
+        self.registry
+            .set_db_pool(Arc::new(std::sync::Mutex::new(db)));
+        self.registry
+            .replay_session(self.storage.path(), SESSION)
+            .unwrap();
+    }
+
+    fn assert_pending(&self) {
+        completion_settlement::wait_for_settlements();
+        let paths =
+            crate::bash_background::persistence::resolve_task(self.storage.path(), SESSION, TASK)
+                .unwrap();
+        assert!(!read_task_at(&paths).unwrap().completion_delivered);
+        assert!(self.registry.pending_completion_ids()[SESSION].contains(TASK));
+    }
+
     fn reconnect_three_times(&mut self, first: RouteChannel) {
         let mut previous = first;
         for epoch in 2..=4 {
@@ -727,9 +749,8 @@ impl Drop for RunnerRecovery {
 fn runner_live_completion_is_delivered_once_across_three_reconnects() {
     let (_dir, root) = test_root("runner-live-completion-once");
     for (principal, harness) in [
-        ("reserved:thalamus-harness", "opencode2"),
-        ("reserved:thalamus-harness", "pi"),
         ("reserved:broca", "runner"),
+        ("reserved:other-runner", "opencode2"),
     ] {
         let mut recovery = RunnerRecovery::new(&root, principal, harness, 8);
         let first = route_key(1, 1);
@@ -754,7 +775,7 @@ fn runner_live_completion_is_delivered_once_across_three_reconnects() {
 #[test]
 fn runner_completion_without_route_is_sent_once_and_stays_delivered_after_restart() {
     let (_dir, root) = test_root("runner-deferred-completion-once");
-    let mut recovery = RunnerRecovery::new(&root, "reserved:thalamus-harness", "opencode2", 8);
+    let mut recovery = RunnerRecovery::new(&root, "reserved:broca", "runner", 8);
     let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
     recovery.live(frame);
     assert!(recovery.output.try_recv().is_err());
@@ -798,7 +819,7 @@ fn runner_completion_without_route_is_sent_once_and_stays_delivered_after_restar
 #[test]
 fn runner_backlog_before_cutover_is_retired_without_a_frame() {
     let (_dir, root) = test_root("runner-completion-backlog-cutover");
-    let mut recovery = RunnerRecovery::new(&root, "reserved:thalamus-harness", "pi", 8);
+    let mut recovery = RunnerRecovery::new(&root, "reserved:broca", "runner", 8);
     const NEW_TASK: &str = "bash-0000000000000002";
     persisted_completion_at(
         recovery.storage.path(),
@@ -942,7 +963,7 @@ fn runner_cutover_is_recorded_once_on_the_owning_database() {
 fn runner_recovery_returns_before_durable_settlement_and_does_not_repeat() {
     let (_dir, root) = test_root("runner-completion-queued-settlement");
     for backlog in [false, true] {
-        let mut recovery = RunnerRecovery::new(&root, "reserved:thalamus-harness", "opencode2", 8);
+        let mut recovery = RunnerRecovery::new(&root, "reserved:broca", "runner", 8);
         let finished = if backlog {
             recovery.cutoff - 1
         } else {
@@ -1041,7 +1062,7 @@ fn direct_plugin_callers_acknowledge_completions() {
 }
 
 #[test]
-fn thalamus_runner_callers_do_not_acknowledge_completions() {
+fn thalamus_runner_callers_acknowledge_completions() {
     let (_dir, root) = test_root("thalamus-completion-ack-policy");
     for (principal, harness) in [
         ("reserved:thalamus-harness", "opencode2"),
@@ -1049,10 +1070,134 @@ fn thalamus_runner_callers_do_not_acknowledge_completions() {
         ("reserved:thalamus-pi", "pi"),
     ] {
         let route = tests::caller_route(&root, principal, harness);
-        assert!(!caller_acknowledges_completions(
+        assert!(caller_acknowledges_completions(
             route.task_identity().principal.as_deref()
         ));
     }
+}
+
+#[test]
+fn thalamus_runner_unacked_completion_reoffers_are_bounded_across_restart() {
+    let (_dir, root) = test_root("runner-completion-ack-budget");
+    for principal in ["reserved:thalamus-harness", "reserved:thalamus-pi"] {
+        let mut recovery = RunnerRecovery::new(&root, principal, "opencode2", 8);
+        let first = route_key(1, 1);
+        recovery.bind(first);
+        let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
+        recovery.live(frame.clone());
+        recovery.assert_frame(first, TASK);
+        recovery.assert_pending();
+        // Maintenance and duplicate live emissions on an open route are not
+        // new offers. Only closing that recipient makes the task replayable.
+        recovery.recover();
+        recovery.live(frame);
+        assert!(recovery.output.try_recv().is_err());
+        recovery.close(first);
+        recovery.restart_registry();
+        for epoch in 2..=RUNNER_COMPLETION_MAX_OFFERS {
+            let next = route_key(1, epoch as u32);
+            recovery.bind(next);
+            recovery.assert_frame(next, TASK);
+            recovery.assert_pending();
+            recovery.close(next);
+            recovery.restart_registry();
+        }
+        for epoch in 4..=6 {
+            let next = route_key(1, epoch);
+            recovery.bind(next);
+            assert!(
+                recovery.output.try_recv().is_err(),
+                "offer budget was reset"
+            );
+            recovery.assert_delivered(TASK);
+            recovery.close(next);
+        }
+    }
+}
+
+#[test]
+fn thalamus_runner_acked_completion_never_reoffers_after_rebind_or_restart() {
+    let (_dir, root) = test_root("runner-completion-explicit-ack");
+    for principal in ["reserved:thalamus-harness", "reserved:thalamus-pi"] {
+        let mut recovery = RunnerRecovery::new(&root, principal, "opencode2", 8);
+        let first = route_key(1, 1);
+        recovery.bind(first);
+        let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
+        recovery.live(frame);
+        recovery.assert_frame(first, TASK);
+        recovery.assert_pending();
+        {
+            let _scope =
+                crate::bash_background::task_identity_scope(Some(recovery.owner.task_identity()));
+            assert_eq!(
+                recovery
+                    .registry
+                    .ack_completions_for_session(Some(SESSION), &[TASK.into()]),
+                vec![TASK]
+            );
+        }
+        recovery.recover();
+        recovery.assert_delivered(TASK);
+        recovery.reconnect_three_times(first);
+        recovery.close(route_key(1, 4));
+        recovery.restart_registry();
+        recovery.bind(route_key(1, 5));
+        assert!(recovery.output.try_recv().is_err());
+    }
+}
+
+#[test]
+fn thalamus_runner_expired_completion_is_retired_in_live_and_recovery_paths() {
+    let (_dir, root) = test_root("runner-completion-ack-expiry");
+    for live in [false, true] {
+        let mut recovery = RunnerRecovery::new(&root, "reserved:thalamus-harness", "opencode2", 8);
+        if live {
+            recovery.bind(route_key(1, 1));
+        }
+        let frame =
+            recovery.add_completion(TASK, recovery.cutoff - RUNNER_COMPLETION_MAX_AGE_MS - 1);
+        if live {
+            recovery.live(frame);
+        } else {
+            recovery.bind(route_key(1, 1));
+        }
+        assert!(
+            recovery.output.try_recv().is_err(),
+            "expired completion was offered"
+        );
+        recovery.assert_delivered(TASK);
+        recovery.reconnect_three_times(route_key(1, 1));
+    }
+}
+
+#[test]
+fn thalamus_runner_offer_persistence_does_not_block_rebind() {
+    let (_dir, root) = test_root("runner-completion-ack-off-thread");
+    let mut recovery = RunnerRecovery::new(&root, "reserved:thalamus-harness", "opencode2", 8);
+    recovery.add_completion(TASK, recovery.cutoff + 1);
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    *recovery
+        .metrics
+        .completion_delivery
+        .settlement_gate
+        .lock()
+        .unwrap() = Some(completion_settlement::TestGate {
+        entered,
+        release: resume,
+    });
+    recovery.bind(route_key(1, 1));
+    recovery.assert_frame(route_key(1, 1), TASK);
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The route reads published delivery metadata, not the task state that
+    // the durable writer can hold while syncing task storage.
+    let _no_state_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+    recovery.close(route_key(1, 1));
+    recovery.bind(route_key(1, 2));
+    recovery.assert_frame(route_key(1, 2), TASK);
+    drop(_no_state_locks);
+    release.send(()).unwrap();
+    recovery.assert_pending();
 }
 
 #[test]

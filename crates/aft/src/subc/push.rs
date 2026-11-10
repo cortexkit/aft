@@ -31,8 +31,9 @@ mod completion_settlement;
 type UnackedCompletions =
     Arc<std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, HashSet<String>>>>>;
 
-/// Plugin offers remain eligible until acknowledged; runner offers settle in
-/// memory as soon as a matching route accepts the frame, then persist off-thread.
+/// Plugin and acknowledging runner offers remain eligible until acknowledged.
+/// Offers to other runners are no longer eligible after acceptance; all durable
+/// delivery writes run off-thread.
 #[derive(Default)]
 pub(super) struct CompletionDelivery {
     state: std::sync::Mutex<CompletionOffers>,
@@ -63,12 +64,21 @@ impl std::fmt::Debug for CompletionDelivery {
 fn caller_acknowledges_completions(principal: Option<&str>) -> bool {
     // RouteIdentity's authenticated principal (also carried in ReplayKey) is
     // stable across reconnects. Harness names are shared by plugins and runners.
-    // Reserved module routes are non-acknowledging because nothing on them calls
-    // bash_ack_completions today; direct plugin routes drain and acknowledge.
-    // When a runner gains durable intake and starts acknowledging, change only
-    // this policy, not the live/replay/retry delivery paths.
-    !principal.is_some_and(|principal| principal.starts_with("reserved:"))
+    acknowledging_runner(principal)
+        || !principal.is_some_and(|principal| principal.starts_with("reserved:"))
 }
+
+fn acknowledging_runner(principal: Option<&str>) -> bool {
+    matches!(
+        principal,
+        Some("reserved:thalamus-harness" | "reserved:thalamus-pi")
+    )
+}
+
+// Count the initial successful offer as well as rebind offers. Plugin delivery
+// is not subject to this runner-specific replay budget.
+const RUNNER_COMPLETION_MAX_OFFERS: u64 = 3;
+const RUNNER_COMPLETION_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
 enum CompletionSend {
     Send,
@@ -128,14 +138,27 @@ impl CompletionDelivery {
             self.settle(key, task);
             return;
         }
-        let mut state = self.state.lock().unwrap();
-        let task_key = (key.root.clone(), task.into());
-        state.admitted.insert(task_key.clone());
-        state
-            .recipients
-            .entry(task_key)
-            .or_default()
-            .insert(channel);
+        {
+            let mut state = self.state.lock().unwrap();
+            let task_key = (key.root.clone(), task.into());
+            state.admitted.insert(task_key.clone());
+            if !state
+                .recipients
+                .entry(task_key)
+                .or_default()
+                .insert(channel)
+            {
+                return;
+            }
+        }
+        if acknowledging_runner(key.principal.as_deref()) {
+            if let Some(offers) = self
+                .registry(&key.root)
+                .and_then(|registry| registry.reserve_runner_completion_offer(task))
+            {
+                self.queue_write(key, task, Some(offers));
+            }
+        }
     }
 
     fn registry(&self, root: &ProjectRootId) -> Option<crate::bash_background::BgTaskRegistry> {
@@ -161,6 +184,10 @@ impl CompletionDelivery {
                 return false;
             }
         }
+        self.queue_write(key, task, None)
+    }
+
+    fn queue_write(&self, key: &ReplayKey, task: &str, offers: Option<u64>) -> bool {
         // Synced task-file and SQLite writes must not block binds or live pushes.
         // A crash before the queued mark lands may repeat the completion once
         // after restart; that is preferable to blocking every route's bind.
@@ -173,6 +200,7 @@ impl CompletionDelivery {
                     key: key.clone(),
                     task: task.into(),
                     unacked: Arc::clone(&self.unacked),
+                    offers,
                     #[cfg(test)]
                     gate: self.settlement_gate.lock().unwrap().take(),
                 })
@@ -181,6 +209,11 @@ impl CompletionDelivery {
             Ok(()) => true,
             Err(error) => {
                 log::warn!("subc completion push: task={task} could not queue durable runner completion delivery key={key:?}: {error}; suppressing further offers in this process");
+                self.state
+                    .lock()
+                    .unwrap()
+                    .settled
+                    .insert((key.root.clone(), task.into()));
                 false
             }
         }
@@ -190,15 +223,33 @@ impl CompletionDelivery {
         let Some(task) = completed_task_id(frame) else {
             return CompletionSend::Send;
         };
-        if caller_acknowledges_completions(key.principal.as_deref()) {
-            return CompletionSend::Send;
-        }
         if self.is_settled(&key.root, task) {
             return CompletionSend::Settled;
         }
         let Some(registry) = self.registry(&key.root) else {
             return CompletionSend::Send;
         };
+        if acknowledging_runner(key.principal.as_deref()) {
+            let Some(state) = registry.runner_completion_state(task) else {
+                return CompletionSend::Hold;
+            };
+            if state.completion_delivered {
+                return CompletionSend::Settled;
+            }
+            let expired = state.completion_finished_at.is_none_or(|finished| {
+                crate::bash_background::persistence::unix_millis().saturating_sub(finished)
+                    >= RUNNER_COMPLETION_MAX_AGE_MS
+            });
+            if expired || state.runner_completion_offers >= RUNNER_COMPLETION_MAX_OFFERS {
+                log::info!("subc completion push: task={task} outcome=retired key={key:?} reason={} offers={}", if expired { "runner_completion_expired" } else { "runner_completion_offer_limit" }, state.runner_completion_offers);
+                self.settle(key, task);
+                return CompletionSend::Settled;
+            }
+            return CompletionSend::Send;
+        }
+        if caller_acknowledges_completions(key.principal.as_deref()) {
+            return CompletionSend::Send;
+        }
         let cutoff = match registry.runner_completion_delivery_cutover() {
             Ok(cutoff) => cutoff,
             Err(error) => {

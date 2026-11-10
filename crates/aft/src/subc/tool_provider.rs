@@ -1633,6 +1633,9 @@ pub(super) fn admit_call_mode(
     name: &str,
     mode: &cortexkit_role_tool_provider::CallMode,
 ) -> Result<(), ErrorBody> {
+    if native_completion_ack(name) {
+        return Ok(());
+    }
     use cortexkit_role_tool_provider::{catalog::serves_call_mode, CallMode};
     let tool = served_tools(CatalogPreset::Head)
         .iter()
@@ -1692,7 +1695,11 @@ pub(super) fn admit_for_session(
     hashline_route: bool,
 ) -> Result<CallerRole, ErrorBody> {
     check_call(call)?;
-    let role = resolve_caller_role(call.preset.as_deref(), scoped_route, false)?;
+    let role = resolve_caller_role(
+        call.preset.as_deref(),
+        scoped_route && !native_completion_ack(&call.name),
+        false,
+    )?;
     admit_as(
         call,
         disabled,
@@ -1861,7 +1868,13 @@ pub(super) fn shell_capability_refusal(name: &str, trusted: bool) -> Option<Erro
     (!trusted
         && matches!(
             name,
-            "bash" | "powershell" | "bash_status" | "bash_kill" | "bash_write" | "bash_watch"
+            "bash"
+                | "powershell"
+                | "bash_status"
+                | "bash_kill"
+                | "bash_write"
+                | "bash_watch"
+                | "bash_ack_completions"
         ))
     .then(|| {
         ErrorBody::new(
@@ -3860,6 +3873,12 @@ fn legacy_file_path_digests(name: &str) -> &'static [String] {
     DIGESTS.get(name).map_or(&[], Vec::as_slice)
 }
 
+fn native_completion_ack(name: &str) -> bool {
+    // Transport bookkeeping reuses the native handler, never the model catalog
+    // or its schemas. Keep this exception narrower than the plumbing allowlist.
+    name == "bash_ack_completions" && super::is_subc_native_plumbing_tool(name)
+}
+
 /// [`admit`] for a call whose role is already resolved.
 fn admit_as(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
@@ -3878,6 +3897,9 @@ fn admit_as(
         trusted,
         role,
     )?;
+    if native_completion_ack(&call.name) {
+        return Ok(());
+    }
     admit_arguments_for(call, role, true, hashline_route)
 }
 
@@ -3891,10 +3913,11 @@ pub(super) fn admit_role_name(
     trusted: bool,
     role: CallerRole,
 ) -> Result<(), ErrorBody> {
-    if !METADATA
-        .iter()
-        .chain(PRESET_ONLY_METADATA)
-        .any(|(tool, _, _)| *tool == name)
+    if !native_completion_ack(name)
+        && !METADATA
+            .iter()
+            .chain(PRESET_ONLY_METADATA)
+            .any(|(tool, _, _)| *tool == name)
     {
         return Err(errors::unknown_tool(name));
     }
@@ -8487,6 +8510,131 @@ pub(in crate::subc) mod route_tests {
                 outcomes.push(outcome);
             }
             assert_eq!(outcomes[0], outcomes[1], "{plugin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_completion_ack_tool_call_owns_tasks_and_stays_out_of_catalog() {
+        use crate::bash_background::persistence::{
+            create_task_layout, read_task_at, write_task_at, PersistedTask,
+        };
+        use crate::bash_background::{BgTaskStatus, TaskIdentity};
+
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for principal in ["reserved:thalamus-harness", "reserved:thalamus-pi"] {
+            let (dir, root) = test_support::test_root("runner-native-completion-ack");
+            let ctx = test_support::test_ctx();
+            let mut identity = test_support::route_identity_with_harness(
+                &root,
+                "ack-session",
+                BindTrust::FirstParty,
+                "opencode2",
+            );
+            let data = Arc::get_mut(&mut identity.0).unwrap();
+            data.role = RouteRole::ToolProviderV1;
+            data.scope = Some(stamp("head"));
+            if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                &mut data.spawn_principal
+            {
+                *principal_id = Some(principal.into());
+            }
+            let storage = dir.path().join("tasks");
+            let mut saved = Vec::new();
+            for (task_id, session, task_principal, harness) in [
+                (
+                    "bash-0000000000000001",
+                    "ack-session",
+                    principal,
+                    "opencode2",
+                ),
+                (
+                    "bash-0000000000000002",
+                    "foreign-session",
+                    principal,
+                    "opencode2",
+                ),
+                (
+                    "bash-0000000000000003",
+                    "ack-session",
+                    "reserved:broca",
+                    "opencode2",
+                ),
+                ("bash-0000000000000004", "ack-session", principal, "pi"),
+            ] {
+                let task = create_task_layout(&storage, session, task_id).unwrap();
+                let mut metadata = PersistedTask::starting(
+                    task_id.into(),
+                    session.into(),
+                    "echo ack".into(),
+                    root.as_path().into(),
+                    Some(root.as_path().into()),
+                    None,
+                    true,
+                    false,
+                );
+                metadata.launching_identity = Some(TaskIdentity {
+                    principal: Some(task_principal.into()),
+                    harness: harness.into(),
+                    session: session.into(),
+                });
+                metadata.harness = Some(harness.into());
+                metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+                write_task_at(&task, &metadata).unwrap();
+                ctx.bash_background()
+                    .replay_session(&storage, session)
+                    .unwrap();
+                saved.push(task);
+            }
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            for preset in ["head", "worker", "reader"] {
+                let reply = exchange_with_actor(
+                    json!({"op":"tool.catalog", "preset":preset}),
+                    identity.clone(),
+                    ctx.clone(),
+                    &metrics,
+                    |_, _| panic!("catalog must not dispatch"),
+                )
+                .await;
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                let tools = body["tools"].as_array().expect("catalog tools");
+                assert!(!tools
+                    .iter()
+                    .any(|tool| tool["name"] == "bash_ack_completions"));
+            }
+            let reply = exchange_with_actor(
+                json!({"op":"tool.call", "name":"bash_ack_completions", "arguments":{
+                    "session_id":"foreign-session",
+                    "task_ids":["bash-0000000000000001", "bash-0000000000000002", "bash-0000000000000003", "bash-0000000000000004", "bash-0000000000000099"]
+                }}),
+                identity.clone(), ctx.clone(), &metrics,
+                |request, ctx| {
+                    assert_eq!(request.command, "bash_ack_completions");
+                    assert_eq!(request.session(), "ack-session");
+                    let response = crate::commands::bash_drain_completions::handle_ack(&request, ctx);
+                    assert_eq!(response.data["acked_task_ids"], json!(["bash-0000000000000001"]));
+                    assert_eq!(response.data["ignored_task_ids"], json!(["bash-0000000000000002", "bash-0000000000000003", "bash-0000000000000004", "bash-0000000000000099"]));
+                    response
+                },
+            ).await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{body}");
+            assert_eq!(body["isError"], false, "{body}");
+            for (index, task) in saved.iter().enumerate() {
+                assert_eq!(read_task_at(task).unwrap().completion_delivered, index == 0);
+            }
+            assert!(admit(
+                &serde_json::from_value(
+                    json!({"name":"bash_ack_completions", "arguments":{"task_ids":[]}})
+                )
+                .unwrap(),
+                false,
+                &[],
+                true,
+                "ack-session",
+                false
+            )
+            .is_err());
+            ctx.bash_background().detach();
         }
     }
 

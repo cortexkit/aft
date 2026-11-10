@@ -1557,6 +1557,9 @@ pub(crate) struct BashDrainReplyCache(Arc<Mutex<BashDrainReplyState>>);
 
 #[derive(Clone, Default)]
 pub(crate) struct BashDrainReplyState {
+    pub(crate) completion_finished_at: Option<u64>,
+    pub(crate) completion_delivered: bool,
+    pub(crate) runner_completion_offers: u64,
     pub(crate) execution_note: Option<String>,
     pub(crate) deadline: Option<(HardKillDeadline, u64)>,
     pub(crate) inputs_captured: Option<bool>,
@@ -1595,6 +1598,13 @@ impl BashDrainReplyCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         published.execution_note = note;
+        published.completion_finished_at = metadata.finished_at;
+        published.completion_delivered = metadata.completion_delivered;
+        // An off-thread write may publish an earlier offer while a later one
+        // is already reserved in memory. Never reopen that replay budget.
+        published.runner_completion_offers = published
+            .runner_completion_offers
+            .max(metadata.runner_completion_offers);
         published.deadline = deadline;
         published.inputs_captured = inputs_captured;
         published.remote = metadata.remote.as_ref().map(remote::RemoteProgress::of);
@@ -11803,7 +11813,40 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn completion_finished_at(&self, task_id: &str) -> Option<u64> {
-        self.task(task_id)?.lock_state().ok()?.metadata.finished_at
+        self.runner_completion_state(task_id)?
+            .completion_finished_at
+    }
+
+    pub(crate) fn runner_completion_state(&self, task_id: &str) -> Option<BashDrainReplyState> {
+        Some(self.task(task_id)?.drain_reply.snapshot())
+    }
+
+    /// Reserve in memory only; the completion writer persists the returned count.
+    pub(crate) fn reserve_runner_completion_offer(&self, task_id: &str) -> Option<u64> {
+        let task = self.task(task_id)?;
+        let mut published = task.drain_reply.0.lock().ok()?;
+        published.runner_completion_offers = published.runner_completion_offers.saturating_add(1);
+        Some(published.runner_completion_offers)
+    }
+
+    pub(crate) fn persist_runner_completion_offer(
+        &self,
+        session: &str,
+        task_id: &str,
+        offers: u64,
+    ) -> std::io::Result<()> {
+        let task = self
+            .task_for_session(task_id, session)
+            .ok_or_else(|| std::io::Error::other("completion task is not owned by this session"))?;
+        self.retry_terminal_persist(&task)?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            metadata.runner_completion_offers = metadata.runner_completion_offers.max(offers);
+        })?;
+        Ok(())
     }
 
     pub fn pending_completions_for_session(&self, session_id: &str) -> Vec<BgCompletion> {
