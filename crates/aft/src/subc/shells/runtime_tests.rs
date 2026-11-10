@@ -227,7 +227,15 @@ async fn shells_v1_output_real_files_default_backfill_exact_resume_and_end_recor
         .insert(row.task_id.clone(), reader);
     let metrics = DispatchPathMetrics::new();
     let (tx, mut output) = tokio::sync::mpsc::channel(16);
-    let frame = Frame::build(FrameType::Request, 0, 41, 1, 7, b"{}".to_vec()).unwrap();
+    let frame = Frame::build(
+        FrameType::Request,
+        subc_protocol::Flags(0),
+        41,
+        1,
+        7,
+        b"{}".to_vec(),
+    )
+    .unwrap();
     let began = tokio::time::Instant::now();
     assert!(service
         .output(
@@ -337,7 +345,15 @@ async fn shells_v1_output_pty_screen_uses_masked_renderer_and_cursor() {
         .insert(row.task_id.clone(), reader);
     let (tx, mut output) = tokio::sync::mpsc::channel(16);
     let metrics = DispatchPathMetrics::new();
-    let frame = Frame::build(FrameType::Request, 0, 41, 1, 7, b"{}".to_vec()).unwrap();
+    let frame = Frame::build(
+        FrameType::Request,
+        subc_protocol::Flags(0),
+        41,
+        1,
+        7,
+        b"{}".to_vec(),
+    )
+    .unwrap();
     service
         .output(
             &tx,
