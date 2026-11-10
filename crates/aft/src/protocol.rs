@@ -92,6 +92,9 @@ pub struct BashCompletedFrame {
     pub tokens_skipped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    /// The build server's memory-kill cause and measurements, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_oom_kill: Option<crate::bash_background::registry::remote::RemoteOomKill>,
     /// True when capture was incomplete; status still reflects the child exit.
     #[serde(skip_serializing_if = "is_false")]
     pub output_incomplete: bool,
@@ -380,6 +383,7 @@ impl BashCompletedFrame {
             compressed_tokens,
             tokens_skipped,
             status_reason: None,
+            remote_oom_kill: None,
             output_incomplete: false,
             live_descendants: None,
             live_descendants_omitted: 0,

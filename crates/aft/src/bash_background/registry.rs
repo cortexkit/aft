@@ -805,6 +805,9 @@ pub struct BgCompletion {
     pub tokens_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    /// The build server's memory-kill cause and measurements, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_oom_kill: Option<remote::RemoteOomKill>,
     /// Output capture was incomplete, without changing the command's outcome.
     #[serde(default, skip_serializing_if = "is_false")]
     pub output_incomplete: bool,
@@ -837,6 +840,7 @@ impl BgCompletion {
         frame.launching_identity = self.launching_identity;
         frame.changed_files = self.changed_files;
         frame.status_reason = self.status_reason;
+        frame.remote_oom_kill = self.remote_oom_kill;
         frame.output_incomplete = self.output_incomplete;
         frame.live_descendants = self.live_descendants;
         frame.live_descendants_omitted = self.live_descendants_omitted;
@@ -941,6 +945,9 @@ pub struct BgTaskSnapshot {
     /// An explicit remote demand was refused before the command started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_refusal: Option<RemoteRefusal>,
+    /// The build server's memory-kill cause and measurements, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_oom_kill: Option<remote::RemoteOomKill>,
     /// Whether the runner confirmed input capture, retained through disk recovery.
     #[serde(skip)]
     pub(crate) remote_inputs_captured: Option<bool>,
@@ -11950,6 +11957,7 @@ impl BgTaskRegistry {
             compressed_tokens: None,
             tokens_skipped: false,
             status_reason: snapshot.info.status_reason,
+            remote_oom_kill: snapshot.remote_oom_kill,
             output_incomplete: snapshot.output_incomplete,
             live_descendants: snapshot.live_descendants,
             live_descendants_omitted: snapshot.live_descendants_omitted,
@@ -14798,6 +14806,7 @@ impl BgTaskRegistry {
             compressed_tokens: token_counts.compressed_tokens,
             tokens_skipped: token_counts.tokens_skipped,
             status_reason: metadata.status_reason.clone(),
+            remote_oom_kill: remote::remote_oom_kill(metadata),
             output_incomplete: metadata.output_incomplete,
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
@@ -17316,6 +17325,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
         .filter(|r| r.explicit_runon)
         .map(|r| r.accepted);
     let remote_job_id = remote_job_id(&metadata);
+    let remote_oom_kill = remote::remote_oom_kill(&metadata);
     BgTaskSnapshot {
         changed_files: None,
         info: BgTaskInfo {
@@ -17344,6 +17354,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
         sandbox_native: metadata.sandbox_native,
         sandbox_unavailable: false,
         remote_refusal,
+        remote_oom_kill,
         remote_inputs_captured,
         phase: None,
         live_descendants: metadata.live_descendants.clone(),
@@ -17537,6 +17548,7 @@ impl BgTask {
                     .and_then(|mut file| file.read_all())
                     .is_ok_and(|bytes| bytes == b"sandbox_unavailable"),
             remote_refusal: remote::remote_refusal(metadata),
+            remote_oom_kill: remote::remote_oom_kill(metadata),
             remote_inputs_captured: metadata
                 .remote
                 .as_ref()
@@ -18354,12 +18366,23 @@ fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
         .as_ref()
         .and_then(|remote| remote.output_incomplete.as_ref())
         .map(remote::RemoteOutputIncomplete::warning_line);
-    let note = match (warning, metadata.execution_note.as_deref()) {
+    let mut note = match (warning, metadata.execution_note.as_deref()) {
         (Some(warning), Some(note)) if !note.is_empty() => Some(format!("{warning}\n{note}")),
         (Some(warning), _) => Some(warning),
         (None, Some(note)) => Some(note.to_owned()),
         (None, None) => None,
     };
+    // Disk recovery can render the task's terminal result before the finalizer has
+    // saved its execution note. Keep the same memory advice on that path.
+    if let Some(oom) = remote::remote_oom_kill(metadata) {
+        let message = oom.message();
+        if !note.as_ref().is_some_and(|note| note.contains(&message)) {
+            note = Some(match note {
+                Some(note) => format!("{note}\n{message}"),
+                None => message,
+            });
+        }
+    }
     let note = if metadata.status == BgTaskStatus::Killed
         && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
     {
@@ -18875,6 +18898,7 @@ mod tests {
                 compressed_tokens: None,
                 tokens_skipped: false,
                 status_reason: None,
+                remote_oom_kill: None,
                 output_incomplete: false,
                 live_descendants: Some(Vec::new()),
                 live_descendants_omitted: 0,

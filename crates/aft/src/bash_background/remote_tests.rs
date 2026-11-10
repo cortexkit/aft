@@ -5,6 +5,147 @@ use crate::exec_remote::wire_tests::{daemon, id, Script};
 #[path = "bookkeeping_probe.rs"]
 mod bookkeeping_probe;
 
+fn assert_remote_oom_terminal(cause: Option<&str>, expected: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut record = TerminalRecord::new(id(), Outcome::Signal { signal: 9 }, 1, 0, 0)
+        .with_ran(Ran::Remote)
+        .with_workspace_changes(Vec::new())
+        .with_memory_stated_mib(8192)
+        .with_memory_peak_working_mib(7798);
+    if let Some(cause) = cause {
+        record = record.with_oom_kill(OomKill::new(cause));
+    }
+    let verdict = exec::grade(&record);
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.terminal(&record, &verdict).unwrap();
+
+    // A crash after the terminal record is saved must give the same advice as live completion.
+    let readonly = self::registry();
+    let (disk, _) = readonly
+        .terminal_status_from_disk(&task_id, "session", Some(dir.path()), dir.path())
+        .unwrap();
+    assert_eq!(disk.info.status_reason.as_deref(), Some(expected));
+    if cause.is_some() {
+        assert!(disk.output_preview.contains(expected), "{disk:?}");
+    }
+    registry.remote_terminal(&task, verdict, None);
+    let done = registry.observed_status(&task_id, "session", 8192).unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Failed);
+    assert_eq!(done.exit_code, Some(137));
+    assert_eq!(done.info.status_reason.as_deref(), Some(expected));
+    assert!(done.output_preview.contains(expected), "{done:?}");
+    assert_eq!(
+        read_task(&paths.json).unwrap().status_reason.as_deref(),
+        Some(expected)
+    );
+    let completion = registry
+        .drain_completions()
+        .into_iter()
+        .find(|completion| completion.task_id == task_id)
+        .expect("remote completion notice");
+    assert_eq!(completion.status_reason.as_deref(), Some(expected));
+    assert!(
+        completion.output_preview.contains(expected),
+        "{completion:?}"
+    );
+    let foreground =
+        crate::commands::bash_orchestrate::foreground_result_response("oom", done.clone());
+    assert!(foreground.data["output"]
+        .as_str()
+        .unwrap()
+        .contains(expected));
+    for value in [
+        serde_json::to_value(&disk).unwrap(),
+        serde_json::to_value(&done).unwrap(),
+        serde_json::to_value(&completion).unwrap(),
+        serde_json::to_value(completion.into_push_frame()).unwrap(),
+        foreground.data,
+    ] {
+        if let Some(cause) = cause {
+            assert_eq!(
+                value["remote_oom_kill"],
+                serde_json::json!({
+                    "cause": cause,
+                    "memory_stated_mib": 8192,
+                    "memory_peak_working_mib": 7798,
+                })
+            );
+        } else {
+            assert!(value.get("remote_oom_kill").is_none(), "{value}");
+            assert!(!value.to_string().contains("memory"));
+        }
+    }
+}
+
+#[test]
+fn exec_remote_bash_oom_job_limit() {
+    assert_remote_oom_terminal(
+        Some("job_limit"),
+        "killed: it went over its memory limit of 8 GiB (peak 7798 MiB); rerun with a larger limit",
+    );
+}
+
+#[test]
+fn exec_remote_bash_oom_host_pressure() {
+    assert_remote_oom_terminal(Some("host_pressure"), "killed: the build server ran out of memory, not this job's limit (peak 7798 MiB); rerun as is");
+}
+
+#[test]
+fn exec_remote_bash_oom_host_oom() {
+    assert_remote_oom_terminal(Some("host_oom"), "killed: the build server ran out of memory, not this job's limit (peak 7798 MiB); rerun as is");
+}
+
+#[test]
+fn exec_remote_bash_oom_absent_keeps_signal_text() {
+    assert_remote_oom_terminal(None, "remote signal 9");
+}
+
+#[test]
+fn exec_remote_bash_oom_optional_measurements_and_unknown_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "true");
+    let task = registry.task(&task_id).unwrap();
+    for (cause, stated, expected) in [
+        (
+            "job_limit",
+            None,
+            "killed: it went over its memory limit; rerun with a larger limit",
+        ),
+        (
+            "job_limit",
+            Some(1536),
+            "killed: it went over its memory limit of 1536 MiB; rerun with a larger limit",
+        ),
+        (
+            "host_oom",
+            None,
+            "killed: the build server ran out of memory, not this job's limit; rerun as is",
+        ),
+        (
+            "future_cause",
+            None,
+            "killed for memory; the build server reported an unrecognized OOM cause",
+        ),
+    ] {
+        let mut record = TerminalRecord::new(id(), Outcome::Signal { signal: 9 }, 1, 0, 0)
+            .with_oom_kill(OomKill::new(cause));
+        if let Some(stated) = stated {
+            record = record.with_memory_stated_mib(stated);
+        }
+        let mut metadata = task.state.lock().unwrap().metadata.clone();
+        metadata.remote.as_mut().unwrap().terminal = Some(record);
+        let oom = remote_oom_kill(&metadata).unwrap();
+        assert_eq!(oom.message(), expected);
+        let structured = serde_json::to_value(&oom).unwrap();
+        assert_eq!(structured["cause"], cause);
+        assert!(structured.get("memory_peak_working_mib").is_none());
+    }
+}
+
 #[test]
 fn remote_admission_progress_lines_are_exact_and_detail_is_plain_text() {
     use exec::types::{Progress, ProgressPhase};

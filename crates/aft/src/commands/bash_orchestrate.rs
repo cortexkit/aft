@@ -1244,6 +1244,9 @@ pub(crate) fn foreground_result_response(request_id: &str, snapshot: BgTaskSnaps
     if let Some(job_id) = &snapshot.remote_job_id {
         data["remote_job_id"] = json!(job_id);
     }
+    if let Some(oom) = &snapshot.remote_oom_kill {
+        data["remote_oom_kill"] = json!(oom);
+    }
     Response::success(request_id, data)
 }
 
@@ -1650,6 +1653,7 @@ mod tests {
             sandbox_native: false,
             sandbox_unavailable: false,
             remote_refusal: None,
+            remote_oom_kill: None,
             remote_inputs_captured: None,
             phase: None,
             live_descendants: Some(Vec::new()),

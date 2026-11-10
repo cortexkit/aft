@@ -13,6 +13,52 @@ use std::ffi::OsStr;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+/// Memory-kill facts reported by the build server, not the local memory cap.
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteOomKill {
+    pub cause: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_stated_mib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_peak_working_mib: Option<u64>,
+}
+
+impl RemoteOomKill {
+    pub(super) fn message(&self) -> String {
+        let peak = self
+            .memory_peak_working_mib
+            .map(|mib| format!(" (peak {mib} MiB)"))
+            .unwrap_or_default();
+        match self.cause.as_str() {
+            OOM_KILL_CAUSE_JOB_LIMIT => {
+                let limit = self.memory_stated_mib.map_or_else(String::new, |mib| {
+                    if mib % 1024 == 0 {
+                        format!(" of {} GiB", mib / 1024)
+                    } else {
+                        format!(" of {mib} MiB")
+                    }
+                });
+                format!("killed: it went over its memory limit{limit}{peak}; rerun with a larger limit")
+            }
+            OOM_KILL_CAUSE_HOST_PRESSURE | OOM_KILL_CAUSE_HOST_OOM => format!(
+                "killed: the build server ran out of memory, not this job's limit{peak}; rerun as is"
+            ),
+            _ => format!(
+                "killed for memory{peak}; the build server reported an unrecognized OOM cause"
+            ),
+        }
+    }
+}
+
+pub(super) fn remote_oom_kill(metadata: &super::PersistedTask) -> Option<RemoteOomKill> {
+    let terminal = metadata.remote.as_ref()?.terminal.as_ref()?;
+    Some(RemoteOomKill {
+        cause: terminal.oom_kill()?.cause().to_owned(),
+        memory_stated_mib: terminal.memory_stated_mib(),
+        memory_peak_working_mib: terminal.memory_peak_working_mib(),
+    })
+}
+
 fn rendered_refusal_reason(reason: &str, detail: Option<&str>) -> String {
     let Some(detail) = detail else {
         return reason.to_owned();
@@ -1714,6 +1760,9 @@ pub(super) fn terminal_metadata_from_proof(metadata: &mut PersistedTask) -> Opti
         return None;
     }
     let (status, code, reason) = terminal_outcome(verdict, None);
+    let reason = remote_oom_kill(metadata)
+        .map(|oom| oom.message())
+        .or(reason);
     metadata.mark_terminal(status, code, reason);
     Some(())
 }
@@ -4732,6 +4781,9 @@ impl BgTaskRegistry {
             if state.metadata.is_terminal() {
                 return;
             }
+            reason = remote_oom_kill(&state.metadata)
+                .map(|oom| oom.message())
+                .or(reason);
             let remote_note = execution_note.map(str::to_owned).unwrap_or_else(|| {
                 state
                     .metadata
