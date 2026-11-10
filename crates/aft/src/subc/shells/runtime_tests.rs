@@ -21,6 +21,7 @@ fn status_context() -> (
     ctx.set_db(Arc::new(std::sync::Mutex::new(
         crate::db::open(&dir.path().join("aft.db")).unwrap(),
     )));
+    ctx.set_harness(crate::harness::Harness::Opencode);
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(
         crate::path_identity::ProjectRootId::from_path(dir.path()).unwrap(),
