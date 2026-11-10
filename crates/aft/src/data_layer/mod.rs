@@ -7,7 +7,6 @@ pub mod checkout;
 pub mod checkout_gate;
 pub mod content;
 pub(crate) mod dead_code;
-pub mod dead_code_gate;
 pub mod dead_code_graph;
 pub mod edit_gate;
 pub mod extract_gate;
@@ -63,6 +62,10 @@ pub mod symbol_prewarm_measure;
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
 mod test_gates;
-pub(crate) mod tools;
 pub mod trace_measure;
 pub mod vectors;
+
+pub(crate) mod bound_checkouts;
+pub(crate) mod external_search;
+pub(crate) mod meaning_query;
+pub(crate) mod text_scope;

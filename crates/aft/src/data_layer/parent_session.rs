@@ -19,14 +19,12 @@
 //! that rebinds to another root, is dropped, or whose routes have all been
 //! closed past the unbind grace period no longer counts.
 
-mod engine;
-mod inspect;
-mod query;
+pub(crate) mod engine;
+pub(crate) mod query;
 #[cfg(test)]
 mod tests;
 mod worker;
 
-pub use query::route;
 pub(crate) use query::{attach_search_gaps, glob_fan_out, grep_fan_out};
 
 use std::collections::HashMap;
@@ -768,7 +766,7 @@ pub struct ParentSession {
     root: PathBuf,
     pub(crate) planes: RequestedPlanes,
     storage: PathBuf,
-    semantic_config: crate::config::SemanticBackendConfig,
+    pub(crate) semantic_config: crate::config::SemanticBackendConfig,
     /// `None` until the worker's first full discovery walk finishes.
     discovery: RwLock<Option<Arc<Discovery>>>,
     children: RwLock<Vec<Arc<Child>>>,

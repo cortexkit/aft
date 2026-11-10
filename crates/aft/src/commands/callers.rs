@@ -72,7 +72,7 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let (snapshot, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
+    let (snapshot, data_view) = match crate::commands::data_callgraph::ops_graph(
         &req.id,
         "callers",
         ctx,
@@ -85,7 +85,7 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
     let include_tests = include_tests_param(req);
     let outcome = callers_result(&snapshot, &file_path, symbol, depth, include_tests);
     if let Some(response) =
-        crate::data_layer::tools::callgraph::failed_reads(&req.id, "callers", data_view.as_ref())
+        crate::commands::data_callgraph::failed_reads(&req.id, "callers", data_view.as_ref())
     {
         return response;
     }

@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::checkout::{CheckoutView, Planes};
-use super::runtime::{DataCheckout, Fresh};
+use crate::data_layer::checkout::{CheckoutView, Planes};
+use crate::data_layer::runtime::{DataCheckout, Fresh};
 use crate::inspect::job::{
     CallgraphExport, CallgraphSnapshot, InspectCategory, InspectJob, JobKey, JobScope,
 };
@@ -285,7 +285,7 @@ fn snapshots(
     if let Some(rows) = &rows {
         // A data-layer snapshot lists no exports; its view's files hold them.
         let files = view.dead_code_files();
-        let graph = super::dead_code_graph::DeadCodeGraph::open(view.root(), &files)?;
+        let graph = crate::data_layer::dead_code_graph::DeadCodeGraph::open(view.root(), &files)?;
         let exported_symbols = graph.all_exported_symbols();
         let identical = format!("{:?}", rows.exported_symbols) == format!("{exported_symbols:?}")
             && rows.entry_points == snapshot.entry_points
@@ -798,7 +798,7 @@ fn index_changes(
     edited: &[PathBuf],
 ) -> Result<Vec<(String, Change)>, String> {
     let files = view.dead_code_files();
-    let graph = super::dead_code_graph::DeadCodeGraph::open(view.root(), &files)?;
+    let graph = crate::data_layer::dead_code_graph::DeadCodeGraph::open(view.root(), &files)?;
     let exports = graph.all_exported_symbols();
     let mut exporters = std::collections::BTreeMap::<&str, BTreeSet<&Path>>::new();
     for export in &exports {
@@ -1407,8 +1407,9 @@ mod tests {
         });
         let view = fresh_view(&fixture.checkout).unwrap();
         let files = view.dead_code_files();
-        let graph = super::super::dead_code_graph::DeadCodeGraph::open_lazy(view.root(), &files);
-        let paths = super::super::dead_code_graph::CallGraphFiles::paths(&files);
+        let graph =
+            crate::data_layer::dead_code_graph::DeadCodeGraph::open_lazy(view.root(), &files);
+        let paths = crate::data_layer::dead_code_graph::CallGraphFiles::paths(&files);
         assert!(
             paths.iter().any(|path| path == "src/real/inner.rs"),
             "{paths:?}"
@@ -1418,7 +1419,7 @@ mod tests {
             "src/shared.rs",
             "src/../src/lib.rs",
         ]) {
-            let canonical = super::super::dead_code::Paths {
+            let canonical = crate::data_layer::dead_code::Paths {
                 root: view.root(),
                 cache: std::collections::HashMap::new(),
             }

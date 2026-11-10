@@ -879,7 +879,7 @@ impl MeaningReport {
 /// off for the checkout.
 fn meaning_report(checkout: &DataCheckout, cached_only: bool) -> Option<MeaningReport> {
     use crate::data_layer::status::SemanticIndexStatus;
-    use crate::data_layer::tools::search::DataSemantic;
+    use crate::commands::data_search::DataSemantic;
     let semantic = if cached_only {
         DataSemantic::from_state(checkout.cached_meaning_status())?
     } else {
@@ -1786,8 +1786,8 @@ pub fn fill_root(
 /// the checkout and starts its fill. Ready only once every file meaning
 /// search applies to is filled: a partial plane is still pending.
 pub fn warm_meaning(ctx: &AppContext) -> Option<WarmState> {
+    use crate::commands::data_search::DataSemantic;
     use crate::data_layer::status::SemanticIndexStatus;
-    use crate::data_layer::tools::search::DataSemantic;
     if !ctx.data_layer_serves_meaning() {
         return None;
     }

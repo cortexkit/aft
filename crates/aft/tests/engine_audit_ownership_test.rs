@@ -49,7 +49,7 @@ const B_OWNED_EXACT: &[&str] = &[
 const SEAM_PATHS: &[&str] = &[
     "crates/aft/src/commands/semantic_search.rs",
     "crates/aft/src/commands/semantic_search/mod.rs",
-    "crates/aft/src/commands/semantic_search/plan_table.rs",
+    "crates/aft/src/search_b2/plan_table.rs",
     "crates/aft/src/commands/semantic_search/generation_token.rs",
 ];
 
@@ -72,7 +72,7 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/generation_token.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/mod.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/nearest_names.rs"),
-                FenceRule::Exact("crates/aft/src/commands/semantic_search/plan_table.rs"),
+                FenceRule::Exact("crates/aft/src/search_b2/plan_table.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/recall_audit.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/regex_route.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/request_files.rs"),
@@ -97,7 +97,7 @@ fn slices() -> Vec<Slice> {
                 "crates/aft/src/commands/semantic_search/generation_token.rs",
                 "crates/aft/src/commands/semantic_search/mod.rs",
                 "crates/aft/src/commands/semantic_search/nearest_names.rs",
-                "crates/aft/src/commands/semantic_search/plan_table.rs",
+                "crates/aft/src/search_b2/plan_table.rs",
                 "crates/aft/src/commands/semantic_search/recall_audit.rs",
                 "crates/aft/src/commands/semantic_search/regex_route.rs",
                 "crates/aft/src/commands/semantic_search/request_files.rs",
@@ -291,6 +291,25 @@ fn slices() -> Vec<Slice> {
                 "crates/aft/tests/engine_search_extensions_test.rs",
             ],
         },
+        Slice {
+            id: "search-layer-boundaries",
+            fence: vec![
+                FenceRule::Prefix("crates/aft/src/commands/semantic_search/planner/"),
+                FenceRule::Exact("crates/aft/src/commands/data_search.rs"),
+                FenceRule::Exact("crates/aft/src/data_layer/meaning_query.rs"),
+                FenceRule::Exact("crates/aft/src/data_layer/external_search.rs"),
+                FenceRule::Exact("crates/aft/src/search_b2/contracts.rs"),
+            ],
+            landed_paths: vec![
+                "crates/aft/src/commands/semantic_search/planner/mod.rs",
+                "crates/aft/src/commands/semantic_search/planner/lane_plan.rs",
+                "crates/aft/src/commands/semantic_search/planner/readiness.rs",
+                "crates/aft/src/commands/data_search.rs",
+                "crates/aft/src/data_layer/meaning_query.rs",
+                "crates/aft/src/data_layer/external_search.rs",
+                "crates/aft/src/search_b2/contracts.rs",
+            ],
+        },
     ]
 }
 
@@ -327,6 +346,11 @@ fn collect_files(root: &Path, relative_dir: &str, output: &mut BTreeSet<String>)
 
 fn constraint_paths(root: &Path) -> BTreeSet<String> {
     let mut paths = BTreeSet::from([
+        "crates/aft/src/search_b2/plan_table.rs".to_string(),
+        "crates/aft/src/search_b2/contracts.rs".to_string(),
+        "crates/aft/src/commands/data_search.rs".to_string(),
+        "crates/aft/src/data_layer/meaning_query.rs".to_string(),
+        "crates/aft/src/data_layer/external_search.rs".to_string(),
         "crates/aft/src/commands/semantic_search.rs".to_string(),
         "crates/aft/src/search_index.rs".to_string(),
         "crates/aft/src/subc_tool_schemas.json".to_string(),
@@ -479,7 +503,7 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        36,
+        38,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {
