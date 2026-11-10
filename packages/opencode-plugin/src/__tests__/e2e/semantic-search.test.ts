@@ -20,6 +20,7 @@ import {
   type E2EHarness,
   type PreparedBinary,
   prepareBinary,
+  searchWhenIndexReady,
 } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
@@ -173,9 +174,8 @@ maybeDescribe("e2e semantic search tool", () => {
   test("aft_search degrades to a lexical fallback when semantic is disabled", async () => {
     const { tools, sdkCtx } = await createToolHarness({ experimentalSemanticSearch: false });
 
-    const output = await tools.aft_search.execute(
-      { query: "request authentication handler" },
-      sdkCtx,
+    const output = await searchWhenIndexReady(() =>
+      tools.aft_search.execute({ query: "request authentication handler" }, sdkCtx),
     );
 
     // The tool_call renderer reports incomplete coverage while retaining usable

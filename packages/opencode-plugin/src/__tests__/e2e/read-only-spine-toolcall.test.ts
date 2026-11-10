@@ -17,6 +17,7 @@ import {
   type HarnessFactory,
   type PreparedBinary,
   prepareBinary,
+  searchWhenIndexReady,
 } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
@@ -142,26 +143,12 @@ export function runReadOnlySpineToolcallSuite(
       const h = await harness();
       const tools = semanticTools(createPluginContext(h));
 
-      // A fresh project's text index builds in the background after bind, and
-      // until it is ready aft_search refuses with search_lanes_unavailable
-      // ("Retry shortly or use grep"). This test is about the tool_call
-      // transport, not index start-up time, so it retries that one refusal.
-      const deadline = Date.now() + 20_000;
-      let output: string;
-      for (;;) {
-        try {
-          output = await tools.aft_search.execute(
-            { query: "tool_call_search_marker", hint: "literal", topK: 5 },
-            createToolContext(h),
-          );
-          break;
-        } catch (error) {
-          if (!String(error).includes("search_lanes_unavailable") || Date.now() > deadline) {
-            throw error;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 200));
-        }
-      }
+      const output = await searchWhenIndexReady(() =>
+        tools.aft_search.execute(
+          { query: "tool_call_search_marker", hint: "literal", topK: 5 },
+          createToolContext(h),
+        ),
+      );
 
       expect(output).toContain("tool_call_search_marker");
       expect(output).toContain("Found ");
