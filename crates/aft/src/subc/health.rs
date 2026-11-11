@@ -7195,14 +7195,7 @@ mod tests {
         assert!(metrics["cache_unavailable_omitted"].as_u64().unwrap() > 0);
         assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
         let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
-        assert!(
-            findings
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|finding| finding["check"] != "health_snapshot"),
-            "{findings}"
-        );
+        assert!(findings.as_array().unwrap().is_empty(), "{findings}");
 
         // A failure beyond the rendered roots must not disappear with their detail.
         let mut rollup = (*cache.snapshot().0).clone();
@@ -7222,14 +7215,8 @@ mod tests {
             json!(true);
         cache.publish(Some(rollup));
         let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
-        assert!(
-            findings
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|finding| finding["check"] == "database_open"),
-            "{findings}"
-        );
+        assert_eq!(findings.as_array().unwrap().len(), 1, "{findings}");
+        assert_eq!(findings[0]["check"], "database_open");
     }
 
     #[test]
