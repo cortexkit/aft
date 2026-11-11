@@ -6940,7 +6940,7 @@ impl BgTaskRegistry {
         Some(ProjectReplayBatch { registry: self })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn task_registration_identity_for_test(&self, task_id: &str) -> Option<usize> {
         self.task(task_id).map(|task| Arc::as_ptr(&task) as usize)
     }

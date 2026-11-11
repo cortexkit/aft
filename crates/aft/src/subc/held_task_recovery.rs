@@ -193,8 +193,12 @@ fn replay(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::bash_background::persistence::{read_task_at, write_task_at, ResolvedTask};
+    use crate::bash_background::persistence::write_task_at;
+    #[cfg(unix)]
+    use crate::bash_background::persistence::{read_task_at, ResolvedTask};
+    #[cfg(unix)]
     use crate::db::call_ledger as ledger;
+    #[cfg(unix)]
     use serde_json::json;
 
     pub(crate) fn context(root: &Path, storage: &Path) -> Arc<AppContext> {
@@ -218,6 +222,7 @@ pub(crate) mod tests {
         ctx
     }
 
+    #[cfg(unix)]
     pub(crate) fn hold_task(ctx: &AppContext, layout: &ResolvedTask, key: &str) -> ledger::Key {
         let key = ledger::Key {
             carrier: "reserved:broca".into(),
@@ -255,6 +260,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) async fn startup(ctx: &AppContext) -> Arc<Executor> {
         let executor = Arc::new(Executor::new());
         start(
@@ -269,6 +275,7 @@ pub(crate) mod tests {
         executor
     }
 
+    #[cfg(unix)]
     pub(crate) async fn settled(ctx: &AppContext, key: &ledger::Key) -> ledger::RecordedFrame {
         let until = Instant::now() + Duration::from_secs(10);
         loop {
@@ -287,6 +294,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn saved_local(ctx: &AppContext, root: &Path) -> (String, ResolvedTask, ledger::Key) {
         let release = root.join("release");
         let command = format!(
