@@ -5479,7 +5479,10 @@ mod tests {
         impl super::super::dead_code_snapshot::EntryPoints for SelectedRoots {
             fn resolve(&self, root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf> {
                 self.0.fetch_add(1, Ordering::Relaxed);
-                assert!(files.iter().all(|file| file.starts_with(root)));
+                // Checkout roots retain the caller's spelling; graph files use
+                // canonical paths, including /private/var on macOS.
+                let root = crate::path_identity::canonicalize_normalized(root);
+                assert!(files.iter().all(|file| file.starts_with(&root)));
                 files
                     .iter()
                     .filter(|file| file.ends_with("selected.rs"))

@@ -15,7 +15,7 @@ function rustEnumVariants(source: string, name: string): string[] {
 describe("live descendant types", () => {
   test("the unavailable reasons match the reasons AFT sends", () => {
     const source = readFileSync(
-      new URL("../../../../crates/aft/src/bash_background/process.rs", import.meta.url),
+      new URL("../../../../crates/aft/src/protocol.rs", import.meta.url),
       "utf8",
     );
     const variants = rustEnumVariants(source, "LiveDescendantsUnavailable");
