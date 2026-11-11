@@ -18444,6 +18444,78 @@ mod memory_limit_tests;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn bash_background_saved_render_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(dir.path());
+        let task_id = "bash-aaaaaaaaaaaaaaa1";
+        let paths =
+            install_delivered_terminal_with_pending_watch(&registry, &db, dir.path(), task_id);
+
+        let reason = hard_kill_reason(HardKillDeadline {
+            limit_ms: 90_000,
+            source: HardKillSource::Timeout,
+        });
+        let mut metadata = read_task(&paths.json).unwrap();
+        metadata.status_reason = Some(reason);
+        write_task(&paths.json, &metadata).unwrap();
+        assert_eq!(
+            read_task(&paths.json)
+                .unwrap()
+                .status_reason
+                .unwrap()
+                .as_bytes(),
+            b"killed by the `timeout` of 90s you passed (exit 124)"
+        );
+
+        let mut matched = PatternMatch {
+            watch_id: "watch-00000001".into(),
+            task_id: task_id.into(),
+            match_text: "ERROR".into(),
+            match_offset: 16,
+            context: String::new(),
+            once: true,
+            literal_pattern: true,
+            batch: Some(super::super::watch_lines::LineBatch {
+                lines: vec![super::super::watch_lines::WatchLine {
+                    stream: "stderr".into(),
+                    offset: 16,
+                    end_offset: 30,
+                    text: "ERROR missing".into(),
+                    count: 2,
+                    unavailable: false,
+                }],
+                ..Default::default()
+            }),
+        };
+        registry.persist_watch_match("session", task_id, &mut matched, 0, 30, 0);
+        let saved = crate::db::bash_watches::get_bash_pattern_watch(
+            &db.lock().unwrap(),
+            "opencode",
+            "session",
+            task_id,
+            "watch-00000001",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            saved.match_context.unwrap().as_bytes(),
+            "stderr byte 16 ×2: ERROR missing".as_bytes()
+        );
+
+        #[cfg(unix)]
+        {
+            let mut preview = "Error: no such table: widgets".to_string();
+            crate::response_finalize::append_db_schema_hint(&mut preview, "Schema: widget(id)");
+            registry.save_completion_preview(task_id, &preview, false, &None);
+            let saved = read_task(&paths.json).unwrap().completion_preview.unwrap();
+            assert_eq!(
+                saved.output_preview.as_bytes(),
+                b"Error: no such table: widgets\nSchema: widget(id)"
+            );
+        }
+    }
+
+    #[test]
     fn persisted_gc_removes_existing_empty_task_and_quarantine_sessions() {
         let storage = tempfile::tempdir().unwrap();
         let task_session = storage.path().join("bash-tasks").join("empty-task-session");
