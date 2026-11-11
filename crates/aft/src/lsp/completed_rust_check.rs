@@ -2938,6 +2938,24 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_byte_and_c_string_macro_arguments_do_not_make_inputs_provisional() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "member/src/data.txt", "before");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r##"
+            const DATA: &str = include_str!("data.txt");
+            opaque!(b"\xff", br#"raw bytes"#, c"c string", cr#"raw c string"#);
+        "##,
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        write(&cache.root, "member/src/data.txt", "after!");
+        assert!(valid(&cache).is_none());
+    }
+
+    #[test]
     fn declared_build_input_directory_addition_invalidates_completed_check() {
         let (_temp, mut cache) = fixture();
         write(&cache.root, "member/data/one.txt", "one");

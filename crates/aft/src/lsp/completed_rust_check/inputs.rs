@@ -49,11 +49,16 @@ fn tokens(node: tree_sitter::Node<'_>, bytes: &[u8], deadline: Instant) -> Optio
         let text = child.utf8_text(bytes).ok()?;
         match child.kind() {
             "line_comment" | "block_comment" | "(" | ")" | "[" | "]" | "{" | "}" => {}
-            "string_literal" => result.push(Token::Literal(string_literal(text, deadline)?)),
-            "raw_string_literal" => result.push(Token::Literal(
+            "string_literal" => result.push(
+                string_literal(text, deadline)
+                    .map(Token::Literal)
+                    .unwrap_or_else(|| Token::Text(text.into())),
+            ),
+            "raw_string_literal" if text.starts_with('r') => result.push(Token::Literal(
                 text.get(text.find('"')? + 1..text.rfind('"')?)?
                     .replace("\r\n", "\n"),
             )),
+            "raw_string_literal" => result.push(Token::Text(text.into())),
             "token_tree" | "token_tree_pattern" => {
                 result.push(Token::Group(tokens(child, bytes, deadline)?))
             }
