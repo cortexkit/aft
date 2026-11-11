@@ -4,8 +4,8 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
@@ -30,6 +30,8 @@ export function pruneExecutableCache(
   current: string,
   now = Date.now(),
   claim: (source: string, destination: string) => void = renameSync,
+  cleanup: (directory: string) => void = (directory) =>
+    rmSync(directory, { recursive: true, force: true }),
 ): void {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const directory = join(root, entry.name);
@@ -37,6 +39,7 @@ export function pruneExecutableCache(
       continue;
     let quarantine: string | undefined;
     let preserve = false;
+    let failure: { error: unknown } | undefined;
     try {
       if (now - statSync(directory).mtimeMs <= retentionMs) continue;
       quarantine = mkdtempSync(join(root, ".pruning-"));
@@ -61,17 +64,18 @@ export function pruneExecutableCache(
       // Another pruner can win the claim; Windows can also refuse to move a
       // running executable. Neither should fail an unrelated fixture lookup.
       if (code !== "ENOENT" && code !== "EACCES" && code !== "EPERM" && code !== "EBUSY")
-        throw error;
-    } finally {
-      if (quarantine && !preserve) {
-        try {
-          rmSync(quarantine, { recursive: true, force: true });
-        } catch (error) {
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code !== "EACCES" && code !== "EPERM" && code !== "EBUSY") throw error;
-        }
+        failure = { error };
+    }
+    if (quarantine && !preserve) {
+      try {
+        cleanup(quarantine);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EACCES" && code !== "EPERM" && code !== "EBUSY" && !failure)
+          failure = { error };
       }
     }
+    if (failure) throw failure.error;
   }
 }
 

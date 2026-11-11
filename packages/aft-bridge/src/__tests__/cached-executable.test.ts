@@ -84,6 +84,39 @@ test("pruning restores an identity refreshed between scan and claim", () => {
   }
 });
 
+test("executable cache body errors take precedence over unexpected cleanup errors", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-errors-"));
+  try {
+    const image = cachedExecutableBytes(Buffer.from("stale"), root);
+    utimesSync(dirname(image), new Date(0), new Date(0));
+    const bodyError = new Error("claim failed");
+    const cleanupError = new Error("cleanup failed");
+    let cleanups = 0;
+    expect(() =>
+      pruneExecutableCache(
+        root,
+        "another identity",
+        Date.now(),
+        () => {
+          throw bodyError;
+        },
+        () => {
+          cleanups++;
+          throw cleanupError;
+        },
+      ),
+    ).toThrow(bodyError);
+    expect(cleanups).toBe(1);
+    expect(() =>
+      pruneExecutableCache(root, "another identity", Date.now(), renameSync, () => {
+        throw cleanupError;
+      }),
+    ).toThrow(cleanupError);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("executable cache republishes an entry deleted between lookup and linking", () => {
   const root = mkdtempSync(join(tmpdir(), "aft-cache-retry-"));
   try {
