@@ -60,6 +60,14 @@ fn cpu_seconds() -> f64 {
     0.0
 }
 
+/// Hands freed allocator pages back to the operating system between
+/// measurements. AFT only knows how to do that on macOS and Linux; on other
+/// platforms the probe measures without this step.
+fn relieve_allocator_pressure() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let _ = aft::memory::relieve_allocator_pressure();
+}
+
 fn percentile(values: &[f64], p: f64) -> f64 {
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);
@@ -262,7 +270,7 @@ fn roots(mut args: impl Iterator<Item = String>) {
         );
         let text = std::fs::read_to_string(root.join(&pair[1])).unwrap();
         checkouts.push((checkout, root, pair[1].clone(), text));
-        aft::memory::relieve_allocator_pressure();
+        relieve_allocator_pressure();
     }
     let warm = |checkouts: &mut Vec<(Checkout, PathBuf, String, String)>, reverse: bool| {
         if let Ok(diff) = std::env::var("PROBE_WARM_DIFF") {
@@ -321,7 +329,7 @@ fn roots(mut args: impl Iterator<Item = String>) {
                     })
                 );
                 *text = std::fs::read_to_string(root.join(path)).unwrap();
-                aft::memory::relieve_allocator_pressure();
+                relieve_allocator_pressure();
             }
         }
     };
@@ -424,7 +432,7 @@ fn roots(mut args: impl Iterator<Item = String>) {
                         "before_publish": before_publish, "after_publish": components(checkout),
                     })
                 );
-                aft::memory::relieve_allocator_pressure();
+                relieve_allocator_pressure();
             }
         }
         println!(
@@ -491,7 +499,7 @@ fn paired(mut args: impl Iterator<Item = String>) {
             "cold" => {
                 drop(current.take());
                 drop(store.take());
-                aft::memory::relieve_allocator_pressure();
+                relieve_allocator_pressure();
                 std::fs::write(root.join(&path), &original).unwrap();
                 store = Some(tempfile::tempdir().unwrap());
                 let layer = Arc::new(DataLayer::new(256 << 20, 8));
@@ -512,7 +520,7 @@ fn paired(mut args: impl Iterator<Item = String>) {
                     })
                 );
                 current = Some(checkout);
-                aft::memory::relieve_allocator_pressure();
+                relieve_allocator_pressure();
             }
             "edit" => {
                 let checkout = current.as_ref().expect("build first");
@@ -545,7 +553,7 @@ fn paired(mut args: impl Iterator<Item = String>) {
                         "publish_cpu_s": publish_cpu, "publish_wall_s": publish_wall,
                     })
                 );
-                aft::memory::relieve_allocator_pressure();
+                relieve_allocator_pressure();
             }
             "census" => {
                 println!(
