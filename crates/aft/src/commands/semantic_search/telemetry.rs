@@ -315,5 +315,5 @@ mod cost_trace {
     }
 }
 
-pub(crate) use cost_trace::{Phase as CostPhase, Request as CostRequest};
 pub(crate) use cost_trace::count as cost_count;
+pub(crate) use cost_trace::{Phase as CostPhase, Request as CostRequest};
