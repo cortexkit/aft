@@ -1974,7 +1974,28 @@ impl Checkout {
         Ok(StoredRecords {
             _snapshot: Some(snapshot),
             segments,
+            pending: self.ready_change_records(),
         })
+    }
+
+    /// A cold scan can reuse content already extracted by an aborted update.
+    /// Looking only at initialized values preserves the pre-extraction cutoff;
+    /// the scan still checks the on-disk content key before using a record.
+    fn ready_change_records(&self) -> HashMap<String, Arc<EncodedRecord>> {
+        #[cfg(feature = "test-hooks")]
+        if std::env::var_os("PROBE_SKIP_HANDOFF").is_some() {
+            return HashMap::new();
+        }
+        self.live
+            .read()
+            .expect("no panics while holding it")
+            .changes
+            .values()
+            .filter_map(|change| match change.content.peek() {
+                Some(Extracted::Parse(key, _, record)) => Some((key.clone(), Arc::clone(record))),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Waits up to [`WRITER_WAIT`] for the store's writer, and refuses it
@@ -2649,15 +2670,16 @@ impl Checkout {
                     limit.parsed
                 );
                 let started = Instant::now();
-                if let Some(reservation) = reservation {
-                    self.build_reserved(false, reservation)?;
+                let rebuilt = if let Some(reservation) = reservation {
+                    self.build_reserved(false, reservation)?
                 } else {
                     // The outer build is reusing another checkout's publication
                     // and already holds the reservation.
-                    self.build_inner(false)?;
-                }
+                    self.build_inner(false)?
+                };
                 return Ok(Some(UpdateStats {
                     cold_build: true,
+                    cold_reused_records: rebuilt.stored_records,
                     total_ms: elapsed_ms(started),
                     ..UpdateStats::default()
                 }));
@@ -4733,6 +4755,9 @@ struct StoredRecords {
     _snapshot: Option<Snapshot>,
     /// Newest last.
     segments: Vec<Arc<Segment>>,
+    /// Encoded parses computed by pending changes, keyed exactly as a stored
+    /// content record. They need not be published just to avoid parsing twice.
+    pending: HashMap<String, Arc<EncodedRecord>>,
 }
 
 impl StoredRecords {
@@ -4740,6 +4765,11 @@ impl StoredRecords {
     /// segment that fails to read counts as not holding it, so the file is
     /// parsed instead.
     fn record(&self, key: RecordKey) -> Option<ContentRecord> {
+        if let Some(record) = self.pending.get(&key.digest().to_string()) {
+            if let Ok(record) = record.decode() {
+                return Some(record);
+            }
+        }
         self.segments.iter().rev().find_map(|segment| {
             let content = ContentSegment::open(segment).ok().flatten()?;
             let ordinal = content.find(key).ok().flatten()?;
@@ -7777,6 +7807,10 @@ pub fn other() { callee(); }
             "two disjoint sub-threshold passes exceed the union limit"
         );
         assert_eq!(source_work_for_test(root).cold_builds, before + 1);
+        assert_eq!(
+            second.cold_reused_records, 1102,
+            "the cold scan reuses both unpublished extracts"
+        );
         assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
         assert!(checkout.refresh_callgraph().unwrap().is_none());
         assert_eq!(source_work_for_test(root).cold_builds, before + 1);

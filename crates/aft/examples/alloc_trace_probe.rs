@@ -76,6 +76,7 @@ struct Switch;
 
 static TRACE: AtomicBool = AtomicBool::new(false);
 static COUNTING: AtomicBool = AtomicBool::new(false);
+static STAGE_TIMING: AtomicBool = AtomicBool::new(false);
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 static PEAK: AtomicIsize = AtomicIsize::new(0);
 static STAGE_RSS: AtomicU64 = AtomicU64::new(0);
@@ -429,7 +430,7 @@ static STAGE: Mutex<Option<Stage>> = Mutex::new(None);
 /// previous stage. Counting is opt-in because atomics on every allocation
 /// perturb CPU timings. C-library memory is visible only in the RSS samples.
 fn stage(name: &'static str) {
-    if !COUNTING.load(Ordering::Relaxed) {
+    if !STAGE_TIMING.load(Ordering::Relaxed) {
         return;
     }
     let mut current = STAGE.lock().unwrap();
@@ -445,9 +446,9 @@ fn stage(name: &'static str) {
                 "refresh_stage": previous.name,
                 "wall_s": previous.started.elapsed().as_secs_f64(),
                 "cpu_s": cpu.0 + cpu.1 - previous.cpu.0 - previous.cpu.1,
-                "live_bytes_at_start": previous.live,
-                "peak_live_bytes": peak,
-                "live_bytes_at_end": live,
+            "live_bytes_at_start": COUNTING.load(Ordering::Relaxed).then_some(previous.live),
+            "peak_live_bytes": COUNTING.load(Ordering::Relaxed).then_some(peak),
+            "live_bytes_at_end": COUNTING.load(Ordering::Relaxed).then_some(live),
                 "resident_peak_bytes": rss_peak,
                 "malloc_at_end": malloc_figures(),
             })
@@ -846,13 +847,18 @@ fn transition(mut args: impl Iterator<Item = String>) {
     let strategy = args.next().unwrap_or_else(|| "sibling".to_string());
     assert!(["sibling", "refresh", "cold"].contains(&strategy.as_str()));
     let profiling = std::env::var_os("PROBE_STAGES").is_some();
+    let stage_timing = profiling || std::env::var_os("PROBE_STAGE_TIMING").is_some();
     COUNTING.store(profiling, Ordering::Relaxed);
+    STAGE_TIMING.store(stage_timing, Ordering::Relaxed);
     #[cfg(feature = "test-hooks")]
-    if profiling {
+    if stage_timing {
         aft::data_layer::refresh_probe::set_observer(stage);
     }
     #[cfg(not(feature = "test-hooks"))]
-    assert!(!profiling, "PROBE_STAGES requires --features test-hooks");
+    assert!(
+        !stage_timing,
+        "stage measurement requires --features test-hooks"
+    );
     start_tracing();
     let scratch = tempfile::tempdir().unwrap();
     let store = scratch.path().join("store");

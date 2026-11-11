@@ -56,6 +56,9 @@ use super::subjects::{affected_by, subjects, Subject};
 pub struct UpdateStats {
     /// A broad incremental update was replaced by a stored-record cold build.
     pub cold_build: bool,
+    /// Content records reused by the cold build, including extracted changes
+    /// handed over by the abandoned incremental update.
+    pub cold_reused_records: usize,
     pub changed_paths: usize,
     /// Recorded checkout reads asked again, and how many got a different
     /// answer.
@@ -811,7 +814,8 @@ impl LiveCheckout {
         if budget.is_some() {
             // A module move can invalidate thousands of method readers even
             // when few paths changed. Admit those declaration readers before
-            // binding or resolving bystanders, not only at the sites pass.
+            // binding or resolving other files, rather than waiting until
+            // method-call sites are processed.
             let keys = MethodCallInputs::changed_parse_method_keys(&old, inputs, &contents);
             let readers = self.reverse.sites_of(&keys);
             admit(&mut budget, &readers)?;
