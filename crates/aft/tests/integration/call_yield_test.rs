@@ -358,9 +358,9 @@ async fn read_pid(path: &Path) -> i32 {
 /// `release` exists.
 fn held_command(pid: &Path, release: &Path) -> String {
     format!(
-        "echo $$ > '{}'; echo started; while [ ! -f '{}' ]; do sleep 0.05; done; echo released",
+        "echo $$ > '{}'; echo started; {}; echo released",
         pid.display(),
-        release.display()
+        crate::test_helpers::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.05")
     )
 }
 

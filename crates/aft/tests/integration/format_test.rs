@@ -1177,7 +1177,7 @@ fn validation_backlog_rejects_overflow_and_duplicate_without_hiding_status() {
     let bin_dir = dir.join("node_modules/.bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let stub = bin_dir.join("tsc");
-    fs::write(&stub, format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 5.0.0'; exit 0; fi\n: > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0\n", started.display(), release.display())).unwrap();
+    fs::write(&stub, format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 5.0.0'; exit 0; fi\n: > '{}'\n{}\nexit 0\n", started.display(), crate::test_helpers::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.05"))).unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     warm_executable(&stub, &["--version"]);
     let _release_guard = ReleaseOnDrop(release.clone());

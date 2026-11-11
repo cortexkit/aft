@@ -794,8 +794,8 @@ fn subc_runner_cancel_of_bash_watch_leaves_the_watched_child_running() {
     run_subc(|mut harness| async move {
         let release = harness.project.path().join("watch-cancel-release");
         let command = format!(
-            "while [ ! -f {} ]; do sleep 0.02; done; exit 7",
-            shell_quote(&release),
+            "{}; exit 7",
+            crate::test_helpers::test_gate::gate(&shell_quote(&release), "sleep 0.02"),
         );
         let task = launch_worker_background(&mut harness.stream, 180, &command).await;
         // The tool-provider-v1 bash route replies on command completion, even

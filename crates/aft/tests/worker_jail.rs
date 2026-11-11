@@ -31,6 +31,8 @@ const FAKE_DAEMON_VERSION: &str = "0.39.0";
 mod aft_binary;
 #[path = "helpers/executable_cache.rs"]
 mod executable_cache;
+#[path = "../src/test_gate.rs"]
+mod test_gate;
 #[path = "helpers/worker_gh_read.rs"]
 mod worker_gh_read;
 
@@ -3154,7 +3156,7 @@ async fn worker_jail_temp_denies_other_task_directory() {
     // when its scratch is retained for its own session.
     let ready = jail.bash("true").await;
     let first_corr = jail.submit_tool("bash", json!({
-        "command": format!("printf original > \"$TMPDIR/sentinel\" && printf '%s' \"$TMPDIR\" > {}; while [ ! -f {} ]; do sleep 0.05; done", quote(&recorded), quote(&release)),
+        "command": format!("printf original > \"$TMPDIR/sentinel\" && printf '%s' \"$TMPDIR\" > {}; {}", quote(&recorded), test_gate::gate(&quote(&release), "sleep 0.05")),
         "timeout": 30_000,
     })).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

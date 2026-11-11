@@ -652,9 +652,9 @@ fn gated_shell(root: &Path, key: Option<&str>) -> Value {
         release.replace('\'', "''")
     );
     #[cfg(not(windows))]
-    let command = format!(
-        "while [ ! -f '{}' ]; do sleep 0.05; done",
-        release.replace('\'', "'\\''")
+    let command = crate::test_helpers::test_gate::gate(
+        &format!("'{}'", release.replace('\'', "'\\''")),
+        "sleep 0.05",
     );
     call["arguments"]["command"] = json!(command);
     call
