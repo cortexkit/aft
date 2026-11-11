@@ -4902,9 +4902,8 @@ fn run_engine_ranking(
     use telemetry::{ConfidenceTelemetry, TelemetryAssembler, TelemetryRun};
     use trailer::{ExactPassState, SearchTrailer};
 
-    // With the data layer running and its view's text plane ready, the
-    // lexical and exact lanes read that view; otherwise they read the legacy
-    // index, or the borrowed one of an external root.
+    // Published roots read their store's text plane. Only an unpublished
+    // external pattern request supplies an ephemeral, bounded corpus here.
     let data_text = borrowed_index
         .is_none()
         .then(|| crate::data_layer::tools::search::DataText::ready(ctx))
@@ -4924,7 +4923,6 @@ fn run_engine_ranking(
             return Err("request_cancelled".to_string());
         }
     }
-    let view_snapshot: Option<crate::search_index::SearchIndexSnapshot> = None;
     let empty_index = SearchIndex::new();
     let index = borrowed_index
         .map(|(index, _)| index)
@@ -4944,11 +4942,6 @@ fn run_engine_ranking(
     let generation = data_text
         .as_ref()
         .map(|text| GenerationToken::new_with_str(&with_meaning(text.generation())))
-        .or_else(|| {
-            view_snapshot.as_ref().map(|snapshot| {
-                GenerationToken::new_with_str(&with_meaning(snapshot.content_generation()))
-            })
-        })
         .or_else(|| borrowed_index.map(|(_, generation)| generation.clone()))
         .unwrap_or_else(|| {
             GenerationToken::new_with_str(&with_meaning(format!(
@@ -4956,8 +4949,8 @@ fn run_engine_ranking(
                 ctx.semantic_index_rx_generation()
             )))
         });
-    let index_ready = data_text.is_some() || view_snapshot.is_some() || index.is_ready();
-    let snapshot = view_snapshot.unwrap_or_else(|| index.snapshot());
+    let index_ready = data_text.is_some() || index.is_ready();
+    let snapshot = index.snapshot();
     let text_index = match &data_text {
         Some(text) => TextIndex::Data(text),
         None => TextIndex::Snapshot(&snapshot),
@@ -4968,7 +4961,7 @@ fn run_engine_ranking(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
+    let query_trigrams = crate::search_index::query_trigrams_from_tokens(&token_refs);
     // The lexical lane still ranks by the query's words, but only the tokens the
     // exact lane accepts may promote a lexical candidate to exact evidence; a
     // hyphenated literal has none, so only a file holding the whole string can.
