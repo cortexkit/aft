@@ -1292,6 +1292,7 @@ async fn shells_v1_real_route_refusals_unknown_agent_watch_cancel_and_drain() {
             QuiescedLsp::ReapInBackground,
             None,
             None,
+            None,
         ))
     });
     assert_eq!(
