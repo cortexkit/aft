@@ -2211,6 +2211,11 @@ fn send_request_attempts(
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
+        if secret.is_some_and(|secret| secret.cancellation.is_cancelled()) {
+            // A cancelled secret request returns its existing refusal rather
+            // than exposing a transport error from connection setup.
+            return Err(secret_fetch_refused("missing_material", named));
+        }
         let phase = error
             .is_timeout()
             .then(|| timed_out_phase(&error, progress));
@@ -2531,11 +2536,7 @@ where
             // The inner connector includes DNS, TCP and TLS. Check again at
             // its handover boundary, before hyper can write request bytes.
             if cancellation.is_some_and(|cancel| cancel.is_cancelled()) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "fetch cancelled",
-                )
-                .into());
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
             }
             progress.connected(attempt);
             Ok(connection)
