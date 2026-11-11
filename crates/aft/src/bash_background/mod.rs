@@ -591,25 +591,8 @@ pub struct TaskCallKey {
     pub minted: bool,
 }
 
-/// A consumer's session namespace, attested by the transport rather than tool arguments.
-/// Route channels and epochs are deliberately excluded so reconnects retain ownership.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TaskIdentity {
-    pub principal: Option<String>,
-    #[serde(deserialize_with = "deserialize_task_harness")]
-    pub harness: String,
-    pub session: String,
-}
+pub use crate::protocol::TaskIdentity;
 
-fn deserialize_task_harness<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<String, D::Error> {
-    let raw = String::deserialize(deserializer)?;
-    Ok(raw
-        .parse::<crate::harness::Harness>()
-        .map(|harness| harness.wire_label())
-        .unwrap_or(raw))
-}
 
 thread_local! {
     static CURRENT_TASK_IDENTITY: std::cell::RefCell<Option<TaskIdentity>> = const { std::cell::RefCell::new(None) };
@@ -629,17 +612,21 @@ pub(crate) fn task_identity_scope(identity: Option<TaskIdentity>) -> TaskIdentit
     TaskIdentityScope(CURRENT_TASK_IDENTITY.with(|slot| slot.replace(identity)))
 }
 
-impl TaskIdentity {
-    pub(crate) fn current() -> Option<Self> {
+pub(crate) trait TaskIdentityAuth: Sized {
+    fn current() -> Option<Self>;
+    fn from_principal(principal: &crate::sandbox_spawn::AuthenticatedPrincipal) -> Option<Self>;
+    fn allows_current(owner: Option<&Self>) -> bool;
+}
+
+impl TaskIdentityAuth for TaskIdentity {
+    fn current() -> Option<Self> {
         if let Some(identity) = CURRENT_TASK_IDENTITY.with(|slot| slot.borrow().clone()) {
             return Some(identity);
         }
         Self::from_principal(&current_authenticated_principal())
     }
 
-    pub(crate) fn from_principal(
-        principal: &crate::sandbox_spawn::AuthenticatedPrincipal,
-    ) -> Option<Self> {
+    fn from_principal(principal: &crate::sandbox_spawn::AuthenticatedPrincipal) -> Option<Self> {
         match principal {
             crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
                 principal_id,
@@ -658,7 +645,7 @@ impl TaskIdentity {
         }
     }
 
-    pub(crate) fn allows_current(owner: Option<&Self>) -> bool {
+    fn allows_current(owner: Option<&Self>) -> bool {
         // Records from before ownership was persisted keep session-only access for
         // tasks in flight across the upgrade. Standalone's single client and
         // provider-internal lifecycle work have no route and retain their access.

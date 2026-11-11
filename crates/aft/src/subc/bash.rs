@@ -1,5 +1,7 @@
 //! Deferred bash orchestration and trust-gated shell helpers for subc route calls.
 
+use crate::bash_background::TaskIdentityAuth;
+
 #[cfg(all(test, unix))]
 #[path = "bash_keepalive_tests.rs"]
 mod keepalive_wait_tests;

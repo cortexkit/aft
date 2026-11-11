@@ -8,6 +8,7 @@ pub(crate) use scope_records::{
 };
 pub use scope_records::{read_task_at, write_task};
 
+use crate::bash_background::TaskIdentityAuth;
 #[cfg(all(test, unix))]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};

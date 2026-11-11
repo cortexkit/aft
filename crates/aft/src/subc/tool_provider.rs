@@ -1,5 +1,8 @@
 //! The v1 catalog and admission boundary, separate from plugin tool forwarding.
 
+#[cfg(test)]
+use crate::bash_background::TaskIdentityAuth;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, OnceLock};

@@ -56,7 +56,7 @@ pub struct PermissionAskFrame {
 #[derive(Debug, Clone, Serialize)]
 pub struct BashCompletedFrame {
     #[serde(skip)]
-    pub launching_identity: Option<crate::bash_background::TaskIdentity>,
+    pub launching_identity: Option<TaskIdentity>,
     #[serde(
         rename = "_bash_changed_files",
         skip_serializing_if = "Option::is_none"
@@ -94,7 +94,7 @@ pub struct BashCompletedFrame {
     pub status_reason: Option<String>,
     /// The build server's memory-kill cause and measurements, when reported.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_oom_kill: Option<crate::bash_background::registry::remote::RemoteOomKill>,
+    pub remote_oom_kill: Option<RemoteOomKill>,
     /// True when capture was incomplete; status still reflects the child exit.
     #[serde(skip_serializing_if = "is_false")]
     pub output_incomplete: bool,
@@ -120,7 +120,7 @@ fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, Serialize)]
 pub struct BashLongRunningFrame {
     #[serde(skip)]
-    pub launching_identity: Option<crate::bash_background::TaskIdentity>,
+    pub launching_identity: Option<TaskIdentity>,
     #[serde(rename = "type")]
     pub frame_type: &'static str,
     pub task_id: String,
@@ -132,7 +132,7 @@ pub struct BashLongRunningFrame {
 #[derive(Debug, Clone, Serialize)]
 pub struct BashPatternMatchFrame {
     #[serde(skip)]
-    pub launching_identity: Option<crate::bash_background::TaskIdentity>,
+    pub launching_identity: Option<TaskIdentity>,
     #[serde(rename = "type")]
     pub frame_type: &'static str,
     pub task_id: String,
@@ -258,6 +258,31 @@ fn status_push_payload(mut snapshot: StatusPayload) -> StatusPayload {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_identity_and_remote_oom_fields_keep_their_wire_shape() {
+        let identity = super::TaskIdentity {
+            principal: None,
+            harness: "opencode".into(),
+            session: "session".into(),
+        };
+        let value =
+            serde_json::json!({"principal": null, "harness": "opencode", "session": "session"});
+        assert_eq!(serde_json::to_value(&identity).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<super::TaskIdentity>(value).unwrap(),
+            identity
+        );
+        let oom = super::RemoteOomKill {
+            cause: "job_limit".into(),
+            memory_stated_mib: None,
+            memory_peak_working_mib: Some(17),
+        };
+        assert_eq!(
+            serde_json::to_value(oom).unwrap(),
+            serde_json::json!({"cause":"job_limit", "memory_peak_working_mib":17})
+        );
+    }
+
     use super::*;
     use serde::Deserialize;
     use serde_json::json;
@@ -810,4 +835,34 @@ impl LiveDescendantsUnavailable {
             Self::UnsupportedPlatform
         }
     }
+}
+
+/// A consumer's session namespace, attested by the transport rather than tool arguments.
+/// Route channels and epochs are deliberately excluded so reconnects retain ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TaskIdentity {
+    pub principal: Option<String>,
+    #[serde(deserialize_with = "deserialize_task_harness")]
+    pub harness: String,
+    pub session: String,
+}
+
+fn deserialize_task_harness<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let raw = String::deserialize(deserializer)?;
+    Ok(raw
+        .parse::<crate::harness::Harness>()
+        .map(|harness| harness.wire_label())
+        .unwrap_or(raw))
+}
+
+/// Memory-kill facts reported by the build server, not the local memory cap.
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteOomKill {
+    pub cause: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_stated_mib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_peak_working_mib: Option<u64>,
 }

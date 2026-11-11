@@ -18,18 +18,14 @@ use std::ffi::OsStr;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-/// Memory-kill facts reported by the build server, not the local memory cap.
-#[derive(Clone, Debug, Serialize)]
-pub struct RemoteOomKill {
-    pub cause: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_stated_mib: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_peak_working_mib: Option<u64>,
+pub use crate::protocol::RemoteOomKill;
+
+pub(crate) trait RemoteOomKillText {
+    fn message(&self) -> String;
 }
 
-impl RemoteOomKill {
-    pub(super) fn message(&self) -> String {
+impl RemoteOomKillText for RemoteOomKill {
+    fn message(&self) -> String {
         let peak = self
             .memory_peak_working_mib
             .map(|mib| format!(" (peak {mib} MiB)"))

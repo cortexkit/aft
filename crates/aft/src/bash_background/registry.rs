@@ -1,3 +1,5 @@
+use self::remote::RemoteOomKillText;
+use crate::bash_background::TaskIdentityAuth;
 #[cfg(unix)]
 use crate::posix_spawn::Child;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
