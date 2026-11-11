@@ -10,6 +10,16 @@ import { renameV2ToolReferences, v2HostToolName } from "../../v2-host-tool-names
 const V2_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const V2_PATH_HEADER_TOOLS = new Set(["read", "write", "edit"]);
 const V2_BASH_TOOLS = new Set(["bash"]);
+// Keep writes and shell execution out of Code Mode until they have a permission design.
+const V2_CODEMODE_READ_TOOLS = new Set([
+  "read",
+  "grep",
+  "glob",
+  "aft_search",
+  "aft_outline",
+  "aft_zoom",
+  "aft_callgraph",
+]);
 
 /**
  * The permission action OpenCode 2 evaluates shell-command rules under.
@@ -93,7 +103,7 @@ export interface V2ProviderTool {
   description: string;
   input: ReturnType<typeof tool.schema.object> & Pick<ZodType, "~standard">;
   options: Readonly<Record<string, unknown>> & {
-    codemode: false;
+    codemode: boolean;
   };
   execute(
     input: Record<string, unknown>,
@@ -484,7 +494,7 @@ export function projectV2Tool(
     options: {
       ...sharedOptions,
       ...(permission ? { permission } : {}),
-      codemode: false,
+      codemode: V2_CODEMODE_READ_TOOLS.has(name),
     },
     execute: (rawInput, context) =>
       Effect.tryPromise({
