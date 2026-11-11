@@ -20,7 +20,7 @@ use crate::callgraph_store::join::{
     self, BlobImport, BlobRef, BlobRefKind, BlobSymbol, CallgraphBlob, ConfigBlob,
     ManifestJoinError, ParseBlob,
 };
-use crate::inspect::scanners::todos::{self, TodoLanguage};
+use crate::parser::todo_markers::{self as todos, TodoLanguage};
 use crate::parser::LangId;
 
 /// The version of the extractor whose output the records hold. Records
@@ -355,7 +355,7 @@ pub fn extract_parsed(
     if let RecordBody::Parsed { body, .. } = &mut record.data {
         body.outline = Some(outline.iter().map(outline_symbol).collect());
         body.dead_code = Some(
-            crate::inspect::scanners::dead_code::StoredFileFacts::encode_for_record(
+            crate::parser::dead_code_facts::StoredFileFacts::encode_for_record(
                 source,
                 tree.language,
                 &tree.tree,
@@ -822,22 +822,17 @@ mod tests {
             ("lib.ts", "import type { Shape } from './types';\nexport * from './other';\n// FIXME: keep type references\nexport function draw(shape: Shape): Shape { return shape; }\n"),
             ("notes.md", "# Notes\n<!-- TODO(writer): document the API -->\n<!-- FIXME: check examples -->\n"),
         ];
-        let mut hashes = Vec::new();
-        for (path, source) in corpus {
+        // These surface/body bytes were captured before moving syntax facts
+        // out of inspect. A refactor must not invalidate persisted records.
+        let expected: Vec<(String, Vec<u8>, Vec<u8>)> =
+            serde_json::from_str(include_str!("content_compatibility.json")).unwrap();
+        assert_eq!(expected.len(), corpus.len());
+        for ((path, source), (name, surface, body)) in corpus.into_iter().zip(expected) {
+            assert_eq!(path, name);
             let language = language_for(path, source.as_bytes()).unwrap();
             let record = extract(source.as_bytes(), &language).unwrap();
-            let (surface, body) = record.encode();
-            hashes.push((
-                path,
-                blake3::hash(&surface).to_hex().to_string(),
-                blake3::hash(&body).to_hex().to_string(),
-            ));
-            println!(
-                "record {path}: {}",
-                serde_json::to_string(&(surface, body)).unwrap()
-            );
+            assert_eq!(record.encode(), (surface, body), "{path}");
         }
-        println!("record hashes: {hashes:?}");
     }
 
     /// The record's version names the call-graph producer it extracts with,
