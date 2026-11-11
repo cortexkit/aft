@@ -461,6 +461,8 @@ struct FsEventsStream {
     stream: usize,
     queue: usize,
     sender: NativeEventSender,
+    #[cfg(test)]
+    context_release_calls: Arc<AtomicU64>,
 }
 
 /// All streams deliver on one serial queue. Only native event translation runs
@@ -565,8 +567,12 @@ impl FsEventsStream {
         counters: Arc<crate::context::WatcherCounters>,
     ) -> notify::Result<Self> {
         let watched_paths = create_cf_path_array(paths)?;
+        #[cfg(test)]
+        let context_release_calls = Arc::new(AtomicU64::new(0));
         let context_info = Box::into_raw(Box::new(CallbackContext {
             sender: sender.clone(),
+            #[cfg(test)]
+            release_calls: Arc::clone(&context_release_calls),
             last_delivered_id,
             nonrecursive_paths,
             #[cfg(test)]
@@ -657,6 +663,8 @@ impl FsEventsStream {
             stream: stream_address,
             queue,
             sender,
+            #[cfg(test)]
+            context_release_calls,
         })
     }
 
@@ -673,6 +681,8 @@ impl Drop for FsEventsStream {
 
 struct CallbackContext {
     sender: NativeEventSender,
+    #[cfg(test)]
+    release_calls: Arc<AtomicU64>,
     last_delivered_id: Arc<AtomicU64>,
     nonrecursive_paths: Option<Vec<PathBuf>>,
     #[cfg(test)]
@@ -681,7 +691,10 @@ struct CallbackContext {
 
 extern "C" fn release_context(info: *const libc::c_void) {
     unsafe {
-        drop(Box::from_raw(info as *mut CallbackContext));
+        let context = Box::from_raw(info as *mut CallbackContext);
+        #[cfg(test)]
+        context.release_calls.fetch_add(1, Ordering::SeqCst);
+        drop(context);
     }
 }
 
@@ -1039,6 +1052,70 @@ mod tests {
                 return;
             }
         }
+    }
+
+    fn wait_for_context_release(rx: &mpsc::Receiver<notify::Result<Event>>, releases: &AtomicU64) {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "stream sender retained after five seconds; release_context calls={}",
+                    releases.load(Ordering::SeqCst)
+                ),
+            }
+        }
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "release_context must run exactly once per stream"
+        );
+        eprintln!(
+            "stream disconnected after {:?}; release_context calls=1",
+            start.elapsed()
+        );
+    }
+
+    fn prove_context_release_after_drop(deliver_events: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let stream = FsEventsStream::start(
+            &root,
+            &[],
+            tx,
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        let releases = Arc::clone(&stream.context_release_calls);
+        if deliver_events {
+            let path = root.join("before-drop.rs");
+            std::fs::write(&path, b"pub fn before() {}\n").unwrap();
+            wait_for_raw_path(&rx, &path);
+        } else {
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        drop(stream);
+        eprintln!(
+            "after drop: delivered_events={deliver_events}, release_context calls={}, channel={:?}",
+            releases.load(Ordering::SeqCst),
+            rx.try_recv()
+        );
+        wait_for_context_release(&rx, &releases);
+    }
+
+    #[test]
+    fn stream_context_released_once_after_eventful_drop() {
+        prove_context_release_after_drop(true);
+    }
+
+    #[test]
+    fn stream_context_released_once_after_eventless_drop() {
+        prove_context_release_after_drop(false);
     }
 
     #[test]
@@ -1399,6 +1476,7 @@ mod tests {
         // Each acknowledged rescan republishes an unchanged matcher, as a real
         // overflow drain does, exercising the replacement-stream decision too.
         let mut context = CallbackContext {
+            release_calls: Arc::new(AtomicU64::new(0)),
             sender: NativeEventSender::Events(sender),
             last_delivered_id: Arc::new(AtomicU64::new(0)),
             nonrecursive_paths: None,
@@ -1518,6 +1596,7 @@ mod tests {
         let (sender, rx) = mpsc::channel();
         let cursor = Arc::new(AtomicU64::new(0));
         let mut context = CallbackContext {
+            release_calls: Arc::new(AtomicU64::new(0)),
             sender: NativeEventSender::Batches(sender),
             last_delivered_id: Arc::clone(&cursor),
             nonrecursive_paths: None,
@@ -1601,6 +1680,7 @@ mod tests {
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (sender, rx) = mpsc::channel();
         let mut context = CallbackContext {
+            release_calls: Arc::new(AtomicU64::new(0)),
             sender: NativeEventSender::Events(sender),
             last_delivered_id: Arc::new(AtomicU64::new(0)),
             nonrecursive_paths: Some(vec![root.clone()]),
