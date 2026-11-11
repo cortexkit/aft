@@ -231,7 +231,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
-        requires: Some(crate::subc::result_body::RESULT_FORMAT),
+        requires: Some(crate::protocol::RESULT_FORMAT),
         command: "ast_search",
         mode: "matches",
         list_id: "payload.matches",

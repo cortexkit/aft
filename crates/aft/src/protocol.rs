@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub(crate) const RESULT_FORMAT: &str = "tool-result/v1";
+
 use crate::list_envelope::ListEnvelope;
 
 /// Full payload returned by the `status` command and cached by status push frames.
