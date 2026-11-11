@@ -757,11 +757,6 @@ pub(crate) fn replace_carry_factory(factory: Option<CarryFactory>, restore: Carr
     CARRY_FACTORY.with(|current| *current.borrow_mut() = factory);
 }
 
-#[cfg(test)]
-fn set_carry_factory(factory: Option<CarryFactory>) {
-    replace_carry_factory(factory, Box::new(|| {}));
-}
-
 struct CarryJobScope {
     factory: Option<CarryFactory>,
     restore: Option<Option<CarryRestore>>,
@@ -2380,7 +2375,7 @@ pub(crate) mod tests {
                     2 => Ok(Box::new(|| Err(io::Error::other("injected entry failure")))),
                     _ => Ok(Box::new(|| panic!("injected entry panic"))),
                 });
-                set_carry_factory(Some(factory));
+                replace_carry_factory(Some(factory), Box::new(|| {}));
                 let ran = Arc::new(AtomicBool::new(false));
                 let called = ran.clone();
                 let result = IsolatedPool::new(1).run(Path::new("carry"), None, move |_| {
@@ -2389,7 +2384,7 @@ pub(crate) mod tests {
                 });
                 assert_eq!(timeout_code(&result.unwrap_err()), "read_io_queue_timeout");
                 assert!(!ran.load(Ordering::SeqCst));
-                set_carry_factory(None);
+                replace_carry_factory(None, Box::new(|| {}));
             })
             .join()
             .unwrap();

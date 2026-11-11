@@ -6,7 +6,9 @@ use crate::bounded_io::*;
 #[cfg(unix)]
 use std::sync::mpsc::channel;
 use std::sync::{atomic::Ordering, Arc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 #[test]
 fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
