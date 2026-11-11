@@ -1496,8 +1496,12 @@ impl TaskSink {
         )
         .collect();
         if !losses.is_empty() {
-            sink.dirty
-                .sync(&sink.stdout, &sink.stderr, sink.unknown.as_ref())?;
+            sink.dirty.sync(
+                &sink.task.paths,
+                &sink.stdout,
+                &sink.stderr,
+                sink.unknown.as_ref(),
+            )?;
             let mut db = DeferredDbWrites::new(registry, &sink.task);
             let mut state = sink
                 .task
