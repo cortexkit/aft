@@ -42,6 +42,8 @@ use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
 mod engines;
 mod fold;
+#[cfg(test)]
+mod todo_tests;
 
 pub use fold::{FoldReport, Folded, OtherFoldReport};
 
@@ -84,6 +86,7 @@ pub(crate) struct SourceWork {
     /// kept, since nothing is let go before then.
     pub(crate) decoded_parses: usize,
     pub(crate) decoded_resolutions: usize,
+    pub(crate) todo_decodes: usize,
 }
 
 #[cfg(test)]
@@ -335,6 +338,7 @@ pub struct Checkout {
     /// Wakes readers at publication, including the text-only publication
     /// that precedes the rest of a checkout's first build.
     readiness: (Mutex<u64>, std::sync::Condvar),
+    todo_counts: Mutex<TodoCountMemo>,
 }
 
 /// A checkout's call graph kept up to date between publications.
@@ -915,6 +919,7 @@ impl Checkout {
             recording: Mutex::new(()),
             memory_epoch,
             readiness: (Mutex::new(0), std::sync::Condvar::new()),
+            todo_counts: Mutex::new(TodoCountMemo::default()),
         };
         handle.adopt_newest()?;
         Ok(handle)
@@ -5056,7 +5061,8 @@ impl Checkout {
             }
             parts.callgraph += live.unparsed.heap_bytes(seen)
                 + live.callgraph_pending.heap_bytes(seen)
-                + live.graph.heap_bytes(seen);
+                + live.graph.heap_bytes(seen)
+                + self.todo_counts.heap_bytes(seen);
             if let Some(refreshed) = &live.refreshed {
                 if seen.first(Arc::as_ptr(refreshed)) {
                     parts.shared += aft_store::heap::COUNTS + std::mem::size_of::<Refreshed>();
@@ -5277,7 +5283,167 @@ pub(crate) enum PathTodos {
     Missing,
 }
 
+/// The record's language and counts; unlike `TodoMarkers`, owns no marker text.
+#[derive(Clone, Debug)]
+pub(crate) struct TodoSummary {
+    pub(crate) language: Option<crate::inspect::scanners::todos::TodoLanguage>,
+    pub(crate) counts: Option<crate::inspect::scanners::todos::TodoCounts>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PathTodoCounts {
+    Recorded(Option<TodoSummary>),
+    Absent,
+    TooLarge,
+    Unrecorded,
+    Unextracted,
+    Missing,
+}
+
+impl From<PathTodos> for PathTodoCounts {
+    fn from(todos: PathTodos) -> Self {
+        use crate::inspect::scanners::todos::{TodoCounts, TodoLanguage};
+        match todos {
+            PathTodos::Absent => Self::Absent,
+            PathTodos::TooLarge => Self::TooLarge,
+            PathTodos::Unrecorded => Self::Unrecorded,
+            PathTodos::Unextracted => Self::Unextracted,
+            PathTodos::Missing => Self::Missing,
+            PathTodos::Recorded(todos) => Self::Recorded(todos.map(|todos| {
+                TodoSummary {
+                    language: TodoLanguage::from_name(&todos.language)
+                        .filter(|language| language.name() == todos.language),
+                    counts: todos.items.as_deref().map(TodoCounts::of),
+                }
+            })),
+        }
+    }
+}
+
+/// One entry per path, replaced on edits and reused across publications by
+/// record key. Limits bound both entry overhead and unusually long paths.
+#[derive(Default)]
+struct TodoCountMemo {
+    entries: HashMap<Vec<u8>, (RecordKey, PathTodoCounts)>,
+    path_bytes: usize,
+}
+
+aft_store::heap_bytes_none!(PathTodoCounts);
+aft_store::heap_bytes_of_fields!(TodoCountMemo {
+    entries,
+    path_bytes
+});
+
+impl TodoCountMemo {
+    const MAX_ENTRIES: usize = 16_384;
+    const MAX_PATH_BYTES: usize = 1_048_576;
+
+    fn insert(&mut self, path: &[u8], key: RecordKey, counts: PathTodoCounts) {
+        if path.len() > Self::MAX_PATH_BYTES {
+            return;
+        }
+        if !self.entries.contains_key(path) {
+            if self.entries.len() == Self::MAX_ENTRIES
+                || self.path_bytes + path.len() > Self::MAX_PATH_BYTES
+            {
+                self.entries.clear();
+                self.path_bytes = 0;
+            }
+            self.path_bytes += path.len();
+        }
+        self.entries.insert(path.to_vec(), (key, counts));
+    }
+}
+
 impl Checkout {
+    #[cfg(test)]
+    pub(crate) fn todo_count_memo_stats_for_test(&self) -> (usize, usize) {
+        use aft_store::heap::HeapBytes as _;
+        let memo = self.todo_counts.lock().unwrap();
+        (
+            memo.entries.len(),
+            memo.heap_bytes(&mut aft_store::heap::Seen::new()),
+        )
+    }
+
+    /// Counts only: cached unchanged records need no decode. Missing and
+    /// unextracted records are not memoized, since publication can repair them
+    /// without changing the content key. Overlay hits still verify that the
+    /// live change belongs to this view, as `todo_markers` does.
+    pub(crate) fn todo_counts(
+        &self,
+        view: &CheckoutView,
+        paths: &[Vec<u8>],
+        max_len: u64,
+    ) -> Result<Vec<PathTodoCounts>, DataError> {
+        let keys = {
+            let live = self.live.read().expect("no panics while holding it");
+            paths
+                .iter()
+                .map(|path| {
+                    let record = view.current_state().get(path)?;
+                    if record.stat.size > max_len || record.language.is_empty() {
+                        return None;
+                    }
+                    let published = view.published.state.get(path).is_some_and(|published| {
+                        published.content == record.content && published.language == record.language
+                    });
+                    if published {
+                        if view.unparsed.contains(path) {
+                            return None;
+                        }
+                    } else {
+                        let change = live.changes.get(path)?;
+                        if change.record.as_ref()?.content != record.content {
+                            return None;
+                        }
+                    }
+                    Some(RecordKey::new(
+                        record.content,
+                        &record.language,
+                        EXTRACTOR_VERSION,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut counts = {
+            let memo = self.todo_counts.lock().expect("no panics while holding it");
+            paths
+                .iter()
+                .zip(&keys)
+                .map(|(path, key)| {
+                    let (cached_key, counts) = memo.entries.get(path)?;
+                    (Some(cached_key) == key.as_ref()).then(|| counts.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let missing = paths
+            .iter()
+            .zip(&counts)
+            .filter(|(_, counts)| counts.is_none())
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let mut found = self.todo_markers(view, &missing, max_len)?.into_iter();
+            let mut memo = self.todo_counts.lock().expect("no panics while holding it");
+            for ((path, key), counts) in paths.iter().zip(keys).zip(&mut counts) {
+                if counts.is_some() {
+                    continue;
+                }
+                let summary = PathTodoCounts::from(found.next().expect("one result per path"));
+                if let (Some(key), PathTodoCounts::Recorded(_)) = (key, &summary) {
+                    memo.insert(path, key, summary.clone());
+                }
+                *counts = Some(summary);
+            }
+            self.touch_memory();
+        }
+        Ok(counts
+            .into_iter()
+            .map(|counts| counts.expect("every path counted"))
+            .collect())
+    }
+
     /// The TODO markers of the files of `view` at `paths` (relative to the
     /// root, `/`-separated), from the records the view's state names: the
     /// publication's for a file unchanged since it, and for a changed file
@@ -5341,6 +5507,7 @@ impl Checkout {
                     let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
                     for content in &contents {
                         if let Some(ordinal) = content.find(key).map_err(DataError::store)? {
+                            note_source_work(&self.root, |work| work.todo_decodes += 1);
                             let todos = content.todos(ordinal).map_err(DataError::store)?;
                             return Ok(PathTodos::Recorded(todos));
                         }
@@ -5357,6 +5524,7 @@ impl Checkout {
                     Extracted::Parse(_, _, stored)
                     | Extracted::Config(_, stored)
                     | Extracted::Markers(stored) => {
+                        note_source_work(&self.root, |work| work.todo_decodes += 1);
                         PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
                     }
                     Extracted::Nothing => PathTodos::Unextracted,

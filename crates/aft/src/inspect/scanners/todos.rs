@@ -19,9 +19,31 @@ use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
 use crate::parser::LangId;
 
 const MAX_LINES_PER_FILE: usize = 100_000;
-const MAX_ITEMS: usize = 100;
+pub(crate) const MAX_ITEMS: usize = 100;
 const MAX_TEXT_CHARS: usize = 200;
 const MARKERS: [&str; 5] = ["TODO", "FIXME", "HACK", "XXX", "BUG"];
+
+/// Marker totals without any retained marker text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TodoCounts {
+    pub(crate) total: usize,
+    pub(crate) by_kind: [usize; 5],
+}
+
+impl TodoCounts {
+    pub(crate) fn of(items: &[TodoMarker]) -> Self {
+        let mut counts = Self {
+            total: items.len(),
+            ..Self::default()
+        };
+        for item in items {
+            if let Some(index) = MARKERS.iter().position(|marker| *marker == item.marker) {
+                counts.by_kind[index] += 1;
+            }
+        }
+        counts
+    }
+}
 
 /// The language a file's comments are read as, to find its TODO markers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +162,11 @@ pub(crate) enum FileTodos {
     NotScanned,
     /// Read, with these markers.
     Scanned(Vec<TodoMarker>),
+    /// Counted from a compact memo; items hold only the TODO detail page.
+    Counted {
+        counts: TodoCounts,
+        items: Vec<TodoMarker>,
+    },
     /// Not read, for this agent-visible reason.
     Skipped(&'static str),
 }
@@ -173,6 +200,25 @@ pub(crate) fn file_todos(path: &Path, todos: TodoMarkers) -> Option<FileTodos> {
     }
     Some(match todos.items {
         Some(items) => FileTodos::Scanned(items),
+        None => FileTodos::NotScanned,
+    })
+}
+
+pub(crate) fn counted_file_todos(
+    path: &Path,
+    summary: crate::data_layer::checkout::TodoSummary,
+) -> Option<FileTodos> {
+    let language = summary.language?;
+    let expected = if is_header(path) {
+        header_matches(&language.name())
+    } else {
+        path_todo_language(path) == Some(language)
+    };
+    expected.then(|| match summary.counts {
+        Some(counts) => FileTodos::Counted {
+            counts,
+            items: Vec::new(),
+        },
         None => FileTodos::NotScanned,
     })
 }
@@ -281,8 +327,9 @@ fn aggregate(job: &InspectJob, files: Vec<FileTodos>) -> InspectScanSuccess {
     let mut skipped_files = Vec::new();
     let mut all_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
+    let mut totals = TodoCounts::default();
     for (path, todos) in job.scope_files.iter().zip(files) {
-        let items = match todos {
+        let (counts, items) = match todos {
             FileTodos::NotScanned => continue,
             FileTodos::Skipped(reason) => {
                 skipped_files.push((
@@ -291,32 +338,34 @@ fn aggregate(job: &InspectJob, files: Vec<FileTodos>) -> InspectScanSuccess {
                 ));
                 continue;
             }
-            FileTodos::Scanned(items) => items,
+            FileTodos::Scanned(items) => (TodoCounts::of(&items), items),
+            FileTodos::Counted { counts, items } => (counts, items),
         };
         scanned_files.push(path.clone());
         let file = display_file_path(&job.project_root, path);
         // Markers in test trees (generated fixtures, mutation notes in test
         // comments) are not product work items; tally them separately.
-        for item in items {
-            if is_test_tree_file(&file) {
+        if is_test_tree_file(&file) {
+            for _ in 0..counts.total {
                 excluded.record(&file);
-            } else {
+            }
+        } else {
+            totals.total += counts.total;
+            for (total, count) in totals.by_kind.iter_mut().zip(counts.by_kind) {
+                *total += count;
+            }
+            for item in items {
                 all_items.push((file.clone(), item));
             }
         }
     }
 
     let mut by_kind = BTreeMap::new();
-    for marker in MARKERS {
-        by_kind.insert(marker.to_string(), 0usize);
-    }
-    for (_, item) in &all_items {
-        if let Some(count) = by_kind.get_mut(item.marker.as_str()) {
-            *count += 1;
-        }
+    for (marker, count) in MARKERS.into_iter().zip(totals.by_kind) {
+        by_kind.insert(marker.to_string(), count);
     }
 
-    let total_count = all_items.len();
+    let total_count = totals.total;
     let drill_down_capped = total_count > MAX_ITEMS;
     let items = all_items
         .into_iter()
@@ -739,6 +788,78 @@ fn display_file_path(project_root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// The pre-memo aggregation path, kept independent of `TodoCounts` so parity
+/// checks cover both summary construction and reuse across checkout changes.
+#[cfg(test)]
+pub(crate) fn uncached_aggregate_for_test(job: &InspectJob) -> serde_json::Value {
+    let stored = crate::data_layer::tools::inspect::stored_todos_uncached_for_test(
+        &job.project_root,
+        &job.config,
+        &job.scope_files,
+    )
+    .unwrap();
+    let StoredTodos::Files { files, unindexed } = stored else {
+        return match stored {
+            StoredTodos::Pending => serde_json::json!({
+                "status": "pending", "reason": "callgraph_building", "complete": false,
+            }),
+            StoredTodos::Unavailable(reason) => serde_json::json!({
+                "unavailable": true, "complete": false,
+                "gaps": [{"kind": "todo_markers_unavailable", "reason": reason}],
+            }),
+            _ => unreachable!(),
+        };
+    };
+    let mut skipped = Vec::new();
+    let mut items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
+    for (path, todos) in job.scope_files.iter().zip(files) {
+        let file = display_file_path(&job.project_root, path);
+        match todos {
+            FileTodos::NotScanned => {}
+            FileTodos::Skipped(reason) => skipped.push((file, reason.to_string())),
+            FileTodos::Scanned(markers) => {
+                for item in markers {
+                    if is_test_tree_file(&file) {
+                        excluded.record(&file);
+                    } else {
+                        items.push((file.clone(), item));
+                    }
+                }
+            }
+            FileTodos::Counted { .. } => panic!("reference must read full records"),
+        }
+    }
+    let count = items.len();
+    let by_kind = MARKERS
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                items
+                    .iter()
+                    .filter(|(_, marker)| marker.marker == kind)
+                    .count(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    // Use truncation rather than the production count or its item iterator.
+    items.truncate(MAX_ITEMS);
+    let mut result = serde_json::json!({
+        "count": count,
+        "by_kind": by_kind,
+        "items": items.into_iter().map(|(file, item)| serde_json::json!({
+            "file": file, "line": item.line, "marker": item.marker,
+            "author": item.author, "text": item.text,
+        })).collect::<Vec<_>>(),
+        "drill_down_capped": count > MAX_ITEMS,
+    });
+    excluded.write_into(&mut result);
+    super::source_text::write_skipped_files(&mut result, skipped, None);
+    write_unindexed_gap(&mut result, &unindexed);
+    result
+}
+
 /// What each count of a root found, in order, for tests that follow the
 /// counts a background refresh takes.
 #[cfg(test)]
@@ -861,7 +982,7 @@ mod tests {
         assert_eq!(lines(&lexical), vec![(2, "XXX".into(), "real".into())]);
     }
 
-    fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
+    pub(super) fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
         let scope = JobScope::for_project(root.to_path_buf());
         InspectJob {
             job_id: 1,
@@ -1025,6 +1146,10 @@ mod tests {
         let result = run_todos_scan(&todos_job(&root, vec![root.join("src/lib.rs")]));
         let aggregate = result.outcome.unwrap().aggregate;
         assert_eq!(aggregate["status"], "pending", "{aggregate:#}");
+        assert_eq!(
+            aggregate,
+            uncached_aggregate_for_test(&todos_job(&root, vec![root.join("src/lib.rs")]))
+        );
         assert!(aggregate.get("count").is_none(), "{aggregate:#}");
 
         crate::data_layer::tools::inspect::note_root(
@@ -1034,6 +1159,10 @@ mod tests {
         let result = run_todos_scan(&todos_job(&root, vec![root.join("src/lib.rs")]));
         let aggregate = result.outcome.unwrap().aggregate;
         assert_eq!(aggregate["unavailable"], true, "{aggregate:#}");
+        assert_eq!(
+            aggregate,
+            uncached_aggregate_for_test(&todos_job(&root, vec![root.join("src/lib.rs")]))
+        );
         assert_eq!(
             aggregate["gaps"][0]["reason"],
             crate::data_layer::tools::inspect::TODOS_NO_INDEX_STORE
@@ -1062,6 +1191,7 @@ mod tests {
         write(&root, "docs/notes.md", notes);
         write(&root, "Cargo.toml", cargo);
         write(&root, "data.json", "{\"note\": \"// TODO: never read\"}\n");
+        write(&root, "src/binary.rs", "// TODO: not text\0\n");
         write(&root, "tests/fixture.rs", "// TODO: test-tree marker\n");
         write(&root, "src/huge.rs", &"// filler\n".repeat(120_000));
 
@@ -1178,5 +1308,70 @@ mod tests {
         assert!(probe.paths().is_empty(), "opened {:?}", probe.paths());
         assert_eq!(folded_aggregate, aggregate);
         assert_eq!([plain, changed_app].map(parses), parsed_before_count);
+
+        let mut job = todos_job(
+            &root,
+            crate::inspect::inventory::InspectInventory::from_checkout(
+                &root,
+                &checkout.view().unwrap(),
+            )
+            .unwrap()
+            .sources,
+        );
+        let parity = |job: &InspectJob| {
+            let cached = run_todos_scan(job).outcome.unwrap().aggregate;
+            assert_eq!(
+                serde_json::to_vec(&cached).unwrap(),
+                serde_json::to_vec(&uncached_aggregate_for_test(job)).unwrap()
+            );
+        };
+        parity(&job);
+        // Cross the detail boundary in one file, with test markers ahead of
+        // it in the caller's order. They must not use up the detail-item limit.
+        write(
+            &root,
+            "src/app.rs",
+            &"// BUG(owner): beyond the first page\n".repeat(110),
+        );
+        checkout.note_paths(&[root.join("src/app.rs")]);
+        job.scope_files.reverse();
+        parity(&job);
+        checkout.checkout().refresh_callgraph().unwrap();
+        checkout.checkout().publish_changes().unwrap();
+        parity(&job);
+        crate::data_layer::tools::inspect::set_todo_store_wait_for_test(
+            &root,
+            std::time::Duration::ZERO,
+        );
+        checkout.checkout().begin_rescan();
+        parity(&job);
+        assert_eq!(
+            run_todos_scan(&job).outcome.unwrap().aggregate["status"],
+            "pending"
+        );
+        checkout.checkout().end_rescan();
+        // Discover an unreported addition and deletion, as a watcher rescan
+        // does after a missed event, and then publish the new membership.
+        write(
+            &root,
+            "src/rescanned.rs",
+            "// FIXME: discovered on rescan\n",
+        );
+        std::fs::remove_file(root.join("src/plain.rs")).unwrap();
+        checkout.checkout().rescan().unwrap();
+        job.scope_files = crate::inspect::inventory::InspectInventory::from_checkout(
+            &root,
+            &checkout.view().unwrap(),
+        )
+        .unwrap()
+        .sources;
+        parity(&job);
+        checkout.checkout().refresh_callgraph().unwrap();
+        checkout.checkout().publish_changes().unwrap();
+        parity(&job);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "todos_replay.rs"]
+mod replay;
