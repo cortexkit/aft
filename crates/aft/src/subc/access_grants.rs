@@ -55,8 +55,9 @@ fn head_source(
     Ok(Some(GrantSource::Unknown))
 }
 use crate::access_policy::{
-    policy_path, AccessGrant, AccessOperation, AccessPolicy, GrantKind, HeadPolicy,
+    AccessGrant, AccessOperation, AccessPolicy, GrantKind, HeadPolicy,
 };
+use crate::policy_path::policy_path;
 use crate::db::access_grants::{self as store, ScopeKey};
 
 fn refusal(code: &str, message: impl Into<String>) -> subc_protocol::ErrorBody {
