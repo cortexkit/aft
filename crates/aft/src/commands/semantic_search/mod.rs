@@ -3887,6 +3887,7 @@ fn matching_line_in_text(
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
     let _cost = telemetry::CostPhase::start("matching_line");
+    telemetry::cost_count("matching_calls", 1);
     static CACHE: std::sync::OnceLock<MatchingSourceCache> = std::sync::OnceLock::new();
     let prepare_cost = telemetry::CostPhase::start("matching_prepare");
     let prepare_wait = waits::time(waits::SearchWait::MatchingPrepare);
@@ -3900,6 +3901,7 @@ fn matching_line_in_text(
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
         if let Some((line_index, line)) = source.lines().enumerate().find(|(index, _)| {
+            telemetry::cost_count("matching_phrase_lines_used", 1);
             prepared.normalized[prepared.lines[*index].normalized.clone()]
                 .contains(&normalized_phrase)
         }) {
@@ -3969,6 +3971,7 @@ struct MatchingSource {
 
 impl MatchingSource {
     fn new(source: &str) -> Self {
+        let _cost = telemetry::CostPhase::start("matching_source_new");
         // Two source-wide buffers avoid allocating and freeing two strings
         // per line while concurrent searches churn the bounded content cache.
         // Ranges keep line boundaries: neither phrase nor trigram matches may
@@ -3978,6 +3981,7 @@ impl MatchingSource {
         let lines = source
             .lines()
             .map(|line| {
+                telemetry::cost_count("matching_lines_prepared", 1);
                 let normalized_start = normalized.len();
                 exact_lane::push_normalized_exact_phrase(line, &mut normalized);
                 let compact_start = compact.len();
@@ -4028,6 +4032,7 @@ impl MatchingSource {
         let mut best_score = 0_usize;
         let mut missing = Vec::with_capacity(tokens.len());
         for (index, (line, prepared)) in source.lines().zip(&self.lines).enumerate() {
+            telemetry::cost_count("matching_best_lines_used", 1);
             let compact = &self.compact[prepared.compact.clone()];
             missing.clear();
             let mut score = 0_usize;
