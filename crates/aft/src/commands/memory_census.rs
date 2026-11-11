@@ -310,7 +310,7 @@ mod tests {
             zero.clone(),
             zero,
         );
-        MemorySnapshot::new("ready", BTreeMap::from([("/repo".to_string(), root)]))
+        crate::memory_census::snapshot("ready", BTreeMap::from([("/repo".to_string(), root)]))
     }
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
         );
         let mut roots = BTreeMap::new();
         roots.insert("/repo".to_string(), root);
-        let snapshot = MemorySnapshot::new("ready", roots);
+        let snapshot = crate::memory_census::snapshot("ready", roots);
         let before = crate::memory::allocator_snapshot_calls_for_test();
         let _ = render_memory_census(&snapshot, None);
         assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), before);
@@ -615,7 +615,7 @@ mod tests {
         );
         let mut roots = BTreeMap::new();
         roots.insert("/repo".to_string(), root);
-        let value = render_memory_census(&MemorySnapshot::new("ready", roots), None);
+        let value = render_memory_census(&crate::memory_census::snapshot("ready", roots), None);
         assert_eq!(
             value["roots"]["/repo"]["planes"]["callgraph_projection"],
             json!(41)
@@ -642,7 +642,7 @@ mod tests {
         );
         let mut roots = BTreeMap::new();
         roots.insert("/repo".to_string(), root);
-        let value = render_memory_census(&MemorySnapshot::new("ready", roots), None);
+        let value = render_memory_census(&crate::memory_census::snapshot("ready", roots), None);
         let row = &value["roots"]["/repo"];
         assert_eq!(row["planes"]["search"], json!(17));
         assert_eq!(row["planes"]["symbols"], json!(29));
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn census_carries_process_io_object_and_updated_slack_label() {
-        let snapshot = MemorySnapshot::new("ready", BTreeMap::new());
+        let snapshot = crate::memory_census::snapshot("ready", BTreeMap::new());
         let value = render_memory_census(&snapshot, None);
         assert_eq!(
             value["process"]["allocator_slack_label"],

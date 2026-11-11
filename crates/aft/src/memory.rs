@@ -295,7 +295,7 @@ pub struct SqliteMemorySnapshot {
 }
 
 impl SqliteMemorySnapshot {
-    fn measure() -> Self {
+    pub(crate) fn measure() -> Self {
         // SQLite's allocator counters are process-wide and internally synchronized.
         // They intentionally replace per-connection guesses in root estimates.
         let memory_used = unsafe { rusqlite::ffi::sqlite3_memory_used() };
@@ -568,85 +568,6 @@ impl AllocatorPressureRelief {
     }
 }
 
-impl ProcessMemorySnapshot {
-    pub fn from_roots(
-        roots: &BTreeMap<String, RootMemorySnapshot>,
-        shared_semantic_bases: &MemoryEstimate,
-    ) -> Self {
-        let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
-        Self::from_root_rollups(
-            rollups.iter(),
-            roots.len(),
-            shared_semantic_bases,
-            crate::data_layer::surfaces::block_cache_estimate().as_ref(),
-            AllocatorObservation::measure(),
-        )
-    }
-
-    fn from_root_rollups<'a>(
-        roots: impl Iterator<Item = &'a RootMemoryRollup>,
-        root_count: usize,
-        shared_semantic_bases: &MemoryEstimate,
-        data_layer_block_cache: Option<&MemoryEstimate>,
-        allocator_observation: AllocatorObservation,
-    ) -> Self {
-        let mut root_attributed_bytes = 0u64;
-        let mut busy_subsystems = 0usize;
-        let mut not_estimated_subsystems = 0usize;
-        for root in roots {
-            root_attributed_bytes = root_attributed_bytes.saturating_add(root.attributed_bytes);
-            busy_subsystems = busy_subsystems.saturating_add(root.busy_subsystems);
-            not_estimated_subsystems =
-                not_estimated_subsystems.saturating_add(root.not_estimated_subsystems);
-        }
-        let sqlite = SqliteMemorySnapshot::measure();
-        let embedding = crate::local_embed::session_memory();
-        let AllocatorObservation {
-            snapshot: allocator,
-            age_ms: allocator_observation_age_ms,
-        } = allocator_observation;
-        let data_layer_block_cache_bytes =
-            data_layer_block_cache.and_then(|cache| cache.estimated_bytes);
-        let total_attributed_bytes = root_attributed_bytes
-            .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
-            .saturating_add(data_layer_block_cache_bytes.unwrap_or(0))
-            .saturating_add(embedding.model_bytes)
-            .saturating_add(sqlite.memory_used_bytes);
-        let rss_bytes = process_rss_bytes();
-        let phys_footprint_bytes = process_phys_footprint_bytes();
-        // Attribute against the footprint when available: it excludes
-        // already-surrendered pages, so the residual actually means
-        // "held memory we cannot explain" instead of allocator noise.
-        let unattributed_basis = phys_footprint_bytes.or(rss_bytes);
-        let unattributed_bytes =
-            unattributed_basis.map(|held| signed_difference(held, total_attributed_bytes));
-        Self {
-            rss_status: if rss_bytes.is_some() {
-                "estimated"
-            } else {
-                "not_estimated_on_this_platform"
-            },
-            rss_bytes,
-            phys_footprint_bytes,
-            rss_not_estimated: rss_bytes
-                .is_none()
-                .then_some("platform_process_rss_unavailable"),
-            sqlite,
-            allocator_slack_measured: allocator.retained_slack_bytes.is_some(),
-            allocator,
-            allocator_observation_age_ms,
-            total_attributed_bytes,
-            embedding_sessions: embedding.sessions,
-            embedding_model_bytes: embedding.model_bytes,
-            data_layer_block_cache_bytes,
-            unattributed_bytes,
-            root_count,
-            busy_subsystems,
-            not_estimated_subsystems,
-        }
-    }
-}
-
 /// Cap on per-root detail entries in serialized snapshots. Process totals
 /// always cover every root; only the per-root breakdown is capped so a
 /// many-root daemon process cannot balloon the status payload past
@@ -656,7 +577,7 @@ impl ProcessMemorySnapshot {
 pub const MEMORY_SNAPSHOT_ROOT_DETAIL_CAP: usize = 8;
 
 /// Operations the census names by their allocation high-water mark.
-const CENSUS_ALLOCATION_LABELS: usize = 5;
+pub(crate) const CENSUS_ALLOCATION_LABELS: usize = 5;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemorySnapshot {
@@ -698,15 +619,6 @@ pub(crate) struct SharedProcessMemory {
     pub(crate) data_layer_block_cache: Option<MemoryEstimate>,
 }
 
-impl SharedProcessMemory {
-    pub(crate) fn measure() -> Self {
-        Self {
-            shared_semantic_bases: crate::semantic_index::shared_semantic_bases_memory(),
-            data_layer_block_cache: crate::data_layer::surfaces::block_cache_estimate(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryRollupSnapshot {
     pub(crate) roots_status: &'static str,
@@ -715,140 +627,6 @@ pub(crate) struct MemoryRollupSnapshot {
     pub(crate) roots_omitted: usize,
     pub(crate) roots_omitted_bytes: u64,
     pub(crate) process: ProcessMemorySnapshot,
-}
-
-impl MemoryRollupSnapshot {
-    #[cfg(test)]
-    pub(crate) fn new(
-        roots_status: &'static str,
-        roots: BTreeMap<String, RootMemoryRollup>,
-        allocator: AllocatorObservation,
-    ) -> Self {
-        Self::with_shared(
-            roots_status,
-            roots,
-            allocator,
-            &SharedProcessMemory::measure(),
-        )
-    }
-
-    /// [`Self::new`] with the process-wide shared memory already measured, so
-    /// one health rollup measures it once for every surface it fills.
-    pub(crate) fn with_shared(
-        roots_status: &'static str,
-        roots: BTreeMap<String, RootMemoryRollup>,
-        allocator: AllocatorObservation,
-        shared: &SharedProcessMemory,
-    ) -> Self {
-        let process = ProcessMemorySnapshot::from_root_rollups(
-            roots.values(),
-            roots.len(),
-            &shared.shared_semantic_bases,
-            shared.data_layer_block_cache.as_ref(),
-            allocator,
-        );
-        let roots_total = roots.len();
-        let (roots, roots_omitted, roots_omitted_bytes) =
-            cap_root_rollups(roots, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
-        Self {
-            roots_status,
-            roots,
-            roots_total,
-            roots_omitted,
-            roots_omitted_bytes,
-            process,
-        }
-    }
-}
-
-impl MemorySnapshot {
-    pub fn new(roots_status: &'static str, roots: BTreeMap<String, RootMemorySnapshot>) -> Self {
-        Self::with_cap(
-            roots_status,
-            roots,
-            true,
-            AllocatorObservation::from_source(AllocatorSource::Cached),
-            SharedProcessMemory::measure(),
-        )
-    }
-
-    /// Build the uncapped form used by the explicit memory census operation.
-    pub fn new_uncapped(
-        roots_status: &'static str,
-        roots: BTreeMap<String, RootMemorySnapshot>,
-    ) -> Self {
-        Self::new_uncapped_with_allocator(roots_status, roots, AllocatorObservation::measure())
-    }
-
-    pub(crate) fn new_uncapped_with_allocator(
-        roots_status: &'static str,
-        roots: BTreeMap<String, RootMemorySnapshot>,
-        allocator: AllocatorObservation,
-    ) -> Self {
-        Self::with_cap(
-            roots_status,
-            roots,
-            false,
-            allocator,
-            SharedProcessMemory::measure(),
-        )
-    }
-
-    /// The uncapped form with the process-wide shared memory already
-    /// measured; see [`MemoryRollupSnapshot::with_shared`].
-    pub(crate) fn new_uncapped_with_shared(
-        roots_status: &'static str,
-        roots: BTreeMap<String, RootMemorySnapshot>,
-        allocator: AllocatorObservation,
-        shared: SharedProcessMemory,
-    ) -> Self {
-        Self::with_cap(roots_status, roots, false, allocator, shared)
-    }
-
-    fn with_cap(
-        roots_status: &'static str,
-        roots: BTreeMap<String, RootMemorySnapshot>,
-        cap_detail: bool,
-        allocator: AllocatorObservation,
-        shared: SharedProcessMemory,
-    ) -> Self {
-        let SharedProcessMemory {
-            shared_semantic_bases,
-            data_layer_block_cache,
-        } = shared;
-        // Totals cover EVERY root before the detail map is capped.
-        let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
-        let process = ProcessMemorySnapshot::from_root_rollups(
-            rollups.iter(),
-            roots.len(),
-            &shared_semantic_bases,
-            data_layer_block_cache.as_ref(),
-            allocator,
-        );
-        let roots_total = roots.len();
-        let (roots, roots_omitted, roots_omitted_bytes) = if cap_detail {
-            cap_root_detail(roots, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP)
-        } else {
-            (roots, 0, 0)
-        };
-        // Reading the marks restarts them, so only the census reads them.
-        let allocation_labels = if cap_detail {
-            Vec::new()
-        } else {
-            crate::alloc_trace::take_census_peaks(CENSUS_ALLOCATION_LABELS)
-        };
-        Self {
-            roots_status,
-            roots,
-            roots_total,
-            roots_omitted,
-            roots_omitted_bytes,
-            shared_semantic_bases,
-            data_layer_block_cache,
-            process,
-            allocation_labels,
-        }
-    }
 }
 
 fn cap_roots<T>(
@@ -873,7 +651,7 @@ fn cap_roots<T>(
     (entries.into_iter().collect(), omitted.len(), omitted_bytes)
 }
 
-fn cap_root_rollups(
+pub(crate) fn cap_root_rollups(
     roots: BTreeMap<String, RootMemoryRollup>,
     cap: usize,
 ) -> (BTreeMap<String, RootMemoryRollup>, usize, u64) {
@@ -882,7 +660,7 @@ fn cap_root_rollups(
 
 /// Keep the `cap` roots with the highest attributed bytes; report the rest
 /// as an omitted-count + omitted-bytes rollup.
-fn cap_root_detail(
+pub(crate) fn cap_root_detail(
     roots: BTreeMap<String, RootMemorySnapshot>,
     cap: usize,
 ) -> (BTreeMap<String, RootMemorySnapshot>, usize, u64) {
@@ -918,7 +696,7 @@ mod snapshot_cap_tests {
                 root_with_bytes((i as u64 + 1) * 1000),
             );
         }
-        let snapshot = MemorySnapshot::new("ready", roots);
+        let snapshot = crate::memory_census::snapshot("ready", roots);
 
         assert_eq!(snapshot.roots.len(), MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
         assert_eq!(snapshot.roots_total, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 4);
@@ -946,7 +724,8 @@ mod snapshot_cap_tests {
                 root_with_bytes((i as u64 + 1) * 1000).rollup(),
             );
         }
-        let snapshot = MemoryRollupSnapshot::new("ready", roots, AllocatorObservation::measure());
+        let snapshot =
+            crate::memory_census::rollup_snapshot("ready", roots, AllocatorObservation::measure());
 
         assert_eq!(snapshot.roots.len(), MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
         assert_eq!(snapshot.roots_total, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 4);
@@ -970,7 +749,8 @@ mod snapshot_cap_tests {
             root_with_bytes(20_000).rollup().with_standing(),
         );
 
-        let snapshot = MemoryRollupSnapshot::new("ready", roots, AllocatorObservation::measure());
+        let snapshot =
+            crate::memory_census::rollup_snapshot("ready", roots, AllocatorObservation::measure());
         assert_eq!(snapshot.roots.len(), MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
         assert_eq!(snapshot.roots_total, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 2);
         assert_eq!(snapshot.roots_omitted, 2);
@@ -986,7 +766,7 @@ mod snapshot_cap_tests {
         let mut roots = BTreeMap::new();
         roots.insert("/a".to_string(), root_with_bytes(10));
         roots.insert("/b".to_string(), root_with_bytes(20));
-        let snapshot = MemorySnapshot::new("ready", roots);
+        let snapshot = crate::memory_census::snapshot("ready", roots);
         assert_eq!(snapshot.roots.len(), 2);
         assert_eq!(snapshot.roots_total, 2);
         assert_eq!(snapshot.roots_omitted, 0);
@@ -1034,7 +814,7 @@ pub fn estimated_json_bytes(value: &Value) -> u64 {
     }
 }
 
-fn signed_difference(lhs: u64, rhs: u64) -> i64 {
+pub(crate) fn signed_difference(lhs: u64, rhs: u64) -> i64 {
     let difference = i128::from(lhs) - i128::from(rhs);
     difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
@@ -1809,7 +1589,7 @@ pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
 }
 
 #[cfg(target_os = "macos")]
-fn process_rss_bytes() -> Option<u64> {
+pub(crate) fn process_rss_bytes() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_taskinfo>();
     let written = unsafe {
@@ -1846,12 +1626,12 @@ pub(crate) fn process_phys_footprint_bytes() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn process_phys_footprint_bytes() -> Option<u64> {
+pub(crate) fn process_phys_footprint_bytes() -> Option<u64> {
     None
 }
 
 #[cfg(target_os = "linux")]
-fn process_rss_bytes() -> Option<u64> {
+pub(crate) fn process_rss_bytes() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -1862,7 +1642,7 @@ fn process_rss_bytes() -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_rss_bytes() -> Option<u64> {
+pub(crate) fn process_rss_bytes() -> Option<u64> {
     None
 }
 
@@ -2041,7 +1821,7 @@ mod tests {
     #[test]
     fn process_snapshot_exposes_sqlite_and_allocator_sections() {
         let shared = MemoryEstimate::estimated(7);
-        let snapshot = ProcessMemorySnapshot::from_roots(&BTreeMap::new(), &shared);
+        let snapshot = crate::memory_census::process_from_roots(&BTreeMap::new(), &shared);
         assert_eq!(snapshot.sqlite.status, "measured");
         assert!(snapshot.sqlite.memory_highwater_bytes >= snapshot.sqlite.memory_used_bytes);
         // The data layer's block cache is counted once for the process when

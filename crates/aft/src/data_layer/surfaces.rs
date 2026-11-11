@@ -2535,7 +2535,7 @@ mod tests {
             |plane: &MemoryEstimate| plane.counts.get("data_layer_bytes").copied();
         // The root's census row and the sum of its planes.
         let census_row = |memory: &crate::memory::RootMemorySnapshot| {
-            let snapshot = crate::memory::MemorySnapshot::new(
+            let snapshot = crate::memory_census::snapshot(
                 "ready",
                 [(root.display().to_string(), memory.clone())].into(),
             );
@@ -2593,7 +2593,7 @@ mod tests {
         assert!(root_memory.trigram.estimated_bytes.unwrap() >= search);
         assert!(root_memory.callgraph.estimated_bytes.unwrap() >= callgraph);
 
-        let snapshot = crate::memory::MemorySnapshot::new(
+        let snapshot = crate::memory_census::snapshot(
             "ready",
             [(root.display().to_string(), root_memory.clone())].into(),
         );

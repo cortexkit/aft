@@ -972,8 +972,7 @@ mod tests {
     fn status_reuses_cached_allocator_observation_for_repeated_requests() {
         let _allocator_test_lock = crate::memory::allocator_observation_test_lock();
         crate::memory::reset_allocator_observation_for_test();
-        let _ =
-            crate::memory::MemorySnapshot::new_uncapped("ready", std::collections::BTreeMap::new());
+        let _ = crate::memory_census::snapshot_uncapped("ready", std::collections::BTreeMap::new());
 
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let before = crate::memory::allocator_snapshot_calls_for_test();

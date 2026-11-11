@@ -100,11 +100,9 @@ fn native_query_embedding_latency_probe() {
                 // Every sample is an independently cold-first query, not one
                 // cold sample hidden among nineteen warm queries.
                 std::thread::sleep(Duration::from_secs(76));
-                let snapshot = serde_json::to_value(aft::memory::MemorySnapshot::new(
-                    "ready",
-                    Default::default(),
-                ))
-                .unwrap();
+                let snapshot =
+                    serde_json::to_value(aft::memory_census::snapshot("ready", Default::default()))
+                        .unwrap();
                 let sessions = snapshot["process"]["embedding_sessions"].as_u64();
                 if label == "single" {
                     assert_eq!(sessions, Some(0), "idle session did not unload");

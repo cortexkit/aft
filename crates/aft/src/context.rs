@@ -11489,9 +11489,9 @@ impl AppContext {
             .entry(current_label)
             .or_insert_with(|| self.memory_root_snapshot());
         if cap_detail {
-            crate::memory::MemorySnapshot::new(roots_status, roots)
+            crate::memory_census::snapshot(roots_status, roots)
         } else {
-            crate::memory::MemorySnapshot::new_uncapped(roots_status, roots)
+            crate::memory_census::snapshot_uncapped(roots_status, roots)
         }
     }
 }

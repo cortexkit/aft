@@ -4624,15 +4624,15 @@ fn build_health_diagnostic_rollup_from_actors(
     rollup_mark!(timer, "allocator observation");
     // Shared bases and semantic arenas are measured once for the compact
     // rollup; a rollup that also measures the census reuses that measurement.
-    let shared_memory = crate::memory::SharedProcessMemory::measure();
-    let memory = memory_rollup_metrics(Some(crate::memory::MemoryRollupSnapshot::with_shared(
+    let shared_memory = crate::memory_census::shared_process_memory();
+    let memory = memory_rollup_metrics(Some(crate::memory_census::rollup_snapshot_with_shared(
         "ready",
         memory_roots,
         allocator.clone(),
         &shared_memory,
     )));
     let census_snapshot = measure_census.then(|| {
-        crate::memory::MemorySnapshot::new_uncapped_with_shared(
+        crate::memory_census::snapshot_uncapped_with_shared(
             "ready",
             census_roots,
             allocator,
@@ -9572,7 +9572,7 @@ mod tests {
             "a new walk must reset the age: {changed_age} >= {reused_age}"
         );
         let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
-        let rendered = memory_rollup_metrics(Some(crate::memory::MemoryRollupSnapshot::new(
+        let rendered = memory_rollup_metrics(Some(crate::memory_census::rollup_snapshot(
             "ready",
             std::collections::BTreeMap::from([("/rollup-shape".to_string(), rollup)]),
             crate::memory::AllocatorObservation::measure(),
@@ -9729,7 +9729,7 @@ mod tests {
                 serde_json::to_vec(&current).unwrap(),
                 serde_json::to_vec(&legacy).unwrap()
             );
-            let shared = crate::memory::SharedProcessMemory::measure();
+            let shared = crate::memory_census::shared_process_memory();
             let allocator = crate::memory::AllocatorObservation::measure();
             let build = |estimates: &[crate::memory::MemoryEstimate]| {
                 let roots = (0..200usize)
@@ -9748,7 +9748,7 @@ mod tests {
                         (format!("/parity/root-{index:03}"), row)
                     })
                     .collect();
-                crate::memory::MemoryRollupSnapshot::with_shared(
+                crate::memory_census::rollup_snapshot_with_shared(
                     "ready",
                     roots,
                     allocator.clone(),

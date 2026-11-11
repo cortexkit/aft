@@ -1183,7 +1183,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let snapshot = crate::memory::MemorySnapshot::new("ready", Default::default());
+            let snapshot = crate::memory_census::snapshot("ready", Default::default());
             assert_eq!(snapshot.process.embedding_sessions, 1);
             assert!(snapshot.process.embedding_model_bytes > 80_000_000);
             assert!(
@@ -1196,7 +1196,7 @@ mod tests {
             }
             assert!(ctx.semantic_embedding_model().lock().is_none());
             wait_for_sessions(0);
-            let snapshot = crate::memory::MemorySnapshot::new("ready", Default::default());
+            let snapshot = crate::memory_census::snapshot("ready", Default::default());
             assert_eq!(snapshot.process.embedding_sessions, 0);
             assert_eq!(snapshot.process.embedding_model_bytes, 0);
         }

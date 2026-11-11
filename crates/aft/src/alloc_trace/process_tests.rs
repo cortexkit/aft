@@ -188,7 +188,7 @@ fn the_census_names_the_operation_with_the_highest_mark() {
         // census's top five while those run alongside.
         drop(black_box(Vec::<u8>::with_capacity(1 << 30)));
     }
-    let census = aft::memory::MemorySnapshot::new_uncapped("ready", Default::default());
+    let census = aft::memory_census::snapshot_uncapped("ready", Default::default());
     assert!(census.allocation_labels.len() <= 5, "{census:?}");
     let mark = census
         .allocation_labels

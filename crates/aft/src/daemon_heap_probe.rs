@@ -46,7 +46,7 @@ fn sample(label: &str, roots: &[Arc<AppContext>], start: Instant) {
         .iter()
         .filter_map(|row| row.counts.get("candidates"))
         .sum();
-    let sqlite = crate::memory::MemorySnapshot::new_uncapped("ready", Default::default())
+    let sqlite = crate::memory_census::snapshot_uncapped("ready", Default::default())
         .process
         .sqlite
         .memory_used_bytes;
