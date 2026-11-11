@@ -510,7 +510,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Internal crash-file housekeeping bounds directory iteration per detached pass, retaining its iterator for continuation; it never truncates an agent-visible result list.",
     },
     ExclusionEntry {
-        file: "commands/semantic_search/memo.rs",
+        file: "search_state/memo.rs",
         enclosing_item: "DigestProofCache::insert",
         location_or_primitive: "MAX_DIGEST_PROOF_BYTES",
         reason: "Internal verified-content proof retention budget; eviction or bypass always falls back to reading and hashing the complete served page, never truncates search candidates or output.",
@@ -924,7 +924,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal retention candidates beyond the budget remain indexed for the next maintenance request; no agent-visible records are truncated",
     },
     ExclusionEntry {
-        file: "commands/semantic_search/memo.rs",
+        file: "search_state/memo.rs",
         enclosing_item: "make_room_for, store_literal_presence, prune_lifecycle",
         location_or_primitive: "MAX_EXACT_MEMO_BYTES, MAX_LITERAL_PRESENCE_BYTES, MAX_RETIRED_POISONED_BYTES and obsolete-generation cache retirement",
         reason: "internal reconstructible cache ownership only; complete verified results still feed ranking and oversized entries are served without retention, while evicted literal-presence answers are recomputed; no agent-visible result is cut",
@@ -996,7 +996,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "optional diff text is omitted as a whole with an explicit notice when its byte allowance is exceeded; every file outcome and line count remains, so this does not cut a result list",
     },
     ExclusionEntry {
-        file: "commands/file_read_exact.rs",
+        file: "file_read_exact.rs",
         enclosing_item: "bounded_bytes",
         location_or_primitive: "exact binary read byte ceiling",
         reason: "the module operation refuses oversized files after at most one lookahead byte; no truncated list or partial file is returned",
@@ -1030,6 +1030,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "cap_with_scope, cap_read, notice_suffix, render_cut, render_cut_with_data, read, cleanup_expired, SCAN_ENTRIES, save_failed_trailer",
         location_or_primitive: "rendered reply and saved artifact byte bounds",
         reason: "a transport-independent text byte budget, not a list surface; preserves list envelopes and saves the uncut reply in a session-private file with a recovery trailer; read instead reclaims whole source lines for its native paging footer and notices without saving a copy; failure reasons have a bounded UTF-8 prefix, artifact reads have a separate 64 MiB allocation guard, and retention cleanup resumes each bounded directory scan",
+    },
+    ExclusionEntry {
+        file: "output_store.rs",
+        enclosing_item: "read, cleanup_expired, SCAN_ENTRIES",
+        location_or_primitive: "saved tool result storage bounds",
+        reason: "Saved-file byte limits and bounded artifact cleanup do not truncate response lists.",
     },
     ExclusionEntry {
         file: "hashline/snapshot/mod.rs",
