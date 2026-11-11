@@ -401,15 +401,6 @@ pub(crate) fn is_sqlite_or_metadata(path: &Path) -> bool {
 
 /// Only explicit, ownership-checked registered task artifacts may bypass the
 /// storage root exclusion. SQLite names and aliases remain forbidden.
-pub(crate) fn read_bounded(
-    path: &Path,
-    deadline: Option<std::time::Instant>,
-    authorized_task_artifact: bool,
-) -> std::io::Result<Vec<u8>> {
-    admit_bounded(path, authorized_task_artifact)?;
-    crate::bounded_io::read(path, deadline)
-}
-
 pub(crate) fn reader_bounded(
     path: &Path,
     deadline: Option<std::time::Instant>,

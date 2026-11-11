@@ -1399,6 +1399,7 @@ impl GrepBlocks {
         // and magic checks). Reject the same binaries before reserving a file-
         // sized buffer, even for patterns that require the whole haystack.
         let prefix = reader.chunk(Vec::new(), 1024)?;
+        let short = prefix.len() < 1024;
         let binary = is_binary_bytes(&prefix);
         let pending = if binary {
             Vec::new()
@@ -1412,7 +1413,7 @@ impl GrepBlocks {
             pending,
             scratch: Vec::new(),
             end: 0,
-            eof: !stream || binary,
+            eof: !stream || binary || short,
             yielded: binary,
             line_base: 0,
         })
@@ -1435,14 +1436,18 @@ impl GrepBlocks {
                 self.yielded = true;
                 return Ok(Some((self.line_base, &self.pending[..])));
             }
+            let size = if self.scratch.capacity() == 0 {
+                64 << 10
+            } else {
+                Self::BLOCK_BYTES
+            };
             self.scratch = self
                 .reader
                 .as_mut()
                 .unwrap()
-                .chunk(std::mem::take(&mut self.scratch), Self::BLOCK_BYTES)?;
-            if self.scratch.is_empty() {
+                .chunk(std::mem::take(&mut self.scratch), size)?;
+            if self.scratch.len() < size {
                 self.eof = true;
-                continue;
             }
             self.pending
                 .try_reserve_exact(self.scratch.len())

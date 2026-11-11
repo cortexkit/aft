@@ -20,30 +20,15 @@ pub struct LiteralSearch {
 
 pub(crate) enum LiteralFinder<'a> {
     Exact(memchr::memmem::Finder<'a>),
-    Folded {
-        regex: Option<Regex>,
-        needle: &'a [u8],
-    },
+    Folded(&'a [u8]),
 }
 
 impl LiteralSearch {
     pub(crate) fn finder(&self) -> LiteralFinder<'_> {
         if self.case_insensitive_ascii {
-            // ASCII-only folding is the literal path's contract. A regex
-            // automaton searches it without making a lowercase haystack copy.
-            let escaped = self
-                .needle
-                .iter()
-                .map(|byte| format!("\\x{byte:02x}"))
-                .collect::<String>();
-            LiteralFinder::Folded {
-                regex: RegexBuilder::new(&escaped)
-                    .unicode(false)
-                    .case_insensitive(true)
-                    .build()
-                    .ok(),
-                needle: &self.needle,
-            }
+            // ASCII-only folding is the literal path's contract. Inspect
+            // candidate starts without making a lowercase haystack copy.
+            LiteralFinder::Folded(&self.needle)
         } else {
             LiteralFinder::Exact(memchr::memmem::Finder::new(&self.needle))
         }
@@ -54,13 +39,7 @@ impl LiteralFinder<'_> {
     pub(crate) fn find(&self, content: &[u8]) -> Option<usize> {
         match self {
             Self::Exact(finder) => finder.find(content),
-            Self::Folded {
-                regex: Some(regex), ..
-            } => regex.find(content).map(|matched| matched.start()),
-            Self::Folded {
-                regex: None,
-                needle,
-            } => {
+            Self::Folded(needle) => {
                 if needle.is_empty() {
                     return Some(0);
                 }
