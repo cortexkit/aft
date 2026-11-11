@@ -78,7 +78,7 @@ fn reap_killed_child(
     let pid = child.process_id();
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match crate::agent_commands::try_wait_pty(child.as_mut()) {
+        match crate::agent_commands::try_wait_pty(child) {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

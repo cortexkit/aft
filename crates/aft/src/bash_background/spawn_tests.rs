@@ -529,16 +529,25 @@ fn agent_commands_local_shell_roots_and_cpu_are_declared_but_internal_children_a
             module_path!(),
             "::agent_commands_local_shell_roots_and_cpu_are_declared_but_internal_children_are_not"
         );
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 name.strip_prefix("aft::").unwrap_or(name),
                 "--nocapture",
             ])
             .env(CHILD, "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated regression did not run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         return;
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -547,6 +556,10 @@ fn agent_commands_local_shell_roots_and_cpu_are_declared_but_internal_children_a
         .unwrap();
     runtime.block_on(async {
         let root = tempfile::tempdir().unwrap();
+        assert!(
+            crate::agent_commands::started(std::process::id()).is_none(),
+            "standalone mode must not register roots"
+        );
         crate::agent_commands::enable(root.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _connection = crate::agent_commands::connect(move |batch| {
