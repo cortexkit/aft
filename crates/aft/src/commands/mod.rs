@@ -34,7 +34,7 @@ pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
 pub mod extract_function;
-pub(crate) mod file_read_exact;
+pub(crate) use crate::file_read_exact;
 pub(crate) mod github_comments;
 pub mod glob;
 pub mod grep;

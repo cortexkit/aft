@@ -109,6 +109,7 @@ pub mod feature_config;
 pub mod feature_status;
 pub(crate) mod file_identity;
 pub mod file_kind;
+pub(crate) mod file_read_exact;
 pub mod fleet_status;
 pub mod format;
 pub mod fs_lock;
