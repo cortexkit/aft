@@ -38,9 +38,16 @@ async fn exact_line(scope_ref: &str, outcome: ConsentOutcome, expected: &str) {
     };
     assert_eq!(code, crate::secret::SECRET_ACCESS_UNAVAILABLE);
     assert_eq!(message, expected);
+    #[cfg(unix)]
     assert!(
         coordinator.status().is_empty(),
         "terminal outcomes clear the approval status"
+    );
+    assert_eq!(
+        coordinator
+            .activity()
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
     );
 }
 

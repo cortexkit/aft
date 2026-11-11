@@ -989,11 +989,25 @@ pub(crate) fn use_current_secret_labels(
                                 }
                             },
                             |key| {
+                                secret_rules::material::check_admissible(
+                                    key,
+                                    label,
+                                    &secret_rules::location::Location::Query("_".into()),
+                                )
+                                .map_err(|_| {
+                                    crate::secret::requests::UseError::InvalidPlan(
+                                        "material_not_admissible",
+                                    )
+                                })?;
                                 observed
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .hold(label, key)
-                                    .map_err(|_| crate::secret::requests::UseError::Unavailable)
+                                    .map_err(|_| {
+                                        crate::secret::requests::UseError::InvalidPlan(
+                                            "replacement_discloses_key",
+                                        )
+                                    })
                             },
                             || async { Ok(()) },
                         )

@@ -349,7 +349,7 @@ thread_local! {
     static TEST_DOCUMENT_OBSERVER: RefCell<Option<Box<dyn Fn(&Path)>>> = const { RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn with_secret_fetch_for_test<T>(
     vault: Arc<dyn SecretVault>,
     options: UrlFetchOptions,

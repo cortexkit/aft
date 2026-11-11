@@ -79,7 +79,7 @@ pub mod undo;
 pub mod untrust_filter_project;
 pub(crate) mod url_output;
 mod url_resolution;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use url_resolution::with_secret_fetch_for_test;
 pub mod write;
 pub mod writes_census;
