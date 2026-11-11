@@ -32,6 +32,7 @@ pub fn run_subc_mode_with_registration(
     user_config_path: Option<PathBuf>,
     registration: Option<AdoptedRegistration>,
 ) -> Result<(), SubcError> {
+    crate::commands::configure::register_runtime_hooks();
     perf_sweep::initialize();
     run_subc_mode_with_probe(
         connection_file_path,

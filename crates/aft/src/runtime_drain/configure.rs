@@ -3,10 +3,12 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Instant;
 
 use crate::context::{AppContext, ConfigureMaintenanceJob};
+
+pub(crate) type DatabaseRuntime = fn(&AppContext, &Path, &Path, crate::db::OpenMode);
 
 pub(crate) struct Hooks {
     pub drain: fn(&AppContext),
@@ -14,7 +16,7 @@ pub(crate) struct Hooks {
     pub pending: fn(&AppContext, &mut ConfigureMaintenanceState) -> bool,
     pub prefix: fn(&AppContext, &mut ConfigureMaintenanceState) -> bool,
     pub unit: fn(&Arc<AppContext>, &mut ConfigureMaintenanceState) -> bool,
-    pub database_runtime: fn(&AppContext, &Path, &Path, crate::db::OpenMode),
+    pub database_runtime: DatabaseRuntime,
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
@@ -35,6 +37,19 @@ pub(crate) fn register(hooks: Hooks) {
 
 pub(crate) fn hooks() -> &'static Hooks {
     HOOKS.get().unwrap_or(&IDLE_HOOKS)
+}
+
+pub(crate) fn database_runtime() -> Option<DatabaseRuntime> {
+    let hooks = HOOKS.get();
+    if hooks.is_none() {
+        static MISSING_REGISTRATION: Once = Once::new();
+        MISSING_REGISTRATION.call_once(|| {
+            log::error!(
+                "Database retry requires commands::configure::register_runtime_hooks; no retry was started"
+            );
+        });
+    }
+    hooks.map(|hooks| hooks.database_runtime)
 }
 
 #[cfg(test)]
