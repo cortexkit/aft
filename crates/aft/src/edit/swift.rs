@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::tool_launcher::{ToolCommand, ToolEnvironment, ToolOutcome, ToolStdin, ToolTimeout};
 use crate::format::{FormatError, SubprocessOutcome};
 
 const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,7 +59,7 @@ enum LookupOutcome {
 }
 
 pub(super) fn confirm_if_needed(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     source: &str,
     original: Option<&str>,
@@ -91,7 +92,7 @@ pub(super) fn confirm_if_needed(
 /// remains the authority. An unfinished confirmation is unknown, not evidence
 /// that the new file contains a syntax error.
 pub(super) fn confirm_created(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     source: &str,
     is_valid: Option<bool>,
@@ -103,7 +104,7 @@ pub(super) fn confirm_created(
 }
 
 fn confirm_with_compiler(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     source: &str,
     is_valid: Option<bool>,
@@ -116,7 +117,7 @@ fn confirm_with_compiler(
 }
 
 fn compiler_verdict(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     source: &str,
 ) -> Result<Option<bool>, &'static str> {
@@ -247,7 +248,7 @@ pub(super) fn with_native_swiftc<T>(f: impl FnOnce() -> T) -> Option<T> {
     })
 }
 
-fn parse(tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy, source: &str) -> ParseOutcome {
+fn parse(tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher, source: &str) -> ParseOutcome {
     #[cfg(test)]
     if let Some(outcome) =
         RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|runner| runner(source)))
@@ -274,23 +275,27 @@ fn parse_with_lookup(
 }
 
 fn run_swiftc(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     source: &str,
 ) -> ParseOutcome {
     // Parsing stdin avoids temporary files. -parse performs no type checking or imports.
-    let args = ["-parse", "-"].map(std::ffi::OsString::from);
-    let command = match tool_policy.command(path.as_os_str(), &args) {
-        Ok(command) => command,
-        Err(reason) => return ParseOutcome::Unavailable(reason),
-    };
-    parse_outcome(run_command(
-        command,
-        "swiftc",
-        source,
-        Instant::now() + parse_timeout(),
-        false,
-    ))
+    let outcome = tool_policy.run(ToolCommand {
+        tool: "swiftc".into(),
+        program: path.as_os_str().into(),
+        args: ["-parse", "-"].map(std::ffi::OsString::from).into(),
+        cwd: None,
+        stdin: ToolStdin::Source {
+            source: source.into(),
+            may_stop_reading: false,
+        },
+        environment: ToolEnvironment::Inherited,
+        timeout: ToolTimeout::AfterPreparation(parse_timeout()),
+    });
+    match outcome {
+        ToolOutcome::Refused(reason) => ParseOutcome::Unavailable(reason.0),
+        outcome => parse_outcome(outcome.into_result("swiftc")),
+    }
 }
 
 fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> ParseOutcome {
@@ -309,7 +314,7 @@ fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> ParseOutcome
 /// With `may_stop_reading`, a checker that exits before reading all of its
 /// input (bash stops at the first syntax error) is judged by its exit status;
 /// otherwise the failed write makes the run fail.
-pub(super) fn run_command(
+pub(crate) fn run_command(
     mut command: Command,
     tool: &str,
     source: &str,

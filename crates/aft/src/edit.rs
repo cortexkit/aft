@@ -2070,7 +2070,7 @@ pub(crate) fn full_validation_requested(config: &Config, params: &serde_json::Va
 /// Validate the completed multi-file operation, never its intermediate writes.
 /// Call only after all writes succeeded and rollback is no longer needed.
 pub(crate) fn validate_written_files(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     paths: &[std::path::PathBuf],
     config: &Config,
     params: &serde_json::Value,
@@ -2096,7 +2096,7 @@ pub(crate) fn validate_written_files(
 /// the project's type checker is invoked after syntax validation and the
 /// results are included in `WriteResult`.
 pub fn write_format_validate(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2118,7 +2118,7 @@ pub fn write_format_validate(
 
 /// Reuse the captured original only while its strong file identity still matches.
 pub(crate) fn write_format_validate_observed(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2138,7 +2138,7 @@ pub(crate) fn write_format_validate_observed(
 }
 
 pub(crate) fn write_format_validate_bytes_observed(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2172,7 +2172,7 @@ pub(crate) fn write_format_validate_bytes_observed(
 /// The caller owns admission for all affected files. Release a completed file
 /// immediately after its write, before invoking formatters or language servers.
 pub(crate) fn write_format_validate_admitted(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2197,9 +2197,10 @@ pub(crate) fn write_format_validate_admitted(
 mod bash;
 mod python_indent;
 mod swift;
+pub mod tool_launcher;
 
 fn write_format_validate_impl(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2405,7 +2406,7 @@ pub(crate) struct CreatedFileSyntax {
 /// for bash that includes a missing shell, since tree-sitter-bash alone
 /// rejects some valid scripts.
 pub(crate) fn check_created_file_syntax(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     source: &str,
 ) -> CreatedFileSyntax {

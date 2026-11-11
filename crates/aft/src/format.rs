@@ -4,7 +4,7 @@
 //! mapping, and the `auto_format` entry point used by `write_format_validate`.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::edit::tool_launcher::{ToolCommand, ToolStdin, ToolTimeout};
 use crate::parser::{detect_language, LangId};
 
 /// Result of running an external tool subprocess.
@@ -152,25 +153,6 @@ pub(crate) fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// Build a formatter, checker, or version-probe command under the request's
-/// resolved shell policy, without deriving a second policy from configuration.
-fn external_tool_command(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
-    command: &str,
-    args: &[&str],
-) -> Result<Command, FormatError> {
-    let args = args
-        .iter()
-        .map(std::ffi::OsString::from)
-        .collect::<Vec<_>>();
-    tool_policy
-        .command(std::ffi::OsStr::new(command), &args)
-        .map_err(|stderr| FormatError::Failed {
-            tool: command.to_string(),
-            stderr,
-        })
-}
-
 /// Spawn a subprocess and wait for completion with timeout protection.
 ///
 /// Wakes when the tool closes its output pipes, then checks for its exit. On
@@ -178,37 +160,20 @@ fn external_tool_command(
 /// and waits for it to exit. Returns `FormatError::NotFound` when the binary
 /// isn't on PATH.
 pub fn run_external_tool(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     command: &str,
     args: &[&str],
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = external_tool_command(tool_policy, command, args)?;
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
-
-    isolate_in_process_group(&mut cmd);
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Err(FormatError::NotFound {
-                tool: command.to_string(),
-            });
-        }
-        Err(e) => {
-            return Err(FormatError::Failed {
-                tool: command.to_string(),
-                stderr: e.to_string(),
-            });
-        }
-    };
-
-    let outcome = wait_with_timeout(child, command, timeout_secs)?;
+    let outcome = tool_policy
+        .run(ToolCommand::external(
+            command,
+            args,
+            working_dir,
+            timeout_secs,
+        ))
+        .into_result(command)?;
     let exit_code = outcome.status.code().unwrap_or(-1);
     if exit_code != 0 {
         return Err(FormatError::Failed {
@@ -226,19 +191,6 @@ pub fn run_external_tool(
 }
 
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
-
-fn wait_with_timeout(
-    child: Child,
-    command: &str,
-    timeout_secs: u32,
-) -> Result<SubprocessOutcome, FormatError> {
-    wait_with_deadline(
-        child,
-        command,
-        Instant::now() + Duration::from_secs(timeout_secs as u64),
-        || false,
-    )
-}
 
 // The optional gh numeric-ID lookup and Ruff version check are best-effort probes.
 // Their short budget is separate from primary GitHub requests and formatter runs.
@@ -692,17 +644,18 @@ pub(crate) fn tool_available_for_missing_warning(tool: &str, project_root: Optio
 }
 
 fn ruff_format_available(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     project_root: Option<&Path>,
 ) -> RuffAvailability {
-    // A shared version result cannot authorize this request's launch. Prepare
+    // A shared version result cannot authorize this request's launch. Check
     // under its policy first, even when another session warmed the cache.
-    let command = match ruff_version_command(tool_policy, project_root) {
+    let mut command = match ruff_version_command(tool_policy, project_root) {
         Ok(command) => command,
         Err(status) => return status,
     };
     ruff_format_availability_with_probe(project_root, || {
-        ruff_version_command_available(command, Instant::now() + AVAILABILITY_PROBE_BUDGET)
+        command.timeout = ToolTimeout::Deadline(Instant::now() + AVAILABILITY_PROBE_BUDGET);
+        ruff_version_outcome_available(tool_policy.run(command).into_result("ruff"))
     })
 }
 
@@ -732,20 +685,38 @@ fn ruff_format_availability_with_probe(
 }
 
 fn ruff_version_command(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     project_root: Option<&Path>,
-) -> Result<Command, RuffAvailability> {
+) -> Result<ToolCommand, RuffAvailability> {
     let command = resolve_tool("ruff", project_root).ok_or(RuffAvailability::Unavailable)?;
-    external_tool_command(tool_policy, &command, &["--version"]).map_err(|error| {
+    let mut command = ToolCommand::external(&command, &["--version"], None, 0);
+    command.tool = "ruff".into();
+    command.stdin = ToolStdin::Null;
+    tool_policy.check(&command).map_err(|error| {
+        let error = FormatError::Failed {
+            tool: command.program.to_string_lossy().into_owned(),
+            stderr: error.0,
+        };
         crate::slog_warn!("ruff version launch refused by request policy: {error}");
         RuffAvailability::Refused
-    })
+    })?;
+    Ok(command)
 }
 
+#[cfg(test)]
 fn ruff_version_command_available(version_command: Command, deadline: Instant) -> RuffAvailability {
-    let output = match capture_probe_command(version_command, "ruff", deadline, || {
-        crate::executor::current_job_cancelled()
-    }) {
+    ruff_version_outcome_available(capture_probe_command(
+        version_command,
+        "ruff",
+        deadline,
+        || crate::executor::current_job_cancelled(),
+    ))
+}
+
+fn ruff_version_outcome_available(
+    outcome: Result<SubprocessOutcome, FormatError>,
+) -> RuffAvailability {
+    let output = match outcome {
         Ok(output) if output.truncated => return RuffAvailability::Unknown,
         Ok(output) => output,
         Err(FormatError::Timeout { .. }) => return RuffAvailability::Unknown,
@@ -1669,7 +1640,7 @@ fn formatter_excluded_path(stderr: &str) -> bool {
 /// - `"error"` — formatter exited non-zero with an unrecognized error
 ///   (likely a real bug in the user's input or the formatter itself)
 pub fn auto_format(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     config: &Config,
 ) -> (bool, Option<String>) {
@@ -1817,37 +1788,20 @@ pub fn auto_format(
 /// Returns `FormatError::NotFound` when the binary isn't on PATH, and
 /// `FormatError::Timeout` if the deadline is exceeded.
 pub fn run_external_tool_capture(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     command: &str,
     args: &[&str],
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = external_tool_command(tool_policy, command, args)?;
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
-
-    isolate_in_process_group(&mut cmd);
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Err(FormatError::NotFound {
-                tool: command.to_string(),
-            });
-        }
-        Err(e) => {
-            return Err(FormatError::Failed {
-                tool: command.to_string(),
-                stderr: e.to_string(),
-            });
-        }
-    };
-
-    let outcome = wait_with_timeout(child, command, timeout_secs)?;
+    let outcome = tool_policy
+        .run(ToolCommand::external(
+            command,
+            args,
+            working_dir,
+            timeout_secs,
+        ))
+        .into_result(command)?;
     Ok(ExternalToolResult {
         stdout: outcome.stdout,
         stderr: outcome.stderr,
@@ -1952,7 +1906,7 @@ struct CheckerBatch {
 /// the configured project root, just as in single-file validation; detection is
 /// deliberately delayed so edits to checker configuration are also visible.
 pub(crate) fn validate_full_batch(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     paths: &[PathBuf],
     config: &Config,
 ) -> BatchValidation {
@@ -2761,7 +2715,7 @@ fn short_output_tail(output: &str) -> Option<String> {
 /// Skip reasons: `"unsupported_language"`, `"no_checker_configured"`,
 /// `"checker_not_installed"`, `"timeout"`, `"error"`
 pub fn validate_full(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     config: &Config,
 ) -> (Vec<ValidationError>, Option<String>) {
@@ -2865,6 +2819,41 @@ pub fn validate_full(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn cached_ruff_version_still_checks_policy_without_running() {
+        use crate::edit::tool_launcher::{ToolLauncher, ToolOutcome, ToolRefusal};
+        struct RefusingLauncher(std::cell::Cell<usize>);
+        impl ToolLauncher for RefusingLauncher {
+            fn check(&self, command: &ToolCommand) -> Result<(), ToolRefusal> {
+                assert_eq!(command.args, [std::ffi::OsString::from("--version")]);
+                self.0.set(self.0.get() + 1);
+                Err(ToolRefusal("sandbox_unavailable: refused".into()))
+            }
+
+            fn run(&self, _: ToolCommand) -> ToolOutcome {
+                panic!("a cached version must not bypass refusal and spawn a probe")
+            }
+        }
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("node_modules/.bin");
+        fs::create_dir_all(&bin).unwrap();
+        crate::executable_cache::write_executable(&bin.join("ruff"), b"#!/bin/sh\nexit 99\n")
+            .unwrap();
+        assert_eq!(
+            ruff_format_availability_with_probe(Some(root.path()), || RuffAvailability::Available),
+            RuffAvailability::Available
+        );
+        let launcher = RefusingLauncher(std::cell::Cell::new(0));
+        assert_eq!(
+            ruff_format_available(&launcher, Some(root.path())),
+            RuffAvailability::Refused
+        );
+        assert_eq!(launcher.0.get(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn call_keepalive_silent_formatter_supervision_preserves_result_and_timeout() {
