@@ -1034,7 +1034,7 @@ async fn audit_existing_acknowledged_key_reuse_is_a_new_call() {
     // Acknowledgement ends the old call's lifetime; reusing its key names a new call.
     ledger::ack_through(
         &reopened,
-        &row.scope.unwrap().custodian,
+        row.custodian.as_deref().unwrap(),
         ledger::provider_incarnation(),
         &cursor,
     )

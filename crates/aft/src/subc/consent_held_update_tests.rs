@@ -163,7 +163,7 @@ async fn approval_held_update_is_gated_durable_and_followed_by_one_terminal() {
         );
         let scope = row.scope.unwrap();
         let owner = scope.owner;
-        let custodian = scope.custodian;
+        let custodian = row.custodian.unwrap();
         assert_eq!(owner, "reserved:prefrontal-core");
         assert_eq!(custodian, "reserved:basal");
         let feed = |conn: &rusqlite::Connection, incarnation: &str| -> Value {
