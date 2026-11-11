@@ -1,0 +1,65 @@
+name: Probe narli Windows tests
+# Temporary probe: runs only on this branch, never on main.
+on:
+  push:
+    branches: [probe/narli-windows]
+
+jobs:
+  probe:
+    runs-on: [self-hosted, narli]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/native-ci-state
+
+      - name: Machine facts
+        shell: pwsh
+        run: |
+          "TEMP=$env:TEMP"
+          "TMP=$env:TMP"
+          "USERPROFILE=$env:USERPROFILE"
+          [Environment]::OSVersion
+          Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,BuildNumber
+          Get-Volume | Format-Table -AutoSize
+          fsutil fsinfo volumeinfo C:
+          fsutil 8dot3name query C:
+          $tempDrive = (Split-Path -Qualifier $env:TEMP)
+          if ($tempDrive -ne 'C:') { fsutil fsinfo volumeinfo $tempDrive; fsutil 8dot3name query $tempDrive }
+          whoami.exe /priv
+          try { rust-analyzer --version } catch { "rust-analyzer: $_" }
+          rustc -Vv
+          cargo -V
+
+      - name: Replace-file tests (verbose)
+        if: always()
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          RUST_BACKTRACE: "1"
+        run: cargo test -p agent-file-tools --features test-hooks --lib -- edit::windows_replace --nocapture --test-threads=1
+
+      - name: TODO count race (5 runs)
+        if: always()
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+        run: |
+          $failed = 0
+          foreach ($i in 1..5) {
+            cargo test -p agent-file-tools --features test-hooks --lib -- inspect::scanners::todos::tests::a_count_pending_while_the_store_builds_is_taken_again_when_it_publishes --exact --nocapture
+            if ($LASTEXITCODE -ne 0) { $failed++ }
+          }
+          "todos race: $failed of 5 runs failed"
+
+      - name: rust-analyzer path test
+        if: always()
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          RUST_BACKTRACE: "1"
+        run: cargo test -p agent-file-tools --features test-hooks --test integration -- real_rust_analyzer_checks_do_not_block_cargo_build --nocapture
+
+      - if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
