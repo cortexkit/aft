@@ -202,8 +202,8 @@ fn resolve_secret_fetch(
     Ok(document)
 }
 
-/// The vault a placeholder fetch resolves through: the one bash uses, which in
-/// production answers `Unavailable` to everything. Tests may install their own.
+/// The same per-call vault factory bash uses: the live scoped subc transport
+/// under AFT's daemon identity, or UnavailableVault without a usable daemon.
 fn fetch_vault() -> Arc<dyn SecretVault> {
     #[cfg(test)]
     if let Some(vault) = TEST_FETCH_VAULT.with(|slot| slot.borrow().clone()) {

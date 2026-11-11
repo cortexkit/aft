@@ -265,9 +265,10 @@ async fn prepare_and_send(
         unsettled.retain(|name| name != label);
         let answer = match answer {
             Ok(answer) => answer,
-            Err(crate::secret::requests::UseError::NotApproved) => {
-                return Ok(not_approved(label, &authority.host, state))
-            }
+            Err(
+                crate::secret::requests::UseError::Declined
+                | crate::secret::requests::UseError::Expired,
+            ) => return Ok(not_approved(label, &authority.host, state)),
             Err(_) => return Err(label.clone()),
         };
         match answer {

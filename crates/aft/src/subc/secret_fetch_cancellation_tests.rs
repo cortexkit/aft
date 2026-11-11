@@ -356,3 +356,102 @@ async fn foreground_fetch_cancellation_does_not_wait_for_local_runtime_blocking_
     );
     vault.release();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_fetch_refuses_non_query_locations_before_any_card_or_releasing_retry() {
+    let _consent_lock = CONSENT_TEST_LOCK.lock().await;
+    let _secret_lock = crate::secret::consent::TEST_TRANSPORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for covered in [false, true] {
+        let f = fixture(FakeCingulate::up());
+        let _restore = Restore;
+        let daemon = FakeClaustrum::start();
+        {
+            let mut state = daemon.state.lock().unwrap();
+            state.pending_expires_at_ms = Some(crate::secret::vault::now_ms() + 600_000);
+            state.record = Some(Record {
+                name: "first".into(),
+                host: "api.secret.test".into(),
+                path: "/v1".into(),
+                location: "authorization_bearer".into(),
+                key: b"must-never-leave-fetch-0123456789".to_vec(),
+            });
+        }
+        let transport = crate::secret::transport::SubcSecretUseTransport::for_test(
+            daemon.path.clone(),
+            subc_protocol::BindIdentity::new("test", "session"),
+            Duration::from_secs(2),
+            subc_client_rs::ConsumerIdentity {
+                module_id: "aft".into(),
+                launch_nonce: NONCE.into(),
+            },
+        );
+        let vault = Arc::new(SubcSecretVault::new(Arc::new(transport)));
+        if covered {
+            let scope = crate::secret::SecretScope::from_stamp(f.head.scope.as_ref().unwrap());
+            let ask = vault.clone();
+            let answer = tokio::task::spawn_blocking(move || {
+                ask.use_secret(
+                    &scope,
+                    "first",
+                    &crate::secret::ApiKeyTarget {
+                        scheme: "https".into(),
+                        host: "api.secret.test".into(),
+                        port: Some(443),
+                        path: "/v1/doc.md".into(),
+                    },
+                )
+            })
+            .await
+            .unwrap();
+            let crate::secret::UseAnswer::ApprovalRequired(pending) = answer else {
+                panic!("setup needs one real vault statement")
+            };
+            daemon
+                .state
+                .lock()
+                .unwrap()
+                .approve(&pending.statement_b64url);
+        }
+        let phone = Arc::new(Phone::default());
+        *PHONE.lock().unwrap() = Some(phone.clone());
+        super::super::secret_consent::install_subc_transport(phone.clone());
+        let (address, tls, sends, server) = server().await;
+        *FETCH_ENV.lock().unwrap() = Some((
+            vault,
+            UrlFetchOptions {
+                tls_config: Some(tls),
+                public_host_overrides: vec![(
+                    "api.secret.test".into(),
+                    vec!["93.184.216.34".parse().unwrap()],
+                )],
+                connect_overrides: vec![("api.secret.test".into(), address)],
+                ..Default::default()
+            },
+        ));
+        let url = format!(
+            "https://api.secret.test:{}/v1/doc.md?first={{{{ck-secret:first}}}}",
+            address.port()
+        );
+        let reply = f
+            .checkout_tool(&f.head, "outline", json!({"target":url}), 93, dispatch)
+            .await;
+        assert_eq!(reply["structuredContent"]["success"], false, "{reply}");
+        assert!(
+            phone.requests.lock().unwrap().is_empty(),
+            "a pending non-query statement must be refused before a phone card is filed"
+        );
+        assert_eq!(
+            daemon.state.lock().unwrap().calls,
+            if covered { 2 } else { 1 },
+            "including the setup ask, there is no releasing retry after refusing the location"
+        );
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "even an already-covered release is dropped unsent"
+        );
+        server.abort();
+    }
+}

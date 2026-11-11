@@ -312,3 +312,20 @@ fn fake_claustrum_orders_caller_grammar_scope_and_target_checks() {
         );
     }
 }
+
+#[test]
+fn secret_use_module_error_discards_peer_detail_before_returning_the_classification() {
+    let daemon = FakeClaustrum::start();
+    const KEY: &str = "module-error-credential-0123456789";
+    daemon.state.lock().unwrap().module_error_message = Some(KEY.into());
+    let transport = transport(&daemon);
+    let mut params = golden(0);
+    params["display_name"] = json!("invalid sender field");
+    let rejected = call(&transport, params);
+    assert_eq!(rejected, json!({"code":"invalid_params", "message":""}));
+    assert!(!serde_json::to_string(&rejected).unwrap().contains(KEY));
+    assert_eq!(
+        parse_answer(&rejected).unwrap().refusal(),
+        Some(SecretUseRefusal::InvalidParams)
+    );
+}

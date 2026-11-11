@@ -149,8 +149,22 @@ impl ResultBody {
                 return Err(malformed());
             }
             return Ok(SecretUseAnswer::Refused(VaultError {
-                code: error.code.as_str().into(),
-                class: error.class.as_ref().map(|class| class.as_str().into()),
+                code: match error.code.as_str() {
+                    "not_found" => "not_found",
+                    "limit_exceeded" => "limit_exceeded",
+                    "secret_setup_incomplete" => "secret_setup_incomplete",
+                    "pending_limit" => "pending_limit",
+                    "store_error" => "store_error",
+                    _ => return Err(malformed()),
+                }
+                .into(),
+                class: match error.class.as_ref().map(Text::as_str) {
+                    None => None,
+                    Some("permanent") => Some("permanent".into()),
+                    Some("transient") => Some("transient".into()),
+                    Some("context_overflow") => Some("context_overflow".into()),
+                    _ => return Err(malformed()),
+                },
             }));
         }
         fn text(v: &Option<Text>) -> Result<&str, ReplyError> {
@@ -204,10 +218,12 @@ pub(super) fn parse(bytes: &[u8]) -> Result<SecretUseAnswer, ReplyError> {
     let envelope: Envelope = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     match (envelope.result, envelope.code, envelope.message) {
         (Some(result), None, None) => result.reply(),
-        (None, Some(code), Some(message)) => Ok(SecretUseAnswer::Rejected(VaultTransportError {
-            code: code.as_str().into(),
-            message: message.as_str().into(),
-        })),
+        (None, Some(code), Some(_message)) if code.as_str() == "invalid_params" => {
+            Ok(SecretUseAnswer::Rejected(VaultTransportError {
+                code: "invalid_params".into(),
+                message: String::new(),
+            }))
+        }
         _ => Err(malformed()),
     }
 }
@@ -281,5 +297,55 @@ mod escaped_tests {
             WIPES.with(|n| n.get()) >= 3,
             "earlier parsed credential fields are wiped when a later field is malformed"
         );
+    }
+}
+
+#[cfg(test)]
+mod classified_error_tests {
+    use super::*;
+    #[test]
+    fn owned_error_decode_retains_only_a_static_classification_and_wipes_peer_detail() {
+        const KEY: &str = "peer-error-credential-0123456789";
+        WIPES.with(|count| count.set(0));
+        let payload = Zeroizing::new(format!(r#"{{"code":"invalid_params","message":"{KEY}"}}"#));
+        let answer = parse(payload.as_bytes()).unwrap();
+        let SecretUseAnswer::Rejected(error) = answer else {
+            panic!("classified module error")
+        };
+        assert_eq!(error.code, "invalid_params");
+        assert!(
+            error.message.is_empty(),
+            "peer detail is discarded rather than copied into an ordinary String"
+        );
+        assert!(!format!("{error:?}").contains(KEY));
+        assert!(WIPES.with(|count| count.get()) >= 2);
+        for payload in [
+            format!(r#"{{"result":{{"error":{{"code":"{KEY}","class":"permanent"}}}}}}"#),
+            format!(r#"{{"result":{{"error":{{"code":"not_found","class":"{KEY}"}}}}}}"#),
+            format!(r#"{{"code":"{KEY}","message":"detail"}}"#),
+        ] {
+            let payload = Zeroizing::new(payload);
+            let failure = parse(payload.as_bytes()).unwrap_err();
+            assert!(!format!("{failure:?}").contains(KEY));
+        }
+    }
+
+    #[test]
+    fn owned_error_decode_preserves_every_documented_sender_refusal_classification() {
+        for (code, class) in [
+            ("not_found", "permanent"),
+            ("limit_exceeded", "context_overflow"),
+            ("secret_setup_incomplete", "permanent"),
+            ("pending_limit", "transient"),
+            ("store_error", "transient"),
+        ] {
+            let payload =
+                format!(r#"{{"result":{{"error":{{"code":"{code}","class":"{class}"}}}}}}"#);
+            let SecretUseAnswer::Refused(error) = parse(payload.as_bytes()).unwrap() else {
+                panic!("sender refusal")
+            };
+            assert_eq!(error.code, code);
+            assert_eq!(error.class.as_deref(), Some(class));
+        }
     }
 }

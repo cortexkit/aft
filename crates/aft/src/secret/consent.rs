@@ -60,6 +60,8 @@ pub enum ConsentOutcome {
     AnsweredOnce,
     Declined,
     Expired,
+    /// The caller left or the card was withdrawn; this is not a phone answer.
+    Cancelled,
     /// Still pending when the call's hold ended: the call ends
     /// `access_pending` and the retried call asks again.
     Pending,
@@ -78,6 +80,7 @@ impl std::fmt::Debug for ConsentOutcome {
             ConsentOutcome::AnsweredOnce => f.write_str("AnsweredOnce"),
             ConsentOutcome::Declined => f.write_str("Declined"),
             ConsentOutcome::Expired => f.write_str("Expired"),
+            ConsentOutcome::Cancelled => f.write_str("Cancelled"),
             ConsentOutcome::Pending => f.write_str("Pending"),
             ConsentOutcome::Unavailable { detail } => f
                 .debug_struct("Unavailable")
@@ -111,9 +114,10 @@ pub trait SecretConsentTransport: Send + Sync + 'static {
             let ask = request.clone();
             let held = tokio::task::spawn_blocking(move || worker.hold(&ask));
             tokio::select! {
-                result = held => result.unwrap_or(ConsentOutcome::Expired),
+                result = held => result.unwrap_or(ConsentOutcome::Unavailable { detail: "Cingulate could not settle the secret-use card".into() }),
                 () = cancel.cancelled() => {
-                    tokio::task::spawn_blocking(move || self.withhold(&request)).await.unwrap_or(ConsentOutcome::Expired)
+                    let _ = tokio::task::spawn_blocking(move || self.withhold(&request)).await;
+                    ConsentOutcome::Cancelled
                 }
             }
         })
@@ -213,6 +217,11 @@ static CARDS: std::sync::LazyLock<
 struct Waiter(std::sync::Arc<SharedCard>);
 impl Drop for Waiter {
     fn drop(&mut self) {
+        // Join increments use this same lock: a joining waiter must be counted
+        // before the last departure can cancel the shared phone card.
+        let _cards = CARDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self
             .0
             .waiters
@@ -222,6 +231,60 @@ impl Drop for Waiter {
         {
             self.0.cancel.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod waiter_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_last_waiter_cannot_decrement_or_cancel_while_a_join_holds_the_cards_lock() {
+        let card = Arc::new(SharedCard {
+            created: Instant::now(),
+            statement: "statement".into(),
+            expires: u64::MAX,
+            outcome: tokio::sync::watch::channel(None).0,
+            cancel: Default::default(),
+            waiters: AtomicUsize::new(1),
+        });
+        let cards = CARDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let leaving = card.clone();
+        let (started, start) = std::sync::mpsc::channel();
+        let (finished, finish) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            drop(Waiter(leaving));
+            finished.send(()).unwrap();
+        });
+        start.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                finish.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the decrement/cancel decision must wait for the joining critical section"
+        );
+        assert_eq!(card.waiters.load(Ordering::Acquire), 1);
+        assert!(!card.cancel.is_cancelled());
+        card.waiters.fetch_add(1, Ordering::AcqRel);
+        drop(cards);
+        finish.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(card.waiters.load(Ordering::Acquire), 1);
+        assert!(
+            !card.cancel.is_cancelled(),
+            "the already-counted join still owns the card"
+        );
+        drop(Waiter(card.clone()));
+        assert!(card.cancel.is_cancelled());
     }
 }
 
@@ -289,7 +352,9 @@ pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcom
             return answer;
         }
         if receiver.changed().await.is_err() {
-            return ConsentOutcome::Expired;
+            return ConsentOutcome::Unavailable {
+                detail: "Cingulate could not settle the secret-use card".into(),
+            };
         }
     }
 }
@@ -324,3 +389,7 @@ pub fn request_params(request: &SecretConsentRequest) -> serde_json::Value {
     }
     params
 }
+
+#[cfg(test)]
+#[path = "consent_cancel_tests.rs"]
+mod cancellation_cache_tests;

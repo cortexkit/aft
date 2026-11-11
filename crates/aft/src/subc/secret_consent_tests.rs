@@ -977,7 +977,7 @@ fn secret_cards_reject_unknown_or_permission_reply_shapes() {
 }
 
 #[test]
-fn withholding_a_secret_card_withdraws_once_and_keeps_the_terminal_expired_outcome() {
+fn withholding_a_secret_card_withdraws_once_and_keeps_the_terminal_cancelled_outcome() {
     let runtime = secret_consent_runtime();
     let cards = Arc::new(SecretCards {
         record: "pending",
@@ -992,7 +992,7 @@ fn withholding_a_secret_card_withdraws_once_and_keeps_the_terminal_expired_outco
     };
     assert!(matches!(
         crate::secret::withhold_consent(&pending.request),
-        ConsentOutcome::Expired
+        ConsentOutcome::Cancelled
     ));
     withdraw_secret_consent(&pending);
     let calls = cards.calls.lock().unwrap();
@@ -1239,7 +1239,7 @@ fn every_vendored_secret_approval_sample_matches_its_source_checksum_and_decodes
     let withdrawn = json!({"kind":"secret_use", "state":"withdrawn"});
     assert_eq!(
         decode_secret_record(&withdrawn, "one"),
-        ConsentOutcome::Expired
+        ConsentOutcome::Cancelled
     );
 }
 
@@ -1250,6 +1250,7 @@ struct HeldCardEndpoint {
     allow_after: usize,
     fail_withdraw: bool,
     fail_await: bool,
+    pending_early: bool,
 }
 impl super::super::consent::ConsentTransport for HeldCardEndpoint {
     fn call(
@@ -1264,6 +1265,7 @@ impl super::super::consent::ConsentTransport for HeldCardEndpoint {
         let allow = self.allow_after > 0 && attempt + 1 >= self.allow_after;
         let fail_withdraw = self.fail_withdraw;
         let fail_await = self.fail_await;
+        let pending_early = self.pending_early;
         Box::pin(async move {
             match call.method {
                 "consent.request" => Ok(serde_json::json!({"elicitation_id":"el_held"})),
@@ -1273,10 +1275,12 @@ impl super::super::consent::ConsentTransport for HeldCardEndpoint {
                             "offline".into(),
                         ));
                     }
-                    tokio::time::sleep(Duration::from_millis(
-                        call.params["timeout_ms"].as_u64().unwrap(),
-                    ))
-                    .await;
+                    if !pending_early {
+                        tokio::time::sleep(Duration::from_millis(
+                            call.params["timeout_ms"].as_u64().unwrap(),
+                        ))
+                        .await;
+                    }
                     if allow {
                         filer_reply("allowed")
                     } else {
@@ -1368,7 +1372,7 @@ async fn production_secret_card_cancellation_withdraws_once_on_its_original_scop
             cards: Default::default(),
         });
         let cancel = crate::secret::consent::Cancellation::default();
-        let waiter = tokio::spawn(transport.wait(
+        let waiter = tokio::spawn(transport.clone().wait(
             held_request(crate::secret::vault::now_ms() + 600_000),
             cancel.clone(),
         ));
@@ -1381,7 +1385,23 @@ async fn production_secret_card_cancellation_withdraws_once_on_its_original_scop
             .any(|call| call.method == "consent.await"));
         cancel.cancel();
         let outcome = waiter.await.unwrap();
-        assert_eq!(matches!(outcome, ConsentOutcome::Expired), !fail_withdraw);
+        assert_eq!(
+            outcome,
+            ConsentOutcome::Cancelled,
+            "withdrawal failure does not turn a caller cancellation into a user answer"
+        );
+        let cached = transport
+            .file_cancellable(
+                &held_request(crate::secret::vault::now_ms() + 600_000),
+                Duration::ZERO,
+                None,
+            )
+            .await;
+        assert_eq!(
+            cached,
+            ConsentOutcome::Cancelled,
+            "the original requester cache retains cancellation, not expiry"
+        );
         for _ in 0..3 {
             tokio::task::yield_now().await;
         }
@@ -1401,7 +1421,7 @@ async fn production_secret_card_cancellation_withdraws_once_on_its_original_scop
 }
 
 #[tokio::test]
-async fn a_failed_secret_card_await_withdraws_before_returning_unavailable_and_cancelled_filing_does_not_start(
+async fn a_failed_secret_card_await_withdraws_before_returning_cancelled_and_cancelled_filing_does_not_start(
 ) {
     let endpoint = Arc::new(HeldCardEndpoint {
         fail_await: true,
@@ -1418,7 +1438,7 @@ async fn a_failed_secret_card_await_withdraws_before_returning_unavailable_and_c
             Default::default(),
         )
         .await;
-    assert!(matches!(answer, ConsentOutcome::Unavailable { .. }));
+    assert_eq!(answer, ConsentOutcome::Cancelled, "a filed card may already have reached the person; a failed await is not a failed filing or a user answer");
     let calls = endpoint.calls.lock().unwrap();
     assert_eq!(
         calls.iter().map(|call| call.method).collect::<Vec<_>>(),
@@ -1441,10 +1461,147 @@ async fn a_failed_secret_card_await_withdraws_before_returning_unavailable_and_c
                 cancel
             )
             .await,
-        ConsentOutcome::Expired
+        ConsentOutcome::Cancelled
     );
     assert!(
         endpoint.calls.lock().unwrap().is_empty(),
         "a worker scheduled after its last request disappeared must not file a card"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn early_pending_secret_answers_back_off_before_reawaiting_the_same_card() {
+    let endpoint = Arc::new(HeldCardEndpoint {
+        pending_early: true,
+        ..Default::default()
+    });
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let cancel = crate::secret::consent::Cancellation::default();
+    let waiter = tokio::spawn(transport.wait(
+        held_request(crate::secret::vault::now_ms() + 600_000),
+        cancel.clone(),
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.awaits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    tokio::time::advance(SECRET_PENDING_BACKOFF - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        endpoint.awaits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an early pending reply cannot spin on consent.await"
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.awaits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    cancel.cancel();
+    assert_eq!(waiter.await.unwrap(), ConsentOutcome::Cancelled);
+    let calls = endpoint.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.method == "consent.request")
+            .count(),
+        1
+    );
+    assert!(calls
+        .iter()
+        .filter(|call| call.method == "consent.await")
+        .all(|call| call.params["elicitation_id"] == "el_held"));
+}
+
+#[path = "secret_consent_outcome_tests.rs"]
+mod fetch_outcome_lines;
+
+struct LostFilingEndpoint {
+    calls: StdMutex<Vec<super::super::consent::ConsentCall>>,
+    files: std::sync::atomic::AtomicUsize,
+    garbled_first: bool,
+    fail_recovery: bool,
+    fail_withdraw: bool,
+}
+impl super::super::consent::ConsentTransport for LostFilingEndpoint {
+    fn call(
+        &self,
+        call: super::super::consent::ConsentCall,
+    ) -> super::super::consent::ConsentFuture {
+        self.calls.lock().unwrap().push(call.clone());
+        let reply = match call.method {
+            "consent.request" => match self.files.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            {
+                0 if self.garbled_first => Ok(json!({"accepted":true})),
+                0 => Err(super::super::consent::ConsentError::Unavailable(
+                    "lost reply".into(),
+                )),
+                1 if self.fail_recovery => Err(super::super::consent::ConsentError::Unavailable(
+                    "recovery unavailable".into(),
+                )),
+                1 => Ok(json!({"elicitation_id":"el_recovered"})),
+                _ => panic!("filing recovery must be bounded to one identical retry"),
+            },
+            "consent.withdraw" if self.fail_withdraw => Err(
+                super::super::consent::ConsentError::Unavailable("withdraw unavailable".into()),
+            ),
+            "consent.withdraw" => Ok(json!({"state":"withdrawn"})),
+            other => panic!("a lost filing must be withdrawn, never awaited: {other}"),
+        };
+        Box::pin(async move { reply })
+    }
+}
+
+#[tokio::test]
+async fn lost_or_garbled_secret_filing_is_refiled_identically_once_then_withdrawn_on_the_original_scope(
+) {
+    for garbled_first in [false, true] {
+        for fail_recovery in [false, true] {
+            for fail_withdraw in [false, true] {
+                let endpoint = Arc::new(LostFilingEndpoint {
+                    calls: Default::default(),
+                    files: Default::default(),
+                    garbled_first,
+                    fail_recovery,
+                    fail_withdraw,
+                });
+                let transport = SubcSecretConsent {
+                    transport: endpoint.clone(),
+                    runtime: tokio::runtime::Handle::current(),
+                    cards: Default::default(),
+                };
+                let request = held_request(crate::secret::vault::now_ms() + 600_000);
+                let answer = transport
+                    .file_cancellable(&request, SECRET_AWAIT_CAP, Some(&Default::default()))
+                    .await;
+                if fail_recovery {
+                    assert!(matches!(answer, ConsentOutcome::Unavailable { .. }));
+                } else {
+                    assert_eq!(answer, ConsentOutcome::Cancelled, "a recovered known card was filed for the person and is cancelled, not expired");
+                }
+                let cached = transport
+                    .file_cancellable(&request, SECRET_AWAIT_CAP, None)
+                    .await;
+                assert_eq!(
+                    cached, answer,
+                    "a repeated caller cannot launch another recovery or withdrawal loop"
+                );
+                let calls = endpoint.calls.lock().unwrap();
+                assert_eq!(calls.len(), if fail_recovery { 2 } else { 3 });
+                assert_eq!(calls[0].method, "consent.request");
+                assert_eq!(calls[1].method, "consent.request");
+                assert_eq!(
+                    calls[0].params, calls[1].params,
+                    "the complete request body, including expiry, is replayed byte for byte"
+                );
+                assert!(calls.iter().all(|call| call.scope == calls[0].scope
+                    && call.project_root == calls[0].project_root
+                    && call.session == calls[0].session));
+                if !fail_recovery {
+                    assert_eq!(calls[2].method, "consent.withdraw");
+                    assert_eq!(calls[2].params, json!({"elicitation_id":"el_recovered"}));
+                }
+            }
+        }
+    }
 }

@@ -35,6 +35,9 @@ use zeroize::Zeroizing;
 
 use crate::parser::detect_language;
 
+#[path = "url_fetch_sensitive.rs"]
+mod sensitive;
+
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// Longest a request may take to set up its connection (name lookup, TCP
@@ -847,12 +850,18 @@ impl SecretFetchCancellation {
         }
     }
     pub(crate) fn is_cancelled(&self) -> bool {
+        self.reason().is_some()
+    }
+    pub(crate) fn reason(&self) -> Option<crate::secret::requests::UseError> {
         self.job
             .as_ref()
             .is_some_and(|job| job.cancel_requested_before_commit())
-            || self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
+            .then_some(crate::secret::requests::UseError::Cancelled)
+            .or_else(|| {
+                self.deadline
+                    .is_some_and(|at| Instant::now() >= at)
+                    .then_some(crate::secret::requests::UseError::Expired)
+            })
     }
     pub(crate) fn expires_at_ms(&self) -> Option<u64> {
         self.deadline.map(|deadline| {
@@ -882,7 +891,7 @@ impl SecretFetchCancellation {
 /// on drop, only until the fetch returns, so every header and body read after
 /// a key was sent is scrubbed of it.
 #[derive(Default)]
-struct HeldKeys(Vec<(String, Zeroizing<Vec<u8>>)>);
+pub(crate) struct HeldKeys(Vec<(String, Zeroizing<Vec<u8>>)>);
 
 impl HeldKeys {
     fn matchers(&self) -> Result<Vec<MatcherSet>, ScrubError> {
@@ -894,7 +903,7 @@ impl HeldKeys {
 
     /// Hold `key` for `label`, refusing a key whose matcher would collide with
     /// one already held (the scrubber could then write one key into a reply).
-    fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
+    pub(crate) fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
         if self
             .0
             .iter()
@@ -925,7 +934,7 @@ impl HeldKeys {
     /// Error text from a library (reqwest, the decoders) with every held key
     /// replaced by its placeholder. Text that still spells a key after that,
     /// or that cannot be scrubbed, is dropped whole.
-    fn sanitize_detail(&self, detail: &str) -> String {
+    pub(crate) fn sanitize_detail(&self, detail: &str) -> String {
         let deadline = Instant::now() + DETAIL_CHECK_LIMIT;
         match self.scrub(detail.as_bytes()) {
             Ok(clean) if self.reveal(&clean, deadline).is_clean() => {
@@ -1047,23 +1056,21 @@ fn fetch_with_secrets(
         let waited = waiting.elapsed();
         deadline.at += waited;
         crate::bounded_io::exclude_secret_approval_wait(waited);
-        if outbound.is_some() {
-            key_sent.set(true);
-        }
         let sent = send_request(
             &client,
-            outbound.as_ref().unwrap_or(&current),
+            outbound.as_deref().unwrap_or(&current),
             Some(SecretSend {
                 shown: current.as_str(),
                 held: &held,
                 released: outbound.is_some(),
                 cancellation: &secrets.cancellation,
+                key_sent,
             }),
             &deadline,
             &progress,
         );
         // Wipe this function's copy of the key-bearing URL now that it is sent.
-        drop(outbound.map(|url| Zeroizing::new(String::from(url))));
+        drop(outbound);
         let response = sent?;
         if !response.status().is_redirection() {
             break response;
@@ -1167,7 +1174,6 @@ fn fetch_with_secrets(
         };
     let (raw, mut download_truncated) =
         read_response_body_with(response, logical_url, &deadline, &sanitize)?;
-    let raw = Zeroizing::new(raw);
     let decoded = decode_secret_body(&raw, &codings, &mut download_truncated, logical_url)?;
     let mut body = held.scrub(&decoded).map_err(scrub_refusal(logical_url))?;
     drop(decoded);
@@ -1381,11 +1387,11 @@ fn decode_secret_body(
     codings: &[SecretCoding],
     truncated: &mut bool,
     url: &str,
-) -> Result<Zeroizing<Vec<u8>>, UrlFetchError> {
+) -> Result<sensitive::Bytes, UrlFetchError> {
     use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
     use tokio::io::{AsyncRead, BufReader};
 
-    let mut data = Zeroizing::new(body.to_vec());
+    let mut data = sensitive::Factory::current().copy(body);
     for coding in codings.iter().rev() {
         let input: &[u8] = &data;
         let reader: std::pin::Pin<Box<dyn AsyncRead + Send + '_>> = match coding {
@@ -1417,14 +1423,15 @@ fn decode_secret_body(
 fn drain_decoder(
     mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + '_>>,
     input_truncated: bool,
-) -> Result<(Zeroizing<Vec<u8>>, bool), ()> {
+) -> Result<(sensitive::Bytes, bool), ()> {
     use std::future::Future;
     use tokio::io::AsyncReadExt;
 
-    let mut output = Zeroizing::new(Vec::new());
+    let factory = sensitive::Factory::current();
+    let mut output = factory.with_capacity(0);
     let polled = {
         let decoding = async {
-            let mut buffer = Zeroizing::new(vec![0u8; 16 * 1024]);
+            let mut buffer = factory.zeroed(16 * 1024);
             loop {
                 match reader.read(&mut buffer).await {
                     Ok(0) => return Ok(false),
@@ -1457,15 +1464,15 @@ fn drain_decoder(
 ///
 /// Returns the URL to send when a rule substitutes a key into this hop, or
 /// `None` to send `current` itself, whose placeholders then go out literally.
-/// Only `query` rules substitute; a rule with any other location leaves its
-/// placeholder literal. Each scanned label gets one audit record for the hop,
+/// Only `query` rules substitute; another location refuses before any card or
+/// releasing retry. Each scanned label gets one audit record for the hop,
 /// and a hop whose records cannot be written is not sent.
 fn secret_hop(
     current: &Url,
     hop: usize,
     secrets: &SecretFetch,
     held: &mut HeldKeys,
-) -> Result<Option<Url>, UrlFetchError> {
+) -> Result<Option<SecretOutboundUrl>, UrlFetchError> {
     let logical = current.as_str();
     let path = current.path();
     let target = match current.query() {
@@ -1548,7 +1555,7 @@ fn secret_hop(
             let location = secret_rules::location::parse_vault_location(&location)
                 .ok_or_else(|| refused(held, "missing_material"))?;
             if !matches!(location, Location::Query(_)) {
-                continue;
+                return Err(refused(held, "missing_material"));
             }
             if check_admissible(material.expose(), label, &location).is_err() {
                 return Err(refused(held, "material_not_admissible"));
@@ -1632,19 +1639,59 @@ fn secret_hop(
     };
     emit_hop_audit(secrets, held, hop, Some(&authority), &rules, decide)
         .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
-    Ok(Some(secret_outbound_url(current, wire_path, substituted)))
+    secret_outbound_url(current, wire_path, substituted)
+        .map(Some)
+        .ok_or_else(|| refused(held, "malformed_query"))
 }
 
 #[cfg(test)]
 thread_local! { static SECRET_URL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-fn secret_outbound_url(current: &Url, wire_path: &str, substituted: &str) -> Url {
+struct SecretOutboundUrl(Option<Url>);
+impl std::ops::Deref for SecretOutboundUrl {
+    type Target = Url;
+    fn deref(&self) -> &Url {
+        self.0
+            .as_ref()
+            .expect("outbound URL remains owned until drop")
+    }
+}
+impl Drop for SecretOutboundUrl {
+    fn drop(&mut self) {
+        if let Some(url) = self.0.take() {
+            drop(Zeroizing::new(String::from(url)));
+        }
+    }
+}
+impl fmt::Debug for SecretOutboundUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProtectedOutboundUrl")
+    }
+}
+
+fn secret_outbound_url(
+    current: &Url,
+    wire_path: &str,
+    substituted: &str,
+) -> Option<SecretOutboundUrl> {
     #[cfg(test)]
     SECRET_URL_BUILDS.with(|n| n.set(n.get() + 1));
-    let mut outbound = current.clone();
-    outbound.set_path(wire_path);
-    outbound.set_query(Some(substituted));
-    outbound
+    let prefix = &current[..url::Position::BeforePath];
+    let capacity = prefix
+        .len()
+        .checked_add(wire_path.len())?
+        .checked_add(1)?
+        .checked_add(substituted.len())?;
+    // Build the complete serialization in protected, pre-sized storage instead
+    // of reallocating a partially key-bearing Url with clone/set_query.
+    let mut serialized = sensitive::Factory::current().with_capacity(capacity);
+    serialized.extend_from_slice(prefix.as_bytes());
+    serialized.extend_from_slice(wire_path.as_bytes());
+    serialized.extend_from_slice(b"?");
+    serialized.extend_from_slice(substituted.as_bytes());
+    Some(SecretOutboundUrl(Some(
+        Url::parse(std::str::from_utf8(&serialized).ok()?).ok()?,
+    )))
 }
 
 fn substitute_query(
@@ -2087,6 +2134,7 @@ struct SecretSend<'a> {
     held: &'a HeldKeys,
     released: bool,
     cancellation: &'a SecretFetchCancellation,
+    key_sent: &'a std::cell::Cell<bool>,
 }
 
 /// [`send_with_transient_retries`] for one request. With `secret` set, the
@@ -2143,6 +2191,9 @@ fn send_request_attempts(
         }
         if secret.is_some_and(|secret| secret.cancellation.is_cancelled()) {
             return Err(secret_fetch_refused("missing_material", named));
+        }
+        if let Some(secret) = secret.filter(|secret| secret.released) {
+            secret.key_sent.set(true);
         }
         let error = match request.send() {
             Ok(response) => return Ok(response),
@@ -3176,10 +3227,10 @@ fn element_attr_value<'a>(element: &'a Element<'_>, name: &str) -> Option<&'a st
 }
 
 enum BodyReadEvent {
-    Chunk(Vec<u8>),
+    Chunk(sensitive::Bytes),
     Done,
     /// A read failed after waiting this long for data.
-    Error(io::ErrorKind, String, Duration),
+    Error(io::ErrorKind, sensitive::Bytes, Duration),
 }
 
 /// Read at most [`MAX_RESPONSE_BYTES`] (plus one lookahead byte) of the body.
@@ -3201,6 +3252,7 @@ fn read_response_body(
     deadline: &FetchDeadline,
 ) -> Result<(Vec<u8>, bool), UrlFetchError> {
     read_response_body_with(response, url, deadline, &|detail: &str| detail.to_string())
+        .map(|(body, truncated)| (body.into_plain_vec(), truncated))
 }
 
 /// [`read_response_body`] with `detail` applied to the text of a failed read
@@ -3210,15 +3262,17 @@ fn read_response_body_with(
     url: &str,
     deadline: &FetchDeadline,
     detail: &dyn Fn(&str) -> String,
-) -> Result<(Vec<u8>, bool), UrlFetchError> {
+) -> Result<(sensitive::Bytes, bool), UrlFetchError> {
     // Bound the producer, not just its consumer: an unbounded channel can
     // queue the entire response before the caller notices the byte ceiling.
     let (tx, rx) = mpsc::sync_channel(1);
+    let factory = sensitive::Factory::current();
+    let worker = factory.clone();
     thread::spawn(move || {
         // One lookahead byte distinguishes an exact-size body from a cut,
         // including chunked responses without Content-Length.
         let mut response = response.take(MAX_RESPONSE_BYTES + 1);
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = worker.zeroed(16 * 1024);
         loop {
             let read_started = Instant::now();
             match response.read(&mut buffer) {
@@ -3227,13 +3281,16 @@ fn read_response_body_with(
                     break;
                 }
                 Ok(n) => {
-                    if tx.send(BodyReadEvent::Chunk(buffer[..n].to_vec())).is_err() {
+                    if tx
+                        .send(BodyReadEvent::Chunk(worker.copy(&buffer[..n])))
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 Err(error) => {
                     let kind = error.kind();
-                    let message = error.to_string();
+                    let message = worker.format(format_args!("{error}"));
                     let waited = read_started.elapsed();
                     let _ = tx.send(BodyReadEvent::Error(kind, message, waited));
                     break;
@@ -3261,7 +3318,7 @@ fn read_response_body_with(
         started: Instant::now(),
         bytes: 0,
     };
-    let mut chunks = Vec::new();
+    let mut chunks = factory.with_capacity(0);
     let mut total = 0u64;
     let slow_body_error = || {
         if deadline.expired() {
@@ -3291,7 +3348,7 @@ fn read_response_body_with(
                     deadline,
                     url,
                     kind,
-                    &detail(&message),
+                    &detail(std::str::from_utf8(&message).unwrap_or_default()),
                     waited,
                 ));
             }

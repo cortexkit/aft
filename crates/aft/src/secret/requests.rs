@@ -38,7 +38,9 @@ impl RequestBudget {
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UseError {
-    NotApproved,
+    Declined,
+    Expired,
+    Cancelled,
     Unavailable,
     InvalidPlan(&'static str),
 }
@@ -189,7 +191,9 @@ impl RequestSecrets {
         .await;
         match answer {
             ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce => Ok(answer),
-            ConsentOutcome::Declined | ConsentOutcome::Expired => Err(UseError::NotApproved),
+            ConsentOutcome::Declined => Err(UseError::Declined),
+            ConsentOutcome::Expired => Err(UseError::Expired),
+            ConsentOutcome::Cancelled => Err(UseError::Cancelled),
             _ => Err(UseError::Unavailable),
         }
     }

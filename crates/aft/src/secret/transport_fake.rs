@@ -51,6 +51,7 @@ pub(crate) struct State {
     pub once: bool,
     pub next_request: usize,
     pub pending_expires_at_ms: Option<u64>,
+    pub module_error_message: Option<String>,
     approved: HashSet<PendingKey>,
     pub(super) pending: HashMap<PendingKey, Value>,
 }
@@ -410,8 +411,13 @@ impl FakeClaustrum {
                                          state.params.push(value["params"].clone());
                                         if state.disconnect { break; }
                                         if state.hold_reply { continue; }
-                                        let reply = state.serve(&principal, value["params"].clone());
+                                        let mut reply = state.serve(&principal, value["params"].clone());
                                         let error = reply.get("code").is_some();
+                                        if error {
+                                            if let Some(message) = &state.module_error_message {
+                                                reply["message"] = json!(message);
+                                            }
+                                        }
                                         (reply, error)
                                     };
                                     let frame = Frame::build(if error { FrameType::Error } else { FrameType::Response }, flags(), request.header.channel, request.header.epoch, request.header.corr, serde_json::to_vec(&reply).unwrap()).unwrap();

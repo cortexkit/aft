@@ -153,18 +153,16 @@ impl SubcSecretUseTransport {
             // transport diagnostics: either could carry released material.
             Err(CallError::Module(error)) => {
                 let code = Zeroizing::new(error.code);
-                let message = Zeroizing::new(error.message);
-                #[derive(serde::Serialize)]
-                struct Rejected<'a> {
-                    code: &'a str,
-                    message: &'a str,
+                let _message = Zeroizing::new(error.message);
+                // Retain only the classified sender error. Peer detail may
+                // contain a credential and must never enter a second buffer.
+                if code.as_str() == "invalid_params" {
+                    Ok(Zeroizing::new(
+                        br#"{"code":"invalid_params","message":""}"#.to_vec(),
+                    ))
+                } else {
+                    Err(UNAVAILABLE.to_owned())
                 }
-                serde_json::to_vec(&Rejected {
-                    code: &code,
-                    message: &message,
-                })
-                .map(Zeroizing::new)
-                .map_err(|_| UNAVAILABLE.to_owned())
             }
             Err(_) => Err(UNAVAILABLE.to_owned()),
         }
