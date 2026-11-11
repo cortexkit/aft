@@ -52,7 +52,7 @@ pub(super) fn applies(path: &Path) -> bool {
 /// tree-sitter's verdict stands, which keeps the conservative rollback for a
 /// file that was valid before.
 pub(super) fn confirm_if_needed(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     source: &str,
     original: Option<&str>,
     was_valid: &mut Option<bool>,
@@ -78,14 +78,14 @@ pub(super) fn confirm_if_needed(
 /// usable bash, which is always the case on Windows), `bash_timeout`, or
 /// `bash_failed` (bash ended without a syntax verdict).
 pub(super) fn confirm_created(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     source: &str,
 ) -> Result<ShellVerdict, &'static str> {
     verdict(tool_policy, source)
 }
 
 fn verdict(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     source: &str,
 ) -> Result<ShellVerdict, &'static str> {
     let outcome = check(tool_policy, source);
@@ -118,7 +118,7 @@ fn reported_line(stderr: &str) -> Option<usize> {
     })
 }
 
-fn check(tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy, source: &str) -> CheckOutcome {
+fn check(tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher, source: &str) -> CheckOutcome {
     #[cfg(test)]
     if let Some(outcome) =
         RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|runner| runner(source)))
@@ -151,19 +151,30 @@ fn find_bash() -> Result<Option<PathBuf>, String> {
 /// inherited startup hooks are cleared before the request's policy environment
 /// is installed; `--norc --noprofile` rules out user startup files too.
 fn run_bash(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     bash: &Path,
     source: &str,
     deadline: Instant,
 ) -> CheckOutcome {
-    let args = ["--norc", "--noprofile", "-n"].map(std::ffi::OsString::from);
-    let command = match tool_policy.command_with_clean_environment(bash.as_os_str(), &args) {
-        Ok(command) => command,
-        Err(reason) => return CheckOutcome::Unavailable(reason),
-    };
-    check_outcome(super::swift::run_command(
-        command, "bash", source, deadline, true,
-    ))
+    use super::tool_launcher::{ToolCommand, ToolEnvironment, ToolOutcome, ToolStdin, ToolTimeout};
+    let outcome = tool_policy.run(ToolCommand {
+        tool: "bash".into(),
+        program: bash.as_os_str().into(),
+        args: ["--norc", "--noprofile", "-n"]
+            .map(std::ffi::OsString::from)
+            .into(),
+        cwd: None,
+        stdin: ToolStdin::Source {
+            source: source.into(),
+            may_stop_reading: true,
+        },
+        environment: ToolEnvironment::Clean,
+        timeout: ToolTimeout::Deadline(deadline),
+    });
+    match outcome {
+        ToolOutcome::Refused(reason) => CheckOutcome::Unavailable(reason.0),
+        outcome => check_outcome(outcome.into_result("bash")),
+    }
 }
 
 fn check_outcome(result: Result<SubprocessOutcome, FormatError>) -> CheckOutcome {

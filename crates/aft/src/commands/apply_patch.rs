@@ -382,7 +382,7 @@ fn restore_pre_write_state(path: &Path, existed: bool, original: Option<&str>) {
 }
 
 fn write_patched_file(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     req: &RawRequest,
     ctx: &AppContext,
     path: &Path,
@@ -657,7 +657,7 @@ fn add_failure(failures: &mut Vec<Value>, path: &str, error: String) {
 /// The check runs once per file after all hunks, because a later hunk in the
 /// same patch can fix, break, move or delete a file an earlier hunk created.
 fn created_file_syntax_checks(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     created: &HashMap<PathBuf, usize>,
 ) -> HashMap<PathBuf, edit::CreatedFileSyntax> {
     created
@@ -706,7 +706,7 @@ fn failure_paths(failures: &[Value]) -> String {
 }
 
 fn apply_add(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     req: &RawRequest,
     ctx: &AppContext,
     resolved: &ResolvedHunk,
@@ -787,7 +787,7 @@ fn apply_delete(
 /// destination, or the source when there is no move) did not exist before
 /// this patch started.
 fn apply_update(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     req: &RawRequest,
     ctx: &AppContext,
     resolved: &ResolvedHunk,
@@ -845,7 +845,7 @@ fn apply_update(
 }
 
 fn apply_move_update(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     req: &RawRequest,
     ctx: &AppContext,
     resolved: &ResolvedHunk,
