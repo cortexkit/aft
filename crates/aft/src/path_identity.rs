@@ -133,9 +133,10 @@ fn project_root_is_shared_temp(directory: &Path) -> bool {
         Path::new("/private/tmp"),
         Path::new("/private/var/tmp"),
     ]);
-    roots
+    let shared = roots
         .filter_map(|root| ProjectRootId::from_path(root).ok())
-        .any(|root| crate::access_policy::policy_path(&root.into_path_buf()) == directory)
+        .any(|root| crate::access_policy::policy_path(&root.into_path_buf()) == directory);
+    shared
 }
 
 fn project_root_path_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {

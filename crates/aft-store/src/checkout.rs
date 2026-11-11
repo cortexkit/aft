@@ -600,6 +600,7 @@ impl CheckoutState {
 /// flag 2: old readers deliberately treat that flag as unusable and rebuild,
 /// rather than refusing the whole family on rollback. The record envelope
 /// and the rest of the state layout are unchanged.
+/// Format 4 appends the skipped-directory paths and their permission errors.
 const STATE_FORMAT: u8 = 4;
 
 /// How much of a state record [`newer_state_format`] reads to find the

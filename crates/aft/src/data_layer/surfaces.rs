@@ -244,6 +244,7 @@ impl DataStoreReport {
 /// The `data_store` object of status and of each root's health.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DataStoreHealth {
+    #[serde(skip_serializing_if = "no_skipped_folders")]
     pub skipped_folders: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_folder_note: Option<String>,
@@ -256,6 +257,10 @@ pub struct DataStoreHealth {
     pub unparsed_files: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<DataStoreFailure>,
+}
+
+fn no_skipped_folders(count: &usize) -> bool {
+    *count == 0
 }
 
 /// The last failed build or refresh of a checkout.
@@ -385,7 +390,7 @@ pub(crate) fn disclose_index_gaps(
         super::parent::text_planes(ctx, session.root(), &children)
             .into_iter()
             .filter_map(|plane| match plane {
-                super::parent::Plane::Ready(view) => Some((*view).clone()),
+                super::parent_session::Plane::Ready(view) => Some((*view).clone()),
                 _ => None,
             })
             .collect::<Vec<_>>()

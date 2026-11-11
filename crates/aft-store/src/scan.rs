@@ -330,14 +330,14 @@ impl Restrict {
     }
 }
 
-/// Walks `root` under the scan's rules, limited to `restrict` when given,
-/// and records every member it reaches.
 type WalkRecords = (
     Vec<PathRecord>,
     std::collections::BTreeMap<Vec<u8>, String>,
     ScanCounters,
 );
 
+/// Walks `root` under the scan's rules, limited to `restrict` when given,
+/// and records every member it reaches.
 fn walk_records(
     root: &Path,
     policy: &ScanPolicy,
@@ -410,10 +410,11 @@ fn walk_records(
                 Err(error) => {
                     // Permission-denied folders are explicit coverage gaps.
                     // Other walk errors still fail the scan.
-                    if let Some(io) = error.io_error()
-                        && io.kind() != io::ErrorKind::NotFound
-                    {
+                    if let Some(io) = error.io_error() {
                         let path = error_path(&error).unwrap_or_else(|| root.to_path_buf());
+                        if io.kind() == io::ErrorKind::NotFound && path != root {
+                            return WalkState::Continue;
+                        }
                         if io.kind() == io::ErrorKind::PermissionDenied
                             && path != root
                             && let Ok(relative) = relative_bytes(root, &path)

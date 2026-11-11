@@ -684,7 +684,7 @@ fn disclose_skipped_folders(req: &RawRequest, ctx: &AppContext, response: &mut R
     let scope = req
         .params
         .get("path")
-        .and_then(Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .map_or_else(|| root.clone(), |path| root.join(path));
     let scope = std::fs::canonicalize(&scope).unwrap_or(scope);
     crate::data_layer::surfaces::disclose_index_gaps(ctx, &[scope], response);
