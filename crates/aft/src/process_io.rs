@@ -167,7 +167,7 @@ pub fn assert_darwin_logical_bytes_observe_file_write() {
     let before = Bytes::capture().unwrap();
     let mut file = std::fs::File::create(dir.path().join("bytes")).unwrap();
     file.write_all(&vec![0x5a; 8 * 1024 * 1024]).unwrap();
-    file.sync_all().unwrap();
+    aft_store::sync::sync_all(&file, &dir.path().join("bytes")).unwrap();
     let delta = Bytes::capture().unwrap().delta(before).unwrap();
     assert!(
         delta.logical >= 8 * 1024 * 1024,

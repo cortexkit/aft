@@ -53,7 +53,7 @@ pub(crate) fn write_new_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fault::point("write")?;
     file.write_all(bytes)?;
     fault::point("sync")?;
-    file.sync_all()?;
+    crate::sync::sync_all(&file, path)?;
     drop(file);
     sync_parent(path)
 }
@@ -113,7 +113,7 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     fault::point("sync_dir")?;
     #[cfg(unix)]
     {
-        File::open(path)?.sync_all()
+        crate::sync::sync_all(&File::open(path)?, path)
     }
     #[cfg(not(unix))]
     {

@@ -177,7 +177,7 @@ fn atomic_write_source_with(
     }
     drop(write_temp);
     let write_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteSync);
-    file.sync_all()
+    aft_store::sync::sync_all(file, &temporary)
         .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
     drop(write_sync);
     cleanup.file.take();
@@ -201,7 +201,7 @@ fn atomic_write_source_with(
     // be reported as a failed edit without implying the original still exists.
     let _dir_sync = crate::backup::latency::time(crate::backup::latency::Part::WriteDirSync);
     if let Ok(directory) = fs::File::open(parent) {
-        let _ = directory.sync_all();
+        let _ = aft_store::sync::sync_all(&directory, parent);
     }
     Ok(SourceWriteOutcome {
         mode: SourceWriteMode::Replaced,
@@ -273,20 +273,21 @@ fn write_source_in_place(
     };
     fn rewrite(
         file: &mut std::fs::File,
+        destination: &Path,
         content: &[u8],
         writer: &mut dyn FnMut(&mut std::fs::File, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         writer(file, content)?;
-        file.sync_all()
+        aft_store::sync::sync_all(file, destination)
             .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))
     }
-    if let Err(error) = rewrite(&mut file, bytes, writer) {
+    if let Err(error) = rewrite(&mut file, destination, bytes, writer) {
         let Some(saved) = saved.as_deref() else {
             return Err(error);
         };
-        let restored = rewrite(&mut file, saved, &mut |file, content| {
+        let restored = rewrite(&mut file, destination, saved, &mut |file, content| {
             file.write_all(content)
         });
         return match (restored, copy) {
@@ -956,9 +957,9 @@ mod source_recovery {
         let prepared = (|| {
             make_private(destination, &copy, &file)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            aft_store::sync::sync_all(&file, &copy)?;
             if let Ok(directory) = File::open(parent) {
-                let _ = directory.sync_all();
+                let _ = aft_store::sync::sync_all(&directory, parent);
             }
             Ok(())
         })();

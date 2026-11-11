@@ -4277,6 +4277,10 @@ fn assemble_health_report(
         json!({"unconfigured_binding_refusals_total": crate::gh_shim_speech::service::unconfigured_binding_refusals_total()}),
     );
     metrics.insert(
+        "full_sync_fallbacks".to_string(),
+        json!(aft_store::sync::full_sync_fallbacks()),
+    );
+    metrics.insert(
         "runtime".to_string(),
         json!({
             "live_watchers": shared_app.watcher_count(),
@@ -8447,6 +8451,25 @@ mod tests {
         assert!(report.metrics.expect("health metrics")["gh_speech"]
             ["unconfigured_binding_refusals_total"]
             .is_u64());
+    }
+
+    #[test]
+    fn health_report_exposes_full_sync_fallbacks() {
+        let before = aft_store::sync::full_sync_fallbacks();
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &App::default_shared(),
+        );
+        let metrics = report.metrics.expect("health metrics");
+        let fallbacks = metrics["full_sync_fallbacks"]
+            .as_u64()
+            .expect("fallback count");
+        assert!(fallbacks >= before);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(fallbacks, 0);
     }
 
     #[test]

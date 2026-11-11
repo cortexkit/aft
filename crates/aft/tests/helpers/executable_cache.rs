@@ -96,10 +96,10 @@ fn publish_with_pruner(
     let pending = pending_dir.path().join("executable");
     write_executable_with_mode(&pending, bytes, 0o755)?;
     #[cfg(target_os = "linux")]
-    OpenOptions::new().read(true).open(&pending)?.sync_all()?;
+    aft_store::sync::sync_all(&OpenOptions::new().read(true).open(&pending)?, &pending)?;
     // Windows requires a writable handle for FlushFileBuffers.
     #[cfg(not(target_os = "linux"))]
-    OpenOptions::new().write(true).open(&pending)?.sync_all()?;
+    aft_store::sync::sync_all(&OpenOptions::new().write(true).open(&pending)?, &pending)?;
 
     match fs::hard_link(&pending, &path) {
         Ok(()) => {}

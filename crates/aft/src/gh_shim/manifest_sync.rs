@@ -131,7 +131,7 @@ fn write_candidate(
         .create_new(true)
         .open(&temporary)?;
     std::io::Write::write_all(&mut file, &serde_json::to_vec(envelope)?)?;
-    file.sync_all()?;
+    aft_store::sync::sync_all(&file, &temporary)?;
     drop(file);
     before_rename()?;
     fs::rename(&temporary, &paths.manifest)

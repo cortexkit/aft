@@ -634,7 +634,7 @@ impl PinnedDir {
     pub(crate) fn repair_sync(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
-            self.file.sync_all()?;
+            aft_store::sync::sync_all(&self.file, &self.path)?;
         }
         Ok(())
     }
@@ -3239,7 +3239,7 @@ fn sync_unchanged_metadata(
     if already_synced {
         return true;
     }
-    if sync != ReplaceSync::None && sync_task_file(&file).is_err() {
+    if sync != ReplaceSync::None && sync_task_file(&file, &dir.path.join(name)).is_err() {
         return false;
     }
     if sync == ReplaceSync::FileAndDirectory && sync_task_directory(dir).is_err() {
@@ -4865,7 +4865,7 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
     atomic_replace(dir, name, content, ReplaceSync::None)
 }
 
-pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
+pub(crate) fn sync_task_file(file: &File, path: &Path) -> io::Result<()> {
     #[cfg(test)]
     work_counts::record_sync();
     #[cfg(test)]
@@ -4887,7 +4887,7 @@ pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
     }
     #[cfg(test)]
     let started = std::time::Instant::now();
-    let result = file.sync_all();
+    let result = aft_store::sync::sync_all(file, path);
     #[cfg(test)]
     work_counts::record_sync_time(started.elapsed());
     result
@@ -4896,7 +4896,7 @@ pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
 fn sync_task_directory(dir: &PinnedDir) -> io::Result<()> {
     #[cfg(unix)]
     {
-        sync_task_file(&dir.file)
+        sync_task_file(&dir.file, &dir.path)
     }
     #[cfg(windows)]
     {
@@ -4920,7 +4920,7 @@ fn sync_task_directory(dir: &PinnedDir) -> io::Result<()> {
                 "pinned directory path identity changed",
             ));
         }
-        sync_task_file(&writable.file)?;
+        sync_task_file(&writable.file, &dir.path)?;
         dir.ensure_current_identity()
     }
 }
@@ -4941,7 +4941,7 @@ fn atomic_replace(
         let result = (|| {
             file.write_all(content)?;
             if sync != ReplaceSync::None {
-                sync_task_file(&file)?;
+                sync_task_file(&file, &dir.path.join(&temporary))?;
             }
             // Atomic replacement protects readers after a daemon kill. Task
             // history is mirrored in a weaker database and is not a durable log.

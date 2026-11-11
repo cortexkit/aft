@@ -1,6 +1,7 @@
 //! Durable file commits use the platform's full sync, including F_FULLFSYNC on
-//! macOS. Rebuildable and process-lifetime stores deliberately do not call these
-//! sync helpers. Atomic writes select their durability explicitly. The test
+//! macOS, or fsync when the mount does not support it. Rebuildable and
+//! process-lifetime stores deliberately do not call these sync helpers.
+//! Atomic writes select their durability explicitly. The test
 //! ledger observes the real calls, never substitutes for them.
 
 use std::fs::{self, File};
@@ -87,11 +88,9 @@ impl Drop for SyncGroup {
 }
 
 fn full_sync(file: &File, path: &Path) -> io::Result<()> {
-    file.sync_all()?;
+    aft_store::sync::sync_all(file, path)?;
     #[cfg(test)]
     FULL_SYNCS.with(|syncs| syncs.borrow_mut().push(path.to_path_buf()));
-    #[cfg(not(test))]
-    let _ = path;
     Ok(())
 }
 

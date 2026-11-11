@@ -433,7 +433,11 @@ pub(crate) fn save_local_launch(
     .map_err(|e| e.to_string())?;
     use std::io::Write;
     file.flush().map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
+    aft_store::sync::sync_all(
+        &file,
+        &prepared.0.dirs.control.path().join(REMOTE_LOCAL_LAUNCH),
+    )
+    .map_err(|e| e.to_string())?;
     let mut hash = blake3::Hasher::new();
     hash.update(prepared.0.paths.task_id.as_bytes());
     hash.update(&bytes);

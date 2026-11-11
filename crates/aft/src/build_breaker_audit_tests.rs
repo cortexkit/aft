@@ -64,7 +64,7 @@ fn write_durable_marker(path: &Path, marker: &DurableMarker) {
     let mut file = File::create(&temporary).unwrap();
     serde_json::to_writer(&mut file, marker).unwrap();
     file.flush().unwrap();
-    file.sync_all().unwrap();
+    aft_store::sync::sync_all(&file, &temporary).unwrap();
     fs::rename(&temporary, path).unwrap();
 }
 

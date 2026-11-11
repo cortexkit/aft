@@ -227,7 +227,7 @@ fn deploy_with_pruner(
     if fs::metadata(&pending_image)?.len() != identity.size {
         return Err(io::Error::other("AFT fixture image copy was incomplete"));
     }
-    File::open(&pending_image)?.sync_all()?;
+    aft_store::sync::sync_all(&File::open(&pending_image)?, &pending_image)?;
     copied(&pending_image);
     let mut permissions = input.metadata()?.permissions();
     permissions.set_readonly(true);

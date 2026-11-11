@@ -354,7 +354,7 @@ impl SnapshotSink for Builder {
             .create_new(true)
             .open(self.dir.join(&disk_name))?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        aft_store::sync::sync_all(&file, &self.dir.join(&disk_name))?;
         let record = FileRecord {
             path: path.to_string(),
             size: bytes.len() as u64,

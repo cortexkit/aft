@@ -259,7 +259,7 @@ fn write_atomic_to_temp(
         .open(temp)?;
     let result = (|| {
         file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
+        aft_store::sync::sync_all(&file, temp)?;
         drop(file);
         if let Ok(metadata) = std::fs::metadata(path) {
             std::fs::set_permissions(temp, metadata.permissions())?;

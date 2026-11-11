@@ -261,7 +261,7 @@ impl SegmentWriter {
             .map_err(|error| io(&path, error.into_error()))?;
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&header.encode()))
-            .and_then(|()| file.sync_all())
+            .and_then(|()| crate::sync::sync_all(&file, &path))
             .map_err(|error| io(&path, error))?;
         Ok(SegmentSummary {
             path,

@@ -339,7 +339,7 @@ fn write_failure_marker(path: &Path) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(b"sandbox_unavailable")?;
-    file.sync_all()
+    aft_store::sync::sync_all(&file, path)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

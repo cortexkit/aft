@@ -472,7 +472,7 @@ fn materialize(
                 output.write_all(&buffer[..count])?;
                 offset += count as u64;
             }
-            output.sync_all()?;
+            aft_store::sync::sync_all(&output, destination)?;
             output.set_permissions(std::fs::Permissions::from_mode(0o500))?;
         }
     }

@@ -615,7 +615,7 @@ fn write_backup(target: &Path, text: &str) -> std::io::Result<PathBuf> {
             Ok(mut file) => {
                 let written = (|| {
                     file.write_all(text.as_bytes())?;
-                    file.sync_all()?;
+                    aft_store::sync::sync_all(&file, &candidate)?;
                     if let Ok(metadata) = std::fs::metadata(target) {
                         std::fs::set_permissions(&candidate, metadata.permissions())?;
                     }

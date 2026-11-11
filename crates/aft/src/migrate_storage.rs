@@ -1053,7 +1053,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 
 fn sync_path(path: &Path) {
     if let Ok(file) = File::open(path) {
-        let _ = file.sync_all();
+        let _ = aft_store::sync::sync_all(&file, path);
     }
 }
 
