@@ -6,6 +6,7 @@ use types::{Killed, Outcome, Ran, TerminalRecord};
 
 mod client;
 pub mod policy;
+pub(crate) mod read_only_note;
 mod reply;
 mod request;
 mod stream;

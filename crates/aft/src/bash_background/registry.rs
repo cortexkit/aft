@@ -3104,6 +3104,11 @@ impl BgTaskRegistry {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
             append_remote_report(&mut snapshot.output_preview, &state.metadata);
+            append_source_read_only_note(
+                &mut snapshot.output_preview,
+                &state.metadata,
+                &state.buffer,
+            );
         }
         snapshot
     }
@@ -9530,6 +9535,7 @@ impl BgTaskRegistry {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
         }
+        append_source_read_only_note(&mut snapshot.output_preview, &metadata, &buffer);
         Some((snapshot, resolved.paths))
     }
 
@@ -11902,52 +11908,54 @@ impl BgTaskRegistry {
             return None;
         }
         let metadata = task.lock_state().ok()?.metadata.clone();
-        let (output_preview, output_truncated, bash_output_list_envelope) =
-            if let Some(saved) = self.saved_completion_preview(&metadata) {
-                (
-                    saved.output_preview,
-                    saved.output_truncated,
-                    saved.bash_output_list_envelope,
-                )
+        let (output_preview, output_truncated, bash_output_list_envelope) = if let Some(saved) =
+            self.saved_completion_preview(&metadata)
+        {
+            (
+                saved.output_preview,
+                saved.output_truncated,
+                saved.bash_output_list_envelope,
+            )
+        } else {
+            let (mut output_preview, output_truncated, cache) = if snapshot.info.mode == BgMode::Pty
+            {
+                (String::new(), false, None)
             } else {
-                let (mut output_preview, output_truncated, cache) =
-                    if snapshot.info.mode == BgMode::Pty {
-                        (String::new(), false, None)
-                    } else {
-                        let metadata = task.lock_state().ok()?.metadata.clone();
-                        self.ensure_terminal_output_cache(task)
-                            .map(|cache| {
-                                let (preview, truncated) = self.completion_preview_for_notice(
-                                    &metadata,
-                                    &cache,
-                                    Some(&task.paths),
-                                );
-                                (preview, truncated, Some(cache))
-                            })
-                            .unwrap_or_else(|| (String::new(), false, None))
-                    };
-                if let Ok(state) = task.lock_state() {
-                    if let Some(note) = rendered_execution_note(&state.metadata) {
-                        output_preview = format!("{note}\n{output_preview}");
-                    }
-                }
-                self.append_db_hint(&task.task_id, &mut output_preview);
-                let bash_output_list_envelope = cache
-                    .as_ref()
-                    .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
-                self.mask_completion_text(&task.task_id, &mut output_preview);
-                let saved = self.save_completion_preview(
-                    &task.task_id,
-                    &output_preview,
-                    output_truncated,
-                    &bash_output_list_envelope,
-                );
-                (
-                    saved.output_preview,
-                    saved.output_truncated,
-                    saved.bash_output_list_envelope,
-                )
+                let metadata = task.lock_state().ok()?.metadata.clone();
+                self.ensure_terminal_output_cache(task)
+                    .map(|cache| {
+                        let (preview, truncated) = self.completion_preview_for_notice(
+                            &metadata,
+                            &cache,
+                            Some(&task.paths),
+                        );
+                        (preview, truncated, Some(cache))
+                    })
+                    .unwrap_or_else(|| (String::new(), false, None))
             };
+            if let Ok(state) = task.lock_state() {
+                if let Some(note) = rendered_execution_note(&state.metadata) {
+                    output_preview = format!("{note}\n{output_preview}");
+                }
+                append_source_read_only_note(&mut output_preview, &state.metadata, &state.buffer);
+            }
+            self.append_db_hint(&task.task_id, &mut output_preview);
+            let bash_output_list_envelope = cache
+                .as_ref()
+                .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
+            self.mask_completion_text(&task.task_id, &mut output_preview);
+            let saved = self.save_completion_preview(
+                &task.task_id,
+                &output_preview,
+                output_truncated,
+                &bash_output_list_envelope,
+            );
+            (
+                saved.output_preview,
+                saved.output_truncated,
+                saved.bash_output_list_envelope,
+            )
+        };
         Some(BgCompletion {
             changed_files: self.changed_files_report(&metadata.task_id),
             task_id: snapshot.info.task_id,
@@ -14745,6 +14753,9 @@ impl BgTaskRegistry {
                     output_preview = format!("{note}\n{output_preview}");
                 }
                 append_remote_report(&mut output_preview, metadata);
+                if let Some(buffer) = render_buffer {
+                    append_source_read_only_note(&mut output_preview, metadata, buffer);
+                }
                 if metadata.status == BgTaskStatus::Failed
                     || metadata.status == BgTaskStatus::FateUnknown
                 {
@@ -18415,6 +18426,41 @@ fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
             output.push('\n');
         }
         output.push_str(&report);
+    }
+}
+
+fn append_source_read_only_note(output: &mut String, metadata: &PersistedTask, buffer: &BgBuffer) {
+    use std::io::BufRead;
+
+    let source_read_only = metadata
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.terminal.as_ref())
+        .and_then(|terminal| terminal.source_read_only())
+        == Some(true);
+    let failed = metadata.exit_code.is_some_and(|code| code != 0)
+        || matches!(
+            metadata.status,
+            BgTaskStatus::Killed | BgTaskStatus::TimedOut
+        );
+    if !source_read_only || !failed {
+        return;
+    }
+    let (Some(root), Some(reader)) = (metadata.project_root.as_deref(), buffer.stderr_reader())
+    else {
+        return;
+    };
+    if let Some(note) = crate::exec_remote::read_only_note::source_read_only_note(
+        source_read_only,
+        failed,
+        reader.lines().map_while(Result::ok),
+        &metadata.workdir,
+        root,
+    ) {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&note);
     }
 }
 

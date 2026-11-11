@@ -5,6 +5,153 @@ use crate::exec_remote::wire_tests::{daemon, id, Script};
 #[path = "bookkeeping_probe.rs"]
 mod bookkeeping_probe;
 
+const READ_ONLY_NOTE: &str = "note: the build server keeps tracked files read-only during a job, so the write to src/x.rs was refused (Operation not permitted). Edit files on this machine; the job's copy is discarded.";
+
+fn read_only_result_case(
+    locked: Option<bool>,
+    outcome: Outcome,
+    error: &str,
+) -> (String, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    task.state.lock().unwrap().metadata.workdir = dir.path().join("package");
+    let error = error.replace("$ROOT", &dir.path().to_string_lossy());
+    let mut record = TerminalRecord::new(id(), outcome, 2, 0, 0)
+        .with_ran(Ran::Remote)
+        .with_workspace_changes(Vec::new());
+    if let Some(locked) = locked {
+        record = record.with_source_read_only(locked);
+    }
+    let verdict = exec::grade(&record);
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.output(1, OutputStream::Stdout, b"command output\n")
+        .unwrap();
+    sink.output(2, OutputStream::Stderr, error.as_bytes())
+        .unwrap();
+    sink.terminal(&record, &verdict).unwrap();
+    let readonly = self::registry();
+    let (disk, _) = readonly
+        .terminal_status_from_disk(&task_id, "session", Some(dir.path()), dir.path())
+        .unwrap();
+    registry.remote_terminal(&task, verdict, None);
+    let done = registry.observed_status(&task_id, "session", 8192).unwrap();
+    let foreground = crate::commands::bash_orchestrate::foreground_result_response("lock", done);
+    let completion = registry
+        .drain_completions()
+        .into_iter()
+        .find(|completion| completion.task_id == task_id)
+        .expect("remote completion notice");
+    assert_eq!(
+        serde_json::to_value(completion.clone().into_push_frame()).unwrap()["output_preview"],
+        completion.output_preview
+    );
+    (
+        foreground.data["output"].as_str().unwrap().to_owned(),
+        completion.output_preview,
+        disk.output_preview,
+    )
+}
+
+fn assert_read_only_note(error: &str) {
+    let (foreground, completion, disk) =
+        read_only_result_case(Some(true), Outcome::Exit { code: 1 }, error);
+    for text in [foreground, completion, disk] {
+        assert_eq!(text.matches(READ_ONLY_NOTE).count(), 1, "{text}");
+        assert!(text.lines().any(|line| line == READ_ONLY_NOTE), "{text}");
+        assert!(text.find("command output").unwrap() < text.find(READ_ONLY_NOTE).unwrap());
+    }
+}
+
+#[test]
+fn runon_read_only_note_quoted_path_foreground_and_background() {
+    for quote in ['\'', '"'] {
+        assert_read_only_note(&format!(
+            "cp: cannot create regular file {quote}$ROOT/src/x.rs{quote}: Operation not permitted\n"
+        ));
+    }
+}
+
+#[test]
+fn runon_read_only_note_bsd_and_redirect_relative_paths() {
+    for prefix in ["touch: ", "bash: line 1: "] {
+        assert_read_only_note(&format!("{prefix}../src/x.rs: Operation not permitted\n"));
+    }
+}
+
+#[test]
+fn runon_read_only_note_python_permission_error() {
+    assert_read_only_note("PermissionError: [Errno 1] Operation not permitted: '../src/x.rs'\n");
+}
+
+#[test]
+fn runon_read_only_note_killed_job_completion() {
+    let (foreground, completion, disk) = read_only_result_case(
+        Some(true),
+        Outcome::Cancelled,
+        "../src/x.rs: Operation not permitted\n",
+    );
+    for text in [foreground, completion, disk] {
+        assert!(text.contains(READ_ONLY_NOTE), "{text}");
+    }
+}
+
+#[test]
+fn runon_read_only_note_requires_lock_failure_and_in_checkout_eperm() {
+    for (locked, code, error) in [
+        (None, 1, "../src/x.rs: Operation not permitted\n"),
+        (Some(false), 1, "../src/x.rs: Operation not permitted\n"),
+        (Some(true), 0, "../src/x.rs: Operation not permitted\n"),
+        (
+            Some(true),
+            1,
+            "'$ROOT/../outside.rs': Operation not permitted\n",
+        ),
+        (Some(true), 1, "../../outside.rs: Operation not permitted\n"),
+        (Some(true), 1, "../src/x.rs: Permission denied\n"),
+        (Some(true), 1, "failed without an error path\n"),
+    ] {
+        let (foreground, completion, disk) =
+            read_only_result_case(locked, Outcome::Exit { code }, error);
+        for text in [foreground, completion, disk] {
+            assert!(
+                !text.contains("note: the build server keeps tracked files"),
+                "{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn runon_read_only_note_ignores_stdout_and_local_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let error = b"src/x.rs: Operation not permitted\n";
+    sink.output(1, OutputStream::Stdout, error).unwrap();
+    let mut state = task.state.lock().unwrap();
+    let mut metadata = state.metadata.clone();
+    metadata.mark_terminal(BgTaskStatus::Failed, Some(1), None);
+    metadata.remote.as_mut().unwrap().terminal = Some(
+        TerminalRecord::new(id(), Outcome::Exit { code: 1 }, 1, 0, 0).with_source_read_only(true),
+    );
+    let mut text = "original output".to_owned();
+    append_source_read_only_note(&mut text, &metadata, &state.buffer);
+    assert_eq!(text, "original output", "stdout alone is not error output");
+    metadata.remote = None;
+    drop(state);
+    sink.output(2, OutputStream::Stderr, error).unwrap();
+    state = task.state.lock().unwrap();
+    append_source_read_only_note(&mut text, &metadata, &state.buffer);
+    assert_eq!(
+        text, "original output",
+        "local jobs have no remote lock proof"
+    );
+}
+
 fn assert_remote_oom_terminal(cause: Option<&str>, expected: &str) {
     let dir = tempfile::tempdir().unwrap();
     let (registry, task_id, paths) =

@@ -359,6 +359,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "exec_remote/read_only_note.rs",
+        enclosing_item: "source_read_only_note",
+        location_or_primitive: ".take(1_000)",
+        reason: "Internal permission-error scan stops after 1,000 matching lines to select one explanatory note; it never truncates the command output or returns a result list.",
+    },
+    ExclusionEntry {
         file: "gh_shim_speech/start_view/sweep.rs",
         enclosing_item: "sweep_entries",
         location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",
