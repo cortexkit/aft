@@ -130,9 +130,16 @@ impl TempDenial {
         }
     }
 
-    pub(crate) fn message(&self, requested: &Path) -> String {
+    pub(crate) fn message(&self, requested: &Path, canonical_requested: &Path) -> String {
         let folder = requested.display();
-        let entry = self.entry.display();
+        // Checks use canonical paths; render descendants under the caller's spelling.
+        let rendered_entry = match self.entry.strip_prefix(canonical_requested) {
+            Ok(relative) if relative.as_os_str().is_empty() => requested.to_path_buf(),
+            Ok(relative) => requested.join(relative),
+            // An entry outside the checked request cannot be rebased; keep its checked spelling.
+            Err(_) => self.entry.clone(),
+        };
+        let entry = rendered_entry.display();
         match self.reason {
             TempReason::SqliteFile => format!("temporary path '{folder}' contains a SQLite file ('{entry}'); AFT does not change SQLite files under the temporary directory, because they can be another program's live database"),
             TempReason::HardLink => format!("temporary path '{folder}' contains a file with more than one hard link ('{entry}'); AFT does not change hard-linked files under the temporary directory, because another link can be outside it"),
@@ -260,6 +267,15 @@ pub(crate) fn safe_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_denial_message_keeps_entry_outside_canonical_request() {
+        let denial = TempDenial::new(Path::new("outside/file.sqlite"), TempReason::SqliteFile);
+        assert_eq!(
+            denial.message(Path::new("caller/folder"), Path::new("canonical/folder")),
+            "temporary path 'caller/folder' contains a SQLite file ('outside/file.sqlite'); AFT does not change SQLite files under the temporary directory, because they can be another program's live database"
+        );
+    }
 
     /// Only Windows's "this cannot be a name" error (123) names nothing; the
     /// same number elsewhere and other errors still fail closed.

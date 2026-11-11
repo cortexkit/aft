@@ -12056,7 +12056,7 @@ impl AppContext {
                 Err(crate::protocol::Response::error(
                     req_id,
                     "unsafe_temp_path",
-                    denial.message(original),
+                    denial.message(original, &identity),
                 ))
             }
             AccessDecision::Deny(AccessDenial::Floor) => Err(crate::protocol::Response::error(

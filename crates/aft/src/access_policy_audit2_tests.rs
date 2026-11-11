@@ -70,13 +70,28 @@ fn assert_temp_delete_denial(f: &Fixture, path: &Path, recursive: bool, message:
     assert!(path.exists());
 }
 
+fn temp_delete_request_root(temp: &tempfile::TempDir) -> PathBuf {
+    #[cfg(unix)]
+    {
+        // Exercise a different caller spelling on Linux too, not just macOS's symlinked temp root.
+        let alias = temp.path().join("caller");
+        let checked = temp.path().join("checked");
+        std::fs::create_dir(&checked).unwrap();
+        std::os::unix::fs::symlink(std::fs::canonicalize(checked).unwrap(), &alias).unwrap();
+        alias
+    }
+    #[cfg(not(unix))]
+    temp.path().to_path_buf()
+}
+
 #[test]
 fn audit2_temp_delete_sqlite_reason_names_first_failing_entry() {
     let f = Fixture::new();
     let temp = tempfile::tempdir().unwrap();
+    let root = temp_delete_request_root(&temp);
     let _route = f.plugin();
     for (folder, name) in [("with-db", "x.db"), ("named", "notes.sqlite.txt")] {
-        let dir = temp.path().join(folder);
+        let dir = root.join(folder);
         std::fs::create_dir_all(dir.join("a")).unwrap();
         let entry = dir.join("a").join(name);
         if folder == "with-db" {
@@ -93,7 +108,7 @@ fn audit2_temp_delete_sqlite_reason_names_first_failing_entry() {
             ));
         }
     }
-    let dir = temp.path().join("no-db");
+    let dir = root.join("no-db");
     std::fs::create_dir_all(dir.join("a")).unwrap();
     std::fs::write(dir.join("a/x.txt"), "ordinary file").unwrap();
     let response = crate::commands::delete_file::handle_delete_file(
@@ -108,7 +123,8 @@ fn audit2_temp_delete_sqlite_reason_names_first_failing_entry() {
 fn audit2_temp_delete_hard_link_reason_names_first_failing_entry() {
     let f = Fixture::new();
     let temp = tempfile::tempdir().unwrap();
-    let dir = temp.path().join("linked");
+    let root = temp_delete_request_root(&temp);
+    let dir = root.join("linked");
     std::fs::create_dir(&dir).unwrap();
     let entry = dir.join("alias.txt");
     let source = temp.path().join("source.txt");
@@ -129,7 +145,8 @@ fn audit2_temp_delete_hard_link_reason_names_first_failing_entry() {
 fn audit2_temp_delete_special_file_reason_names_first_failing_entry() {
     let f = Fixture::new();
     let temp = tempfile::tempdir().unwrap();
-    let dir = temp.path().join("special");
+    let root = temp_delete_request_root(&temp);
+    let dir = root.join("special");
     std::fs::create_dir(&dir).unwrap();
     let entry = dir.join("socket");
     let _socket = std::os::unix::net::UnixListener::bind(&entry).unwrap();
@@ -148,7 +165,8 @@ fn audit2_temp_delete_unreadable_reason_names_first_failing_entry() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     let temp = tempfile::tempdir().unwrap();
-    let dir = temp.path().join("container");
+    let root = temp_delete_request_root(&temp);
+    let dir = root.join("container");
     let blocked = dir.join("unreadable");
     std::fs::create_dir_all(&blocked).unwrap();
     let entry = blocked.join("entry.txt");
