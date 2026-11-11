@@ -583,7 +583,7 @@ fn revoke_in_other_process(store: &Store, expected: &str) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "db::gh_speech::tests::nonholder_child",
+            "gh_shim_speech::store::tests::nonholder_child",
             "--nocapture",
         ])
         .env("AFT_TEST_SPEECH_DB_PATH", store.path())
