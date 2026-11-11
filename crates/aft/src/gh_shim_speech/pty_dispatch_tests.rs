@@ -161,7 +161,7 @@ async fn pty_seal_failure_revokes_speech_durably_but_runs_the_command_normally()
         .write_pty(&fixture.task, &fixture.session, b"finish\n")
         .unwrap();
     completed(&fixture).await;
-    let restarted = crate::db::gh_speech::Store::new(fixture.service.store.path());
+    let restarted = crate::gh_shim_speech::store::Store::new(fixture.service.store.path());
     let error = restarted
         .seal(
             &fixture.incarnation,
@@ -243,7 +243,7 @@ fn revoked_probe_child() {
     };
     let incarnation = std::env::var("AFT_TEST_REVOKED_PTY_INCARNATION").unwrap();
     let ticket = std::env::var("AFT_TEST_REVOKED_PTY_TICKET").unwrap();
-    let store = crate::db::gh_speech::Store::new(Path::new(&root).join("aft.db"));
+    let store = crate::gh_shim_speech::store::Store::new(Path::new(&root).join("aft.db"));
     assert_eq!(
         store
             .seal(

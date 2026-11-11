@@ -795,7 +795,7 @@ async fn captured_dispatch_reaches_the_real_gate_with_a_precommitted_pinned_nonc
             let slot = reserve(project, session, scope, body)?;
             let path = path.clone();
             Ok(ReservedBotRequest::for_test(move || {
-                let conn = crate::db::gh_speech::Store::new(path).connect().unwrap();
+                let conn = crate::gh_shim_speech::store::Store::new(path).connect().unwrap();
                 let expect: String = conn
                     .query_row(
                         "SELECT expect_json FROM gh_speech_requests WHERE request_nonce=?1",
@@ -1001,7 +1001,7 @@ async fn bound_background_cancel_committed_before_sdk_send_is_refused() {
                 1,
                 "{receipt:?}"
             );
-            let marker = crate::db::gh_speech::Store::new(root.join("aft.db"))
+            let marker = crate::gh_shim_speech::store::Store::new(root.join("aft.db"))
                 .get(&incarnation)
                 .err()
                 .map(|error| error.reason);
@@ -1093,7 +1093,7 @@ async fn historical_legacy_dispatch_cannot_be_resent_by_the_relay() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     seed_historical_dispatch(&fixture, "lost-consumer");
-    let recovered = crate::db::gh_speech::Store::new(fixture.service.store.path());
+    let recovered = crate::gh_shim_speech::store::Store::new(fixture.service.store.path());
     assert_eq!(
         recovered
             .pending_legacy_for_identity(&fixture.session, &fixture.task)

@@ -10,9 +10,9 @@ use subc_protocol::session::ModuleControlResponseToModule;
 
 use super::model::{Binding, LaunchAuthority, PolicySnapshot};
 use super::scope::{validate_scope_identity, Answer, ValidatedEnd};
+use super::store::Store;
 use super::{Code, Refusal, ScopeRole};
 use crate::db::access_grants::ScopeKey;
-use crate::db::gh_speech::Store;
 use crate::gh_shim_relay::{facade_reply, GhRelay};
 
 type Describe = Arc<

@@ -12,6 +12,36 @@ use crate::gh_shim_speech::ScopeRole;
 use super::*;
 
 #[test]
+fn speech_authority_row_matches_legacy_write_bytes() {
+    let (_old_dir, old, record) = fixture();
+    let (_new_dir, new, _) = fixture();
+    let text = serde_json::to_string(&record).unwrap();
+    let digest = blake3::hash(text.as_bytes()).as_bytes().to_vec();
+    let mut conn = old.connect().unwrap();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    tx.execute(
+        "INSERT INTO gh_speech_authorities(incarnation,minting_run,harness,session_id,task_id,record_json,record_digest,phase)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'candidate')",
+        params![record.incarnation,record.minting_run,record.harness,record.session_id,record.task_id,text,digest],
+    ).unwrap();
+    tx.commit().unwrap();
+    new.capture(&record).unwrap();
+    // SQLite TEXT is read as a string before comparing its exact UTF-8 bytes.
+    let read =
+        |store: &Store| {
+            let (text, digest): (String, Vec<u8>) = store.connect().unwrap().query_row(
+            "SELECT record_json,record_digest FROM gh_speech_authorities WHERE incarnation=?1",
+            [&record.incarnation], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+            (text.into_bytes(), digest)
+        };
+    assert_eq!(read(&old), read(&new));
+    assert_eq!(new.get(&record.incarnation).unwrap().record, record);
+}
+
+#[test]
 fn database_error_warning_does_not_include_raw_error_values() {
     crate::gh_shim_speech::tests::assert_snapshot_warning(
         || {
