@@ -4,12 +4,13 @@
   "kind": "harness",
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs",
-    "crates/aft/src/commands/semantic_search/mod.rs"
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/search_state/mod.rs"
   ],
   "slices": [
     "crate-split-step2"
   ],
-  "note": "Crate split steps 2 and 4 (seams 1-3): code moves between modules and narrow host interfaces replace AppContext reads in the index layer. Ranking-fenced files change only module paths, imports and the host interface they read through; no routing, lane plan, score, candidate, range, snippet or reply text changes. Rows must stay byte-equal to the reference. The committed reference still predates 0.64, so the nine pattern-lane candidate-count transitions declared for the index-store cutover (land-index-store-0.64.json) are declared here unchanged; files_matched, ranked paths and rendered lines stay byte-equal.",
+  "note": "Crate split steps 2 and 4 (seams 1-7): code moves between modules, narrow host interfaces replace AppContext reads in the index layer, and runtime hook tables replace upward calls. Search request, candidate, memo and reranker state primitives move to search_state with compatibility re-exports. Ranking-fenced files change only module paths, imports and the host interface they read through; no routing, lane plan, score, candidate, range, snippet or reply text changes. Rows must stay byte-equal to the reference. The committed reference still predates 0.64, so the nine pattern-lane candidate-count transitions declared for the index-store cutover (land-index-store-0.64.json) are declared here unchanged; files_matched, ranked paths and rendered lines stay byte-equal.",
   "pattern_counts": {
     "followup-census:910002": {
       "candidate_files": {
