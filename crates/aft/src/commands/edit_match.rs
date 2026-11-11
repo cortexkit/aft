@@ -1261,6 +1261,74 @@ mod tests {
 
     use super::{handle_edit_match, restore_glob_checkpoint};
 
+    /// Measures real edit handlers plus a 512 KiB request-side SQLite commit.
+    /// The payload forces many crossings of SQLite's default 1000-page limit
+    /// without relying on a concurrent writer or synthetic CPU/disk load.
+    #[test]
+    #[ignore = "manual before/after WAL checkpoint latency measurement"]
+    fn wal_checkpoint_edit_latency_probe() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = project.path().join("edited.txt");
+        fs::write(&path, "value-0\n").unwrap();
+        let pool = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        pool.lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE checkpoint_probe (payload BLOB NOT NULL)")
+            .unwrap();
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        {
+            let mut backup = ctx.backup().lock();
+            backup.set_storage_dir(storage.path().to_path_buf(), 72);
+            backup.set_db_pool(Arc::clone(&pool));
+            backup.set_db_harness(crate::harness::Harness::Opencode);
+            backup.set_db_project_key("checkpoint-probe".to_owned());
+        }
+        let before = crate::db::lifecycle::inline_checkpoints_on_this_thread();
+        let mut durations = Vec::new();
+        const N: usize = 200;
+        const PAYLOAD: usize = 512 * 1024;
+        for index in 0..N {
+            let request: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": format!("checkpoint-{index}"),
+                "command": "edit_match",
+                "file": path,
+                "match": format!("value-{index}"),
+                "replacement": format!("value-{}", index + 1),
+            }))
+            .unwrap();
+            let started = Instant::now();
+            let response = handle_edit_match(&request, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            ctx.backup().lock().record_post_mutation_states();
+            pool.lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO checkpoint_probe VALUES (zeroblob(?1))",
+                    [PAYLOAD],
+                )
+                .unwrap();
+            durations.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        durations.sort_by(f64::total_cmp);
+        let page_size: usize = pool
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        assert!(N * PAYLOAD / page_size > 1000);
+        println!(
+            "wal_edit_probe n={N} payload_bytes={PAYLOAD} payload_pages={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} request_checkpoints={}",
+            N * PAYLOAD / page_size, durations[N / 2], durations[N * 95 / 100],
+            durations[N - 1], crate::db::lifecycle::inline_checkpoints_on_this_thread() - before,
+        );
+    }
+
     /// A failed edit should name the miss, not paste the whole `match` text
     /// back: the caller already has it, and a large one doubles its cost in
     /// the transcript. The nearest-miss excerpt that follows is already
