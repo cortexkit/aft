@@ -11,7 +11,7 @@ pub(crate) fn gate_with_limit(file: &str, sleep: &str, seconds: u64) -> String {
         "(aft_gate_file={file}; \
          aft_gate_parent=$(cd \"$(dirname \"$aft_gate_file\")\" 2>/dev/null && pwd -P) || exit 0; \
          aft_gate_deadline=$(($(date +%s) + {seconds})); \
-         while [ ! -e \"$aft_gate_file\" ] && [ -d \"$aft_gate_parent\" ] && \
+         while [ ! -f \"$aft_gate_file\" ] && [ -d \"$aft_gate_parent\" ] && \
          [ \"$(date +%s)\" -lt \"$aft_gate_deadline\" ]; do {sleep}; done)"
     )
 }
@@ -43,8 +43,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = format!("'{}'", dir.path().join("release").display());
         let marker = dir.path().join("started");
-        let script = format!(": > '{}'; {}", marker.display(), gate_with_limit(&file, "sleep 0.02", 60));
-        let child = Command::new("/bin/sh").args(["-c", &script]).stdout(Stdio::null()).spawn().unwrap();
+        let script = format!(
+            ": > '{}'; {}",
+            marker.display(),
+            gate_with_limit(&file, "sleep 0.02", 60)
+        );
+        let child = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
         let started = Instant::now();
         while !marker.exists() {
             assert!(started.elapsed() < Duration::from_secs(5));
@@ -57,7 +65,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let file = format!("'{}'", dir.path().join("release").display());
-        let child = Command::new("/bin/sh").args(["-c", &gate_with_limit(&file, "sleep 0.02", 1)]).stdout(Stdio::null()).spawn().unwrap();
+        let child = Command::new("/bin/sh")
+            .args(["-c", &gate_with_limit(&file, "sleep 0.02", 1)])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
         assert!(wait(child) < Duration::from_secs(5));
     }
 }
