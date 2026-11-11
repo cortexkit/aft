@@ -296,6 +296,10 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
     )
     .unwrap();
     let metadata = persistence::read_task_at(&task).unwrap();
+    assert!(
+        !metadata.completion_delivered,
+        "launch reply consumed completion before notice offer: {response:?}"
+    );
     assert_eq!(metadata.launching_identity, Some(expected.clone()));
     assert_eq!(metadata.scope, f.worker.scope);
     assert_ne!(metadata.scope, effective.scope);
@@ -407,6 +411,15 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
         None,
     );
     assert_eq!(result.matched_channels, 0);
+    let notice_metadata = f
+        .ctx
+        .bash_background()
+        .notice_metadata(&task_id)
+        .expect("notice task must remain registered");
+    assert!(
+        !notice_metadata.completion_delivered,
+        "task observations or fan-out consumed completion before notice offer"
+    );
     let capture = super::super::runner_notices::test_endpoint::capture(&task_id, false);
     assert!(super::super::runner_notices::enqueue(
         f.ctx.bash_background().clone(),
