@@ -45,7 +45,6 @@
     "comment-json": "^4.6.2",
     "effect": "4.0.1",
     "solid-js": "1.9.12",
-    "undici": "^7.25.0",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
