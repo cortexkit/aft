@@ -359,6 +359,24 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "parser/todo_markers.rs",
+        enclosing_item: "markers_lexical",
+        location_or_primitive: ".take(MAX_LINES_PER_FILE)",
+        reason: "Bounds per-file lexical comment scanning when producing stored TODO marker facts; it is not response pagination.",
+    },
+    ExclusionEntry {
+        file: "parser/todo_markers.rs",
+        enclosing_item: "truncate_text",
+        location_or_primitive: ".take(MAX_TEXT_CHARS)",
+        reason: "Bounds the text of one TODO marker in its stored content record, not the number of findings returned by inspect.",
+    },
+    ExclusionEntry {
+        file: "parser/dead_code_facts.rs",
+        enclosing_item: "collect_rust_macro_token_refs",
+        location_or_primitive: "scope_stack.truncate(scope_len)",
+        reason: "Restores the syntax walk's lexical scope after leaving a node; it does not cut findings or stored references.",
+    },
+    ExclusionEntry {
         file: "parent_search/mod.rs",
         enclosing_item: "discover,walk,note_outside,DEFAULT_MAX_CHILD_REPOS,MAX_DISCOVERY_DEPTH,MAX_DISCOVERY_ENTRIES,MAX_OUTSIDE_PATHS",
         location_or_primitive: "bounded parent repository discovery and split_off(cap)",

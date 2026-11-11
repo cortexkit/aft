@@ -274,13 +274,13 @@ fn snapshots(
     storage: &Path,
 ) -> Result<(Arc<CallgraphSnapshot>, Option<CallgraphSnapshot>), String> {
     let snapshot = measured(out, &format!("{label}: snapshot"), || {
-        view.dead_code_snapshot_in(Some(storage.join("dead-code")))
+        view.dead_code_snapshot_in(Some(storage.join("dead-code")), &super::InspectEntryPoints)
             .map_err(|error| format!("{error:?}"))
     })?;
     let rows = (mode == Mode::Compare)
         .then(|| {
             measured(out, &format!("{label}: snapshot of every call row"), || {
-                view.rows_dead_code_snapshot()
+                view.rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
                     .map_err(|error| format!("{error:?}"))
             })
         })

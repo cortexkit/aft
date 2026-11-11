@@ -71,10 +71,12 @@ impl IndexHost for AppContext {
     fn try_semantic_backend_health_snapshot(&self) -> Option<EmbeddingBackendHealthSnapshot> {
         self.try_semantic_backend_health_snapshot()
     }
-    fn temporary_inspect_projection(&self) -> Option<Arc<crate::inspect::CallgraphSnapshot>> {
+    fn callgraph_projection(
+        &self,
+    ) -> Option<Arc<crate::data_layer::dead_code_snapshot::CallgraphSnapshot>> {
         self.inspect_manager().try_callgraph_projection_snapshot()
     }
-    fn temporary_symbol_cache(&self) -> SharedSymbolCache {
+    fn symbol_cache(&self) -> SharedSymbolCache {
         self.symbol_cache()
     }
 }

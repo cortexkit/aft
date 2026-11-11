@@ -1,6 +1,5 @@
-//! inspect's view of generated files. The rules live in
-//! [`crate::file_kind`], shared with grep and aft_search; this module keeps
-//! inspect's entry points and its per-file probe accounting.
+//! Generated-file predicates shared by search and inspect, with per-file probe
+//! accounting for tests. The classification rules live in [`crate::file_kind`].
 
 #[cfg(test)]
 use std::collections::BTreeMap;

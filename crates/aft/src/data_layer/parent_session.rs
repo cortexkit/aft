@@ -60,11 +60,21 @@ impl<T> Plane<T> {
     }
 }
 
+/// Project-wide aggregates that a parent can read without owning inspect's
+/// database or exposing its job keys to the index.
+pub trait InspectCacheView: Send + Sync {
+    fn project_aggregate(
+        &self,
+        category: crate::inspect_category::InspectCategory,
+        config: &crate::config::Config,
+    ) -> Result<Option<serde_json::Value>, String>;
+}
+
 /// Published state of a child, independent of its runtime search engine.
 pub struct Child {
     pub root: PathBuf,
     pub relative: PathBuf,
-    pub(crate) inspect: RwLock<Option<Arc<crate::inspect::cache::ReadonlyInspectCache>>>,
+    pub(crate) inspect: RwLock<Option<Arc<dyn InspectCacheView>>>,
 }
 
 impl Child {

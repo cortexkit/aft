@@ -1,7 +1,7 @@
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use crate::cache_freshness::{self, FileFreshness};
 use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
+use crate::imports::specifier_imported_name;
 use crate::inspect::job::{
     canonicalize_normalized as canonicalize_uncached, dead_code_skipped_language,
     is_test_tree_file, language_name, ExcludedTestTally, CALLGRAPH_PROVENANCE_REEXPORT,

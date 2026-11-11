@@ -67,7 +67,11 @@ pub(crate) fn path_key(path: &Path) -> &[u8] {
 /// The dead-code snapshot of the checkout at `root` whose call graph is
 /// `rows`.
 #[must_use]
-pub(crate) fn snapshot(root: &Path, rows: &GraphRows) -> CallgraphSnapshot {
+pub(crate) fn snapshot(
+    root: &Path,
+    rows: &GraphRows,
+    entry_points: &dyn super::dead_code_snapshot::EntryPoints,
+) -> CallgraphSnapshot {
     let mut paths = Paths {
         root,
         cache: HashMap::new(),
@@ -78,14 +82,7 @@ pub(crate) fn snapshot(root: &Path, rows: &GraphRows) -> CallgraphSnapshot {
         .map(|path| paths.resolve(path))
         .collect::<Vec<_>>();
     files.sort_by(|left, right| path_key(left).cmp(path_key(right)));
-    let entry_points = {
-        let resolved = crate::inspect::resolve_entry_points(root);
-        files
-            .iter()
-            .filter(|file| resolved.is_entry_point(file))
-            .cloned()
-            .collect()
-    };
+    let entry_points = entry_points.resolve(root, &files);
     CallgraphSnapshot {
         generated_at: Some(SystemTime::now()),
         exported_symbols: exported_symbols(rows, &mut paths),

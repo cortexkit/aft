@@ -340,7 +340,7 @@ pub(crate) fn root_bound(
     let Some(checkout) = ctx.data_checkout() else {
         return;
     };
-    let cache = ctx.temporary_symbol_cache();
+    let cache = ctx.symbol_cache();
     let Ok(generation) = cache.read().map(|cache| cache.generation()) else {
         return;
     };

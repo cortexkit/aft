@@ -8312,12 +8312,16 @@ export function bannerUnused() {}
             .view()
             .expect("cold view");
         let cold = cold_view
-            .dead_code_snapshot_shared()
+            .dead_code_snapshot_shared(&crate::inspect::InspectEntryPoints)
             .expect("cold snapshot");
         assert_eq!(parts(&refreshed), parts(&cold));
         // Every call row too, though dead code reads them file by file.
         let rows = |view: &crate::data_layer::checkout::CheckoutView| {
-            parts(&view.rows_dead_code_snapshot().expect("every call row"))
+            parts(
+                &view
+                    .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
+                    .expect("every call row"),
+            )
         };
         assert_eq!(rows(&checkout.view().expect("view")), rows(&cold_view));
         assert_eq!(aggregate, dead(&job, &cold).1);
@@ -8924,7 +8928,7 @@ export function bannerUnused() {}
                 .checkout
                 .view()
                 .expect("published call graph")
-                .dead_code_snapshot()
+                .dead_code_snapshot(&crate::inspect::InspectEntryPoints)
                 .expect("project snapshot"),
         ));
         let cache = manager
@@ -9255,7 +9259,7 @@ mod dead_code_projection_tests {
         let projected = checkout
             .view()
             .expect("view")
-            .dead_code_snapshot()
+            .dead_code_snapshot(&crate::inspect::InspectEntryPoints)
             .expect("project snapshot");
 
         let config = Arc::new(Config {
@@ -9491,7 +9495,9 @@ mod dead_code_projection_tests {
             Fresh::Building => panic!("edited call graph did not publish"),
             Fresh::Failed(reason) => panic!("edited call graph failed: {reason}"),
         };
-        let incremental = view.dead_code_snapshot().expect("snapshot");
+        let incremental = view
+            .dead_code_snapshot(&crate::inspect::InspectEntryPoints)
+            .expect("snapshot");
         let aggregate = dead_code_aggregate(&root, project_files(&root), incremental);
         assert_live_item(&aggregate, "src/commands.rs", "get_primers");
         assert_live_item(&aggregate, "src/db.rs", "helper");

@@ -1673,6 +1673,17 @@ impl InspectCache {
     }
 }
 
+impl crate::data_layer::parent_session::InspectCacheView for ReadonlyInspectCache {
+    fn project_aggregate(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.get_aggregated_for_config(&JobKey::for_project_category(category), config)
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl ReadonlyInspectCache {
     fn from_inner(inner: InspectCache) -> Self {
         Self { inner }

@@ -835,7 +835,7 @@ pub(crate) fn memory_estimate(ctx: &dyn IndexHost) -> Option<DataLayerMemory> {
             // aft_inspect's dead-code scan may hold the same snapshot the
             // checkout's dead-code memo holds; the root's
             // `callgraph_projection` plane counts it then.
-            if let Some(snapshot) = ctx.temporary_inspect_projection() {
+            if let Some(snapshot) = ctx.callgraph_projection() {
                 seen.counted_elsewhere(Arc::as_ptr(&snapshot));
             }
             let memory = checkout.checkout().memory(&mut seen);

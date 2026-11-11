@@ -2364,6 +2364,8 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     paths.push(source_dir.join("subc/bind_log.rs"));
     paths.push(source_dir.join("subc/diagnostics_findings.rs"));
     paths.push(source_dir.join("runtime_drain.rs"));
+    paths.push(source_dir.join("parser/todo_markers.rs"));
+    paths.push(source_dir.join("parser/dead_code_facts.rs"));
     paths.push(source_dir.join("bash_permissions/scan.rs"));
     paths.extend(collect_rs_files(&source_dir.join("compress")));
     let primitives = [
