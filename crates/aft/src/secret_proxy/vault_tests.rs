@@ -504,7 +504,7 @@ async fn live_vault_fetch_uses_the_concrete_target_and_holds_for_the_phone() {
             cfg.authorization_scope.stamp().clone(),
             || {
                 let secrets = crate::url_fetch::SecretFetch {
-                    vault: cfg.vault.as_ref(),
+                    vault: cfg.vault.clone(),
                     authorization: Some(cfg.authorization_scope.clone()),
                     labels: vec!["test".into()],
                     test_https_port: Some(port),

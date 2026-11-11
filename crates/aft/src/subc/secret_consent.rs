@@ -40,6 +40,7 @@ use subc_protocol::scope::ScopeKind;
 use subc_protocol::scope::ScopeStamp;
 
 const SECRET_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
+const SECRET_AWAIT_CAP: Duration = Duration::from_secs(120);
 
 /// Use the daemon connection that files filesystem-access questions with
 /// Cingulate as its reserved AFT module principal. Retain each secret card's id
@@ -144,6 +145,15 @@ impl SubcSecretConsent {
     }
 
     async fn file(&self, request: &SecretConsentRequest, hold: Duration) -> ConsentOutcome {
+        self.file_cancellable(request, hold, None).await
+    }
+
+    async fn file_cancellable(
+        &self,
+        request: &SecretConsentRequest,
+        hold: Duration,
+        cancel: Option<&crate::secret::consent::Cancellation>,
+    ) -> ConsentOutcome {
         let card = {
             let mut cards = self.cards.lock().await;
             cards.retain(|_, card| {
@@ -172,6 +182,9 @@ impl SubcSecretConsent {
             return answer.clone();
         }
         if card.elicitation.is_none() {
+            if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                return ConsentOutcome::Expired;
+            }
             // A lost filing reply must not cause the same request to be filed again.
             card.answered = Some(consent_unavailable(
                 "Cingulate could not file the secret-use card",
@@ -196,15 +209,33 @@ impl SubcSecretConsent {
             card.elicitation = Some(id.to_owned());
             card.answered = None;
         }
-        let outcome = match self
+        let await_card = self
             .call(
                 request,
                 "consent.await",
-                serde_json::json!({"elicitation_id": card.elicitation, "timeout_ms": hold.as_millis() as u64}),
-                hold + SECRET_CONSENT_TIMEOUT,
-            )
-            .await
-        {
+                serde_json::json!({"elicitation_id": card.elicitation, "timeout_ms": hold.min(SECRET_AWAIT_CAP).as_millis() as u64}),
+                hold.min(SECRET_AWAIT_CAP) + SECRET_CONSENT_TIMEOUT,
+            );
+        let cancelled = async {
+            match cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let response = tokio::select! {
+            biased;
+            () = cancelled => {
+                let result = self.call(request, "consent.withdraw", serde_json::json!({"elicitation_id": card.elicitation}), SECRET_CONSENT_TIMEOUT).await;
+                if result.is_err() {
+                    tracing::warn!("secret consent withdrawal failed");
+                    return consent_unavailable("Cingulate could not settle the secret-use card");
+                }
+                card.answered = Some(ConsentOutcome::Expired);
+                return ConsentOutcome::Expired;
+            },
+            response = await_card => response,
+        };
+        let outcome = match response {
             Ok(record) => decode_secret_record(&record, &request.request_id),
             Err(_) => consent_unavailable("Cingulate could not settle the secret-use card"),
         };
@@ -235,6 +266,38 @@ impl SubcSecretConsent {
 }
 
 impl crate::secret::SecretConsentTransport for SubcSecretConsent {
+    fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        Some(self.runtime.clone())
+    }
+
+    fn wait(
+        self: Arc<Self>,
+        request: SecretConsentRequest,
+        cancel: crate::secret::consent::Cancellation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ConsentOutcome> + Send>> {
+        Box::pin(async move {
+            loop {
+                let now = crate::secret::vault::now_ms();
+                let expires = request.expires_at_ms.unwrap_or(now.saturating_add(600_000));
+                if now >= expires {
+                    cancel.cancel();
+                }
+                let outcome = self
+                    .file_cancellable(
+                        &request,
+                        Duration::from_millis(expires.saturating_sub(now)).min(SECRET_AWAIT_CAP),
+                        Some(&cancel),
+                    )
+                    .await;
+                if outcome != ConsentOutcome::Pending {
+                    return outcome;
+                }
+                // Cingulate returns pending at its per-await cap. Re-awaiting
+                // the same card is read-only; it never files another card.
+                tokio::task::yield_now().await;
+            }
+        })
+    }
     fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
         self.dispatch(request, super::consent::hold_budget(None))
     }
@@ -243,11 +306,19 @@ impl crate::secret::SecretConsentTransport for SubcSecretConsent {
         self.dispatch(request, Duration::from_secs(600))
     }
 
-    fn withhold(&self, _request: &SecretConsentRequest) -> ConsentOutcome {
-        // Cingulate has not published a withdrawal method for secret_use cards
-        // yet. Do not send the filesystem permission method; the vault still
-        // governs release and the card's original deadline is unchanged.
-        consent_unavailable("secret-use card withdrawal is not supported")
+    fn withhold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+        let cancel = crate::secret::consent::Cancellation::default();
+        cancel.cancel();
+        let future = self.file_cancellable(request, Duration::ZERO, Some(&cancel));
+        match tokio::runtime::Handle::try_current() {
+            Ok(current)
+                if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(|| self.runtime.block_on(future))
+            }
+            Ok(_) => consent_unavailable("secret consent cannot block a single-threaded runtime"),
+            Err(_) => self.runtime.block_on(future),
+        }
     }
 }
 
@@ -400,6 +471,7 @@ pub(super) fn file_secret_consent(
         label: label.to_string(),
         request_id: request_id.to_string(),
         statement_b64url: statement_b64url.to_string(),
+        expires_at_ms: None,
     };
     match file_consent(&request) {
         // No usable card or answer: nothing is held, nothing starts.
@@ -436,6 +508,7 @@ pub(crate) enum LaunchDecision {
 
 /// Fetch tools already know the target. Check eligibility before asking once,
 /// then use the existing held-call consent path if approval is required.
+#[cfg(test)]
 pub(crate) fn use_label_for_fetch(
     identity: &RouteIdentity,
     vault: &dyn crate::secret::SecretVault,
@@ -509,6 +582,7 @@ thread_local! {
 }
 
 /// Use only the dispatcher-installed identity, never tool arguments.
+#[cfg(test)]
 pub(crate) fn use_current_secret_label(
     vault: &dyn crate::secret::SecretVault,
     label: &str,
@@ -684,3 +758,112 @@ impl Drop for SecretScopeGuard {
 #[cfg(test)]
 #[path = "secret_consent_tests.rs"]
 mod tests;
+
+/// Fetch and proxy requests join the same scope/request-id cards, each with
+/// one person-wait deadline shared by every concurrently requested label.
+pub(crate) fn use_current_secret_labels(
+    vault: Arc<dyn crate::secret::SecretVault>,
+    labels: &[String],
+    target: &crate::secret::ApiKeyTarget,
+) -> Vec<LaunchDecision> {
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    let unavailable = || {
+        labels
+            .iter()
+            .map(|label| {
+                LaunchDecision::Refuse(crate::secret::refuse(
+                    crate::secret::SECRET_ACCESS_UNAVAILABLE,
+                    label,
+                    "the consent ask could not be filed",
+                ))
+            })
+            .collect()
+    };
+    let scopes = match current_call_scopes() {
+        Ok((scopes, _)) => scopes,
+        Err(reason) => {
+            return labels
+                .iter()
+                .map(|label| {
+                    LaunchDecision::Refuse(crate::secret::refuse_ineligible(label, reason))
+                })
+                .collect()
+        }
+    };
+    #[cfg(unix)]
+    if vault.can_release_material() && crate::secret_proxy::protect_secret_process().is_err() {
+        return unavailable();
+    }
+    let coordinator = crate::secret::requests::RequestSecrets::new(
+        vault,
+        scopes.authorization,
+        current_secret_consent_context(),
+    );
+    let labels = labels.to_vec();
+    let target = target.clone();
+    let future = async move {
+        use futures_util::StreamExt;
+        let mut budget = coordinator.budget();
+        let mut pending = futures_util::stream::FuturesUnordered::new();
+        for (index, label) in labels.iter().enumerate() {
+            let target = &target;
+            let coordinator = &coordinator;
+            let expires = budget.expires_at_ms;
+            pending.push(async move {
+                (
+                    index,
+                    coordinator
+                        .use_in_request(label, target, expires, || async { Ok(()) })
+                        .await,
+                )
+            });
+        }
+        let mut answers: Vec<Option<crate::secret::UseAnswer>> =
+            (0..labels.len()).map(|_| None).collect();
+        while !pending.is_empty() {
+            let result = tokio::select! {
+                biased;
+                () = budget.expired() => None,
+                result = pending.next() => result,
+            };
+            let Some((index, answer)) = result else {
+                return None;
+            };
+            match answer {
+                Ok(answer) => answers[index] = Some(answer),
+                Err(_) => return None,
+            }
+        }
+        Some(
+            labels
+                .iter()
+                .zip(answers)
+                .map(|(label, answer)| {
+                    let answer = answer.unwrap_or(crate::secret::UseAnswer::Unavailable);
+                    let outcome = crate::secret::outcome_for(label, &answer);
+                    if outcome.proceeds() {
+                        LaunchDecision::Proceed(answer)
+                    } else {
+                        LaunchDecision::Refuse(outcome)
+                    }
+                })
+                .collect(),
+        )
+    };
+    // Blocking fetches run on tool worker threads. A local runtime drives only
+    // their coordinator; production card workers stay on the daemon runtime.
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => None,
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|runtime| runtime.block_on(future)),
+    };
+    result.unwrap_or_else(unavailable)
+}

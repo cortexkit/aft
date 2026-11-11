@@ -453,7 +453,17 @@ impl SecretProxy {
 
     #[cfg(unix)]
     pub(crate) fn approval_status(&self) -> Vec<String> {
-        self.state.approvals.status()
+        self.state
+            .approvals
+            .status()
+            .into_iter()
+            .filter_map(|line| {
+                self.state
+                    .scrub(line.as_bytes())
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .collect()
     }
 
     /// Exec-time only: never persist the returned credential with a task request.

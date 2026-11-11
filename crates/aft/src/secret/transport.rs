@@ -53,7 +53,7 @@ struct Work {
     params: Value,
     principal: ConsumerIdentity,
     deadline: tokio::time::Instant,
-    reply: std::sync::mpsc::Sender<Result<Value, String>>,
+    reply: std::sync::mpsc::Sender<Result<Zeroizing<Vec<u8>>, String>>,
 }
 
 struct ConnectionConfig {
@@ -102,7 +102,7 @@ impl SubcSecretUseTransport {
         consumer: &subc_client_rs::SubcConsumer,
         params: Value,
         principal: ConsumerIdentity,
-    ) -> Result<Value, String> {
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
         let target = &params["target"];
         if target["scheme"] != "https"
             || target
@@ -146,20 +146,35 @@ impl SubcSecretUseTransport {
         match reply {
             Ok(bytes) => {
                 let bytes = Zeroizing::new(bytes);
-                serde_json::from_slice(&bytes).map_err(|_| UNAVAILABLE.to_owned())
+                Ok(bytes)
             }
             // Preserve the distinction between a module Error frame and a
             // result refusal. Do not include SDK errors or reply bytes in
             // transport diagnostics: either could carry released material.
-            Err(CallError::Module(error)) => Ok(json!({
-                "code": error.code,
-                "message": error.message,
-            })),
+            Err(CallError::Module(error)) => {
+                let code = Zeroizing::new(error.code);
+                let message = Zeroizing::new(error.message);
+                #[derive(serde::Serialize)]
+                struct Rejected<'a> {
+                    code: &'a str,
+                    message: &'a str,
+                }
+                serde_json::to_vec(&Rejected {
+                    code: &code,
+                    message: &message,
+                })
+                .map(Zeroizing::new)
+                .map_err(|_| UNAVAILABLE.to_owned())
+            }
             Err(_) => Err(UNAVAILABLE.to_owned()),
         }
     }
 
-    fn dispatch(&self, params: Value, principal: ConsumerIdentity) -> Result<Value, String> {
+    fn dispatch(
+        &self,
+        params: Value,
+        principal: ConsumerIdentity,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
         let sender = self.worker.get_or_init(|| {
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
             let config = ConnectionConfig {
@@ -236,7 +251,7 @@ fn aft_identity() -> Option<ConsumerIdentity> {
 }
 
 impl SecretUseTransport for SubcSecretUseTransport {
-    fn secret_use(&self, params: Value) -> Result<Value, String> {
+    fn secret_use(&self, params: Value) -> Result<Zeroizing<Vec<u8>>, String> {
         #[cfg(test)]
         if let Some(principal) = &self.test_principal {
             return self.dispatch(params, principal.clone());

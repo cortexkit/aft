@@ -172,7 +172,7 @@ pub fn now_ms() -> u64 {
 pub trait SecretUseTransport: Send + Sync {
     /// Send `params` as a `secret.use` call and return the reply body: either
     /// `{"result": …}` or an error object (§15, §1a).
-    fn secret_use(&self, params: serde_json::Value) -> Result<serde_json::Value, String>;
+    fn secret_use(&self, params: serde_json::Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String>;
 }
 
 /// The real client: `secret.use` over the daemon's transport (§15).
@@ -207,7 +207,7 @@ impl SubcSecretVault {
             .transport
             .secret_use(request.to_params())
             .map_err(|detail| wire::ReplyError::Malformed { detail })?;
-        wire::parse_answer(&body)
+        super::wire_owned::parse(&body)
     }
 }
 

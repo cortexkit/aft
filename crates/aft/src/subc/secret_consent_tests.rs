@@ -750,6 +750,7 @@ impl super::super::consent::ConsentTransport for SecretCards {
                 assert_eq!(call.params["elicitation_id"], "el_1");
                 filer_reply(self.record)
             }
+            "consent.withdraw" => Ok(serde_json::json!({})),
             method => panic!("unexpected consent method: {method}"),
         };
         Box::pin(async move { reply })
@@ -762,14 +763,19 @@ struct ScriptedSecretUse {
 }
 
 impl crate::secret::SecretUseTransport for ScriptedSecretUse {
-    fn secret_use(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    fn secret_use(&self, params: serde_json::Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
         self.calls.lock().unwrap().push(params);
-        Ok(self
-            .replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("an expected secret.use retry"))
+        Ok(zeroize::Zeroizing::new(
+            serde_json::to_vec(
+                &self
+                    .replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("an expected secret.use retry"),
+            )
+            .unwrap(),
+        ))
     }
 }
 

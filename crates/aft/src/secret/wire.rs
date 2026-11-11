@@ -214,7 +214,7 @@ pub struct ReleasedLogin {
     /// The account name.
     pub username: String,
     /// The password.
-    password: crate::secret::vault::Material,
+    pub(super) password: crate::secret::vault::Material,
     /// The current TOTP code, when the record holds a seed. The seed itself
     /// never leaves the vault.
     pub totp: Option<String>,
@@ -382,7 +382,7 @@ fn b64url() -> base64::engine::general_purpose::GeneralPurpose {
 
 /// Read `key_b64url`, which is strict unpadded base64url (nonzero trailing
 /// bits included).
-fn decode_key(text: &str) -> Result<Vec<u8>, ReplyError> {
+pub(super) fn decode_key(text: &str) -> Result<Vec<u8>, ReplyError> {
     b64url()
         .decode(text)
         .map_err(|_| ReplyError::BadKeyEncoding)
@@ -392,7 +392,7 @@ fn decode_key(text: &str) -> Result<Vec<u8>, ReplyError> {
 /// characters from the 32-symbol Crockford alphabet, uppercase, with no
 /// padding. The first character is bounded to `0..=7` because the leading
 /// 128-bit timestamp field may not overflow.
-fn is_ulid(text: &str) -> bool {
+pub(super) fn is_ulid(text: &str) -> bool {
     const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let bytes = text.as_bytes();
     bytes.len() == 26
@@ -571,6 +571,12 @@ struct TransportError {
 /// tests read replies by the same rules.
 pub fn parse_answer(body: &Value) -> Result<SecretUseAnswer, ReplyError> {
     if let Some(result) = body.get("result") {
+        expect_keys(
+            body.as_object().ok_or_else(|| ReplyError::Malformed {
+                detail: "the reply is not an object".into(),
+            })?,
+            &["result"],
+        )?;
         if result.get("error").is_some() {
             let error: ResultError =
                 serde_json::from_value(result.clone()).map_err(|_| ReplyError::Malformed {

@@ -416,14 +416,17 @@ fn a_result_error_and_a_transport_error_read_as_the_contract_spells_them() {
 fn the_secret_use_client_sends_the_pinned_params_and_reads_a_release() {
     struct Recording(std::sync::Mutex<Vec<Value>>);
     impl SecretUseTransport for Recording {
-        fn secret_use(&self, params: Value) -> Result<Value, String> {
+        fn secret_use(&self, params: Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
             self.0.lock().unwrap().push(params);
-            Ok(json!({"result":{
-                "status": "released",
-                "kind": "agent_api_key",
-                "key_b64url": "c2stZXhhbXBsZQ",
-                "location": "header:X-Api-Key"
-            }}))
+            Ok(zeroize::Zeroizing::new(
+                serde_json::to_vec(&json!({"result":{
+                    "status": "released",
+                    "kind": "agent_api_key",
+                    "key_b64url": "c2stZXhhbXBsZQ",
+                    "location": "header:X-Api-Key"
+                }}))
+                .unwrap(),
+            ))
         }
     }
     let transport = std::sync::Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
@@ -455,14 +458,17 @@ fn the_secret_use_client_sends_the_pinned_params_and_reads_a_release() {
 fn the_secret_use_client_reports_an_approval_as_pending() {
     struct Pending;
     impl SecretUseTransport for Pending {
-        fn secret_use(&self, _params: Value) -> Result<Value, String> {
+        fn secret_use(&self, _params: Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
             let file = vectors();
-            Ok(json!({"result":{
-                "status": "approval_required",
-                "request_id": file["vectors"][0]["statements"][0]["request_id"],
-                "statement_b64url": file["vectors"][0]["statements"][0]["statement_b64url"],
-                "expires_at_ms": 1700000600000u64,
-            }}))
+            Ok(zeroize::Zeroizing::new(
+                serde_json::to_vec(&json!({"result":{
+                    "status": "approval_required",
+                    "request_id": file["vectors"][0]["statements"][0]["request_id"],
+                    "statement_b64url": file["vectors"][0]["statements"][0]["statement_b64url"],
+                    "expires_at_ms": 1700000600000u64,
+                }}))
+                .unwrap(),
+            ))
         }
     }
     let vault = SubcSecretVault::new(std::sync::Arc::new(Pending));
@@ -487,8 +493,13 @@ fn the_secret_use_client_reports_an_approval_as_pending() {
 fn the_secret_use_client_preserves_uniform_not_found_for_literal_forwarding() {
     struct NotFound;
     impl SecretUseTransport for NotFound {
-        fn secret_use(&self, _params: Value) -> Result<Value, String> {
-            Ok(json!({"result":{"error":{"code":"not_found","class":"permanent"}}}))
+        fn secret_use(&self, _params: Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+            Ok(zeroize::Zeroizing::new(
+                serde_json::to_vec(
+                    &json!({"result":{"error":{"code":"not_found","class":"permanent"}}}),
+                )
+                .unwrap(),
+            ))
         }
     }
     let vault = SubcSecretVault::new(std::sync::Arc::new(NotFound));

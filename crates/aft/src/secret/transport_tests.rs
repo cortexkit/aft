@@ -20,7 +20,7 @@ fn transport(daemon: &FakeClaustrum) -> SubcSecretUseTransport {
 }
 
 fn call(transport: &SubcSecretUseTransport, params: Value) -> Value {
-    transport.dispatch(params, principal("aft")).unwrap()
+    serde_json::from_slice(&transport.dispatch(params, principal("aft")).unwrap()).unwrap()
 }
 
 #[test]

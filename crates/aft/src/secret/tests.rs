@@ -241,6 +241,7 @@ fn a_secret_consent_files_exactly_the_single_phone_item() {
     let request_id = item["request_id"].as_str().unwrap();
     let statement = item["statement_b64url"].as_str().unwrap();
     let request = SecretConsentRequest {
+        expires_at_ms: None,
         scope: production_scope(),
         project_root: "project".into(),
         session: "session".into(),

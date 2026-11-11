@@ -19,6 +19,7 @@ pub mod scope;
 pub mod transport;
 pub mod vault;
 pub mod wire;
+mod wire_owned;
 
 pub use consent::{
     file_consent, request_params, withhold_consent, ConsentOutcome, SecretConsentRequest,

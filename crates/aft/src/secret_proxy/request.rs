@@ -145,11 +145,7 @@ async fn prepare_and_send(
         .headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.split(';')
-                .next()
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
-        });
+        .is_some_and(secret_rules::location::is_json_content_type);
     let mut body = body_buffer(has_json);
     if has_json {
         while let Some(frame) = incoming.frame().await {
@@ -180,25 +176,82 @@ async fn prepare_and_send(
         port: Some(443),
         path: String::from_utf8(path.wire).map_err(|_| fail())?,
     };
+    let labels: Vec<_> = state
+        .config
+        .scanned_labels
+        .iter()
+        .filter(|label| {
+            super::audit::mentions(target.as_bytes(), label)
+                || parts
+                    .headers
+                    .values()
+                    .any(|value| super::audit::mentions(value.as_bytes(), label))
+                || super::audit::mentions(&body, label)
+        })
+        .cloned()
+        .collect();
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
+        .collect();
+    let structure = RequestView::new(&target, headers).with_body(&body);
+    if has_json && !labels.is_empty() {
+        secret_rules::location::validate_json_request(&structure).map_err(|_| fail())?;
+    }
+    if evaluate_request_with_connect(&structure, authority, &[], &[])
+        .refusal
+        .is_some()
+    {
+        return Err(fail());
+    }
+    drop(structure);
+    let mut budget = state.approvals.budget();
+    // Finish verified TLS before any releasing call. Approval waits reconnect
+    // before their retry; no socket held across a phone wait authorizes a send.
+    let initial = connect_upstream(authority, state, ws).await?;
+    let reconnected = tokio::sync::Mutex::new(Vec::new());
+    use futures_util::StreamExt;
+    let mut pending = futures_util::stream::FuturesUnordered::new();
+    for label in &labels {
+        audit.mention(label);
+        let addressed = &addressed;
+        let reconnected = &reconnected;
+        let expires = budget.expires_at_ms;
+        pending.push(async move {
+            let answer = if state.is_https_port(authority.port) {
+                state
+                    .approvals
+                    .use_in_request(label, addressed, expires, || async {
+                        let connection = connect_upstream(authority, state, ws)
+                            .await
+                            .map_err(|_| crate::secret::requests::UseError::Unavailable)?;
+                        reconnected.lock().await.push(connection);
+                        Ok(())
+                    })
+                    .await
+            } else {
+                Ok(crate::secret::UseAnswer::NotFound)
+            };
+            (label, answer)
+        });
+    }
     let mut rules = Vec::new();
     let mut materials = Vec::new();
-    for label in &state.config.scanned_labels {
-        if !super::audit::mentions(target.as_bytes(), label)
-            && !parts
-                .headers
-                .values()
-                .any(|value| super::audit::mentions(value.as_bytes(), label))
-            && !super::audit::mentions(&body, label)
-        {
-            continue;
-        }
-        audit.mention(label);
-        if !state.is_https_port(authority.port) {
-            continue;
-        }
-        let answer = match state.approvals.use_for_request(label, &addressed).await {
+    let mut unsettled = labels.clone();
+    while !pending.is_empty() {
+        let (label, answer) = tokio::select! {
+            biased;
+            () = budget.expired() => return Ok(not_approved(unsettled.first().map(String::as_str).unwrap_or(""), &authority.host, state)),
+            result = pending.next() => result.ok_or_else(fail)?,
+        };
+        unsettled.retain(|name| name != label);
+        let answer = match answer {
             Ok(answer) => answer,
-            Err(()) => return Ok(not_approved(label, &authority.host)),
+            Err(crate::secret::requests::UseError::NotApproved) => {
+                return Ok(not_approved(label, &authority.host, state))
+            }
+            Err(crate::secret::requests::UseError::Unavailable) => return Err(label.clone()),
         };
         match answer {
             crate::secret::UseAnswer::NotFound => continue,
@@ -206,17 +259,39 @@ async fn prepare_and_send(
                 let (location, material) = released.into_parts();
                 let location = secret_rules::location::parse_vault_location(&location)
                     .ok_or_else(|| label.clone())?;
-                check_admissible(material.expose(), label, &location).map_err(|_| label.clone())?;
-                state
-                    .install(label, material.expose())
-                    .map_err(|_| label.clone())?;
-                rules.push(secret_rules::location::LabelRule {
+                // Covered requests disclose their location only with the release,
+                // so a location-dependent refusal cannot precede that release.
+                let rule = secret_rules::location::LabelRule {
                     label: label.clone(),
                     host: addressed.host.clone(),
                     port: authority.port,
                     path_prefix: addressed.path.clone(),
                     location,
-                });
+                };
+                let headers = parts
+                    .headers
+                    .iter()
+                    .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
+                    .collect();
+                let view = RequestView::new(&target, headers).with_body(&body);
+                let dummy = [(label.clone(), b"proxy-planning-value-0000".to_vec())];
+                if evaluate_request_with_connect(
+                    &view,
+                    authority,
+                    std::slice::from_ref(&rule),
+                    &dummy,
+                )
+                .refusal
+                .is_some()
+                {
+                    return Err(label.clone());
+                }
+                check_admissible(material.expose(), label, &rule.location)
+                    .map_err(|_| label.clone())?;
+                state
+                    .install(label, material.expose())
+                    .map_err(|_| label.clone())?;
+                rules.push(rule);
                 materials.push(Some(material));
             }
             _ => return Err(label.clone()),
@@ -248,8 +323,9 @@ async fn prepare_and_send(
             }
         }
     }
-    // No HTTP request reaches the upstream until every required approval ends.
-    let upstream = connect_upstream(authority, state, ws).await?;
+    // Earlier releases belong only to this request and are already spent: any
+    // later refusal or deadline drops them without sending or reusing them.
+    let upstream = reconnected.into_inner().pop().unwrap_or(initial);
     let http2 = matches!(&upstream, Upstream::Http2(_));
     let response = {
         let _gate = state.material_gate.lock();
@@ -344,12 +420,13 @@ async fn prepare_and_send(
         }
         #[cfg(test)]
         state.headers_sensitive.store(
-            plan.header_edits.iter().all(|edit| {
-                outbound
-                    .headers()
-                    .get(edit.name.as_str())
-                    .is_some_and(|value| value.is_sensitive())
-            }),
+            !plan.header_edits.is_empty()
+                && plan.header_edits.iter().all(|edit| {
+                    outbound
+                        .headers()
+                        .get(edit.name.as_str())
+                        .is_some_and(|value| value.is_sensitive())
+                }),
             Ordering::Release,
         );
         if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
@@ -369,10 +446,15 @@ async fn prepare_and_send(
         .map_err(|_| fail())
 }
 
-fn not_approved(label: &str, host: &str) -> Response<Body> {
-    let mut response = Response::new(full(Bytes::from(format!(
+fn not_approved(label: &str, host: &str, state: &State) -> Response<Body> {
+    let body = Zeroizing::new(format!(
         "secret {label} was not approved for {host}; the request was not sent"
-    ))));
+    ));
+    let mut response = Response::new(full(Bytes::from(
+        state
+            .scrub(body.as_bytes())
+            .unwrap_or_else(|_| super::PROXY_REFUSAL.as_bytes().to_vec()),
+    )));
     *response.status_mut() = hyper::StatusCode::FORBIDDEN;
     response
 }

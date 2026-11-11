@@ -1,20 +1,21 @@
-//! Serialize approval waits for a label without caching any released material.
+//! Request-addressed vault use and shared, cancellable approval cards.
 
-use std::collections::{BTreeMap, HashMap};
+use super::{
+    ApiKeyTarget, ApprovalRequest, ConsentOutcome, SecretConsentRequest, SecretScope, SecretVault,
+    UseAnswer,
+};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use super::{ApiKeyTarget, SecretConsentRequest, SecretScope, SecretVault, UseAnswer};
 
 /// The phone's approval window is independent of upstream network deadlines.
 pub(crate) trait ApprovalClock: Send + Sync {
     fn now_ms(&self) -> u64;
     fn deadline(&self) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
-
 struct WallClock;
 impl ApprovalClock for WallClock {
     fn now_ms(&self) -> u64 {
@@ -25,30 +26,46 @@ impl ApprovalClock for WallClock {
     }
 }
 
-#[derive(Default)]
-struct History {
-    filed: Option<(String, u64)>,
-    used_after_card: bool,
+/// One absolute person-wait limit, shared by every label in an HTTP request.
+pub(crate) struct RequestBudget {
+    pub(crate) expires_at_ms: u64,
+    deadline: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
-#[derive(Default)]
-struct Slot {
-    history: tokio::sync::Mutex<History>,
-    expires: AtomicU64,
+impl RequestBudget {
+    pub(crate) async fn expired(&mut self) {
+        self.deadline.as_mut().await;
+    }
 }
-type SlotKey = (String, String, u64, String);
-static SLOTS: LazyLock<Mutex<HashMap<SlotKey, Arc<Slot>>>> = LazyLock::new(Mutex::default);
+#[derive(Clone, Copy)]
+pub(crate) enum UseError {
+    NotApproved,
+    Unavailable,
+}
 
 pub(crate) struct RequestSecrets {
     vault: Arc<dyn SecretVault>,
     scope: SecretScope,
     context: Option<(std::path::PathBuf, String)>,
-    slots: Mutex<HashMap<String, Arc<Slot>>>,
-    status: Mutex<BTreeMap<String, (u64, Vec<String>)>>,
+    status: Mutex<BTreeMap<u64, Vec<String>>>,
     sequence: AtomicU64,
     clock: Arc<dyn ApprovalClock>,
     active: Arc<std::sync::atomic::AtomicUsize>,
+    once: Mutex<BTreeMap<String, bool>>,
 }
-
+struct Waiting<'a> {
+    owner: &'a RequestSecrets,
+    sequence: u64,
+}
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.owner
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.sequence);
+        self.owner.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 impl RequestSecrets {
     pub(crate) fn new(
         vault: Arc<dyn SecretVault>,
@@ -59,60 +76,32 @@ impl RequestSecrets {
             vault,
             scope,
             context,
-            slots: Mutex::default(),
             status: Mutex::default(),
             sequence: AtomicU64::new(1),
             clock: Arc::new(WallClock),
             active: Arc::default(),
+            once: Mutex::default(),
         }
     }
-
-    fn slot(&self, label: &str) -> Arc<Slot> {
-        let mut local = self
-            .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        local
-            .entry(label.into())
-            .or_insert_with(|| {
-                let mut slots = SLOTS
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                slots.retain(|_, slot| {
-                    Arc::strong_count(slot) > 1
-                        || slot.expires.load(Ordering::Acquire) > self.clock.now_ms()
-                });
-                let key = (
-                    self.scope.owner().into(),
-                    self.scope.reference().into(),
-                    self.scope.stamp().scope_epoch,
-                    label.to_owned(),
-                );
-                if let Some(slot) = slots.get(&key) {
-                    return slot.clone();
-                }
-                let slot = Arc::new(Slot::default());
-                slots.insert(key, slot.clone());
-                slot
-            })
-            .clone()
+    pub(crate) fn budget(&self) -> RequestBudget {
+        RequestBudget {
+            expires_at_ms: self.clock.now_ms().saturating_add(600_000),
+            deadline: self.clock.deadline(),
+        }
     }
-
     #[cfg(unix)]
     pub(crate) fn status(&self) -> Vec<String> {
         self.status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .flat_map(|(_, lines)| lines)
+            .flatten()
             .cloned()
             .collect()
     }
-
     pub(crate) fn activity(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.active.clone()
     }
-
     #[cfg(test)]
     pub(crate) fn with_clock(mut self, clock: Option<Arc<dyn ApprovalClock>>) -> Self {
         if let Some(clock) = clock {
@@ -121,93 +110,44 @@ impl RequestSecrets {
         self
     }
 
-    pub(crate) async fn use_for_request(
-        &self,
-        label: &str,
-        target: &ApiKeyTarget,
-    ) -> Result<UseAnswer, ()> {
-        struct Active(Arc<std::sync::atomic::AtomicUsize>);
-        impl Drop for Active {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        self.active.fetch_add(1, Ordering::AcqRel);
-        let _active = Active(self.active.clone());
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let result = tokio::select! {
-            result = self.use_serial(label, target, sequence) => result,
-            () = self.clock.deadline() => Err(()),
-        };
-        let mut status = self
-            .status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if status
-            .get(label)
-            .is_some_and(|(owner, _)| *owner == sequence)
-        {
-            status.remove(label);
-        }
-        result
-    }
-
-    async fn ask(&self, label: &str, target: &ApiKeyTarget) -> UseAnswer {
+    pub(crate) async fn ask(&self, label: &str, target: &ApiKeyTarget) -> UseAnswer {
         let (vault, scope, label, target) = (
             self.vault.clone(),
             self.scope.clone(),
             label.to_owned(),
             target.clone(),
         );
-        let (send, receive) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let _ = send.send(vault.use_secret(&scope, &label, &target));
-        });
-        receive.await.unwrap_or(UseAnswer::Unavailable)
+        tokio::task::spawn_blocking(move || vault.use_secret(&scope, &label, &target))
+            .await
+            .unwrap_or(UseAnswer::Unavailable)
     }
 
-    async fn use_serial(
+    pub(crate) async fn approve(
         &self,
         label: &str,
         target: &ApiKeyTarget,
-        sequence: u64,
-    ) -> Result<UseAnswer, ()> {
-        let slot = self.slot(label);
-        let mut history = slot.history.lock().await;
-        if history
-            .filed
-            .as_ref()
-            .is_some_and(|(_, expires)| *expires <= self.clock.now_ms())
-        {
-            history.filed = None;
-        }
-        let answer = self.ask(label, target).await;
-        let UseAnswer::ApprovalRequired(pending) = answer else {
-            if matches!(answer, UseAnswer::Released(_)) {
-                history.used_after_card = false;
-            }
-            return Ok(answer);
-        };
-        if history
-            .filed
-            .as_ref()
-            .is_some_and(|(id, _)| id == &pending.request_id)
-        {
-            return Err(());
-        }
+        pending: ApprovalRequest,
+        expires_at_ms: u64,
+    ) -> Result<ConsentOutcome, UseError> {
         let Some((project_root, session)) = &self.context else {
-            return Err(());
+            return Err(UseError::Unavailable);
         };
-        let request = SecretConsentRequest {
-            scope: self.scope.clone(),
-            project_root: project_root.clone(),
-            session: session.clone(),
-            label: label.into(),
-            request_id: pending.request_id.clone(),
-            statement_b64url: pending.statement_b64url,
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.active.fetch_add(1, Ordering::AcqRel);
+        // Drop also runs when a client cancels, the command stops, or another
+        // label refuses; none of those paths may leave a waiting status behind.
+        let _waiting = Waiting {
+            owner: self,
+            sequence,
         };
         let mut lines = vec![format!("secret {label}: waiting for approval on the phone for {} (requests wait up to 10 minutes)", target.host)];
-        if history.used_after_card {
+        if self
+            .once
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(label)
+            == Some(&true)
+        {
             lines.push(format!(
                 "secret {label}: the approval covered one request; another card was sent"
             ));
@@ -215,26 +155,58 @@ impl RequestSecrets {
         self.status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(label.into(), (sequence, lines));
-        history.filed = Some((pending.request_id.clone(), pending.expires_at_ms));
-        slot.expires.store(pending.expires_at_ms, Ordering::Release);
-        let (send, receive) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let _ = send.send(super::consent::hold_consent(&request));
-        });
-        let once = match receive.await.ok() {
-            Some(super::ConsentOutcome::AnsweredOnce) => true,
-            Some(super::ConsentOutcome::Answered) => false,
-            _ => return Err(()),
-        };
-        let answer = self.ask(label, target).await;
+            .insert(sequence, lines);
+        let answer = super::consent::wait_consent(SecretConsentRequest {
+            scope: self.scope.clone(),
+            project_root: project_root.clone(),
+            session: session.clone(),
+            label: label.into(),
+            request_id: pending.request_id,
+            statement_b64url: pending.statement_b64url,
+            expires_at_ms: Some(expires_at_ms.min(pending.expires_at_ms)),
+        })
+        .await;
         match answer {
-            UseAnswer::ApprovalRequired(_) => Err(()),
-            UseAnswer::Released(_) => {
-                history.used_after_card = once;
-                Ok(answer)
+            ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce => Ok(answer),
+            ConsentOutcome::Declined | ConsentOutcome::Expired => Err(UseError::NotApproved),
+            _ => Err(UseError::Unavailable),
+        }
+    }
+
+    /// The caller supplies a fresh verified connection before a releasing retry.
+    /// No mutex is held while asking the vault or waiting for a person's answer.
+    pub(crate) async fn use_in_request<F, Fut>(
+        &self,
+        label: &str,
+        target: &ApiKeyTarget,
+        expires_at_ms: u64,
+        mut before_retry: F,
+    ) -> Result<UseAnswer, UseError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), UseError>>,
+    {
+        let mut answered = std::collections::HashSet::new();
+        let mut once = false;
+        loop {
+            let answer = self.ask(label, target).await;
+            let UseAnswer::ApprovalRequired(pending) = answer else {
+                if matches!(answer, UseAnswer::Released(_)) {
+                    self.once
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(label.into(), once);
+                }
+                return Ok(answer);
+            };
+            // An allowed card that still cannot release fails closed, but only
+            // recorded decline/expiry (or the request deadline) means denial.
+            if !answered.insert(pending.request_id.clone()) {
+                return Err(UseError::Unavailable);
             }
-            _ => Ok(answer),
+            once = self.approve(label, target, pending, expires_at_ms).await?
+                == ConsentOutcome::AnsweredOnce;
+            before_retry().await?;
         }
     }
 }

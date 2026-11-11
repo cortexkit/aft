@@ -182,7 +182,7 @@ fn resolve_secret_fetch(
     // failures included, leaves the folder to be deleted at the call's end.
     FetchTempScope::adopt(document_dir.clone());
     let secrets = SecretFetch {
-        vault: vault.as_ref(),
+        vault: vault.clone(),
         authorization,
         labels: labels.to_vec(),
         #[cfg(test)]
@@ -750,6 +750,34 @@ mod url_tests {
             vault.set_answer("test", crate::secret::granted(rule));
             vault.set_material("test", vec![KEY.to_vec()]);
             vault
+        }
+
+        #[test]
+        fn released_fetch_is_not_replayed_after_peer_receives_credential_and_resets() {
+            let fixture = fixture(crate::config::Config::default());
+            let server = serve(&fixture.tls, |_| None);
+            let vault = granted_vault(rule("api.secret.test", 443, "/"));
+            let req = request(
+                "outline",
+                &format!("https://api.secret.test/document.md?key={PLACEHOLDER}"),
+                serde_json::json!({}),
+            );
+            let result = run(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &req,
+                true,
+            );
+            assert!(result.documents.is_empty());
+            assert!(result.text().contains("Failed to fetch"));
+            assert_eq!(
+                server.heads().len(),
+                1,
+                "a consumed release cannot authorize a retry after an ambiguous send failure"
+            );
+            assert!(server.targets()[0].contains(ENCODED_KEY));
+            assert!(!result.text().contains(std::str::from_utf8(KEY).unwrap()));
         }
 
         fn stamp() -> subc_protocol::scope::ScopeStamp {

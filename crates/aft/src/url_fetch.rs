@@ -817,9 +817,9 @@ pub(crate) fn create_secret_fetch_dir(storage_dir: &Path) -> Result<PathBuf, Url
 }
 
 /// What a placeholder fetch may do with its secrets.
-pub struct SecretFetch<'a> {
+pub struct SecretFetch {
     /// The vault each addressed request and audit record go to.
-    pub vault: &'a dyn crate::secret::SecretVault,
+    pub vault: Arc<dyn crate::secret::SecretVault>,
     /// The call's authorization scope; `None` only when the URL holds no
     /// well-formed placeholder, in which case nothing is resolved or audited.
     pub authorization: Option<crate::secret::SecretScope>,
@@ -948,7 +948,7 @@ pub fn fetch_url_with_secrets(
     logical_url: &str,
     document_dir: &Path,
     options: UrlFetchOptions,
-    secrets: &SecretFetch<'_>,
+    secrets: &SecretFetch,
 ) -> Result<PathBuf, UrlFetchError> {
     let key_sent = std::cell::Cell::new(false);
     let result = fetch_with_secrets(logical_url, document_dir, options, secrets, &key_sent)
@@ -971,7 +971,7 @@ fn fetch_with_secrets(
     logical_url: &str,
     document_dir: &Path,
     options: UrlFetchOptions,
-    secrets: &SecretFetch<'_>,
+    secrets: &SecretFetch,
     key_sent: &std::cell::Cell<bool>,
 ) -> Result<PathBuf, UrlFetchError> {
     let mut current = Url::parse(logical_url)
@@ -979,7 +979,7 @@ fn fetch_with_secrets(
     // A fragment never reaches a server, and a rule never matches one.
     current.set_fragment(None);
     let start = current.clone();
-    let deadline = FetchDeadline::for_current_call();
+    let mut deadline = FetchDeadline::for_current_call();
     let approved = Arc::new(ApprovedHosts::default());
     let progress = Arc::new(ConnectProgress::default());
     let client = build_client(&options, Arc::clone(&approved), Arc::clone(&progress))?;
@@ -987,7 +987,10 @@ fn fetch_with_secrets(
     let mut hop = 0;
     let response = loop {
         validate_public_url(&current, &options, &deadline, &approved)?;
+        let waiting = Instant::now();
         let outbound = secret_hop(&current, hop, secrets, &mut held)?;
+        // Approval is a separate person-wait budget, not network time.
+        deadline.at += waiting.elapsed();
         if outbound.is_some() {
             key_sent.set(true);
         }
@@ -1399,7 +1402,7 @@ fn drain_decoder(
 fn secret_hop(
     current: &Url,
     hop: usize,
-    secrets: &SecretFetch<'_>,
+    secrets: &SecretFetch,
     held: &mut HeldKeys,
 ) -> Result<Option<Url>, UrlFetchError> {
     let logical = current.as_str();
@@ -1441,6 +1444,7 @@ fn secret_hop(
         port: Some(443),
         path: String::from_utf8(normalized.wire).map_err(|_| refused(held, "malformed_path"))?,
     };
+    let mut eligible = Vec::new();
     for label in &secrets.labels {
         let https_port = authority.port == 443;
         #[cfg(test)]
@@ -1448,7 +1452,12 @@ fn secret_hop(
         if !https_port || !present.contains(label) {
             continue;
         }
-        let answer = match crate::subc::use_current_secret_label(secrets.vault, label, &addressed) {
+        eligible.push(label.clone());
+    }
+    let answers =
+        crate::subc::use_current_secret_labels(secrets.vault.clone(), &eligible, &addressed);
+    for (label, answer) in eligible.iter().zip(answers) {
+        let answer = match answer {
             crate::subc::LaunchDecision::Proceed(answer) => answer,
             crate::subc::LaunchDecision::Pending(pending) => {
                 let _ = refused(held, "missing_material");
@@ -1540,7 +1549,13 @@ fn secret_hop(
 
     edits.sort_by_key(|(start, _, _)| *start);
     let query = current.query().unwrap_or_default().as_bytes();
-    let mut substituted = Zeroizing::new(Vec::with_capacity(query.len() + 64));
+    let final_len = edits
+        .iter()
+        .try_fold(query.len(), |len, (start, end, value)| {
+            len.checked_sub(end - start)?.checked_add(value.len())
+        })
+        .ok_or_else(|| refused(held, "malformed_query"))?;
+    let mut substituted = Zeroizing::new(Vec::with_capacity(final_len));
     let mut cursor = 0;
     for (start, end, replacement) in &edits {
         substituted.extend_from_slice(&query[cursor..*start]);
@@ -1559,18 +1574,18 @@ fn secret_hop(
     let Ok(wire_path) = std::str::from_utf8(&normalized.wire) else {
         return Err(refused(&*held, "malformed_path"));
     };
+    emit_hop_audit(secrets, held, hop, Some(&authority), &rules, decide)
+        .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
     let mut outbound = current.clone();
     outbound.set_path(wire_path);
     outbound.set_query(Some(substituted));
-    emit_hop_audit(secrets, held, hop, Some(&authority), &rules, decide)
-        .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
     Ok(Some(outbound))
 }
 
 /// One audit record per scanned label for one hop. A record is handed to the
 /// vault only after the crate's writer checked it against every held key.
 fn emit_hop_audit(
-    secrets: &SecretFetch<'_>,
+    secrets: &SecretFetch,
     held: &HeldKeys,
     hop: usize,
     authority: Option<&ConnectAuthority>,
@@ -2037,7 +2052,11 @@ fn send_request_attempts(
         // A server that accepted the request and stayed silent until the
         // headers limit is not a passing connection fault; retrying it would
         // only spend the rest of the deadline the same way.
-        let retryable = is_transient_reqwest_error(&error) && phase != Some(FetchPhase::Headers);
+        // One released key authorizes one send attempt, even if the peer received
+        // the credential and reset before its response reached this process.
+        let retryable = secret.is_none()
+            && is_transient_reqwest_error(&error)
+            && phase != Some(FetchPhase::Headers);
         let backoff = TRANSIENT_RETRY_BACKOFFS_MS
             .get(attempt)
             .map(|ms| Duration::from_millis(*ms))

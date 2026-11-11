@@ -16,6 +16,11 @@ mod json;
 
 pub use json::is_json_content_type;
 
+/// Validate JSON structure without selecting a deposit location or holding a key.
+pub fn validate_json_request(request: &RequestView<'_>) -> Result<(), RequestRefusal> {
+    json::evaluate(request, &[], &[]).map(|_| ())
+}
+
 use crate::material::{check_admissible, encode_for_location, MaterialRefusal};
 use crate::placeholder::{is_label, parse_exact, PLACEHOLDER_PREFIX};
 use crate::target::{authority_matches_connect, ConnectAuthority, RuleTarget, TargetRefusal};
