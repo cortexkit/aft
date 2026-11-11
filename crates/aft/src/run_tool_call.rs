@@ -735,7 +735,7 @@ impl RepeatObservation {
         worker_session: bool,
         bash_watch_available: bool,
     ) -> Option<Self> {
-        if crate::subc::is_native_plumbing_call(tool, args) || preview {
+        if crate::host_tool_names::is_native_plumbing_call(tool, args) || preview {
             return None;
         }
         Some(Self {
