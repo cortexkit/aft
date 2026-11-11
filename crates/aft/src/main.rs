@@ -1084,7 +1084,7 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     aft::logging::perf_tick(None);
     aft::runtime_drain::spawn_standalone_log_maintenance();
     aft::db::write_ledger::maybe_spawn_fold(runtime.db());
-    aft::db::compression_events::maybe_spawn_retention(
+    aft::bash_background::persistence::retention::maybe_spawn_retention(
         runtime.db(),
         Some(signal_bg_registries(registry)),
     );

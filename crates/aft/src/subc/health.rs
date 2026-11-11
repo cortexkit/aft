@@ -6496,9 +6496,12 @@ mod tests {
         let conn = crate::db::open(&storage.path().join("aft.db")).expect("open database");
         let db = Arc::new(std::sync::Mutex::new(conn));
         let held = db.lock().expect("hold database mutex");
-        let outcome =
-            crate::db::compression_events::prune_retention_sweep(&db, i64::MAX, Some(&[]))
-                .expect("retention sweep outcome");
+        let outcome = crate::bash_background::persistence::retention::prune_retention_sweep(
+            &db,
+            i64::MAX,
+            Some(&[]),
+        )
+        .expect("retention sweep outcome");
         drop(held);
         let crate::db::compression_events::RetentionSweepOutcome::Skipped(skip) = outcome else {
             panic!("contention was not reported as a skipped sweep: {outcome:?}");

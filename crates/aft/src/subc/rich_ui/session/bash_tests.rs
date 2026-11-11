@@ -19,7 +19,7 @@ pub(super) fn seed(
     let harness: crate::harness::Harness = f.policy.harness.parse().unwrap();
     let storage = f.dir.path().join("storage").join(harness.storage_segment());
     let layout = persistence::create_task_layout(&storage, session, id).unwrap();
-    let mut task = crate::db::rich_ui::terminal_task_metadata_for_test(None);
+    let mut task = crate::bash_background::persistence::terminal_task_metadata_for_test(None);
     task.task_id = id.into();
     task.session_id = session.into();
     task.harness = Some(harness.storage_segment());

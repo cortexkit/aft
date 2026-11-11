@@ -92,27 +92,6 @@ pub(crate) fn prune_presets(conn: &Connection, now_ms: i64) -> rusqlite::Result<
     )
 }
 
-/// A terminal completed task carrying `pin`, for read-only app-server calls and persistence tests.
-#[cfg(test)]
-pub(crate) fn terminal_task_metadata_for_test(
-    pin: Option<&str>,
-) -> crate::bash_background::persistence::PersistedTask {
-    use crate::protocol::BgTaskStatus;
-    let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
-        "bash-0123456789abcdef".into(),
-        "session".into(),
-        "exit 0".into(),
-        std::path::PathBuf::from("/work"),
-        Some(std::path::PathBuf::from("/work")),
-        None,
-        true,
-        true,
-    );
-    metadata.schema_pin = pin.map(str::to_string);
-    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
-    metadata
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,7 +307,8 @@ mod tests {
         record_preset(&conn, &key(1), cutoff - 1).unwrap();
         record_preset(&conn, &key(2), cutoff).unwrap();
         record_preset(&conn, &key(3), now).unwrap();
-        super::super::compression_events::prune_retention_tick(&mut conn, now).unwrap();
+        crate::bash_background::persistence::retention::prune_retention_tick(&mut conn, now)
+            .unwrap();
         assert!(session_presets(&conn, &key(1)).unwrap().is_empty());
         assert_eq!(session_presets(&conn, &key(2)).unwrap(), ["worker"]);
         assert_eq!(session_presets(&conn, &key(3)).unwrap(), ["worker"]);

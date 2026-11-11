@@ -318,6 +318,7 @@ fn terminal_retention_delete_rechecks_prepared_identities() {
 
 #[test]
 fn retention_and_hot_query_plans_on_unanalyzed_history() {
+    use crate::bash_background::persistence::retention::prune_retention_tick;
     use crate::db::compression_events::*;
     let mut fixture = Fixture::new();
     fixture

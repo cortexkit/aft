@@ -6797,7 +6797,7 @@ where
                 // only spawn their work, and only when it is due.
                 if let Some(db) = shared_app.try_db() {
                     crate::db::write_ledger::maybe_spawn_fold(db.clone());
-                    crate::db::compression_events::maybe_spawn_retention(
+                    crate::bash_background::persistence::retention::maybe_spawn_retention(
                         db,
                         retention_registries,
                     );

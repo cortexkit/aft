@@ -23,6 +23,56 @@ use crate::backup::hash_session;
 use crate::bash_permissions::PermissionAsk;
 use crate::db::bash_tasks::BashTaskRow;
 
+pub mod retention;
+
+/// A terminal completed task carrying `pin`, for read-only app-server calls and persistence tests.
+#[cfg(test)]
+pub(crate) fn terminal_task_metadata_for_test(
+    pin: Option<&str>,
+) -> crate::bash_background::persistence::PersistedTask {
+    use crate::protocol::BgTaskStatus;
+    let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
+        "bash-0123456789abcdef".into(),
+        "session".into(),
+        "exit 0".into(),
+        std::path::PathBuf::from("/work"),
+        Some(std::path::PathBuf::from("/work")),
+        None,
+        true,
+        true,
+    );
+    metadata.schema_pin = pin.map(str::to_string);
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    metadata
+}
+
+#[test]
+fn bash_task_row_reads_legacy_metadata_without_rewriting_bytes() {
+    const SAVED: &str = r#"{"schema_version":7,"task_id":"bash-0123456789abcdef","session_id":"row-fixture","command":"exit 0","workdir":"/work","status":"completed","started_at":1,"completion_delivered":true}"#;
+    let task: PersistedTask = serde_json::from_str(SAVED).unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let resolved = create_task_layout(storage.path(), &task.session_id, &task.task_id).unwrap();
+    write_task_at(&resolved, &task).unwrap();
+    let mut row = task.to_bash_task_row("runner", &resolved.paths).unwrap();
+    row.metadata = SAVED.into();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::db::run_migrations(&mut conn).unwrap();
+    crate::db::bash_tasks::upsert_bash_task(&conn, &row).unwrap();
+    let saved =
+        crate::db::bash_tasks::get_bash_task(&conn, "runner", &task.session_id, &task.task_id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(saved.metadata.as_bytes(), SAVED.as_bytes());
+    let restored = PersistedTask::from(saved);
+    assert_eq!(restored.command, "exit 0");
+    assert!(restored.completion_delivered);
+    let unchanged =
+        crate::db::bash_tasks::get_bash_task(&conn, "runner", &task.session_id, &task.task_id)
+            .unwrap()
+            .unwrap();
+    assert_eq!(unchanged.metadata.as_bytes(), SAVED.as_bytes());
+}
+
 use super::process::{LiveDescendant, LiveDescendantsUnavailable, ProcessIdentity};
 use super::BgTaskStatus;
 
