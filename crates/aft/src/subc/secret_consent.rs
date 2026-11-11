@@ -879,41 +879,16 @@ pub(crate) fn use_label_for_fetch(
     }
 }
 
-/// The eligibility answer for the tool call executing on this thread.
-///
-/// The dispatch path installs it once per call, before the call runs, so a
-/// launch reads the answer without seeing the route identity. A launch that
-/// finds nothing installed refuses: a scope that was never resolved is not an
-/// eligible one.
-pub(crate) fn current_call_scopes() -> Result<(CallScopes, EligibilityForm), Ineligibility> {
-    CURRENT_SCOPES
-        .with(|slot| slot.borrow().clone())
-        .unwrap_or(Err(Ineligibility::NoScope))
-}
+#[cfg(test)]
+use crate::context::call_context::current_call_scopes;
+pub(crate) use crate::context::call_context::{current_secret_consent_context, SecretScopeGuard};
 
 thread_local! {
     static CURRENT_IDENTITY: std::cell::RefCell<Option<RouteIdentity>> = const { std::cell::RefCell::new(None) };
-    /// `None` while no call is being dispatched on this thread.
-    static CURRENT_SCOPES: std::cell::RefCell<Option<Result<(CallScopes, EligibilityForm), Ineligibility>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-pub(crate) fn current_secret_consent_context() -> Option<(std::path::PathBuf, String)> {
-    current_identity().map(|identity| (identity.project_root.clone(), identity.session.clone()))
 }
 
 pub(super) fn current_identity() -> Option<RouteIdentity> {
     CURRENT_IDENTITY.with(|slot| slot.borrow().clone())
-}
-
-pub(crate) fn current_secret_audit_scope() -> Option<SecretScope> {
-    current_call_scopes()
-        .ok()
-        .map(|(scopes, _)| scopes.authorization)
-        .or_else(|| {
-            current_identity()
-                .and_then(|identity| identity.scope.as_ref().map(SecretScope::from_stamp))
-        })
 }
 
 #[cfg(test)]
@@ -948,7 +923,10 @@ impl Drop for SecretContextRestoreCheck {
     }
 }
 
-pub(super) struct SecretIdentityGuard(Option<RouteIdentity>);
+pub(super) struct SecretIdentityGuard {
+    previous: Option<RouteIdentity>,
+    _context: crate::context::call_context::IdentityGuard,
+}
 
 impl SecretIdentityGuard {
     pub(super) fn install(identity: RouteIdentity) -> Self {
@@ -956,13 +934,20 @@ impl SecretIdentityGuard {
     }
 
     pub(super) fn install_optional(identity: Option<RouteIdentity>) -> Self {
-        Self(CURRENT_IDENTITY.with(|slot| slot.replace(identity)))
+        let audit_scope = identity
+            .as_ref()
+            .and_then(|identity| identity.scope.as_ref().map(SecretScope::from_stamp));
+        let consent_context = identity.as_ref().map(|identity| (identity.project_root.clone(), identity.session.clone()));
+        Self {
+            previous: CURRENT_IDENTITY.with(|slot| slot.replace(identity)),
+            _context: crate::context::call_context::install_identity(consent_context, audit_scope),
+        }
     }
 }
 
 impl Drop for SecretIdentityGuard {
     fn drop(&mut self) {
-        CURRENT_IDENTITY.with(|slot| slot.replace(self.0.take()));
+        CURRENT_IDENTITY.with(|slot| slot.replace(self.previous.take()));
     }
 }
 
@@ -1035,25 +1020,6 @@ pub(crate) fn with_secret_bound_identity_for_test<R>(
     let _scopes = SecretScopeGuard::install(Some(call_scopes(&identity)));
     let _identity = SecretIdentityGuard::install(identity);
     run()
-}
-
-/// Installs the eligibility answer for one call and restores the previous one
-/// when it drops, so the executor lane never carries a stale answer into the
-/// next call.
-pub(super) struct SecretScopeGuard(Option<Result<(CallScopes, EligibilityForm), Ineligibility>>);
-
-impl SecretScopeGuard {
-    pub(super) fn install(
-        scopes: Option<Result<(CallScopes, EligibilityForm), Ineligibility>>,
-    ) -> Self {
-        SecretScopeGuard(CURRENT_SCOPES.with(|slot| slot.replace(scopes)))
-    }
-}
-
-impl Drop for SecretScopeGuard {
-    fn drop(&mut self) {
-        CURRENT_SCOPES.with(|slot| slot.replace(self.0.take()));
-    }
 }
 
 #[cfg(test)]

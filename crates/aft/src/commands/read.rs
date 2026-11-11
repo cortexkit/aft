@@ -281,12 +281,12 @@ fn image_attachment_response(id: &str, image: ProcessedImage) -> Response {
     image_attachment_response_with_budget(
         id,
         image,
-        crate::subc::result_body::active().then_some(image_base64_budget()),
+        crate::context::call_context::active().then_some(image_base64_budget()),
     )
 }
 
 fn image_base64_budget() -> usize {
-    (crate::subc::result_body::MAX_RESULT_BYTES - IMAGE_REPLY_MARGIN_BYTES - 1) / 2
+    (crate::response_finalize::MAX_RESULT_BYTES - IMAGE_REPLY_MARGIN_BYTES - 1) / 2
 }
 
 fn image_attachment_response_with_budget(
@@ -303,7 +303,7 @@ fn image_attachment_response_with_budget(
             .saturating_mul(2)
             .saturating_add(IMAGE_REPLY_MARGIN_BYTES);
         if base64_len(byte_size).is_none_or(|bytes| bytes > budget) {
-            return crate::subc::result_body::too_large(id, wire_size, "read a smaller image");
+            return crate::response_finalize::too_large(id, wire_size, "read a smaller image");
         }
     }
     let data = match encode_base64_checked(&image.bytes, |encoded_len| {
@@ -381,7 +381,7 @@ fn process_image_with_timeout(
     process_image_with_budget_timeout(
         raw_bytes,
         kind,
-        crate::subc::result_body::active().then_some(image_base64_budget()),
+        crate::context::call_context::active().then_some(image_base64_budget()),
         Instant::now() + IMAGE_PROCESS_TIMEOUT,
     )
 }
@@ -1176,7 +1176,7 @@ fn github_read_response(
             lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines),
         )
     };
-    let attachments = if crate::subc::result_body::active() {
+    let attachments = if crate::context::call_context::active() {
         match fit_github_images(req, &mut completion) {
             Ok(attachments) => attachments,
             Err(response) => return response,
@@ -1242,15 +1242,15 @@ fn fit_github_images(
         .len()
         .saturating_mul(3);
     if text_bytes.saturating_add(IMAGE_REPLY_MARGIN_BYTES)
-        >= crate::subc::result_body::MAX_RESULT_BYTES
+        >= crate::response_finalize::MAX_RESULT_BYTES
     {
-        return Err(crate::subc::result_body::too_large(
+        return Err(crate::response_finalize::too_large(
             &req.id,
             text_bytes.saturating_add(IMAGE_REPLY_MARGIN_BYTES),
             "read a page with fewer or smaller images",
         ));
     }
-    let mut remaining = crate::subc::result_body::MAX_RESULT_BYTES
+    let mut remaining = crate::response_finalize::MAX_RESULT_BYTES
         .saturating_sub(IMAGE_REPLY_MARGIN_BYTES)
         .saturating_sub(text_bytes)
         .saturating_sub(1)
@@ -1495,7 +1495,7 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 ///   `{ binary: true, byte_size }`
 pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut response = crate::bounded_io::command(req, ctx, handle_read_inner);
-    if crate::subc::result_body::active() {
+    if crate::context::call_context::active() {
         if let Some(attachments) = response
             .data
             .get_mut("attachments")
@@ -2842,7 +2842,7 @@ mod tests {
         assert!(legacy.success);
         assert_eq!(legacy.data["attachments"].as_array().unwrap().len(), 8);
         assert_eq!(legacy.data["content"], "canonical text\n");
-        let _budget = crate::subc::result_body::enter(true);
+        let _budget = crate::context::call_context::enter(true);
         let bounded = github_read_response(&request, completion(), 1);
         assert!(bounded.success, "{:?}", bounded.data);
         let attached = bounded.data["attachments"].as_array().unwrap();
@@ -2874,7 +2874,7 @@ mod tests {
             .iter()
             .map(|image| image["data"].as_str().unwrap().len())
             .sum();
-        assert!(image_bytes * 2 + 64 * 1024 < crate::subc::result_body::MAX_RESULT_BYTES);
+        assert!(image_bytes * 2 + 64 * 1024 < crate::response_finalize::MAX_RESULT_BYTES);
     }
 
     #[test]
@@ -2895,7 +2895,7 @@ mod tests {
             diff_page: None,
         };
         assert!(github_read_response(&request, completion(), 1).success);
-        let _budget = crate::subc::result_body::enter(true);
+        let _budget = crate::context::call_context::enter(true);
         let response = github_read_response(&request, completion(), 1);
         assert!(!response.success);
         assert_eq!(response.data["code"], "response_too_large");
@@ -2926,7 +2926,7 @@ mod tests {
             document: None,
             diff_page: None,
         };
-        let _budget = crate::subc::result_body::enter(true);
+        let _budget = crate::context::call_context::enter(true);
         let _io = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
             Duration::from_millis(1),
         )));
@@ -3039,7 +3039,7 @@ mod tests {
         assert_eq!(legacy.bytes, bytes);
         assert_eq!(legacy.width, 1024);
         assert!(!legacy.resized);
-        let _budget = crate::subc::result_body::enter(true);
+        let _budget = crate::context::call_context::enter(true);
         let image = process_image_with_timeout(bytes, ImageKind::Png).unwrap();
         assert!(image.width < 1024 && image.width >= MIN_FITTED_IMAGE_DIMENSION);
         assert_eq!(image.height, image.width);

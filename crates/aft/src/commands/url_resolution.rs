@@ -161,7 +161,7 @@ fn resolve_secret_fetch(
 
     let mut authorization = None;
     if let Some(first) = labels.first() {
-        let scopes = match crate::subc::current_call_scopes() {
+        let scopes = match crate::context::call_context::current_call_scopes() {
             Ok((scopes, _)) => scopes,
             Err(reason) => {
                 let outcome = crate::secret::refuse_ineligible(first, reason);
@@ -243,7 +243,8 @@ fn secret_fetch_refusal(
     code: &str,
     message: &str,
 ) -> Response {
-    let scope = crate::subc::current_secret_audit_scope().map(|scope| scope.to_scope_ref());
+    let scope = crate::context::call_context::current_secret_audit_scope()
+        .map(|scope| scope.to_scope_ref());
     for label in labels {
         let record = secret_rules::audit::AuditRecordV1::new(
             crate::secret::now_ms(),
