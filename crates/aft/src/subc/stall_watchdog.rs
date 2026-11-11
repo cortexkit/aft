@@ -2284,10 +2284,12 @@ mod tests {
     fn process_wide_late_wake_defers_but_next_punctual_tick_exits() {
         let probe = InjectedWatchdog::start(false);
         probe.advance(31);
-        assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
+        // Only the first tick is late. Subsequent ticks at the frozen clock
+        // are punctual and may already have requested exit before we observe.
+        assert_eq!(probe.deferrals().len(), 1);
         assert!(probe.deferrals()[0].contains("because watchdog itself woke late"));
-        probe.advance(1);
         assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        assert!(probe.stderr.lines()[0].contains("watchdog_wake_late_ms=0"));
         probe.watchdog.stop_and_join();
     }
 
