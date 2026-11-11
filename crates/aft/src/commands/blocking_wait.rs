@@ -7,8 +7,9 @@ use serde_json::Value;
 // Calls without an explicit client deadline use the catalog's default window.
 // Share its constants so enlarging the transport declaration also preserves
 // the ordinary worker wait inside the same reply-budget rule.
+pub(crate) const WORKER_REPLY_MARGIN_MS: u64 = 240_000;
 const LEGACY_TRANSPORT_MS: u64 =
-    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS + crate::subc::WORKER_REPLY_MARGIN_MS;
+    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS + WORKER_REPLY_MARGIN_MS;
 pub(crate) const MAX_BLOCKING_WAIT_MS: u64 =
     LEGACY_TRANSPORT_MS - safety_margin_ms(LEGACY_TRANSPORT_MS);
 
