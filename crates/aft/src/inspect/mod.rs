@@ -3,6 +3,7 @@ pub(crate) mod diagnostics_category;
 #[doc(hidden)]
 pub mod dispatch;
 mod entry_points;
+pub(crate) use entry_points::InspectEntryPoints;
 mod frameworks;
 pub mod freshness;
 pub(crate) use crate::file_kind::generated;

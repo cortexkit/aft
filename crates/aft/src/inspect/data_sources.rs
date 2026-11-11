@@ -166,7 +166,7 @@ impl DeadCodeSources {
         // Each publication's dead-code graph is kept beside the family's
         // store, so later rollups over the same publication read it.
         let section_dir = checkout.checkout().family_dir().join("dead-code");
-        match view.dead_code_snapshot_in(Some(section_dir)) {
+        match view.dead_code_snapshot_in(Some(section_dir), &super::InspectEntryPoints) {
             Ok(snapshot) => {
                 crate::slog_info!(
                     "perf tier2_callgraph_snapshot: source=data_layer files={} entry_points={} ms={}",

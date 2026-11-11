@@ -161,6 +161,6 @@ pub(crate) fn view_for_test(root: &std::path::Path) -> crate::data_layer::checko
 #[cfg(test)]
 pub(crate) fn snapshot_for_test(root: &std::path::Path) -> crate::inspect::job::CallgraphSnapshot {
     view_for_test(root)
-        .dead_code_snapshot()
+        .dead_code_snapshot(&crate::inspect::InspectEntryPoints)
         .expect("scanner fixture snapshot")
 }

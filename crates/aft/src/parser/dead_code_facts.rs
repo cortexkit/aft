@@ -5,7 +5,7 @@ use crate::imports::{parse_imports, specifier_imported_name, specifier_local_nam
 use crate::parser::LangId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 pub(crate) const RUST_MACRO_REF_SHAPE_CALL: &str = "call";

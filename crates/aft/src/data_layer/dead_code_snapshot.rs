@@ -1,9 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+
+/// Resolves the liveness roots among a snapshot's files. Inspect supplies the
+/// inventory and manifest policy; the index owns only the resulting paths.
+pub(crate) trait EntryPoints {
+    fn resolve(&self, root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf>;
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeOptions {

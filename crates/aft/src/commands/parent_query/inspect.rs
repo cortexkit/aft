@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::context::AppContext;
-use crate::inspect::job::{InspectCategory, JobKey};
+use crate::inspect_category::InspectCategory;
 use crate::protocol::{RawRequest, Response};
 
 use crate::parent_search::query::{attach_gaps, Gaps};
@@ -168,9 +168,9 @@ pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession
                 );
                 continue;
             }
-            let aggregate = cache.as_ref().map(|cache| {
-                cache.get_aggregated_for_config(&JobKey::for_project_category(*category), &config)
-            });
+            let aggregate = cache
+                .as_ref()
+                .map(|cache| cache.project_aggregate(*category, &config));
             match aggregate {
                 Some(Ok(Some(Value::Object(payload)))) => {
                     if let Some(Value::Object(merged)) = summary.get_mut(category.as_str()) {

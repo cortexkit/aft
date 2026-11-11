@@ -39,10 +39,11 @@ pub trait IndexHost: Send + Sync {
         &self,
     ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>;
     fn try_semantic_backend_health_snapshot(&self) -> Option<EmbeddingBackendHealthSnapshot>;
-    /// Inspect owns this snapshot; index memory accounting borrows it through this temporary projection.
-    fn temporary_inspect_projection(&self) -> Option<Arc<crate::inspect::CallgraphSnapshot>>;
+    /// The snapshot reported separately by the root's callgraph memory accounting.
+    /// Its shared allocation must not also be counted as index memory.
+    fn callgraph_projection(&self) -> Option<Arc<super::dead_code_snapshot::CallgraphSnapshot>>;
     /// The parser-owned cache used to prewarm symbols.
-    fn temporary_symbol_cache(&self) -> SharedSymbolCache;
+    fn symbol_cache(&self) -> SharedSymbolCache;
 }
 
 impl<T: IndexHost + ?Sized> IndexHost for Arc<T> {
@@ -111,10 +112,10 @@ impl<T: IndexHost + ?Sized> IndexHost for Arc<T> {
     fn try_semantic_backend_health_snapshot(&self) -> Option<EmbeddingBackendHealthSnapshot> {
         (**self).try_semantic_backend_health_snapshot()
     }
-    fn temporary_inspect_projection(&self) -> Option<Arc<crate::inspect::CallgraphSnapshot>> {
-        (**self).temporary_inspect_projection()
+    fn callgraph_projection(&self) -> Option<Arc<super::dead_code_snapshot::CallgraphSnapshot>> {
+        (**self).callgraph_projection()
     }
-    fn temporary_symbol_cache(&self) -> SharedSymbolCache {
-        (**self).temporary_symbol_cache()
+    fn symbol_cache(&self) -> SharedSymbolCache {
+        (**self).symbol_cache()
     }
 }

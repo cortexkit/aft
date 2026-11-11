@@ -1254,7 +1254,7 @@ fn memory_estimate_with(ctx: &dyn IndexHost, reuse_dirty: bool) -> Option<DataLa
             ..DataLayerMemory::unbound()
         },
         DataCheckoutProbe::Bound(checkout) => {
-            let snapshot = ctx.temporary_inspect_projection();
+            let snapshot = ctx.callgraph_projection();
             let counted_elsewhere = snapshot
                 .as_ref()
                 .map(|snapshot| Arc::as_ptr(snapshot) as usize);

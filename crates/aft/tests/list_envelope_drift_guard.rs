@@ -80,6 +80,8 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     files_to_scan.push(src_dir.join("tool_output.rs"));
     files_to_scan.push(src_dir.join("runtime_drain.rs"));
     files_to_scan.push(src_dir.join("parent_search/mod.rs"));
+    files_to_scan.push(src_dir.join("parser/todo_markers.rs"));
+    files_to_scan.push(src_dir.join("parser/dead_code_facts.rs"));
     files_to_scan.push(src_dir.join("edit.rs"));
     files_to_scan.push(src_dir.join("bash_permissions/scan.rs"));
     // 4. crates/aft/src/compress/**
