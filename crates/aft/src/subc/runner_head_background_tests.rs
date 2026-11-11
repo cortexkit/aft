@@ -1,8 +1,8 @@
-//! A `background` bash launch by a head agent on one of Thalamus's runners
-//! answers at once with its task id, and the task's completion reaches that
-//! head's route later as a notice. Every other server-owned call (a Broca
-//! head, any worker, any other carrier) and every foreground call keeps
-//! holding until its command ends.
+//! A `background` bash launch by a top-level (head) agent on one of Thalamus's
+//! runners answers at once with its task id, and the task's completion reaches that
+//! head's route later as a notice. Other server-owned background calls and
+//! every foreground call keep holding until their commands end. PTY launches
+//! always answer at once so any caller can drive its interactive command.
 
 use super::super::test_support::*;
 use super::*;
@@ -370,6 +370,61 @@ async fn thalamus_harness_head_background_answers_at_once_and_completes_to_its_r
 #[tokio::test]
 async fn thalamus_harness_pi_head_background_answers_at_once_and_sends_a_notice() {
     assert_runner_head_background_hands_back("reserved:thalamus-harness", "pi").await;
+}
+
+async fn assert_pty_launch_hands_back(principal: &str, harness: &str, kind: &str, worker: bool) {
+    let fixture = Fixture::new("pty-launch-handback");
+    let route = v1_route(&fixture.root, principal, harness, kind);
+    let received = fixture.release_path("received-input");
+    let (mut replies, cancel) = fixture.call(
+        &route,
+        worker,
+        json!({
+            "command": format!(
+                "IFS= read -r line; printf '%s' \"$line\" > '{}'",
+                received.display()
+            ),
+            "pty": true,
+            "timeout": 60_000,
+        }),
+    );
+    // The command needs stdin to finish, so only a launch reply can arrive
+    // before bash_write supplies the input.
+    let reply = reply_within(&mut replies, Duration::from_millis(750)).await;
+    let response = reply.response_for_test();
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["status"], "running", "{response:?}");
+    assert_eq!(response.data["mode"], "pty", "{response:?}");
+    assert!(reply.text_for_test().unwrap().starts_with("PTY task started:"));
+    let task_id = response.data["task_id"].as_str().unwrap();
+    assert_eq!(fixture.status(task_id), BgTaskStatus::Running);
+
+    cancel.route.cancel();
+    cancel.connection.cancel();
+    let request: crate::protocol::RawRequest = serde_json::from_value(json!({
+        "id": "pty-input",
+        "command": "bash_write",
+        "session_id": SESSION,
+        "params": {"task_id": task_id, "input": "interactive-input\n"},
+    }))
+    .unwrap();
+    let write = crate::commands::bash_write::handle(&request, &fixture.ctx);
+    assert!(write.success, "{write:?}");
+    assert_eq!(write.data["bytes_written"], 18);
+    fixture.wait_terminal(task_id).await;
+    assert_eq!(fixture.status(task_id), BgTaskStatus::Completed);
+    assert_eq!(std::fs::read_to_string(received).unwrap(), "interactive-input");
+    assert!(replies.try_recv().is_err(), "the call answers exactly once");
+}
+
+#[tokio::test]
+async fn broca_worker_pty_launch_answers_at_once_and_accepts_input() {
+    assert_pty_launch_hands_back("reserved:broca", "broca", "worker", true).await;
+}
+
+#[tokio::test]
+async fn runner_head_pty_launch_answers_at_once_and_accepts_input() {
+    assert_pty_launch_hands_back("reserved:thalamus-harness", "opencode2", "head", false).await;
 }
 
 /// The completion of a runner head's handed-back task goes to routes with

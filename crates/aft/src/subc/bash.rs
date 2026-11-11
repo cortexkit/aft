@@ -2296,28 +2296,30 @@ pub(super) fn submit_deferred_bash(
             .and_then(crate::subc_translate::model_boolean)
             == Some(true)
     });
-    // A server-owned call normally owns its command until it ends. A head
-    // agent on one of Thalamus's runners is the exception for a `background`
-    // or `pty` launch: it gets the ordinary launch reply at once, and the
-    // task's completion reaches it later as a notice, which the runner turns
-    // into a message in the session. Its task is then an ordinary background
-    // task: a cancel or route close before the reply hands it off instead of
-    // killing it, and a slow startup hands back its task id. Workers, Broca's
-    // routes and every other carrier keep the hold.
+    // A PTY launch always hands back its task id so the caller can drive the
+    // interactive command with bash_write/bash_status.
+    // Other server-owned calls own their command until it ends, except a
+    // `background` launch by a top-level (head) agent on a Thalamus runner,
+    // where completion reaches the session later as a notice. Handed-back
+    // tasks are ordinary background tasks: a cancel or route close before
+    // the reply hands them off instead of killing them, and a slow startup
+    // hands back the task id.
     let hands_back_launch = server_completion
-        && !run_scoped
-        && !worker_session
-        && !worker_preset
-        && !worker_jail
-        && secret_identity
-            .as_ref()
-            .is_some_and(|identity| identity.session == session_id && runner_head_route(identity))
-        && ["background", "pty"].iter().any(|key| {
-            raw_args
-                .get(*key)
-                .and_then(crate::subc_translate::model_boolean)
-                == Some(true)
-        });
+        && (raw_args
+            .get("pty")
+            .and_then(crate::subc_translate::model_boolean)
+            == Some(true)
+            || (!run_scoped
+                && !worker_session
+                && !worker_preset
+                && !worker_jail
+                && secret_identity.as_ref().is_some_and(|identity| {
+                    identity.session == session_id && runner_head_route(identity)
+                })
+                && raw_args
+                    .get("background")
+                    .and_then(crate::subc_translate::model_boolean)
+                    == Some(true)));
     let owns_command = server_completion && !hands_back_launch;
     let capture_wait_mode = raw_args
         .get("wait")
@@ -5767,7 +5769,7 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn v1_server_completion_never_returns_a_promoted_or_background_launch() {
+    async fn v1_server_completion_holds_foreground_and_background_launches() {
         let ctx = super::super::test_support::test_ctx();
         let registry = ctx.bash_background().clone();
         let target = drain::BashDetachTarget {
@@ -5799,7 +5801,7 @@ mod grant_path_tests {
             detached["detail"],
             json!({"task_id":"bash-00000000000000aa","late_results":false})
         );
-        for (background, pty) in [(false, false), (true, false), (false, true)] {
+        for background in [false, true] {
             let (_dir, root) = super::super::test_support::test_root("v1-shell-completion");
             let ctx = super::super::test_support::test_ctx();
             ctx.update_config(|config| config.foreground_wait_window_ms = 10);
@@ -5827,7 +5829,7 @@ mod grant_path_tests {
                 1,
                 Flags::new(false, Priority::Interactive, false),
                 PROTOCOL_VERSION,
-                json!({"command":"sleep 0.2", "timeout":5000,"background":background,"pty":pty,"foreground_orchestrate":true,"block_to_completion":true}),
+                json!({"command":"sleep 0.2", "timeout":5000,"background":background,"foreground_orchestrate":true,"block_to_completion":true}),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
                     keepalive: None,
