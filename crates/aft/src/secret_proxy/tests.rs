@@ -165,7 +165,12 @@ impl Server {
         let names = if mode == "wrong-name" {
             vec!["wrong.invalid".into()]
         } else {
-            vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]
+            vec![
+                "localhost".into(),
+                "127.0.0.1".into(),
+                "::1".into(),
+                "other.test".into(),
+            ]
         };
         let mut params = CertificateParams::new(names).unwrap();
         if mode == "expired" {
@@ -288,7 +293,7 @@ impl Server {
                                 response.headers_mut().insert(
                                     "location",
                                     HeaderValue::from_str(&format!(
-                                        "https://127.0.0.1:{port}/approved"
+                                        "https://other.test:{port}/approved"
                                     ))
                                     .unwrap(),
                                 );

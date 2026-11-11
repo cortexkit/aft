@@ -1907,11 +1907,10 @@ mod url_tests {
             assert_absent(&run, &documents, &[KEY, ENCODED_KEY.as_bytes()]);
         }
 
-        /// `material` is asked only for a hop that substitutes: not for a
-        /// placeholder in another parameter, and not for a same-prefix
-        /// redirect hop that carries no placeholder.
+        /// A request must ask the vault before it knows the key's location.
+        /// A redirect without a placeholder has nothing to ask about.
         #[test]
-        fn material_is_requested_only_for_a_hop_that_substitutes() {
+        fn present_labels_ask_before_location_planning_but_empty_redirects_do_not() {
             let fixture = fixture(Default::default());
             let server = serve(&fixture.tls, |target| {
                 if target.starts_with("/v1/first.md") {
@@ -1933,7 +1932,11 @@ mod url_tests {
                 no_extra,
             );
             assert!(run.response.success, "{:?}", run.response.data);
-            assert_eq!(vault.material_calls(), 0, "nothing was substituted");
+            assert_eq!(
+                vault.material_calls(),
+                1,
+                "release names the location; a placeholder in another parameter stays literal"
+            );
 
             let redirected =
                 format!("https://api.secret.test:{port}/v1/first.md?key={PLACEHOLDER}");

@@ -98,6 +98,7 @@ impl RequestSecrets {
             .clone()
     }
 
+    #[cfg(unix)]
     pub(crate) fn status(&self) -> Vec<String> {
         self.status
             .lock()

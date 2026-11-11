@@ -81,7 +81,7 @@ impl SubcSecretUseTransport {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn for_test(
         connection_file: PathBuf,
         identity: BindIdentity,

@@ -193,6 +193,8 @@ pub(crate) struct State {
     test_identity_generation: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     test_idle_timeout_ms: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    test_upstream: Mutex<std::collections::HashMap<String, SocketAddr>>,
 }
 
 impl State {
@@ -409,6 +411,8 @@ impl SecretProxy {
             test_identity_generation: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_idle_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            test_upstream: Mutex::default(),
         });
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|_| ProxyError::Initialization)?;
@@ -447,6 +451,7 @@ impl SecretProxy {
         self.address
     }
 
+    #[cfg(unix)]
     pub(crate) fn approval_status(&self) -> Vec<String> {
         self.state.approvals.status()
     }

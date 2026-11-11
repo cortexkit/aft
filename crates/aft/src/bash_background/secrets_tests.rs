@@ -11,6 +11,7 @@ mod audit_followups;
 struct Vault {
     resolves: AtomicUsize,
     materials: AtomicUsize,
+    #[cfg(unix)]
     port: u16,
     audits: Mutex<Vec<secret_rules::audit::AuditRecordV1>>,
     resolve_kinds: Mutex<Vec<String>>,
@@ -19,13 +20,14 @@ struct Vault {
 }
 
 impl Vault {
-    fn new(port: u16) -> Arc<Self> {
+    fn new(_port: u16) -> Arc<Self> {
         #[cfg(unix)]
-        TEST_HTTPS_PORT.with(|slot| slot.set((port != 0).then_some(port)));
+        TEST_HTTPS_PORT.with(|slot| slot.set((_port != 0).then_some(_port)));
         Arc::new(Self {
             resolves: AtomicUsize::new(0),
             materials: AtomicUsize::new(0),
-            port,
+            #[cfg(unix)]
+            port: _port,
             audits: Mutex::new(Vec::new()),
             resolve_kinds: Mutex::new(Vec::new()),
             material_kinds: Mutex::new(Vec::new()),

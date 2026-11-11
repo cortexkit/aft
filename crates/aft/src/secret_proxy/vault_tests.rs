@@ -446,14 +446,19 @@ async fn live_vault_redirect_to_another_host_asks_again_and_sends_no_key() {
     let (first, mut client) = worker.join().unwrap();
     assert_eq!(first["status"], 302);
     let location = url::Url::parse(first["headers"]["location"].as_str().unwrap()).unwrap();
-    assert_eq!(location.host_str(), Some("127.0.0.1"));
+    assert_eq!(location.host_str(), Some("other.test"));
+    proxy
+        .state
+        .test_upstream
+        .lock()
+        .insert("other.test".into(), server.address);
     assert_eq!(
         client.command(
-            json!({"op":"connect", "authority":format!("127.0.0.1:{}", server.address.port())})
+            json!({"op":"connect", "authority":format!("other.test:{}", server.address.port())})
         )["ok"],
         true
     );
-    let second = client.command(json!({"op":"request", "authority":format!("127.0.0.1:{}", server.address.port()), "path":location.path(), "headers":{"authorization":format!("Bearer {MARKER}")}}));
+    let second = client.command(json!({"op":"request", "authority":format!("other.test:{}", server.address.port()), "path":location.path(), "headers":{"authorization":format!("Bearer {MARKER}")}}));
     assert_eq!(second["status"], 200);
     assert_eq!(
         server.seen.lock()[1]["headers"]["authorization"],

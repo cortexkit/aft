@@ -439,10 +439,16 @@ async fn connect_upstream(
     websocket: bool,
 ) -> Result<Upstream, String> {
     let fail = || String::new();
-    let socket = tokio::time::timeout(
-        state.idle_timeout(),
-        tokio::net::TcpStream::connect((super::network_host(&authority.host), authority.port)),
-    )
+    let socket = tokio::time::timeout(state.idle_timeout(), async {
+        #[cfg(test)]
+        {
+            let address = state.test_upstream.lock().get(&authority.host).copied();
+            if let Some(address) = address {
+                return tokio::net::TcpStream::connect(address).await;
+            }
+        }
+        tokio::net::TcpStream::connect((super::network_host(&authority.host), authority.port)).await
+    })
     .await
     .map_err(|_| fail())?
     .map_err(|_| fail())?;
