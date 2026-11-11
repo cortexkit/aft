@@ -1363,6 +1363,29 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                     else:
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_windows_jq_preflight_fails_before_tests_when_the_managed_helper_is_unavailable(self) -> None:
+        action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
+        step = next(step for step in action["runs"]["steps"] if step.get("name") == "Verify administrator-installed Windows jq")
+        self.assertEqual(step["if"], "runner.os == 'Windows' && runner.environment == 'self-hosted' && inputs.phase == 'setup'")
+        self.assertNotRegex(step["run"], r"(?i)\b(winget|choco|scoop|Install-Package|curl)\b")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jq = root / "jq"
+            for output, code, message in ((None, 0, "jq is missing"), ("broken", 7, "cannot report its version"),
+                                           ("not a jq version", 0, "Unexpected jq version response"), ("jq-1.8.1", 0, "")):
+                with self.subTest(output=output, code=code):
+                    if output is not None:
+                        jq.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(output) + f"\nexit {code}\n")
+                        jq.chmod(0o755)
+                    result = subprocess.run(["/bin/bash", "-c", step["run"]], capture_output=True, text=True,
+                                            env={**os.environ, "PATH": str(root)})
+                    if message:
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn(message, result.stdout + result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn("Managed jq: jq-1.8.1", result.stdout)
+
     def test_self_hosted_workflows_validate_system_python_instead_of_running_its_installer(self) -> None:
         suites = self.suites + [workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows" / name))
                                 for name in ("tests.yml", "release.yml")]
