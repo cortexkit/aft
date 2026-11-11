@@ -347,6 +347,52 @@ fn runner_notices_startup_replay_offers_only_named_pending_runner_completions() 
 }
 
 #[test]
+fn runner_notices_consumed_terminal_result_suppresses_stale_completion_frame() {
+    for (id, ack_before_offer) in [
+        ("bash-00000000000b0008", true),
+        ("bash-00000000000b0009", false),
+    ] {
+        let task = Completion::new(id, 0);
+        let frame = task.frame();
+        let capture = test_endpoint::capture(&task.task, false);
+        let scheduler = Scheduler::default();
+        let _scope = crate::bash_background::task_identity_scope(Some(task.route.task_identity()));
+        if ack_before_offer {
+            task.registry
+                .ack_terminal_result_for_session(&task.task, &task.task);
+        }
+        assert!(offer(
+            &scheduler,
+            task.registry.clone(),
+            frame,
+            PathBuf::new(),
+            false,
+            move || 0
+        ));
+        if !ack_before_offer {
+            task.registry
+                .ack_terminal_result_for_session(&task.task, &task.task);
+        }
+        assert!(task.delivered());
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+        assert!(
+            capture.receiver.try_recv().is_err(),
+            "a consumed result must not be announced again"
+        );
+        assert_eq!(
+            task.registry
+                .notice_metadata(&task.task)
+                .unwrap()
+                .runner_completion_offers,
+            0
+        );
+    }
+}
+
+#[test]
 fn runner_notices_decode_open_states_and_error_envelopes() {
     for state in [
         "pending",

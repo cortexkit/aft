@@ -2213,6 +2213,45 @@ mod tests {
     use super::*;
     use crate::protocol::{BashLongRunningFrame, BashPatternMatchFrame};
 
+    /// Delay command exit until its background-launch reply has been received.
+    /// A terminal launch reply includes command output and acknowledges the task,
+    /// leaving no pending completion notice for these tests to send.
+    pub(super) struct BackgroundCompletionGate(PathBuf);
+
+    impl BackgroundCompletionGate {
+        pub(super) fn new(root: &Path) -> Self {
+            Self(root.join("background-completion-release"))
+        }
+
+        pub(super) fn command(&self, output: &str) -> String {
+            if cfg!(windows) {
+                let release = self
+                    .0
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .replace('\'', "''");
+                let output = output.replace('\'', "''");
+                format!("while (-not (Test-Path -LiteralPath '{release}')) {{ Start-Sleep -Milliseconds 50 }}; Write-Output '{output}'")
+            } else {
+                let release = self.0.to_string_lossy().replace('\'', "'\\''");
+                let output = output.replace('\'', "'\\''");
+                format!(
+                    "while [ ! -f '{release}' ]; do sleep 0.05; done; printf '%s\\n' '{output}'"
+                )
+            }
+        }
+
+        pub(super) fn release(&self) {
+            std::fs::write(&self.0, b"release").unwrap();
+        }
+    }
+
+    impl Drop for BackgroundCompletionGate {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+
     pub(super) fn caller_route(
         root: &ProjectRootId,
         principal: &str,
@@ -2482,6 +2521,7 @@ mod tests {
         use subc_protocol::call_mode::CallMode;
 
         let (_root_dir, root) = test_root("codemode-background-owner");
+        let completion_gate = BackgroundCompletionGate::new(root.as_path());
         let storage = tempfile::tempdir().unwrap();
         let storage_root = storage.path().join("opencode");
         let mut head = caller_route(&root, "reserved:thalamus-harness", "opencode");
@@ -2571,7 +2611,7 @@ mod tests {
                 1,
                 control_flags(),
                 PROTOCOL_VERSION,
-                json!({"command":"echo codemode-head-complete","background":true,"compressed":false,"timeout":5000}),
+                json!({"command":completion_gate.command("codemode-head-complete"),"background":true,"compressed":false,"timeout":60_000}),
                 crate::subc_format::FormatContext::default(),
                 bash::BashWaitCancel {
                     keepalive: None,
@@ -2608,10 +2648,17 @@ mod tests {
             .unwrap();
         let response = done.response_for_test();
         assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "running", "{response:?}");
+        assert!(
+            response.data.get("output_preview").is_none(),
+            "launch guidance must not consume terminal output: {response:?}"
+        );
         let task_id = response.data["task_id"]
             .as_str()
             .expect("background task id")
             .to_string();
+        let capture = super::super::runner_notices::test_endpoint::capture(&task_id, false);
+        completion_gate.release();
         let completion = loop {
             let frame = tokio::time::timeout(Duration::from_secs(30), notice_rx.recv())
                 .await
@@ -2629,7 +2676,7 @@ mod tests {
         let metadata = persistence::read_task_at(&task).unwrap();
         assert!(
             !metadata.completion_delivered,
-            "launch reply consumed completion before notice offer: {response:?}"
+            "background launch must leave completion pending: {response:?}"
         );
         assert_eq!(metadata.launching_identity, Some(expected));
         assert_eq!(metadata.session_id, "head-session");
@@ -2670,7 +2717,6 @@ mod tests {
             !notice_metadata.completion_delivered,
             "fan-out consumed completion before notice offer"
         );
-        let capture = super::super::runner_notices::test_endpoint::capture(&task_id, false);
         assert!(super::super::runner_notices::enqueue(
             ctx.bash_background().clone(),
             completion
