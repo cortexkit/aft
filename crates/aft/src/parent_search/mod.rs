@@ -21,12 +21,14 @@
 
 pub(crate) mod engine;
 pub(crate) mod external;
-pub(crate) mod query;
+pub(crate) use crate::data_layer::parent_query as query;
+pub(crate) use crate::data_layer::parent_session::{display_relative, Plane};
+pub use crate::data_layer::parent_session::{Discovery, RequestedPlanes};
 #[cfg(test)]
 mod tests;
 mod worker;
 
-pub(crate) use query::{attach_search_gaps, glob_fan_out, grep_fan_out};
+pub(crate) use query::{attach_gaps, attach_search_gaps};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -89,20 +91,6 @@ pub(crate) fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
-
-/// The child repositories found below a parent folder.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Discovery {
-    /// Canonical parent folder.
-    pub root: PathBuf,
-    /// Served children, canonical, in byte order of their paths.
-    pub children: Vec<PathBuf>,
-    /// Children past the cap, in the same order. They are not served.
-    pub skipped: Vec<PathBuf>,
-    /// Top-level entries of the parent folder that hold files outside every
-    /// child (at most [`MAX_OUTSIDE_PATHS`]).
-    pub outside: Vec<PathBuf>,
-}
 
 fn is_repository(dir: &Path) -> bool {
     // A `.git` directory is a primary checkout; a `.git` file is a linked
@@ -352,15 +340,6 @@ fn probe(root: &Path, budget: Duration) -> Option<PathBuf> {
 // Session registry
 // ---------------------------------------------------------------------------
 
-/// The index planes the user asked for before the parent session turned its
-/// own indexes off. A plane that is off is not served from the children either.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RequestedPlanes {
-    pub trigram: bool,
-    pub semantic: bool,
-    pub callgraph: bool,
-}
-
 #[derive(Default)]
 struct Registry {
     prepared: HashMap<PathBuf, RequestedPlanes>,
@@ -457,6 +436,7 @@ pub fn activate(
         semantic.clone(),
         Holder::of(ctx),
     );
+    crate::data_layer::parent_session::publish(session.clone());
     if let Some(previous) = registry.sessions.insert(root, session) {
         previous.stop();
     }
@@ -674,54 +654,9 @@ pub fn set_default_refresh_interval(interval: Duration) {
 // Session and children
 // ---------------------------------------------------------------------------
 
-/// One child plane as seen by queries.
-pub(crate) enum Plane<T> {
-    /// The worker has not finished its first load of this plane.
-    Loading,
-    Ready(Arc<T>),
-    /// The child has nothing this session can serve; the reason is shown to
-    /// the user as the gap's reason.
-    Gap(String),
-}
-
-impl<T> Clone for Plane<T> {
-    // Manual so a plane clones its `Arc`, without requiring `T: Clone`.
-    fn clone(&self) -> Self {
-        match self {
-            Self::Loading => Self::Loading,
-            Self::Ready(value) => Self::Ready(Arc::clone(value)),
-            Self::Gap(reason) => Self::Gap(reason.clone()),
-        }
-    }
-}
-
-impl<T> Plane<T> {
-    pub(crate) fn ready(&self) -> Option<&Arc<T>> {
-        match self {
-            Self::Ready(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    /// The reason this plane cannot answer, for a named gap.
-    pub(crate) fn gap_reason(&self, plane: &str) -> Option<String> {
-        match self {
-            Self::Loading => Some(format!("{plane} index of this repository is still loading")),
-            Self::Ready(_) => None,
-            Self::Gap(reason) => Some(format!("{plane}: {reason}")),
-        }
-    }
-}
-
 /// One child repository of a parent folder.
 pub struct Child {
-    /// Canonical checkout root.
-    pub root: PathBuf,
-    /// Path relative to the parent folder, used as the answer's path prefix.
-    pub relative: PathBuf,
-    /// Read-only handle on the child's persisted inspect aggregates, holding
-    /// a read marker on the inspect generation it reads.
-    pub(crate) inspect: RwLock<Option<Arc<crate::inspect::cache::ReadonlyInspectCache>>>,
+    view: Arc<crate::data_layer::parent_session::Child>,
     /// The search engine context that runs `aft_search` over this child's
     /// loaded indexes; see [`engine`].
     pub(crate) engine: Mutex<Option<engine::ChildEngine>>,
@@ -729,14 +664,8 @@ pub struct Child {
 
 impl Child {
     fn new(parent: &Path, root: PathBuf) -> Self {
-        let relative = root
-            .strip_prefix(parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| root.clone());
         Self {
-            root,
-            relative,
-            inspect: RwLock::new(None),
+            view: Arc::new(crate::data_layer::parent_session::Child::new(parent, root)),
             engine: Mutex::new(None),
         }
     }
@@ -749,6 +678,14 @@ impl Child {
     /// True once this child's search engine serves its loaded indexes.
     pub fn engine_ready(&self) -> bool {
         lock(&self.engine).is_some()
+    }
+}
+
+impl std::ops::Deref for Child {
+    type Target = crate::data_layer::parent_session::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
     }
 }
 
@@ -834,7 +771,7 @@ impl ParentSession {
     /// child has not published yet. See [`record_child_failure`].
     pub(crate) fn note_child_failure(
         &self,
-        child: &Child,
+        child: &crate::data_layer::parent_session::Child,
         plane: &'static str,
         error: &str,
     ) -> String {
@@ -891,6 +828,7 @@ impl ParentSession {
 
     fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        crate::data_layer::parent_session::withdraw(self);
         self.wake();
     }
 
@@ -944,16 +882,68 @@ impl ParentSession {
 impl Drop for ParentSession {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        crate::data_layer::parent_session::withdraw(self);
     }
 }
 
-/// Paths in `paths` relative to the parent root, for gap reports.
-pub(crate) fn display_relative(root: &Path, path: &Path) -> String {
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    let text = relative.to_string_lossy().replace('\\', "/");
-    if text.is_empty() {
-        ".".into()
-    } else {
-        text
+impl crate::data_layer::parent_session::ParentView for ParentSession {
+    fn root(&self) -> &Path {
+        self.root()
     }
+    fn planes(&self) -> RequestedPlanes {
+        self.planes
+    }
+    fn children(&self) -> Vec<Arc<crate::data_layer::parent_session::Child>> {
+        self.children()
+            .iter()
+            .map(|child| Arc::clone(&child.view))
+            .collect()
+    }
+    fn discovery(&self) -> Option<Arc<Discovery>> {
+        self.discovery()
+    }
+    fn stopped(&self) -> bool {
+        self.stopped()
+    }
+    fn note_child_failure(
+        &self,
+        child: &crate::data_layer::parent_session::Child,
+        plane: &'static str,
+        error: &str,
+    ) -> String {
+        self.note_child_failure(child, plane, error)
+    }
+}
+
+pub(crate) fn grep_fan_out(
+    ctx: &crate::context::AppContext,
+    pattern: &crate::pattern_compile::CompiledPattern,
+    scope: &crate::grep_executor::GrepScope,
+    params: &crate::grep_executor::GrepParams,
+    filters: &crate::search_index::PathFilters,
+    order: crate::search_index::GrepScanOrder,
+) -> Option<(
+    crate::search_index::GrepResult,
+    crate::grep_executor::GrepExecutionPhaseTimings,
+    Vec<serde_json::Value>,
+)> {
+    let session = session_for(ctx)?;
+    query::grep_fan_out(
+        ctx,
+        session.as_ref(),
+        pattern,
+        scope,
+        params,
+        filters,
+        order,
+    )
+}
+
+pub(crate) fn glob_fan_out(
+    ctx: &crate::context::AppContext,
+    search_roots: &[PathBuf],
+    pattern: &str,
+) -> Option<query::GlobFanOut> {
+    let session = session_for(ctx)?;
+    query::glob_fan_out(ctx, session.as_ref(), search_roots, pattern)
 }

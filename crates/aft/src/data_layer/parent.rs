@@ -26,9 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::SemanticBackendConfig;
-use crate::context::AppContext;
 use crate::data_layer::checkout::{CheckoutView, PlaneStatus, Planes};
-use crate::parent_search::Plane;
+use crate::data_layer::host::IndexHost;
+use crate::data_layer::parent_session::Plane;
 use crate::data_layer::runtime::{DataCheckout, Fresh};
 use crate::executor::RootMaintenanceExecutor;
 use crate::semantic_index::SemanticIndexFingerprint;
@@ -40,7 +40,7 @@ type Slot = Arc<parking_lot::Mutex<Option<Arc<DataCheckout>>>>;
 /// The data-layer checkouts of the child repositories of the parent folder
 /// a context is bound to.
 #[derive(Default)]
-pub(crate) struct ChildCheckouts {
+pub struct ChildCheckouts {
     inner: parking_lot::Mutex<Children>,
 }
 
@@ -153,7 +153,7 @@ fn bind(
 /// once: a bind of a published checkout compares its files with the
 /// publication first.
 fn checkouts(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     parent: &Path,
     children: &[&Path],
 ) -> Vec<Result<Arc<DataCheckout>, String>> {
@@ -184,7 +184,7 @@ fn checkouts(
 /// its view once the text plane covers every path, still loading before
 /// that, or the reason it cannot answer.
 pub(crate) fn text_planes(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     parent: &Path,
     children: &[&Path],
 ) -> Vec<Plane<CheckoutView>> {
@@ -225,7 +225,7 @@ fn not_ready(checkout: &DataCheckout) -> Plane<CheckoutView> {
 /// that `ctx` is bound to: a view whose call graph covers every recorded
 /// change, still loading, or the reason it cannot answer.
 pub(crate) fn callgraph_plane(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     parent: &Path,
     child: &Path,
 ) -> Plane<CheckoutView> {
@@ -276,7 +276,7 @@ pub(crate) const NO_VECTORS: &str = "no semantic view has been published for thi
 /// them, and never fills, since semantic search is not admitted for a
 /// repository no session has opened.
 pub(crate) fn search_children(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     parent: &Path,
     children: &[&Path],
     meaning: Option<(&SemanticBackendConfig, &SemanticIndexFingerprint)>,

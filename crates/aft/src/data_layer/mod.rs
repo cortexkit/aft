@@ -14,6 +14,8 @@ pub mod fragment;
 pub(crate) mod gate;
 pub(crate) mod graph_rows;
 pub(crate) mod graph_store;
+pub mod host;
+pub(crate) mod ignore_rules;
 pub mod incremental;
 #[cfg(test)]
 mod incremental_tests;
@@ -22,9 +24,12 @@ pub mod old_index;
 pub(crate) mod outline;
 pub(crate) mod overlay;
 pub(crate) mod parent;
+pub(crate) mod parent_query;
+pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;
 pub(crate) mod query;
+pub(crate) mod read_fence;
 pub mod reuse;
 pub(crate) mod runtime;
 #[cfg(test)]

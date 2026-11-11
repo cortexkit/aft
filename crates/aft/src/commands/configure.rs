@@ -2965,8 +2965,7 @@ fn handle_configure_inner(
     );
     if ctx.configure_generation() > 0
         && !root_too_broad
-        && (!parent_folder
-            || crate::parent_search::held_by(ctx, &canonical_cache_root))
+        && (!parent_folder || crate::parent_search::held_by(ctx, &canonical_cache_root))
         && !ctx.database_runtime_failed()
         && !ctx.artifact_identity_provisional()
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
@@ -3362,12 +3361,7 @@ fn handle_configure_inner(
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
     if cache_available && !root_too_broad && !identity_provisional {
-        crate::parent_search::activate(
-            ctx,
-            &canonical_cache_root,
-            &storage_root,
-            &parent_semantic,
-        );
+        crate::parent_search::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
     }
     ctx.begin_configure_ack_step("warm_key");
     let warm_key = configure_warm_key(
@@ -6616,7 +6610,7 @@ mod tests {
                         crate::feature_status::IndexPlane::Callgraph,
                     ] {
                         assert_eq!(
-                            crate::feature_status::observed_index_status(&ctx, plane)
+                            crate::feature_status::observed_index_status(&ctx, &ctx, plane)
                                 .unavailable_reason
                                 .as_deref(),
                             Some(crate::root_cache::CACHE_DIR_BUSY)
@@ -8318,7 +8312,7 @@ mod tests {
         }
         for plane in crate::feature_status::IndexPlane::ALL {
             let observation =
-                crate::feature_status::observed_index_status(&ctx, plane).consumer_json();
+                crate::feature_status::observed_index_status(&ctx, &ctx, plane).consumer_json();
             assert_eq!(observation["status"], "off");
             assert_eq!(observation["reason"], "root_too_broad");
         }

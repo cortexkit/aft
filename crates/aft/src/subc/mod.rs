@@ -12679,7 +12679,7 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
     runtime_drain::drain_configure_warning_events(ctx);
     if !stepped_aside {
         crate::data_layer::runtime::root_bound(ctx);
-        crate::data_layer::outline::root_bound(ctx);
+        crate::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
     }
     let identity_replay = (!stepped_aside && ctx.configure_tail_idle())
         .then(|| crate::provisional_identity_retry::poll(ctx))
@@ -17941,8 +17941,7 @@ mod tests {
         roots.get_mut(&root).unwrap().reactivate_bound();
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
         crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-        let rebound =
-            crate::parent_search::session_for(&ctx).expect("rebound parent session");
+        let rebound = crate::parent_search::session_for(&ctx).expect("rebound parent session");
         assert!(!Arc::ptr_eq(&parent, &rebound));
         assert!(rebound.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);

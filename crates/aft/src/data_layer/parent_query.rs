@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::context::AppContext;
+use crate::data_layer::host::IndexHost;
 use crate::grep_executor::{GrepExecutionPhaseTimings, GrepParams, GrepScope};
 use crate::pattern_compile::CompiledPattern;
 use crate::search_index::{GrepResult, IndexStatus, PathFilters, SearchIndexSnapshot};
 
-use super::{display_relative, Child, ParentSession, Plane};
+use super::parent_session::{display_relative, Child, ParentView, Plane};
 
 /// Named gaps collected while answering one request, deduplicated.
 #[derive(Default)]
@@ -35,7 +35,7 @@ impl Gaps {
 
     /// Children, skipped children and outside paths a search of `scope`
     /// covers but cannot reach, beyond the per-child plane gaps.
-    pub(crate) fn scope(&mut self, session: &ParentSession, scope: &Path) {
+    pub(crate) fn scope(&mut self, session: &dyn ParentView, scope: &Path) {
         let Some(discovery) = session.discovery() else {
             self.discovering();
             return;
@@ -136,7 +136,7 @@ fn attach_gaps_in_order(body: &mut Value, gaps: Vec<Value>, first: bool) {
 }
 
 /// True once discovery finished; otherwise records the discovering gap.
-pub(crate) fn discovered(session: &ParentSession, gaps: &mut Gaps) -> bool {
+pub(crate) fn discovered(session: &dyn ParentView, gaps: &mut Gaps) -> bool {
     if session.discovery().is_some() {
         return true;
     }
@@ -145,7 +145,7 @@ pub(crate) fn discovered(session: &ParentSession, gaps: &mut Gaps) -> bool {
 }
 
 /// Children whose checkout overlaps `scope`: inside it, or containing it.
-fn overlapping(session: &ParentSession, scope: &Path) -> Vec<Arc<Child>> {
+fn overlapping(session: &dyn ParentView, scope: &Path) -> Vec<Arc<Child>> {
     session
         .children()
         .into_iter()
@@ -206,13 +206,13 @@ impl ChildText {
 /// Each child overlapping `search_root`, with its text index (the child's
 /// own checkout in the index store) or the reason it cannot answer.
 fn child_texts(
-    ctx: &AppContext,
-    session: &ParentSession,
+    ctx: &impl IndexHost,
+    session: &dyn ParentView,
     search_root: &Path,
 ) -> Vec<(Arc<Child>, Result<ChildText, String>)> {
     let children = overlapping(session, search_root);
     // A plane the user turned off is a named gap for every child.
-    if !session.planes.trigram {
+    if !session.planes().trigram {
         return children
             .into_iter()
             .map(|child| (child, Err("trigram: the trigram index is off".to_string())))
@@ -255,16 +255,16 @@ fn child_texts(
 /// warm trigram snapshots of the children it overlaps, walking children whose
 /// indexes are still building. Explicit files and
 /// roots outside the parent folder keep the ordinary executor, which reads
-/// them directly. `None` when `ctx` is not a parent session.
+/// them directly. The runtime supplies the parent session's published view.
 pub(crate) fn grep_fan_out(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
+    session: &dyn ParentView,
     pattern: &CompiledPattern,
     scope: &GrepScope,
     params: &GrepParams,
     filters: &PathFilters,
     order: crate::search_index::GrepScanOrder,
 ) -> Option<(GrepResult, GrepExecutionPhaseTimings, Vec<Value>)> {
-    let session = super::session_for(ctx)?;
     let project_root = crate::grep_executor::project_root(ctx);
     let query = crate::search_index::decompose_grep_pattern(pattern);
     let mut results = Vec::new();
@@ -293,7 +293,7 @@ pub(crate) fn grep_fan_out(
             params.max_results
         };
         let mut sources = Vec::new();
-        for (child, text) in child_texts(ctx, &session, search_root) {
+        for (child, text) in child_texts(ctx, session, search_root) {
             let text = match text {
                 Ok(text) => text,
                 Err(reason) => {
@@ -395,7 +395,7 @@ pub(crate) fn grep_fan_out(
             phases.query.bytes_verified += timings.bytes_verified;
             results.push(result);
         }
-        gaps.scope(&session, search_root);
+        gaps.scope(session, search_root);
     }
     phases.indexed_scope_has_files = Some(scope_has_files || !gaps.is_empty());
     let result = if results.is_empty() {
@@ -437,14 +437,13 @@ pub(crate) struct GlobFanOut {
 
 /// The parent session's glob: each root is answered from the warm trigram
 /// snapshots of the children it overlaps, walking children whose indexes are
-/// still building. `None` when `ctx` is not a parent
-/// session.
+/// still building. The runtime supplies the session view.
 pub(crate) fn glob_fan_out(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
+    session: &dyn ParentView,
     search_roots: &[PathBuf],
     pattern: &str,
 ) -> Option<GlobFanOut> {
-    let session = super::session_for(ctx)?;
     let mut answer = GlobFanOut {
         files: Vec::new(),
         scope_has_files: false,
@@ -467,7 +466,7 @@ pub(crate) fn glob_fan_out(
             );
             continue;
         }
-        for (child, text) in child_texts(ctx, &session, &search_root) {
+        for (child, text) in child_texts(ctx, session, &search_root) {
             let text = match text {
                 Ok(text) => text,
                 Err(reason) => {
@@ -514,7 +513,7 @@ pub(crate) fn glob_fan_out(
             answer.entries_visited += visited;
             answer.files.extend(files);
         }
-        gaps.scope(&session, &search_root);
+        gaps.scope(session, &search_root);
     }
     answer.files.sort();
     answer.files.dedup();

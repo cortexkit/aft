@@ -4942,12 +4942,13 @@ fn dead_code_callgraph_observation(
     ctx: &AppContext,
 ) -> (crate::feature_status::IndexObservation, bool) {
     let (query_observation, transient_lock_contention) =
-        crate::feature_status::observe_callgraph_query_with_contention(ctx);
+        crate::feature_status::observe_callgraph_query_with_contention(ctx, ctx);
     if transient_lock_contention {
         (query_observation, true)
     } else {
         (
             crate::feature_status::observed_index_status(
+                ctx,
                 ctx,
                 crate::feature_status::IndexPlane::Callgraph,
             ),

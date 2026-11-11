@@ -491,7 +491,7 @@ fn a_reader_floor_above_this_build_refuses_the_store_before_anything_is_written(
         !cache.exists(),
         "a build below the floor must not write the store"
     );
-    let observation = observed_index_status(&ctx, IndexPlane::Trigram);
+    let observation = observed_index_status(&ctx, &ctx, IndexPlane::Trigram);
     let reason = observation.unavailable_reason.unwrap_or_default();
     assert!(reason.starts_with(CODE), "{reason}");
     assert!(reason.contains(&floor.display().to_string()), "{reason}");

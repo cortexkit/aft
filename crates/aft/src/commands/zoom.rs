@@ -1853,7 +1853,7 @@ fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     }
     // Timing hooks for the read-bound test. Unconfigured test contexts have no
     // cache root, so the hooks are skipped there instead of panicking.
-    let observation = observe_callgraph_query(ctx);
+    let observation = observe_callgraph_query(ctx, ctx);
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",

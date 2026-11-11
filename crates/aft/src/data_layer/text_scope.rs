@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aft_store::checkout::{PathKind, PathRecord};
 use aft_store::text::{plan_pattern, Query, Scope};
 
-use crate::context::AppContext;
 use crate::data_layer::checkout::{CheckoutView, DataError, PlaneStatus};
+use crate::data_layer::host::IndexHost;
 use crate::pattern_compile::CompiledPattern;
 use crate::search_index::{FileEntry, PathFilters, SearchIndexSnapshot, DEFAULT_MAX_FILE_SIZE};
 
@@ -35,7 +35,7 @@ mod tests;
 /// The data layer's view of this root, when grep and glob may answer from
 /// it: the process runs the data layer, the checkout has published, and its
 /// text plane covers every path.
-pub(crate) fn ready_view(ctx: &AppContext) -> Option<CheckoutView> {
+pub(crate) fn ready_view(ctx: &(impl IndexHost + ?Sized)) -> Option<CheckoutView> {
     #[cfg(test)]
     if test_hooks::today_only() {
         return None;

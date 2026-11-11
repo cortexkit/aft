@@ -371,13 +371,13 @@ fn delay_watcher_receive_for_test() {}
 /// query, and a rebind compares its files with the disk again.
 pub fn standalone_root_configured(ctx: &AppContext) {
     crate::data_layer::runtime::root_bound(ctx);
-    crate::data_layer::outline::root_bound(ctx);
+    crate::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
 }
 
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
     crate::data_layer::runtime::root_bound(ctx);
-    crate::data_layer::outline::root_bound(ctx);
+    crate::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
 }
 
 /// Once per configure of a standalone AFT: the root's checkout binds and

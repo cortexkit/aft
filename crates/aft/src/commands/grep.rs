@@ -237,7 +237,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         &req.id,
         req.session(),
-        Some(crate::context::WorkerSearchTool::Grep),
+        &ctx.search_read_policy(crate::context::WorkerSearchTool::Grep),
     ) {
         Ok(scope) => scope,
         Err(response) => return response,
@@ -274,9 +274,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         None
     } else {
-        crate::parent_search::grep_fan_out(
-            ctx, &compiled, &scope, &params, &filters, order,
-        )
+        crate::parent_search::grep_fan_out(ctx, &compiled, &scope, &params, &filters, order)
     };
     let (result, phases, parent_gaps) = match parent_answer {
         Some(answer) => answer,
@@ -521,6 +519,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 pub(crate) fn trigram_index_disclosure(ctx: &AppContext) -> serde_json::Value {
     serde_json::json!({
         "trigram": crate::feature_status::observed_index_status(
+            ctx,
             ctx,
             crate::feature_status::IndexPlane::Trigram,
         )

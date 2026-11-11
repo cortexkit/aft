@@ -2681,6 +2681,7 @@ pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Respo
         // the plane's observed cause rather than "not configured".
         let observation = match crate::feature_status::observed_index_status(
             ctx,
+            ctx,
             crate::feature_status::IndexPlane::Callgraph,
         ) {
             observation if observation.unavailable_reason.is_some() => observation,

@@ -17,7 +17,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::context::AppContext;
+use crate::data_layer::host::IndexHost;
 use crate::data_layer::meaning::{self, FillFailure, MeaningState};
 use crate::data_layer::status::SemanticIndexStatus;
 use crate::data_layer::vectors::{Coverage, MeaningSnapshot};
@@ -138,7 +140,7 @@ pub(crate) enum DataSemantic {
 impl DataSemantic {
     /// As [`Self::current`] for status reads: never binds a checkout and
     /// never starts a fill.
-    pub(crate) fn probe(ctx: &AppContext) -> Option<Self> {
+    pub(crate) fn probe(ctx: &(impl IndexHost + ?Sized)) -> Option<Self> {
         use crate::data_layer::surfaces::DataCheckoutProbe;
         if !ctx.config().indexes.semantic {
             return None;

@@ -330,3 +330,98 @@ mod tests {
         );
     }
 }
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticHealthComponentSnapshot {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_until_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_batch: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_batches: Option<usize>,
+    /// The data layer's meaning plane: how far its fill has got and what it
+    /// could not embed. Present only while that plane reports for the root.
+    #[serde(flatten)]
+    pub fill: Option<SemanticFillHealth>,
+}
+
+/// The fill of the data layer's meaning plane as each root's health carries
+/// it inside `semantic_index`, beside the status, `stage` and `reason`.
+/// Health replies are held to a byte budget, so only what says something is
+/// present: `files` while files still wait for vectors, every other count
+/// only when it is above zero, `filling` only while true, and
+/// `last_progress_at_ms` only while the plane is building. A fill that
+/// waits for another fill of the repository says so in `stage`
+/// (`waiting_for_another_fill`).
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticFillHealth {
+    /// Files meaning search applies to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<usize>,
+    /// Files whose every chunk has a vector or a recorded failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_embedded: Option<usize>,
+    /// Files within `semantic.max_files` still waiting for vectors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_pending: Option<usize>,
+    /// Files over the size limit, which get no chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_too_large: Option<usize>,
+    /// Files past `semantic.max_files` that no checkout has embedded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_past_cap: Option<usize>,
+    /// Files that could not be read or cut into chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_failed: Option<usize>,
+    /// Chunks the embedder refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks_failed: Option<usize>,
+    /// A fill round is queued or running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filling: Option<bool>,
+    /// While the plane is building: when a fill last stored vectors and
+    /// chunk maps, in milliseconds since the Unix epoch, as the fill itself
+    /// recorded it. Health's stuck-plane check reads it with `since_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmbeddingBackendHealthSnapshot {
+    pub(crate) available: bool,
+    pub(crate) last_error: Option<String>,
+    pub(crate) since_ms: Option<u64>,
+    pub(crate) next_retry_ms: Option<u64>,
+    pub(crate) paused_until_ms: Option<u64>,
+    /// Why the backend refused requests for now, when `paused_until_ms` is set.
+    pub(crate) pause_cause: Option<crate::synapse_embed::PauseCause>,
+}
+
+pub enum SemanticIndexEvent {
+    Progress {
+        stage: String,
+        files: Option<usize>,
+        entries_done: Option<usize>,
+        entries_total: Option<usize>,
+    },
+    /// Emitted when the semantic worker avoids or pauses full project corpus
+    /// collection before reaching terminal Ready/Failed, such as after loading a
+    /// cached index or while waiting to retry an embedding backend with no vectors
+    /// retained. Work that was waiting for the full index can proceed.
+    ColdSeedGateCleared,
+    Ready(crate::semantic_index::SemanticIndex),
+    Failed(String),
+}

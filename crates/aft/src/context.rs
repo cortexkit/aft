@@ -1,10 +1,11 @@
 pub use crate::callgraph_store::access::CallgraphStoreAccess;
+pub(crate) use crate::data_layer::status::EmbeddingBackendHealthSnapshot;
 pub(crate) use crate::data_layer::status::{
     view_load_cause, view_load_error_response, VIEW_LOAD_DEGRADED_REASON, VIEW_LOAD_LOG_INTERVAL,
 };
 pub use crate::data_layer::status::{
-    SemanticIndexStatus, SemanticRefreshAccounting, ViewLoadFailure,
-    SEMANTIC_MASS_REFRESH_MIN_FILES,
+    SemanticFillHealth, SemanticHealthComponentSnapshot, SemanticIndexEvent, SemanticIndexStatus,
+    SemanticRefreshAccounting, ViewLoadFailure, SEMANTIC_MASS_REFRESH_MIN_FILES,
 };
 pub(crate) use crate::executor::root_lifecycle::SubcLifecycleAdmission;
 pub(crate) use crate::watcher_backend::counters::{
@@ -233,9 +234,11 @@ use crate::protocol::{
 use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
-#[path = "gitignore_state.rs"]
-mod gitignore_state;
+use crate::data_layer::ignore_rules as gitignore_state;
+#[path = "context_index_host.rs"]
+mod index_host;
 pub(crate) use gitignore_state::IgnoreRuleChange;
+pub use index_host::SearchReadPolicy;
 // The shared ignore-rule definition every project walker applies; see
 // `apply_project_ignore_rules`.
 pub(crate) use gitignore_state::apply_project_ignore_rules;
@@ -646,74 +649,6 @@ impl SemanticBuildProgress {
             total_batches: self.total_batches.load(Ordering::Relaxed),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SemanticHealthComponentSnapshot {
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub since_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_retry_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub paused_until_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stage: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedded_chunks: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_chunks: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_batch: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_batches: Option<usize>,
-    /// The data layer's meaning plane: how far its fill has got and what it
-    /// could not embed. Present only while that plane reports for the root.
-    #[serde(flatten)]
-    pub fill: Option<SemanticFillHealth>,
-}
-
-/// The fill of the data layer's meaning plane as each root's health carries
-/// it inside `semantic_index`, beside the status, `stage` and `reason`.
-/// Health replies are held to a byte budget, so only what says something is
-/// present: `files` while files still wait for vectors, every other count
-/// only when it is above zero, `filling` only while true, and
-/// `last_progress_at_ms` only while the plane is building. A fill that
-/// waits for another fill of the repository says so in `stage`
-/// (`waiting_for_another_fill`).
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct SemanticFillHealth {
-    /// Files meaning search applies to.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub files: Option<usize>,
-    /// Files whose every chunk has a vector or a recorded failure.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub files_embedded: Option<usize>,
-    /// Files within `semantic.max_files` still waiting for vectors.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub files_pending: Option<usize>,
-    /// Files over the size limit, which get no chunks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub files_too_large: Option<usize>,
-    /// Files past `semantic.max_files` that no checkout has embedded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub files_past_cap: Option<usize>,
-    /// Files that could not be read or cut into chunks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub files_failed: Option<usize>,
-    /// Chunks the embedder refused.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunks_failed: Option<usize>,
-    /// A fill round is queued or running.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filling: Option<bool>,
-    /// While the plane is building: when a fill last stored vectors and
-    /// chunk maps, in milliseconds since the Unix epoch, as the fill itself
-    /// recorded it. Health's stuck-plane check reads it with `since_ms`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_progress_at_ms: Option<u64>,
 }
 
 /// Per-project checkout view load health. Counts every load attempt the
@@ -1864,17 +1799,6 @@ fn emit_pending_status(state: &StatusEmitterState) {
 use crate::cache_freshness::FileFreshness;
 use crate::semantic_index::{EmbeddingEntry, SemanticIndex};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct EmbeddingBackendHealthSnapshot {
-    pub(crate) available: bool,
-    pub(crate) last_error: Option<String>,
-    pub(crate) since_ms: Option<u64>,
-    pub(crate) next_retry_ms: Option<u64>,
-    pub(crate) paused_until_ms: Option<u64>,
-    /// Why the backend refused requests for now, when `paused_until_ms` is set.
-    pub(crate) pause_cause: Option<crate::synapse_embed::PauseCause>,
-}
-
 /// The refresh circuit only trips once an index exists and later refreshes
 /// fail. A first build against an unreachable backend never gets that far: it
 /// parks in a retry loop that records its outage per project root instead.
@@ -1940,22 +1864,6 @@ fn semantic_health_unix_millis() -> u64 {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SemanticColdSeedResume {
     request_tier2: bool,
-}
-
-pub enum SemanticIndexEvent {
-    Progress {
-        stage: String,
-        files: Option<usize>,
-        entries_done: Option<usize>,
-        entries_total: Option<usize>,
-    },
-    /// Emitted when the semantic worker avoids or pauses full project corpus
-    /// collection before reaching terminal Ready/Failed, such as after loading a
-    /// cached index or while waiting to retry an embedding backend with no vectors
-    /// retained. Work that was waiting for the full index can proceed.
-    ColdSeedGateCleared,
-    Ready(SemanticIndex),
-    Failed(String),
 }
 
 #[derive(Debug, Clone)]

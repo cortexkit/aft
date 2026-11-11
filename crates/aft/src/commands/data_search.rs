@@ -20,8 +20,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(crate) use crate::parent_search::external::ExternalSearch;
 pub(crate) use crate::data_layer::meaning_query as meaning;
+pub(crate) use crate::parent_search::external::ExternalSearch;
 
 pub(crate) use meaning::{DataMeaning, DataSemantic};
 
@@ -1112,7 +1112,9 @@ impl DataSemantic {
     /// nothing has, and starts a fill when files wait for vectors. `None`
     /// otherwise (the root has no checkout in the data layer, or semantic
     /// search is off), and the caller keeps reading today's index.
-    pub(crate) fn current(ctx: &AppContext) -> Option<Self> {
+    pub(crate) fn current(
+        ctx: &(impl crate::data_layer::host::IndexHost + ?Sized),
+    ) -> Option<Self> {
         if !ctx.config().indexes.semantic {
             return None;
         }

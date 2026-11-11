@@ -379,7 +379,7 @@ fn aft_inspect_dead_code_matches_the_shared_fixtures() {
         crate::commands::inspect::annotate_dead_code_unavailable_for_test(
             &mut summary,
             &payload,
-            observed_index_status(&scenario.ctx, IndexPlane::Callgraph),
+            observed_index_status(&scenario.ctx, &scenario.ctx, IndexPlane::Callgraph),
         );
         let frozen = &expected["analyses"]["dead_code"];
         assert_eq!(project(&summary, frozen), *frozen, "dead_code/{name}");

@@ -1025,7 +1025,7 @@ fn attach_not_opened_notice(
             root
         }
         None => {
-            let observed = observed_index_status(ctx, IndexPlane::Semantic);
+            let observed = observed_index_status(ctx, ctx, IndexPlane::Semantic);
             if observed.unavailable_reason.as_deref() != Some(feature_cause::SEMANTIC_NOT_OPENED) {
                 return;
             }
@@ -1255,7 +1255,7 @@ fn collect_pattern_list(
         split_query::BOUNDED_SCAN_MATCH_LIMIT,
         &req.id,
         req.session(),
-        None,
+        ctx,
     )?;
     let params = GrepParams {
         include: Vec::new(),
@@ -1877,7 +1877,7 @@ impl SearchLaneStatus {
         let trigram = if trigram_ready {
             IndexObservation::ready()
         } else {
-            match observed_index_status(ctx, IndexPlane::Trigram) {
+            match observed_index_status(ctx, ctx, IndexPlane::Trigram) {
                 // Usable from its persisted cache but not loaded in time for
                 // this request: its reload is in flight.
                 observation if observation.is_ready() => IndexObservation::building(),
@@ -1885,7 +1885,7 @@ impl SearchLaneStatus {
             }
         };
         let mut semantic_reload_started = false;
-        let semantic = match observed_index_status(ctx, IndexPlane::Semantic) {
+        let semantic = match observed_index_status(ctx, ctx, IndexPlane::Semantic) {
             // Enabled but not resident: a query is the signal that recovers an
             // idle-evicted semantic index, as the semantic branch did before.
             // A read-only root may also recover a failed shared snapshot; the
@@ -1915,8 +1915,8 @@ impl SearchLaneStatus {
 
     fn observe_current(ctx: &AppContext) -> Self {
         Self {
-            trigram: observed_index_status(ctx, IndexPlane::Trigram),
-            semantic: observed_index_status(ctx, IndexPlane::Semantic),
+            trigram: observed_index_status(ctx, ctx, IndexPlane::Trigram),
+            semantic: observed_index_status(ctx, ctx, IndexPlane::Semantic),
             semantic_reload_started: false,
         }
     }
@@ -2200,7 +2200,7 @@ fn callgraph_enrichment_json(ctx: &AppContext) -> serde_json::Value {
             "index": IndexObservation::ready().consumer_json(),
         });
     }
-    let observation = match observed_index_status(ctx, IndexPlane::Callgraph) {
+    let observation = match observed_index_status(ctx, ctx, IndexPlane::Callgraph) {
         // Resident but mid-refresh: enrichment waits for the refresh.
         observation if observation.is_ready() => IndexObservation::building(),
         observation => observation,
@@ -2590,7 +2590,7 @@ fn handle_external_bounded_lexical_fallback(
         top_k,
         &req.id,
         req.session(),
-        None,
+        ctx,
     ) {
         Ok(scope) => scope,
         Err(response) => return response,
@@ -3001,7 +3001,7 @@ fn handle_grep_search(
             fetch_limit,
             &req.id,
             req.session(),
-            None,
+            ctx,
         ) {
             Ok(scope) => scope,
             Err(response) => return response,
