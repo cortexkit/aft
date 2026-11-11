@@ -1963,6 +1963,8 @@ fn copy_terminal_body(body: &[u8]) -> Vec<u8> {
     body.to_vec()
 }
 struct LedgerWait {
+    key: crate::db::call_ledger::Key,
+    live: tokio::sync::watch::Sender<bool>,
     admission: super::AdmissionWait,
     cancel: super::PersistentCancelSignal,
     terminal_claim: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2691,6 +2693,8 @@ impl LedgerEdge {
         self.waiting.lock().unwrap().insert(
             (route, decoded.frame.header.corr),
             LedgerWait {
+                key: response_key.clone(),
+                live: tokio::sync::watch::channel(false).0,
                 admission,
                 cancel: cancel.clone(),
                 terminal_claim: terminal_claim.clone(),
@@ -2789,6 +2793,9 @@ impl LedgerEdge {
                                     detached: false,
                                 },
                             );
+                            let _ = waiting[&(route, decoded.frame.header.corr)]
+                                .live
+                                .send_replace(true);
                         }
                         admitted
                     };
@@ -3144,6 +3151,68 @@ impl LedgerEdge {
         writer: &super::WriterSender,
         metrics: &std::sync::Arc<super::DispatchPathMetrics>,
     ) {
+        let pending = super::call_yield::parse_request(body)
+            .ok()
+            .and_then(|yielded| {
+                self.admission_for_yield(
+                    super::route_key(decoded.frame.header.channel, decoded.frame.header.epoch),
+                    &Self::key(identity, &yielded.call_key),
+                )
+            });
+        let Some(mut pending) = pending else {
+            self.call_yield_ready(decoded, body, identity, writer, metrics, false);
+            return;
+        };
+        let edge = self.clone();
+        let body = body.clone();
+        let identity = identity.clone();
+        let writer = writer.clone();
+        let metrics = metrics.clone();
+        let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        tokio::spawn(async move {
+            // Admission is asynchronous, so an immediately following yield can
+            // arrive before the live call exists. Leave most of the five-second
+            // reply budget for persisting and delivering the held reply.
+            let live = *pending.borrow();
+            if !live {
+                let _ = tokio::time::timeout_at(admission_deadline, pending.changed()).await;
+            }
+            edge.call_yield_ready(decoded, &body, &identity, &writer, &metrics, true);
+        });
+    }
+
+    fn admission_for_yield(
+        &self,
+        route: super::RouteChannel,
+        key: &crate::db::call_ledger::Key,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        // Match admission's waiting -> calls lock order. Subscribe while the
+        // registration lock is held so a completion cannot lose its wakeup.
+        let waiting = self.waiting.lock().unwrap();
+        if self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|((call_route, _), call)| *call_route == route && call.key == *key)
+        {
+            return None;
+        }
+        waiting.iter().find_map(|((call_route, _), wait)| {
+            (*call_route == route && wait.key == *key && !*wait.live.borrow())
+                .then(|| wait.live.subscribe())
+        })
+    }
+
+    fn call_yield_ready(
+        self: &std::sync::Arc<Self>,
+        decoded: super::DecodedFrame,
+        body: &Value,
+        identity: &super::RouteIdentity,
+        writer: &super::WriterSender,
+        metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+        received_during_admission: bool,
+    ) {
         use super::call_yield::{NotYieldable, YieldAnswer, YieldableTool};
         let request = decoded.frame;
         let writer = writer.clone();
@@ -3172,6 +3241,9 @@ impl LedgerEdge {
                     && !call.detached
                     && call.withdrawn.is_none()
             }) {
+                None if received_during_admission => {
+                    YieldAnswer::NotYieldable(NotYieldable::NotWaiting)
+                }
                 None => YieldAnswer::UnknownCall,
                 // The contract never accepts a yield twice.
                 Some((_, call)) if call.yielded => YieldAnswer::UnknownCall,
@@ -10792,6 +10864,224 @@ mod ledger_terminal_tests {
         }
     }
 
+    fn yield_admission_request(corr: u64, body: Value) -> crate::subc::DecodedFrame {
+        crate::subc::DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            launch_restore: None,
+            codemode_policies: None,
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                42,
+                1,
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+            phase_trace: crate::run_tool_call::PhaseTrace::new(Instant::now()),
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_restart_yield_waits_for_call_ledger_admission() {
+        use crate::subc::*;
+        let (dir, root) = test_support::test_root("yield-during-admission");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked = executor.submit_async(
+            root.clone(),
+            crate::executor::Lane::CallLedger,
+            "block-yield-admission".into(),
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                crate::protocol::Response::success("block-yield-admission", json!({}))
+            }),
+        );
+        started_rx.await.unwrap();
+        let mut identity = test_support::route_identity_with_harness(
+            &root,
+            "session",
+            BindTrust::FirstParty,
+            "runner",
+        );
+        let data = std::sync::Arc::get_mut(&mut identity.0).unwrap();
+        data.role = RouteRole::ToolProviderV1;
+        data.call_yield = true;
+        data.held_reply = true;
+        data.tool_result_body = true;
+        let route = route_key(42, 1);
+        let key = LedgerEdge::key(&identity, "admission-watch");
+        let routes = std::collections::HashMap::from([(route, identity)]);
+        let (edge, mut ready) = LedgerEdge::new();
+        let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
+        let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
+        let signal = metrics.watch_yields.register(route, 7);
+        crate::subc::call_yield::watch_waiting(
+            &signal,
+            crate::subc::call_yield::WatchWait::new(
+                ctx.clone(),
+                crate::protocol::RawRequest {
+                    id: "7".into(),
+                    command: "bash_watch".into(),
+                    session_id: Some("session".into()),
+                    params: json!({"task_id":"pending-watch", "timeout_ms":10000}),
+                    lsp_hints: None,
+                },
+                crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+                10000,
+            ),
+        );
+        assert!(edge.defer(
+            yield_admission_request(7, json!({"name":"bash_watch", "preset":"worker", "call_key":key.call_key, "arguments":{"taskId":"pending-watch", "timeoutMs":10000}})),
+            &routes, &executor, &writer, &metrics,
+        ).is_ok());
+        assert!(edge.calls.lock().unwrap().is_empty());
+        assert!(ready.try_recv().is_err());
+        let sent = Instant::now();
+        assert!(edge.defer(
+            yield_admission_request(8, json!({"name":"tool.yield", "arguments":{"call_key":key.call_key, "reason":"runner_restart"}})),
+            &routes, &executor, &writer, &metrics,
+        ).is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err(),
+            "a received call must not answer unknown_call while its admission is blocked"
+        );
+        release_tx.send(()).unwrap();
+        blocked.await.unwrap();
+        let admitted = tokio::time::timeout(Duration::from_secs(5), ready.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.frame.header.corr, 7);
+        let mut held = false;
+        let mut accepted = false;
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            match frame.header.corr {
+                7 => {
+                    assert_eq!(body["held"], json!({"reason":"running", "yielded":true}));
+                    held = true;
+                }
+                8 => {
+                    assert_eq!(body, json!({"answer":"accepted"}));
+                    accepted = true;
+                }
+                other => panic!("unexpected response corr={other}: {body}"),
+            }
+        }
+        assert!(held && accepted);
+        assert!(sent.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            crate::db::call_ledger::get(&ctx.db().unwrap().lock().unwrap(), &key)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::call_ledger::State::DispatchStarted
+        );
+        assert!(crate::subc::call_yield::watch_finished(
+            &signal,
+            &crate::protocol::Response::success(
+                "7",
+                json!({"task_id":"pending-watch", "output":"watch completed", "status":"completed"})
+            )
+        ));
+        assert_eq!(
+            crate::db::call_ledger::get(&ctx.db().unwrap().lock().unwrap(), &key)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::call_ledger::State::Settled
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_restart_yield_bounds_admission_wait_and_handles_completion_before_reply() {
+        use crate::subc::*;
+        let (_dir, root) = test_support::test_root("yield-admission-bounds");
+        for completed in [false, true] {
+            let mut identity = test_support::route_identity(&root, "session");
+            std::sync::Arc::get_mut(&mut identity.0).unwrap().call_yield = true;
+            let key = LedgerEdge::key(&identity, "pending-watch");
+            let (edge, _) = LedgerEdge::new();
+            let request = yield_admission_request(
+                7,
+                json!({"name":"bash_watch", "call_key":key.call_key, "arguments":{"taskId":"pending-watch"}}),
+            );
+            edge.waiting.lock().unwrap().insert(
+                (route_key(42, 1), 7),
+                LedgerWait {
+                    key: key.clone(),
+                    live: tokio::sync::watch::channel(false).0,
+                    admission: AdmissionWait::from_decoded(&request, "bash_watch"),
+                    cancel: PersistentCancelSignal::new(),
+                    terminal_claim: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            );
+            let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
+            let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
+            let body = json!({"name":"tool.yield", "arguments":{"call_key":key.call_key, "reason":"runner_restart"}});
+            let sent = Instant::now();
+            edge.call_yield(
+                yield_admission_request(8, body.clone()),
+                &body,
+                &identity,
+                &writer,
+                &metrics,
+            );
+            if completed {
+                // Admission and completion can both happen before the waiter
+                // first polls. Its subscription must retain that notification.
+                let pending = edge
+                    .waiting
+                    .lock()
+                    .unwrap()
+                    .remove(&(route_key(42, 1), 7))
+                    .unwrap();
+                pending.live.send_replace(true);
+            }
+            let frame = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&frame.body).unwrap(),
+                json!({"answer":"not_yieldable", "reason":"not_waiting"}),
+                "completed={completed}"
+            );
+            assert!(sent.elapsed() < Duration::from_secs(3));
+            let unknown = json!({"name":"tool.yield", "arguments":{"call_key":"never-received", "reason":"runner_restart"}});
+            edge.call_yield(
+                yield_admission_request(9, unknown.clone()),
+                &unknown,
+                &identity,
+                &writer,
+                &metrics,
+            );
+            let frame = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&frame.body).unwrap(),
+                json!({"answer":"unknown_call"})
+            );
+        }
+    }
+
     #[tokio::test]
     async fn drained_ledger_admission_never_dispatches_and_settles_not_started() {
         use crate::subc::*;
@@ -10892,6 +11182,8 @@ mod ledger_terminal_tests {
         edge.waiting.lock().unwrap().insert(
             (route_key(42, 1), 7),
             LedgerWait {
+                key: key(),
+                live: tokio::sync::watch::channel(false).0,
                 admission: crate::subc::AdmissionWait::from_decoded(
                     &crate::subc::DecodedFrame {
                         parsed_body: Default::default(),
@@ -10936,6 +11228,8 @@ mod ledger_terminal_tests {
         edge.waiting.lock().unwrap().insert(
             (route_key(42, 1), 7),
             LedgerWait {
+                key: key(),
+                live: tokio::sync::watch::channel(false).0,
                 admission: crate::subc::AdmissionWait::from_decoded(
                     &crate::subc::DecodedFrame {
                         parsed_body: Default::default(),
