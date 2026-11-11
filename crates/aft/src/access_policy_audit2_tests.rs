@@ -136,7 +136,7 @@ fn audit2_temp_delete_special_file_reason_names_first_failing_entry() {
     let _route = f.plugin();
     for (requested, recursive) in [(&entry, false), (&dir, true)] {
         assert_temp_delete_denial(&f, requested, recursive, &format!(
-            "temporary path '{}' contains a special file ('{}'); AFT changes only regular files, folders, and symbolic links under the temporary directory",
+            "temporary path '{}' contains a special file ('{}'); AFT changes only regular files, folders and symbolic links under the temporary directory",
             requested.display(), entry.display()
         ));
     }

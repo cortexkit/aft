@@ -119,7 +119,7 @@ pub struct TempDenial {
 }
 
 const SPECIAL_FILE_MESSAGE: &str =
-    "AFT changes only regular files, folders, and symbolic links under the temporary directory";
+    "AFT changes only regular files, folders and symbolic links under the temporary directory";
 const PROTECTED_ROOT_MESSAGE: &str = "AFT does not replace or remove temporary directory roots";
 
 impl TempDenial {
