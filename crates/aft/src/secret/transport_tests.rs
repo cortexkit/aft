@@ -329,3 +329,22 @@ fn secret_use_module_error_discards_peer_detail_before_returning_the_classificat
         Some(SecretUseRefusal::InvalidParams)
     );
 }
+
+#[test]
+fn fake_live_expiry_uses_the_documented_statement_field_and_matches_the_pending_reply() {
+    use base64::Engine;
+    let daemon = FakeClaustrum::start();
+    let expires = crate::secret::vault::now_ms() + 600_000;
+    daemon.state.lock().unwrap().pending_expires_at_ms = Some(expires);
+    let transport = transport(&daemon);
+    let reply = call(&transport, golden(0));
+    let statement: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(reply["result"]["statement_b64url"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reply["result"]["expires_at_ms"], expires);
+    assert_eq!(statement["request_expires_at_ms"], expires);
+    assert!(statement.get("expires_at_ms").is_none());
+}

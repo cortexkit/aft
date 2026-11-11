@@ -247,7 +247,7 @@ impl State {
         statement["agent_id"] = json!(stamp.attributes.agent_id);
         if let Some(expires) = self.pending_expires_at_ms {
             pending["expires_at_ms"] = json!(expires);
-            statement["expires_at_ms"] = json!(expires);
+            statement["request_expires_at_ms"] = json!(expires);
         }
         if let Some(record) = &record {
             statement["secret"]["name"] = json!(record.name);

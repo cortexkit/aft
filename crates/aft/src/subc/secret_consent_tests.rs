@@ -648,6 +648,14 @@ fn filer_vector(name: &str) -> serde_json::Value {
 fn decode_filer_reply(
     reply: &serde_json::Value,
 ) -> Result<serde_json::Value, super::super::consent::ConsentError> {
+    // These handler samples show refusals as error envelopes; the live SDK
+    // delivers them as module errors, not successful result bytes.
+    if let Some(error) = reply.get("error") {
+        return Err(super::super::consent::ConsentError::Refused {
+            code: error["code"].as_str().unwrap().into(),
+            message: error["message"].as_str().unwrap().into(),
+        });
+    }
     super::super::consent::decode_result(&serde_json::to_vec(reply).unwrap())
 }
 
@@ -1603,5 +1611,26 @@ async fn lost_or_garbled_secret_filing_is_refiled_identically_once_then_withdraw
                 }
             }
         }
+    }
+}
+
+#[test]
+fn handler_refusal_samples_are_named_module_errors_not_lost_filing_replies() {
+    let vectors = filer_vector("refusals");
+    let cases = vectors["cases"].as_array().unwrap();
+    let expected = [
+        "elicitation_invalid_request",
+        "elicitation_invalid_request",
+        "elicitation_request_conflict",
+        "elicitation_requester_refused",
+    ];
+    assert_eq!(cases.len(), expected.len());
+    for (case, code) in cases.iter().zip(expected) {
+        let Err(super::super::consent::ConsentError::Refused { code: actual, .. }) =
+            decode_filer_reply(&case["reply"])
+        else {
+            panic!("a published named refusal is a module error, not Unavailable")
+        };
+        assert_eq!(actual, code);
     }
 }
