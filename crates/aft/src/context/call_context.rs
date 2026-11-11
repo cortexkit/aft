@@ -155,11 +155,13 @@ mod tests {
         {
             let _result = enter(true);
             let _scope = SecretScopeGuard::install(Some(Err(Ineligibility::FlowRead)));
+            let _identity = install_identity(None, None);
             assert!(active());
             assert_eq!(current_call_scopes(), Err(Ineligibility::FlowRead));
             {
                 let _result = enter(false);
                 let _scope = SecretScopeGuard::install(None);
+                let _identity = install_identity(None, None);
                 assert!(!active());
                 assert_eq!(current_call_scopes(), Err(Ineligibility::NoScope));
             }
