@@ -282,12 +282,12 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/confinement.rs",
-      "line": 281,
+      "path": "crates/aft/src/data_layer/read_fence.rs",
+      "line": 358,
       "column": 26,
       "token": "filePath",
       "text": "for key in [\"path\", \"filePath\", \"target\", \"directory\", \"files\", \"url\"] {",
-      "location": "line 281, column 26",
+      "location": "line 358, column 26",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -8592,12 +8592,12 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/confinement.rs",
-      "line": 92,
-      "column": 22,
+      "path": "crates/aft/src/data_layer/read_fence.rs",
+      "line": 358,
+      "column": 26,
       "token": "filePath",
       "text": "for key in [\"path\", \"filePath\", \"target\", \"directory\", \"files\", \"url\"] {",
-      "location": "line 92, column 22",
+      "location": "line 358, column 26",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "The read preflight validates both canonical and legacy path keys before dispatch; this spelling is internal confinement logic, not a new agent argument."
