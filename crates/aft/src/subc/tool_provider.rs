@@ -765,7 +765,7 @@ pub(super) fn catalog(
 // delay outside AFT's execution clock. Declare four minutes beyond the wait so
 // the reply-budget safety reserve preserves a full default 30-minute wait.
 // This extends the caller's reply window, never the command's hard timeout.
-pub(crate) const WORKER_REPLY_MARGIN_MS: u64 = 240_000;
+pub(crate) use crate::commands::blocking_wait::WORKER_REPLY_MARGIN_MS;
 const MAX_DECLARED_REPLY_MS: u64 = 86_400_000;
 
 /// Render a catalog directly from arguments for catalog conformance fixtures.
