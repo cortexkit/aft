@@ -188,6 +188,7 @@ fn resolve_secret_fetch(
         #[cfg(test)]
         test_https_port: url::Url::parse(file).ok().and_then(|url| url.port()),
         call_id: req.id.clone(),
+        cancellation: crate::url_fetch::SecretFetchCancellation::for_current_call(),
     };
     let document = crate::url_fetch::fetch_url_with_secrets(file, &document_dir, options, &secrets)
         .map_err(|error| url_fetch_error_response(&req.id, &error))?;
@@ -346,6 +347,30 @@ thread_local! {
     static TEST_FETCH_OPTIONS: RefCell<Option<Box<dyn Fn(&mut UrlFetchOptions)>>> = const { RefCell::new(None) };
     /// Sees each placeholder fetch's document path while the call still runs.
     static TEST_DOCUMENT_OBSERVER: RefCell<Option<Box<dyn Fn(&Path)>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_secret_fetch_for_test<T>(
+    vault: Arc<dyn SecretVault>,
+    options: UrlFetchOptions,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(
+        Option<Arc<dyn SecretVault>>,
+        Option<Box<dyn Fn(&mut UrlFetchOptions)>>,
+    );
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_FETCH_VAULT.with(|slot| slot.replace(self.0.take()));
+            TEST_FETCH_OPTIONS.with(|slot| slot.replace(self.1.take()));
+        }
+    }
+    let _restore = Restore(
+        TEST_FETCH_VAULT.with(|slot| slot.replace(Some(vault))),
+        TEST_FETCH_OPTIONS
+            .with(|slot| slot.replace(Some(Box::new(move |current| *current = options.clone())))),
+    );
+    run()
 }
 
 #[cfg(test)]

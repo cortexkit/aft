@@ -52,6 +52,7 @@ pub(crate) struct RequestSecrets {
     clock: Arc<dyn ApprovalClock>,
     active: Arc<std::sync::atomic::AtomicUsize>,
     once: Mutex<BTreeMap<String, bool>>,
+    request_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 struct Waiting<'a> {
     owner: &'a RequestSecrets,
@@ -82,7 +83,19 @@ impl RequestSecrets {
             clock: Arc::new(WallClock),
             active: Arc::default(),
             once: Mutex::default(),
+            request_cancelled: None,
         }
+    }
+    pub(crate) fn with_request_cancellation(
+        mut self,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.request_cancelled = Some(Arc::new(cancelled));
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.request_cancelled.as_ref().is_some_and(|check| check())
     }
     pub(crate) fn budget(&self) -> RequestBudget {
         RequestBudget {
@@ -118,9 +131,16 @@ impl RequestSecrets {
             label.to_owned(),
             target.clone(),
         );
-        tokio::task::spawn_blocking(move || vault.use_secret(&scope, &label, &target))
-            .await
-            .unwrap_or(UseAnswer::Unavailable)
+        let cancelled = self.request_cancelled.clone();
+        tokio::task::spawn_blocking(move || {
+            if cancelled.as_ref().is_some_and(|check| check()) {
+                UseAnswer::Unavailable
+            } else {
+                vault.use_secret(&scope, &label, &target)
+            }
+        })
+        .await
+        .unwrap_or(UseAnswer::Unavailable)
     }
 
     pub(crate) async fn approve(
@@ -217,7 +237,13 @@ impl RequestSecrets {
         let mut answered = std::collections::HashSet::new();
         let mut once = false;
         loop {
+            if self.cancelled() {
+                return Err(UseError::Unavailable);
+            }
             let answer = self.ask(label, target).await;
+            if self.cancelled() {
+                return Err(UseError::Unavailable);
+            }
             let UseAnswer::ApprovalRequired(pending) = answer else {
                 if let UseAnswer::Released(released) = &answer {
                     observe(released.material())?;

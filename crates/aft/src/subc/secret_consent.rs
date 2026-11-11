@@ -42,6 +42,26 @@ use subc_protocol::scope::ScopeStamp;
 const SECRET_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
 const SECRET_AWAIT_CAP: Duration = Duration::from_secs(120);
 
+thread_local! {
+    static FETCH_REPLY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The caller's reply deadline is independent of a fetch's network budget.
+pub(super) struct FetchReplyDeadline(Option<std::time::Instant>);
+impl FetchReplyDeadline {
+    pub(super) fn enter(deadline: std::time::Instant) -> Self {
+        Self(FETCH_REPLY_DEADLINE.with(|slot| slot.replace(Some(deadline))))
+    }
+}
+impl Drop for FetchReplyDeadline {
+    fn drop(&mut self) {
+        FETCH_REPLY_DEADLINE.with(|slot| slot.set(self.0));
+    }
+}
+pub(crate) fn current_fetch_reply_deadline() -> Option<std::time::Instant> {
+    FETCH_REPLY_DEADLINE.with(std::cell::Cell::get)
+}
+
 /// Use the daemon connection that files filesystem-access questions with
 /// Cingulate as its reserved AFT module principal. Retain each secret card's id
 /// so a held call waits for the existing card instead of filing another.
@@ -778,6 +798,7 @@ pub(crate) fn use_current_secret_labels(
     labels: &[String],
     target: &crate::secret::ApiKeyTarget,
     request_target: &str,
+    cancellation: &crate::url_fetch::SecretFetchCancellation,
 ) -> Vec<LaunchDecision> {
     if labels.is_empty() {
         return Vec::new();
@@ -794,6 +815,9 @@ pub(crate) fn use_current_secret_labels(
             })
             .collect()
     };
+    if cancellation.is_cancelled() {
+        return unavailable();
+    }
     let scopes = match current_call_scopes() {
         Ok((scopes, _)) => scopes,
         Err(reason) => {
@@ -809,17 +833,23 @@ pub(crate) fn use_current_secret_labels(
     if vault.can_release_material() && crate::secret_proxy::protect_secret_process().is_err() {
         return unavailable();
     }
+    let checkpoint = cancellation.clone();
     let coordinator = crate::secret::requests::RequestSecrets::new(
         vault,
         scopes.authorization,
         current_secret_consent_context(),
-    );
+    )
+    .with_request_cancellation(move || checkpoint.is_cancelled());
     let labels = labels.to_vec();
     let target = target.clone();
     let request_target = request_target.to_owned();
+    let cancellation = cancellation.clone();
     let future = async move {
         use futures_util::StreamExt;
         let mut budget = coordinator.budget();
+        if let Some(expires) = cancellation.expires_at_ms() {
+            budget.expires_at_ms = budget.expires_at_ms.min(expires);
+        }
         let mut pending = futures_util::stream::FuturesUnordered::new();
         for (index, label) in labels.iter().enumerate() {
             let target = &target;
@@ -890,6 +920,7 @@ pub(crate) fn use_current_secret_labels(
         while !pending.is_empty() {
             let result = tokio::select! {
                 biased;
+                () = cancellation.cancelled() => None,
                 () = budget.expired() => None,
                 result = pending.next() => result,
             };
@@ -936,7 +967,13 @@ pub(crate) fn use_current_secret_labels(
             .enable_all()
             .build()
             .ok()
-            .and_then(|runtime| runtime.block_on(future)),
+            .and_then(|runtime| {
+                let result = runtime.block_on(future);
+                // An already-started blocking vault call cannot be aborted; do
+                // not make cancellation wait for its transport timeout.
+                runtime.shutdown_background();
+                result
+            }),
     };
     result.unwrap_or_else(unavailable)
 }

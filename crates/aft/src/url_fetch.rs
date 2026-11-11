@@ -830,6 +830,52 @@ pub struct SecretFetch {
     pub test_https_port: Option<u16>,
     /// The fetch call's id: audit records name it, plus the hop index.
     pub call_id: String,
+    /// The foreground call's cancellation and absolute reply deadline.
+    pub cancellation: SecretFetchCancellation,
+}
+
+#[derive(Clone, Default)]
+pub struct SecretFetchCancellation {
+    job: Option<crate::executor::JobCancellation>,
+    deadline: Option<Instant>,
+}
+impl SecretFetchCancellation {
+    pub(crate) fn for_current_call() -> Self {
+        Self {
+            job: crate::executor::current_job_cancellation(),
+            deadline: crate::subc::current_fetch_reply_deadline(),
+        }
+    }
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.cancel_requested_before_commit())
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+    pub(crate) fn expires_at_ms(&self) -> Option<u64> {
+        self.deadline.map(|deadline| {
+            now_ms().saturating_add(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64,
+            )
+        })
+    }
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let delay = self.deadline.map_or(Duration::from_millis(25), |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25))
+            });
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 /// Keys the vault released during one placeholder fetch. They are kept, wiped
@@ -991,6 +1037,9 @@ fn fetch_with_secrets(
     let mut held = HeldKeys::default();
     let mut hop = 0;
     let response = loop {
+        if secrets.cancellation.is_cancelled() {
+            return Err(secret_fetch_refused("missing_material", logical_url));
+        }
         validate_public_url(&current, &options, &deadline, &approved)?;
         let waiting = Instant::now();
         let outbound = secret_hop(&current, hop, secrets, &mut held)?;
@@ -1008,6 +1057,7 @@ fn fetch_with_secrets(
                 shown: current.as_str(),
                 held: &held,
                 released: outbound.is_some(),
+                cancellation: &secrets.cancellation,
             }),
             &deadline,
             &progress,
@@ -1470,6 +1520,7 @@ fn secret_hop(
         &eligible,
         &addressed,
         &target,
+        &secrets.cancellation,
     );
     for (label, answer) in eligible.iter().zip(answers) {
         let answer = match answer {
@@ -2035,6 +2086,7 @@ struct SecretSend<'a> {
     shown: &'a str,
     held: &'a HeldKeys,
     released: bool,
+    cancellation: &'a SecretFetchCancellation,
 }
 
 /// [`send_with_transient_retries`] for one request. With `secret` set, the
@@ -2088,6 +2140,9 @@ fn send_request_attempts(
             .timeout(remaining.min(HEADERS_TIMEOUT));
         if held.is_some() {
             request = request.header(ACCEPT_ENCODING, "identity");
+        }
+        if secret.is_some_and(|secret| secret.cancellation.is_cancelled()) {
+            return Err(secret_fetch_refused("missing_material", named));
         }
         let error = match request.send() {
             Ok(response) => return Ok(response),
@@ -4240,6 +4295,7 @@ mod secret_audit_regressions {
                 labels: vec!["test".into()],
                 test_https_port: None,
                 call_id: "audit-url".into(),
+                cancellation: Default::default(),
             };
             let mut held = HeldKeys::default();
             assert!(secret_hop(

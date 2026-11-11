@@ -7838,3 +7838,6 @@ fn standalone_approval_deadline_leaves_the_rerun_margin() {
         now
     );
 }
+#[cfg(unix)]
+#[path = "secret_fetch_cancellation_tests.rs"]
+mod secret_fetch_cancellation;

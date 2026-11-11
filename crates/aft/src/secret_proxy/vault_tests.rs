@@ -523,6 +523,7 @@ async fn live_vault_fetch_uses_the_concrete_target_and_holds_for_the_phone() {
                     labels: vec!["test".into()],
                     test_https_port: Some(port),
                     call_id: "fetch-live-vault".into(),
+                    cancellation: Default::default(),
                 };
                 let result =
                     crate::url_fetch::fetch_url_with_secrets(&url, &project, options, &secrets);
@@ -878,6 +879,7 @@ async fn a_fetch_and_proxy_request_share_one_once_card_then_raise_exactly_one_su
                 labels: vec!["test".into()],
                 test_https_port: Some(port),
                 call_id: "concurrent-fetch".into(),
+                cancellation: Default::default(),
             };
             crate::url_fetch::fetch_url_with_secrets(
                 &format!("https://localhost:{port}/approved/doc.md?key={MARKER}"),

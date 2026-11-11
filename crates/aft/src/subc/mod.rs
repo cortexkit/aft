@@ -245,8 +245,8 @@ pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;
 pub(crate) use secret_consent::{
-    current_call_scopes, current_secret_audit_scope, current_secret_consent_context,
-    use_current_secret_labels, LaunchDecision,
+    current_call_scopes, current_fetch_reply_deadline, current_secret_audit_scope,
+    current_secret_consent_context, use_current_secret_labels, LaunchDecision,
 };
 mod standalone;
 #[doc(hidden)]
@@ -10792,6 +10792,7 @@ impl PlainToolRun {
                 io_budget
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(reply_deadline);
             // Translation resolves tool paths before dispatch. Keep the agent's
             // spelling for messages about folders a walk could not read, without
             // changing the translated paths.
@@ -12295,8 +12296,10 @@ async fn handle_tool_call_with_capabilities(
         // reads them through `SecretScopeGuard`, so a background command keeps
         // them for its whole life.
         let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
+        let fetch_reply_deadline = reply_budget.deadline;
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(fetch_reply_deadline);
             let _deferred_wake_scope = completion_wake.install();
             let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes.clone());
             let _secret_identity =

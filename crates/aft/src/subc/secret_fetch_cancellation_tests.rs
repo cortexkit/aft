@@ -1,0 +1,357 @@
+//! Foreground executor cancellation must reach a real placeholder fetch.
+use super::*;
+use crate::secret::transport::fake::{FakeClaustrum, Record, NONCE};
+use crate::secret::{SecretVault, SubcSecretVault};
+use crate::url_fetch::UrlFetchOptions;
+use std::sync::atomic::AtomicUsize;
+
+static FINISHED: AtomicUsize = AtomicUsize::new(0);
+static NO_RUNTIME: AtomicBool = AtomicBool::new(false);
+static FETCH_ENV: std::sync::LazyLock<StdMutex<Option<(Arc<dyn SecretVault>, UrlFetchOptions)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    let (vault, options) = FETCH_ENV.lock().unwrap().clone().unwrap();
+    NO_RUNTIME.store(
+        tokio::runtime::Handle::try_current().is_err(),
+        Ordering::SeqCst,
+    );
+    let response =
+        crate::commands::url_resolution::with_secret_fetch_for_test(vault, options, || {
+            crate::commands::outline::handle_outline(&request, ctx)
+        });
+    FINISHED.fetch_add(1, Ordering::SeqCst);
+    response
+}
+
+#[derive(Default)]
+struct Phone {
+    requests: StdMutex<Vec<Value>>,
+    answers: StdMutex<HashMap<String, Value>>,
+    withdrawals: StdMutex<Vec<String>>,
+}
+impl ConsentTransport for Phone {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        match call.method {
+            "consent.request" => {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(call.params.clone());
+                let id = format!("el_{}", requests.len());
+                Box::pin(async move { Ok(json!({"elicitation_id": id})) })
+            }
+            "consent.withdraw" => {
+                self.withdrawals
+                    .lock()
+                    .unwrap()
+                    .push(call.params["elicitation_id"].as_str().unwrap().into());
+                Box::pin(async { Ok(json!({"state":"withdrawn"})) })
+            }
+            "consent.await" => {
+                let id = call.params["elicitation_id"].as_str().unwrap().to_owned();
+                let phone = PHONE.lock().unwrap().as_ref().unwrap().clone();
+                Box::pin(async move {
+                    loop {
+                        if let Some(answer) = phone.answers.lock().unwrap().get(&id).cloned() {
+                            return Ok(answer);
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+            }
+            other => panic!("unexpected consent method {other}"),
+        }
+    }
+}
+static PHONE: std::sync::LazyLock<StdMutex<Option<Arc<Phone>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+struct Restore;
+impl Drop for Restore {
+    fn drop(&mut self) {
+        crate::secret::consent::install_transport(None);
+        FETCH_ENV.lock().unwrap().take();
+        if let Some(phone) = PHONE.lock().unwrap().take() {
+            for index in 0..phone.requests.lock().unwrap().len() {
+                phone
+                    .answers
+                    .lock()
+                    .unwrap()
+                    .insert(format!("el_{}", index + 1), json!({"state":"expired"}));
+            }
+        }
+    }
+}
+
+async fn server() -> (
+    std::net::SocketAddr,
+    rustls::ClientConfig,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let key = rcgen::KeyPair::generate().unwrap();
+    let certificate = rcgen::CertificateParams::new(vec!["api.secret.test".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate.der().clone()).unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let seen = sends.clone();
+    let worker = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = tls.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
+            let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: 8\r\nConnection: close\r\n\r\n# Fetch\n").await;
+        }
+    });
+    (address, client, sends, worker)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_fetch_cancel_with_two_pending_labels_withdraws_both_and_a_late_allow_cannot_release_or_send(
+) {
+    held_foreground_fetch_late_allow(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_fetch_reply_deadline_with_two_pending_labels_withdraws_both_and_cannot_send_after_late_allow(
+) {
+    held_foreground_fetch_late_allow(true).await;
+}
+
+async fn held_foreground_fetch_late_allow(expire: bool) {
+    let _consent_lock = CONSENT_TEST_LOCK.lock().await;
+    let _secret_lock = crate::secret::consent::TEST_TRANSPORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = fixture(FakeCingulate::up());
+    let _restore = Restore;
+    let daemon = FakeClaustrum::start();
+    for label in ["first", "second"] {
+        daemon.state.lock().unwrap().records.push(Record {
+            name: label.into(),
+            host: "api.secret.test".into(),
+            path: "/v1".into(),
+            location: format!("query:{label}"),
+            key: format!("released-key-for-{label}-0000").into_bytes(),
+        });
+    }
+    let transport = crate::secret::transport::SubcSecretUseTransport::for_test(
+        daemon.path.clone(),
+        subc_protocol::BindIdentity::new("test", "session"),
+        Duration::from_secs(2),
+        subc_client_rs::ConsumerIdentity {
+            module_id: "aft".into(),
+            launch_nonce: NONCE.into(),
+        },
+    );
+    let phone = Arc::new(Phone::default());
+    *PHONE.lock().unwrap() = Some(phone.clone());
+    super::super::secret_consent::install_subc_transport(phone.clone());
+    let (address, tls, sends, server) = server().await;
+    *FETCH_ENV.lock().unwrap() = Some((
+        Arc::new(SubcSecretVault::new(Arc::new(transport))),
+        UrlFetchOptions {
+            tls_config: Some(tls),
+            public_host_overrides: vec![(
+                "api.secret.test".into(),
+                vec!["93.184.216.34".parse().unwrap()],
+            )],
+            connect_overrides: vec![("api.secret.test".into(), address)],
+            ..Default::default()
+        },
+    ));
+    let url = format!("https://api.secret.test:{}/v1/doc.md?first={{{{ck-secret:first}}}}&second={{{{ck-secret:second}}}}", address.port());
+    let reply_deadline_ms = crate::secret::vault::now_ms() + 2000;
+    if expire {
+        f.deadlines.lock().unwrap().insert(91, reply_deadline_ms);
+    }
+    let mut replies = f
+        .send_tool(&f.head, "outline", json!({"target":url}), 91, dispatch)
+        .await;
+    wait_for(|| phone.requests.lock().unwrap().len() == 2).await;
+    assert_eq!(
+        daemon.state.lock().unwrap().calls,
+        2,
+        "one initial approval-required ask per label"
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
+    if expire {
+        assert!(phone
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["expires_at_ms"].as_u64().unwrap() <= reply_deadline_ms));
+    } else {
+        assert!(cancel_active_tool_call(
+            &f.active,
+            &f.executor,
+            route_key(41, 1),
+            91,
+            "cancel foreground fetch"
+        )
+        .is_some());
+    }
+    wait_for(|| phone.withdrawals.lock().unwrap().len() == 2).await;
+    // Deliver both signed allows even after cancellation. Neither answer may
+    // revive the executor job, re-ask the vault, or dispatch its HTTP request.
+    let requests = phone.requests.lock().unwrap().clone();
+    for (index, request) in requests.iter().enumerate() {
+        let item = &request["secret_use"]["items"][0];
+        daemon
+            .state
+            .lock()
+            .unwrap()
+            .approve(item["statement_b64url"].as_str().unwrap());
+        phone.answers.lock().unwrap().insert(
+            format!("el_{}", index + 1),
+            json!({
+                "state":"answered", "answered_choice_id":"allow", "secret_use_answer": {
+                    "decision":"allow", "duration":"once", "envelope_sha256":"00".repeat(32),
+                    "items":[{"request_id":item["request_id"],"decision":"allow"}]
+                }
+            }),
+        );
+    }
+    wait_for(|| phone.withdrawals.lock().unwrap().len() == 2).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), replies.recv()).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        daemon.state.lock().unwrap().calls,
+        2,
+        "cancellation forbids even a releasing retry"
+    );
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        0,
+        "the late allow must not send an HTTP request"
+    );
+    server.abort();
+}
+
+#[derive(Default)]
+struct HeldVault {
+    entered: AtomicBool,
+    released: StdMutex<bool>,
+    wake: std::sync::Condvar,
+}
+impl HeldVault {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+impl SecretVault for HeldVault {
+    fn use_secret(
+        &self,
+        _: &crate::secret::SecretScope,
+        _: &str,
+        _: &crate::secret::ApiKeyTarget,
+    ) -> crate::secret::UseAnswer {
+        self.entered.store(true, Ordering::SeqCst);
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.wake.wait(released).unwrap();
+        }
+        crate::secret::UseAnswer::Unavailable
+    }
+    fn audit(
+        &self,
+        _: &secret_rules::audit::AuditRecordV1,
+    ) -> Result<(), crate::secret::AuditError> {
+        Ok(())
+    }
+    fn can_release_material(&self) -> bool {
+        false
+    }
+}
+struct ReleaseHeld(Arc<HeldVault>);
+impl Drop for ReleaseHeld {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_fetch_cancellation_does_not_wait_for_local_runtime_blocking_work_to_finish() {
+    let _consent_lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let _restore = Restore;
+    FINISHED.store(0, Ordering::SeqCst);
+    NO_RUNTIME.store(false, Ordering::SeqCst);
+    let vault = Arc::new(HeldVault::default());
+    let _release = ReleaseHeld(vault.clone());
+    *FETCH_ENV.lock().unwrap() = Some((
+        vault.clone(),
+        UrlFetchOptions {
+            public_host_overrides: vec![(
+                "api.secret.test".into(),
+                vec!["93.184.216.34".parse().unwrap()],
+            )],
+            ..Default::default()
+        },
+    ));
+    let _replies = f
+        .send_tool(
+            &f.head,
+            "outline",
+            json!({"target":"https://api.secret.test/v1/doc.md?first={{ck-secret:first}}"}),
+            92,
+            dispatch,
+        )
+        .await;
+    wait_for(|| vault.entered.load(Ordering::SeqCst)).await;
+    assert!(
+        NO_RUNTIME.load(Ordering::SeqCst),
+        "the foreground executor really uses the no-current-runtime branch"
+    );
+    assert!(cancel_active_tool_call(
+        &f.active,
+        &f.executor,
+        route_key(41, 1),
+        92,
+        "cancel blocked lookup"
+    )
+    .is_some());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while FINISHED.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runtime destruction must not wait for the vault transport's blocking timeout");
+    assert!(
+        !*vault.released.lock().unwrap(),
+        "the blocked lookup is still held when the caller finishes"
+    );
+    vault.release();
+}
