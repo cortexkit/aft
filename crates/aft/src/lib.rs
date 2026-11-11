@@ -144,6 +144,7 @@ pub mod launch_nonce;
 pub(crate) mod lifecycle_census;
 pub mod list_envelope;
 pub mod list_surfaces;
+pub mod live_db_files;
 pub mod local_embed;
 pub(crate) mod lock_diagnostics;
 pub mod log_ctx;

@@ -29,8 +29,6 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-use super::SqliteStore;
-
 /// Most recent hazards retained for inspection. Bounded because a process that
 /// keeps replacing databases under open connections would otherwise grow this
 /// without limit.
@@ -325,12 +323,12 @@ pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()
 /// The key is returned rather than recomputed at close time because the
 /// database file may be gone by then, and a path that no longer resolves would
 /// otherwise file the close under a different key than the open.
-pub(crate) fn note_open(path: &Path, store: SqliteStore) -> PathBuf {
+pub(crate) fn note_open(path: &Path, store: &'static str) -> PathBuf {
     let key = registry_key(path);
     let paths = database_files(&key);
     let identities = paths.each_ref().map(|path| LiveFileIdentity::of(path));
     let opener = Opener {
-        store: store.label(),
+        store,
         thread: thread_label(),
         identity: identities[0].map(|identity| identity.file),
     };
@@ -357,7 +355,7 @@ pub(crate) fn note_open(path: &Path, store: SqliteStore) -> PathBuf {
 }
 
 /// Record that a tracked connection opened under `key` has closed.
-pub(crate) fn note_close(key: &Path, store: SqliteStore) {
+pub(crate) fn note_close(key: &Path, store: &'static str) {
     let mut databases = open_databases()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -367,7 +365,7 @@ pub(crate) fn note_close(key: &Path, store: SqliteStore) {
     if let Some(index) = entry
         .openers
         .iter()
-        .rposition(|opener| opener.store == store.label())
+        .rposition(|opener| opener.store == store)
     {
         entry.openers.remove(index);
     }
@@ -682,7 +680,7 @@ pub(crate) mod stat_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::TrackedConnection;
+    use crate::db::{SqliteStore, TrackedConnection};
     // Only the POSIX-only tests below open raw connections.
     #[cfg(unix)]
     use rusqlite::Connection;
@@ -701,7 +699,7 @@ mod tests {
             // device/inode protection, including possible reuse false positives.
             return;
         };
-        let key = note_open(&database, SqliteStore::AftDb);
+        let key = note_open(&database, SqliteStore::AftDb.label());
         // Model an unlinked sidecar's recycled inode without relying on the
         // filesystem allocator to reuse a particular inode during the test.
         let old = LiveFileIdentity {
@@ -713,7 +711,7 @@ mod tests {
             retain_identities(databases.get_mut(&key).unwrap(), [old]);
         }
         let result = crate::cache_freshness::collect(&source);
-        note_close(&key, SqliteStore::AftDb);
+        note_close(&key, SqliteStore::AftDb.label());
         assert!(
             result.is_ok(),
             "recycled sidecar inode denied source: {result:?}"
@@ -726,7 +724,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let database = root.join("unconventional.cache");
         std::fs::write(&database, "database").unwrap();
-        let key = note_open(&database, SqliteStore::AftDb);
+        let key = note_open(&database, SqliteStore::AftDb.label());
         let sidecars = &database_files(&key)[1..];
         for path in sidecars {
             assert!(!path.exists());
@@ -752,7 +750,7 @@ mod tests {
             );
         }
         assert!(probe.paths().is_empty());
-        note_close(&key, SqliteStore::AftDb);
+        note_close(&key, SqliteStore::AftDb.label());
         for path in database_files(&key) {
             assert!(!is_registered_file_path(&path));
         }
@@ -766,14 +764,14 @@ mod tests {
         let sidecar = dir.path().join("registered.cache-shm");
         std::fs::write(&database, "database").unwrap();
         std::fs::write(&sidecar, "sidecar").unwrap();
-        let key = note_open(&database, SqliteStore::AftDb);
-        note_open(&database, SqliteStore::BlobStore);
+        let key = note_open(&database, SqliteStore::AftDb.label());
+        note_open(&database, SqliteStore::BlobStore.label());
         let alias = dir.path().join("innocent.rs");
         std::fs::rename(&sidecar, &alias).unwrap();
         assert!(is_live_sqlite_file(&alias));
-        note_close(&key, SqliteStore::AftDb);
+        note_close(&key, SqliteStore::AftDb.label());
         assert!(is_live_sqlite_file(&alias));
-        note_close(&key, SqliteStore::BlobStore);
+        note_close(&key, SqliteStore::BlobStore.label());
         assert!(!is_live_sqlite_file(&alias));
     }
 
@@ -787,11 +785,11 @@ mod tests {
         std::fs::write(&first, "database").unwrap();
         std::fs::hard_link(&first, &second).unwrap();
         std::fs::hard_link(&first, &alias).unwrap();
-        let first_key = note_open(&first, SqliteStore::AftDb);
-        let second_key = note_open(&second, SqliteStore::BlobStore);
-        note_close(&first_key, SqliteStore::AftDb);
+        let first_key = note_open(&first, SqliteStore::AftDb.label());
+        let second_key = note_open(&second, SqliteStore::BlobStore.label());
+        note_close(&first_key, SqliteStore::AftDb.label());
         assert!(is_live_sqlite_file(&alias));
-        note_close(&second_key, SqliteStore::BlobStore);
+        note_close(&second_key, SqliteStore::BlobStore.label());
         assert!(!is_live_sqlite_file(&alias));
     }
 
