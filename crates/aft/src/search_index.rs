@@ -286,6 +286,7 @@ impl SearchIndexSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_file_in_scope(&self, search_root: &Path) -> bool {
         let search_root = canonicalize_for_search_membership(search_root);
         self.files.iter().any(|file| {
@@ -3955,10 +3956,6 @@ pub(crate) fn resolve_search_scope(project_root: &Path, path: Option<&str>) -> S
 
 pub(crate) fn is_binary_bytes(content: &[u8]) -> bool {
     content_inspector::inspect(content).is_binary()
-}
-
-pub(crate) fn current_git_head(root: &Path) -> Option<String> {
-    run_git(root, &["rev-parse", "HEAD"])
 }
 
 /// `storage_dir` is the root for rebuildable cache artifacts (see

@@ -7817,22 +7817,6 @@ impl SemanticIndex {
         })
     }
 
-    /// The modification time, and the size when one was recorded, of exactly
-    /// `path` when its vectors were embedded, or `None` when the index holds no
-    /// vectors for that spelling of the path.
-    ///
-    /// Unlike [`Self::recorded_file_freshness`] this never canonicalizes a
-    /// missing path, so a caller can probe every file of a directory walk (whose
-    /// paths already use the index's own spelling of the root) without one extra
-    /// filesystem call per file the index does not cover.
-    pub(crate) fn recorded_stat(&self, path: &Path) -> Option<(SystemTime, Option<u64>)> {
-        let mtime = *self.metadata_value(path, &self.file_mtimes, |base| &base.file_mtimes)?;
-        let size = self
-            .metadata_value(path, &self.file_sizes, |base| &base.file_sizes)
-            .copied();
-        Some((mtime, size))
-    }
-
     /// Keep only the files whose vectors are out of date: those whose content on
     /// disk no longer matches what this index embedded, plus deleted files and
     /// files the index has no record of. See [`indexed_file_content_unchanged`]
