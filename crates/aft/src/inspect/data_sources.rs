@@ -353,7 +353,7 @@ fn stored_todos_now(
                 seen.push(checkout_root.clone());
                 first
             });
-            if let Some(session) = crate::data_layer::parent_session::session_for_root(&root) {
+            if let Some(session) = crate::parent_search::session_for_root(&root) {
                 // Until the folder's repositories are found, which of them
                 // lack a checkout is not known.
                 if session.discovery().is_none() {

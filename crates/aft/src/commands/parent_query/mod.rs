@@ -5,8 +5,8 @@ pub(crate) mod inspect;
 
 use crate::commands::callgraph_store_adapter as adapter;
 use crate::context::AppContext;
-use crate::data_layer::parent_session::query::{discovered, Gaps};
-use crate::data_layer::parent_session::{display_relative, Child, ParentSession, Plane};
+use crate::parent_search::query::{discovered, Gaps};
+use crate::parent_search::{display_relative, Child, ParentSession, Plane};
 use crate::protocol::{RawRequest, Response};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ pub fn route(req: &RawRequest, ctx: &AppContext) -> Option<Response> {
     if !ROUTED_COMMANDS.contains(&req.command.as_str()) {
         return None;
     }
-    let session = crate::data_layer::parent_session::session_for(ctx)?;
+    let session = crate::parent_search::session_for(ctx)?;
     Some(match req.command.as_str() {
         "semantic_search" => engine::search(req, ctx, &session),
         "inspect" => inspect(req, ctx, &session),

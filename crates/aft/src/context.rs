@@ -3035,7 +3035,7 @@ pub struct AppContext {
     /// each answered from its own checkout in the data layer, by root (see
     /// `commands::data_search::ExternalSearch`). Released when idle.
     data_external: parking_lot::Mutex<
-        std::collections::HashMap<PathBuf, Arc<crate::data_layer::external_search::ExternalSearch>>,
+        std::collections::HashMap<PathBuf, Arc<crate::parent_search::external::ExternalSearch>>,
     >,
     callgraph_executor: parking_lot::Mutex<Option<crate::executor::RootMaintenanceExecutor>>,
     /// Checkout view load failures of this project (see [`ViewLoadHealth`]).
@@ -6772,7 +6772,7 @@ impl AppContext {
         // A parent folder of repositories builds nothing of its own: each
         // child repository has a checkout of its own instead, which this
         // context keeps only while it is bound to that parent folder.
-        let parent = crate::data_layer::parent_session::session_for(self);
+        let parent = crate::parent_search::session_for(self);
         self.data_children
             .keep_only(parent.as_ref().map(|session| session.root()));
         if parent.is_some() {
@@ -6837,8 +6837,8 @@ impl AppContext {
     pub(crate) fn external_data_search(
         &self,
         root: &Path,
-        bind: impl FnOnce() -> Option<crate::data_layer::external_search::ExternalSearch>,
-    ) -> Option<Arc<crate::data_layer::external_search::ExternalSearch>> {
+        bind: impl FnOnce() -> Option<crate::parent_search::external::ExternalSearch>,
+    ) -> Option<Arc<crate::parent_search::external::ExternalSearch>> {
         let mut external = self.data_external.lock();
         if let Some(search) = external.get(root) {
             return Some(Arc::clone(search));
@@ -6943,7 +6943,7 @@ impl AppContext {
     /// admitted for it.
     pub(crate) fn data_layer_serves_meaning(&self) -> bool {
         self.data_layer_withheld().is_none()
-            && crate::data_layer::parent_session::session_for(self).is_none()
+            && crate::parent_search::session_for(self).is_none()
             && self.data_meaning_config().is_some()
     }
 

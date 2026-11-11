@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(crate) use crate::data_layer::external_search::ExternalSearch;
+pub(crate) use crate::parent_search::external::ExternalSearch;
 pub(crate) use crate::data_layer::meaning_query as meaning;
 
 pub(crate) use meaning::{DataMeaning, DataSemantic};

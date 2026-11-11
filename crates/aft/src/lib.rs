@@ -162,6 +162,7 @@ pub mod ort_pin;
 pub(crate) mod os_metadata;
 pub(crate) mod page_collect;
 pub mod parser;
+pub mod parent_search;
 pub mod patch;
 pub mod path_identity;
 pub mod pattern_compile;

@@ -2918,7 +2918,7 @@ fn handle_configure_inner(
     }
     // A context that binds another root stops holding the parent folder
     // session it held before; a session no context holds stops.
-    crate::data_layer::parent_session::release_context_except(ctx, &canonical_cache_root);
+    crate::parent_search::release_context_except(ctx, &canonical_cache_root);
     // With views on, a plain folder of repositories is a parent folder: it is
     // served from its child repositories' own indexes and, like HOME, builds
     // none of its own. The index types the user enabled are passed to the
@@ -2926,9 +2926,9 @@ fn handle_configure_inner(
     // The decision is a probe bounded by a short wall-clock budget; the full
     // walk for every child runs on the parent session's worker.
     let parent_folder = !root_too_broad
-        && crate::data_layer::parent_session::prepare(
+        && crate::parent_search::prepare(
             &canonical_cache_root,
-            crate::data_layer::parent_session::RequestedPlanes {
+            crate::parent_search::RequestedPlanes {
                 trigram: next_config.indexes.trigram,
                 semantic: next_config.indexes.semantic,
                 callgraph: next_config.indexes.callgraph,
@@ -2966,7 +2966,7 @@ fn handle_configure_inner(
     if ctx.configure_generation() > 0
         && !root_too_broad
         && (!parent_folder
-            || crate::data_layer::parent_session::held_by(ctx, &canonical_cache_root))
+            || crate::parent_search::held_by(ctx, &canonical_cache_root))
         && !ctx.database_runtime_failed()
         && !ctx.artifact_identity_provisional()
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
@@ -3355,14 +3355,14 @@ fn handle_configure_inner(
     ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
     if root_too_broad {
         ctx.stop_watcher_runtime();
-        crate::data_layer::parent_session::deactivate(&canonical_cache_root);
+        crate::parent_search::deactivate(&canonical_cache_root);
     }
     // Past the commit seal: start (or join) the parent session now, so the
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
     if cache_available && !root_too_broad && !identity_provisional {
-        crate::data_layer::parent_session::activate(
+        crate::parent_search::activate(
             ctx,
             &canonical_cache_root,
             &storage_root,
@@ -8301,7 +8301,7 @@ mod tests {
                 "broad root must bind no checkout"
             );
             assert!(true);
-            assert!(crate::data_layer::parent_session::session_for_root(root).is_none());
+            assert!(crate::parent_search::session_for_root(root).is_none());
             assert!(!ctx.watcher_runtime_active());
         };
         assert_no_workers();

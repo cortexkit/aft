@@ -19,9 +19,9 @@ use serde_json::{json, Value};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
-use crate::data_layer::parent_session::engine::ChildEngine;
-use crate::data_layer::parent_session::query::{attach_gaps, Gaps};
-use crate::data_layer::parent_session::{display_relative, lock, read, Child, ParentSession};
+use crate::parent_search::engine::ChildEngine;
+use crate::parent_search::query::{attach_gaps, Gaps};
+use crate::parent_search::{display_relative, lock, read, Child, ParentSession};
 
 // ---------------------------------------------------------------------------
 // The parent's aft_search
@@ -183,7 +183,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     };
 
     let mut gaps = Gaps::default();
-    if !crate::data_layer::parent_session::query::discovered(session, &mut gaps) {
+    if !crate::parent_search::query::discovered(session, &mut gaps) {
         let mut body = json!({
             "status": "building",
             "complete": false,

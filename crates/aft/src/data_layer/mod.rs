@@ -22,7 +22,6 @@ pub mod old_index;
 pub(crate) mod outline;
 pub(crate) mod overlay;
 pub(crate) mod parent;
-pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;
 pub(crate) mod query;
@@ -41,7 +40,6 @@ pub mod trace_measure;
 pub mod vectors;
 
 pub(crate) mod bound_checkouts;
-pub(crate) mod external_search;
 pub(crate) mod meaning_query;
 pub(crate) mod text_scope;
 
