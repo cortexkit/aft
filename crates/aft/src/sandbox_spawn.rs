@@ -1667,7 +1667,7 @@ fn resolve_sandbox_spawn_with_mode(
                     return setup_refusal(error);
                 }
             };
-            let launcher_path = match native_launcher_path(ctx) {
+            let launcher_path = match native_launcher_path(ctx, task_bundle_dir) {
                 Ok(path) => path,
                 Err(error) => {
                     let _ = cleanup_task_temp_dir(&profile.temp_dir);
@@ -5701,7 +5701,7 @@ fn observation_key(project_root: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
+fn native_launcher_path(ctx: &AppContext, _task_bundle_dir: &Path) -> std::io::Result<PathBuf> {
     #[cfg(any(test, feature = "test-hooks"))]
     if let Some(launchers) = TEST_LAUNCHERS.get() {
         if let Some(root) = ctx.config().project_root.as_deref() {
@@ -5710,6 +5710,13 @@ fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
                 .expect("sandbox launcher test mutex poisoned")
                 .get(&observation_key(root))
             {
+                if std::env::var("AFT_TEST_LINK_FIXTURE_LAUNCHER").as_deref() == Ok("1") {
+                    let retained = _task_bundle_dir.join("fixture-launcher");
+                    std::fs::create_dir_all(&retained)?;
+                    let task_image = retained.join("aft");
+                    std::fs::hard_link(path, &task_image)?;
+                    return Ok(task_image);
+                }
                 return Ok(path.clone());
             }
         }

@@ -76,7 +76,7 @@ jobs:
         run: |
           unset AFT_STORAGE_DIR
           export AFT_TEST_BASH_PHASE_TRACE=1
-          export NEXTEST_RUN_ID="classic-image-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export AFT_TEST_PREWARM_FIXTURE_IMAGE=1
           python3 - <<'PY'
           import json, os, pathlib, shutil, subprocess, tempfile, threading, time
 
@@ -153,9 +153,19 @@ jobs:
               "--exact", "--nocapture"]
           paths = set()
           images = set()
+          signed_image = None
           failures = 0
           for iteration in range(1, 4):
-              print(f"=== classic probe {iteration}/3 ===", flush=True)
+              if iteration == 1:
+                  os.environ.pop("AFT_TEST_LINK_FIXTURE_LAUNCHER", None)
+                  model = "warmed_stable_fixture_path"
+              else:
+                  os.environ["AFT_TEST_LINK_FIXTURE_LAUNCHER"] = "1"
+                  model = "warmed_fixture_with_task_hard_link"
+              if iteration == 3 and signed_image:
+                  os.environ["AFT_TEST_AFT_BINARY"] = str(signed_image)
+                  model = "explicit_identifier_signed_fixture_with_task_hard_link"
+              print(f"=== classic probe {iteration}/3 model={model} ===", flush=True)
               start = time.perf_counter()
               try:
                   result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
@@ -170,29 +180,49 @@ jobs:
                   if iteration == 1:
                       security_log()
                       for image in sorted(images):
-                          time_image(image, "exact_fixture_first_uncapped_after_timeout", ["sandbox-launch", "--support"], sample=True)
+                          time_image(image, "exact_fixture_first_direct_after_test", ["sandbox-launch", "--support"])
                           time_image(image, "exact_fixture_warm", ["sandbox-launch", "--support"])
                           describe_image(image, "exact_fixture")
                           root = target.parent.parent / "scratch"
                           root.mkdir(exist_ok=True)
                           with tempfile.TemporaryDirectory(prefix="classic-image-", dir=root) as temporary:
-                              copied = pathlib.Path(temporary) / "fresh-copy-aft"
+                              copied = pathlib.Path(temporary) / "fresh-copy" / "aft"
+                              copied.parent.mkdir()
                               shutil.copyfile(image, copied)
                               copied.chmod(0o500)
-                              time_image(copied, "fresh_copy_first", ["sandbox-launch", "--support"], sample=True)
+                              time_image(copied, "fresh_copy_first_unsampled", ["sandbox-launch", "--support"])
                               time_image(copied, "fresh_copy_warm", ["sandbox-launch", "--support"])
                               describe_image(copied, "fresh_copy")
-                              linked = pathlib.Path(temporary) / "fresh-link-aft"
+                              linked = pathlib.Path(temporary) / "fresh-link" / "aft"
+                              linked.parent.mkdir()
                               try:
                                   os.link(image, linked)
                               except OSError as error:
                                   print(f"AFT_IMAGE_LINK skipped={error}", flush=True)
                               else:
                                   image_metadata(image, "exact_fixture_after_link")
-                                  time_image(linked, "hard_link_first_path", ["sandbox-launch", "--support"], sample=True)
+                                  time_image(linked, "hard_link_first_path_unsampled", ["sandbox-launch", "--support"])
                                   time_image(linked, "hard_link_warm_path", ["sandbox-launch", "--support"])
                                   describe_image(linked, "hard_link")
-                      print("assessment_control: subsequent test processes reuse the same fixture image via NEXTEST_RUN_ID; no timeout or assertion changes", flush=True)
+                          signed_image = pathlib.Path(os.environ["XDG_CACHE_HOME"]) / "explicit-signed-image" / "aft"
+                          signed_image.parent.mkdir(exist_ok=True)
+                          shutil.copyfile(image, signed_image)
+                          signed_image.chmod(0o700)
+                          result = subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--identifier", "ck-aft", str(signed_image)],
+                              capture_output=True, text=True, timeout=30)
+                          print("AFT_RESIGN " + json.dumps(dict(exit=result.returncode, stdout=result.stdout, stderr=result.stderr)), flush=True)
+                          result.check_returncode()
+                          signed_image.chmod(0o500)
+                          time_image(signed_image, "explicit_id_first_unsampled", ["sandbox-launch", "--support"])
+                          time_image(signed_image, "explicit_id_warm", ["sandbox-launch", "--support"])
+                          describe_image(signed_image, "explicit_identifier_signed")
+                          for link_number in range(1, 4):
+                              linked = signed_image.parent / f"link-{link_number}" / "aft"
+                              linked.parent.mkdir()
+                              os.link(signed_image, linked)
+                              time_image(linked, f"explicit_id_new_link_{link_number}_first_unsampled", ["sandbox-launch", "--support"])
+                              time_image(linked, f"explicit_id_new_link_{link_number}_warm", ["sandbox-launch", "--support"])
+                      print("assessment_control: each fixture warms one stable image before its first request; calls retain the original 1s timeout and assertion", flush=True)
               except subprocess.TimeoutExpired as error:
                   print(error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout, flush=True)
                   print(f"probe_result iteration={iteration} outer_timeout=90s", flush=True)

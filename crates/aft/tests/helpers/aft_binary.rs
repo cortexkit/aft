@@ -25,8 +25,68 @@ pub fn source_binary() -> PathBuf {
 /// a large debug image from the build server's target mount for every child.
 #[cfg(unix)]
 pub fn aft_binary() -> PathBuf {
-    deploy(&source_binary(), &std::env::temp_dir())
-        .unwrap_or_else(|error| panic!("cannot deploy real AFT fixture image: {error}"))
+    let image = deploy(&source_binary(), &std::env::temp_dir())
+        .unwrap_or_else(|error| panic!("cannot deploy real AFT fixture image: {error}"));
+    #[cfg(target_os = "macos")]
+    if std::env::var("AFT_TEST_PREWARM_FIXTURE_IMAGE").as_deref() == Ok("1") {
+        warm_fixture_image(&image)
+            .unwrap_or_else(|error| panic!("cannot warm real AFT fixture image: {error}"));
+    }
+    image
+}
+
+#[cfg(target_os = "macos")]
+fn warm_fixture_image(image: &Path) -> io::Result<()> {
+    use std::collections::HashSet;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static WARMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let mut warmed = WARMED.get_or_init(Default::default).lock().unwrap();
+    if warmed.contains(image) {
+        return Ok(());
+    }
+    #[cfg(feature = "test-hooks")]
+    aft::bash_background::trace_phase_for_test("fixture_image_warm_begin", image.display());
+    let start = Instant::now();
+    let mut child = Command::new(image)
+        .env_clear()
+        .args(["gh-shim", "--shim-version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    loop {
+        match child.try_wait()? {
+            Some(status) if status.success() => break,
+            Some(status) => {
+                return Err(io::Error::other(format!("fixture warmup exited {status}")))
+            }
+            None if start.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                // SAFETY: the warmup child was placed in its own process group.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                return Err(io::Error::other("fixture image warmup exceeded 30s"));
+            }
+        }
+    }
+    #[cfg(feature = "test-hooks")]
+    aft::bash_background::trace_phase_for_test(
+        "fixture_image_warm_end",
+        format_args!(
+            "path={} elapsed_ms={}",
+            image.display(),
+            start.elapsed().as_millis()
+        ),
+    );
+    warmed.insert(image.to_path_buf());
+    Ok(())
 }
 
 // Windows holds the running .exe open and does not copy or link it into storage.
