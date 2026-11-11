@@ -1457,7 +1457,7 @@ fn push_external_path(
         // Folder eligibility is identical for read and write approvals.
         operation: AccessOperation::Read,
     };
-    let scope = crate::subc::directory_scope(&grant);
+    let scope = crate::access_policy::directory_scope(&grant);
     let pattern = match scope.kind {
         GrantKind::File => display_path(&scope.path),
         GrantKind::Subtree => format!("{}/*", display_path(&scope.path)),
