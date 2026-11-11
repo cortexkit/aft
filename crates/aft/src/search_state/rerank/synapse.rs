@@ -7,9 +7,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use crate::commands::semantic_search::rerank::{
-    RerankBackend, RerankDoc, RerankError, RerankFingerprint,
-};
+use super::{RerankBackend, RerankDoc, RerankError, RerankFingerprint};
 use crate::config::SemanticBackendConfig;
 use crate::synapse_embed::{SynapseEmbeddingError, SynapseRerankTransport};
 
@@ -318,7 +316,8 @@ pub(crate) mod tests {
                 key: key.clone(),
                 daemon_id,
                 pid: std::process::id(),
-                // The SDK requires daemon 0.39+ for project-free management opens.
+        // The SDK requires daemon 0.39+ to open a management route without
+        // specifying a project.
                 daemon_ver: "0.39.0".into(),
             },
         )
