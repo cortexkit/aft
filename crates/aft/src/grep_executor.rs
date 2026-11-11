@@ -3009,21 +3009,21 @@ mod tests {
     /// The grep measurement on a data-layer context, checking that the data
     /// layer answered: a walk of the fixture reports `Fallback`.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn measured_data_layer_grep(ctx: &impl IndexHost) -> (Duration, usize, usize) {
+    fn measured_data_layer_grep(ctx: &AppContext) -> (Duration, usize, usize) {
         let budget = crate::bounded_io::Budget::after(Duration::from_secs(60));
         let (measurement, index_status) = measured_grep_with_status(ctx, budget);
         assert_eq!(index_status, "Ready", "the data layer did not answer");
         measurement
     }
 
-    fn measured_grep(ctx: &impl IndexHost) -> (Duration, usize, usize) {
+    fn measured_grep(ctx: &AppContext) -> (Duration, usize, usize) {
         let budget = crate::bounded_io::Budget::after(Duration::from_secs(60));
         measured_grep_with_status(ctx, budget).0
     }
 
     /// The measurement and the reply's `index_status`.
     fn measured_grep_with_status(
-        ctx: &impl IndexHost,
+        ctx: &AppContext,
         budget: crate::bounded_io::Budget,
     ) -> ((Duration, usize, usize), serde_json::Value) {
         let request = crate::protocol::RawRequest {

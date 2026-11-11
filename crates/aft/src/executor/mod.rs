@@ -1159,7 +1159,7 @@ pub struct Executor {
 /// A root may submit maintenance without keeping its owning executor alive.
 /// The weak link avoids a cycle through the executor's actor context.
 #[derive(Clone)]
-pub(crate) struct RootMaintenanceExecutor {
+pub struct RootMaintenanceExecutor {
     inner: std::sync::Weak<ExecutorInner>,
     root_id: ProjectRootId,
 }

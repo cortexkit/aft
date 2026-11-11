@@ -759,7 +759,7 @@ pub fn separator() -> char {
         let sources = fixture(&root);
         let (ctx, _storage) = published_then_restarted(&root);
         let cache = ctx.symbol_cache();
-        root_bound(&ctx);
+        root_bound(&ctx, ctx.subc_lifecycle_admission());
         let deadline = Instant::now() + Duration::from_secs(60);
         while cache.read().unwrap().len() < sources.len() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -770,7 +770,7 @@ pub fn separator() -> char {
 
         // A reset (a reconfigure, an idle eviction) is filled again.
         cache.write().unwrap().reset();
-        root_bound(&ctx);
+        root_bound(&ctx, ctx.subc_lifecycle_admission());
         let deadline = Instant::now() + Duration::from_secs(60);
         while cache.read().unwrap().len() < sources.len() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));

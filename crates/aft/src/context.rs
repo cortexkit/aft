@@ -238,7 +238,7 @@ use crate::data_layer::ignore_rules as gitignore_state;
 #[path = "context_index_host.rs"]
 mod index_host;
 pub(crate) use gitignore_state::IgnoreRuleChange;
-pub use index_host::SearchReadPolicy;
+
 // The shared ignore-rule definition every project walker applies; see
 // `apply_project_ignore_rules`.
 pub(crate) use gitignore_state::apply_project_ignore_rules;

@@ -8312,7 +8312,7 @@ mod tests {
         }
         for plane in crate::feature_status::IndexPlane::ALL {
             let observation =
-                crate::feature_status::observed_index_status(&ctx, &ctx, plane).consumer_json();
+                crate::feature_status::observed_index_status(&*ctx, &*ctx, plane).consumer_json();
             assert_eq!(observation["status"], "off");
             assert_eq!(observation["reason"], "root_too_broad");
         }

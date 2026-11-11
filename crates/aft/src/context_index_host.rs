@@ -96,13 +96,13 @@ impl ReadPolicy for AppContext {
     }
 }
 
-pub struct SearchReadPolicy<'a> {
+pub(crate) struct SearchReadPolicy<'a> {
     context: &'a AppContext,
     tool: WorkerSearchTool,
 }
 
 impl AppContext {
-    pub fn search_read_policy(&self, tool: WorkerSearchTool) -> SearchReadPolicy<'_> {
+    pub(crate) fn search_read_policy(&self, tool: WorkerSearchTool) -> SearchReadPolicy<'_> {
         SearchReadPolicy {
             context: self,
             tool,

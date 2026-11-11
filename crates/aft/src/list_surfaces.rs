@@ -359,6 +359,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "parent_search/mod.rs",
+        enclosing_item: "discover,walk,note_outside,DEFAULT_MAX_CHILD_REPOS,MAX_DISCOVERY_DEPTH,MAX_DISCOVERY_ENTRIES,MAX_OUTSIDE_PATHS",
+        location_or_primitive: "bounded parent repository discovery and split_off(cap)",
+        reason: "Parent discovery bounds filesystem work and the served child set. Repositories past the child cap remain in Discovery.skipped and queries disclose them as parent_children_over_cap gaps; outside paths are bounded discovery diagnostics, not a paged result list.",
+    },
+    ExclusionEntry {
         file: "commands/data_search.rs",
         enclosing_item: "lexical_rank_at_depth",
         location_or_primitive: ".take(depth), truncate(depth)",
