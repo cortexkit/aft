@@ -501,24 +501,31 @@ impl PreparedReplay {
             retry.attempts = retry.attempts.saturating_add(1);
         }
         let Some(hooks) = crate::runtime_drain::configure::command_hooks() else {
-            return crate::protocol::Response::error(id, crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION);
+            return crate::protocol::Response::error(
+                id,
+                "internal_error",
+                crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION,
+            );
         };
         let run = || match retry.kind {
-            RetryKind::Identity => {
-                match hooks.identity_retry {
-                    Some(replay) => replay(&retry.request, ctx),
-                    None => crate::protocol::Response::error(self.request_id(), crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION),
-                }
-            }
+            RetryKind::Identity => (hooks
+                .identity_retry
+                .expect("command_hooks requires the identity callback"))(
+                &retry.request, ctx
+            ),
             RetryKind::CacheCoordination => {
                 // Cache recovery must preserve the running configuration,
                 // including edits deferred until the next real connect.
                 let mut prepared = (*ctx.config()).clone();
                 crate::cache_location::prepare_cache_root(&mut prepared);
-                match hooks.cache_retry {
-                    Some(replay) => replay(&retry.request, retry.connect_generation, ctx, &prepared),
-                    None => crate::protocol::Response::error(self.request_id(), crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION),
-                }
+                (hooks
+                    .cache_retry
+                    .expect("command_hooks requires the cache callback"))(
+                    &retry.request,
+                    retry.connect_generation,
+                    ctx,
+                    &prepared,
+                )
             }
         };
         let response = match retry.prepared_bind.as_ref() {
