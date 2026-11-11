@@ -55,7 +55,7 @@ fn tokens(node: tree_sitter::Node<'_>, bytes: &[u8], deadline: Instant) -> Optio
             "token_tree" | "token_tree_pattern" => {
                 result.push(Token::Group(tokens(child, bytes, deadline)?))
             }
-            "token_binding" => result.extend(tokens(child, bytes, deadline)?),
+            "token_binding_pattern" => result.extend(tokens(child, bytes, deadline)?),
             _ => result.push(Token::Text(text.into())),
         }
     }
@@ -556,4 +556,34 @@ fn string_literal(text: &str, deadline: Instant) -> Option<String> {
         });
     }
     Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_macro_matcher_binds_its_metavariable() {
+        let bytes = br#"macro_rules! fixture { ($fixture:literal) => { include_str!(concat!("data/", $fixture)) }; }"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(bytes, None).unwrap();
+        let definition = tree.root_node().named_child(0).unwrap();
+        let mut cursor = definition.walk();
+        let rule = definition
+            .named_children(&mut cursor)
+            .find(|node| node.kind() == "macro_rule")
+            .unwrap();
+        let left = rule.child_by_field_name("left").unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let tokens = tokens(left, bytes, deadline).unwrap();
+        assert_eq!(
+            parameters(&tokens, deadline),
+            Some(vec!["$fixture".into()]),
+            "{}: {tokens:?}",
+            left.to_sexp()
+        );
+    }
 }
