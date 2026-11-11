@@ -5262,7 +5262,7 @@ fn data_layer_handoff_runs_while_reads_wait_for_it() {
                         "data-layer-build",
                         Lane::MaintenanceCommit,
                         JobCancellation::new(),
-                        Box::new(move |_| {
+                        Box::new(move || {
                             let _ = ran_tx.send(current_job_cancellation().is_some());
                             ok("data-layer-build")
                         }),
@@ -5297,7 +5297,7 @@ fn data_layer_handoff_runs_while_reads_wait_for_it() {
         "data-layer-build",
         Lane::MaintenanceCommit,
         JobCancellation::new(),
-        Box::new(move |_| {
+        Box::new(move || {
             let _ = ran_tx.send(());
             ok("data-layer-build")
         }),
