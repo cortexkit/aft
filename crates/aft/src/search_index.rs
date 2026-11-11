@@ -1458,6 +1458,20 @@ impl GrepBlocks {
                 self.yielded = true;
                 return Ok(Some((self.line_base, &self.pending[..self.end])));
             }
+            if self.pending.len() > Self::BLOCK_BYTES {
+                // A single line already needs more than a block. Finish the
+                // file with reader.rest, reserving its remaining byte count
+                // once instead of repeatedly growing the carry. Ordinary
+                // lines still stream.
+                self.scratch = Vec::new();
+                self.pending = self
+                    .reader
+                    .as_mut()
+                    .unwrap()
+                    .rest(std::mem::take(&mut self.pending))?;
+                self.reader = None;
+                self.eof = true;
+            }
         }
     }
 }
@@ -3224,6 +3238,20 @@ mod grep_block_tests {
         ] {
             assert!(!compiled(expression).can_stream_lines(), "{expression}");
         }
+    }
+
+    #[test]
+    fn grep_overlong_line_switches_to_one_whole_remainder_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.json");
+        let mut content = vec![b'x'; GrepBlocks::BLOCK_BYTES + (1 << 20)];
+        content.extend_from_slice(b"needle\nlast line");
+        std::fs::write(&path, &content).unwrap();
+        let mut blocks = GrepBlocks::open(&path, None, false, true).unwrap();
+        assert_eq!(blocks.next().unwrap().unwrap(), (0, content.as_slice()));
+        assert!(blocks.reader.is_none());
+        assert_eq!(blocks.scratch.capacity(), 0);
+        assert!(blocks.next().unwrap().is_none());
     }
 }
 

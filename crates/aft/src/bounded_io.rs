@@ -1906,10 +1906,13 @@ impl Reader {
             .take()
             .ok_or_else(|| io::Error::other("file read already failed"))?;
         let read = move || {
-            let size = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
-            bytes
-                .try_reserve(size.saturating_sub(bytes.len()))
-                .map_err(io::Error::other)?;
+            use std::io::Seek;
+            let remaining = file
+                .metadata()?
+                .len()
+                .saturating_sub(file.stream_position()?);
+            let size = usize::try_from(remaining).map_err(io::Error::other)?;
+            bytes.try_reserve_exact(size).map_err(io::Error::other)?;
             let before = bytes.len();
             file.read_to_end(&mut bytes)?;
             crate::io_accounting::WORK.content_read_bytes.fetch_add(
