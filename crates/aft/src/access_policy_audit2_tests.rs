@@ -61,7 +61,7 @@ fn request(command: &str, params: Value) -> RawRequest {
 
 fn assert_temp_delete_denial(f: &Fixture, path: &Path, recursive: bool, message: &str) {
     let response = crate::commands::delete_file::handle_delete_file(
-        &request("delete_file", json!({"file":path,"recursive":recursive})),
+        &request("delete_file", json!({"files":[path],"recursive":recursive})),
         &f.ctx,
     );
     assert!(!response.success, "{:?}", response.data);
@@ -97,7 +97,7 @@ fn audit2_temp_delete_sqlite_reason_names_first_failing_entry() {
     std::fs::create_dir_all(dir.join("a")).unwrap();
     std::fs::write(dir.join("a/x.txt"), "ordinary file").unwrap();
     let response = crate::commands::delete_file::handle_delete_file(
-        &request("delete_file", json!({"file":dir,"recursive":true})),
+        &request("delete_file", json!({"files":[dir],"recursive":true})),
         &f.ctx,
     );
     assert!(response.success, "{:?}", response.data);
@@ -140,6 +140,53 @@ fn audit2_temp_delete_special_file_reason_names_first_failing_entry() {
             requested.display(), entry.display()
         ));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn audit2_temp_delete_unreadable_reason_names_first_failing_entry() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("container");
+    let blocked = dir.join("unreadable");
+    std::fs::create_dir_all(&blocked).unwrap();
+    let entry = blocked.join("entry.txt");
+    std::fs::write(&entry, "must survive").unwrap();
+    struct RestorePermissions(PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let restore = RestorePermissions(blocked.clone());
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0)).unwrap();
+    assert!(
+        std::fs::read_dir(&blocked).is_err(),
+        "requires an unprivileged test user"
+    );
+    let _route = f.plugin();
+    for (requested, recursive, failing) in [(&entry, false, &entry), (&dir, true, &blocked)] {
+        let response = crate::commands::delete_file::handle_delete_file(
+            &request(
+                "delete_file",
+                json!({"files":[requested],"recursive":recursive}),
+            ),
+            &f.ctx,
+        );
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(response.data["code"], "unsafe_temp_path");
+        assert_eq!(
+            response.data["message"],
+            format!(
+                "temporary path '{}' could not be fully checked ('{}' could not be read)",
+                requested.display(),
+                failing.display()
+            )
+        );
+    }
+    drop(restore);
+    assert_eq!(std::fs::read_to_string(entry).unwrap(), "must survive");
 }
 
 #[test]
@@ -448,6 +495,10 @@ fn audit2_temp_roots_cannot_be_recursively_deleted() {
             "{:?}",
             response.data
         );
+        assert_eq!(response.data["message"], format!(
+            "temporary path '{}' is a temporary directory root; AFT does not replace or remove temporary directory roots",
+            controlled.path().display()
+        ));
         assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "must survive");
         assert!(floor.exists());
     }

@@ -3,7 +3,7 @@
  * Both go through Rust so backups and checkpoint rollback work the same way.
  */
 
-import { coerceBoolean, coerceStringArray } from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceStringArray, toolErrorFromResponse } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
@@ -205,7 +205,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
             extCtx,
           );
           if (response.success === false) {
-            throw new Error(response.text || response.message || "delete failed");
+            throw toolErrorFromResponse("delete", response);
           }
           const deletedEntries = (response.deleted as Array<{ file: string }> | undefined) ?? [];
           const skipped =

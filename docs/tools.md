@@ -181,6 +181,11 @@ for and inline fresh LSP diagnostics on every edit.
 
 For partial edits (find/replace), use `edit` instead.
 
+Under the temporary directory, AFT refuses to change SQLite files (including names containing
+`.sqlite`), files with more than one hard link, and other sessions' scratch folders: a database
+may be live in another program, another link may be outside the directory, and scratch belongs
+to its owning session.
+
 ---
 
 ### edit
@@ -1291,9 +1296,14 @@ restores what was removed.
 
 Paths under the system temp directory are never backed up, and neither is anything when
 backups are disabled; such deletes skip these checks and the backup budget, and only a mount
-point is refused. A recursive delete whose backup would record more than 2,000 entries (files,
-directories and links) or copy 100 MiB in one call is refused; delete it in smaller pieces or
-use bash `rm -rf` when no undo is needed.
+point is refused by the backup checks. A recursive delete whose backup would record more than
+2,000 entries (files, directories and links) or copy 100 MiB in one call is refused; delete it
+in smaller pieces or use bash `rm -rf` when no undo is needed.
+
+Under the temporary directory, AFT refuses to change SQLite files (including names containing
+`.sqlite`), files with more than one hard link, and other sessions' scratch folders: a database
+may be live in another program, another link may be outside the directory, and scratch belongs
+to its owning session. These access checks apply even when no backup is made.
 
 ```json
 { "files": ["build/cache"], "recursive": true }

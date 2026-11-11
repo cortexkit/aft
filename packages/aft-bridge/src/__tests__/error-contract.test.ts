@@ -32,6 +32,7 @@ import {
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
   shellTimeoutNotStartedDisposition,
   shellTimeoutTaskDisposition,
+  toolErrorFromResponse,
 } from "../error-contract.js";
 import {
   isLocalRouteCloseRejection,
@@ -41,6 +42,22 @@ import {
   SubcRouteClosedMidCallError,
   SubcTransportShuttingDownError,
 } from "../subc-transport.js";
+
+test("toolErrorFromResponse preserves unsafe_temp_path and its exact refusal message", () => {
+  const response = {
+    success: false,
+    code: "unsafe_temp_path",
+    message:
+      "temporary path '/tmp/foreign' is another session's scratch folder; AFT changes only this session's scratch folders",
+    text: "rendered refusal",
+  };
+  const error = toolErrorFromResponse("delete", response);
+  expect(error).toBeInstanceOf(AftToolError);
+  expect(error.code).toBe("unsafe_temp_path");
+  expect(error.message).toBe(response.message);
+  expect(error.response).toBe(response);
+  expect(error.cause).toEqual({ code: "unsafe_temp_path", message: response.message, response });
+});
 
 /** Shaped exactly as subc-client raises it: bare SubcError, no code. */
 function routeGoodbyeError(): SubcError {
