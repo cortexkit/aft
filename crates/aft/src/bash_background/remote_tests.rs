@@ -60,7 +60,10 @@ fn assert_read_only_note(error: &str) {
     for text in [foreground, completion, disk] {
         assert_eq!(text.matches(READ_ONLY_NOTE).count(), 1, "{text}");
         assert!(text.lines().any(|line| line == READ_ONLY_NOTE), "{text}");
-        assert!(text.find("command output").unwrap() < text.find(READ_ONLY_NOTE).unwrap());
+        assert!(
+            text.find("Operation not permitted").unwrap() < text.find(READ_ONLY_NOTE).unwrap(),
+            "{text}"
+        );
     }
 }
 
