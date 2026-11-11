@@ -17262,3 +17262,50 @@ async fn runon_draining_wait_saves_its_record_at_a_coarse_step() {
         waited - wait_began
     );
 }
+
+#[tokio::test]
+async fn agent_commands_runon_never_declares_a_local_root() {
+    const CHILD: &str = "AFT_AGENT_COMMANDS_RUNON_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = concat!(
+            module_path!(),
+            "::agent_commands_runon_never_declares_a_local_root"
+        );
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                name.strip_prefix("aft::").unwrap_or(name),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    crate::agent_commands::enable(dir.path());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let connection = crate::agent_commands::connect(move |batch| {
+        tx.send(batch).unwrap();
+        async { Ok(()) }
+    });
+    assert_eq!(rx.recv().await.unwrap().known, Some(vec![]));
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command":"uname -a","runon":"linux","compressed":false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let _done = terminal(ctx.bash_background(), &task_id).await;
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    tokio::task::yield_now().await;
+    assert!(
+        rx.try_recv().is_err(),
+        "remote jobs and internal git helpers have no declared local root"
+    );
+    connection.stop().await;
+}

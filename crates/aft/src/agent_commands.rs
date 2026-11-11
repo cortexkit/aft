@@ -52,6 +52,20 @@ impl State {
 }
 
 impl Declarations {
+    fn load(&self, storage: &Path) {
+        let path = storage.join("agent-command-roots.json");
+        let roots = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<AgentCommandRoot>>(&bytes).ok())
+            .unwrap_or_default();
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).storage = Some(path);
+        for root in roots {
+            if subc_os::process_start_time_ms(root.pid) == Some(root.start_time_ms) {
+                self.restored(root);
+            }
+        }
+    }
+
     fn started(&self, root: AgentCommandRoot) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.live.insert(root.pid, root);
@@ -280,21 +294,7 @@ where
 }
 
 pub(crate) fn enable(storage: &Path) {
-    let path = storage.join("agent-command-roots.json");
-    let roots = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<AgentCommandRoot>>(&bytes).ok())
-        .unwrap_or_default();
-    declarations()
-        .state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .storage = Some(path);
-    for root in roots {
-        if subc_os::process_start_time_ms(root.pid) == Some(root.start_time_ms) {
-            restored(root);
-        }
-    }
+    declarations().load(storage);
 }
 
 pub(crate) fn started(pid: u32) -> Option<AgentCommandRoot> {
@@ -313,10 +313,6 @@ pub(crate) fn started(pid: u32) -> Option<AgentCommandRoot> {
     };
     declarations().started(root);
     Some(root)
-}
-
-pub(crate) fn restored(root: AgentCommandRoot) {
-    declarations().restored(root);
 }
 
 pub(crate) fn finished(root: Option<AgentCommandRoot>, cpu_ms: Option<u64>) {
@@ -594,6 +590,43 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(old_reply.is_closed());
         reply.send(Ok(())).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_commands_persists_before_send_and_recovers_without_a_project_bind() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let root = AgentCommandRoot {
+            pid: child.id(),
+            start_time_ms: subc_os::process_start_time_ms(child.id()).unwrap(),
+        };
+        let first = Arc::new(Declarations::default());
+        first.load(storage.path());
+        first.started(root);
+        let (connection, mut rx) = sender(&first);
+        let (_, reply) = receive(&mut rx).await;
+        let saved: Vec<AgentCommandRoot> = serde_json::from_slice(
+            &std::fs::read(storage.path().join("agent-command-roots.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved, [root]);
+        reply.send(Ok(())).unwrap();
+        connection.stop().await;
+
+        let recovered = Arc::new(Declarations::default());
+        recovered.load(storage.path());
+        let (connection, mut rx) = sender(&recovered);
+        let (batch, reply) = receive(&mut rx).await;
+        assert_eq!(batch.known, Some(vec![root]));
+        assert!(batch.started.is_empty());
+        reply.send(Ok(())).unwrap();
+        connection.stop().await;
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]
