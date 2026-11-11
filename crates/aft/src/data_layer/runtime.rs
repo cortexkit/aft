@@ -333,6 +333,99 @@ struct BuildRetry {
     timer: Option<crate::shared_timer::Timer>,
 }
 
+/// A scheduled lane pause has one clock and one wakeup, regardless of how
+/// many checkouts are waiting for that embedding model.
+#[derive(Default)]
+struct FillPauses(std::collections::HashMap<String, FillPause>);
+
+struct FillPause {
+    pause: crate::synapse_embed::LanePause,
+    at: Instant,
+    waiters: std::collections::HashMap<PathBuf, Weak<Work>>,
+}
+
+impl FillPauses {
+    /// Returns true when the lane needs its first wakeup thread.
+    fn record(
+        &mut self,
+        mut pause: crate::synapse_embed::LanePause,
+        now_ms: u64,
+        now: Instant,
+    ) -> bool {
+        if pause.paused_until_ms == 0 {
+            if self.0.get(&pause.lane_id).is_some_and(|entry| {
+                now < entry.at
+                    && entry.pause.reason == pause.reason
+                    && entry.pause.retry_after_ms == pause.retry_after_ms
+            }) {
+                return false;
+            }
+            pause.paused_until_ms = now_ms.saturating_add(pause.retry_after_ms.unwrap_or(0));
+        }
+        let at = now + Duration::from_millis(pause.paused_until_ms.saturating_sub(now_ms));
+        let first = !self.0.contains_key(&pause.lane_id);
+        let entry = self
+            .0
+            .entry(pause.lane_id.clone())
+            .or_insert_with(|| FillPause {
+                pause: pause.clone(),
+                at,
+                waiters: Default::default(),
+            });
+        if first
+            || entry.pause.paused_until_ms != pause.paused_until_ms
+            || entry.pause.reason != pause.reason
+        {
+            crate::slog_info!(
+                "data layer meaning fill paused: lane={} until_ms={} reason={}",
+                pause.lane_id,
+                pause.paused_until_ms,
+                pause.reason
+            );
+            entry.at = at;
+            entry.pause = pause;
+        }
+        first
+    }
+
+    fn park(&mut self, lane: &str, root: &Path, work: Weak<Work>, now: Instant) -> bool {
+        let Some(entry) = self.0.get_mut(lane).filter(|entry| now < entry.at) else {
+            return false;
+        };
+        crate::synapse_embed::share_lane_pause(root, &entry.pause);
+        entry.waiters.insert(root.to_path_buf(), work);
+        true
+    }
+}
+
+fn fill_pauses() -> &'static parking_lot::Mutex<FillPauses> {
+    static PAUSES: OnceLock<parking_lot::Mutex<FillPauses>> = OnceLock::new();
+    PAUSES.get_or_init(Default::default)
+}
+
+static FILL_PAUSE_CHANGED: parking_lot::Condvar = parking_lot::Condvar::new();
+
+fn wake_paused_fills(lane: String) {
+    loop {
+        let waiters = {
+            let mut pauses = fill_pauses().lock();
+            let Some(entry) = pauses.0.get(&lane) else {
+                return;
+            };
+            let wait = entry.at.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                FILL_PAUSE_CHANGED.wait_for(&mut pauses, wait);
+                continue;
+            }
+            pauses.0.remove(&lane).unwrap().waiters
+        };
+        for work in waiters.into_values().filter_map(|work| work.upgrade()) {
+            work.start_fill();
+        }
+        return;
+    }
+}
+
 /// A checkout and the state of its background work, shared by the work
 /// itself and the handle that starts it.
 struct Work {
@@ -883,6 +976,9 @@ impl Work {
         if !self.meaning.enabled() || self.meaning.reads_only() {
             return;
         }
+        if self.park_for_lane_pause() {
+            return;
+        }
         {
             let retry = self
                 .fill_retry
@@ -900,6 +996,15 @@ impl Work {
         self.runner.run(FILL_REQUEST, Pool::Fill, move || {
             if work.stopped.load(Ordering::Acquire) || crate::executor::current_job_cancelled() {
                 // Runs again when the root is bound and a search asks.
+                return;
+            }
+            // Another root may have learned of the pause while this job
+            // waited for a place in the process-wide fill pool.
+            if work.park_for_lane_pause() {
+                drop(flag);
+                // If the pause ended just as this job parked, its wakeup
+                // may have seen the running flag. Recheck after releasing it.
+                work.start_fill();
                 return;
             }
             let round = work.meaning.round(&work.checkout);
@@ -928,6 +1033,34 @@ impl Work {
     }
 
     fn retry_fill_later(self: &Arc<Self>, error: &str) {
+        if let Some(pause) = crate::synapse_embed::LanePause::from_error(error)
+            .filter(|pause| pause.cause == crate::synapse_embed::PauseCause::LanePaused)
+        {
+            let lane = pause.lane_id.clone();
+            let first = {
+                let mut pauses = fill_pauses().lock();
+                let first = pauses.record(
+                    pause,
+                    crate::semantic_index::unix_millis_now(),
+                    Instant::now(),
+                );
+                // Also keep a waiter when an already-expired pause was returned:
+                // the lane's wakeup will start it immediately.
+                let entry = pauses.0.get_mut(&lane).unwrap();
+                crate::synapse_embed::share_lane_pause(self.checkout.root(), &entry.pause);
+                entry
+                    .waiters
+                    .insert(self.checkout.root().to_path_buf(), Arc::downgrade(self));
+                first
+            };
+            FILL_PAUSE_CHANGED.notify_all();
+            if first {
+                let _ = std::thread::Builder::new()
+                    .name("aft-data-lane-resume".to_string())
+                    .spawn(move || wake_paused_fills(lane));
+            }
+            return;
+        }
         let (wait, at) = {
             let mut retry = self
                 .fill_retry
@@ -959,6 +1092,17 @@ impl Work {
         if !self.stopped.load(Ordering::Acquire) {
             retry.timer = timer;
         }
+    }
+
+    fn park_for_lane_pause(self: &Arc<Self>) -> bool {
+        self.meaning.synapse_lane().is_some_and(|lane| {
+            fill_pauses().lock().park(
+                &lane,
+                self.checkout.root(),
+                Arc::downgrade(self),
+                Instant::now(),
+            )
+        })
     }
 
     /// Tells the status listener, if any, that the checkout's status may
@@ -1776,6 +1920,115 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    fn planned_pause(until: u64) -> crate::synapse_embed::LanePause {
+        crate::synapse_embed::LanePause {
+            lane_id: "scheduled-embedding-lane".into(),
+            fingerprint: None,
+            retry_after_ms: Some(1_399_000),
+            paused_until_ms: until,
+            reason: "Neural Engine maintenance".into(),
+            cause: crate::synapse_embed::PauseCause::LanePaused,
+            safe_to_retry_same_request: true,
+            record_id: 0,
+        }
+    }
+
+    #[test]
+    fn planned_pause_deadline_and_log_are_shared_across_fill_roots() {
+        let mut pauses = FillPauses::default();
+        let now = Instant::now();
+        let now_ms = crate::semantic_index::unix_millis_now();
+        let pause = planned_pause(now_ms + 1_399_000);
+        let lane = pause.lane_id.clone();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            assert!(pauses.record(pause.clone(), now_ms, now));
+            assert!(pauses.park(&lane, first.path(), Weak::new(), now));
+            let mut duplicate = pause.clone();
+            duplicate.record_id = 17;
+            duplicate.retry_after_ms = Some(1_390_000);
+            assert!(!pauses.record(duplicate, now_ms + 9_000, now + Duration::from_secs(9)));
+            assert!(pauses.park(&lane, second.path(), Weak::new(), now));
+        });
+        assert_eq!(pauses.0.len(), 1, "one lane timer, not one per root");
+        let entry = &pauses.0[&lane];
+        assert_eq!(entry.at, now + Duration::from_millis(1_399_000));
+        assert_eq!(entry.waiters.len(), 2);
+        assert!(pauses.park(
+            &lane,
+            first.path(),
+            Weak::new(),
+            now + Duration::from_millis(1_398_999)
+        ));
+        assert!(!pauses.park(
+            &lane,
+            first.path(),
+            Weak::new(),
+            now + Duration::from_millis(1_399_000)
+        ));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("INFO "), "{lines:?}");
+        for value in [&lane, &pause.paused_until_ms.to_string(), &pause.reason] {
+            assert!(lines[0].contains(value), "{lines:?}");
+        }
+        for root in [first.path(), second.path()] {
+            assert_eq!(
+                crate::synapse_embed::lane_pause_for_root(root),
+                Some(pause.clone())
+            );
+        }
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            assert!(!pauses.record(planned_pause(now_ms + 2_000_000), now_ms, now));
+        });
+        assert_eq!(lines.len(), 1, "a changed pause is reported once");
+        assert_eq!(pauses.0[&lane].at, now + Duration::from_millis(2_000_000));
+    }
+
+    #[test]
+    fn planned_pause_without_absolute_end_uses_retry_hint() {
+        let mut pauses = FillPauses::default();
+        let now = Instant::now();
+        assert!(pauses.record(planned_pause(0), 1_000, now));
+        let entry = &pauses.0["scheduled-embedding-lane"];
+        assert_eq!(entry.pause.paused_until_ms, 1_400_000);
+        assert_eq!(entry.at, now + Duration::from_millis(1_399_000));
+        assert!(!pauses.record(planned_pause(0), 10_000, now + Duration::from_secs(9)));
+        assert_eq!(
+            pauses.0["scheduled-embedding-lane"].at,
+            now + Duration::from_millis(1_399_000)
+        );
+    }
+
+    #[test]
+    fn planned_pause_fill_errors_bypass_per_root_failure_backoff() {
+        let first = PublicationFixture::new(Duration::from_secs(60), QUIET);
+        let second = PublicationFixture::new(Duration::from_secs(60), QUIET);
+        let mut pause = planned_pause(crate::semantic_index::unix_millis_now() + 1_399_000);
+        pause.lane_id = format!("fill-error-{}", first.handle.root().display());
+        let error = format!("[lane_paused] {}", serde_json::to_string(&pause).unwrap());
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            first.handle.work.retry_fill_later(&error);
+            second.handle.work.retry_fill_later(&error);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("INFO "), "{lines:?}");
+        for fixture in [&first, &second] {
+            let retry = fixture.handle.work.fill_retry.lock().unwrap();
+            assert_eq!(retry.in_a_row, 0);
+            assert!(retry.at.is_none());
+            assert_eq!(
+                crate::synapse_embed::lane_pause_for_root(fixture.handle.root()),
+                Some(pause.clone())
+            );
+        }
+        let pauses = fill_pauses().lock();
+        assert_eq!(pauses.0[&pause.lane_id].waiters.len(), 2);
+        assert!(
+            pauses.0[&pause.lane_id].at.duration_since(Instant::now()) > Duration::from_secs(1_390)
+        );
+    }
 
     struct PublicationFixture {
         handle: Arc<DataCheckout>,

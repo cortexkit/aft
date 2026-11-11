@@ -4250,6 +4250,41 @@ fn consent_scope_unknown_alias_answer_is_not_memoized() {
     );
 }
 
+#[test]
+fn consent_scope_vanished_directory_is_info_once_even_after_memo_pruning() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("removed-scratch");
+    let grant = AccessGrant {
+        path: parent.join("first.txt"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        assert_eq!(directory_scope_with(&grant, |_, _| Some(false)), grant);
+        let mut state = DIRECTORY_SCOPE_PROBES.lock().unwrap();
+        state.last_pruned = Some(Instant::now() - DIRECTORY_SCOPE_MEMO_TTL);
+        drop(state);
+        let sibling = AccessGrant {
+            path: parent.join("second.txt"),
+            ..grant.clone()
+        };
+        assert_eq!(directory_scope_with(&sibling, |_, _| Some(false)), sibling);
+    });
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("INFO "), "{lines:?}");
+    assert!(lines[0].contains("directory does not exist"), "{lines:?}");
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        log_directory_scope_fallback(&parent, "home identity unknown");
+        log_directory_scope_fallback(&parent, "directory probe timed out");
+    });
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines.iter().all(|line| line.starts_with("WARN ")),
+        "{lines:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn consent_scope_memo_expires_and_unsafe_answers_keep_each_file() {

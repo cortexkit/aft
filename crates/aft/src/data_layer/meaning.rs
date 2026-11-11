@@ -305,6 +305,12 @@ impl Meaning {
         lock(&self.config).clone().flatten()
     }
 
+    pub(super) fn synapse_lane(&self) -> Option<String> {
+        self.config()
+            .filter(|config| config.backend == crate::config::SemanticBackend::Synapse)
+            .map(|config| config.model)
+    }
+
     /// How meaning search stands for `view`, the checkout's current view
     /// (`None` before anything is published).
     pub(crate) fn state(&self, view: Option<&CheckoutView>) -> MeaningState {

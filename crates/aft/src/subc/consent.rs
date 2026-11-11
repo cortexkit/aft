@@ -2031,6 +2031,7 @@ impl DirectoryScopeProbe {
 struct DirectoryScopeProbes {
     probes: HashMap<PathBuf, Arc<DirectoryScopeProbe>>,
     logged: HashMap<(PathBuf, &'static str), Instant>,
+    missing_logged: std::collections::HashSet<PathBuf>,
     last_pruned: Option<Instant>,
 }
 
@@ -2057,6 +2058,9 @@ impl DirectoryScopeProbes {
     }
 
     fn note_fallback(&mut self, directory: &Path, reason: &'static str) -> bool {
+        if reason == "directory does not exist" {
+            return self.missing_logged.insert(directory.to_path_buf());
+        }
         match self.logged.entry((directory.to_path_buf(), reason)) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 if entry.get().elapsed() < DIRECTORY_SCOPE_MEMO_TTL {
@@ -2128,13 +2132,26 @@ where
                 .unwrap()
                 .note_fallback(parent, reason);
             if should_log {
-                log::warn!(
-                    "consent directory scope fell back to file-only for {}: {reason}",
-                    parent.display()
-                );
+                log_directory_scope_fallback(parent, reason);
             }
             grant.clone()
         }
+    }
+}
+
+fn log_directory_scope_fallback(parent: &Path, reason: &str) {
+    // Scratch directories may be removed after their command exits, before
+    // consent can offer a wider grant. The original file grant is still safe.
+    if reason == "directory does not exist" {
+        crate::slog_info!(
+            "consent directory scope fell back to file-only for {}: {reason}",
+            parent.display()
+        );
+    } else {
+        crate::slog_warn!(
+            "consent directory scope fell back to file-only for {}: {reason}",
+            parent.display()
+        );
     }
 }
 

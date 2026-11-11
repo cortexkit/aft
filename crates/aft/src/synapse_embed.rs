@@ -61,6 +61,7 @@ pub struct LanePause {
     pub lane_id: String,
     pub fingerprint: Option<String>,
     pub retry_after_ms: Option<u64>,
+    #[serde(default)]
     pub paused_until_ms: u64,
     pub reason: String,
     #[serde(default)]
@@ -295,6 +296,15 @@ pub(crate) fn lane_pause_for_root(root: &Path) -> Option<LanePause> {
         return None;
     }
     Some(pause)
+}
+
+/// A fill that waits on another root's lane pause reports the same planned
+/// downtime in health, even though it made no request of its own.
+pub(crate) fn share_lane_pause(root: &Path, pause: &LanePause) {
+    lane_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf(), pause.clone());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1549,20 +1559,28 @@ fn decode_result_envelope_for_request(
                         });
                     }
                 }
-                let paused_until_ms = details["paused_until_ms"].as_u64().ok_or_else(|| {
-                    SynapseEmbeddingError::InvalidEnvelope(
-                        "lane_paused omitted paused_until_ms".into(),
-                    )
-                })?;
+                let retry_after_ms = error["retry_after_ms"]
+                    .as_u64()
+                    .filter(|ms| (1_000..=MAX_LANE_PAUSE_MS).contains(ms));
+                let paused_until_ms = details["paused_until_ms"]
+                    .as_u64()
+                    .or_else(|| {
+                        retry_after_ms.map(|delay| {
+                            crate::semantic_index::unix_millis_now().saturating_add(delay)
+                        })
+                    })
+                    .ok_or_else(|| {
+                        SynapseEmbeddingError::InvalidEnvelope(
+                            "lane_paused omitted paused_until_ms".into(),
+                        )
+                    })?;
                 let reason = details["reason"].as_str().ok_or_else(|| {
                     SynapseEmbeddingError::InvalidEnvelope("lane_paused omitted reason".into())
                 })?;
                 Err(SynapseEmbeddingError::LanePaused(LanePause {
                     lane_id: lane_id.to_owned(),
                     fingerprint: fingerprint.and_then(Value::as_str).map(str::to_owned),
-                    retry_after_ms: error["retry_after_ms"]
-                        .as_u64()
-                        .filter(|ms| (1_000..=MAX_LANE_PAUSE_MS).contains(ms)),
+                    retry_after_ms,
                     paused_until_ms,
                     reason: reason.to_owned(),
                     cause: PauseCause::LanePaused,
@@ -2107,6 +2125,26 @@ mod tests {
             ),
             Err(SynapseEmbeddingError::DaemonUnavailable(_))
         ));
+    }
+
+    #[test]
+    fn lane_paused_retry_hint_supplies_missing_absolute_end() {
+        use super::pause_test_support::*;
+        let mut reply = pause_reply(json!(1_399_000));
+        reply["error"]["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("paused_until_ms");
+        let before = crate::semantic_index::unix_millis_now();
+        let error = decode_result_envelope_for_request(
+            serde_json::to_vec(&reply).unwrap(),
+            Some(&json!({"model": MODEL, "required_fingerprint": "pinned"})),
+        )
+        .unwrap_err();
+        let after = crate::semantic_index::unix_millis_now();
+        let pause = LanePause::from_error(&error.to_string()).unwrap();
+        assert!((before + 1_399_000..=after + 1_399_000).contains(&pause.paused_until_ms));
+        assert_eq!(pause.cause, PauseCause::LanePaused);
     }
 
     #[test]

@@ -3491,6 +3491,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let mut embedding_backend_available = true;
     let mut embedding_backend_paused_until_ms: Option<u64> = None;
     let mut embedding_backend_down = false;
+    let mut embedding_backend_only_planned_pauses = true;
     let mut embedding_backend_last_error = None;
     let mut embedding_backend_since_ms = None;
     let mut task_storage_roots = std::collections::HashSet::new();
@@ -3565,6 +3566,8 @@ fn build_health_diagnostic_rollup_from_actors(
         let backend = ctx.semantic_backend_health_snapshot();
         if !backend.available {
             embedding_backend_available = false;
+            embedding_backend_only_planned_pauses &=
+                backend.pause_cause == Some(crate::synapse_embed::PauseCause::LanePaused);
             if let Some(until) = backend.paused_until_ms {
                 embedding_backend_paused_until_ms =
                     Some(embedding_backend_paused_until_ms.map_or(until, |old| old.max(until)));
@@ -3887,6 +3890,7 @@ fn build_health_diagnostic_rollup_from_actors(
             "available": embedding_backend_available,
             "state": if embedding_backend_available { "available" } else if !embedding_backend_down && embedding_backend_paused_until_ms.is_some() { "paused" } else { "backend_unavailable" },
             "paused_until_ms": embedding_backend_paused_until_ms,
+            "pause_cause": if !embedding_backend_available && !embedding_backend_down && embedding_backend_only_planned_pauses { Some("lane_paused") } else { None },
             "last_error": embedding_backend_last_error,
             "since_ms": embedding_backend_since_ms,
         },
@@ -4232,6 +4236,10 @@ fn assemble_health_report(
     metrics.insert(
         "durable_log".to_string(),
         crate::logging::durable_log_health(),
+    );
+    metrics.insert(
+        "gh_speech".to_string(),
+        json!({"unconfigured_binding_refusals_total": crate::gh_shim_speech::service::unconfigured_binding_refusals_total()}),
     );
     metrics.insert(
         "runtime".to_string(),
@@ -8269,6 +8277,23 @@ mod tests {
             health["stderr_mirror"]["best_effort"].is_boolean(),
             "{health}"
         );
+    }
+
+    #[test]
+    fn health_report_exposes_unconfigured_binding_refusal_counter() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = App::default_shared();
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &app,
+        );
+        assert!(report.metrics.expect("health metrics")["gh_speech"]
+            ["unconfigured_binding_refusals_total"]
+            .is_u64());
     }
 
     #[test]

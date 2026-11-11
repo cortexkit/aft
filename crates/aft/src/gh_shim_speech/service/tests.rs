@@ -65,7 +65,7 @@ fn binding_reply_diagnostics_distinguish_missing_generation_missing_rows_and_inv
             "invalid_binding",
         ),
     ] {
-        let refusal = parse_bindings(&desired, &reply, "agent-subc").unwrap_err();
+        let refusal = parse_bindings(&desired, &reply, "agent-subc", "session").unwrap_err();
         assert_eq!(refusal.code, Code::AuthorityUnavailable);
         assert_eq!(refusal.reason, "binding_unverifiable");
         assert!(
@@ -83,6 +83,7 @@ fn no_binding_row_preserves_main_refusal_wording_and_structured_detail() {
         &desired,
         &serde_json::json!({"repo_binding_generation":36,"bindings":[]}),
         "agent-subc",
+        "session",
     )
     .unwrap_err();
     assert_eq!(
@@ -98,6 +99,57 @@ fn no_binding_row_preserves_main_refusal_wording_and_structured_detail() {
 }
 
 #[test]
+fn unconfigured_binding_refusal_is_info_once_per_session_and_agent() {
+    let desired = BTreeMap::from([("org/other".into(), "other-agent".into())]);
+    let reply = serde_json::json!({"repo_binding_generation":36,"bindings":[]});
+    let before = unconfigured_binding_refusals_total();
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        for (session, agent) in [
+            ("unconfigured-session-a", "agent-a"),
+            ("unconfigured-session-a", "agent-a"),
+            ("unconfigured-session-b", "agent-a"),
+            ("unconfigured-session-a", "agent-b"),
+        ] {
+            let refusal = parse_bindings(&desired, &reply, agent, session).unwrap_err();
+            assert_eq!(refusal.code, Code::AuthorityUnavailable);
+            assert_eq!(refusal.reason, "binding_unverifiable");
+            assert_eq!(
+                refusal.detail.unwrap(),
+                format!("no_binding_row: launch_agent={agent:?} repositories=[]")
+            );
+        }
+    });
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines.iter().all(|line| line.starts_with("INFO ")),
+        "{lines:?}"
+    );
+    assert!(
+        unconfigured_binding_refusals_total() >= before + 4,
+        "count suppressed attempts too"
+    );
+}
+
+#[test]
+fn configured_binding_absence_and_other_refusals_still_warn_each_time() {
+    let desired = BTreeMap::from([("org/repo".into(), "agent".into())]);
+    let reply = serde_json::json!({"repo_binding_generation":36,"bindings":[]});
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        for _ in 0..2 {
+            parse_bindings(&desired, &reply, "agent", "configured-session").unwrap_err();
+        }
+        binding_unverifiable("binding_read_timeout");
+    });
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines.iter().all(|line| line.starts_with("WARN ")),
+        "{lines:?}"
+    );
+    assert!(lines[0].contains("org/repo"), "{lines:?}");
+    assert!(lines[2].contains("binding_read_timeout"), "{lines:?}");
+}
+
+#[test]
 fn real_plexus_binding_replies_preserve_authority_and_refuse_missing_or_wrong_agents() {
     use crate::gh_shim_relay::bindings_contract::{vector, CASES};
     let desired = BTreeMap::from([
@@ -107,7 +159,7 @@ fn real_plexus_binding_replies_preserve_authority_and_refuse_missing_or_wrong_ag
     ]);
     for name in CASES {
         let (_, reply) = vector(name);
-        let parsed = parse_bindings(&desired, &reply, "agent-x");
+        let parsed = parse_bindings(&desired, &reply, "agent-x", "session");
         match name {
             "agent" | "connection" => {
                 let bindings = parsed.unwrap();
@@ -141,7 +193,8 @@ fn real_plexus_binding_replies_preserve_authority_and_refuse_missing_or_wrong_ag
             }
         }
     }
-    let bindings = parse_bindings(&desired, &vector("other-agent").1, "agent-y").unwrap();
+    let bindings =
+        parse_bindings(&desired, &vector("other-agent").1, "agent-y", "session").unwrap();
     assert_eq!(
         bindings.keys().map(String::as_str).collect::<Vec<_>>(),
         ["o/a", "o/z"]
@@ -158,7 +211,7 @@ fn binding_reply_diagnostics_name_both_agents_without_accepting_mismatches() {
     let reply = json!({"repo_binding_generation":36,"bindings":[{
         "repository":"cortexkit/subconscious","agent_id":"agent-aft","app_handle_id":"aft-alfonso"
     }]});
-    let refusal = parse_bindings(&desired, &reply, "agent-subc").unwrap_err();
+    let refusal = parse_bindings(&desired, &reply, "agent-subc", "session").unwrap_err();
     assert_eq!(refusal.code, Code::IdentityConflict);
     assert_eq!(refusal.reason, "binding_changed");
     let detail = refusal.detail.unwrap();
