@@ -138,7 +138,9 @@ maybeDescribe("hoisted tools (real bridge)", () => {
       newString: "b",
       replaceAll: true,
     });
-    const text = harness.text(result);
+    // The status bar follows when a count changed since the session's last
+    // result, for example once the first TODO count lands, so drop it here.
+    const text = harness.text(result).replace(/\n*\[AFT [^\]\n]*\]\s*$/, "");
     expect(text).toBe("Edited (+3/-3).");
     expect((result as { details?: { editsApplied?: number } }).details?.editsApplied).toBe(1);
 

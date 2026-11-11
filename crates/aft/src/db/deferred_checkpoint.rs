@@ -309,14 +309,28 @@ pub(crate) mod test_hooks {
         STATE.get_or_init(Default::default)
     }
 
+    /// The worker knows a database by the path SQLite reports, which has its
+    /// symlinks resolved (macOS's /var is /private/var), while tests pass the
+    /// temp path they created. Key both sides by the resolved folder.
+    fn key(path: &Path) -> PathBuf {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => parent
+                .canonicalize()
+                .map(|parent| parent.join(name))
+                .unwrap_or_else(|_| path.to_path_buf()),
+            _ => path.to_path_buf(),
+        }
+    }
+
     pub(crate) fn note_finished(path: &Path) {
         let (lock, changed) = state();
         let mut state = lock.lock().unwrap();
-        *state.finished.entry(path.to_path_buf()).or_default() += 1;
+        *state.finished.entry(key(path)).or_default() += 1;
         changed.notify_all();
     }
 
     pub(super) fn wait_at_gate(path: &Path) {
+        let path = key(path);
         let (lock, changed) = state();
         let mut state = lock.lock().unwrap();
         if !state.gate_closed || state.gate_path != path {
@@ -350,7 +364,7 @@ pub(crate) mod test_hooks {
         let (lock, _) = state();
         let mut state = lock.lock().unwrap();
         state.gate_closed = true;
-        state.gate_path = path.to_path_buf();
+        state.gate_path = key(path);
         Gate { _serial: serial }
     }
 
@@ -381,7 +395,7 @@ pub(crate) mod test_hooks {
         lock.lock()
             .unwrap()
             .finished
-            .get(path)
+            .get(&key(path))
             .copied()
             .unwrap_or(0)
     }
@@ -416,6 +430,8 @@ pub(crate) mod test_hooks {
 
     /// Wait until more than `seen` deferred checkpoints of `path` finished.
     pub(crate) fn wait_finished_after(path: &Path, seen: u64, timeout: Duration) -> bool {
+        let path = key(path);
+        let path = path.as_path();
         let (lock, changed) = state();
         let deadline = Instant::now() + timeout;
         let mut state = lock.lock().unwrap();
