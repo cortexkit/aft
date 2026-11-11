@@ -3,6 +3,7 @@
 //! A request probes each directory once. Ordinary files in accessible local
 //! directories stay on the caller's hot path. Network/removable/unknown volumes
 //! and symlinks retain per-file isolation. Helpers own no actor or epoch guard.
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
@@ -15,10 +16,11 @@ use std::sync::LazyLock;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::context::AppContext;
-use crate::protocol::{RawRequest, Response};
+use crate::protocol::Response;
 
 pub(crate) const IO_BUDGET: Duration = Duration::from_secs(5);
+/// Wall-clock budget for grep/glob index-unavailable fallback walks on the dispatch thread.
+pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
 pub(crate) const WALK_PARTIAL_GAP: &str =
     "Directory walk reached its time budget; only examined entries are reported.";
 /// Request budget for a mutation's path checks when no caller budget exists.
@@ -30,14 +32,14 @@ const IO_POOL_SIZE: usize = 8;
 static NEXT_BUDGET: AtomicU64 = AtomicU64::new(1);
 static HELPERS: OnceLock<Arc<Limiter>> = OnceLock::new();
 #[cfg(test)]
-static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static THREAD_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 #[derive(Default)]
-struct Measurements {
-    dispatches: AtomicUsize,
-    round_trips: AtomicUsize,
-    directory_probes: AtomicUsize,
-    traversal_probes: AtomicUsize,
+pub(crate) struct Measurements {
+    pub(crate) dispatches: AtomicUsize,
+    pub(crate) round_trips: AtomicUsize,
+    pub(crate) directory_probes: AtomicUsize,
+    pub(crate) traversal_probes: AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -152,7 +154,7 @@ pub(crate) struct Budget {
     /// Set once the end of the budget has been kept back for the reply.
     reply_margin_kept: bool,
     #[cfg(test)]
-    measurements: Arc<Measurements>,
+    pub(crate) measurements: Arc<Measurements>,
     #[cfg(test)]
     access_budget: Duration,
     #[cfg(test)]
@@ -734,6 +736,112 @@ thread_local! {
     static DIRECTORIES: RefCell<(u64, HashMap<PathBuf, Access>)> = RefCell::new((0, HashMap::new()));
     static HELPER_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     static MUTATION_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CARRY_FACTORY: RefCell<Option<CarryFactory>> = const { RefCell::new(None) };
+    static CARRY_RESTORE: RefCell<Option<Option<CarryRestore>>> = const { RefCell::new(None) };
+}
+
+/// Higher layers carry request-local state without exposing its type to I/O.
+pub(crate) type Carry = Box<dyn FnOnce() -> io::Result<Box<dyn Any + Send>> + Send>;
+pub(crate) type CarryFactory = Arc<dyn Fn() -> io::Result<Carry> + Send + Sync>;
+type CarryRestore = Box<dyn FnOnce() + Send>;
+
+/// Updated alongside the higher layer's thread-local state, including restores.
+/// A helper also restores state first installed by its work, even if the
+/// helper was entered with no carried state at all.
+pub(crate) fn replace_carry_factory(factory: Option<CarryFactory>, restore: CarryRestore) {
+    CARRY_RESTORE.with(|pending| {
+        if let Some(first @ None) = &mut *pending.borrow_mut() {
+            *first = Some(restore);
+        }
+    });
+    CARRY_FACTORY.with(|current| *current.borrow_mut() = factory);
+}
+
+#[cfg(test)]
+fn set_carry_factory(factory: Option<CarryFactory>) {
+    replace_carry_factory(factory, Box::new(|| {}));
+}
+
+struct CarryJobScope {
+    factory: Option<CarryFactory>,
+    restore: Option<Option<CarryRestore>>,
+}
+
+impl CarryJobScope {
+    fn enter() -> Self {
+        Self {
+            factory: CARRY_FACTORY.with(|current| current.borrow().clone()),
+            restore: CARRY_RESTORE.with(|pending| pending.replace(Some(None))),
+        }
+    }
+}
+
+impl Drop for CarryJobScope {
+    fn drop(&mut self) {
+        let restore = CARRY_RESTORE
+            .with(|pending| pending.replace(self.restore.take()))
+            .flatten();
+        if let Some(restore) = restore {
+            restore();
+        }
+        CARRY_FACTORY.with(|current| *current.borrow_mut() = self.factory.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn has_carry_factory() -> bool {
+    CARRY_FACTORY.with(|current| current.borrow().is_some())
+}
+
+#[cfg(test)]
+pub(crate) fn dirty_helper_job_state() {
+    MUTATION_ADMISSION.with(|flag| flag.set(true));
+    DIRECTORIES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.0 = 42;
+        cache
+            .1
+            .insert(PathBuf::from("old"), Access { direct: true });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn helper_job_state() -> (bool, bool) {
+    (
+        DIRECTORIES.with(|cache| cache.borrow().1.is_empty()),
+        MUTATION_ADMISSION.with(|flag| flag.get()),
+    )
+}
+
+fn carry_refusal(path: &Path) -> io::Error {
+    failure(
+        path,
+        "read_io_queue_timeout",
+        "filesystem helper did not start before the deadline; this call did not start",
+    )
+}
+
+fn capture_carry(path: &Path) -> io::Result<Option<Carry>> {
+    let factory = CARRY_FACTORY.with(|current| current.borrow().clone());
+    factory
+        .map(|factory| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory()))
+                .ok()
+                .and_then(Result::ok)
+                .ok_or_else(|| carry_refusal(path))
+        })
+        .transpose()
+}
+
+fn enter_carry(path: &Path, carry: Option<Carry>) -> io::Result<Option<Box<dyn Any + Send>>> {
+    carry
+        .map(|carry| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(carry))
+                .ok()
+                .and_then(Result::ok)
+                .ok_or_else(|| carry_refusal(path))
+        })
+        .transpose()
 }
 pub(crate) struct Scope(Option<Budget>);
 impl Drop for Scope {
@@ -874,83 +982,6 @@ fn prior_failure() -> Option<io::Error> {
             .map(|failure| io::Error::new(io::ErrorKind::TimedOut, failure.clone()));
         error
     })
-}
-#[cfg(test)]
-thread_local! {
-    /// Inputs [`command`] probed before running its handler, so tests can
-    /// check that a long `files` list is not probed past what is examined.
-    pub(crate) static COMMAND_INPUT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-pub(crate) fn command(
-    req: &RawRequest,
-    ctx: &AppContext,
-    work: impl FnOnce(&RawRequest, &AppContext) -> Response,
-) -> Response {
-    let duration = if req.command == "grep" {
-        crate::grep_executor::FALLBACK_WALK_BUDGET
-    } else {
-        IO_BUDGET
-    };
-    let _scope = enter_if_absent(duration);
-    // Probe explicit target roots before canonicalization/stat can cross a
-    // protected location. Files themselves are never opened by this probe.
-    let root = ctx.config().project_root.clone().unwrap_or_default();
-    let mut inputs = Vec::new();
-    for key in ["path", "file", "directory", "target", "files"] {
-        match req.params.get(key) {
-            Some(serde_json::Value::String(path)) => inputs.push(path.as_str()),
-            // An outline reads at most the first entries of its `files` list,
-            // and none of them for a directory, files-mode or revision
-            // outline; probing the rest would cost one access check each
-            // for entries the handler never opens.
-            Some(serde_json::Value::Array(_)) if key == "files" && req.command == "outline" => {
-                inputs.extend(crate::commands::outline::outline_examined_files(req));
-            }
-            Some(serde_json::Value::Array(paths)) => {
-                inputs.extend(paths.iter().filter_map(|p| p.as_str()))
-            }
-            _ => {}
-        }
-    }
-    if !root.as_os_str().is_empty() {
-        inputs.push(root.to_str().unwrap_or_default());
-    }
-    inputs.sort_unstable();
-    inputs.dedup();
-    let mut probe_error = None;
-    for input in inputs {
-        if input.starts_with("http://") || input.starts_with("https://") || input.contains("://") {
-            continue;
-        }
-        let path = if Path::new(input).is_absolute() {
-            PathBuf::from(input)
-        } else {
-            root.join(input)
-        };
-        if let Some(budget) = current() {
-            budget
-                .walk_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(crate::path_identity::lexical_normalize(&path))
-                .or_insert_with(|| PathBuf::from(input));
-        }
-        #[cfg(test)]
-        COMMAND_INPUT_PROBES.with(|probes| probes.set(probes.get() + 1));
-        if let Err(error) = probe_target(&path) {
-            // Missing paths still get the handler's normal validation/error.
-            if error.kind() == io::ErrorKind::TimedOut {
-                probe_error = Some(error);
-                break;
-            }
-        }
-    }
-    let response = match probe_error {
-        Some(error) => Response::error(&req.id, "read_deadline_exceeded", error.to_string()),
-        None => work(req, ctx),
-    };
-    finish_response(response)
 }
 
 type IoJob = Box<dyn FnOnce() + Send + 'static>;
@@ -1184,12 +1215,26 @@ struct Limiter {
     max: usize,
     max_live: usize,
     create: std::sync::mpsc::SyncSender<()>,
+    #[cfg(test)]
+    test_scope: Option<fn() -> Box<dyn Any>>,
 }
 impl Limiter {
     fn new(max: usize) -> Arc<Self> {
         Self::with_limits(max, MAX_IO_THREADS)
     }
     fn with_limits(max: usize, max_live: usize) -> Arc<Self> {
+        Self::with_options(
+            max,
+            max_live,
+            #[cfg(test)]
+            None,
+        )
+    }
+    fn with_options(
+        max: usize,
+        max_live: usize,
+        #[cfg(test)] test_scope: Option<fn() -> Box<dyn Any>>,
+    ) -> Arc<Self> {
         assert!(max > 0 && max <= max_live);
         let (create, requests) = std::sync::mpsc::sync_channel(1);
         Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
@@ -1212,6 +1257,8 @@ impl Limiter {
                 max,
                 max_live,
                 create,
+                #[cfg(test)]
+                test_scope,
             }
         })
     }
@@ -1228,6 +1275,8 @@ impl Limiter {
         let retired = Arc::new(AtomicBool::new(false));
         let worker_retired = Arc::clone(&retired);
         let pool = Arc::downgrade(self);
+        #[cfg(test)]
+        let test_scope = self.test_scope;
         let spawned = std::thread::Builder::new()
             .name("aft-filesystem-probe".into())
             .spawn(move || {
@@ -1240,6 +1289,8 @@ impl Limiter {
                     // worker alive until its caller retires it and closes sender.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let _state = HelperJobScope::enter();
+                        #[cfg(test)]
+                        let _test_state = test_scope.map(|scope| scope());
                         job();
                     }));
                 }
@@ -1308,33 +1359,23 @@ impl Limiter {
     }
 }
 struct HelperJobScope {
+    _carry: CarryJobScope,
     directories: (u64, HashMap<PathBuf, Access>),
     mutation_admission: bool,
     #[cfg(test)]
     canonicalize_calls: Option<Vec<PathBuf>>,
-    #[cfg(test)]
-    _read: crate::commands::read::HelperStateScope,
-    #[cfg(test)]
-    _snapshot: crate::hashline::snapshot::HelperStateScope,
-    #[cfg(test)]
-    _search: crate::search_index::HelperStateScope,
 }
 impl HelperJobScope {
     fn enter() -> Self {
         // Reset only at the dispatched job boundary. Nested probes run inline
         // and must keep the enclosing job's cache, counters and test hooks.
         Self {
+            _carry: CarryJobScope::enter(),
             directories: DIRECTORIES.with(|cache| cache.replace(Default::default())),
             mutation_admission: MUTATION_ADMISSION.with(|flag| flag.replace(false)),
             #[cfg(test)]
             canonicalize_calls: crate::path_identity::CANONICALIZE_CALLS
                 .with(|calls| calls.replace(None)),
-            #[cfg(test)]
-            _read: crate::commands::read::helper_state_scope(),
-            #[cfg(test)]
-            _snapshot: crate::hashline::snapshot::helper_state_scope(),
-            #[cfg(test)]
-            _search: crate::search_index::helper_state_scope(),
         }
     }
 }
@@ -1475,6 +1516,10 @@ pub(crate) fn run<T: Send + 'static>(
 pub(crate) struct IsolatedPool(Arc<Limiter>);
 
 impl IsolatedPool {
+    #[cfg(test)]
+    pub(crate) fn with_test_scope(thread_cap: usize, scope: fn() -> Box<dyn Any>) -> Self {
+        Self(Limiter::with_options(thread_cap, thread_cap, Some(scope)))
+    }
     pub(crate) fn new(thread_cap: usize) -> Self {
         Self(Limiter::with_limits(thread_cap, thread_cap))
     }
@@ -1587,7 +1632,7 @@ fn run_with_timeout<T: Send + 'static>(
     let owned = path.to_path_buf();
     let budget = current();
     let alloc_label = crate::alloc_trace::carry();
-    let confinement = crate::context::confinement::capture();
+    let carry = capture_carry(path)?;
     #[cfg(test)]
     let measurements = budget.as_ref().map(|b| Arc::clone(&b.measurements));
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -1601,7 +1646,9 @@ fn run_with_timeout<T: Send + 'static>(
             let _alloc_label = alloc_label.enter();
             #[cfg(test)]
             regression_tests::before_helper(&owned);
-            let result = crate::context::confinement::inherit(confinement, || with_budget(budget, || {
+            let result = (|| {
+                let _carry = enter_carry(&owned, carry)?;
+                with_budget(budget, || {
                 // Owning a slot does not mean the OS has scheduled this helper.
                 // Never start expired work or blame its scheduling delay on I/O.
                 // Publish the phase under the same lock used by the owner and
@@ -1641,7 +1688,8 @@ fn run_with_timeout<T: Send + 'static>(
                 #[cfg(test)]
                 regression_tests::after_helper_start(&owned);
                 work(owned)
-            }));
+                })
+            })();
             let _ = tx.send(result);
         }))?;
     #[cfg(test)]
@@ -1940,7 +1988,7 @@ fn run_traversal<T: Send + 'static>(
     }
     Ok(result)
 }
-fn probe_target(path: &Path) -> io::Result<()> {
+pub(crate) fn probe_target(path: &Path) -> io::Result<()> {
     if cached_directory(path).is_some() {
         return Ok(());
     }
@@ -2306,7 +2354,7 @@ pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
 
 #[cfg(test)]
 #[path = "bounded_io_tests.rs"]
-mod regression_tests;
+pub(crate) mod regression_tests;
 #[cfg(all(test, unix))]
 pub(crate) use regression_tests::{stall_helper, stall_running_helper};
 #[cfg(all(test, unix))]
@@ -2321,6 +2369,32 @@ pub(crate) fn stall_running_helper_if_requested(path: &Path) {
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn carry_factory_errors_and_panics_refuse_work() {
+        for phase in 0..4 {
+            std::thread::spawn(move || {
+                let factory: CarryFactory = Arc::new(move || match phase {
+                    0 => Err(io::Error::other("injected capture failure")),
+                    1 => panic!("injected capture panic"),
+                    2 => Ok(Box::new(|| Err(io::Error::other("injected entry failure")))),
+                    _ => Ok(Box::new(|| panic!("injected entry panic"))),
+                });
+                set_carry_factory(Some(factory));
+                let ran = Arc::new(AtomicBool::new(false));
+                let called = ran.clone();
+                let result = IsolatedPool::new(1).run(Path::new("carry"), None, move |_| {
+                    called.store(true, Ordering::SeqCst);
+                    Ok(())
+                });
+                assert_eq!(timeout_code(&result.unwrap_err()), "read_io_queue_timeout");
+                assert!(!ran.load(Ordering::SeqCst));
+                set_carry_factory(None);
+            })
+            .join()
+            .unwrap();
+        }
+    }
     use std::os::unix::fs::OpenOptionsExt;
 
     static MACOS_DIRECTORIES: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
@@ -2751,53 +2825,6 @@ mod modes_macos_tests {
         let _scope = enter(Some(non_macos.clone()));
         observe_permission(dir.path(), &Err(error.error()), false);
         assert!(non_macos.permissions().is_empty());
-    }
-
-    #[test]
-    fn macos_first_touch_timeout_never_mutates_after_probe_release() {
-        let dir = tempfile::tempdir().unwrap();
-        let protected = dir.path().join("protected");
-        std::fs::create_dir(&protected).unwrap();
-        // Exercise aliased roots on every Unix host, not only macOS's /var.
-        let root = dir.path().join("alias");
-        std::os::unix::fs::symlink(&protected, &root).unwrap();
-        let target = root.join("file.txt");
-        std::fs::write(&target, "before").unwrap();
-        let fifo = dir.path().join("answer");
-        tests::fifo(&fifo);
-        let blocker = tests::block_directory_probe(&root, &fifo);
-        let mut config = crate::config::Config::default();
-        config.project_root = Some(root.clone());
-        config.storage_dir = Some(dir.path().join("store"));
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
-        let request: RawRequest = serde_json::from_value(
-            serde_json::json!({"id":"write","command":"write","file":target,"content":"after"}),
-        )
-        .unwrap();
-        let started = Instant::now();
-        // The access cap starts only after the helper is scheduled. A short
-        // whole-request budget can expire during unrelated preflight I/O and
-        // never reach the blocked directory, especially on a loaded test host.
-        // Preflight probes the canonical directory, not the request's alias.
-        let budget = Budget::after(Duration::from_secs(30))
-            .with_path_access_budget(&root.canonicalize().unwrap(), Duration::from_millis(100));
-        let response = with_budget(Some(budget.clone()), || {
-            crate::commands::write::handle_write(&request, &ctx)
-        });
-        assert_eq!(response.data["code"], "read_blocked", "{response:?}");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the blocked probe must hit its per-access cap, not the five-second default"
-        );
-        assert_eq!(blocker.fired.load(Ordering::Relaxed), 1);
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
-        tests::release_fifo(&fifo);
-        blocker
-            .finished
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the released helper finishes its read-only probe");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
-        assert!(!response.success);
     }
 }
 

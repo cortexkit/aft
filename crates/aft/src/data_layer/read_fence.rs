@@ -232,7 +232,10 @@ impl ReadGate {
 }
 
 pub(crate) fn with_gate<R>(gate: ReadGate, run: impl FnOnce() -> R) -> R {
-    FENCE.with(|fence| fence.borrow_mut().gate = Some(Arc::new(gate)));
+    // Gate assignment deliberately outlives this call, until the enclosing fence is restored.
+    let mut fence = capture();
+    fence.gate = Some(Arc::new(gate));
+    replace_fence(fence);
     run()
 }
 
@@ -258,16 +261,51 @@ pub(crate) fn capture() -> Fence {
     FENCE.with(|fence| fence.borrow().clone())
 }
 
-pub(crate) fn inherit<R>(fence: Fence, run: impl FnOnce() -> R) -> R {
-    struct Restore(Option<Fence>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            if let Some(previous) = self.0.take() {
-                FENCE.with(|fence| *fence.borrow_mut() = previous);
-            }
+struct FenceScope {
+    previous: Option<Fence>,
+}
+
+/// Keep the opaque helper carrier identical to the typed thread-local fence.
+/// A standalone gate remains installed even without an active request.
+fn replace_fence(fence: Fence) -> Fence {
+    let factory: Option<crate::bounded_io::CarryFactory> = if fence == Fence::default() {
+        None
+    } else {
+        let carried = fence.clone();
+        Some(Arc::new(move || {
+            let fence = carried.clone();
+            Ok(Box::new(move || Ok(Box::new(FenceScope::enter(fence)))))
+        }))
+    };
+    let previous = FENCE.with(|current| current.replace(fence));
+    let restore = previous.clone();
+    crate::bounded_io::replace_carry_factory(
+        factory,
+        Box::new(move || {
+            replace_fence(restore);
+        }),
+    );
+    previous
+}
+
+impl FenceScope {
+    fn enter(fence: Fence) -> Self {
+        Self {
+            previous: Some(replace_fence(fence)),
         }
     }
-    let _restore = Restore(Some(FENCE.with(|current| current.replace(fence))));
+}
+
+impl Drop for FenceScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            replace_fence(previous);
+        }
+    }
+}
+
+pub(crate) fn inherit<R>(fence: Fence, run: impl FnOnce() -> R) -> R {
+    let _scope = FenceScope::enter(fence);
     run()
 }
 
@@ -358,20 +396,9 @@ pub(crate) fn with_root<R>(
     id: &str,
     run: impl FnOnce() -> Result<R, Response>,
 ) -> Result<R, Response> {
-    struct Restore(Option<Fence>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            if let Some(previous) = self.0.take() {
-                FENCE.with(|fence| *fence.borrow_mut() = previous);
-            }
-        }
-    }
-    let _restore = Restore(Some(FENCE.with(|fence| {
-        let mut fence = fence.borrow_mut();
-        let previous = fence.clone();
-        fence.requests.push(id.to_owned());
-        previous
-    })));
+    let mut fence = capture();
+    fence.requests.push(id.to_owned());
+    let _scope = FenceScope::enter(fence);
     run()
 }
 
@@ -596,4 +623,152 @@ fn read_without_following(path: &Path) -> std::io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn assert_helper_fence() {
+        let expected = capture();
+        let expected_denied = denied_count();
+        let expected_carrier = expected != Fence::default();
+        assert_eq!(crate::bounded_io::has_carry_factory(), expected_carrier);
+        let pool = Arc::new(crate::bounded_io::IsolatedPool::new(2));
+        let nested_pool = pool.clone();
+        let caller_thread = std::thread::current().id();
+        let (helper, nested, denied, carried, helper_thread, nested_thread) = pool
+            .run(Path::new("."), None, move |_| {
+                let helper = capture();
+                let helper_thread = std::thread::current().id();
+                let nested = nested_pool.run(
+                    Path::new("."),
+                    Some(Instant::now() + Duration::from_secs(1)),
+                    |_| Ok((capture(), std::thread::current().id())),
+                )?;
+                Ok((
+                    helper,
+                    nested.0,
+                    denied_count(),
+                    crate::bounded_io::has_carry_factory(),
+                    helper_thread,
+                    nested.1,
+                ))
+            })
+            .unwrap();
+        assert_ne!(caller_thread, helper_thread);
+        assert_ne!(
+            helper_thread, nested_thread,
+            "nested work must dispatch another helper"
+        );
+        assert_eq!(helper, expected);
+        assert_eq!(nested, expected);
+        assert_eq!(denied, expected_denied);
+        assert_eq!(carried, expected_carrier);
+    }
+
+    fn gate() -> ReadGate {
+        let gate = ReadGate::new(PathBuf::from("root"), Arc::new(|_| false));
+        gate.denied.lock().insert(PathBuf::from("denied"));
+        gate
+    }
+
+    #[test]
+    fn default_fence_has_no_carrier_on_fresh_caller_or_helpers() {
+        std::thread::spawn(|| {
+            assert_eq!(capture(), Fence::default());
+            assert_helper_fence();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn every_fence_entry_carries_exact_state_to_nested_helpers() {
+        std::thread::spawn(|| {
+            with_root("outer", || {
+                assert_helper_fence();
+                with_gate(gate(), assert_helper_fence);
+                assert!(
+                    capture().gate.is_some(),
+                    "gate assignment must outlive with_gate"
+                );
+                assert_helper_fence();
+                let fence = capture().for_floor_filter_root(Path::new("filter-root"));
+                inherit(fence, assert_helper_fence);
+                assert_helper_fence();
+                with_floor_disclosure(|| {
+                    assert_helper_fence();
+                    Response::error("test", "test", "test")
+                });
+                assert_helper_fence();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(capture(), Fence::default());
+            assert_helper_fence();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn standalone_gate_and_denied_count_are_carried_after_with_gate() {
+        std::thread::spawn(|| {
+            with_gate(gate(), assert_helper_fence);
+            assert!(!active());
+            assert!(capture().gate.is_some());
+            assert_eq!(denied_count(), 1);
+            assert_helper_fence();
+            inherit(Fence::default(), assert_helper_fence);
+            assert_eq!(denied_count(), 1);
+            assert_helper_fence();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn helper_local_standalone_gate_cannot_leak_to_the_next_unconfined_job() {
+        std::thread::spawn(|| {
+            let pool = crate::bounded_io::IsolatedPool::new(1);
+            let first = pool
+                .run(Path::new("."), None, |_| {
+                    with_gate(gate(), || {});
+                    assert!(capture().gate.is_some());
+                    Ok(std::thread::current().id())
+                })
+                .unwrap();
+            let second = pool
+                .run(Path::new("."), None, |_| {
+                    assert_eq!(capture(), Fence::default());
+                    assert!(!crate::bounded_io::has_carry_factory());
+                    Ok(std::thread::current().id())
+                })
+                .unwrap();
+            assert_eq!(first, second, "the jobs must reuse the same helper");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn fence_and_carrier_restore_together_after_unwind() {
+        std::thread::spawn(|| {
+            let unwound = std::panic::catch_unwind(|| {
+                with_root::<()>("outer", || {
+                    with_gate(gate(), || {
+                        inherit(capture(), || panic!("leave inherited fence"))
+                    })
+                })
+                .unwrap();
+            });
+            assert!(unwound.is_err());
+            assert_eq!(capture(), Fence::default());
+            assert_helper_fence();
+        })
+        .join()
+        .unwrap();
+    }
 }

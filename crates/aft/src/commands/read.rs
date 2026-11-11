@@ -1494,7 +1494,7 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 /// Returns for binary files:
 ///   `{ binary: true, byte_size }`
 pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = crate::bounded_io::command(req, ctx, handle_read_inner);
+    let mut response = crate::bounded_io_command::command(req, ctx, handle_read_inner);
     if crate::context::call_context::active() {
         if let Some(attachments) = response
             .data

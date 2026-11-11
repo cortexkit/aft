@@ -135,7 +135,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.with_read_policy_snapshot(&req.id, || {
         crate::bounded_io::with_skip_disclosure(|| {
             crate::context::confinement::with_floor_disclosure(|| {
-                crate::bounded_io::command(req, ctx, handle_grep_inner)
+                crate::bounded_io_command::command(req, ctx, handle_grep_inner)
             })
         })
     })

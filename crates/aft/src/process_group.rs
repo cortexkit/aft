@@ -1,8 +1,8 @@
 //! Process-group isolation and cleanup for deadline-bound subprocesses.
 
-use std::process::{Child, Command};
 #[cfg(windows)]
 use std::process::Stdio;
+use std::process::{Child, Command};
 
 /// Apply Unix-specific isolation so a kill() on timeout terminates
 /// grandchildren too (e.g. `sh -c 'sleep 60'` orphaning `sleep`).
@@ -60,4 +60,30 @@ pub(crate) fn kill_process_tree(child: &mut Child) {
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn isolated_child_can_be_killed_and_reaped() {
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 60"]);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping -n 60 127.0.0.1 >NUL"]);
+            command
+        };
+        isolate_in_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        kill_process_tree(&mut child);
+        assert!(!child.wait().unwrap().success());
+    }
 }

@@ -103,8 +103,7 @@ pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
     let _restore = Restore(WALK_LIMIT.with(|current| current.replace(limit)));
     run()
 }
-/// Wall-clock budget for grep/glob index-unavailable fallback walks on the dispatch thread.
-pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
+pub(crate) use crate::bounded_io::FALLBACK_WALK_BUDGET;
 const FALLBACK_WALK_RETURN_MARGIN: Duration = Duration::from_millis(100);
 
 fn fallback_walk_budget() -> Duration {

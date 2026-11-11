@@ -71,7 +71,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn handle_outline_with_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = crate::bounded_io::command(req, ctx, handle_outline_inner);
+    let mut response = crate::bounded_io_command::command(req, ctx, handle_outline_inner);
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
     super::read_manifest::normalize_response_content_files(ctx, &mut response.data);
     response
@@ -2674,7 +2674,7 @@ fn requested_outline_files(files: &[serde_json::Value]) -> (Vec<&str>, bool) {
 /// The `files` entries an outline request examines: none for a revision,
 /// files-mode or directory outline (those branches never read the list),
 /// otherwise the entries [`requested_outline_files`] keeps. The pre-handler
-/// access probe in [`crate::bounded_io::command`] uses this so that it never
+/// access probe in [`crate::bounded_io_command::command`] uses this so that it never
 /// probes an entry the handler skips.
 pub(crate) fn outline_examined_files(req: &RawRequest) -> Vec<&str> {
     if crate::revision_read::requested_ref(req).is_some()
@@ -6432,11 +6432,11 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             params["id"] = serde_json::json!("probe-bound");
             params["command"] = serde_json::json!("outline");
             let request: RawRequest = serde_json::from_value(params).unwrap();
-            crate::bounded_io::COMMAND_INPUT_PROBES.with(|probes| probes.set(0));
+            crate::bounded_io_command::COMMAND_INPUT_PROBES.with(|probes| probes.set(0));
             let response = handle_outline(&request, &ctx);
             assert!(response.success, "{response:?}");
             assert_eq!(
-                crate::bounded_io::COMMAND_INPUT_PROBES.with(std::cell::Cell::get),
+                crate::bounded_io_command::COMMAND_INPUT_PROBES.with(std::cell::Cell::get),
                 expected
             );
         }

@@ -42,7 +42,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let _pin = false.then(|| ctx.pin_config_to(config));
     ctx.with_read_policy_snapshot(&req.id, || {
         crate::context::confinement::with_floor_disclosure(|| {
-            crate::bounded_io::command(req, ctx, handle_glob_inner)
+            crate::bounded_io_command::command(req, ctx, handle_glob_inner)
         })
     })
 }
