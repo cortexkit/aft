@@ -155,7 +155,7 @@ fn child_gap(path: &str, reason: Option<String>) -> Value {
 /// unbound. The returned executor and context keep it that way.
 fn refusing_executor() -> (
     crate::executor::RootMaintenanceExecutor,
-    crate::executor::Executor,
+    crate::context::Executor,
     Arc<AppContext>,
     tempfile::TempDir,
 ) {
@@ -166,7 +166,7 @@ fn refusing_executor() -> (
         crate::config::Config::default(),
     ));
     ctx.mark_subc_bound();
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
     assert!(executor.register_actor(root_id, Arc::clone(&ctx)));
     let maintenance = ctx
@@ -710,7 +710,7 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     };
     let _session = parent_session(&parent);
     parent.mark_subc_bound();
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
     assert!(executor.register_actor(root_id, Arc::clone(&parent)));
     parent.mark_subc_unbound();

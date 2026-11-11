@@ -14,8 +14,9 @@ use std::sync::{
 use parking_lot::Mutex;
 
 use crate::config::{Config, IndexKind};
+use crate::context::Executor;
 use crate::context::{App, AppContext};
-use crate::executor::{Executor, Lane, MaintenanceCoalesceKey};
+use crate::executor::{Lane, MaintenanceCoalesceKey};
 use crate::path_identity::ProjectRootId;
 use crate::root_cache;
 use crate::standing_roots::{StandingRootEntry, StandingRoots};

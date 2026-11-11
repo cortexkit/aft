@@ -11,7 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::context::AppContext;
-use aft::executor::{Executor, ExecutorConfig, Lane};
+use aft::context::Executor;
+use aft::executor::{ExecutorConfig, Lane};
 use aft::path_identity::ProjectRootId;
 use aft::protocol::{ProgressFrame, ProgressKind, PushFrame, RawRequest, Response};
 use aft::subc::SubcLifecycleEvent;

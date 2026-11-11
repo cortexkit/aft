@@ -10,6 +10,14 @@ use std::{
 use tempfile::TempDir;
 
 use super::*;
+use crate::context::AppContext;
+type Executor = super::Executor<AppContext>;
+type SchedulerState = super::SchedulerState<AppContext>;
+type ActorState = super::ActorState<AppContext>;
+type QueuedJob = super::QueuedJob<AppContext>;
+type SchedulerEvent = super::SchedulerEvent<AppContext>;
+type DispatchLoopLiveness = super::DispatchLoopLiveness<AppContext>;
+
 use crate::{
     config::Config,
     inspect::{InspectCache, InspectCacheError},

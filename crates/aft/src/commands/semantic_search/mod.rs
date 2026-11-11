@@ -11128,7 +11128,8 @@ mod tests {
 
     #[test]
     fn first_text_index_deferred_search_releases_executor_for_publication() {
-        use crate::executor::{Executor, Lane};
+        use crate::context::Executor;
+        use crate::executor::Lane;
         use crate::path_identity::ProjectRootId;
         use crate::response_finalize::DispatchOutcome;
         let (_dir, root, ctx) = first_text_index_fixture();

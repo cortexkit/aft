@@ -237,8 +237,15 @@ use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
 use crate::data_layer::ignore_rules as gitignore_state;
+#[path = "context_executor.rs"]
+mod executor_adapter;
 #[path = "context_index_host.rs"]
 mod index_host;
+
+pub type Executor = crate::executor::Executor<AppContext>;
+pub type ExecutorJob = crate::executor::ExecutorJob<AppContext>;
+pub type RepeatableJob = crate::executor::RepeatableJob<AppContext>;
+pub type DispatchLoopLiveness = crate::executor::DispatchLoopLiveness<AppContext>;
 pub(crate) use gitignore_state::IgnoreRuleChange;
 
 // The shared ignore-rule definition every project walker applies; see
@@ -4405,7 +4412,9 @@ impl AppContext {
         let project_root = config.project_root.clone();
         drop(config);
         let new_registry = crate::compress::build_registry_for_paths(
-            harness, storage_dir.as_deref(), project_root.as_deref(),
+            harness,
+            storage_dir.as_deref(),
+            project_root.as_deref(),
         );
         self.filter_registry_rebuild_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4431,7 +4440,9 @@ impl AppContext {
         let project_root = config.project_root.clone();
         drop(config);
         let new_registry = crate::compress::build_registry_for_paths(
-            harness, storage_dir.as_deref(), project_root.as_deref(),
+            harness,
+            storage_dir.as_deref(),
+            project_root.as_deref(),
         );
         self.filter_registry_rebuild_count
             .fetch_add(1, Ordering::SeqCst);

@@ -2371,7 +2371,7 @@ fn run_custody(
 /// task, then stores and returns the answer. When no bound root holds it, the
 /// custody root checks the task's record instead (see [`kill_withdrawn_call`]).
 async fn kill_on_owning_root(
-    executor: &std::sync::Arc<crate::executor::Executor>,
+    executor: &std::sync::Arc<crate::context::Executor>,
     custody_root: crate::path_identity::ProjectRootId,
     kill: WithdrawKill,
     op: &str,
@@ -2566,7 +2566,7 @@ impl LedgerEdge {
         self: &std::sync::Arc<Self>,
         decoded: super::DecodedFrame,
         routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
-        executor: &std::sync::Arc<crate::executor::Executor>,
+        executor: &std::sync::Arc<crate::context::Executor>,
         writer: &super::WriterSender,
         metrics: &std::sync::Arc<super::DispatchPathMetrics>,
     ) -> Result<(), super::DecodedFrame> {
@@ -3067,7 +3067,7 @@ impl LedgerEdge {
         op: &str,
         body: &Value,
         identity: super::RouteIdentity,
-        executor: &std::sync::Arc<crate::executor::Executor>,
+        executor: &std::sync::Arc<crate::context::Executor>,
         writer: &super::WriterSender,
         metrics: &std::sync::Arc<super::DispatchPathMetrics>,
     ) {
@@ -3454,7 +3454,7 @@ impl LedgerEdge {
     /// result in the call ledger for replay and late_results.
     pub(super) async fn detach_shells(
         &self,
-        executor: &std::sync::Arc<crate::executor::Executor>,
+        executor: &std::sync::Arc<crate::context::Executor>,
         route: Option<super::RouteChannel>,
     ) {
         self.received
@@ -3679,7 +3679,7 @@ impl LedgerEdge {
         self: &std::sync::Arc<Self>,
         decoded: super::DecodedFrame,
         asks: &std::collections::HashMap<super::ReverseCorrKey, super::PendingBashAsk>,
-        executor: &std::sync::Arc<crate::executor::Executor>,
+        executor: &std::sync::Arc<crate::context::Executor>,
     ) -> Result<(), super::DecodedFrame> {
         use super::*;
         use crate::db::call_ledger::{self as ledger, State};
@@ -3777,7 +3777,7 @@ impl LedgerEdge {
     pub(super) fn proxy(
         self: &std::sync::Arc<Self>,
         actual: super::WriterSender,
-        executor: std::sync::Arc<crate::executor::Executor>,
+        executor: std::sync::Arc<crate::context::Executor>,
         _metrics: std::sync::Arc<super::DispatchPathMetrics>,
     ) -> (super::WriterSender, tokio::task::JoinHandle<()>) {
         use super::*;
@@ -11494,7 +11494,7 @@ mod ledger_terminal_tests {
         ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(
             crate::db::open(&_dir.path().join("aft.db")).unwrap(),
         )));
-        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        let executor = std::sync::Arc::new(crate::context::Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
         let mut identity = test_support::route_identity(&root, "session");
         let inner = std::sync::Arc::get_mut(&mut identity.0).unwrap();
@@ -11561,7 +11561,7 @@ mod ledger_terminal_tests {
         ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(
             crate::db::open(&path).unwrap(),
         )));
-        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        let executor = std::sync::Arc::new(crate::context::Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
         let mut identity = test_support::route_identity(&root, "session");
         std::sync::Arc::get_mut(&mut identity.0).unwrap().role = RouteRole::ToolProviderV1;
@@ -11769,7 +11769,7 @@ mod ledger_terminal_tests {
         ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(
             crate::db::open(&dir.path().join("aft.db")).unwrap(),
         )));
-        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        let executor = std::sync::Arc::new(crate::context::Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -11989,7 +11989,7 @@ mod ledger_terminal_tests {
             crate::db::open(&_dir.path().join("aft.db")).unwrap(),
         )));
         assert!(ctx.db().is_some());
-        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        let executor = std::sync::Arc::new(crate::context::Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

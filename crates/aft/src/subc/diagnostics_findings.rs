@@ -134,7 +134,7 @@ pub(super) async fn dispatch(
     scope: Option<&ScopeStamp>,
     envelope: &Value,
     cache: &super::HealthRollupCache,
-    executor: &crate::executor::Executor,
+    executor: &crate::context::Executor,
 ) -> Result<(), super::SubcError> {
     match reply(scope, envelope, cache, executor) {
         Err(error) => super::send_provider_error(tx, metrics, frame, error).await,
@@ -158,7 +158,7 @@ fn reply(
     scope: Option<&ScopeStamp>,
     envelope: &Value,
     cache: &super::HealthRollupCache,
-    executor: &crate::executor::Executor,
+    executor: &crate::context::Executor,
 ) -> Result<Value, ErrorBody> {
     let now = now_ms()?;
     admit(scope, now)?;
@@ -993,7 +993,7 @@ mod tests {
             Some(&scope(ScopeKind::Worker)),
             &envelope,
             &super::super::HealthRollupCache::new(),
-            &crate::executor::Executor::new(),
+            &crate::context::Executor::new(),
         )
         .await
         .unwrap();
@@ -1388,7 +1388,7 @@ mod tests {
     #[test]
     fn diagnostics_findings_serving_replies_match_vector_shape_and_windows() {
         let cache = super::super::HealthRollupCache::new();
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let head = scope(ScopeKind::Head);
         let mut flow = scope(ScopeKind::Ephemeral);
         flow.attributes.agent_id = None;

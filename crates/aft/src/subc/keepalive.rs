@@ -95,8 +95,8 @@ impl Drop for TestClock {
 
 pub(super) fn job(
     progress: Option<Progress>,
-    job: crate::executor::ExecutorJob,
-) -> crate::executor::ExecutorJob {
+    job: crate::context::ExecutorJob,
+) -> crate::context::ExecutorJob {
     Box::new(move |ctx| {
         if let (Some(progress), Some(token)) =
             (progress, crate::executor::current_job_cancellation())

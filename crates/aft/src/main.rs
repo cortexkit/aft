@@ -508,7 +508,7 @@ fn main() {
         if !aft::subc::settings_gate_requested() {
             aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
         }
-        let executor = Arc::new(aft::executor::Executor::new());
+        let executor = Arc::new(aft::context::Executor::new());
         install_subc_signal_handler(
             Arc::clone(&executor),
             Arc::clone(&ctx),
@@ -1069,7 +1069,7 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_lsp_events(runtime);
         aft::runtime_drain::shutdown_idle_lsp(runtime);
     }
-    aft::logging::perf_tick(None);
+    aft::logging::perf_tick::<AppContext>(None);
 }
 
 fn drain_runtime_events_cooperatively(
@@ -1106,7 +1106,7 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     aft::runtime_drain::drain_on_demand_callgraph_build(runtime);
     aft::runtime_drain::drain_lsp_events(runtime);
     aft::runtime_drain::shutdown_idle_lsp(runtime);
-    aft::logging::perf_tick(None);
+    aft::logging::perf_tick::<AppContext>(None);
     aft::runtime_drain::spawn_standalone_log_maintenance();
     aft::db::write_ledger::maybe_spawn_fold(runtime.db());
     aft::bash_background::persistence::retention::maybe_spawn_retention(
@@ -1320,7 +1320,7 @@ fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspC
 
 #[cfg(unix)]
 fn install_subc_signal_handler(
-    executor: Arc<aft::executor::Executor>,
+    executor: Arc<aft::context::Executor>,
     initial_ctx: Arc<AppContext>,
     lsp_children: LspChildRegistry,
 ) {
@@ -1364,7 +1364,7 @@ fn install_subc_signal_handler(
 
 #[cfg(not(unix))]
 fn install_subc_signal_handler(
-    _executor: Arc<aft::executor::Executor>,
+    _executor: Arc<aft::context::Executor>,
     initial_ctx: Arc<AppContext>,
     lsp_children: LspChildRegistry,
 ) {

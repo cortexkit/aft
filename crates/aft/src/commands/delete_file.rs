@@ -147,7 +147,8 @@ mod incident_tests {
     }
 
     fn bind_beside_delete(inside: bool) {
-        use crate::executor::{Executor, Lane};
+        use crate::context::Executor;
+        use crate::executor::Lane;
         use crate::path_identity::ProjectRootId;
         use crate::response_finalize::DispatchOutcome;
         use std::sync::Arc;

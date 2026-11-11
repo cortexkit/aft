@@ -4137,7 +4137,8 @@ fn bounded_scoped_inspect_slow_server_returns_partial_before_transport_deadline(
 
 #[test]
 fn bounded_scoped_inspect_abandoned_pull_releases_reader_for_same_root_rebind() {
-    use aft::executor::{Executor, Lane};
+    use aft::context::Executor;
+    use aft::executor::Lane;
     use aft::path_identity::ProjectRootId;
 
     let (_temp, root, _lib) = single_crate_fixture("bounded-abandoned-inspect");

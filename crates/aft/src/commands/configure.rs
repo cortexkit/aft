@@ -7167,7 +7167,7 @@ mod tests {
                 ..Config::default()
             },
         ));
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let root_id = crate::path_identity::ProjectRootId::from_path(&canonical_root)
             .expect("canonical project root id");
         assert!(executor.register_actor(root_id.clone(), Arc::clone(&ctx)));

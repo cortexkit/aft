@@ -27,8 +27,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
+use crate::context::Executor;
 use crate::context::{App, AppContext, ProgressSender, RootHealthSnapshot};
-use crate::executor::{Executor, JobCancellation, Lane, PreExecutionCancelOutcome};
+use crate::executor::{JobCancellation, Lane, PreExecutionCancelOutcome};
 use crate::fleet_status::{spawn_fleet_status_dial, FleetStatusClient};
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
@@ -1031,7 +1032,7 @@ fn submit_active_tool_call(
     detach_policy: RouteDetachPolicy,
     tool: &str,
     request: RequestFrameMeta,
-    job: crate::executor::ExecutorJob,
+    job: crate::context::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
     let job = queued_call::guard(request.deadline, tool, request_id.clone(), job);
     let job = push::routed_progress_job(route, corr, &request_id, job);
@@ -1075,7 +1076,7 @@ fn resubmit_active_tool_call(
     lane: Lane,
     request_id: String,
     tool: &str,
-    job: crate::executor::ExecutorJob,
+    job: crate::context::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
     let mut calls = active
         .lock()
@@ -2502,7 +2503,7 @@ fn submit_ignore_rule_load(executor: &Executor, root_id: &ProjectRootId) {
         root_id.as_path().to_string_lossy()
     );
     let response_id = request_id.clone();
-    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
         let published = crate::commands::configure::load_ignore_rules_if_unpublished(ctx);
         Response::success(response_id, json!({ "published": published }))
     });
@@ -2529,7 +2530,7 @@ fn submit_unbound_teardown_persist(executor: &Executor, root_id: &ProjectRootId)
         root_id.as_path().to_string_lossy()
     );
     let response_id = request_id.clone();
-    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
         let persisted = ctx.persist_unbound_artifacts_for_teardown();
         Response::success(response_id, json!({ "persisted": persisted }))
     });
@@ -10520,7 +10521,7 @@ impl PlainToolRun {
         ask_route: crate::access_policy::AskRoute,
         mut phase_trace: PhaseTrace,
         done: oneshot::Sender<ToolCallCompletion>,
-    ) -> crate::executor::ExecutorJob {
+    ) -> crate::context::ExecutorJob {
         if self.approved_io_window.is_some() {
             if let Some(key) = &self.ledger_key {
                 rich_ui::display::person_answered(key);
@@ -12105,7 +12106,7 @@ async fn handle_tool_call_with_capabilities(
         // them for its whole life.
         let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
         let fetch_reply_deadline = reply_budget.deadline;
-        let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
+        let job: crate::context::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(fetch_reply_deadline);
             let _deferred_wake_scope = completion_wake.install();
@@ -12808,7 +12809,7 @@ fn submit_maintenance_job(
     // Keeping every drain on MaintenanceCommit lets interactive reads and lazy
     // HeavyInit queries run while maintenance converges after the bind ack.
     let lane = Lane::MaintenanceCommit;
-    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
         let outcome = match kind {
             MaintenanceDrainKind::Watcher => {
                 let drained = runtime_drain::drain_watcher_events_bounded(

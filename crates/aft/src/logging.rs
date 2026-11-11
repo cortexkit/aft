@@ -3,7 +3,7 @@
 //! Rust module processes use one file per PID. That avoids cross-process rename
 //! races while preserving a single greppable directory for all AFT activity.
 
-use crate::executor::Executor;
+use crate::executor::{Executor, ExecutorContext};
 use crate::process_identity::is_process_alive;
 use crate::tool_progress::{ToolCallPhaseDurations, WaitingOn};
 use sha2::{Digest, Sha256};
@@ -2476,7 +2476,7 @@ fn slow_phase_time(wall: Duration, cpu: Option<Duration>) -> String {
 ///
 /// The transport may call this every loop turn; an atomic deadline keeps all
 /// executor sampling and reporter locking off that path between drain ticks.
-pub fn perf_tick(executor: Option<&Executor>) {
+pub fn perf_tick<C: ExecutorContext>(executor: Option<&Executor<C>>) {
     if !perf_sample_due() {
         return;
     }
@@ -2494,7 +2494,7 @@ pub fn perf_tick(executor: Option<&Executor>) {
             })
     });
 
-    let completion_counts = executor.map_or((0, 0), Executor::completion_counts);
+    let completion_counts = executor.map_or((0, 0), Executor::<C>::completion_counts);
     report_perf_tick(&PERF, sample, completion_counts);
 }
 

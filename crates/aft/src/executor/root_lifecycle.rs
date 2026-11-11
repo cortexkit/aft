@@ -60,7 +60,7 @@ impl Drop for LifecycleLockMarker {
 /// root work. The lock covers only the bounded decision and worker-start commit;
 /// call sites must not wait for worker completion or run a scan while holding it.
 #[derive(Clone, Debug)]
-pub(crate) struct SubcLifecycleAdmission {
+pub struct SubcLifecycleAdmission {
     pub(crate) unbound: Arc<parking_lot::Mutex<bool>>,
     /// Mirrors `unbound` for cancellation checkpoints. A bound root takes the
     /// atomic fast path; an unbound root still confirms grace and rebind under

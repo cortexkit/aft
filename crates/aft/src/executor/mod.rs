@@ -1,5 +1,8 @@
+mod context;
 pub(crate) mod root_lifecycle;
 mod single_flight;
+pub use context::{ExecutorApp, ExecutorContext};
+pub use root_lifecycle::SubcLifecycleAdmission;
 
 #[cfg(test)]
 mod tests;
@@ -19,7 +22,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use tokio::sync::oneshot;
 
 use crate::lock_diagnostics::{LockDiagnostics, TrackedMutex};
-use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Response};
+use crate::{path_identity::ProjectRootId, protocol::Response};
 
 // Mutation lock order: the executor's per-root mutating lane and context epoch
 // gate precede source-file admission, then backup and checkpoint locks. Never
@@ -130,7 +133,7 @@ pub(crate) enum MaintenanceCoalesceKey {
     ConfigReload,
 }
 
-pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>;
+pub type ExecutorJob<C> = Box<dyn FnOnce(&C) -> Response + Send + 'static>;
 
 /// Age at which a queued interactive mutating job (route binds, edits) jumps
 /// ahead of pure reads in interactive admission. Reads-first admission would
@@ -444,7 +447,7 @@ impl DispatchLivenessAtomics {
 /// watchdog from its own thread. Everything here is an atomic or a channel
 /// length read, so reading it never waits on the scheduler state mutex that a
 /// stalled loop may be blocked on or holding.
-pub struct DispatchLoopLiveness {
+pub struct DispatchLoopLiveness<C: ExecutorContext> {
     origin: Instant,
     /// Milliseconds since `origin` when the loop last became ready to receive
     /// or finished an event.
@@ -454,11 +457,11 @@ pub struct DispatchLoopLiveness {
     in_event: AtomicBool,
     /// Clone of the scheduler's event receiver. Readiness waits and watchdog
     /// queue checks never dequeue; only the scheduler consumes events.
-    event_rx: Receiver<SchedulerEvent>,
+    event_rx: Receiver<SchedulerEvent<C>>,
 }
 
-impl DispatchLoopLiveness {
-    fn new(event_rx: Receiver<SchedulerEvent>) -> Self {
+impl<C: ExecutorContext> DispatchLoopLiveness<C> {
+    fn new(event_rx: Receiver<SchedulerEvent<C>>) -> Self {
         Self {
             origin: Instant::now(),
             last_progress_ms: AtomicU64::new(0),
@@ -1052,7 +1055,7 @@ pub(crate) fn install_actor_waiting_writers_for_test(
 /// a bind beside a running maintenance job or interactive readers with only a
 /// shared hold on the actor's epoch gate; when the configure finds it must change the root, the
 /// run is discarded and the same job is queued again as an exclusive writer.
-pub type RepeatableJob = Arc<dyn Fn(&AppContext) -> Response + Send + Sync + 'static>;
+pub type RepeatableJob<C> = Arc<dyn Fn(&C) -> Response + Send + Sync + 'static>;
 
 thread_local! {
     /// True while the job on this worker is a route bind holding its actor's
@@ -1152,21 +1155,37 @@ struct RunningMutatingJob {
 }
 
 /// Concurrent scheduler-dispatch executor.
-pub struct Executor {
-    inner: Arc<ExecutorInner>,
+pub struct Executor<C: ExecutorContext> {
+    inner: Arc<ExecutorInner<C>>,
 }
 
 /// A root may submit maintenance without keeping its owning executor alive.
 /// The weak link avoids a cycle through the executor's actor context.
 #[derive(Clone)]
 pub struct RootMaintenanceExecutor {
-    inner: std::sync::Weak<ExecutorInner>,
+    inner: Arc<dyn MaintenanceSubmit>,
+}
+
+type MaintenanceJob = Box<dyn FnOnce() -> Response + Send + 'static>;
+
+trait MaintenanceSubmit: Send + Sync {
+    fn submit_maintenance(
+        &self,
+        request_id: &str,
+        lane: Lane,
+        cancellation: JobCancellation,
+        job: MaintenanceJob,
+    ) -> bool;
+}
+
+struct TypedMaintenanceExecutor<C: ExecutorContext> {
+    inner: std::sync::Weak<ExecutorInner<C>>,
     root_id: ProjectRootId,
 }
 
-struct SubmissionExecutor(Option<Executor>);
+struct SubmissionExecutor<C: ExecutorContext>(Option<Executor<C>>);
 
-impl Drop for SubmissionExecutor {
+impl<C: ExecutorContext> Drop for SubmissionExecutor<C> {
     fn drop(&mut self) {
         let executor = self.0.take();
         if current_thread_is_executor_worker() {
@@ -1179,6 +1198,14 @@ impl Drop for SubmissionExecutor {
 }
 
 impl RootMaintenanceExecutor {
+    fn new<C: ExecutorContext>(
+        inner: std::sync::Weak<ExecutorInner<C>>,
+        root_id: ProjectRootId,
+    ) -> Self {
+        Self {
+            inner: Arc::new(TypedMaintenanceExecutor::<C> { inner, root_id }),
+        }
+    }
     /// Admits `job` as this root's maintenance and runs it at once on the
     /// calling thread, with the root's cancellation installed as the current
     /// job's: `cancellation` gains the root and its bind lifecycle, so a root
@@ -1204,13 +1231,26 @@ impl RootMaintenanceExecutor {
         request_id: &str,
         lane: Lane,
         cancellation: JobCancellation,
-        job: ExecutorJob,
+        job: MaintenanceJob,
+    ) -> bool {
+        self.inner
+            .submit_maintenance(request_id, lane, cancellation, job)
+    }
+}
+
+impl<C: ExecutorContext> MaintenanceSubmit for TypedMaintenanceExecutor<C> {
+    fn submit_maintenance(
+        &self,
+        request_id: &str,
+        lane: Lane,
+        cancellation: JobCancellation,
+        job: MaintenanceJob,
     ) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
         // Dropped off-worker if it turns out to be the executor's last owner.
-        let owner = SubmissionExecutor(Some(Executor { inner }));
+        let owner = SubmissionExecutor::<C>(Some(Executor::<C> { inner }));
         let executor = owner.0.as_ref().unwrap();
         // A root stat can stall on disk I/O; probe it before taking the
         // scheduler lock, as a queued submission does.
@@ -1228,7 +1268,7 @@ impl RootMaintenanceExecutor {
                     (Arc::clone(&actor.ctx), token)
                 })
         };
-        let Some((ctx, token)) = admitted.filter(|_| root_exists) else {
+        let Some((_ctx, token)) = admitted.filter(|_| root_exists) else {
             log::debug!(
                 "executor refused maintenance: request_id={request_id} lane={lane:?} root={} \
                  (unbound, missing or unregistered)",
@@ -1244,12 +1284,12 @@ impl RootMaintenanceExecutor {
             self.root_id.as_path().display()
         );
         let _installed = JobCancellationContextGuard::install(Some(token));
-        let _ = job(&ctx);
+        let _ = job();
         true
     }
 }
 
-impl Executor {
+impl<C: ExecutorContext> Executor<C> {
     pub fn new() -> Self {
         Self::with_config(ExecutorConfig::default())
     }
@@ -1257,7 +1297,7 @@ impl Executor {
     pub fn with_config(config: ExecutorConfig) -> Self {
         let effective = config.effective();
         let state = Arc::new(TrackedMutex::new(
-            SchedulerState::new(effective.clone()),
+            SchedulerState::<C>::new(effective.clone()),
             file!(),
         ));
         let heavy = Arc::new(HeavySemaphore::new(effective.heavy_permits));
@@ -1267,7 +1307,7 @@ impl Executor {
         let dispatch_liveness = Arc::new(DispatchLivenessAtomics::new());
         let (run_tx, run_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        let dispatch_loop_liveness = Arc::new(DispatchLoopLiveness::new(event_rx.clone()));
+        let dispatch_loop_liveness = Arc::new(DispatchLoopLiveness::<C>::new(event_rx.clone()));
 
         let scheduler_event_tx = event_tx.clone();
         let scheduler_loop_liveness = Arc::clone(&dispatch_loop_liveness);
@@ -1312,7 +1352,7 @@ impl Executor {
         }
 
         Self {
-            inner: Arc::new(ExecutorInner {
+            inner: Arc::new(ExecutorInner::<C> {
                 state,
                 event_tx,
                 scheduler_handle: Mutex::new(Some(scheduler_handle)),
@@ -1333,14 +1373,12 @@ impl Executor {
     ///
     /// Existing actors keep their current context and scheduler state; subc
     /// routing reuses them and reconfigures through the Mutating lane
-    /// rather than replacing the per-root [`AppContext`]. Returns `true` when a
+    /// rather than replacing the per-root [`ExecutorContext`]. Returns `true` when a
     /// new actor was inserted.
-    pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<AppContext>) -> bool {
+    pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<C>) -> bool {
         ctx.bind_status_context();
-        let maintenance = RootMaintenanceExecutor {
-            inner: Arc::downgrade(&self.inner),
-            root_id: root_id.clone(),
-        };
+        let maintenance =
+            RootMaintenanceExecutor::new(Arc::downgrade(&self.inner), root_id.clone());
         let memory_root = root_id.as_path().to_path_buf();
         let inserted = {
             let mut state = self.inner.state.lock();
@@ -1350,7 +1388,7 @@ impl Executor {
                 state.actor_order.push(root_id.clone());
                 state
                     .actors
-                    .insert(root_id, ActorState::new(Arc::clone(&ctx)));
+                    .insert(root_id, ActorState::<C>::new(Arc::clone(&ctx)));
                 true
             }
         };
@@ -1370,7 +1408,7 @@ impl Executor {
     ///
     /// This is intentionally minimal: subc uses it only for a just-created
     /// RouteBind actor whose configure failed before any route was installed, so
-    /// there is no in-flight work to quiesce. The removed [`AppContext`] is
+    /// there is no in-flight work to quiesce. The removed [`ExecutorContext`] is
     /// dropped after releasing the scheduler lock so watcher/LSP teardown never
     /// runs under that mutex.
     pub fn remove_actor(&self, root_id: &ProjectRootId) {
@@ -1396,7 +1434,10 @@ impl Executor {
     /// Return true only when the actor has no queued or running executor work.
     pub fn actor_is_idle(&self, root_id: &ProjectRootId) -> bool {
         let state = self.inner.state.lock();
-        state.actors.get(root_id).is_some_and(ActorState::is_idle)
+        state
+            .actors
+            .get(root_id)
+            .is_some_and(ActorState::<C>::is_idle)
     }
 
     /// Idle probe for maintenance sweeps that waits at most
@@ -1405,7 +1446,12 @@ impl Executor {
     /// the next sweep without stalling the module loop.
     pub fn try_actor_is_idle(&self, root_id: &ProjectRootId) -> Option<bool> {
         let state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
-        Some(state.actors.get(root_id).is_some_and(ActorState::is_idle))
+        Some(
+            state
+                .actors
+                .get(root_id)
+                .is_some_and(ActorState::<C>::is_idle),
+        )
     }
 
     /// Forget an idle actor and drop its root-scoped registries off the scheduler
@@ -1414,7 +1460,11 @@ impl Executor {
     pub fn retire_idle_actor_in_background(&self, root_id: &ProjectRootId) -> bool {
         let removed = {
             let mut state = self.inner.state.lock();
-            if !state.actors.get(root_id).is_some_and(ActorState::is_idle) {
+            if !state
+                .actors
+                .get(root_id)
+                .is_some_and(ActorState::<C>::is_idle)
+            {
                 return false;
             }
             state.actor_order.retain(|actor_root| actor_root != root_id);
@@ -1429,7 +1479,11 @@ impl Executor {
     pub fn try_retire_idle_actor_in_background(&self, root_id: &ProjectRootId) -> Option<bool> {
         let removed = {
             let mut state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
-            if !state.actors.get(root_id).is_some_and(ActorState::is_idle) {
+            if !state
+                .actors
+                .get(root_id)
+                .is_some_and(ActorState::<C>::is_idle)
+            {
                 return Some(false);
             }
             state.actor_order.retain(|actor_root| actor_root != root_id);
@@ -1441,7 +1495,7 @@ impl Executor {
     fn finish_idle_actor_retirement(
         &self,
         root_id: &ProjectRootId,
-        removed: Option<ActorState>,
+        removed: Option<ActorState<C>>,
     ) -> bool {
         let Some(actor) = removed else {
             return false;
@@ -1492,7 +1546,7 @@ impl Executor {
             .lock()
             .actors
             .get_mut(root_id)
-            .map(ActorState::cancel_queued_root_work)
+            .map(ActorState::<C>::cancel_queued_root_work)
             .unwrap_or(0);
         self.wake_scheduler();
         cancelled
@@ -1505,7 +1559,7 @@ impl Executor {
         let mut cancelled = state
             .actors
             .get_mut(root_id)
-            .map(ActorState::cancel_queued_root_work)
+            .map(ActorState::<C>::cancel_queued_root_work)
             .unwrap_or(0);
         if let Some(actor) = state.actors.get_mut(root_id) {
             for lane in ALL_LANES {
@@ -1545,7 +1599,7 @@ impl Executor {
 
     /// Snapshot one actor context without retaining the scheduler lock while
     /// maintenance drops root-scoped resources.
-    pub fn actor_context(&self, root_id: &ProjectRootId) -> Option<Arc<AppContext>> {
+    pub fn actor_context(&self, root_id: &ProjectRootId) -> Option<Arc<C>> {
         let state = self.inner.state.lock();
         state
             .actors
@@ -1562,7 +1616,7 @@ impl Executor {
     /// loop's maintenance sweeps use this and retry on the next sweep. Request
     /// routing keeps the blocking form, because there a missing actor and a
     /// busy scheduler mean different things.
-    pub fn try_actor_context(&self, root_id: &ProjectRootId) -> Option<Option<Arc<AppContext>>> {
+    pub fn try_actor_context(&self, root_id: &ProjectRootId) -> Option<Option<Arc<C>>> {
         let state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
         Some(
             state
@@ -1584,7 +1638,7 @@ impl Executor {
     ///
     /// The returned [`Arc`]s keep contexts alive after the scheduler lock is
     /// released, so callers can run teardown without holding executor state.
-    pub fn actor_contexts(&self) -> Vec<Arc<AppContext>> {
+    pub fn actor_contexts(&self) -> Vec<Arc<C>> {
         let state = self.inner.state.lock();
         state
             .actors
@@ -1594,7 +1648,7 @@ impl Executor {
     }
 
     /// Snapshot the registered root ids paired with their actor contexts.
-    pub fn actor_entries(&self) -> Vec<(ProjectRootId, Arc<AppContext>)> {
+    pub fn actor_entries(&self) -> Vec<(ProjectRootId, Arc<C>)> {
         let state = self.inner.state.lock();
         state
             .actors
@@ -1606,7 +1660,7 @@ impl Executor {
     /// Non-blocking variant for the health path: the probe reply must stay
     /// cheap under any load, so it skips the actor list (reported as busy)
     /// rather than waiting on the scheduler state lock.
-    pub fn try_actor_entries(&self) -> Option<Vec<(ProjectRootId, Arc<AppContext>)>> {
+    pub fn try_actor_entries(&self) -> Option<Vec<(ProjectRootId, Arc<C>)>> {
         let state = self.inner.state.try_lock()?;
         Some(
             state
@@ -1634,7 +1688,7 @@ impl Executor {
         root_id: ProjectRootId,
         lane: Lane,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
     ) -> CompletionHandle {
         let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
         self.submit_with_completion(
@@ -1653,7 +1707,7 @@ impl Executor {
         root_id: ProjectRootId,
         lane: Lane,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
     ) -> oneshot::Receiver<Response> {
         let (completion_tx, completion_rx) = oneshot::channel();
         self.submit_with_completion(
@@ -1677,7 +1731,7 @@ impl Executor {
         root_id: ProjectRootId,
         lane: Lane,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
     ) -> (oneshot::Receiver<Response>, JobCancellation) {
         let cancellation = JobCancellation::new();
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -1704,7 +1758,7 @@ impl Executor {
         lane: Lane,
         request_id: String,
         tool: &str,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
     ) -> (oneshot::Receiver<Response>, JobCancellation) {
         let cancellation = JobCancellation::new();
         let completion_rx = self.submit_tool_call_with_cancellation_async(
@@ -1726,7 +1780,7 @@ impl Executor {
         lane: Lane,
         request_id: String,
         tool: &str,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
         cancellation: JobCancellation,
     ) -> oneshot::Receiver<Response> {
         // Checkout callgraph views rebuild as Maintenance/HeavyInit jobs.
@@ -1776,7 +1830,7 @@ impl Executor {
         &self,
         root_id: ProjectRootId,
         request_id: String,
-        job: RepeatableJob,
+        job: RepeatableJob<C>,
     ) -> (oneshot::Receiver<Response>, JobCancellation) {
         debug_assert!(is_configure_request(&request_id));
         let cancellation = JobCancellation::new();
@@ -1891,7 +1945,7 @@ impl Executor {
         root_id: ProjectRootId,
         lane: Lane,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
     ) -> oneshot::Receiver<Response> {
         self.submit_maintenance_async_with_key(root_id, lane, request_id, job, None)
     }
@@ -1902,7 +1956,7 @@ impl Executor {
         &self,
         root_id: ProjectRootId,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
     ) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
         self.submit_labeled(
@@ -1926,7 +1980,7 @@ impl Executor {
         root_id: ProjectRootId,
         lane: Lane,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
     ) -> (oneshot::Receiver<Response>, JobCancellation) {
         let (completion_tx, completion_rx) = oneshot::channel();
         let cancellation = JobCancellation::new();
@@ -1950,7 +2004,7 @@ impl Executor {
         lane: Lane,
         request_id: String,
         coalesce_key: MaintenanceCoalesceKey,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
     ) -> oneshot::Receiver<Response> {
         self.submit_maintenance_async_with_key(root_id, lane, request_id, job, Some(coalesce_key))
     }
@@ -1960,7 +2014,7 @@ impl Executor {
         root_id: ProjectRootId,
         lane: Lane,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
         coalesce_key: Option<MaintenanceCoalesceKey>,
     ) -> oneshot::Receiver<Response> {
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -1984,7 +2038,7 @@ impl Executor {
         job_class: JobClass,
         lane: Lane,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
         completion: CompletionSender,
     ) {
         self.submit_with_completion_cancellable(
@@ -1999,11 +2053,11 @@ impl Executor {
         job_class: JobClass,
         lane: Lane,
         request_id: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
         completion: CompletionSender,
         cancellation: Option<JobCancellation>,
         maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
-        rerun: Option<RepeatableJob>,
+        rerun: Option<RepeatableJob<C>>,
     ) {
         // Final LSP receipts must drain after the last route closes, even
         // though configure, watcher and indexing maintenance are suspended.
@@ -2038,11 +2092,11 @@ impl Executor {
         lane: Lane,
         request_id: String,
         command: String,
-        job: ExecutorJob,
+        job: ExecutorJob<C>,
         completion: CompletionSender,
         cancellation: Option<JobCancellation>,
         maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
-        rerun: Option<RepeatableJob>,
+        rerun: Option<RepeatableJob<C>>,
     ) {
         let cancellation = if job_class == JobClass::Maintenance
             || command == "inspect"
@@ -2142,7 +2196,7 @@ impl Executor {
                         actor.push_job(
                             job_class,
                             lane,
-                            QueuedJob {
+                            QueuedJob::<C> {
                                 job: job.take().expect("executor job already queued"),
                                 completion: completion
                                     .take()
@@ -2396,7 +2450,7 @@ impl Executor {
     }
 
     /// Progress marker of the scheduler loop, for the subc stall watchdog.
-    pub fn dispatch_loop_liveness(&self) -> Arc<DispatchLoopLiveness> {
+    pub fn dispatch_loop_liveness(&self) -> Arc<DispatchLoopLiveness<C>> {
         Arc::clone(&self.inner.dispatch_loop_liveness)
     }
 
@@ -2411,7 +2465,7 @@ impl Executor {
         let (held_tx, held_rx) = crossbeam_channel::bounded(1);
         let handle = thread::spawn(move || {
             let _state = state.lock();
-            let _ = event_tx.send(SchedulerEvent::Wake);
+            let _ = event_tx.send(SchedulerEvent::<C>::Wake);
             let _ = held_tx.send(());
             let _ = release.recv();
         });
@@ -2441,19 +2495,19 @@ impl Executor {
     }
 
     fn wake_scheduler(&self) {
-        let _ = self.inner.event_tx.send(SchedulerEvent::Wake);
+        let _ = self.inner.event_tx.send(SchedulerEvent::<C>::Wake);
     }
 }
 
-impl Default for Executor {
+impl<C: ExecutorContext> Default for Executor<C> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-struct ExecutorInner {
-    state: Arc<TrackedMutex<SchedulerState>>,
-    event_tx: Sender<SchedulerEvent>,
+struct ExecutorInner<C: ExecutorContext> {
+    state: Arc<TrackedMutex<SchedulerState<C>>>,
+    event_tx: Sender<SchedulerEvent<C>>,
     scheduler_handle: Mutex<Option<JoinHandle<()>>>,
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
     config: EffectiveConfig,
@@ -2461,12 +2515,12 @@ struct ExecutorInner {
     completed_interactive: Arc<AtomicU64>,
     completed_maintenance: Arc<AtomicU64>,
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
-    dispatch_loop_liveness: Arc<DispatchLoopLiveness>,
+    dispatch_loop_liveness: Arc<DispatchLoopLiveness<C>>,
     #[cfg(test)]
     maintenance_root_check_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-impl Drop for ExecutorInner {
+impl<C: ExecutorContext> Drop for ExecutorInner<C> {
     fn drop(&mut self) {
         // Stop maintenance before joining workers. Queued closures must also
         // release their captured builders instead of surviving a stopped loop.
@@ -2483,7 +2537,7 @@ impl Drop for ExecutorInner {
                 actor.maintenance.cancel_queued_jobs();
             }
         }
-        let _ = self.event_tx.send(SchedulerEvent::Shutdown);
+        let _ = self.event_tx.send(SchedulerEvent::<C>::Shutdown);
 
         if let Some(handle) = self.scheduler_handle.lock().take() {
             if handle.thread().id() != std::thread::current().id() {
@@ -2502,8 +2556,8 @@ impl Drop for ExecutorInner {
     }
 }
 
-struct SchedulerState {
-    actors: HashMap<ProjectRootId, ActorState>,
+struct SchedulerState<C: ExecutorContext> {
+    actors: HashMap<ProjectRootId, ActorState<C>>,
     actor_order: Vec<ProjectRootId>,
     cursor: usize,
     idle_workers: usize,
@@ -2519,7 +2573,7 @@ struct SchedulerState {
     bind_retry_pending: bool,
 }
 
-impl SchedulerState {
+impl<C: ExecutorContext> SchedulerState<C> {
     fn new(config: EffectiveConfig) -> Self {
         Self {
             actors: HashMap::new(),
@@ -2714,7 +2768,7 @@ impl SchedulerState {
         let configure_state = self.mutating_job_state_label(root_id, request_id);
         let now = Instant::now();
         let actor = self.actors.get(root_id);
-        let oldest_queued_writer_at = actor.and_then(ActorState::oldest_queued_writer_at);
+        let oldest_queued_writer_at = actor.and_then(ActorState::<C>::oldest_queued_writer_at);
         let oldest_queued_writer_age_ms = oldest_queued_writer_at
             .map(|queued_at| duration_millis_u64(now.saturating_duration_since(queued_at)));
         let mut in_flight_readers = self
@@ -2888,7 +2942,7 @@ struct QueueSnapshotAccumulator {
 }
 
 impl QueueSnapshotAccumulator {
-    fn add(&mut self, queues: &ClassQueues, now: Instant) {
+    fn add<C: ExecutorContext>(&mut self, queues: &ClassQueues<C>, now: Instant) {
         self.queued += queues.queued_count();
         if let Some(queued_at) = queues.oldest_queued_at() {
             let age_ms = duration_millis_u64(now.saturating_duration_since(queued_at));
@@ -2911,8 +2965,8 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-struct ActorState {
-    ctx: Arc<AppContext>,
+struct ActorState<C: ExecutorContext> {
+    ctx: Arc<C>,
     epoch: Arc<RwLock<()>>,
     read_inflight: usize,
     lsp_inflight: bool,
@@ -2930,8 +2984,8 @@ struct ActorState {
     mutating_inflight: Option<RunningMutatingJob>,
     reader_admissions_while_promoted_writer_waited: u64,
     deficit: isize,
-    interactive: ClassQueues,
-    maintenance: ClassQueues,
+    interactive: ClassQueues<C>,
+    maintenance: ClassQueues<C>,
     fatal: bool,
     /// Number of queued interactive mutating jobs, shared with this actor's
     /// running jobs through [`current_actor_writer_waiting`]. Kept equal to
@@ -2943,8 +2997,8 @@ struct ActorState {
     detached_writers: Arc<AtomicUsize>,
 }
 
-impl ActorState {
-    fn new(ctx: Arc<AppContext>) -> Self {
+impl<C: ExecutorContext> ActorState<C> {
+    fn new(ctx: Arc<C>) -> Self {
         Self {
             ctx,
             epoch: Arc::new(RwLock::new(())),
@@ -2960,8 +3014,8 @@ impl ActorState {
             mutating_inflight: None,
             reader_admissions_while_promoted_writer_waited: 0,
             deficit: 0,
-            interactive: ClassQueues::new(),
-            maintenance: ClassQueues::new(),
+            interactive: ClassQueues::<C>::new(),
+            maintenance: ClassQueues::<C>::new(),
             fatal: false,
             waiting_writers: Arc::new(AtomicUsize::new(0)),
             detached_writers: Arc::new(AtomicUsize::new(0)),
@@ -2973,7 +3027,7 @@ impl ActorState {
             .store(self.interactive.mutating.len(), Ordering::Release);
     }
 
-    fn push_job(&mut self, job_class: JobClass, lane: Lane, job: QueuedJob) {
+    fn push_job(&mut self, job_class: JobClass, lane: Lane, job: QueuedJob<C>) {
         self.class_queues_mut(job_class).push_job(lane, job);
         self.sync_waiting_writers();
     }
@@ -3002,13 +3056,13 @@ impl ActorState {
         self.class_queues(job_class).front_lane()
     }
 
-    fn pop_front_job(&mut self, job_class: JobClass, lane: Lane) -> Option<QueuedJob> {
+    fn pop_front_job(&mut self, job_class: JobClass, lane: Lane) -> Option<QueuedJob<C>> {
         let job = self.class_queues_mut(job_class).pop_front_job(lane);
         self.sync_waiting_writers();
         job
     }
 
-    fn pop_first_bind_job(&mut self) -> Option<QueuedJob> {
+    fn pop_first_bind_job(&mut self) -> Option<QueuedJob<C>> {
         let job = self.interactive.remove_first_bind_job();
         self.sync_waiting_writers();
         job
@@ -3022,14 +3076,14 @@ impl ActorState {
             && !self.interactive.queue(Lane::Mutating).is_empty()
     }
 
-    fn class_queues(&self, job_class: JobClass) -> &ClassQueues {
+    fn class_queues(&self, job_class: JobClass) -> &ClassQueues<C> {
         match job_class {
             JobClass::Interactive => &self.interactive,
             JobClass::Maintenance => &self.maintenance,
         }
     }
 
-    fn class_queues_mut(&mut self, job_class: JobClass) -> &mut ClassQueues {
+    fn class_queues_mut(&mut self, job_class: JobClass) -> &mut ClassQueues<C> {
         match job_class {
             JobClass::Interactive => &mut self.interactive,
             JobClass::Maintenance => &mut self.maintenance,
@@ -3051,7 +3105,7 @@ impl ActorState {
             || self.maintenance.has_queued_mutating_job(request_id)
     }
 
-    fn remove_queued_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob> {
+    fn remove_queued_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob<C>> {
         let removed = self
             .interactive
             .remove_cancellable(token)
@@ -3081,18 +3135,18 @@ impl ActorState {
     }
 }
 
-struct ClassQueues {
+struct ClassQueues<C: ExecutorContext> {
     order: VecDeque<Lane>,
-    pure_reads: VecDeque<QueuedJob>,
-    lsp_status: VecDeque<QueuedJob>,
-    heavy_init: VecDeque<QueuedJob>,
-    mutating: VecDeque<QueuedJob>,
-    maintenance_commit: VecDeque<QueuedJob>,
-    provider_metadata: VecDeque<QueuedJob>,
-    call_ledger: VecDeque<QueuedJob>,
+    pure_reads: VecDeque<QueuedJob<C>>,
+    lsp_status: VecDeque<QueuedJob<C>>,
+    heavy_init: VecDeque<QueuedJob<C>>,
+    mutating: VecDeque<QueuedJob<C>>,
+    maintenance_commit: VecDeque<QueuedJob<C>>,
+    provider_metadata: VecDeque<QueuedJob<C>>,
+    call_ledger: VecDeque<QueuedJob<C>>,
 }
 
-impl ClassQueues {
+impl<C: ExecutorContext> ClassQueues<C> {
     fn new() -> Self {
         Self {
             order: VecDeque::new(),
@@ -3106,7 +3160,7 @@ impl ClassQueues {
         }
     }
 
-    fn push_job(&mut self, lane: Lane, job: QueuedJob) {
+    fn push_job(&mut self, lane: Lane, job: QueuedJob<C>) {
         self.order.push_back(lane);
         self.queue_mut(lane).push_back(job);
     }
@@ -3114,13 +3168,13 @@ impl ClassQueues {
     /// Queue a job ahead of everything else in its lane. `order` pairs its
     /// lane entries with each lane's queue first-to-first, so the entry goes
     /// to the front as well.
-    fn push_front_job(&mut self, lane: Lane, job: QueuedJob) {
+    fn push_front_job(&mut self, lane: Lane, job: QueuedJob<C>) {
         self.order.push_front(lane);
         self.queue_mut(lane).push_front(job);
     }
 
     /// The route bind the bind pass would admit next.
-    fn first_bind_job(&self) -> Option<&QueuedJob> {
+    fn first_bind_job(&self) -> Option<&QueuedJob<C>> {
         self.mutating
             .iter()
             .find(|job| is_configure_request(&job.request_id))
@@ -3186,7 +3240,7 @@ impl ClassQueues {
         })
     }
 
-    fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob> {
+    fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob<C>> {
         // Keep `order` consistent with per-lane queues when admission picks a
         // lane other than the arrival-order head: remove the FIRST occurrence
         // of the chosen lane from `order`, not necessarily the front.
@@ -3208,7 +3262,7 @@ impl ClassQueues {
     }
 
     /// Remove only redundant idempotent drains while preserving survivor order.
-    fn remove_duplicate_maintenance_jobs(&mut self) -> Vec<QueuedJob> {
+    fn remove_duplicate_maintenance_jobs(&mut self) -> Vec<QueuedJob<C>> {
         let mut seen = HashSet::new();
         let mut lane_positions = [0usize; ALL_LANES.len()];
         let mut duplicates = Vec::new();
@@ -3289,7 +3343,7 @@ impl ClassQueues {
     /// Remove the oldest queued route-bind configure from the Mutating lane,
     /// even when other mutating jobs are ahead of it. Keeps `order` paired
     /// with the lane queue the same way `remove_cancellable` does.
-    fn remove_first_bind_job(&mut self) -> Option<QueuedJob> {
+    fn remove_first_bind_job(&mut self) -> Option<QueuedJob<C>> {
         let position = self
             .mutating
             .iter()
@@ -3317,7 +3371,7 @@ impl ClassQueues {
     /// FIRST matching order entry for a job deeper in its lane queue would
     /// shift the pairing and reorder the survivors, so the occurrence at the
     /// job's own queue position is removed instead.
-    fn remove_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob> {
+    fn remove_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob<C>> {
         for lane in ALL_LANES {
             let queue = self.queue_mut(lane);
             let position = queue.iter().position(|queued| {
@@ -3361,7 +3415,7 @@ impl ClassQueues {
             .min()
     }
 
-    fn queue(&self, lane: Lane) -> &VecDeque<QueuedJob> {
+    fn queue(&self, lane: Lane) -> &VecDeque<QueuedJob<C>> {
         match lane {
             Lane::PureRead => &self.pure_reads,
             Lane::SerialLspStatus => &self.lsp_status,
@@ -3373,7 +3427,7 @@ impl ClassQueues {
         }
     }
 
-    fn queue_mut(&mut self, lane: Lane) -> &mut VecDeque<QueuedJob> {
+    fn queue_mut(&mut self, lane: Lane) -> &mut VecDeque<QueuedJob<C>> {
         match lane {
             Lane::PureRead => &mut self.pure_reads,
             Lane::SerialLspStatus => &mut self.lsp_status,
@@ -3386,8 +3440,8 @@ impl ClassQueues {
     }
 }
 
-struct QueuedJob {
-    job: ExecutorJob,
+struct QueuedJob<C: ExecutorContext> {
+    job: ExecutorJob<C>,
     completion: CompletionSender,
     request_id: String,
     command: String,
@@ -3396,7 +3450,7 @@ struct QueuedJob {
     maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
     /// Present for a route bind that may run beside maintenance with a shared
     /// hold and be queued again (see [`RepeatableJob`]).
-    rerun: Option<RepeatableJob>,
+    rerun: Option<RepeatableJob<C>>,
     /// A bind queued again after a shared-hold attempt: it is admitted only
     /// with exclusive use of the actor.
     force_exclusive: bool,
@@ -3422,7 +3476,7 @@ fn lane_index(lane: Lane) -> usize {
     }
 }
 
-fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
+fn fail_queued_job_queue<C: ExecutorContext>(queue: &mut VecDeque<QueuedJob<C>>) {
     for queued in queue.drain(..) {
         queued
             .completion
@@ -3430,7 +3484,7 @@ fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
     }
 }
 
-fn cancel_queued_job_queue(queue: &mut VecDeque<QueuedJob>) -> usize {
+fn cancel_queued_job_queue<C: ExecutorContext>(queue: &mut VecDeque<QueuedJob<C>>) -> usize {
     let cancelled = queue.len();
     for queued in queue.drain(..) {
         queued.completion.send(Response::error(
@@ -3518,20 +3572,20 @@ impl CompletionSender {
     }
 }
 
-struct RunJob {
+struct RunJob<C: ExecutorContext> {
     root_id: ProjectRootId,
     job_class: JobClass,
     lane: Lane,
-    ctx: Arc<AppContext>,
+    ctx: Arc<C>,
     epoch: Arc<RwLock<()>>,
-    job: ExecutorJob,
+    job: ExecutorJob<C>,
     completion: Option<CompletionSender>,
     request_id: String,
     command: String,
     heavy_permit: Option<HeavyPermit>,
     cancellation: Option<JobCancellation>,
     execution_started: Arc<AtomicBool>,
-    completion_guard: Option<JobCompletionGuard>,
+    completion_guard: Option<JobCompletionGuard<C>>,
     /// The actor's queued-interactive-writer counter, exposed to the running
     /// job through [`current_actor_writer_waiting`].
     waiting_writers: Arc<AtomicUsize>,
@@ -3542,7 +3596,7 @@ struct RunJob {
     /// gate: it runs with a shared hold (see [`current_bind_gate_is_shared`]).
     shared_bind_gate: bool,
     /// How to run this bind again if it has to be queued again.
-    rerun: Option<RepeatableJob>,
+    rerun: Option<RepeatableJob<C>>,
     /// When the job first queued; a requeued bind keeps its age so its
     /// promotion over new readers is not reset.
     queued_at: Instant,
@@ -3559,7 +3613,7 @@ enum JobCompletionOutcome {
     Abandoned,
 }
 
-struct CompletionEvent {
+struct CompletionEvent<C: ExecutorContext> {
     job_id: u64,
     heavy_permit: Option<HeavyPermit>,
     outcome: JobCompletionOutcome,
@@ -3567,16 +3621,16 @@ struct CompletionEvent {
     /// A shared-hold bind that must run again as an exclusive writer. The
     /// scheduler queues it at the head of the actor's binds in the same step
     /// that releases the finished run's reservation.
-    requeue: Option<QueuedJob>,
+    requeue: Option<QueuedJob<C>>,
 }
 
-struct JobCompletionGuard {
-    event_tx: Sender<SchedulerEvent>,
-    event: Option<CompletionEvent>,
+struct JobCompletionGuard<C: ExecutorContext> {
+    event_tx: Sender<SchedulerEvent<C>>,
+    event: Option<CompletionEvent<C>>,
 }
 
-impl JobCompletionGuard {
-    fn new(event_tx: Sender<SchedulerEvent>, event: CompletionEvent) -> Self {
+impl<C: ExecutorContext> JobCompletionGuard<C> {
+    fn new(event_tx: Sender<SchedulerEvent<C>>, event: CompletionEvent<C>) -> Self {
         Self {
             event_tx,
             event: Some(event),
@@ -3589,14 +3643,14 @@ impl JobCompletionGuard {
         }
     }
 
-    fn set_requeue(&mut self, job: QueuedJob) {
+    fn set_requeue(&mut self, job: QueuedJob<C>) {
         if let Some(event) = self.event.as_mut() {
             event.requeue = Some(job);
         }
     }
 }
 
-impl Drop for JobCompletionGuard {
+impl<C: ExecutorContext> Drop for JobCompletionGuard<C> {
     fn drop(&mut self) {
         let Some(mut event) = self.event.take() else {
             return;
@@ -3604,27 +3658,27 @@ impl Drop for JobCompletionGuard {
         if std::thread::panicking() {
             event.outcome = JobCompletionOutcome::Panicked;
         }
-        let _ = self.event_tx.send(SchedulerEvent::Completed(event));
+        let _ = self.event_tx.send(SchedulerEvent::<C>::Completed(event));
     }
 }
 
-enum SchedulerEvent {
+enum SchedulerEvent<C: ExecutorContext> {
     Wake,
-    Completed(CompletionEvent),
+    Completed(CompletionEvent<C>),
     Shutdown,
 }
 
-fn scheduler_loop(
-    state: Arc<TrackedMutex<SchedulerState>>,
+fn scheduler_loop<C: ExecutorContext>(
+    state: Arc<TrackedMutex<SchedulerState<C>>>,
     heavy: Arc<HeavySemaphore>,
-    run_tx: Sender<RunJob>,
-    event_tx: Sender<SchedulerEvent>,
-    event_rx: Receiver<SchedulerEvent>,
+    run_tx: Sender<RunJob<C>>,
+    event_tx: Sender<SchedulerEvent<C>>,
+    event_rx: Receiver<SchedulerEvent<C>>,
     nonrunnable_dispatches: Arc<AtomicUsize>,
     completed_interactive: Arc<AtomicU64>,
     completed_maintenance: Arc<AtomicU64>,
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
-    loop_liveness: Arc<DispatchLoopLiveness>,
+    loop_liveness: Arc<DispatchLoopLiveness<C>>,
 ) {
     let mut next_retry_at: Option<Instant> = None;
     loop {
@@ -3645,7 +3699,7 @@ fn scheduler_loop(
                 }
             }
         } else {
-            SchedulerEvent::Wake
+            SchedulerEvent::<C>::Wake
         };
         let shutdown;
         {
@@ -3678,10 +3732,10 @@ fn scheduler_loop(
     }
 }
 
-fn process_scheduler_event_batch(
-    first: SchedulerEvent,
-    event_rx: &Receiver<SchedulerEvent>,
-    state: &mut SchedulerState,
+fn process_scheduler_event_batch<C: ExecutorContext>(
+    first: SchedulerEvent<C>,
+    event_rx: &Receiver<SchedulerEvent<C>>,
+    state: &mut SchedulerState<C>,
     completed_interactive: &AtomicU64,
     completed_maintenance: &AtomicU64,
 ) -> bool {
@@ -3712,26 +3766,29 @@ fn note_completed_class(
     }
 }
 
-fn process_scheduler_event(
-    event: SchedulerEvent,
-    state: &mut SchedulerState,
+fn process_scheduler_event<C: ExecutorContext>(
+    event: SchedulerEvent<C>,
+    state: &mut SchedulerState<C>,
     completed_interactive: &AtomicU64,
     completed_maintenance: &AtomicU64,
 ) -> bool {
     match event {
-        SchedulerEvent::Wake => false,
-        SchedulerEvent::Completed(event) => {
+        SchedulerEvent::<C>::Wake => false,
+        SchedulerEvent::<C>::Completed(event) => {
             if let Some(job_class) = complete_job(state, event) {
                 note_completed_class(job_class, completed_interactive, completed_maintenance);
             }
             false
         }
-        SchedulerEvent::Shutdown => true,
+        SchedulerEvent::<C>::Shutdown => true,
     }
 }
 
-fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<JobClass> {
-    let CompletionEvent {
+fn complete_job<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    event: CompletionEvent<C>,
+) -> Option<JobClass> {
+    let CompletionEvent::<C> {
         job_id,
         heavy_permit,
         outcome,
@@ -3853,11 +3910,11 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
     Some(job_class)
 }
 
-fn dispatch_runnable(
-    state: &mut SchedulerState,
+fn dispatch_runnable<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
     heavy: &Arc<HeavySemaphore>,
-    run_tx: &Sender<RunJob>,
-    event_tx: &Sender<SchedulerEvent>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
     nonrunnable_dispatches: &AtomicUsize,
 ) {
     while state.idle_workers > 0 && !state.actor_order.is_empty() {
@@ -3937,12 +3994,12 @@ fn dispatch_runnable(
     }
 }
 
-fn dispatch_runnable_class(
-    state: &mut SchedulerState,
+fn dispatch_runnable_class<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
     job_class: JobClass,
     heavy: &Arc<HeavySemaphore>,
-    run_tx: &Sender<RunJob>,
-    event_tx: &Sender<SchedulerEvent>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
     nonrunnable_dispatches: &AtomicUsize,
     dispatch_failed: &mut bool,
 ) -> bool {
@@ -4020,11 +4077,11 @@ fn dispatch_runnable_class(
 /// oldest bind first. Binds skip the DRR deficit and the per-actor interactive
 /// cap: a configure is short, and waiting a round-robin turn behind dozens of
 /// busy roots is what pushed binds past the daemon's relay deadline.
-fn dispatch_queued_binds(
-    state: &mut SchedulerState,
+fn dispatch_queued_binds<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
     heavy: &Arc<HeavySemaphore>,
-    run_tx: &Sender<RunJob>,
-    event_tx: &Sender<SchedulerEvent>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
     nonrunnable_dispatches: &AtomicUsize,
     dispatch_failed: &mut bool,
 ) -> bool {
@@ -4080,11 +4137,11 @@ fn dispatch_queued_binds(
 
 /// Provider work uses the same root queues, completion and cancellation machinery
 /// as other jobs, but never waits for an index lane's capacity or epoch gate.
-fn dispatch_provider_metadata(
-    state: &mut SchedulerState,
+fn dispatch_provider_metadata<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
     heavy: &Arc<HeavySemaphore>,
-    run_tx: &Sender<RunJob>,
-    event_tx: &Sender<SchedulerEvent>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
     nonrunnable_dispatches: &AtomicUsize,
     dispatch_failed: &mut bool,
 ) -> bool {
@@ -4122,11 +4179,11 @@ fn dispatch_provider_metadata(
 /// writer barrier: a keyed reply cannot be written until its settlement
 /// commits, so it must not wait for the reads queued or running on its root.
 /// Each actor runs one at a time, in submission order.
-fn dispatch_call_ledger(
-    state: &mut SchedulerState,
+fn dispatch_call_ledger<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
     heavy: &Arc<HeavySemaphore>,
-    run_tx: &Sender<RunJob>,
-    event_tx: &Sender<SchedulerEvent>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
     nonrunnable_dispatches: &AtomicUsize,
     dispatch_failed: &mut bool,
 ) -> bool {
@@ -4161,18 +4218,18 @@ fn dispatch_call_ledger(
 
 /// Record an admitted job as running and hand it to a worker. Returns false
 /// when the worker channel is closed.
-fn launch_run_job(
-    state: &mut SchedulerState,
-    mut run_job: RunJob,
-    run_tx: &Sender<RunJob>,
-    event_tx: &Sender<SchedulerEvent>,
+fn launch_run_job<C: ExecutorContext>(
+    state: &mut SchedulerState<C>,
+    mut run_job: RunJob<C>,
+    run_tx: &Sender<RunJob<C>>,
+    event_tx: &Sender<SchedulerEvent<C>>,
     nonrunnable_dispatches: &AtomicUsize,
 ) -> bool {
     let job_id = state.next_job_id();
     let ownership = Arc::new(JobCompletionOwnership);
-    run_job.completion_guard = Some(JobCompletionGuard::new(
+    run_job.completion_guard = Some(JobCompletionGuard::<C>::new(
         event_tx.clone(),
-        CompletionEvent {
+        CompletionEvent::<C> {
             job_id,
             heavy_permit: run_job.heavy_permit.take(),
             outcome: JobCompletionOutcome::Abandoned,
@@ -4222,7 +4279,7 @@ fn launch_run_job(
     true
 }
 
-fn can_dispatch_class(state: &SchedulerState, job_class: JobClass) -> bool {
+fn can_dispatch_class<C: ExecutorContext>(state: &SchedulerState<C>, job_class: JobClass) -> bool {
     // Running binds and metadata have already reduced idle_workers. Hold back
     // only the unused part of each reservation, or each running bind would also
     // remove a general-pool slot. All jobs still use one worker channel.
@@ -4264,14 +4321,14 @@ enum AdmissionPass {
     Class(JobClass),
 }
 
-fn try_admit_actor(
+fn try_admit_actor<C: ExecutorContext>(
     root_id: &ProjectRootId,
-    actor: &mut ActorState,
+    actor: &mut ActorState<C>,
     pass: AdmissionPass,
     config: &EffectiveConfig,
     heavy: &Arc<HeavySemaphore>,
     newest_reader_started_at: Option<Instant>,
-) -> Option<RunJob> {
+) -> Option<RunJob<C>> {
     let bind_pass = pass == AdmissionPass::Bind;
     let job_class = match pass {
         AdmissionPass::Bind | AdmissionPass::ProviderMetadata | AdmissionPass::CallLedger => {
@@ -4468,7 +4525,7 @@ fn try_admit_actor(
         }
     }
 
-    Some(RunJob {
+    Some(RunJob::<C> {
         root_id: root_id.clone(),
         job_class,
         lane,
@@ -4500,7 +4557,7 @@ pub(crate) fn current_thread_is_executor_worker() -> bool {
     IS_EXECUTOR_WORKER.with(std::cell::Cell::get)
 }
 
-fn worker_loop(run_rx: Receiver<RunJob>) {
+fn worker_loop<C: ExecutorContext>(run_rx: Receiver<RunJob<C>>) {
     IS_EXECUTOR_WORKER.with(|worker| worker.set(true));
     while let Ok(mut run_job) = run_rx.recv() {
         let response =
@@ -4547,10 +4604,10 @@ fn worker_loop(run_rx: Receiver<RunJob>) {
 /// Rebuild a shared-hold bind that must run again as a queued exclusive
 /// writer, keeping its completion, cancellation token, and original age.
 /// Returns the response to send instead when the bind was cancelled meanwhile.
-fn requeue_as_exclusive(
-    run_job: &mut RunJob,
+fn requeue_as_exclusive<C: ExecutorContext>(
+    run_job: &mut RunJob<C>,
     retry_after: Option<Duration>,
-) -> Result<QueuedJob, Response> {
+) -> Result<QueuedJob<C>, Response> {
     let cancelled = || {
         Response::error(
             run_job.request_id.clone(),
@@ -4590,7 +4647,7 @@ fn requeue_as_exclusive(
         .take()
         .expect("a requeued bind still owns its completion");
     let next_run = Arc::clone(&rerun);
-    Ok(QueuedJob {
+    Ok(QueuedJob::<C> {
         job: Box::new(move |ctx| next_run(ctx)),
         completion,
         request_id: run_job.request_id.clone(),
@@ -4690,7 +4747,7 @@ fn detached_writer_backoff(attempts: u32) -> Duration {
 /// Poll interval for epoch waits that must stay responsive to cancellation.
 const EPOCH_WAIT_POLL: Duration = Duration::from_millis(25);
 
-fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
+fn run_lane_job<C: ExecutorContext>(run_job: &mut RunJob<C>) -> LaneRun {
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
     let _waiting_writers_ctx = ActorWaitingWritersGuard::install(ActorWriterDemand {
         queued: Arc::clone(&run_job.waiting_writers),
@@ -4721,7 +4778,7 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
             .as_ref()
             .is_some_and(JobCancellation::cancel_requested_before_commit)
     };
-    let run = |job: ExecutorJob| {
+    let run = |job: ExecutorJob<C>| {
         if cancel_requested()
             || ((run_job.job_class == JobClass::Maintenance
                 || run_job.command == "inspect"

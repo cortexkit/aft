@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use aft::commands::status::handle_status;
 use aft::config::Config;
+use aft::context::Executor;
 use aft::context::{App, AppContext};
-use aft::executor::Executor;
 use aft::protocol::RawRequest;
 use cortexkit_paths::ProjectRootId;
 use serde_json::json;

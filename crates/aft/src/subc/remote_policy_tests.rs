@@ -455,7 +455,7 @@ async fn unconfined_call_keeps_policy_answer_when_database_slot_becomes_busy() {
     let ctx = Arc::new(context(root.path(), storage.path(), None));
     let route = identity(root.path(), "designer", 7, true);
     assert_eq!(confined(&ctx, &route), Ok(false));
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let mut waits = DatabaseWaits::default();
@@ -523,7 +523,7 @@ async fn uncached_calls_wait_for_busy_database_slot_and_keep_saved_confinement()
         } else {
             context_without_database(root.path(), storage.path())
         });
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
         let routes = HashMap::from([(route_key(43, 1), route.clone())]);
         let (held_tx, held_rx) = mpsc::channel();
@@ -575,7 +575,7 @@ async fn keyed_call_waits_for_slow_policy_store_before_confinement_admission() {
     let ctx = Arc::new(context_without_database(root.path(), storage.path()));
     ctx.mark_database_runtime_initializing_for_test();
     let route = identity(root.path(), "designer", 7, true);
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let mut waits = DatabaseWaits::default();
@@ -615,7 +615,7 @@ async fn policy_read_wait_budget_exhaustion_fails_closed() {
     let storage = tempfile::tempdir().unwrap();
     let ctx = Arc::new(context(root.path(), storage.path(), None));
     let route = identity(root.path(), "designer", 7, true);
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let (held_tx, held_rx) = mpsc::channel();
@@ -702,7 +702,7 @@ async fn failed_policy_store_frame_read_fails_closed_after_off_loop_wait() {
     ctx.finish_database_runtime_error("configured store cannot open".into(), false);
     assert!(!ctx.database_runtime_unconfigured());
     let route = identity(root.path(), "designer", 7, true);
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let holder = hold_empty_policy_slot_until_memory_miss(&ctx);
@@ -737,7 +737,7 @@ async fn opening_policy_store_past_wait_budget_fails_closed() {
     ctx.mark_database_runtime_initializing_for_test();
     assert!(!ctx.database_runtime_unconfigured());
     let route = identity(root.path(), "designer", 7, true);
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let mut frame = admission_frame_for("grep", json!({"pattern":"token"}));
@@ -797,7 +797,7 @@ async fn unconfigured_policy_store_direct_and_frame_reads_remain_unconfined() {
     holder.join().unwrap();
     assert_eq!(read, Ok(false));
 
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let holder = hold_empty_policy_slot_until_memory_miss(&ctx);

@@ -4521,7 +4521,7 @@ async fn runon_restart_first_watch_reattaches(
         );
         assert!(snapshot.is_some(), "relaxed lookup must find the saved job");
     }
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     let root_id = crate::path_identity::ProjectRootId::from_path(&project).unwrap();
     assert!(executor.register_actor(root_id.clone(), ctx.clone()));
     let bind_request = serde_json::from_value::<crate::protocol::RawRequest>(serde_json::json!({

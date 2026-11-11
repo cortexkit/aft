@@ -17,7 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::health::DispatchPathMetrics;
-use crate::executor::DispatchLoopLiveness;
+use crate::context::DispatchLoopLiveness;
 
 /// How long a loop may owe work without progressing before it is a stall.
 pub(super) const STALL_THRESHOLD: Duration = Duration::from_secs(15);
@@ -1099,7 +1099,7 @@ mod tests {
 
     fn daemon_markers(
         metrics: &Arc<DispatchPathMetrics>,
-        executor: &crate::executor::Executor,
+        executor: &crate::context::Executor,
     ) -> Vec<Box<dyn LivenessMarker>> {
         vec![
             Box::new(FrameLoopMarker(
@@ -1129,7 +1129,7 @@ mod tests {
         stderr: RecordedLog,
         exits: Arc<Mutex<Vec<(i32, Vec<String>)>>>,
         capture: Arc<RecordingCapture>,
-        executor: Arc<crate::executor::Executor>,
+        executor: Arc<crate::context::Executor>,
         log: RecordedLog,
         _storage: tempfile::TempDir,
     }
@@ -1169,7 +1169,7 @@ mod tests {
                 writer_setup: None,
             };
             let (mut daemon, module_stream) = tokio::io::duplex(64 * 1024);
-            let executor = Arc::new(crate::executor::Executor::new());
+            let executor = Arc::new(crate::context::Executor::new());
             let module_executor = Arc::clone(&executor);
             let module = thread::spawn(move || {
                 let runtime = hooks.metrics.frame_loop_runtime().unwrap();
@@ -1725,7 +1725,7 @@ mod tests {
 
     #[test]
     fn held_dispatch_loop_is_captured_once_and_logged_with_its_marker_and_end() {
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let metrics = Arc::new(DispatchPathMetrics::new());
         let log = RecordedLog::default();
         let capture = Arc::new(RecordingCapture::default());
@@ -1802,7 +1802,7 @@ mod tests {
 
     #[test]
     fn first_stall_duration_covers_the_whole_hold() {
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let metrics = Arc::new(DispatchPathMetrics::new());
         let log = RecordedLog::default();
         let capture = Arc::new(RecordingCapture::default());
@@ -1835,7 +1835,7 @@ mod tests {
 
     #[test]
     fn idle_daemon_past_the_threshold_is_never_a_stall() {
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let metrics = Arc::new(DispatchPathMetrics::new());
         let log = RecordedLog::default();
         let capture = Arc::new(RecordingCapture::default());

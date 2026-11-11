@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use aft::bash_background::BgTaskStatus;
 use aft::config::Config;
+use aft::context::Executor;
 use aft::context::{App, AppContext};
-use aft::executor::{Executor, ExecutorConfig, Lane};
+use aft::executor::{ExecutorConfig, Lane};
 use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
 use aft::path_identity::ProjectRootId;

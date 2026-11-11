@@ -344,7 +344,7 @@ impl Runner {
             request_id,
             Lane::MaintenanceCommit,
             cancellation,
-            Box::new(move |_| {
+            Box::new(move || {
                 // The executor gave the admitted job the root's lifecycle; a
                 // fresh token with the same root and lifecycle lets the pool
                 // job see the root unbind at its checkpoints.
@@ -3476,7 +3476,7 @@ mod tests {
             crate::config::Config::default(),
         ));
         ctx.mark_subc_bound();
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
         assert!(executor.register_actor(root_id.clone(), Arc::clone(&ctx)));
         let maintenance = ctx
@@ -3560,7 +3560,7 @@ mod tests {
             crate::config::Config::default(),
         ));
         ctx.mark_subc_bound();
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
         assert!(executor.register_actor(root_id, Arc::clone(&ctx)));
         let maintenance = ctx

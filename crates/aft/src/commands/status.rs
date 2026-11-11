@@ -879,7 +879,7 @@ mod tests {
         config.storage_dir = Some(dir.path().join("storage"));
         config.backup.enabled = Some(false);
         let ctx = Arc::new(AppContext::from_app(app.clone(), config));
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         assert!(executor.register_actor(root_id.clone(), ctx.clone()));
         let registered: Vec<_> = app
             .try_memory_contexts()
