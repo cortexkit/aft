@@ -23,7 +23,7 @@ pub enum EvidenceKind {
     None,
 }
 
-/// Frozen evidence descriptor carrying the verified values of comparator fields (1)-(6).
+/// Frozen evidence descriptor carrying the verified values used by the comparator.
 ///
 /// Per spec:
 /// For a non-exact candidate, `tier` is `"non_exact"`, `kind` is `"none"`, and
@@ -112,8 +112,8 @@ impl EvidenceDescriptor {
     }
 
     /// Create a descriptor for an anchored hit with canonical alignment metrics.
-    /// `matched_span`: (3a) matched-run character total.
-    /// `gap_chars`: (3b) gap characters read off the canonical alignment.
+    /// `matched_span`: total characters in matched runs.
+    /// `gap_chars`: gap characters read off the canonical alignment.
     pub fn for_anchored(
         matched_span: usize,
         gap_chars: usize,
