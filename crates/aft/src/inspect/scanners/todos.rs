@@ -907,7 +907,8 @@ mod tests {
         // the job's resolved root, which differs from the spelled temp path
         // where the temp folder sits behind a link (/var on macOS) or a short
         // name (Windows).
-        let root = crate::inspect::job::canonicalize_normalized(&dir.path().join("project"));
+        let checkout_root = fs::canonicalize(dir.path().join("project")).unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(&checkout_root);
         assert!(std::process::Command::new("git")
             .args(["init", "-q"])
             .arg(&root)
@@ -919,7 +920,10 @@ mod tests {
             "src/app.rs",
             "// TODO: counted once the store publishes\nfn app() {}\n",
         );
-        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        // The checkout retains configure's canonical path, including Windows's
+        // `\\?\` prefix. The build hold must use that exact key, not inspect's
+        // normalized outcome key, or the build can publish before we release it.
+        let hold = crate::data_layer::runtime::hold_builds_for_test(&checkout_root);
         // A refresh that finds the store building answers pending at once.
         crate::data_layer::tools::inspect::set_todo_store_wait_for_test(&root, Duration::ZERO);
 
@@ -944,9 +948,12 @@ mod tests {
         let response = crate::commands::configure::handle_configure(&configure, &ctx);
         assert!(response.success, "configure failed: {response:?}");
         crate::runtime_drain::standalone_root_configured(&ctx);
-        assert!(
-            ctx.data_checkout().is_some(),
-            "the index store binds the root"
+        assert_eq!(
+            ctx.data_checkout()
+                .expect("the index store binds the root")
+                .root(),
+            checkout_root,
+            "the build hold must name the bound checkout"
         );
 
         // The warm-up refresh runs while the build is held.
@@ -960,8 +967,11 @@ mod tests {
             Some(Tier2TriggerReason::ConfigureWarm)
         );
         let deadline = Instant::now() + Duration::from_secs(60);
-        while outcomes_for_test(&root).is_empty() {
+        // The outcome is noted inside the scan, before its completion is queued.
+        // Drain the completion too, so an in-flight job cannot hide a stray pull.
+        while outcomes_for_test(&root).is_empty() || ctx.inspect_manager().tier2_any_in_flight() {
             assert!(Instant::now() < deadline, "the warm-up refresh never ran");
+            crate::runtime_drain::drain_inspect_events(&ctx);
             std::thread::sleep(Duration::from_millis(20));
         }
         crate::runtime_drain::drain_inspect_events(&ctx);
