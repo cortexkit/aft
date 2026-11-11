@@ -143,6 +143,8 @@ pub(super) struct Lsp {
 pub(super) struct RootStatus {
     pub root: String,
     pub agent_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_ids_truncated: Option<bool>,
     pub text_index: Readiness,
     pub call_graph: Readiness,
     pub meaning: Readiness,

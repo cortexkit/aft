@@ -30,6 +30,311 @@ fn status_context() -> (
     (dir, ctx, executor, app)
 }
 
+thread_local! {
+    static FACTS_SQL_TRACE: std::cell::RefCell<Vec<String>> = const {std::cell::RefCell::new(Vec::new())};
+}
+
+fn trace_facts_sql(sql: &str) {
+    FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().push(sql.to_owned()));
+}
+
+fn insert_launch(conn: &rusqlite::Connection, root: &str, key: &ScopeKey) {
+    conn.execute("INSERT INTO access_launch_params(project_root,harness,session,principal,owner,scope_ref,epoch,preset,params)
+        VALUES (?1,'test',?2,?3,?3,?2,?4,'default','{}')",rusqlite::params![root,key.scope_ref,key.owner,key.epoch.to_string()]).unwrap();
+}
+
+#[test]
+fn shells_v1_database_facts_scale_with_shells_not_thirty_thousand_scope_rows() {
+    use crate::bash_background::persistence::{read_task_at, write_task_at};
+    let (dir, ctx, executor, app) = status_context();
+    let db = app.db().unwrap();
+    let root = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .unwrap()
+        .display()
+        .to_string();
+    {
+        let conn = db.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute(
+            "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<29999)
+            INSERT INTO access_scopes(owner,scope_ref,epoch,config,ended)
+            SELECT 'history',printf('old-%05d',i),'1','{}',1 FROM n",
+            [],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO access_scope_agents(owner,scope_ref,epoch,agent_id,kind)
+            SELECT owner,scope_ref,epoch,'old-agent-'||scope_ref,'head' FROM access_scopes WHERE owner='history'",[]).unwrap();
+        tx.execute("INSERT INTO access_launch_params(project_root,harness,session,principal,owner,scope_ref,epoch,preset,params)
+            SELECT CASE WHEN CAST(substr(scope_ref,5) AS INTEGER)<10000 THEN ?1 ELSE '/unbound-history' END,
+            'test',scope_ref,'history',owner,scope_ref,epoch,'default','{}' FROM access_scopes WHERE owner='history'",[&root]).unwrap();
+        tx.commit().unwrap();
+    }
+    for index in 0..3 {
+        let scope = stamp(&format!("live-{index}"), false);
+        let key = ScopeKey::from_stamp(&scope);
+        let (_, _, task) = captured(dir.path(), b"", false, false);
+        let mut metadata = read_task_at(&task).unwrap();
+        metadata.scope = Some(scope);
+        metadata.remote=Some(serde_json::from_value(json!({"harness":"test","session":"plain-session","job_id":format!("0b816da2-78cb-4fef-8abc-{index:012x}"),"stdout_len":0,"stderr_len":0,"cancel_requested":false})).unwrap());
+        let conn = db.lock().unwrap();
+        crate::db::access_grants::register_scope(&conn, &key, None, &Default::default()).unwrap();
+        crate::db::access_grants::register_agent(&conn, &key, &format!("agent-live-{index}"), true)
+            .unwrap();
+        insert_launch(&conn, &root, &key);
+        if index == 0 {
+            let snapshot = crate::bash_background::registry::ShellSnapshot {
+                metadata: metadata.clone(),
+                stdout: 0,
+                stderr: 0,
+                last_output_at_ms: None,
+            };
+            let row = project_row(&snapshot, Some(&conn));
+            metadata.shell_fingerprint = Some(
+                blake3::hash(&serde_json::to_vec(&row).unwrap())
+                    .to_hex()
+                    .to_string(),
+            );
+            metadata.shell_revision = 1;
+        }
+        drop(conn);
+        write_task_at(&task, &metadata).unwrap();
+        let conn = db.lock().unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &conn,
+            &metadata.to_bash_task_row("test", &task.paths).unwrap(),
+        )
+        .unwrap();
+        drop(conn);
+        if index == 0 {
+            ctx.bash_background()
+                .insert_shell_fixture(metadata, task.paths)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM access_scope_agents", [], |row| row
+                .get::<_, usize>(
+                0
+            ))
+            .unwrap(),
+        30_003
+    );
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM access_launch_params", [], |row| row
+                .get::<_, usize>(
+                0
+            ))
+            .unwrap(),
+        30_003
+    );
+    FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
+    DB_LOCK_DURATIONS.with(|durations| durations.borrow_mut().clear());
+    db.lock().unwrap().trace(Some(trace_facts_sql));
+    // Supply an explicit revision to isolate the cache test from other tests'
+    // concurrent registry writes. Production supplies the metadata revision.
+    let first = collect_at_revision(&executor, Some(&db), true, DbFacts::default(), 10);
+    let sql = FACTS_SQL_TRACE.with(|trace| trace.borrow().clone());
+    let durations = DB_LOCK_DURATIONS.with(|samples| samples.borrow().clone());
+    assert!(first.db_available);
+    assert_eq!(first.rows.len(), 3);
+    assert!(first
+        .rows
+        .iter()
+        .all(|row| row.state == "queued" && row.holder.kind == "agent"));
+    assert_eq!(first.db.holders.len(), 3);
+    assert_eq!(
+        first
+            .sources
+            .values()
+            .filter(|source| !source.is_persisted())
+            .count(),
+        1
+    );
+    assert_eq!(
+        first.status.roots[0].agent_ids,
+        ["agent-live-0", "agent-live-1", "agent-live-2"]
+    );
+    assert!(
+        sql.len() <= 6,
+        "statement count grew with scope history: {sql:?}"
+    );
+    assert_eq!(durations.len(), 2);
+    let held: Duration = durations.iter().sum();
+    assert!(
+        held < Duration::from_millis(20),
+        "DB lock held for {held:?}: {durations:?}"
+    );
+    println!(
+        "30k-scope facts: {} statements, {} lock sections, total lock held {held:?}",
+        sql.len(),
+        durations.len()
+    );
+    FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
+    DB_LOCK_DURATIONS.with(|durations| durations.borrow_mut().clear());
+    let idle = collect_at_revision(&executor, Some(&db), false, first.db, 10);
+    assert!(
+        FACTS_SQL_TRACE.with(|trace| trace.borrow().is_empty()),
+        "idle status issued SQL"
+    );
+    assert!(
+        DB_LOCK_DURATIONS.with(|samples| samples.borrow().is_empty()),
+        "idle status acquired aft.db"
+    );
+    // A watchdog wakeup without a metadata mutation must not dirty the cache,
+    // even when persisted output observation asks for refreshed rows.
+    crate::bash_background::shell_metadata::changed();
+    let polled = collect_at_revision(&executor, Some(&db), true, idle.db, 10);
+    assert_eq!(polled.rows.len(), 3);
+    assert!(FACTS_SQL_TRACE.with(|trace| trace.borrow().is_empty()));
+    assert!(DB_LOCK_DURATIONS.with(|samples| samples.borrow().is_empty()));
+    db.lock()
+        .unwrap()
+        .execute(
+            "UPDATE access_scope_agents SET agent_id='agent-renamed' WHERE scope_ref='live-0'",
+            [],
+        )
+        .unwrap();
+    FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
+    let changed = collect_at_revision(&executor, Some(&db), true, polled.db, 11);
+    assert!(changed.db_available);
+    assert!(
+        !FACTS_SQL_TRACE.with(|trace| trace.borrow().is_empty()),
+        "metadata change did not refresh facts"
+    );
+    assert!(changed
+        .rows
+        .iter()
+        .any(|row| row.holder.agent_id.as_deref() == Some("agent-renamed")));
+    db.lock().unwrap().trace(None);
+}
+
+#[test]
+fn shells_v1_root_agent_hints_are_live_bound_and_explicitly_truncated() {
+    let (dir, ctx, executor, app) = status_context();
+    let second_root = dir.path().join("z");
+    std::fs::create_dir(&second_root).unwrap();
+    let second = Arc::new(crate::context::AppContext::with_app_and_provider(
+        app.clone(),
+        Box::new(crate::language::StubProvider),
+        crate::config::Config {
+            project_root: Some(second_root.clone()),
+            ..Default::default()
+        },
+    ));
+    second.set_harness(crate::harness::Harness::Opencode);
+    assert!(executor.register_actor(
+        crate::path_identity::ProjectRootId::from_path(&second_root).unwrap(),
+        second
+    ));
+    let first_root = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .unwrap()
+        .display()
+        .to_string();
+    let second_root = second_root.display().to_string();
+    let db = app.db().unwrap();
+    {
+        let conn = db.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for (name, root, ended) in [
+            ("first", first_root.as_str(), false),
+            ("ended", first_root.as_str(), true),
+            ("outside", "/unbound-live-root", false),
+        ] {
+            let key = ScopeKey::from_stamp(&stamp(name, false));
+            crate::db::access_grants::register_scope(&tx, &key, None, &Default::default()).unwrap();
+            crate::db::access_grants::register_agent(&tx, &key, &format!("agent-{name}"), true)
+                .unwrap();
+            insert_launch(&tx, root, &key);
+            if ended {
+                tx.execute(
+                    "UPDATE access_scopes SET ended=1 WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+                    rusqlite::params![key.owner, key.scope_ref, key.epoch.to_string()],
+                )
+                .unwrap();
+            }
+        }
+        for index in 0..ROOT_ASSOCIATION_LIMIT + 1 {
+            let key = ScopeKey::from_stamp(&stamp(&format!("cap-{index:04}"), false));
+            crate::db::access_grants::register_scope(&tx, &key, None, &Default::default()).unwrap();
+            crate::db::access_grants::register_agent(
+                &tx,
+                &key,
+                &format!("agent-cap-{index:04}"),
+                true,
+            )
+            .unwrap();
+            insert_launch(&tx, &second_root, &key);
+        }
+        let head = ScopeKey::from_stamp(&stamp("first", false));
+        let worker = ScopeKey::from_stamp(&stamp("root-worker", true));
+        crate::db::access_grants::register_scope(&tx, &worker, Some(&head), &Default::default())
+            .unwrap();
+        crate::db::access_grants::register_worker(&tx, &worker).unwrap();
+        insert_launch(&tx, &first_root, &worker);
+        let revived = ScopeKey {
+            epoch: 2,
+            ..head.clone()
+        };
+        crate::db::access_grants::register_scope(&tx, &revived, None, &Default::default()).unwrap();
+        crate::db::access_grants::register_agent(&tx, &revived, "agent-first", true).unwrap();
+        tx.execute(
+            "DELETE FROM access_scope_agents WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+            rusqlite::params![head.owner, head.scope_ref, head.epoch.to_string()],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    let collected = collect_at_revision(&executor, Some(&db), true, DbFacts::default(), 1);
+    assert!(collected.db_available);
+    assert_eq!(collected.status.roots.len(), 2);
+    let first = collected
+        .status
+        .roots
+        .iter()
+        .find(|root| root.root == first_root)
+        .unwrap();
+    assert_eq!(first.agent_ids, ["agent-first"]);
+    assert!(first.agent_ids_truncated.is_none());
+    let second = collected
+        .status
+        .roots
+        .iter()
+        .find(|root| root.root == second_root)
+        .unwrap();
+    assert_eq!(second.agent_ids.len(), ROOT_ASSOCIATION_LIMIT - 1);
+    assert_eq!(second.agent_ids_truncated, Some(true));
+    assert!(second
+        .agent_ids
+        .iter()
+        .all(|agent| agent.starts_with("agent-cap-")));
+    assert_eq!(
+        serde_json::to_value(second).unwrap()["agent_ids_truncated"],
+        true
+    );
+    assert!(serde_json::to_value(first)
+        .unwrap()
+        .get("agent_ids_truncated")
+        .is_none());
+    let requested = (0..ROOT_ASSOCIATION_LIMIT + 1)
+        .map(|index| format!("agent-cap-{index:04}"))
+        .find(|agent| !second.agent_ids.contains(agent))
+        .unwrap();
+    let filtered = state::filtered_status(&collected.status, Some(&[requested]));
+    assert_eq!(filtered.roots.len(), 1);
+    assert_eq!(filtered.roots[0].root, second_root);
+    assert_eq!(filtered.roots[0].agent_ids_truncated, Some(true));
+}
+
 #[test]
 fn shells_v1_status_refresh_skips_busy_lsp_and_releases_database_before_probes() {
     use std::sync::mpsc;
@@ -205,7 +510,12 @@ fn shells_v1_holder_resolution_uses_registered_head_and_worker_parent() {
     assert_eq!(resolved.harness.as_deref(), Some("opencode"));
     assert!(resolved.agent_id.is_none());
     let db = std::sync::Mutex::new(conn);
-    let (facts, available) = read_db_facts(Some(&db), true, DbFacts::default());
+    let (facts, available) = read_db_facts(
+        Some(&db),
+        &[head_key.clone(), worker_key.clone()].into(),
+        &Default::default(),
+        DbFacts::default(),
+    );
     assert!(available);
     assert_eq!(
         facts.holders.get(&head_key),
@@ -271,6 +581,7 @@ fn shells_v1_status_unknown_counts_are_omitted_individually() {
         reason: None,
     };
     let root = RootStatus {
+        agent_ids_truncated: None,
         root: "/work".into(),
         agent_ids: vec![],
         text_index: ready.clone(),

@@ -233,9 +233,10 @@ pub(super) fn matching_rows<'a>(
 pub(super) fn filtered_status(status: &Status, agents: Option<&[String]>) -> Status {
     let mut status = status.clone();
     if let Some(agents) = agents {
-        status
-            .roots
-            .retain(|root| root.agent_ids.iter().any(|id| agents.contains(id)));
+        status.roots.retain(|root| {
+            root.agent_ids_truncated == Some(true)
+                || root.agent_ids.iter().any(|id| agents.contains(id))
+        });
     }
     status
 }

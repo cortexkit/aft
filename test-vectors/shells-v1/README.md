@@ -46,6 +46,21 @@ named agents' own shells are included. `include_workers: true` also includes
 their workers. With `agent_ids` absent, every holder is included, including
 workers and unattributed sessions.
 
+Root-agent sidebar hints share a 256-association query budget across bound
+roots, restricted to live scopes. When that budget is exhausted, the affected
+root status objects include `agent_ids_truncated: true`; earlier roots whose
+lists were fully visited omit it. Later roots may have no listed IDs yet and
+still carry the flag because their associations have not been fully visited.
+Agent-filtered status retains these incomplete roots even when the requested
+agent is not among the shown IDs: an incomplete list cannot prove absence.
+For example, this root-status fragment says that the known IDs are incomplete:
+
+```json
+{"agent_ids": ["agent-alf"], "agent_ids_truncated": true}
+```
+
+This optional edge case is documented here without changing the hashed samples.
+
 Regenerate deliberately, review the changes, then commit all five artifacts:
 
 ```sh

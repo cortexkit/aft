@@ -300,6 +300,15 @@ impl ShellReader {
 }
 
 impl BgTaskRegistry {
+    #[cfg(test)]
+    pub(crate) fn insert_shell_fixture(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+    ) -> Result<(), String> {
+        self.insert_rehydrated_task(metadata, paths, false)
+    }
+
     pub(crate) fn shell_reader(&self, task_id: &str) -> Option<ShellReader> {
         let task = self.task(task_id)?;
         let state = task.lock_state().ok()?;

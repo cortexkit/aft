@@ -419,6 +419,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "The operator-only shells/v1 wire protocol uses next_cursor for 50-row pages, command_truncated for command previews, and raw offset/end_offset for bounded output chunks; no agent-visible list is shortened.",
     },
     ExclusionEntry {
+        file: "subc/shells/runtime.rs",
+        enclosing_item: "read_root_agents",
+        location_or_primitive: "SQL LIMIT, ROOT_ASSOCIATION_LIMIT (256), lookahead (257)",
+        reason: "Operator sidebar root-agent hints have one shared 256-association budget. A bounded SQL iterator reads one lookahead row; agent_ids_truncated marks that root and any later roots whose association lists were not fully visited. Shell rows and their holder resolution remain complete.",
+    },
+    ExclusionEntry {
         file: "subc/shells/state.rs",
         enclosing_item: "push, resync",
         location_or_primitive: "HISTORY, PAGE_SIZE",

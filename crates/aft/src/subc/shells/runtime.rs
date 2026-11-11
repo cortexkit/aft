@@ -703,10 +703,23 @@ fn readiness(value: &Value) -> Readiness {
 
 #[derive(Clone, Default)]
 struct DbFacts {
+    key: Option<FactsKey>,
     root_agents: BTreeMap<String, Vec<String>>,
+    truncated_roots: std::collections::BTreeSet<String>,
     holders: HashMap<ScopeKey, GrantHolder>,
     saved: Vec<crate::db::bash_tasks::BashTaskRow>,
 }
+
+#[derive(Clone, PartialEq, Eq)]
+struct FactsKey {
+    revision: u64,
+    roots: std::collections::BTreeSet<String>,
+    db_identity: Option<usize>,
+}
+
+// Root-agent associations are sidebar hints, not an exhaustive agent inventory.
+// One lookahead row identifies the first root whose list may be incomplete.
+const ROOT_ASSOCIATION_LIMIT: usize = 256;
 
 struct Collected {
     rows: Vec<Row>,
@@ -721,83 +734,103 @@ thread_local! {
     static AFTER_DB_FACTS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static DB_LOCK_DURATIONS: std::cell::RefCell<Vec<std::time::Duration>> = const {std::cell::RefCell::new(Vec::new())};
+}
+
+fn with_db_read<T>(
+    db: &std::sync::Mutex<crate::db::TrackedConnection>,
+    read: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+) -> Option<T> {
+    let conn = db.try_lock().ok()?;
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let result = match read(&conn) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            #[cfg(test)]
+            eprintln!("shell facts SQL failed: {error}");
+            #[cfg(not(test))]
+            let _ = error;
+            None
+        }
+    };
+    drop(conn);
+    #[cfg(test)]
+    DB_LOCK_DURATIONS.with(|samples| samples.borrow_mut().push(started.elapsed()));
+    result
+}
+
+fn read_root_agents(
+    conn: &rusqlite::Connection,
+    roots: &std::collections::BTreeSet<String>,
+    facts: &mut DbFacts,
+) -> rusqlite::Result<()> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let roots_json = serde_json::to_string(roots).expect("root strings serialize");
+    // The launch primary key starts with project_root for indexed root seeks.
+    // SQLite applies the unique-association limit before returning rows; Rust
+    // never materializes the entire association list just to truncate it.
+    let mut query=conn.prepare("SELECT DISTINCT l.project_root,
+        CASE a.kind WHEN 'head' THEN NULLIF(a.agent_id,'') WHEN 'worker' THEN COALESCE(
+          (SELECT h.agent_id FROM access_scope_agents h
+           WHERE h.owner=s.parent_owner AND h.scope_ref=s.parent AND h.epoch=s.parent_epoch AND h.kind='head' AND h.agent_id<>''),
+          (SELECT h.agent_id FROM access_scope_agents h
+           WHERE h.owner=s.parent_owner AND h.scope_ref=s.parent AND h.kind='head' AND h.agent_id<>''
+           ORDER BY length(h.epoch) DESC,h.epoch DESC LIMIT 1)
+        ) END AS head_id
+        FROM access_launch_params l
+        JOIN access_scopes s USING(owner,scope_ref,epoch)
+        JOIN access_scope_agents a USING(owner,scope_ref,epoch)
+        WHERE l.project_root IN (SELECT value FROM json_each(?1)) AND s.ended=0
+          AND a.kind IN ('head','worker') AND head_id IS NOT NULL
+        ORDER BY l.project_root LIMIT ?2")?;
+    let entries = query.query_map(
+        rusqlite::params![roots_json, (ROOT_ASSOCIATION_LIMIT + 1) as i64],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    for (index, entry) in entries.enumerate() {
+        let (root, agent) = entry?;
+        if index == ROOT_ASSOCIATION_LIMIT {
+            // Earlier roots were fully visited. This root and all later roots
+            // share the exhausted budget and must not claim complete lists.
+            facts.truncated_roots.extend(roots.range(root..).cloned());
+        } else {
+            facts.root_agents.entry(root).or_default().push(agent);
+        }
+    }
+    Ok(())
+}
+
 fn read_db_facts(
     db: Option<&std::sync::Mutex<crate::db::TrackedConnection>>,
-    include_rows: bool,
-    previous: DbFacts,
+    scopes: &std::collections::HashSet<ScopeKey>,
+    roots: &std::collections::BTreeSet<String>,
+    mut previous: DbFacts,
 ) -> (DbFacts, bool) {
     let Some(db) = db else {
         return (previous, true);
     };
-    let Ok(conn) = db.try_lock() else {
-        return (previous, false);
-    };
-    // Copy only database facts under this guard. Context, registry, file and
-    // language-server locks are acquired only after this function returns.
-    let loaded = (|| -> rusqlite::Result<DbFacts> {
+    // Only scopes observed on live or retained shell rows need a holder. No
+    // context, registry, file or language-server lock is held in this closure.
+    let loaded = with_db_read(db, |conn| {
         let mut facts = DbFacts::default();
-        let mut scopes = conn.prepare("SELECT owner,scope_ref,epoch FROM access_scope_agents")?;
-        for entry in scopes.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })? {
-            let (owner, scope_ref, epoch) = entry?;
-            let Ok(epoch) = epoch.parse() else {
-                continue;
-            };
-            let key = ScopeKey {
-                owner,
-                scope_ref,
-                epoch,
-            };
-            if let Some(holder) = crate::db::access_grant_rows::holder_for_scope(&conn, &key)? {
-                facts.holders.insert(key, holder);
+        for key in scopes {
+            if let Some(holder) = crate::db::access_grant_rows::holder_for_scope(conn, key)? {
+                facts.holders.insert(key.clone(), holder);
             }
         }
-        let mut launches = conn.prepare(
-            "SELECT DISTINCT project_root,owner,scope_ref,epoch FROM access_launch_params",
-        )?;
-        for entry in launches.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })? {
-            let (root, owner, scope_ref, epoch) = entry?;
-            let Ok(epoch) = epoch.parse() else {
-                continue;
-            };
-            if let Some(agent) = facts
-                .holders
-                .get(&ScopeKey {
-                    owner,
-                    scope_ref,
-                    epoch,
-                })
-                .and_then(GrantHolder::agent_id)
-            {
-                facts
-                    .root_agents
-                    .entry(root)
-                    .or_default()
-                    .push(agent.to_owned());
-            }
-        }
-        facts.saved = if include_rows {
-            crate::db::bash_tasks::operator_shell_rows(&conn, now().saturating_sub(RETENTION_MS))?
-        } else {
-            previous.saved.clone()
-        };
+        read_root_agents(conn, roots, &mut facts)?;
         Ok(facts)
-    })();
-    match loaded {
-        Ok(facts) => (facts, true),
-        Err(_) => (previous, false),
+    });
+    if let Some(mut facts) = loaded {
+        facts.saved = std::mem::take(&mut previous.saved);
+        (facts, true)
+    } else {
+        (previous, false)
     }
 }
 
@@ -807,94 +840,117 @@ fn collect(
     include_rows: bool,
     previous: DbFacts,
 ) -> Collected {
-    let (facts, db_available) = read_db_facts(db, include_rows, previous);
-    let include_rows = include_rows && db_available;
+    collect_at_revision(
+        executor,
+        db,
+        include_rows,
+        previous,
+        crate::bash_background::shell_metadata::facts_revision(),
+    )
+}
+
+fn collect_at_revision(
+    executor: &Executor,
+    db: Option<&std::sync::Mutex<crate::db::TrackedConnection>>,
+    include_rows: bool,
+    previous: DbFacts,
+    revision: u64,
+) -> Collected {
+    let contexts = executor.actor_contexts();
+    let bound_roots: std::collections::BTreeSet<_> = contexts
+        .iter()
+        .filter_map(|ctx| {
+            ctx.config()
+                .project_root
+                .as_ref()
+                .map(|root| root.display().to_string())
+        })
+        .collect();
+    let key = FactsKey {
+        revision,
+        roots: bound_roots.clone(),
+        db_identity: db.map(|db| std::ptr::from_ref(db) as usize),
+    };
+    let dirty = previous.key.as_ref() != Some(&key);
+    let mut facts = previous;
+    let mut db_available = true;
+    if dirty {
+        if let Some(db) = db {
+            if let Some(saved) = with_db_read(db, |conn| {
+                crate::db::bash_tasks::operator_shell_rows(conn, now().saturating_sub(RETENTION_MS))
+            }) {
+                facts.saved = saved;
+            } else {
+                db_available = false;
+            }
+        }
+    }
+    let observe = db_available && (include_rows || dirty);
+    let mut observations = Vec::new();
+    let mut sources = HashMap::new();
+    for ctx in &contexts {
+        if observe {
+            let registry = ctx.bash_background();
+            for snapshot in registry.shell_snapshots() {
+                if !state::retained(&project_row(&snapshot, None), now()) {
+                    continue;
+                }
+                if let Some(reader) = registry.shell_reader(&snapshot.metadata.task_id) {
+                    sources.insert(snapshot.metadata.task_id.clone(), reader);
+                }
+                observations.push(snapshot);
+            }
+        }
+    }
+    if observe {
+        for saved in facts.saved.iter().cloned() {
+            if sources.contains_key(&saved.task_id) {
+                continue;
+            }
+            if let Some((snapshot, reader)) = ShellReader::persisted(saved) {
+                if !state::retained(&project_row(&snapshot, None), now()) {
+                    continue;
+                }
+                sources.insert(snapshot.metadata.task_id.clone(), reader);
+                observations.push(snapshot);
+            }
+        }
+    }
+    if dirty && db_available {
+        let scopes = observations
+            .iter()
+            .filter_map(|snapshot| snapshot.metadata.scope.as_ref().map(ScopeKey::from_stamp))
+            .collect();
+        (facts, db_available) = read_db_facts(db, &scopes, &bound_roots, facts);
+        if db_available {
+            facts.key = Some(key);
+        }
+    }
     #[cfg(test)]
     AFTER_DB_FACTS.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook();
         }
     });
-    let contexts = executor.actor_contexts();
     let mut rows = Vec::new();
-    let mut sources = HashMap::new();
+    if include_rows && db_available {
+        for snapshot in observations {
+            let mut row = project_row(&snapshot, None);
+            row.revision = snapshot.metadata.shell_revision;
+            row.holder = resolved_holder(
+                snapshot
+                    .metadata
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| facts.holders.get(&ScopeKey::from_stamp(scope)))
+                    .cloned(),
+                &snapshot.metadata,
+            );
+            rows.push(row);
+        }
+    }
     let mut root_agents = facts.root_agents.clone();
-    for ctx in &contexts {
-        let root = ctx
-            .config()
-            .project_root
-            .as_ref()
-            .map(|root| root.display().to_string())
-            .unwrap_or_default();
-        if include_rows {
-            let registry = ctx.bash_background();
-            for snapshot in registry.shell_snapshots() {
-                let mut row = project_row(&snapshot, None);
-                row.holder = resolved_holder(
-                    snapshot
-                        .metadata
-                        .scope
-                        .as_ref()
-                        .and_then(|scope| facts.holders.get(&ScopeKey::from_stamp(scope)))
-                        .cloned(),
-                    &snapshot.metadata,
-                );
-                if !state::retained(&row, now()) {
-                    continue;
-                }
-                if let Some(agent) = &row.holder.agent_id {
-                    root_agents
-                        .entry(root.clone())
-                        .or_default()
-                        .push(agent.clone());
-                }
-                row.revision = snapshot.metadata.shell_revision;
-                if let Some(reader) = registry.shell_reader(&row.task_id) {
-                    sources.insert(row.task_id.clone(), reader);
-                }
-                rows.push(row);
-            }
-        }
-    }
-    if include_rows {
-        for saved in facts.saved.iter().cloned() {
-            if sources.contains_key(&saved.task_id) {
-                continue;
-            }
-            if let Some((snapshot, reader)) = ShellReader::persisted(saved) {
-                let mut row = project_row(&snapshot, None);
-                row.holder = resolved_holder(
-                    snapshot
-                        .metadata
-                        .scope
-                        .as_ref()
-                        .and_then(|scope| facts.holders.get(&ScopeKey::from_stamp(scope)))
-                        .cloned(),
-                    &snapshot.metadata,
-                );
-                if !state::retained(&row, now()) {
-                    continue;
-                }
-                if let Some(agent) = &row.holder.agent_id {
-                    root_agents
-                        .entry(
-                            snapshot
-                                .metadata
-                                .project_root
-                                .as_ref()
-                                .unwrap_or(&snapshot.metadata.workdir)
-                                .display()
-                                .to_string(),
-                        )
-                        .or_default()
-                        .push(agent.clone());
-                }
-                row.revision = snapshot.metadata.shell_revision;
-                sources.insert(row.task_id.clone(), reader);
-                rows.push(row);
-            }
-        }
-    }
+    root_agents.retain(|root, _| bound_roots.contains(root));
     for row in &mut rows {
         let mut fingerprint_row = row.clone();
         fingerprint_row.revision = 0;
@@ -907,15 +963,6 @@ fn collect(
                 .unwrap_or(row.revision);
         }
     }
-    let bound_roots: std::collections::BTreeSet<_> = contexts
-        .iter()
-        .filter_map(|ctx| {
-            ctx.config()
-                .project_root
-                .as_ref()
-                .map(|root| root.display().to_string())
-        })
-        .collect();
     let mut roots = Vec::new();
     let mut degraded = false;
     let mut building = false;
@@ -979,6 +1026,7 @@ fn collect(
         roots.push(RootStatus {
             root: root.into(),
             agent_ids: agents,
+            agent_ids_truncated: facts.truncated_roots.contains(root).then_some(true),
             text_index,
             call_graph,
             meaning,
@@ -1008,6 +1056,7 @@ fn collect(
             ),
         };
         roots.push(RootStatus {
+            agent_ids_truncated: facts.truncated_roots.contains(&root).then_some(true),
             root,
             agent_ids: agents,
             text_index: readiness.clone(),

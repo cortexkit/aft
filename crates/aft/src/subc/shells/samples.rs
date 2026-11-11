@@ -82,6 +82,7 @@ fn status() -> Status {
         },
         roots: vec![
             RootStatus {
+                agent_ids_truncated: None,
                 root: "/work/project".into(),
                 agent_ids: vec!["agent-alf".into()],
                 text_index: ready.clone(),
@@ -103,6 +104,7 @@ fn status() -> Status {
                 todos: Some(3),
             },
             RootStatus {
+                agent_ids_truncated: None,
                 root: "/work/notes".into(),
                 agent_ids: vec!["agent-alf".into()],
                 text_index: ready.clone(),

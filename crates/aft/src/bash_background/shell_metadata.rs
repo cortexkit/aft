@@ -42,6 +42,19 @@ pub(crate) fn changed() {
     changes().send_modify(|revision| *revision = revision.wrapping_add(1));
 }
 
+// A watchdog wakeup alone does not imply changed database facts.
+// Advance the cache generation only when task metadata is persisted.
+static FACTS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn facts_changed() {
+    FACTS_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    changed();
+}
+
+pub(crate) fn facts_revision() -> u64 {
+    FACTS_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn subscribe() -> tokio::sync::watch::Receiver<u64> {
     changes().subscribe()
 }

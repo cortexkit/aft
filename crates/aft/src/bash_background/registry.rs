@@ -3703,7 +3703,7 @@ impl BgTaskRegistry {
     }
 
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
-        super::shell_metadata::changed();
+        super::shell_metadata::facts_changed();
         let pool = {
             let slot = self.inner.db_pool.read().ok();
             let pool = slot.as_ref().and_then(|slot| (*slot).clone());
