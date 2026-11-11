@@ -482,7 +482,7 @@ pub struct PersistedTask {
     pub schema_pin: Option<String>,
     /// Original display identity and once-only terminal publication fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) display: Option<crate::subc::rich_ui::display::TaskDisplay>,
+    pub(crate) display: Option<crate::bash_background::frames::TaskDisplay>,
     /// The daemon's scope owner, reference and epoch at spawn. A reconnect
     /// must not relabel a running command as belonging to the new route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -600,7 +600,7 @@ impl PersistedTask {
             output_incomplete: false,
             call_key,
             schema_pin: super::current_schema_pin(),
-            display: crate::subc::rich_ui::display::current_task(),
+            display: crate::bash_background::frames::current_task(),
             scope: super::registry::scope_for_spawn(),
             remote: None,
             execution_note: None,
@@ -835,22 +835,7 @@ fn capture_output_bytes(mode: &BgMode, paths: &TaskPaths) -> Option<i64> {
     }
 }
 
-pub fn validate_task_id(task_id: &str) -> io::Result<()> {
-    let bytes = task_id.as_bytes();
-    if bytes.len() == 21
-        && bytes.starts_with(b"bash-")
-        && bytes[5..]
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "background task id must match ^bash-[0-9a-f]{16}$",
-        ))
-    }
-}
+pub use crate::task_temp_reads::validate_task_id;
 
 pub fn session_tasks_dir(storage_dir: &Path, session_id: &str) -> PathBuf {
     let session_hash = hash_session(session_id);
@@ -3914,20 +3899,6 @@ mod tests {
             "retrying metadata read failed: {retry_error:?}"
         );
         eprintln!("single-attempt read observed {replacement_error:?}; read_task succeeded");
-    }
-
-    #[test]
-    fn task_id_validation_is_exact() {
-        assert!(validate_task_id("bash-0123456789abcdef").is_ok());
-        for invalid in [
-            "bash-0123456789abcde",
-            "bash-0123456789abcdef0",
-            "bash-0123456789ABCDEf",
-            "bash-0123456789abcdeg",
-            "../bash-0123456789abcdef",
-        ] {
-            assert!(validate_task_id(invalid).is_err(), "accepted {invalid}");
-        }
     }
 
     #[cfg(unix)]
