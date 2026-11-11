@@ -1002,7 +1002,7 @@ mod tests {
         std::fs::write(&bundle, "x".repeat(10 * 1024 * 1024)).unwrap();
 
         // inspect's generated-header check used to read the whole first line.
-        assert!(!crate::inspect::is_generated_file(root, &bundle));
+        assert!(!generated::is_generated_file(root, &bundle));
         let after_inspect = read_probe::bytes_read(&bundle);
         assert!(
             after_inspect <= HEAD_BYTES,

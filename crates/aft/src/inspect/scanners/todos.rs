@@ -16,8 +16,6 @@ use aft_store::content::{TodoMarker, TodoMarkers};
 use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
 pub(crate) use crate::parser::todo_markers::*;
-#[cfg(test)]
-use crate::parser::LangId;
 
 const MAX_ITEMS: usize = 100;
 
