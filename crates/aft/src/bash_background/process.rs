@@ -1211,6 +1211,22 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_oom_priority_write_failure_runs_command_and_warns_once() {
+        // The warning budget is process-wide; unrelated parallel tests must not
+        // consume it before this forced-failure scenario runs.
+        const CHILD: &str = "AFT_TEST_OOM_PRIORITY_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "bash_background::process::tests::linux_oom_priority_write_failure_runs_command_and_warns_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{result:?}");
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let readback = root.path().join("readback");
         std::fs::write(&readback, "17\n").unwrap();
