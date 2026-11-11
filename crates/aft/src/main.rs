@@ -214,6 +214,7 @@ fn main() {
     aft::memory::profile::publish(None);
     #[cfg(feature = "test-hooks")]
     aft::grammar::initialize_test_identity();
+    aft::commands::policy_environment::register();
     // Take the daemon handoff before any threads or children start. Standalone
     // mode never touches the inherited descriptors.
     let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
@@ -4827,5 +4828,17 @@ mod config_pin_tests {
         assert_eq!(*seen.lock().unwrap(), vec![false, false]);
         // The next request sees the publication.
         assert!(ctx.config().restrict_to_project_root);
+    }
+}
+
+#[cfg(test)]
+mod policy_environment_startup_tests {
+    #[test]
+    fn both_entry_modes_register_policy_environment_before_config_or_context() {
+        let source = include_str!("main.rs");
+        let main = source.split_once("fn main() {").unwrap().1;
+        let first_statement = main.trim_start().lines().next().unwrap();
+        assert_eq!(first_statement, "aft::commands::policy_environment::register();",
+            "both NDJSON and subc enter through main: register before parsing the mode or resolving config");
     }
 }
