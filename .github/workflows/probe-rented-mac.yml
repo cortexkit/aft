@@ -21,6 +21,10 @@ jobs:
         shell: /bin/bash --noprofile --norc -e -o pipefail {0}
     steps:
       - uses: actions/checkout@v4
+      - name: Expose the existing runner Rust toolchain
+        run: |
+          printf 'runner_original_PATH=%s\n' "$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Account and shell startup baselines
         run: |
           git log -1
