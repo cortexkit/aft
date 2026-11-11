@@ -856,7 +856,7 @@ fn codemode_head_routes_ignore_preexisting_worker_policies() {
             let (f, _storage, ctx) = saved_policy_fixture();
             let head = &f.routes[&channel(3)];
             let scope = head.scope.as_ref().unwrap();
-            let key = crate::db::remote_exec::PolicyKey {
+            let key = crate::exec_remote::persistence::PolicyKey {
                 project_root: head.project_root.display().to_string(),
                 harness: head.harness.clone(),
                 session: head.session.clone(),
@@ -869,7 +869,7 @@ fn codemode_head_routes_ignore_preexisting_worker_policies() {
             let policy =
                 crate::exec_remote::FrozenParams::decode(params.as_object().unwrap()).unwrap();
             let db = ctx.db().unwrap();
-            crate::db::remote_exec::freeze(
+            crate::exec_remote::persistence::freeze(
                 &db.lock().unwrap(),
                 &key,
                 &policy,

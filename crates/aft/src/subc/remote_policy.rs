@@ -1,6 +1,6 @@
 //! Catalog-time policy freezing. A tool call only looks up daemon-bound identity.
 use super::*;
-use crate::db::remote_exec::{self as store, PolicyKey};
+use crate::exec_remote::persistence::{self as store, PolicyKey};
 
 pub(super) fn key(identity: &RouteIdentity, preset: Option<&str>) -> Option<PolicyKey> {
     // A requested worker preset cannot turn a head scope into a worker or
