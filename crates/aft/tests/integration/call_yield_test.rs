@@ -414,6 +414,9 @@ async fn yield_reason_until_accepted(
         if reply == json!({"answer": "accepted"}) {
             return (corr, sent);
         }
+        if reply != json!({"answer": "not_yieldable", "reason": "not_waiting"}) {
+            inbox.collect_for(stream, Duration::from_millis(100)).await;
+        }
         assert_eq!(
             reply,
             json!({"answer": "not_yieldable", "reason": "not_waiting"}),
