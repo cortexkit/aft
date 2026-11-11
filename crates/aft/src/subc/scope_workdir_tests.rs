@@ -691,7 +691,7 @@ fn scope_workdir_stamp_selects_project_config_instead_of_bind_config() {
 
 #[test]
 fn scope_workdir_stamp_recovers_legacy_catalog_state_for_same_path() {
-    use crate::db::remote_exec::{self, PolicyKey};
+    use crate::exec_remote::persistence::{self as remote_exec, PolicyKey};
     use crate::exec_remote::FrozenParams;
 
     let _serial = serial();

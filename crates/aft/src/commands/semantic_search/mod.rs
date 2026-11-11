@@ -3,29 +3,30 @@ pub mod blocks;
 pub mod comparator;
 pub mod confidence;
 pub mod data_file;
-pub mod evidence_descriptor;
+pub use crate::search_state::evidence_descriptor;
 pub mod exact_lane;
 pub mod extensions;
 pub(crate) mod external_disk_check;
 mod external_exact;
 mod external_pattern;
-pub mod generation_token;
+pub use crate::search_state::generation_token;
 pub mod lexical_lane;
-pub mod memo;
+pub use crate::search_state::memo;
 mod nearest_names;
 pub mod paging;
-pub mod plan_table;
+pub use crate::search_b2::plan_table;
+pub mod planner;
 pub mod provenance;
 mod recall_audit;
 mod regex_route;
-pub mod request_files;
+pub use crate::search_state::request_files;
 pub(crate) mod rerank;
 pub mod scoring;
 pub(crate) mod snippet_bounds;
 pub mod split_query;
 pub mod telemetry;
 pub mod trailer;
-pub mod waits;
+pub use crate::search_state::waits;
 
 pub use comparator::{r3_cmp, score_free_r3_cmp, CandidateResult, RankedTuple, SymbolOffsetRange};
 pub use evidence_descriptor::{
@@ -270,7 +271,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         // With the data layer on and semantic search on for the root, the
         // lane is the data layer's meaning plane, sampled as it stands now
         // and retained, so the ranking reads the generation admitted here.
-        let data_semantic = crate::data_layer::tools::search::DataSemantic::current(self.ctx);
+        let data_semantic = crate::commands::data_search::DataSemantic::current(self.ctx);
         let semantic = if let Some(data) = data_semantic {
             SemanticReadiness {
                 status: data.status(),
@@ -333,7 +334,7 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
             }
         };
 
-        let trigram = if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some() {
+        let trigram = if crate::commands::data_search::DataText::ready(self.ctx).is_some() {
             TrigramReadiness {
                 status: IndexStatus::Ready,
                 snapshot: None,
@@ -554,7 +555,7 @@ fn standing_snapshot_metadata(
     external_root: &Path,
     storage_dir: Option<&Path>,
 ) -> ExternalBorrowMetadata {
-    let db_path = crate::bash_background::storage_dir(storage_dir).join("aft.db");
+    let db_path = crate::storage_path::storage_dir(storage_dir).join("aft.db");
     if !db_path.is_file() {
         return ExternalBorrowMetadata::default();
     }
@@ -601,7 +602,7 @@ fn external_data_layer_search(
     req: &RawRequest,
     ctx: &AppContext,
     root: &Path,
-    external: &crate::data_layer::tools::search::ExternalSearch,
+    external: &crate::commands::data_search::ExternalSearch,
 ) -> Response {
     let (mut response, drift) = external.search(req, ctx);
     if !response.success {
@@ -851,13 +852,12 @@ fn handle_semantic_search_with_disk_fallback(
     // With the data layer, a repository whose checkout `aft index` or another
     // AFT published is answered from that checkout, as its own root would be.
     if let Some(root) = external_root.as_deref() {
-        if let Some(external) = crate::data_layer::tools::search::ExternalSearch::of(ctx, root) {
+        if let Some(external) = crate::commands::data_search::ExternalSearch::of(ctx, root) {
             return external_data_layer_search(req, ctx, root, &external);
         }
     }
-    // The extensions come from the search_b2 install point: A-side defaults
-    // until campaign B2 installs its router, plans, variants and readiness.
-    let extensions = crate::search_b2::install_defaults();
+    // Compose routing, plans, variants and readiness at the command boundary.
+    let extensions = crate::commands::semantic_search::planner::install_defaults();
     let import_building = false;
     let allow_disk_fallback = allow_disk_fallback || import_building;
     if let Some((pattern_text, compiled)) = pattern {
@@ -1006,8 +1006,11 @@ fn attach_not_opened_notice(
 ) {
     let would_use_semantic = ctx.config().indexes.semantic
         && !plan.contains(SearchLaneKind::Semantic)
-        && crate::search_b2::lane_plan::legal_lanes(plan.shape, &plan.query_facts)
-            .contains(&SearchLaneKind::Semantic);
+        && crate::commands::semantic_search::planner::lane_plan::legal_lanes(
+            plan.shape,
+            &plan.query_facts,
+        )
+        .contains(&SearchLaneKind::Semantic);
     if !would_use_semantic {
         return;
     }
@@ -1022,7 +1025,7 @@ fn attach_not_opened_notice(
             root
         }
         None => {
-            let observed = observed_index_status(ctx, IndexPlane::Semantic);
+            let observed = observed_index_status(ctx, ctx, IndexPlane::Semantic);
             if observed.unavailable_reason.as_deref() != Some(feature_cause::SEMANTIC_NOT_OPENED) {
                 return;
             }
@@ -1133,7 +1136,7 @@ fn handle_pattern_request(
         None => {
             let plan = extensions.plan(
                 &SearchShape::Regex,
-                &crate::search_b2::lane_plan::no_query_facts(),
+                &crate::commands::semantic_search::planner::lane_plan::no_query_facts(),
                 &readiness,
             );
             let semantic_status = try_read_with_budget(
@@ -1252,7 +1255,7 @@ fn collect_pattern_list(
         split_query::BOUNDED_SCAN_MATCH_LIMIT,
         &req.id,
         req.session(),
-        None,
+        ctx,
     )?;
     let params = GrepParams {
         include: Vec::new(),
@@ -1294,7 +1297,7 @@ struct SplitSemantic {
     checkout_gaps: Option<CheckoutSemanticGaps>,
     /// The data layer's meaning plane the candidates came from, which then
     /// scores the pattern's definitions too.
-    data_meaning: Option<Arc<crate::data_layer::tools::search::DataMeaning>>,
+    data_meaning: Option<Arc<crate::commands::data_search::DataMeaning>>,
 }
 
 impl SplitSemantic {
@@ -1430,11 +1433,11 @@ fn split_semantic_from_data(
     include_tests: bool,
     project_root: &Path,
     plan: &extensions::LanePlan<'_>,
-    meaning: Option<Arc<crate::data_layer::tools::search::DataMeaning>>,
+    meaning: Option<Arc<crate::commands::data_search::DataMeaning>>,
 ) -> SplitSemantic {
     let status = match plan.readiness.semantic_status() {
         Some(status) => status.clone(),
-        None => crate::data_layer::tools::search::DataSemantic::current(ctx)
+        None => crate::commands::data_search::DataSemantic::current(ctx)
             .map_or_else(SemanticIndexStatus::ready, |data| data.status()),
     };
     if !matches!(status, SemanticIndexStatus::Ready { .. }) {
@@ -1482,9 +1485,9 @@ fn file_cosines(
     ctx: &AppContext,
     query_vector: &[f32],
     paths: &[PathBuf],
-    data: Option<&crate::data_layer::tools::search::DataMeaning>,
+    data: Option<&crate::commands::data_search::DataMeaning>,
 ) -> HashMap<PathBuf, f32> {
-    use crate::data_layer::tools::search::MeaningIndex;
+    use crate::commands::data_search::MeaningIndex;
     let guard;
     let index = match data {
         Some(meaning) => MeaningIndex::Data(meaning),
@@ -1874,7 +1877,7 @@ impl SearchLaneStatus {
         let trigram = if trigram_ready {
             IndexObservation::ready()
         } else {
-            match observed_index_status(ctx, IndexPlane::Trigram) {
+            match observed_index_status(ctx, ctx, IndexPlane::Trigram) {
                 // Usable from its persisted cache but not loaded in time for
                 // this request: its reload is in flight.
                 observation if observation.is_ready() => IndexObservation::building(),
@@ -1882,7 +1885,7 @@ impl SearchLaneStatus {
             }
         };
         let mut semantic_reload_started = false;
-        let semantic = match observed_index_status(ctx, IndexPlane::Semantic) {
+        let semantic = match observed_index_status(ctx, ctx, IndexPlane::Semantic) {
             // Enabled but not resident: a query is the signal that recovers an
             // idle-evicted semantic index, as the semantic branch did before.
             // A read-only root may also recover a failed shared snapshot; the
@@ -1912,8 +1915,8 @@ impl SearchLaneStatus {
 
     fn observe_current(ctx: &AppContext) -> Self {
         Self {
-            trigram: observed_index_status(ctx, IndexPlane::Trigram),
-            semantic: observed_index_status(ctx, IndexPlane::Semantic),
+            trigram: observed_index_status(ctx, ctx, IndexPlane::Trigram),
+            semantic: observed_index_status(ctx, ctx, IndexPlane::Semantic),
             semantic_reload_started: false,
         }
     }
@@ -1957,7 +1960,7 @@ impl SearchLaneStatus {
                 let state = if name == "semantic" {
                     // With the data layer's meaning plane serving the lane,
                     // its own status words the label.
-                    let status = match crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+                    let status = match crate::commands::data_search::DataSemantic::probe(ctx) {
                         Some(data) => Some(data.status()),
                         None => ctx
                             .semantic_index_status()
@@ -2054,7 +2057,7 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
-        match crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+        match crate::commands::data_search::DataSemantic::probe(ctx) {
             Some(semantic) => {
                 if let Some((summary, rows, reason)) = semantic
                     .serving()
@@ -2197,7 +2200,7 @@ fn callgraph_enrichment_json(ctx: &AppContext) -> serde_json::Value {
             "index": IndexObservation::ready().consumer_json(),
         });
     }
-    let observation = match observed_index_status(ctx, IndexPlane::Callgraph) {
+    let observation = match observed_index_status(ctx, ctx, IndexPlane::Callgraph) {
         // Resident but mid-refresh: enrichment waits for the refresh.
         observation if observation.is_ready() => IndexObservation::building(),
         observation => observation,
@@ -2335,7 +2338,7 @@ fn handle_semantic_search_inner(
     // With the data layer's meaning plane serving the lane, the reply
     // reports the status the readiness sample saw for it, the one the plan
     // was made from, and never today's index status.
-    let data_semantic = crate::data_layer::tools::search::DataSemantic::current(ctx);
+    let data_semantic = crate::commands::data_search::DataSemantic::current(ctx);
     let semantic_status_snapshot = if let Some(data) = &data_semantic {
         engine_plan
             .readiness
@@ -2587,7 +2590,7 @@ fn handle_external_bounded_lexical_fallback(
         top_k,
         &req.id,
         req.session(),
-        None,
+        ctx,
     ) {
         Ok(scope) => scope,
         Err(response) => return response,
@@ -2998,7 +3001,7 @@ fn handle_grep_search(
             fetch_limit,
             &req.id,
             req.session(),
-            None,
+            ctx,
         ) {
             Ok(scope) => scope,
             Err(response) => return response,
@@ -3267,9 +3270,9 @@ fn data_layer_regex_candidates(
     ctx: &AppContext,
     compiled: &pattern_compile::CompiledPattern,
 ) -> Option<std::io::Result<crate::search_index::SearchIndexSnapshot>> {
-    let view = crate::data_layer::tools::grep::ready_view(ctx)?;
+    let view = crate::data_layer::text_scope::ready_view(ctx)?;
     let scope =
-        crate::data_layer::tools::grep::ViewScope::of(view, &grep_executor::project_root(ctx))?;
+        crate::data_layer::text_scope::ViewScope::of(view, &grep_executor::project_root(ctx))?;
     Some(
         scope
             .candidates(compiled)
@@ -3335,7 +3338,7 @@ impl CheckoutSemanticGaps {
     /// into chunks are accounted for, as today's index leaves them out, and
     /// chunks the embedder refused are disclosed as today's index discloses
     /// them.
-    fn from_data(meaning: &crate::data_layer::tools::search::DataMeaning) -> Self {
+    fn from_data(meaning: &crate::commands::data_search::DataMeaning) -> Self {
         Self {
             pending: meaning.coverage().pending.clone(),
             failed: Vec::new(),
@@ -3548,7 +3551,7 @@ fn file_stamp(path: &Path) -> memo::FileStamp {
 /// literal.
 fn literal_presence(
     ctx: &AppContext,
-    index: crate::data_layer::tools::search::TextIndex<'_>,
+    index: crate::commands::data_search::TextIndex<'_>,
     project_root: &Path,
     generation: &GenerationToken,
     phrase: &str,
@@ -3578,7 +3581,7 @@ fn literal_presence(
 /// possible holders (a file that gained the literal would join them).
 fn literal_presence_still_holds(
     entry: &memo::LiteralPresenceEntry,
-    index: crate::data_layer::tools::search::TextIndex<'_>,
+    index: crate::commands::data_search::TextIndex<'_>,
     phrase: &str,
     project_root: &Path,
 ) -> std::io::Result<bool> {
@@ -3699,7 +3702,7 @@ fn presence_check(path: &Path, normalized: &str) -> Option<(memo::FileStamp, boo
 /// holder. Running out of reads or time, or meeting an unreadable file,
 /// settles nothing: that is never an absence.
 fn settle_literal_presence(
-    index: crate::data_layer::tools::search::TextIndex<'_>,
+    index: crate::commands::data_search::TextIndex<'_>,
     project_root: &Path,
     phrase: &str,
     normalized: &str,
@@ -4784,7 +4787,7 @@ fn take_windows_semantic_preview(
 /// the lane's answer does not depend on which one ran.
 fn path_lookup_paths(
     ctx: &AppContext,
-    data_text: Option<&crate::data_layer::tools::search::DataText>,
+    data_text: Option<&crate::commands::data_search::DataText>,
     project_root: &Path,
     tokens: &[&str],
     candidate_filter: &dyn Fn(&Path) -> bool,
@@ -4876,7 +4879,7 @@ fn run_engine_ranking(
     borrowed_index: Option<(&SearchIndex, &GenerationToken)>,
     split: Option<&SplitEngineInput<'_>>,
 ) -> Result<EngineRanking, String> {
-    use crate::data_layer::tools::search::TextIndex;
+    use crate::commands::data_search::TextIndex;
     use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate, BLOCK_DEPTHS};
     use confidence::{Confidence, ConfidenceEngine};
     use lexical_lane::CanonicalLexicalLane;
@@ -4890,7 +4893,7 @@ fn run_engine_ranking(
     // index, or the borrowed one of an external root.
     let data_text = borrowed_index
         .is_none()
-        .then(|| crate::data_layer::tools::search::DataText::ready(ctx))
+        .then(|| crate::commands::data_search::DataText::ready(ctx))
         .flatten();
     if let Some(text) = &data_text {
         text.note_read(request_id);
@@ -6141,7 +6144,7 @@ fn handle_engine_only_search(
                 Some(Some(meaning)) => {
                     embed_query_for_data(&params.query, ctx, &meaning).and_then(|vector| {
                         recall_audit_full_semantic_from(
-                            crate::data_layer::tools::search::MeaningIndex::Data(&meaning),
+                            crate::commands::data_search::MeaningIndex::Data(&meaning),
                             project_root,
                             params.include_tests,
                             &vector,
@@ -6485,7 +6488,7 @@ fn handle_semantic_or_hybrid_search(
     if let Some(audit) = engine_ranking.recall_audit.as_mut() {
         let full_ranking = match data_meaning.as_deref() {
             Some(meaning) => recall_audit_full_semantic_from(
-                crate::data_layer::tools::search::MeaningIndex::Data(meaning),
+                crate::commands::data_search::MeaningIndex::Data(meaning),
                 project_root,
                 params.include_tests,
                 &query_vector,
@@ -7597,7 +7600,7 @@ fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
 }
 
 fn search_index_ready_with_budget(ctx: &AppContext, _wait_budget: Duration) -> bool {
-    if crate::data_layer::tools::search::DataText::ready(ctx).is_some() {
+    if crate::commands::data_search::DataText::ready(ctx).is_some() {
         return true;
     }
 
@@ -7619,7 +7622,7 @@ fn recall_audit_full_semantic(
         .as_ref()
         .ok_or_else(|| "semantic index is not loaded".to_string())?;
     recall_audit_full_semantic_from(
-        crate::data_layer::tools::search::MeaningIndex::Snapshot(index),
+        crate::commands::data_search::MeaningIndex::Snapshot(index),
         project_root,
         include_tests,
         query_vector,
@@ -7628,7 +7631,7 @@ fn recall_audit_full_semantic(
 
 /// [`recall_audit_full_semantic`] over `index`, whichever source it reads.
 fn recall_audit_full_semantic_from(
-    index: crate::data_layer::tools::search::MeaningIndex<'_>,
+    index: crate::commands::data_search::MeaningIndex<'_>,
     project_root: &Path,
     include_tests: bool,
     query_vector: &[f32],
@@ -7652,8 +7655,8 @@ fn recall_audit_full_semantic_from(
 fn data_meaning_for(
     ctx: &AppContext,
     plan: &extensions::LanePlan<'_>,
-) -> Option<Option<Arc<crate::data_layer::tools::search::DataMeaning>>> {
-    let data = crate::data_layer::tools::search::DataSemantic::current(ctx)?;
+) -> Option<Option<Arc<crate::commands::data_search::DataMeaning>>> {
+    let data = crate::commands::data_search::DataSemantic::current(ctx)?;
     Some(
         plan.readiness
             .retained()
@@ -7668,10 +7671,10 @@ fn data_meaning_for(
 fn embed_query_for_data(
     query: &str,
     ctx: &AppContext,
-    meaning: &crate::data_layer::tools::search::DataMeaning,
+    meaning: &crate::commands::data_search::DataMeaning,
 ) -> Result<Vec<f32>, String> {
     let _cost = telemetry::CostPhase::start("embedding");
-    let dimension = crate::data_layer::tools::search::MeaningIndex::Data(meaning).dimension();
+    let dimension = crate::commands::data_search::MeaningIndex::Data(meaning).dimension();
     embed_query_for_dimension(query, ctx, dimension)
 }
 
@@ -7679,12 +7682,12 @@ fn embed_query_for_data(
 /// what the answer could not cover: files still waiting for vectors while a
 /// fill is under way, or the plane's store failing to read.
 fn data_meaning_search(
-    meaning: &crate::data_layer::tools::search::DataMeaning,
+    meaning: &crate::commands::data_search::DataMeaning,
     query_vector: &[f32],
     fetch_limit: usize,
     include: &dyn Fn(&Path) -> bool,
 ) -> (Vec<SemanticResult>, Option<CheckoutSemanticGaps>) {
-    match crate::data_layer::tools::search::MeaningIndex::Data(meaning).search_filtered(
+    match crate::commands::data_search::MeaningIndex::Data(meaning).search_filtered(
         query_vector,
         fetch_limit,
         include,
@@ -7718,7 +7721,7 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
                     )
                 })?;
         semantic_index.as_ref().and_then(|index| {
-            crate::data_layer::tools::search::MeaningIndex::Snapshot(index).dimension()
+            crate::commands::data_search::MeaningIndex::Snapshot(index).dimension()
         })
     };
     embed_query_for_dimension(query, ctx, index_dimension)
@@ -9540,7 +9543,7 @@ fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<O
         .collect();
     // A file whose slice could not be read looked absent, so the counts may
     // be short: leave every annotation out rather than show a wrong one.
-    if crate::data_layer::tools::callgraph::read_failure(&view).is_some() {
+    if crate::commands::data_callgraph::read_failure(&view).is_some() {
         return vec![None; results.len()];
     }
     annotations
@@ -9552,7 +9555,7 @@ fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<O
 fn warm_callgraph(
     ctx: &AppContext,
 ) -> Option<(
-    crate::data_layer::tools::callgraph::DataGraph,
+    crate::commands::data_callgraph::DataGraph,
     crate::data_layer::checkout::CheckoutView,
 )> {
     let checkout = ctx
@@ -9565,7 +9568,7 @@ fn warm_callgraph(
 }
 
 fn blast_radius_annotation_for_result(
-    graph: &crate::data_layer::tools::callgraph::DataGraph,
+    graph: &crate::commands::data_callgraph::DataGraph,
     view: &crate::data_layer::checkout::CheckoutView,
     result: &HybridResult,
 ) -> Option<String> {
@@ -9575,7 +9578,7 @@ fn blast_radius_annotation_for_result(
     if result.name.trim().is_empty() {
         return None;
     }
-    if !crate::data_layer::tools::callgraph::covers(view, &result.file) {
+    if !crate::commands::data_callgraph::covers(view, &result.file) {
         return None;
     }
 
@@ -10272,13 +10275,11 @@ mod tests {
             if ready {
                 crate::data_layer::surfaces::serve_text_index_for_test(&indexed);
                 assert!(
-                    crate::data_layer::tools::search::ExternalSearch::of(&caller, &external)
-                        .is_some()
+                    crate::commands::data_search::ExternalSearch::of(&caller, &external).is_some()
                 );
             } else {
                 assert!(
-                    crate::data_layer::tools::search::ExternalSearch::of(&caller, &external)
-                        .is_none()
+                    crate::commands::data_search::ExternalSearch::of(&caller, &external).is_none()
                 );
             }
             for (route, params) in &requests {
@@ -10599,7 +10600,7 @@ mod tests {
         }
         let ctx = test_context(&root);
         install_ready_search_index(&ctx, &root);
-        let extensions = crate::search_b2::install_defaults();
+        let extensions = crate::commands::semantic_search::planner::install_defaults();
         let plan = split_query_plan(
             extensions,
             "needle_symbol",
@@ -11178,7 +11179,7 @@ mod tests {
     #[test]
     fn path_lookup_from_the_view_matches_the_project_walk() {
         let (_project, root, ctx) = path_lookup_fixture();
-        let text = crate::data_layer::tools::search::DataText::ready(&ctx)
+        let text = crate::commands::data_search::DataText::ready(&ctx)
             .expect("the checkout's text plane serves");
         let token_sets: [&[&str]; 9] = [
             &["subc_format.rs"],
@@ -11239,10 +11240,10 @@ mod tests {
     #[test]
     fn path_lookup_walks_no_folder_when_a_current_view_exists() {
         let (_project, root, ctx) = path_lookup_fixture();
-        let text = crate::data_layer::tools::search::DataText::ready(&ctx)
+        let text = crate::commands::data_search::DataText::ready(&ctx)
             .expect("the checkout's text plane serves");
         let filter = |path: &Path| path_allowed_by_include_tests(path, &root, true);
-        let lookup = |live: bool, text: Option<&crate::data_layer::tools::search::DataText>| {
+        let lookup = |live: bool, text: Option<&crate::commands::data_search::DataText>| {
             crate::search_hot_path_measurements::reset();
             let found = with_watcher_live_for_test(live, || {
                 path_lookup_paths(&ctx, text, &root, &["subc_format.rs"], &filter)
@@ -11493,19 +11494,19 @@ mod tests {
     /// starting its fill) until `done` holds for how it stands.
     fn wait_for_data_semantic(
         ctx: &AppContext,
-        done: impl Fn(&crate::data_layer::tools::search::DataSemantic) -> bool,
-    ) -> crate::data_layer::tools::search::DataSemantic {
+        done: impl Fn(&crate::commands::data_search::DataSemantic) -> bool,
+    ) -> crate::commands::data_search::DataSemantic {
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
-            if let Some(found) = crate::data_layer::tools::search::DataSemantic::current(ctx)
-                .filter(|data| done(data))
+            if let Some(found) =
+                crate::commands::data_search::DataSemantic::current(ctx).filter(|data| done(data))
             {
                 return found;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "the meaning plane never reached the state: {:?}",
-                crate::data_layer::tools::search::DataSemantic::current(ctx)
+                crate::commands::data_search::DataSemantic::current(ctx)
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -13448,7 +13449,7 @@ mod tests {
             cap_protected: false,
             source: "semantic",
         };
-        let extensions = crate::search_b2::install_defaults();
+        let extensions = crate::commands::semantic_search::planner::install_defaults();
         let raw = extensions::RawQuery::new(query);
         let (shape, facts) = extensions.classify(&raw);
         assert_eq!(shape, SearchShape::NaturalLanguage);
@@ -13659,7 +13660,7 @@ mod tests {
             rank_score: 0.01,
             ..summary.clone()
         };
-        let extensions = crate::search_b2::install_defaults();
+        let extensions = crate::commands::semantic_search::planner::install_defaults();
         for (query, exact) in [
             (
                 "how does the bash watchdog kill a background task that exceeded its timeout",
@@ -15339,7 +15340,7 @@ mod split_request_tests {
             .collect::<Vec<_>>();
         let readiness = extensions::Readiness::new(false, true, true);
         let plan = split_query_plan(
-            crate::search_b2::install_defaults(),
+            crate::commands::semantic_search::planner::install_defaults(),
             "scheduler drains the work queue",
             &readiness,
         );
@@ -15355,7 +15356,7 @@ mod split_request_tests {
                 false,
                 semantic.clone(),
                 page_request,
-                crate::search_b2::install_defaults(),
+                crate::commands::semantic_search::planner::install_defaults(),
                 &plan,
                 None,
                 Some(&input),
@@ -15423,7 +15424,7 @@ mod split_request_tests {
         top_k: usize,
     ) -> Vec<PathBuf> {
         let readiness = extensions::Readiness::new(false, true, true);
-        let extensions = crate::search_b2::install_defaults();
+        let extensions = crate::commands::semantic_search::planner::install_defaults();
         let mut plan = split_query_plan(extensions, prose, &readiness);
         if split.is_none() {
             plan.selected_lanes

@@ -576,9 +576,13 @@ fn prune_compression_events_in_transaction(
     Ok(deleted)
 }
 
-pub fn prune_retention_tick(conn: &mut Connection, now_ms: i64) -> rusqlite::Result<RetentionTick> {
+pub(crate) fn prune_retention_tick(
+    conn: &mut Connection,
+    now_ms: i64,
+    hooks: crate::db::bash_tasks::RetentionHooks,
+) -> rusqlite::Result<RetentionTick> {
     let plan = crate::db::bash_tasks::select_terminal_prune_candidates(conn, now_ms, 500)?;
-    let prepared = crate::db::bash_tasks::prepare_terminal_prune(plan, |_| false);
+    let prepared = crate::db::bash_tasks::prepare_terminal_prune(plan, hooks, |_| false);
     apply_prepared_retention_tick(conn, now_ms, prepared)
 }
 
@@ -629,18 +633,24 @@ fn apply_prepared_retention_tick_timed(
     })
 }
 
-pub fn prune_retention_once(
-    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
-    now_ms: i64,
-    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
-) -> Result<Option<RetentionPass>, String> {
-    prune_retention_once_observed(db, now_ms, registries, || {})
+#[derive(Clone)]
+pub(crate) struct RetentionGuard {
+    pub(crate) hooks: crate::db::bash_tasks::RetentionHooks,
+    pub(crate) has_active_watch: Option<std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
 
-fn prune_retention_once_observed(
+pub(crate) fn prune_retention_once(
     db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
     now_ms: i64,
-    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+    guard: &RetentionGuard,
+) -> Result<Option<RetentionPass>, String> {
+    prune_retention_once_observed(db, now_ms, guard, || {})
+}
+
+pub(crate) fn prune_retention_once_observed(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+    guard: &RetentionGuard,
     observe_stat_phase: impl FnOnce(),
 ) -> Result<Option<RetentionPass>, String> {
     use std::sync::TryLockError;
@@ -686,12 +696,12 @@ fn prune_retention_once_observed(
     let stat_started = Instant::now();
     let mut prepared = crate::db::bash_tasks::prepare_terminal_prune_observed(
         plan,
+        guard.hooks,
         |task_id| {
-            registries.is_none_or(|registries| {
-                registries
-                    .iter()
-                    .any(|registry| registry.active_watch_count(task_id) > 0)
-            })
+            guard
+                .has_active_watch
+                .as_ref()
+                .is_none_or(|check| check(task_id))
         },
         observe_stat_phase,
     );
@@ -734,7 +744,7 @@ fn prune_retention_once_observed(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetentionCountPhase {
+pub(crate) enum RetentionCountPhase {
     Opening,
     Closing,
 }
@@ -937,18 +947,18 @@ fn retention_row_ceiling(eligible_rows: usize) -> usize {
 
 /// Drain a retention backlog through independently committed, bounded transactions.
 /// Contention between batches stops the sweep so interactive work always wins the mutex.
-pub fn prune_retention_sweep(
+pub(crate) fn prune_retention_sweep(
     db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
     now_ms: i64,
-    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+    guard: &RetentionGuard,
 ) -> Result<RetentionSweepOutcome, String> {
-    prune_retention_sweep_observed(db, now_ms, registries, |_, _| {})
+    prune_retention_sweep_observed(db, now_ms, guard, |_, _| {})
 }
 
-fn prune_retention_sweep_observed(
+pub(crate) fn prune_retention_sweep_observed(
     db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
     now_ms: i64,
-    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+    guard: &RetentionGuard,
     mut observe_count_attempt: impl FnMut(RetentionCountPhase, usize),
 ) -> Result<RetentionSweepOutcome, String> {
     use std::time::Instant;
@@ -985,7 +995,7 @@ fn prune_retention_sweep_observed(
     let mut worst_lock_micros = initial_count_lock_micros;
 
     loop {
-        let Some(pass) = prune_retention_once(db, now_ms, registries)? else {
+        let Some(pass) = prune_retention_once(db, now_ms, guard)? else {
             break;
         };
         passes = passes.saturating_add(1);
@@ -1054,9 +1064,9 @@ fn prune_retention_sweep_observed(
 /// Schedule bounded retention away from the daemon and standalone request loops.
 /// A process can have only one sweep in flight and attempts at most once a
 /// minute, or a few seconds after a sweep skipped for lack of the mutex.
-pub fn maybe_spawn_retention(
+pub(crate) fn maybe_spawn_retention(
     db: Option<std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>>,
-    registries: Option<Vec<crate::bash_background::BgTaskRegistry>>,
+    guard: RetentionGuard,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1080,7 +1090,7 @@ pub fn maybe_spawn_retention(
             match prune_retention_sweep(
                 &db,
                 i64::try_from(now).unwrap_or(i64::MAX),
-                registries.as_deref(),
+                &guard,
             ) {
                 Ok(RetentionSweepOutcome::Completed(sweep)) => {
                     RETENTION_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
@@ -1183,6 +1193,9 @@ fn note_skipped_sweep() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bash_background::persistence::retention::{
+        prune_retention_once_observed, prune_retention_sweep, prune_retention_sweep_observed,
+    };
     use tempfile::tempdir;
 
     fn retention_sweep_for_logging(

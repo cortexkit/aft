@@ -30,8 +30,8 @@ pub(crate) const SOCKET_ENV: &str = "AFT_GH_READ_SOCKET";
 pub(crate) const CAPABILITY_FILE_ENV: &str = "AFT_GH_READ_CAPABILITY_FILE";
 pub(crate) const STATE_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 pub(crate) const CHILD_KEYS: [&str; 5] = [
-    crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
-    crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+    crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
+    crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
     SOCKET_ENV,
     CAPABILITY_FILE_ENV,
     STATE_ENV,
@@ -322,7 +322,7 @@ pub(crate) fn start(
         let _entered = service.runtime.enter();
         tokio::net::UnixListener::from_std(listener).map_err(|error| error.to_string())?
     };
-    env.remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
+    env.remove(crate::gh_shim_paths::GH_SHIM_TICKET_ENV);
     env.insert(SOCKET_ENV.into(), socket.to_string_lossy().into_owned());
     env.insert(
         CAPABILITY_FILE_ENV.into(),
@@ -393,7 +393,7 @@ pub(crate) fn provision_optional(
         SOCKET_ENV,
         CAPABILITY_FILE_ENV,
         STATE_ENV,
-        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+        crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
     ] {
         env.remove(key);
     }
@@ -411,7 +411,7 @@ pub(crate) fn provision_optional(
                 SOCKET_ENV,
                 CAPABILITY_FILE_ENV,
                 STATE_ENV,
-                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+                crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
             ] {
                 env.remove(key);
             }

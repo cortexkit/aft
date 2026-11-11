@@ -11,7 +11,9 @@
 
 use serde_json::{json, Value};
 
-use crate::context::{AppContext, SemanticIndexStatus};
+use crate::data_layer::host::IndexHost;
+use crate::data_layer::status::SemanticIndexStatus;
+use crate::read_policy::ReadPolicy;
 
 /// One background index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -191,8 +193,12 @@ pub fn unobserved_index_status(enabled: bool) -> IndexObservation {
 /// An enabled index is `ready` or `building` when the
 /// runtime holds that state, otherwise `unavailable` with a named cause
 /// (`runtime_not_observed` when nothing has been observed yet).
-pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObservation {
-    if ctx.root_too_broad() {
+pub fn observed_index_status(
+    ctx: &dyn IndexHost,
+    policy: &dyn ReadPolicy,
+    plane: IndexPlane,
+) -> IndexObservation {
+    if policy.root_too_broad() {
         return IndexObservation {
             effective: IndexEffective::Off,
             unavailable_reason: Some(cause::ROOT_TOO_BROAD.into()),
@@ -204,7 +210,7 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
     // Configure forces every index off for a HOME root (degraded mode). That
     // is not the user's resolved choice, so report it as unavailable with its
     // cause rather than as configured off.
-    if ctx.is_home_root() {
+    if policy.is_home_root() {
         return IndexObservation::unavailable(cause::HOME_ROOT);
     }
     // Configure also forces every index off while the root's identity is
@@ -228,7 +234,7 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
     }
 }
 
-fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
+fn observe_callgraph(ctx: &dyn IndexHost) -> IndexObservation {
     // A bound checkout's call-graph plane in the index store serves every
     // call-graph reader; nothing else does. Same mapping as the text plane.
     match crate::data_layer::surfaces::report(ctx).map(|report| report.callgraph.status) {
@@ -242,7 +248,7 @@ fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
 /// file written by a newer build, or the storage root's reader floor. Passive:
 /// consults only what readers and the startup floor check already recorded.
 pub fn storage_refusal(
-    ctx: &AppContext,
+    ctx: &dyn IndexHost,
     plane: IndexPlane,
 ) -> Option<crate::persisted_format::UnsupportedPersistedFormat> {
     use crate::persisted_format::{refusal_covering, PersistedStore};
@@ -280,7 +286,7 @@ pub fn storage_refusal(
 // wait on or deadlock against index work. A lock held for writing means the
 // index is being replaced or updated, which reports as building.
 
-fn observe_trigram(ctx: &AppContext) -> IndexObservation {
+fn observe_trigram(ctx: &dyn IndexHost) -> IndexObservation {
     // A bound checkout's text plane in the index store serves the lexical
     // lanes; nothing else does.
     match crate::data_layer::surfaces::report(ctx).map(|report| report.text.status) {
@@ -290,11 +296,11 @@ fn observe_trigram(ctx: &AppContext) -> IndexObservation {
     }
 }
 
-fn observe_semantic(ctx: &AppContext) -> IndexObservation {
+fn observe_semantic(ctx: &dyn IndexHost) -> IndexObservation {
     // With the data layer on, its meaning plane serves the lane: ready while
     // it serves (a partial answer says so itself), and otherwise as its fill
     // stands, whatever today's index status reads.
-    if let Some(data) = crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+    if let Some(data) = crate::data_layer::meaning_query::DataSemantic::probe(ctx) {
         return match data.status() {
             SemanticIndexStatus::Failed(message) => {
                 IndexObservation::unavailable(semantic_failure_cause(ctx, &message))
@@ -344,7 +350,7 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
 }
 
 /// Classify a failed semantic build into a named cause.
-pub fn semantic_failure_cause(ctx: &AppContext, message: &str) -> &'static str {
+pub fn semantic_failure_cause(ctx: &dyn IndexHost, message: &str) -> &'static str {
     if let Some(reason) = ctx.cache_unavailable_reason() {
         return crate::root_cache::cache_status_code(&reason);
     }
@@ -390,10 +396,11 @@ pub const fn local_semantic_platform_supported() -> bool {
 /// observation, so a consumer that already asked for the store reports the
 /// same state it acted on.
 pub fn callgraph_access_observation(
-    ctx: &AppContext,
-    access: &crate::context::CallgraphStoreAccess,
+    ctx: &dyn IndexHost,
+    policy: &dyn ReadPolicy,
+    access: &crate::callgraph_store::access::CallgraphStoreAccess,
 ) -> IndexObservation {
-    use crate::context::CallgraphStoreAccess;
+    use crate::callgraph_store::access::CallgraphStoreAccess;
     match access {
         CallgraphStoreAccess::Off => IndexObservation::off(),
         CallgraphStoreAccess::Building => IndexObservation::building(),
@@ -402,7 +409,7 @@ pub fn callgraph_access_observation(
         }
         CallgraphStoreAccess::Suspended(_) => IndexObservation::unavailable(cause::BUILD_SUSPENDED),
         CallgraphStoreAccess::Unavailable | CallgraphStoreAccess::Error(_) => {
-            match observed_index_status(ctx, IndexPlane::Callgraph) {
+            match observed_index_status(ctx, policy, IndexPlane::Callgraph) {
                 observation if observation.effective == IndexEffective::Unavailable => observation,
                 _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
             }
@@ -415,13 +422,19 @@ pub fn callgraph_access_observation(
 /// Published view databases are opened without waiting. SQLite busy or locked
 /// errors during that open describe temporary contention, so consumers should
 /// ask again instead of reporting that the graph is unavailable.
-pub fn observe_callgraph_query(ctx: &AppContext) -> IndexObservation {
-    observe_callgraph_query_with_contention(ctx).0
+pub fn observe_callgraph_query(ctx: &dyn IndexHost, policy: &dyn ReadPolicy) -> IndexObservation {
+    observe_callgraph_query_with_contention(ctx, policy).0
 }
 
 /// Observe the current call-graph lane without opening a retired view database.
-pub fn observe_callgraph_query_with_contention(ctx: &AppContext) -> (IndexObservation, bool) {
-    (observed_index_status(ctx, IndexPlane::Callgraph), false)
+pub fn observe_callgraph_query_with_contention(
+    ctx: &dyn IndexHost,
+    policy: &dyn ReadPolicy,
+) -> (IndexObservation, bool) {
+    (
+        observed_index_status(ctx, policy, IndexPlane::Callgraph),
+        false,
+    )
 }
 
 #[cfg(test)]

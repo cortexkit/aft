@@ -76,7 +76,7 @@ fn fixture(trust: BindTrust) -> Fixture {
     Fixture {
         _dirs: vec![root_dir, outside_dir],
         // Opened paths are fully resolved; compare against the same form.
-        root: crate::inspect::job::normalize_path(&root.canonicalize().unwrap()),
+        root: crate::path_identity::normalize_path(&root.canonicalize().unwrap()),
         outside,
         ctx,
         executor,

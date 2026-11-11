@@ -110,7 +110,7 @@ fn carrier_status_skips_head_worker_and_unscoped_project_fallbacks() {
     crate::db::access_grants::register_agent(&db.lock().unwrap(), &head, "head-agent", true)
         .unwrap();
     let layout = create_task_layout(&root, "worker-session", "bash-0000000000000091").unwrap();
-    let mut metadata = crate::db::rich_ui::terminal_task_metadata_for_test(None);
+    let mut metadata = crate::bash_background::persistence::terminal_task_metadata_for_test(None);
     metadata.task_id = layout.paths.task_id.clone();
     metadata.session_id = "worker-session".into();
     metadata.project_root = Some(root.clone());

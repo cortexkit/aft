@@ -694,12 +694,12 @@ fn collect_warm_working_set(
     let scoped_files = scoped_files.map(|files| {
         files
             .iter()
-            .map(|file| crate::inspect::job::canonicalize_normalized(file))
+            .map(|file| crate::path_identity::canonicalize_normalized(file))
             .collect::<HashSet<_>>()
     });
-    let project_root = crate::inspect::job::canonicalize_normalized(&snapshot.project_root);
+    let project_root = crate::path_identity::canonicalize_normalized(&snapshot.project_root);
     let accepts_file = |file: &Path| {
-        let file = crate::inspect::job::canonicalize_normalized(file);
+        let file = crate::path_identity::canonicalize_normalized(file);
         file.starts_with(&project_root)
             || scoped_files
                 .as_ref()
@@ -1005,7 +1005,7 @@ fn scoped_coverage_candidates_with_budget(
         scope.roots().to_vec()
     }
     .into_iter()
-    .map(|root| crate::inspect::job::canonicalize_normalized(&root))
+    .map(|root| crate::path_identity::canonicalize_normalized(&root))
     .collect::<Vec<_>>();
 
     let mut candidates = BTreeSet::new();
@@ -1606,9 +1606,9 @@ fn scope_contains_canonical_file(scope: &JobScope, file: &Path) -> bool {
     if scope.roots().is_empty() {
         return scope.contains(file);
     }
-    let file = crate::inspect::job::canonicalize_normalized(file);
+    let file = crate::path_identity::canonicalize_normalized(file);
     scope.roots().iter().any(|root| {
-        let root = crate::inspect::job::canonicalize_normalized(root);
+        let root = crate::path_identity::canonicalize_normalized(root);
         file.starts_with(&root)
     })
 }
@@ -1934,7 +1934,7 @@ mod payload_count_tests {
             Config::default(),
         );
         let external = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(external.path());
+        let root = crate::path_identity::canonicalize_normalized(external.path());
         let real = root.join("real");
         let alias = root.join("alias");
         std::fs::create_dir(&real).unwrap();
@@ -1966,7 +1966,7 @@ mod payload_count_tests {
         crate::inspect::scoped_diagnostics_sweep::ScopedSweep,
     ) {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let configured = root.join("configured");
         let external = root.join("external");
         std::fs::create_dir(&configured).unwrap();
@@ -2291,7 +2291,7 @@ mod payload_count_tests {
     #[test]
     fn inspect_noise_missing_docker_server_names_files_and_install_path() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let project = crate::inspect::job::canonicalize_normalized(temp.path());
+        let project = crate::path_identity::canonicalize_normalized(temp.path());
         std::fs::create_dir_all(project.join("images")).unwrap();
         std::fs::write(project.join("Dockerfile"), "FROM scratch\n").unwrap();
         // Plain Dockerfile is a root marker, not a registered extension. Keep
@@ -2532,7 +2532,7 @@ mod ignore_rule_candidate_tests {
     use crate::parser::SymbolCache;
 
     fn candidates(root: &Path) -> std::collections::BTreeSet<String> {
-        let root = crate::inspect::job::canonicalize_normalized(root);
+        let root = crate::path_identity::canonicalize_normalized(root);
         let snapshot = InspectSnapshot::new(
             root.clone(),
             root.join(".aft-inspect"),
@@ -2564,7 +2564,7 @@ mod ignore_rule_candidate_tests {
     #[test]
     fn scoped_candidate_entry_limit_reports_incomplete_walk() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         for index in 0..10 {
             std::fs::write(root.join(format!("unsupported-{index}.txt")), "text").unwrap();
         }
@@ -2615,7 +2615,7 @@ mod ignore_rule_candidate_tests {
     #[test]
     fn unscoped_failure_file_walk_obeys_inspect_deadline_and_keeps_gap() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         std::fs::write(root.join("main.ts"), "export const main = 1;").unwrap();
         let snapshot = InspectSnapshot::new(
             root.clone(),
@@ -2636,7 +2636,7 @@ mod ignore_rule_candidate_tests {
     #[test]
     fn scoped_candidate_deadline_retains_incomplete_inventory() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         std::fs::write(root.join("main.ts"), "export const main = 1;").unwrap();
         let snapshot = InspectSnapshot::new(
             root.clone(),
@@ -2657,9 +2657,9 @@ mod ignore_rule_candidate_tests {
     #[test]
     fn scoped_candidates_share_applicability_inside_and_outside_project_root() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let other = tempfile::tempdir().unwrap();
-        let other_root = crate::inspect::job::canonicalize_normalized(other.path());
+        let other_root = crate::path_identity::canonicalize_normalized(other.path());
         for (name, content) in [
             ("package.json", "{}"),
             ("tsconfig.json", "{\"include\":[\"*.ts\"]}"),

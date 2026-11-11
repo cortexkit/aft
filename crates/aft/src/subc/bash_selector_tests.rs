@@ -726,7 +726,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
             .unwrap();
         let status = snapshot.info.status;
         let _ = ctx.bash_background().kill(task_id, "wait-limit-test");
-        assert_eq!(status, crate::bash_background::BgTaskStatus::Running);
+        assert_eq!(status, crate::protocol::BgTaskStatus::Running);
     }
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["status"], "running", "{response:?}");

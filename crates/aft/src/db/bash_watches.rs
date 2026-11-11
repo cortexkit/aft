@@ -304,7 +304,7 @@ pub(crate) fn refresh_watch_gap_health(conn: &Connection) {
         let (mut outstanding, mut missing) = (0u64, 0u64);
         let mut uncertain = false;
         for batch in batches {
-            match serde_json::from_str::<crate::bash_background::watch_lines::LineBatch>(&batch?) {
+            match serde_json::from_str::<crate::task_watch_lines::LineBatch>(&batch?) {
                 Ok(batch) => {
                     if let Some(gap) = batch.retry_gap {
                         outstanding = outstanding.saturating_add(1);
@@ -365,18 +365,18 @@ pub(crate) fn acknowledge_delivery(
     task: &str,
     watch: &str,
     version: u64,
-    gap: Option<&crate::bash_background::watch_lines::RetryGap>,
+    gap: Option<&crate::task_watch_lines::RetryGap>,
 ) -> rusqlite::Result<()> {
     let epoch = gap
         .map(|gap| gap.eviction_epoch.as_str())
-        .unwrap_or(crate::subc::watch_delivery::eviction_epoch());
+        .unwrap_or(crate::task_watch_lines::eviction_epoch());
     let through = gap.map(|gap| gap.evicted_through).unwrap_or_default();
     conn.execute("INSERT INTO bash_watch_delivery_acks(harness, session_id, task_id, watch_id, version, acknowledged_at, eviction_epoch, evicted_through) VALUES(?1,?2,?3,?4,?5,unixepoch(),?6,?7) ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET version=MAX(version,excluded.version), acknowledged_at=excluded.acknowledged_at, eviction_epoch=CASE WHEN excluded.eviction_epoch != '' THEN excluded.eviction_epoch ELSE eviction_epoch END, evicted_through=CASE WHEN eviction_epoch = excluded.eviction_epoch THEN MAX(evicted_through,excluded.evicted_through) WHEN excluded.eviction_epoch != '' THEN excluded.evicted_through ELSE evicted_through END", params![harness, session, task, watch, version as i64, epoch, through as i64])?;
     // Only prune old acknowledgements from an earlier daemon: its process-local
     // retry copies no longer exist, even if the current daemon is long-lived.
     conn.execute(
         "DELETE FROM bash_watch_delivery_acks WHERE acknowledged_at < unixepoch() - 2592000 AND eviction_epoch != ?1",
-        [crate::subc::watch_delivery::eviction_epoch()],
+        [crate::task_watch_lines::eviction_epoch()],
     )?;
     Ok(())
 }
@@ -406,14 +406,15 @@ pub(crate) fn list_delivery_gaps(
         let task_id: String = row.get(1)?;
         let watch_id = row.get(2)?;
         let saved: String = row.get(3)?;
-        let batch = serde_json::from_str::<crate::bash_background::watch_lines::LineBatch>(&saved)
-            .map_err(|error| {
+        let batch = serde_json::from_str::<crate::task_watch_lines::LineBatch>(&saved).map_err(
+            |error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     3,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
-            })?;
+            },
+        )?;
         Ok(BashPatternWatchRow {
             harness: harness.into(),
             session_id,
@@ -464,6 +465,23 @@ pub(crate) fn delete_delivery_gap(
 #[cfg(test)]
 mod delivery_ack_tests {
     use super::*;
+
+    #[test]
+    fn existing_delivery_ack_keeps_legacy_epoch_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        const EPOCH: &[u8] = b"8731:1794411200123456789";
+        conn.execute("INSERT INTO bash_watch_delivery_acks VALUES('opencode','session','task','fixture',17,unixepoch(),'8731:1794411200123456789',23)", []).unwrap();
+        let (version, epoch, through) =
+            delivery_ack_version(&conn, "opencode", "session", "task", "fixture")
+                .unwrap()
+                .unwrap();
+        assert_eq!((version, through), (17, 23));
+        assert_eq!(epoch.as_bytes(), EPOCH);
+        acknowledge_delivery(&conn, "opencode", "session", "task", "current", 19, None).unwrap();
+        let saved: Vec<u8> = conn.query_row("SELECT CAST(eviction_epoch AS BLOB) FROM bash_watch_delivery_acks WHERE watch_id='fixture'", [], |row| row.get(0)).unwrap();
+        assert_eq!(saved, EPOCH);
+    }
 
     #[test]
     fn retry_overflow_ack_tombstones_survive_a_long_lived_daemon() {

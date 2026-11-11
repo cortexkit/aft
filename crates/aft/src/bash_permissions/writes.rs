@@ -83,7 +83,7 @@ fn resolve(text: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     } else {
         cwd?.join(path)
     };
-    Some(super::resolve_with_existing_ancestors(&path))
+    Some(crate::system_temp::resolve_with_existing_ancestors(&path))
 }
 
 fn operands<'a>(args: &'a [String], takes_value: &[&str]) -> Vec<&'a str> {

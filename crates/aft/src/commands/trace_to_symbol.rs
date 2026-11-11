@@ -5,7 +5,7 @@ use crate::commands::callgraph_store_adapter::{
     store_error_response, trace_to_symbol_candidates, trace_to_symbol_result,
 };
 use crate::context::AppContext;
-use crate::inspect::job::is_test_file;
+use crate::file_kind::is_test_file;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to_symbol` request.
@@ -81,7 +81,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
 
-    let (store, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
+    let (store, data_view) = match crate::commands::data_callgraph::ops_graph(
         &req.id,
         "trace_to_symbol",
         ctx,
@@ -171,7 +171,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         depth,
         include_tests,
     );
-    if let Some(response) = crate::data_layer::tools::callgraph::failed_reads(
+    if let Some(response) = crate::commands::data_callgraph::failed_reads(
         &req.id,
         "trace_to_symbol",
         data_view.as_ref(),

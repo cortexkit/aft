@@ -20,7 +20,7 @@ use crate::callgraph_store::join::{
     self, BlobImport, BlobRef, BlobRefKind, BlobSymbol, CallgraphBlob, ConfigBlob,
     ManifestJoinError, ParseBlob,
 };
-use crate::inspect::scanners::todos::{self, TodoLanguage};
+use crate::parser::todo_markers::{self as todos, TodoLanguage};
 use crate::parser::LangId;
 
 /// The version of the extractor whose output the records hold. Records
@@ -355,7 +355,7 @@ pub fn extract_parsed(
     if let RecordBody::Parsed { body, .. } = &mut record.data {
         body.outline = Some(outline.iter().map(outline_symbol).collect());
         body.dead_code = Some(
-            crate::inspect::scanners::dead_code::StoredFileFacts::encode_for_record(
+            crate::parser::dead_code_facts::StoredFileFacts::encode_for_record(
                 source,
                 tree.language,
                 &tree.tree,
@@ -811,6 +811,29 @@ fn blob_ref_kind(kind: RefKind) -> BlobRefKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_fact_record_bytes_stay_compatible() {
+        let corpus = [
+            ("main.rs", "// TODO(alice): keep entry facts\n#[derive(serde::Serialize)]\nstruct Message { value: u32 }\nfn main() { helper(); }\nfn helper() {}\n#[cfg(test)] mod tests { fn check() {} }\n"),
+            ("lib.rs", "pub mod api;\nmod private { pub fn callback() {} }\npub use private::callback;\nmacro_rules! invoke { ($f:ident) => { $f() }; }\n// FIXME: keep macro references\nfn run() { invoke!(callback); }\n"),
+            ("main.go", "package main\n// TODO: keep dispatch facts\ntype Reader interface { Read() int }\ntype File struct {}\nfunc (f File) Read() int { return 1 }\nfunc main() { var r Reader = File{}; r.Read() }\n"),
+            ("main.js", "import { helper } from './lib.js';\n// TODO(bob): keep imports\nexport { helper as run };\nexport const value = helper();\n"),
+            ("lib.ts", "import type { Shape } from './types';\nexport * from './other';\n// FIXME: keep type references\nexport function draw(shape: Shape): Shape { return shape; }\n"),
+            ("notes.md", "# Notes\n<!-- TODO(writer): document the API -->\n<!-- FIXME: check examples -->\n"),
+        ];
+        // These surface/body bytes were captured before moving syntax facts
+        // out of inspect. A refactor must not invalidate persisted records.
+        let expected: Vec<(String, Vec<u8>, Vec<u8>)> =
+            serde_json::from_str(include_str!("content_compatibility.json")).unwrap();
+        assert_eq!(expected.len(), corpus.len());
+        for ((path, source), (name, surface, body)) in corpus.into_iter().zip(expected) {
+            assert_eq!(path, name);
+            let language = language_for(path, source.as_bytes()).unwrap();
+            let record = extract(source.as_bytes(), &language).unwrap();
+            assert_eq!(record.encode(), (surface, body), "{path}");
+        }
+    }
 
     /// The record's version names the call-graph producer it extracts with,
     /// so a producer bump cannot leave records of its old output under the

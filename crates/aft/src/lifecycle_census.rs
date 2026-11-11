@@ -149,7 +149,7 @@ pub(crate) fn collect(
             .iter()
             .filter_map(|context| {
                 context.config().project_root.as_ref().map(|root| {
-                    let root = crate::inspect::job::canonicalize_normalized(root);
+                    let root = crate::path_identity::canonicalize_normalized(root);
                     (
                         root.display().to_string(),
                         crate::lsp::manager::applicability_metrics(&root),

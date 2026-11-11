@@ -206,7 +206,7 @@ fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
         IMAGE_PROCESSING_DELAY, LEGACY_HASHLINE_READ, LEGACY_READ_RENDER_BYTES,
     };
     use crate::hashline::snapshot::{SOURCE_AFTER_READ, SOURCE_READS};
-    use crate::inspect::job::CANONICALIZE_CALLS;
+    use crate::path_identity::CANONICALIZE_CALLS;
     use crate::search_index::{
         audit_record, audit_work, AuditWork, AUDIT_CANCEL_ELAPSED, AUDIT_IO_PROBE,
     };

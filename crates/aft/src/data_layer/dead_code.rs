@@ -21,11 +21,12 @@ use crate::callgraph_store::dead_code_projection::{
 use crate::callgraph_store::{
     lang_from_label, PROVENANCE_TREESITTER, PROVENANCE_VALUE_REF, TOP_LEVEL_SYMBOL,
 };
-use crate::inspect::job::{
-    canonicalize_normalized, CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot,
-    GoInitializerGroup, DISPATCHED_CALLEE_SEPARATOR,
+use crate::data_layer::dead_code_snapshot::DEFAULT_EXPORT_MARKER_KIND;
+use crate::data_layer::dead_code_snapshot::{
+    CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, GoInitializerGroup,
+    DISPATCHED_CALLEE_SEPARATOR,
 };
-use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
+use crate::path_identity::canonicalize_normalized;
 
 /// The kinds of reference an outbound call can come from.
 pub(crate) const OUTBOUND_KINDS: [&str; 5] = [
@@ -66,7 +67,11 @@ pub(crate) fn path_key(path: &Path) -> &[u8] {
 /// The dead-code snapshot of the checkout at `root` whose call graph is
 /// `rows`.
 #[must_use]
-pub(crate) fn snapshot(root: &Path, rows: &GraphRows) -> CallgraphSnapshot {
+pub(crate) fn snapshot(
+    root: &Path,
+    rows: &GraphRows,
+    entry_points: &dyn super::dead_code_snapshot::EntryPoints,
+) -> CallgraphSnapshot {
     let mut paths = Paths {
         root,
         cache: HashMap::new(),
@@ -77,14 +82,7 @@ pub(crate) fn snapshot(root: &Path, rows: &GraphRows) -> CallgraphSnapshot {
         .map(|path| paths.resolve(path))
         .collect::<Vec<_>>();
     files.sort_by(|left, right| path_key(left).cmp(path_key(right)));
-    let entry_points = {
-        let resolved = crate::inspect::resolve_entry_points(root);
-        files
-            .iter()
-            .filter(|file| resolved.is_entry_point(file))
-            .cloned()
-            .collect()
-    };
+    let entry_points = entry_points.resolve(root, &files);
     CallgraphSnapshot {
         generated_at: Some(SystemTime::now()),
         exported_symbols: exported_symbols(rows, &mut paths),

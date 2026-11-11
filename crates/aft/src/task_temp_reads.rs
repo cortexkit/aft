@@ -49,8 +49,8 @@ pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
     let (Some(parent), Some(name)) = (absolute_root.parent(), absolute_root.file_name()) else {
         return Err(refused());
     };
-    let root = crate::inspect::job::normalize_path(&std::fs::canonicalize(parent)?.join(name));
-    let expected = crate::inspect::job::normalize_path(&root.join(remainder));
+    let root = crate::path_identity::normalize_path(&std::fs::canonicalize(parent)?.join(name));
+    let expected = crate::path_identity::normalize_path(&root.join(remainder));
     Ok(Some(OpenCheck { root, expected }))
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn open(path: &Path) -> io::Result<File> {
 }
 
 fn validate_opened(path: &Path, check: &OpenCheck, file: &File) -> io::Result<()> {
-    let opened = crate::inspect::job::normalize_path(
+    let opened = crate::path_identity::normalize_path(
         &crate::commands::file_read_exact::opened_location(file)?,
     );
     // Judge the descriptor, not a second canonicalization of the input: a
@@ -109,4 +109,64 @@ fn refused() -> io::Error {
         io::ErrorKind::PermissionDenied,
         "scratch read escaped its task directory or named unsafe content",
     )
+}
+
+pub fn validate_task_id(task_id: &str) -> std::io::Result<()> {
+    let bytes = task_id.as_bytes();
+    if bytes.len() == 21
+        && bytes.starts_with(b"bash-")
+        && bytes[5..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "background task id must match ^bash-[0-9a-f]{16}$",
+        ))
+    }
+}
+
+/// Recognize the task bundle structurally, without trusting a caller's session
+/// namespace or granting access to the enclosing private store.
+pub(crate) fn task_directory(path: &Path) -> Option<&Path> {
+    // Ordinary project paths never need ancestor-by-ancestor task validation.
+    // A marker match is only a fast prefilter; the component checks still win.
+    static MARKER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"bash-tasks"));
+    MARKER.find(path.as_os_str().as_encoded_bytes())?;
+    path.ancestors().find(|ancestor| {
+        ancestor
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new("bash-tasks"))
+            && ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| validate_task_id(name).is_ok())
+    })
+}
+
+pub(crate) fn is_task_environment(path: &Path) -> bool {
+    task_directory(path).is_some_and(|root| path == root.join("control/environment.bin"))
+}
+
+#[cfg(test)]
+mod task_path_tests {
+    use super::*;
+    #[test]
+    fn task_id_validation_is_exact() {
+        assert!(validate_task_id("bash-0123456789abcdef").is_ok());
+        for invalid in [
+            "bash-0123456789abcde",
+            "bash-0123456789abcdef0",
+            "bash-0123456789ABCDEf",
+            "bash-0123456789abcdeg",
+            "../bash-0123456789abcdef",
+        ] {
+            assert!(validate_task_id(invalid).is_err(), "accepted {invalid}");
+        }
+    }
 }

@@ -398,7 +398,7 @@ impl AppContext {
         }
         // Everything under the storage root that this build refused because a
         // newer build wrote it (or the reader floor requires a newer reader).
-        let storage_root = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let storage_root = crate::storage_path::storage_dir(config.storage_dir.as_deref());
         // Push projection supplies only this project's refusals. Do not build
         // the full-storage list that it would immediately discard.
         let storage_refusals = if kind == StatusSnapshotKind::Explicit {
@@ -574,7 +574,7 @@ impl AppContext {
             // Read only this root's LSP applicability rather than cloning
             // applicability for every root and the other lifecycle details.
             let root = config.project_root.clone().unwrap_or_default();
-            let normalized = crate::inspect::job::canonicalize_normalized(&root)
+            let normalized = crate::path_identity::canonicalize_normalized(&root)
                 .display()
                 .to_string();
             let mut roots = serde_json::Map::new();

@@ -31,6 +31,7 @@ struct Slice {
 }
 
 const SEMANTIC_MODULE_PREFIX: &str = "crates/aft/src/commands/semantic_search/";
+const SEARCH_STATE_PREFIX: &str = "crates/aft/src/search_state/";
 const ENGINE_FIXTURE_PREFIX: &str = "benchmarks/aft-search/engine-fixtures/";
 const ENGINE_TEST_PREFIX: &str = "crates/aft/tests/engine_";
 const RANKING_DIRECTORY: &str = "crates/aft/src/ranking";
@@ -49,8 +50,8 @@ const B_OWNED_EXACT: &[&str] = &[
 const SEAM_PATHS: &[&str] = &[
     "crates/aft/src/commands/semantic_search.rs",
     "crates/aft/src/commands/semantic_search/mod.rs",
-    "crates/aft/src/commands/semantic_search/plan_table.rs",
-    "crates/aft/src/commands/semantic_search/generation_token.rs",
+    "crates/aft/src/search_b2/plan_table.rs",
+    "crates/aft/src/search_state/generation_token.rs",
 ];
 
 fn slices() -> Vec<Slice> {
@@ -62,23 +63,24 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("benchmarks/aft-search/engine-fixtures/plan-table.json"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/comparator.rs"),
+                FenceRule::Exact("crates/aft/src/search_state/candidate.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/data_file.rs"),
                 FenceRule::Exact(
-                    "crates/aft/src/commands/semantic_search/evidence_descriptor.rs",
+                    "crates/aft/src/search_state/evidence_descriptor.rs",
                 ),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/external_disk_check.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/external_exact.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/external_pattern.rs"),
-                FenceRule::Exact("crates/aft/src/commands/semantic_search/generation_token.rs"),
+                FenceRule::Exact("crates/aft/src/search_state/generation_token.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/mod.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/nearest_names.rs"),
-                FenceRule::Exact("crates/aft/src/commands/semantic_search/plan_table.rs"),
+                FenceRule::Exact("crates/aft/src/search_b2/plan_table.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/recall_audit.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/regex_route.rs"),
-                FenceRule::Exact("crates/aft/src/commands/semantic_search/request_files.rs"),
+                FenceRule::Exact("crates/aft/src/search_state/request_files.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/snippet_bounds.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/split_query.rs"),
-                FenceRule::Exact("crates/aft/src/commands/semantic_search/waits.rs"),
+                FenceRule::Exact("crates/aft/src/search_state/waits.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_comparator_test.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_lint_test.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_plan_table_test.rs"),
@@ -89,21 +91,22 @@ fn slices() -> Vec<Slice> {
                 "benchmarks/aft-search/engine-fixtures/plan-table.json",
                 "crates/aft/src/commands/semantic_search.rs",
                 "crates/aft/src/commands/semantic_search/comparator.rs",
+                "crates/aft/src/search_state/candidate.rs",
                 "crates/aft/src/commands/semantic_search/data_file.rs",
-                "crates/aft/src/commands/semantic_search/evidence_descriptor.rs",
+                "crates/aft/src/search_state/evidence_descriptor.rs",
                 "crates/aft/src/commands/semantic_search/external_disk_check.rs",
                 "crates/aft/src/commands/semantic_search/external_exact.rs",
                 "crates/aft/src/commands/semantic_search/external_pattern.rs",
-                "crates/aft/src/commands/semantic_search/generation_token.rs",
+                "crates/aft/src/search_state/generation_token.rs",
                 "crates/aft/src/commands/semantic_search/mod.rs",
                 "crates/aft/src/commands/semantic_search/nearest_names.rs",
-                "crates/aft/src/commands/semantic_search/plan_table.rs",
+                "crates/aft/src/search_b2/plan_table.rs",
                 "crates/aft/src/commands/semantic_search/recall_audit.rs",
                 "crates/aft/src/commands/semantic_search/regex_route.rs",
-                "crates/aft/src/commands/semantic_search/request_files.rs",
+                "crates/aft/src/search_state/request_files.rs",
                 "crates/aft/src/commands/semantic_search/snippet_bounds.rs",
                 "crates/aft/src/commands/semantic_search/split_query.rs",
-                "crates/aft/src/commands/semantic_search/waits.rs",
+                "crates/aft/src/search_state/waits.rs",
                 "crates/aft/tests/engine_comparator_test.rs",
                 "crates/aft/tests/engine_lint_test.rs",
                 "crates/aft/tests/engine_plan_table_test.rs",
@@ -114,8 +117,9 @@ fn slices() -> Vec<Slice> {
             fence: vec![
                 FenceRule::Prefix("benchmarks/aft-search/engine-fixtures/exact/"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/exact_lane.rs"),
-                FenceRule::Exact("crates/aft/src/commands/semantic_search/memo.rs"),
+                FenceRule::Exact("crates/aft/src/search_state/memo.rs"),
                 FenceRule::Exact("crates/aft/src/search_index.rs"),
+                FenceRule::Exact("crates/aft/src/search_state/mod.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_content_binding_test.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_exact_test.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_fallback_test.rs"),
@@ -128,8 +132,9 @@ fn slices() -> Vec<Slice> {
                 "benchmarks/aft-search/engine-fixtures/exact/fallback_bounds.json",
                 "benchmarks/aft-search/engine-fixtures/exact/uncapped_ready.json",
                 "crates/aft/src/commands/semantic_search/exact_lane.rs",
-                "crates/aft/src/commands/semantic_search/memo.rs",
+                "crates/aft/src/search_state/memo.rs",
                 "crates/aft/src/search_index.rs",
+                "crates/aft/src/search_state/mod.rs",
                 "crates/aft/tests/engine_content_binding_test.rs",
                 "crates/aft/tests/engine_exact_test.rs",
                 "crates/aft/tests/engine_fallback_test.rs",
@@ -266,17 +271,19 @@ fn slices() -> Vec<Slice> {
         },
         Slice {
             id: "C1-rerank-core",
-            fence: vec![FenceRule::Prefix(
-                "crates/aft/src/commands/semantic_search/rerank/",
-            )],
+            fence: vec![
+                FenceRule::Prefix("crates/aft/src/commands/semantic_search/rerank/"),
+                FenceRule::Prefix("crates/aft/src/search_state/rerank/"),
+            ],
             landed_paths: vec![
-                "crates/aft/src/commands/semantic_search/rerank/fixture.rs",
+                "crates/aft/src/search_state/rerank/fixture.rs",
                 "crates/aft/src/commands/semantic_search/rerank/mod.rs",
-                "crates/aft/src/commands/semantic_search/rerank/onnx.rs",
+                "crates/aft/src/search_state/rerank/mod.rs",
+                "crates/aft/src/search_state/rerank/onnx.rs",
                 "crates/aft/src/commands/semantic_search/rerank/pool_export.rs",
-                "crates/aft/src/commands/semantic_search/rerank/remote.rs",
-                "crates/aft/src/commands/semantic_search/rerank/slot.rs",
-                "crates/aft/src/commands/semantic_search/rerank/synapse.rs",
+                "crates/aft/src/search_state/rerank/remote.rs",
+                "crates/aft/src/search_state/rerank/slot.rs",
+                "crates/aft/src/search_state/rerank/synapse.rs",
                 "crates/aft/src/commands/semantic_search/rerank/tests.rs",
             ],
         },
@@ -289,6 +296,29 @@ fn slices() -> Vec<Slice> {
             landed_paths: vec![
                 "crates/aft/src/commands/semantic_search/extensions.rs",
                 "crates/aft/tests/engine_search_extensions_test.rs",
+            ],
+        },
+        Slice {
+            id: "search-layer-boundaries",
+            fence: vec![
+                FenceRule::Prefix("crates/aft/src/commands/semantic_search/planner/"),
+                FenceRule::Exact("crates/aft/src/commands/data_search.rs"),
+                FenceRule::Exact("crates/aft/src/data_layer/meaning_query.rs"),
+                FenceRule::Exact("crates/aft/src/data_layer/external_search.rs"),
+                FenceRule::Exact("crates/aft/src/search_b2/contracts.rs"),
+                FenceRule::Exact("crates/aft/src/grep_executor/multi_path.rs"),
+                FenceRule::Exact("crates/aft/src/grep_executor/git_exclude.rs"),
+            ],
+            landed_paths: vec![
+                "crates/aft/src/commands/semantic_search/planner/mod.rs",
+                "crates/aft/src/commands/semantic_search/planner/lane_plan.rs",
+                "crates/aft/src/commands/semantic_search/planner/readiness.rs",
+                "crates/aft/src/commands/data_search.rs",
+                "crates/aft/src/data_layer/meaning_query.rs",
+                "crates/aft/src/data_layer/external_search.rs",
+                "crates/aft/src/search_b2/contracts.rs",
+                "crates/aft/src/grep_executor/multi_path.rs",
+                "crates/aft/src/grep_executor/git_exclude.rs",
             ],
         },
     ]
@@ -327,6 +357,13 @@ fn collect_files(root: &Path, relative_dir: &str, output: &mut BTreeSet<String>)
 
 fn constraint_paths(root: &Path) -> BTreeSet<String> {
     let mut paths = BTreeSet::from([
+        "crates/aft/src/search_b2/plan_table.rs".to_string(),
+        "crates/aft/src/search_b2/contracts.rs".to_string(),
+        "crates/aft/src/grep_executor/multi_path.rs".to_string(),
+        "crates/aft/src/grep_executor/git_exclude.rs".to_string(),
+        "crates/aft/src/commands/data_search.rs".to_string(),
+        "crates/aft/src/data_layer/meaning_query.rs".to_string(),
+        "crates/aft/src/data_layer/external_search.rs".to_string(),
         "crates/aft/src/commands/semantic_search.rs".to_string(),
         "crates/aft/src/search_index.rs".to_string(),
         "crates/aft/src/subc_tool_schemas.json".to_string(),
@@ -337,6 +374,7 @@ fn constraint_paths(root: &Path) -> BTreeSet<String> {
         "packages/pi-plugin/src/tools/semantic.ts".to_string(),
     ]);
     collect_files(root, "crates/aft/src/commands/semantic_search", &mut paths);
+    collect_files(root, "crates/aft/src/search_state", &mut paths);
     collect_files(root, "benchmarks/aft-search/engine-fixtures", &mut paths);
 
     for entry in fs::read_dir(root.join("crates/aft/tests")).expect("read engine tests") {
@@ -475,11 +513,13 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
 
     let modules = constraint_paths(&root)
         .into_iter()
-        .filter(|path| path.starts_with(SEMANTIC_MODULE_PREFIX))
+        .filter(|path| {
+            path.starts_with(SEMANTIC_MODULE_PREFIX) || path.starts_with(SEARCH_STATE_PREFIX)
+        })
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        36,
+        41,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {

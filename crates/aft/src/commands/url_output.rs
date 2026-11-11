@@ -78,7 +78,7 @@ pub(crate) fn redact_url_cache_paths(
     if let Some(configured) = &config.cache_dir_configured {
         roots.push(configured.spelling.join("aft"));
     }
-    roots.push(crate::bash_background::storage_dir(
+    roots.push(crate::storage_path::storage_dir(
         config.storage_dir.as_deref(),
     ));
     roots.dedup();

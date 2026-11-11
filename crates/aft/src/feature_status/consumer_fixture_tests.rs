@@ -373,13 +373,13 @@ fn aft_inspect_dead_code_matches_the_shared_fixtures() {
         let scenario = scenario(name, &[EXAMPLE_FUNCTION]);
         let payload = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(1);
         let mut summary = crate::commands::inspect::summary_for_test(
-            crate::inspect::InspectCategory::DeadCode,
+            crate::inspect_category::InspectCategory::DeadCode,
             &payload,
         );
         crate::commands::inspect::annotate_dead_code_unavailable_for_test(
             &mut summary,
             &payload,
-            observed_index_status(&scenario.ctx, IndexPlane::Callgraph),
+            observed_index_status(&scenario.ctx, &scenario.ctx, IndexPlane::Callgraph),
         );
         let frozen = &expected["analyses"]["dead_code"];
         assert_eq!(project(&summary, frozen), *frozen, "dead_code/{name}");

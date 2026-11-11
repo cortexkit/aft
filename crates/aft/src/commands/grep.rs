@@ -28,9 +28,6 @@ pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = crate::tool_output::LIST_BODY_BY
 /// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
 /// knows the printed text is not the whole line.
 pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
-/// Text note for a grep or glob whose search path holds no searchable file.
-pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
-    "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";
 
 #[cfg(test)]
 mod contract_tests {
@@ -240,7 +237,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         &req.id,
         req.session(),
-        Some(crate::context::WorkerSearchTool::Grep),
+        &ctx.search_read_policy(crate::context::WorkerSearchTool::Grep),
     ) {
         Ok(scope) => scope,
         Err(response) => return response,
@@ -277,9 +274,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         None
     } else {
-        crate::data_layer::parent_session::grep_fan_out(
-            ctx, &compiled, &scope, &params, &filters, order,
-        )
+        crate::parent_search::grep_fan_out(ctx, &compiled, &scope, &params, &filters, order)
     };
     let (result, phases, parent_gaps) = match parent_answer {
         Some(answer) => answer,
@@ -475,7 +470,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
-    crate::data_layer::parent_session::attach_search_gaps(&mut body, parent_gaps);
+    crate::parent_search::attach_search_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
     if let Some(mut envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
@@ -524,6 +519,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 pub(crate) fn trigram_index_disclosure(ctx: &AppContext) -> serde_json::Value {
     serde_json::json!({
         "trigram": crate::feature_status::observed_index_status(
+            ctx,
             ctx,
             crate::feature_status::IndexPlane::Trigram,
         )

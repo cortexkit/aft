@@ -319,7 +319,7 @@ pub(crate) fn is_excluded_with_file_type(
 pub(crate) fn is_excluded_event(path: &Path) -> bool {
     is_storage_path(path)
         || crate::os_metadata::is_os_metadata_path(path)
-        || crate::db::file_identity::is_registered_file_path(path)
+        || crate::live_db_files::is_registered_file_path(path)
         || has_sqlite_suffix(path) && path.metadata().is_ok_and(|metadata| !metadata.is_dir())
 }
 
@@ -334,7 +334,7 @@ pub(crate) fn is_excluded_file_by_path(path: &Path) -> bool {
         || is_storage_path(path)
         || crate::os_metadata::is_os_metadata_path(path)
         || has_sqlite_suffix(path)
-        || crate::db::file_identity::is_registered_file_path(path)
+        || crate::live_db_files::is_registered_file_path(path)
 }
 
 fn is_storage_path(path: &Path) -> bool {
@@ -346,20 +346,23 @@ fn is_storage_path(path: &Path) -> bool {
 }
 
 /// Resolve aliases without opening file contents before checking retained stores.
-pub(crate) fn storage_root_for_path(path: &Path) -> Option<PathBuf> {
-    let path = crate::access_policy::policy_path(path);
+pub(crate) fn storage_root_for_path(
+    path: &Path,
+    policy: &dyn crate::read_policy::StoragePathPolicy,
+) -> Option<PathBuf> {
+    let path = policy.identity(path);
     storage_roots()
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
-        .find(|root| crate::access_policy::floor_contains(&path, root))
+        .find(|root| policy.contains(&path, root))
         .cloned()
 }
 
 fn is_excluded_file(path: &Path) -> bool {
     crate::os_metadata::is_os_metadata_path(path)
         || has_sqlite_suffix(path) && !path.is_dir()
-        || crate::db::file_identity::is_registered_file_path(path)
+        || crate::live_db_files::is_registered_file_path(path)
 }
 
 fn has_sqlite_suffix(path: &Path) -> bool {
@@ -390,13 +393,13 @@ fn is_excluded_file_with_metadata(
         || has_sqlite_suffix(path)
             && !file_type.is_some_and(std::fs::FileType::is_dir)
             && !metadata.is_some_and(std::fs::Metadata::is_dir)
-        || crate::db::file_identity::is_registered_file_path(path)
+        || crate::live_db_files::is_registered_file_path(path)
 }
 
 /// Authorized task content is not project source, but must still be checked
 /// before a pinned-directory permission probe opens and closes its descriptor.
 pub(crate) fn is_sqlite_or_metadata(path: &Path) -> bool {
-    is_excluded_file(path) || crate::db::file_identity::is_live_sqlite_file(path)
+    is_excluded_file(path) || crate::live_db_files::is_live_sqlite_file(path)
 }
 
 /// Only explicit, ownership-checked registered task artifacts may bypass the
@@ -467,7 +470,7 @@ fn admit(path: &Path, file_type: Option<&std::fs::FileType>) -> std::io::Result<
             Some(_) => is_excluded_file_with_metadata(path, file_type, None),
             None => {
                 crate::os_metadata::is_os_metadata_path(path)
-                    || crate::db::file_identity::is_registered_file_path(path)
+                    || crate::live_db_files::is_registered_file_path(path)
             }
         }
     {
@@ -476,7 +479,7 @@ fn admit(path: &Path, file_type: Option<&std::fs::FileType>) -> std::io::Result<
     if file_type.is_some_and(|kind| !kind.is_file() && !kind.is_symlink()) {
         return Ok(());
     }
-    let metadata = crate::db::file_identity::candidate_metadata(path).ok();
+    let metadata = crate::live_db_files::candidate_metadata(path).ok();
     if file_type.is_none()
         && has_sqlite_suffix(path)
         && !metadata.as_ref().is_some_and(std::fs::Metadata::is_dir)
@@ -491,7 +494,7 @@ fn admit(path: &Path, file_type: Option<&std::fs::FileType>) -> std::io::Result<
         .is_some_and(|metadata| metadata.file_type().is_symlink())
         && path.canonicalize().is_ok_and(|target| is_excluded(&target));
     if excluded_alias
-        || crate::db::file_identity::is_live_sqlite_file_with_metadata(path, metadata.as_ref())
+        || crate::live_db_files::is_live_sqlite_file_with_metadata(path, metadata.as_ref())
     {
         Err(excluded_error())
     } else {
@@ -562,6 +565,54 @@ pub(crate) use open_probe::{record_open, Probe};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_root_lookup_uses_supplied_identity_and_containment() {
+        struct Policy {
+            original: PathBuf,
+            identity: PathBuf,
+            storage: PathBuf,
+            allow: bool,
+            compared: std::cell::Cell<bool>,
+        }
+        impl crate::read_policy::StoragePathPolicy for Policy {
+            fn identity(&self, path: &Path) -> PathBuf {
+                assert_eq!(path, self.original);
+                self.identity.clone()
+            }
+
+            fn contains(&self, path: &Path, prefix: &Path) -> bool {
+                assert_eq!(path, self.identity);
+                if prefix == self.storage {
+                    self.compared.set(true);
+                    self.allow
+                } else {
+                    false
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let storage = root.join("storage");
+        register_storage_root(&storage);
+        let mut policy = Policy {
+            original: root.join("alias"),
+            identity: root.join("opaque-identity"),
+            storage: storage.clone(),
+            allow: true,
+            compared: std::cell::Cell::new(false),
+        };
+        assert_eq!(
+            storage_root_for_path(&policy.original, &policy),
+            Some(storage)
+        );
+        assert!(policy.compared.get());
+        policy.allow = false;
+        policy.compared.set(false);
+        assert_eq!(storage_root_for_path(&policy.original, &policy), None);
+        assert!(policy.compared.get());
+    }
 
     #[test]
     fn sqlite_named_directories_remain_project_source() {

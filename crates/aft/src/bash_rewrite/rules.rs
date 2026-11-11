@@ -53,7 +53,7 @@ impl RewriteRule for GrepRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         let path = request.params.get("path").and_then(Value::as_str);
-        let response = crate::commands::grep::handle_grep(&tool_request("grep", request, ctx), ctx);
+        let response = crate::bash_rewrite::dispatch::run(&tool_request("grep", request, ctx), ctx);
         grep_footer_response(response, request, ctx, path)
     }
 }
@@ -109,7 +109,7 @@ impl RewriteRule for RgRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         let path = request.params.get("path").and_then(Value::as_str);
-        let response = crate::commands::grep::handle_grep(&tool_request("grep", request, ctx), ctx);
+        let response = crate::bash_rewrite::dispatch::run(&tool_request("grep", request, ctx), ctx);
         grep_footer_response(response, request, ctx, path)
     }
 }
@@ -165,7 +165,7 @@ impl RewriteRule for FindRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         call_and_footer(
-            crate::commands::glob::handle_glob(&tool_request("glob", request, ctx), ctx),
+            crate::bash_rewrite::dispatch::run(&tool_request("glob", request, ctx), ctx),
             "glob",
             request,
         )
@@ -230,7 +230,7 @@ impl RewriteRule for CatRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
             "read",
             request,
         )
@@ -289,7 +289,7 @@ impl RewriteRule for HeadRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
             "read",
             request,
         )
@@ -353,7 +353,7 @@ impl RewriteRule for TailRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
             "read",
             request,
         )
@@ -426,10 +426,7 @@ impl RewriteRule for CatAppendRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         call_and_footer(
-            crate::commands::edit_match::handle_edit_match(
-                &tool_request("edit_match", request, ctx),
-                ctx,
-            ),
+            crate::bash_rewrite::dispatch::run(&tool_request("edit_match", request, ctx), ctx),
             "edit",
             request,
         )
@@ -493,7 +490,7 @@ impl RewriteRule for SedRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
             "read",
             request,
         )
@@ -553,7 +550,7 @@ impl RewriteRule for LsRule {
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
             "read",
             request,
         )
@@ -1093,7 +1090,7 @@ fn find_shape_is_faithful(ctx: &AppContext, params: &Value) -> bool {
     if glob_params.get("path").is_none() {
         glob_params["path"] = Value::String(project_root.display().to_string());
     }
-    let response = crate::commands::glob::handle_glob(
+    let response = crate::bash_rewrite::dispatch::run(
         &RawRequest {
             id: "bash-rewrite-find-faithfulness".to_string(),
             command: "glob".to_string(),

@@ -11,7 +11,7 @@ use super::scoring::{
     freeze_non_exact_scores, AdmittedContribution, LaneContribution, ScoringError, ScoringPolicy,
 };
 
-pub const BLOCK_DEPTHS: [usize; 5] = [200, 400, 800, 1_600, 3_200];
+pub use crate::search_state::BLOCK_DEPTHS;
 pub const MAX_BLOCK_DEPTH: usize = 3_200;
 pub const MAX_PUBLIC_TOP_K: usize = 100;
 pub const MAX_OFFSET: usize = 100_000;

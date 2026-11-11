@@ -90,7 +90,7 @@ impl ProjectTypeScript {
                 break;
             }
             super::applicability_cache::observe_path(&package_dir);
-            let real_dir = crate::inspect::job::canonicalize_normalized(&package_dir);
+            let real_dir = crate::path_identity::canonicalize_normalized(&package_dir);
             if !visited.insert(real_dir.clone()) {
                 continue;
             }
@@ -313,9 +313,9 @@ pub(crate) fn project_typescript_for(
     server_root: &Path,
     project_root: Option<&Path>,
 ) -> Option<ProjectTypeScript> {
-    let source_file = crate::inspect::job::canonicalize_normalized(source_file);
-    let server_root = crate::inspect::job::canonicalize_normalized(server_root);
-    let project_root = project_root.map(crate::inspect::job::canonicalize_normalized);
+    let source_file = crate::path_identity::canonicalize_normalized(source_file);
+    let server_root = crate::path_identity::canonicalize_normalized(server_root);
+    let project_root = project_root.map(crate::path_identity::canonicalize_normalized);
     let boundary = project_root
         .as_deref()
         .filter(|root| source_file.starts_with(root))
@@ -466,7 +466,7 @@ pub(crate) fn shared_typescript_server_root(
         find_project_typescript_package(&dir.join("package.json"), &project_root).map(|found| {
             let sdk = found.resolved_tsserver().unwrap_or(found);
             if sdk.major().is_none() {
-                crate::inspect::job::canonicalize_normalized(&sdk.package_dir)
+                crate::path_identity::canonicalize_normalized(&sdk.package_dir)
                     .to_string_lossy()
                     .into_owned()
             } else {
@@ -594,7 +594,7 @@ pub(crate) fn resolve_native_binary(project: &ProjectTypeScript) -> Result<PathB
             std::env::consts::ARCH
         ));
     };
-    let real_dir = crate::inspect::job::canonicalize_normalized(&project.package_dir);
+    let real_dir = crate::path_identity::canonicalize_normalized(&project.package_dir);
     let binary_name = if cfg!(windows) { "tsc.exe" } else { "tsc" };
     for ancestor in real_dir.ancestors() {
         // Node looks in `<dir>/node_modules` for every ancestor, except that
@@ -701,7 +701,7 @@ mod tests {
         // Resolution follows real paths, so compare against the canonical
         // temp folder (macOS reaches it through a /var symlink).
         let modules =
-            crate::inspect::job::canonicalize_normalized(temp.path()).join("node_modules");
+            crate::path_identity::canonicalize_normalized(temp.path()).join("node_modules");
         let shim = modules.join("typescript");
         let sdk = modules.join("@typescript").join("old");
         alias_package(&sdk, "6.0.3", serde_json::json!({}));
@@ -736,7 +736,7 @@ mod tests {
     #[test]
     fn linked_shims_resolve_sdk_aliases_inside_isolated_package_stores() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         for store in [".bun", ".pnpm"] {
             let modules = root.join(store).join("shim@6.0.2").join("node_modules");
             let shim = modules.join("@typescript").join("typescript6");
@@ -766,7 +766,7 @@ mod tests {
     fn shim_sdk_resolution_bounds_cycles_and_long_chains() {
         let temp = tempfile::tempdir().unwrap();
         let modules =
-            crate::inspect::job::canonicalize_normalized(temp.path()).join("node_modules");
+            crate::path_identity::canonicalize_normalized(temp.path()).join("node_modules");
         let shim = modules.join("typescript");
         alias_package(
             &shim,
@@ -900,7 +900,9 @@ mod tests {
         let project = ProjectTypeScript::read(&project_modules.join("typescript")).unwrap();
         let binary = resolve_native_binary(&project).unwrap();
         assert!(
-            binary.starts_with(crate::inspect::job::canonicalize_normalized(&store_modules)),
+            binary.starts_with(crate::path_identity::canonicalize_normalized(
+                &store_modules
+            )),
             "{}",
             binary.display()
         );

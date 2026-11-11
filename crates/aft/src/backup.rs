@@ -21,9 +21,7 @@ mod ordinary_format_tests;
 mod portable;
 pub mod purge;
 
-pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
-/// Default upper bound for one automatic undo snapshot (64 MiB).
-pub const DEFAULT_MAX_BACKUP_FILE_SIZE: u64 = 64 * 1024 * 1024;
+pub use crate::config::{DEFAULT_MAX_BACKUP_FILE_SIZE, DEFAULT_MAX_UNDO_DEPTH};
 /// Most files one recursive delete may copy into the undo store.
 ///
 /// A recursive delete snapshots every file before it removes anything, and the
@@ -4408,9 +4406,7 @@ impl BackupStore {
             Ok(metadata) if metadata.file_type().is_symlink() => path.parent().unwrap_or(path),
             _ => path,
         };
-        if self.temp_path_policy_applies()
-            && crate::bash_permissions::is_system_temp_path(temp_probe)
-        {
+        if self.temp_path_policy_applies() && crate::system_temp::is_system_temp_path(temp_probe) {
             return Ok(SnapshotDecision::Skip(BackupSkippedReason::TempPath));
         }
         let Some(max_file_size) = self.policy.max_file_size else {
@@ -4445,7 +4441,7 @@ impl BackupStore {
         if !self.policy.enabled || self.policy.max_file_size == Some(0) {
             return Some(BackupSkippedReason::Disabled);
         }
-        if self.temp_path_policy_applies() && crate::bash_permissions::is_system_temp_path(root) {
+        if self.temp_path_policy_applies() && crate::system_temp::is_system_temp_path(root) {
             return Some(BackupSkippedReason::TempPath);
         }
         None
@@ -5971,7 +5967,8 @@ fn refuse_storage_path_with_metadata(
     path: &Path,
     metadata: Option<&std::fs::Metadata>,
 ) -> Result<(), AftError> {
-    if crate::project_content::storage_root_for_path(path).is_some()
+    if crate::project_content::storage_root_for_path(path, &crate::access_policy::StoragePaths)
+        .is_some()
         || match metadata {
             Some(metadata) => {
                 crate::db::file_identity::is_live_sqlite_file_with_metadata(path, Some(metadata))

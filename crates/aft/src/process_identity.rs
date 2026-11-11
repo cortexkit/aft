@@ -151,3 +151,77 @@ mod tests {
         );
     }
 }
+
+#[cfg(unix)]
+pub fn is_process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    (unsafe { libc::kill(pid, 0) == 0 })
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub fn is_process_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
+        fn GetExitCodeProcess(hProcess: Handle, lpExitCode: *mut u32) -> i32;
+        fn CloseHandle(hObject: Handle) -> i32;
+    }
+
+    const FALSE: i32 = 0;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 0x103;
+
+    if pid == 0 {
+        return false;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE;
+        let _ = CloseHandle(handle);
+        ok
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::is_process_alive;
+
+    #[test]
+    fn is_process_alive_returns_true_for_self() {
+        assert!(is_process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn is_process_alive_returns_false_for_dead_pid() {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "true"])
+            .spawn()
+            .expect("spawn true");
+
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "exit 0"])
+            .spawn()
+            .expect("spawn cmd");
+
+        let pid = child.id();
+        child.wait().expect("wait for child");
+
+        assert!(!is_process_alive(pid));
+    }
+}

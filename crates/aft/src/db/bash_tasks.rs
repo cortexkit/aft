@@ -1,12 +1,6 @@
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
-
-use crate::bash_background::persistence::{
-    resolve_task_layout, session_tasks_dir, uninitialized_layout_is_recent,
-};
 
 #[cfg(test)]
 #[path = "retention_query_plan_tests.rs"]
@@ -14,7 +8,6 @@ mod query_plan_tests;
 
 pub const TERMINAL_ROW_RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_TERMINAL_PRUNE_ROWS: usize = 500;
-const LAYOUT_CREATION_GRACE: Duration = Duration::from_secs(5 * 60);
 
 const TERMINAL_ROW_PREDICATE: &str = "
     status IN ('completed', 'failed', 'killed', 'timed_out')
@@ -43,15 +36,23 @@ pub struct TerminalRowsPrune {
 }
 
 #[derive(Debug, Clone)]
-struct TerminalPruneCandidate {
-    harness: String,
-    session_id: String,
-    task_id: String,
-    pid: Option<i64>,
-    pgid: Option<i64>,
-    started_at: i64,
-    stdout_path: Option<String>,
-    stderr_path: Option<String>,
+pub(crate) struct TerminalPruneCandidate {
+    pub(crate) harness: String,
+    pub(crate) session_id: String,
+    pub(crate) task_id: String,
+    pub(crate) pid: Option<i64>,
+    pub(crate) pgid: Option<i64>,
+    pub(crate) started_at: i64,
+    pub(crate) stdout_path: Option<String>,
+    pub(crate) stderr_path: Option<String>,
+}
+
+/// Shell facts checked outside the database lock before deleting terminal rows.
+#[derive(Clone, Copy)]
+pub(crate) struct RetentionHooks {
+    pub(crate) write_order_is_live: fn(&str, &str) -> bool,
+    pub(crate) process_alive: fn(u32, u64) -> bool,
+    pub(crate) layout_is_gone: fn(Option<&Path>, &TerminalPruneCandidate) -> bool,
 }
 
 #[derive(Debug)]
@@ -247,22 +248,24 @@ pub fn delete_bash_task(
 /// and the task layout is absent. The filesystem check uses the same lookup and
 /// initialization grace as persisted-task garbage collection, so a task being
 /// created concurrently is not mistaken for a missing task.
-pub fn prune_terminal_rows(
+pub(crate) fn prune_terminal_rows(
     conn: &Connection,
     now_ms: i64,
     limit: usize,
+    hooks: RetentionHooks,
 ) -> rusqlite::Result<TerminalRowsPrune> {
-    prune_terminal_rows_guarded(conn, now_ms, limit, |_| false)
+    prune_terminal_rows_guarded(conn, now_ms, limit, hooks, |_| false)
 }
 
 pub(crate) fn prune_terminal_rows_guarded(
     conn: &Connection,
     now_ms: i64,
     limit: usize,
+    hooks: RetentionHooks,
     is_registered_in_process: impl Fn(&str) -> bool,
 ) -> rusqlite::Result<TerminalRowsPrune> {
     let plan = select_terminal_prune_candidates(conn, now_ms, limit)?;
-    let prepared = prepare_terminal_prune(plan, is_registered_in_process);
+    let prepared = prepare_terminal_prune(plan, hooks, is_registered_in_process);
     delete_prepared_terminal_rows(conn, prepared)
 }
 
@@ -353,13 +356,15 @@ pub(crate) fn select_terminal_prune_candidates(
 
 pub(crate) fn prepare_terminal_prune(
     plan: TerminalPrunePlan,
+    hooks: RetentionHooks,
     is_registered_in_process: impl Fn(&str) -> bool,
 ) -> PreparedTerminalPrune {
-    prepare_terminal_prune_observed(plan, is_registered_in_process, || {})
+    prepare_terminal_prune_observed(plan, hooks, is_registered_in_process, || {})
 }
 
 pub(crate) fn prepare_terminal_prune_observed(
     plan: TerminalPrunePlan,
+    hooks: RetentionHooks,
     is_registered_in_process: impl Fn(&str) -> bool,
     observe_stat_phase: impl FnOnce(),
 ) -> PreparedTerminalPrune {
@@ -371,12 +376,9 @@ pub(crate) fn prepare_terminal_prune_observed(
             // A task some registry still holds may have a row snapshot queued
             // behind the aft.db mutex, which would re-insert a pruned row.
             !is_registered_in_process(&candidate.task_id)
-                && !crate::bash_background::registry::task_db_write_order_is_live(
-                    &candidate.session_id,
-                    &candidate.task_id,
-                )
-                && !candidate_process_is_alive(candidate)
-                && task_layout_is_gone(plan.storage_root.as_deref(), candidate)
+                && !(hooks.write_order_is_live)(&candidate.session_id, &candidate.task_id)
+                && !candidate_process_is_alive(candidate, hooks.process_alive)
+                && (hooks.layout_is_gone)(plan.storage_root.as_deref(), candidate)
         })
         .collect();
     PreparedTerminalPrune {
@@ -424,74 +426,17 @@ pub(crate) fn delete_prepared_terminal_rows(
     })
 }
 
-fn candidate_process_is_alive(candidate: &TerminalPruneCandidate) -> bool {
+fn candidate_process_is_alive(
+    candidate: &TerminalPruneCandidate,
+    process_alive: fn(u32, u64) -> bool,
+) -> bool {
     let started_at = u64::try_from(candidate.started_at).unwrap_or_default();
     candidate
         .pid
         .and_then(|pid| u32::try_from(pid).ok())
         .into_iter()
         .chain(candidate.pgid.and_then(|pid| u32::try_from(pid).ok()))
-        .any(|pid| crate::bash_background::process::is_recorded_process_alive(pid, started_at))
-}
-
-fn task_layout_is_gone(storage_root: Option<&Path>, candidate: &TerminalPruneCandidate) -> bool {
-    let session_dir = candidate_session_dir(candidate).or_else(|| {
-        storage_root.map(|storage_root| session_tasks_dir(storage_root, &candidate.session_id))
-    });
-    let Some(session_dir) = session_dir else {
-        return false;
-    };
-    let task_id = &candidate.task_id;
-    let directory_layout = session_dir.join(task_id);
-    let flat_layout = session_dir.join(format!("{task_id}.json"));
-    match resolve_task_layout(&session_dir, task_id) {
-        Ok(_) => false,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            if !directory_layout.exists() && !flat_layout.exists() {
-                return true;
-            }
-            !uninitialized_layout_is_recent(&session_dir, task_id, LAYOUT_CREATION_GRACE)
-                .unwrap_or(true)
-        }
-        // Releases before the 64-bit random suffix used eight hexadecimal
-        // digits. Current layout validation intentionally rejects those IDs,
-        // so retain any surviving legacy artifact and prune only full absence.
-        Err(error) if error.kind() == ErrorKind::InvalidInput && is_legacy_task_id(task_id) => {
-            !directory_layout.exists()
-                && !flat_layout.exists()
-                && !candidate
-                    .stdout_path
-                    .iter()
-                    .chain(&candidate.stderr_path)
-                    .any(|path| Path::new(path).exists())
-        }
-        Err(_) => false,
-    }
-}
-
-fn candidate_session_dir(candidate: &TerminalPruneCandidate) -> Option<PathBuf> {
-    candidate
-        .stdout_path
-        .iter()
-        .chain(&candidate.stderr_path)
-        .find_map(|path| {
-            let path = Path::new(path);
-            let parent = path.parent()?;
-            let file_name = path.file_name()?.to_str()?;
-            if file_name.starts_with(&format!("{}.", candidate.task_id)) {
-                return Some(parent.to_path_buf());
-            }
-            let task_dir = parent.parent()?;
-            (task_dir.file_name()?.to_str()? == candidate.task_id)
-                .then(|| task_dir.parent().map(Path::to_path_buf))
-                .flatten()
-        })
-}
-
-fn is_legacy_task_id(task_id: &str) -> bool {
-    task_id.strip_prefix("bash-").is_some_and(|suffix| {
-        suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
+        .any(|pid| process_alive(pid, started_at))
 }
 
 pub fn get_bash_task(

@@ -24,14 +24,14 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::watcher_filter::config_events::is_config_file_name;
+pub use crate::watcher_filter::config_events::{
+    is_project_config_event_path, ConfigReloadSignal, CONFIG_RELOAD_DEBOUNCE,
+};
+
 use crate::config::Config;
 use crate::config_resolve::ConfigTier;
 use crate::context::AppContext;
-
-/// How long a burst of file events must be quiet before the reload runs.
-/// Editors save by writing a temporary sibling and renaming it over the file,
-/// which arrives as several events.
-pub const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// File name both config tiers use.
 const CONFIG_FILE_NAME: &str = "aft.jsonc";
@@ -39,65 +39,6 @@ const CONFIG_FILE_NAME: &str = "aft.jsonc";
 /// Largest config file a live reload accepts, the same bound the bind-time
 /// read applies. An oversized or invalid file is reported instead of applied.
 const CONFIG_READ_LIMIT: usize = 1024 * 1024;
-
-fn process_epoch() -> Instant {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    *EPOCH.get_or_init(Instant::now)
-}
-
-fn now_ms() -> u64 {
-    u64::try_from(process_epoch().elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// A pending "re-read the config files" request for one root, with a trailing
-/// debounce: every new request pushes the due time out again.
-#[derive(Debug, Default)]
-pub struct ConfigReloadSignal {
-    /// Milliseconds since the process epoch at which the reload is due; zero
-    /// when no reload is pending.
-    due_at_ms: AtomicU64,
-}
-
-impl ConfigReloadSignal {
-    /// Ask for a reload once the debounce window has passed quietly.
-    pub fn request(&self) {
-        self.request_after(CONFIG_RELOAD_DEBOUNCE);
-    }
-
-    fn request_after(&self, delay: Duration) {
-        let due = now_ms()
-            .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))
-            .max(1);
-        self.due_at_ms.store(due, Ordering::Release);
-    }
-
-    /// Ask for a reload that is due at once (used when a root reattaches after
-    /// idle eviction: the content check makes an unneeded reload a no-op).
-    pub fn request_now(&self) {
-        self.request_after(Duration::ZERO);
-    }
-
-    pub fn is_pending(&self) -> bool {
-        self.due_at_ms.load(Ordering::Acquire) != 0
-    }
-
-    pub fn is_due(&self) -> bool {
-        let due = self.due_at_ms.load(Ordering::Acquire);
-        due != 0 && due <= now_ms()
-    }
-
-    /// Clear a due request and report whether there was one. A request that
-    /// arrives while the reload runs sets a new due time and is not lost.
-    pub fn take_if_due(&self) -> bool {
-        let due = self.due_at_ms.load(Ordering::Acquire);
-        if due == 0 || due > now_ms() {
-            return false;
-        }
-        self.due_at_ms
-            .compare_exchange(due, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-}
 
 /// What one tier's text was when it was last applied, and where it lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,37 +121,6 @@ impl ConfigSources {
 /// `<root>/.cortexkit/aft.jsonc`.
 pub fn project_config_path(project_root: &Path) -> PathBuf {
     project_root.join(".cortexkit").join(CONFIG_FILE_NAME)
-}
-
-/// Whether `path` names a shared or legacy project config, or an editor's
-/// temporary sibling. `root` is the configured canonical directory; the
-/// event's containing root is canonicalized if needed, while filenames stay literal.
-pub fn is_project_config_event_path(root: &Path, path: &Path) -> bool {
-    if !is_config_file_name(path) {
-        return false;
-    }
-    let Some(dir) = path.parent() else {
-        return false;
-    };
-    if !matches!(
-        dir.file_name().and_then(|name| name.to_str()),
-        Some(".cortexkit" | ".opencode" | ".pi")
-    ) {
-        return false;
-    }
-    let Some(dir_root) = dir.parent() else {
-        return false;
-    };
-    // Raw watcher events may spell the root differently from the configured
-    // canonical root (macOS reports `/private/var` for `/var`); resolve only
-    // the root directory, never the config file name itself.
-    dir_root == root || std::fs::canonicalize(dir_root).is_ok_and(|resolved| resolved == root)
-}
-
-fn is_config_file_name(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("aft.json") || name.starts_with(".aft.json"))
 }
 
 static PROCESS_USER_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -856,12 +766,12 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
             max_depth: after
                 .backup
                 .max_depth
-                .unwrap_or(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
+                .unwrap_or(crate::config::DEFAULT_MAX_UNDO_DEPTH),
             max_file_size: Some(
                 after
                     .backup
                     .max_file_size
-                    .unwrap_or(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
+                    .unwrap_or(crate::config::DEFAULT_MAX_BACKUP_FILE_SIZE),
             ),
         });
     }
@@ -880,7 +790,7 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
         ctx.reset_tier2_refresh_scheduler();
     }
     if before.git.co_author == "off" && after.git.co_author != "off" {
-        let storage_root = crate::bash_background::storage_dir(after.storage_dir.as_deref());
+        let storage_root = crate::storage_path::storage_dir(after.storage_dir.as_deref());
         if let Err(error) = crate::agent_child_env::ensure_git_hooks(&storage_root) {
             crate::slog_warn!("config reload: could not install git hooks: {}", error);
         }

@@ -3386,7 +3386,7 @@ impl RollupStepTimer {
 /// same directories, so resolving once per distinct configuration keeps a
 /// many-root tick off realpath/getcwd instead of re-resolving once per
 /// context. The resolved values are identical to calling
-/// [`crate::bash_background::storage_dir`] and [`crate::root_cache::cache_root`]
+/// [`crate::storage_path::storage_dir`] and [`crate::root_cache::cache_root`]
 /// directly: the memo is keyed by the exact configured spellings and dropped
 /// with the tick, so a reconfiguration on the next tick resolves afresh.
 #[derive(Default)]
@@ -3401,7 +3401,7 @@ impl TickStoragePaths {
         if let Some(hit) = self.storage.get(&key) {
             return hit.clone();
         }
-        let resolved = crate::bash_background::storage_dir(configured);
+        let resolved = crate::storage_path::storage_dir(configured);
         self.storage.insert(key, resolved.clone());
         resolved
     }
@@ -6496,9 +6496,12 @@ mod tests {
         let conn = crate::db::open(&storage.path().join("aft.db")).expect("open database");
         let db = Arc::new(std::sync::Mutex::new(conn));
         let held = db.lock().expect("hold database mutex");
-        let outcome =
-            crate::db::compression_events::prune_retention_sweep(&db, i64::MAX, Some(&[]))
-                .expect("retention sweep outcome");
+        let outcome = crate::bash_background::persistence::retention::prune_retention_sweep(
+            &db,
+            i64::MAX,
+            Some(&[]),
+        )
+        .expect("retention sweep outcome");
         drop(held);
         let crate::db::compression_events::RetentionSweepOutcome::Skipped(skip) = outcome else {
             panic!("contention was not reported as a skipped sweep: {outcome:?}");
@@ -7194,7 +7197,7 @@ mod tests {
         for (_, ctx) in &entries {
             assert_eq!(ctx.config().storage_dir, storage);
         }
-        crate::bash_background::reset_storage_dir_calls_for_test();
+        crate::storage_path::reset_storage_dir_calls_for_test();
         crate::project_content::reset_register_canonicalizations_for_test();
         let rollup =
             build_health_diagnostic_rollup_from_actors(&cache, &executor, &shared_app, entries);
@@ -7205,7 +7208,7 @@ mod tests {
         // One tick over 32 contexts sharing a root resolves it once (plus the
         // one standing-roots probe, which runs once per tick by construction).
         // Resolving once per context would report hundreds here.
-        let resolutions = crate::bash_background::storage_dir_calls_for_test();
+        let resolutions = crate::storage_path::storage_dir_calls_for_test();
         let canonicalizations = crate::project_content::register_canonicalizations_for_test();
         println!(
             "health tick over 32 contexts: {resolutions} storage resolutions, {canonicalizations} canonicalizations"
@@ -7381,7 +7384,7 @@ mod tests {
                 .unwrap();
             let scope = crate::inspect::JobScope::for_project(root.as_path().to_path_buf());
             let key = crate::inspect::JobKey::for_category_scope(
-                crate::inspect::InspectCategory::Diagnostics,
+                crate::inspect_category::InspectCategory::Diagnostics,
                 &scope,
             );
             inspect
@@ -7415,7 +7418,7 @@ mod tests {
             .unwrap();
         let scope = crate::inspect::JobScope::for_project(root.as_path().to_path_buf());
         let key = crate::inspect::JobKey::for_category_scope(
-            crate::inspect::InspectCategory::Diagnostics,
+            crate::inspect_category::InspectCategory::Diagnostics,
             &scope,
         );
         inspect
@@ -7466,7 +7469,7 @@ mod tests {
                 cache
                     .store_aggregated(
                         crate::inspect::JobKey::for_project_category(
-                            crate::inspect::InspectCategory::Todos,
+                            crate::inspect_category::InspectCategory::Todos,
                         ),
                         json!({"items": ["fixed peer diagnostic".repeat(30 * (index + 1))]}),
                     )
@@ -7542,14 +7545,15 @@ mod tests {
             );
         };
         assert_parity();
-        let project =
-            crate::inspect::JobKey::for_project_category(crate::inspect::InspectCategory::Todos);
+        let project = crate::inspect::JobKey::for_project_category(
+            crate::inspect_category::InspectCategory::Todos,
+        );
         for revision in 0..140 {
             inspect.store_aggregated(project.clone(), json!({"items": [{"message": "warning".repeat(revision + 1), "revision": revision}]})).unwrap();
             inspect
                 .store_aggregated(
                     crate::inspect::JobKey {
-                        category: crate::inspect::InspectCategory::Todos,
+                        category: crate::inspect_category::InspectCategory::Todos,
                         scope_hash: Some(format!("scope-{revision}")),
                     },
                     json!({"nested": [{"unicode": "λ", "values": [null, false, revision]}]}),
@@ -7911,7 +7915,7 @@ mod tests {
             config,
         ));
         ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
+            .set_tier2_in_flight_for_test(crate::inspect_category::InspectCategory::DeadCode, true);
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
 
         // Health reads try-locks by design and reports "could not be snapshotted
@@ -7953,8 +7957,10 @@ mod tests {
         assert_eq!(metrics["roots"][0]["callgraph_store"]["status"], "off");
         assert_eq!(metrics["roots"][0]["tier2"]["status"], "building");
 
-        ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, false);
+        ctx.inspect_manager().set_tier2_in_flight_for_test(
+            crate::inspect_category::InspectCategory::DeadCode,
+            false,
+        );
     }
 
     #[test]
@@ -8872,8 +8878,10 @@ mod tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
-        ctx.inspect_manager()
-            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::Duplicates, true);
+        ctx.inspect_manager().set_tier2_in_flight_for_test(
+            crate::inspect_category::InspectCategory::Duplicates,
+            true,
+        );
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let app = App::default_shared();
         let dispatch = DispatchPathMetrics::new();
@@ -8890,7 +8898,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(2));
         ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
-            crate::inspect::InspectCategory::Duplicates,
+            crate::inspect_category::InspectCategory::Duplicates,
             crate::inspect::JobOutcome::Fresh {
                 payload: json!({ "count": 3 }),
             },
@@ -9508,7 +9516,7 @@ fn standing_health_entries(
     };
 
     let database_path =
-        crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
+        crate::storage_path::storage_dir(config.storage_dir.as_deref()).join("aft.db");
     let database = crate::db::open_readonly(&database_path).ok();
     let mut entries = std::collections::BTreeMap::new();
     for root in &config.index.roots {
@@ -9796,8 +9804,8 @@ mod watch_gap_tests {
 
     #[test]
     fn retry_overflow_health_keeps_evictions_separate_and_clears_after_ack() {
-        use crate::bash_background::watch_lines::{LineBatch, RetryGap};
         use crate::db::bash_watches::*;
+        use crate::task_watch_lines::{LineBatch, RetryGap};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aft.db");
         let conn = crate::db::open(&path).unwrap();

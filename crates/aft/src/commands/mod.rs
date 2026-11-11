@@ -4,6 +4,17 @@ pub mod ast_replace;
 pub mod ast_scope;
 pub mod ast_search;
 pub mod bash;
+
+/// Install typed rewrite targets before serving bash in a process or embedder.
+pub fn register_shell_handlers() {
+    policy_environment::register();
+    crate::bash_rewrite::dispatch::register(crate::bash_rewrite::dispatch::RewriteDispatch {
+        read: read::handle_read,
+        grep: grep::handle_grep,
+        glob: glob::handle_glob,
+        edit_match: edit_match::handle_edit_match,
+    });
+}
 pub mod bash_abort_inflight;
 pub mod bash_artifact_owned;
 pub mod bash_drain_completions;
@@ -34,7 +45,8 @@ pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
 pub mod extract_function;
-pub(crate) mod file_read_exact;
+pub mod policy_environment;
+pub(crate) use crate::file_read_exact;
 pub(crate) mod github_comments;
 pub mod glob;
 pub mod grep;
@@ -57,7 +69,7 @@ pub mod lsp_rename;
 pub mod memory_census;
 pub mod move_file;
 pub mod move_symbol;
-pub mod multi_path;
+pub use crate::grep_executor::multi_path;
 pub mod organize_imports;
 pub mod outline;
 pub mod read;
@@ -85,3 +97,7 @@ pub mod zoom;
 
 #[cfg(test)]
 mod storage_floor_tests;
+
+pub(crate) mod data_callgraph;
+pub(crate) mod data_search;
+pub mod parent_query;

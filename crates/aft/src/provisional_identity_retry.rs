@@ -228,7 +228,7 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
     let reasons = ctx.degraded_reasons();
     let kind = if reasons
         .iter()
-        .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+        .any(|reason| reason == crate::cache_location::CACHE_DIR_BUSY)
     {
         Some(RetryKind::CacheCoordination)
     } else if reasons
@@ -336,7 +336,7 @@ fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> 
             if !ctx
                 .degraded_reasons()
                 .iter()
-                .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+                .any(|reason| reason == crate::cache_location::CACHE_DIR_BUSY)
             {
                 return Some("settled");
             }
@@ -402,7 +402,7 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
     }
     let root = retry.root.clone();
     if retry.kind == RetryKind::Identity {
-        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        let storage = crate::storage_path::storage_dir(ctx.config().storage_dir.as_deref());
         if !crate::root_identity::legacy_pins_readable(&root, &storage) {
             reschedule(ctx, &root, retry, timing());
             return None;
@@ -508,7 +508,7 @@ impl PreparedReplay {
                 // Cache recovery must preserve the running configuration,
                 // including edits deferred until the next real connect.
                 let mut prepared = (*ctx.config()).clone();
-                crate::root_cache::prepare_cache_root(&mut prepared);
+                crate::cache_location::prepare_cache_root(&mut prepared);
                 crate::commands::configure::handle_cache_recovery(
                     &retry.request,
                     retry.connect_generation,
@@ -625,7 +625,7 @@ fn reschedule_cache_retry(ctx: &AppContext, retry: &PendingRetry) -> Option<Dura
         || !ctx
             .degraded_reasons()
             .iter()
-            .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+            .any(|reason| reason == crate::cache_location::CACHE_DIR_BUSY)
     {
         return None;
     }

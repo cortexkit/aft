@@ -3,12 +3,13 @@ pub(crate) mod diagnostics_category;
 #[doc(hidden)]
 pub mod dispatch;
 mod entry_points;
+pub(crate) use entry_points::InspectEntryPoints;
 mod frameworks;
 pub mod freshness;
-mod generated;
+pub(crate) use crate::file_kind::generated;
 pub(crate) mod inventory;
 pub(crate) mod scoped_diagnostics_sweep;
-pub(crate) use generated::{is_generated_file, relative_shape_is_generated};
+pub(crate) use generated::relative_shape_is_generated;
 pub mod job;
 mod manager;
 pub mod oxc_engine;
@@ -42,3 +43,6 @@ pub use phase_log::{
 pub use tier2_scheduler::{
     Tier2DispatchBlock, Tier2ExternalGates, Tier2RefreshScheduler, Tier2TriggerReason,
 };
+
+pub(crate) mod data_sources;
+pub mod dead_code_gate;

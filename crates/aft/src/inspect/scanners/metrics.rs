@@ -65,8 +65,8 @@ fn wait_at_metrics_gate_for_debug(project_root: &Path) {
     let Some(root) = std::env::var_os("AFT_TEST_METRICS_GATE_ROOT") else {
         return;
     };
-    if crate::inspect::job::canonicalize_normalized(Path::new(&root))
-        != crate::inspect::job::canonicalize_normalized(project_root)
+    if crate::path_identity::canonicalize_normalized(Path::new(&root))
+        != crate::path_identity::canonicalize_normalized(project_root)
     {
         return;
     }
@@ -90,7 +90,7 @@ fn run_metrics_scan_with_memo(
 ) -> crate::inspect::InspectResult {
     let started = Instant::now();
     memo.reserve_for_scan(job.scope_files.len());
-    let progress = crate::run_tool_call::progress::FileProgress::current();
+    let progress = crate::tool_progress::FileProgress::current();
     let cached_files = job
         .scope_files
         .par_iter()
@@ -297,7 +297,7 @@ fn bump_file_read_count(path: &Path) {
 pub fn reset_file_read_count_for_debug(project_root: &Path) {
     // Normalized like the scanned paths themselves: bare canonicalize is
     // verbatim on Windows and the starts_with filter would miss every entry.
-    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let project_root = crate::path_identity::canonicalize_normalized(project_root);
     FILE_READS.reset(project_root);
 }
 
@@ -306,7 +306,7 @@ pub fn reset_file_read_count_for_debug(project_root: &Path) {
 pub fn file_read_count_for_debug(project_root: &Path) -> usize {
     // Normalized like the scanned paths themselves: bare canonicalize is
     // verbatim on Windows and the starts_with filter would miss every entry.
-    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let project_root = crate::path_identity::canonicalize_normalized(project_root);
     FILE_READS.count(&project_root)
 }
 
@@ -365,7 +365,7 @@ mod tests {
             })
             .collect();
         let mut job = metrics_job(project.path(), files);
-        let progress = crate::run_tool_call::progress::FileProgress::default();
+        let progress = crate::tool_progress::FileProgress::default();
         let guard = progress.enter();
         assert_eq!(progress.completed(), 0);
         assert!(run_metrics_scan(&job).outcome.is_ok());
@@ -381,7 +381,7 @@ mod tests {
             .is_ok());
         assert_eq!(progress.completed(), 9);
         drop(guard);
-        assert!(crate::run_tool_call::progress::FileProgress::current().is_none());
+        assert!(crate::tool_progress::FileProgress::current().is_none());
         assert_eq!(
             progress.completed(),
             9,

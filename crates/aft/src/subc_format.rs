@@ -5872,70 +5872,12 @@ mod executed_outline_mode_tests {
     }
 }
 
-/// Render a bounded line batch; offsets refer to the original, unmasked stream.
-pub fn format_watch_line_batch(
-    task_id: &str,
-    batch: &crate::bash_background::watch_lines::LineBatch,
-) -> String {
-    let mut text = String::new();
-    for line in &batch.lines {
-        let body = if line.unavailable {
-            crate::bash_background::watch_lines::unavailable_match_text(
-                line.count,
-                batch
-                    .masking_limit_bytes
-                    .map(|limit| limit as usize)
-                    .unwrap_or(crate::bash_background::watch_lines::MASKING_LINE_CAP_BYTES),
-            )
-        } else {
-            line.text.clone()
-        };
-        let repeats = if line.count > 1 {
-            format!(" ×{}", line.count)
-        } else {
-            String::new()
-        };
-        text.push_str(&format!(
-            "{} byte {}{repeats}: {}\n",
-            line.stream, line.offset, body
-        ));
-    }
-    if batch.dropped_lines > 0 || batch.skipped_long_lines > 0 {
-        let incomplete = if batch.skipped_long_lines > 0 {
-            format!(
-                " {} lines longer than 64 KiB were skipped, so the scan is incomplete.",
-                batch.skipped_long_lines
-            )
-        } else {
-            String::new()
-        };
-        let cursor = if batch.first_dropped_stream.as_deref() == Some("stderr") {
-            "stderr_offset"
-        } else {
-            "output_offset"
-        };
-        text.push_str(&format!("{} matching lines dropped.{incomplete} Read them with bash_status({{ task_id: {}, {cursor}: {} }}).\n", batch.dropped_lines, serde_json::to_string(task_id).unwrap_or_default(), batch.first_dropped_offset.unwrap_or(0)));
-    }
-    if let Some(gap) = &batch.retry_gap {
-        let missing = match gap.known_missing_occurrences {
-            0 => "Some matches may be missing.".to_string(),
-            1 => "At least 1 match is missing.".to_string(),
-            count => format!("At least {count} matches are missing."),
-        };
-        let cursor = if gap.stream.as_deref() == Some("stderr") {
-            "stderr_offset"
-        } else {
-            "output_offset"
-        };
-        text.push_str(&format!("Some watch notices were lost: a stalled connection dropped {} of them, and they cannot be recovered. {missing} Read the task output with bash_status({{ task_id: {}, {cursor}: {} }}).\n", gap.dropped_notifications, serde_json::to_string(task_id).unwrap_or_default(), gap.first_offset.unwrap_or(0)));
-    }
-    text.trim_end().to_string()
-}
+pub use crate::task_watch_lines::format_watch_line_batch;
 
 #[cfg(test)]
 mod watch_line_format_tests {
     use super::format_watch_line_batch;
-    use crate::bash_background::watch_lines::{LineBatch, RetryGap, WatchLine};
+    use crate::task_watch_lines::{LineBatch, RetryGap, WatchLine};
 
     #[test]
     fn retry_gap_wording_golden() {

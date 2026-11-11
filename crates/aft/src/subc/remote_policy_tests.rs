@@ -2240,16 +2240,16 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
             .info
             .status;
         if cancelled {
-            assert_eq!(status, crate::bash_background::BgTaskStatus::Killed);
+            assert_eq!(status, crate::protocol::BgTaskStatus::Killed);
         } else {
             assert_ne!(
                 status,
-                crate::bash_background::BgTaskStatus::Killed,
+                crate::protocol::BgTaskStatus::Killed,
                 "draining the wait must not kill the detached task"
             );
             assert_eq!(
                 status,
-                crate::bash_background::BgTaskStatus::Starting,
+                crate::protocol::BgTaskStatus::Starting,
                 "the fake runner has not sent Accepted yet"
             );
             daemon.acceptance_gate.notify_one();
@@ -2262,10 +2262,10 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                         .status;
                     assert_ne!(
                         status,
-                        crate::bash_background::BgTaskStatus::Killed,
+                        crate::protocol::BgTaskStatus::Killed,
                         "draining the wait must not kill the detached task"
                     );
-                    if status == crate::bash_background::BgTaskStatus::Running {
+                    if status == crate::protocol::BgTaskStatus::Running {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2282,9 +2282,9 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         assert_eq!(
             status,
             if cancelled {
-                crate::bash_background::BgTaskStatus::Killed
+                crate::protocol::BgTaskStatus::Killed
             } else {
-                crate::bash_background::BgTaskStatus::Running
+                crate::protocol::BgTaskStatus::Running
             }
         );
         let sent = daemon

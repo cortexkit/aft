@@ -444,7 +444,7 @@ fn handle_delete_file_with_skip(
                     "details": resp.data,
                 })),
             }
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
         }
         if deleted.is_empty() && !skipped.is_empty() {
             let message = format!(
@@ -1092,7 +1092,7 @@ fn unlink_pinned(req: &RawRequest, ctx: &AppContext, path: &Path) -> Result<(), 
     #[cfg(test)]
     unlink_seam(UnlinkStage::AfterAuthorize);
     // The handle must still be at the location the policy judged.
-    if crate::inspect::job::normalize_path(&judged) != located
+    if crate::path_identity::normalize_path(&judged) != located
         || location(&entry).ok().as_deref() != Some(located.as_path())
     {
         return Err(changed());
@@ -1301,7 +1301,7 @@ fn delete_directory(
                 .into());
             }
         }
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
 
     if let Err(error) = crate::bounded_io::check_request_deadline(path, capture_now()) {
@@ -1602,7 +1602,7 @@ fn collect_for_unbacked_delete(
         // symlinks. The identity lets the delete refuse an entry that was
         // replaced after this walk instead of unlinking it by name.
         let identity = crate::commands::delete_tree::recorded_identity(&entry.metadata()?);
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
         if entry.file_type()?.is_dir() {
             if boundary.should_descend(&path)? {
                 manifest.entries.push(TreeEntry {

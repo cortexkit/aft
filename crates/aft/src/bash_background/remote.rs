@@ -2392,7 +2392,7 @@ fn runon_write_refusal(command: &str, request: &RunRequest) -> Option<String> {
     let returned: Vec<_> = request
         .return_paths
         .iter()
-        .map(|path| crate::bash_permissions::resolve_with_existing_ancestors(&cwd.join(path)))
+        .map(|path| crate::system_temp::resolve_with_existing_ancestors(&cwd.join(path)))
         .collect();
     let paths = crate::bash_permissions::writes::literal_write_targets(command, cwd, &|path| {
         runon_snapshot_directory_known(checkout, path, Path::new("git"), deadline)
@@ -2550,7 +2550,7 @@ fn runon_cd_refusal_with_git(
             siblings.push(crate::path_identity::lexical_normalize(&parent.join(name)));
         }
     }
-    let mut homes: Vec<PathBuf> = crate::commands::configure::resolve_account_home_dir()
+    let mut homes: Vec<PathBuf> = crate::production_storage::resolve_account_home_dir()
         .into_iter()
         .collect();
     if let Some(home) = std::env::var_os("HOME")

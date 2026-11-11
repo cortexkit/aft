@@ -1,3 +1,4 @@
+use crate::grep_executor::git_exclude::git_info_exclude_for_target;
 const LINE_COUNT_BYTES: u64 = 1024 * 1024;
 const ENTRY_BUDGET: usize = 10_000;
 
@@ -15,7 +16,7 @@ use crate::commands::read::{handle_github_outline, is_github_read_target};
 use crate::context::AppContext;
 use crate::edit;
 use crate::error::AftError;
-use crate::inspect::job::is_test_file;
+use crate::file_kind::is_test_file;
 use crate::parser::{
     detect_language, node_range_with_decorators, node_text, FileParser, LangId, ParsedFile,
     RustModule, TreeSitterProvider,
@@ -445,7 +446,7 @@ fn excluded_read_paths(req: &RawRequest, ctx: &AppContext) -> HashSet<PathBuf> {
         // Restricted reads can use a canonical path internally even when the
         // host denied the file using the project-root path supplied by the caller.
         if let Ok(canonical) = std::fs::canonicalize(ctx.resolve_relative_path(&path)) {
-            excluded.insert(crate::inspect::job::normalize_path(&canonical));
+            excluded.insert(crate::path_identity::normalize_path(&canonical));
         }
     }
     excluded
@@ -462,7 +463,7 @@ fn is_read_excluded(excluded: &HashSet<PathBuf>, path: &Path) -> bool {
     }
     excluded.contains(path)
         || std::fs::canonicalize(path).is_ok_and(|canonical| {
-            excluded.contains(&crate::inspect::job::normalize_path(&canonical))
+            excluded.contains(&crate::path_identity::normalize_path(&canonical))
         })
 }
 
@@ -1517,7 +1518,11 @@ fn build_outline_gitignore(
     if !ignore_file.is_file() {
         return None;
     }
-    if crate::project_content::storage_root_for_path(ignore_file).is_some()
+    if crate::project_content::storage_root_for_path(
+        ignore_file,
+        &crate::access_policy::StoragePaths,
+    )
+    .is_some()
         || crate::db::file_identity::is_live_sqlite_file(ignore_file)
     {
         return None;
@@ -1525,46 +1530,6 @@ fn build_outline_gitignore(
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     let _ = builder.add(ignore_file);
     builder.build().ok().map(Arc::new)
-}
-
-pub(crate) fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
-    for repository_root in target.ancestors() {
-        let git_entry = repository_root.join(".git");
-        let Ok(metadata) = crate::bounded_io::metadata(&git_entry) else {
-            continue;
-        };
-        let git_dir = if metadata.is_dir() {
-            git_entry
-        } else if metadata.is_file() {
-            let contents = crate::bounded_io::read_to_string(&git_entry).ok()?;
-            let git_dir = contents.trim().strip_prefix("gitdir:")?.trim();
-            let git_dir = PathBuf::from(git_dir);
-            if git_dir.is_absolute() {
-                git_dir
-            } else {
-                repository_root.join(git_dir)
-            }
-        } else {
-            continue;
-        };
-        let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
-        let common_dir = git_dir.join("commondir");
-        let git_common_dir = if let Ok(common) = crate::bounded_io::read_to_string(&common_dir) {
-            let common = PathBuf::from(common.trim());
-            if common.is_absolute() {
-                common
-            } else {
-                git_dir.join(common)
-            }
-        } else {
-            git_dir
-        };
-        return Some((
-            repository_root.to_path_buf(),
-            git_common_dir.join("info/exclude"),
-        ));
-    }
-    None
 }
 
 fn handle_outline_files_mode(
@@ -2761,7 +2726,7 @@ fn outline_many_files(
         };
         match structure {
             Ok(entries) => {
-                crate::run_tool_call::progress::report();
+                crate::tool_progress::report();
                 let outline = FileOutline {
                     absolute_path: path.clone(),
                     path: rel_path,
@@ -4394,12 +4359,12 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
                 assert!(response.success);
                 let paths = response.data["content_files"].as_array().unwrap();
                 assert!(
-                    paths.contains(&serde_json::json!(crate::inspect::job::normalize_path(
+                    paths.contains(&serde_json::json!(crate::path_identity::normalize_path(
                         &allowed
                     )))
                 );
                 assert_eq!(
-                    paths.contains(&serde_json::json!(crate::inspect::job::normalize_path(
+                    paths.contains(&serde_json::json!(crate::path_identity::normalize_path(
                         &denied
                     ))),
                     !exclude
@@ -4566,7 +4531,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             assert!(!text.contains("z.ts"));
             assert_eq!(
                 response.data["content_files"],
-                serde_json::json!([crate::inspect::job::normalize_path(&shown)])
+                serde_json::json!([crate::path_identity::normalize_path(&shown)])
             );
         }
     }
@@ -4620,13 +4585,13 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|path| crate::inspect::job::normalize_path(Path::new(path.as_str().unwrap())))
+                .map(|path| crate::path_identity::normalize_path(Path::new(path.as_str().unwrap())))
                 .collect()
         };
-        let root = crate::inspect::job::normalize_path(&root);
+        let root = crate::path_identity::normalize_path(&root);
         let expected: Vec<_> = ["a/b.rs", "a-b.rs", "z.rs"]
             .into_iter()
-            .map(|file| crate::inspect::job::normalize_path(&root.join(file)))
+            .map(|file| crate::path_identity::normalize_path(&root.join(file)))
             .collect();
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -4963,7 +4928,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         let (_temp, files, ctx) = navigation_fixture();
         for (path, leaves) in files.iter().zip(cases) {
             // Without a project root the manifest names the canonical file.
-            let manifest_path = crate::inspect::job::canonicalize_normalized(path);
+            let manifest_path = crate::path_identity::canonicalize_normalized(path);
             let symbols = ["alpha", "beta"].into_iter().zip(leaves).map(|(name, (range, content, before, after))| serde_json::json!({
                 "name":name, "response":{
                     "id":"zoom-golden", "success":true, "name":name, "kind":"function",

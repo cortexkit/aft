@@ -100,7 +100,7 @@ impl ProjectWatcher {
         // thread's first instruction would otherwise be read as "already
         // observed" and the rebuild it requires would never run.
         let generation = matcher_generation.load(Ordering::Acquire);
-        let counters = crate::context::watcher_counters_for_root(&root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&root);
         let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
         let outcome = planning
             .attempt(&root, generation, &counters, || derive(&root, &matcher))
@@ -561,7 +561,7 @@ fn watch_directory<F>(
     watcher: &mut notify::RecommendedWatcher,
     path: &Path,
     watch: &mut F,
-    counters: &crate::context::WatcherCounters,
+    counters: &crate::watcher_backend::counters::WatcherCounters,
 ) -> notify::Result<bool>
 where
     F: FnMut(&mut notify::RecommendedWatcher, &Path) -> notify::Result<()>,
@@ -1123,7 +1123,7 @@ pub(super) mod tests {
         let tree = staging.path().join("tree");
         std::fs::create_dir(&tree).unwrap();
         std::fs::write(tree.join("source.rs"), b"already populated").unwrap();
-        let counters = crate::context::watcher_counters_for_root(&root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&root);
         assert!(counters.bash_changes.get().is_none());
         let (tx, rx) = mpsc::channel();
         let _watcher = ProjectWatcher::create(
@@ -1235,7 +1235,7 @@ pub(super) mod tests {
         root: tempfile::TempDir,
         rx: mpsc::Receiver<notify::Result<Event>>,
         watch_rx: mpsc::Receiver<PathBuf>,
-        counters: Arc<crate::context::WatcherCounters>,
+        counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     }
 
     impl ReincludeFixture {
@@ -1249,7 +1249,8 @@ pub(super) mod tests {
             builder.add(root.path().join(".gitignore"));
             let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
             let generation = Arc::new(AtomicU64::new(1));
-            let counters = crate::context::watcher_counters_for_root(&canonical_root);
+            let counters =
+                crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
             let (tx, rx) = mpsc::channel();
             let (watch_tx, watch_rx) = mpsc::channel();
             let mut initial = true;
@@ -1697,7 +1698,7 @@ pub(super) mod tests {
         let root = tempfile::tempdir().unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let vanished = canonical_root.join("ephemeral");
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         let (tx, rx) = mpsc::channel();
         let watcher = ProjectWatcher::create_with_watch(
             canonical_root.clone(),
@@ -1776,7 +1777,7 @@ pub(super) mod tests {
             }
         }
         assert_eq!(
-            crate::context::watcher_counters_for_root(&canonical_root)
+            crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root)
                 .snapshot()
                 .watch_lost_races_total,
             0
@@ -2029,10 +2030,12 @@ pub(super) mod tests {
             matches!(event.kind, EventKind::Create(_)) && event.paths.iter().any(|path| path == foo)
         });
         assert_eq!(watcher.watched_directory_count(), 1);
-        assert!(crate::context::watcher_counters_for_root(root)
-            .backend_exclusions()
-            .paths
-            .contains(&foo.to_path_buf()));
+        assert!(
+            crate::watcher_backend::counters::watcher_counters_for_root(root)
+                .backend_exclusions()
+                .paths
+                .contains(&foo.to_path_buf())
+        );
     }
 
     fn assert_external_replacement_unopened(

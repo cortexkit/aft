@@ -5,62 +5,12 @@ use serde::Serialize;
 
 use super::plan_table::{SearchLaneKind, SearchShape};
 use super::{LaneExecution, LaneInput, SearchLane};
-use crate::context::SemanticIndexStatus;
+use crate::data_layer::status::SemanticIndexStatus;
 use crate::parser::SymbolCache;
 use crate::query_shape::{classify, looks_like_regex, QueryKind};
+pub use crate::search_b2::contracts::{QueryFacts, RawQuery, Span, Token, TokenVariant};
 use crate::search_index::{IndexStatus, SearchIndexSnapshot};
 use crate::semantic_index::SemanticIndex;
-
-/// Original request text retained before lane-specific normalization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawQuery(String);
-
-impl RawQuery {
-    pub fn new(query: impl Into<String>) -> Self {
-        Self(query.into())
-    }
-
-    pub fn original_query(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Byte range of a delimiter's verbatim interior in [`RawQuery`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
-
-impl Span {
-    pub fn extract<'a>(&self, raw_query: &'a str) -> Option<&'a str> {
-        raw_query.get(self.start..self.end)
-    }
-}
-
-/// The five classification facts passed unchanged to lane planning: the first
-/// embedded span, qualifying exact-token count, path presence, log-marker
-/// presence, and identifier-shaped-token presence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct QueryFacts {
-    pub embedded_span: Option<Span>,
-    pub exact_input_tokens: usize,
-    pub has_path_token: bool,
-    pub has_timestamp_or_pid: bool,
-    pub has_identifier_token: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Token<'a> {
-    pub index: usize,
-    pub text: &'a str,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TokenVariant {
-    pub token_index: usize,
-    pub text: String,
-}
 
 /// Result of waiting for the first search index to become ready, with a time bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +37,7 @@ enum SemanticSnapshotStorage<'a> {
     Guard(Arc<RwLockReadGuard<'a, Option<SemanticIndex>>>),
     Borrowed(Arc<SemanticIndex>),
     /// The data layer's meaning plane at the generation the sample saw.
-    Data(Arc<crate::data_layer::tools::search::DataMeaning>),
+    Data(Arc<crate::commands::data_search::DataMeaning>),
 }
 
 impl std::fmt::Debug for SemanticSnapshot<'_> {
@@ -113,7 +63,7 @@ impl<'a> SemanticSnapshot<'a> {
 
     /// The data layer's meaning plane, retained so the ranking reads the
     /// generation readiness admitted.
-    pub(crate) fn from_data(meaning: Arc<crate::data_layer::tools::search::DataMeaning>) -> Self {
+    pub(crate) fn from_data(meaning: Arc<crate::commands::data_search::DataMeaning>) -> Self {
         Self(SemanticSnapshotStorage::Data(meaning))
     }
 
@@ -126,7 +76,7 @@ impl<'a> SemanticSnapshot<'a> {
     }
 
     /// The data layer's meaning plane, when the sample read one.
-    pub(crate) fn data(&self) -> Option<&Arc<crate::data_layer::tools::search::DataMeaning>> {
+    pub(crate) fn data(&self) -> Option<&Arc<crate::commands::data_search::DataMeaning>> {
         match &self.0 {
             SemanticSnapshotStorage::Data(meaning) => Some(meaning),
             _ => None,
@@ -149,7 +99,7 @@ pub struct TrigramReadiness {
     pub status: IndexStatus,
     pub snapshot: Option<Arc<SearchIndexSnapshot>>,
     /// Whether the lanes read the data layer's view instead of `snapshot`
-    /// (see `crate::data_layer::tools::search`). The ranking takes the view
+    /// (see `crate::commands::data_search`). The ranking takes the view
     /// again when it runs, so nothing is retained for it here.
     pub data_view: bool,
     pub evicted: bool,
@@ -298,9 +248,7 @@ impl<'a> RetainedReadinessSnapshots<'a> {
 
     /// The data layer's meaning plane readiness admitted, which the ranking
     /// then reads, so both see one generation of its vectors.
-    pub(crate) fn data_meaning(
-        &self,
-    ) -> Option<&Arc<crate::data_layer::tools::search::DataMeaning>> {
+    pub(crate) fn data_meaning(&self) -> Option<&Arc<crate::commands::data_search::DataMeaning>> {
         self.semantic.as_ref().and_then(SemanticSnapshot::data)
     }
 
@@ -446,7 +394,7 @@ pub trait SearchExtensions: Send + Sync {
     }
 
     fn sample_readiness<'a>(&self, root: &Root<'a>) -> Readiness<'a> {
-        crate::search_b2::readiness::sample(root)
+        crate::commands::semantic_search::planner::readiness::sample(root)
     }
 
     fn plan<'a>(

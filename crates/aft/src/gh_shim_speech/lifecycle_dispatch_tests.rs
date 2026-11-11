@@ -2,7 +2,7 @@ use super::*;
 use crate::gh_shim_speech::model::AuthorityRecord;
 
 fn rewrite(
-    store: &crate::db::gh_speech::Store,
+    store: &crate::gh_shim_speech::store::Store,
     incarnation: &str,
     change: impl FnOnce(&mut AuthorityRecord),
 ) {

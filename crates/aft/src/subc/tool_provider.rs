@@ -765,7 +765,7 @@ pub(super) fn catalog(
 // delay outside AFT's execution clock. Declare four minutes beyond the wait so
 // the reply-budget safety reserve preserves a full default 30-minute wait.
 // This extends the caller's reply window, never the command's hard timeout.
-pub(crate) const WORKER_REPLY_MARGIN_MS: u64 = 240_000;
+pub(crate) use crate::commands::blocking_wait::WORKER_REPLY_MARGIN_MS;
 const MAX_DECLARED_REPLY_MS: u64 = 86_400_000;
 
 /// Render a catalog directly from arguments for catalog conformance fixtures.
@@ -7693,7 +7693,7 @@ pub(in crate::subc) mod route_tests {
         use crate::bash_background::persistence::{
             create_task_layout, write_task_at, PersistedTask,
         };
-        use crate::bash_background::BgTaskStatus;
+        use crate::protocol::BgTaskStatus;
 
         let (dir, root) = test_support::test_root("occipital-tasks");
         let ctx = test_support::test_ctx();
@@ -10961,6 +10961,7 @@ mod ledger_terminal_tests {
 
     #[tokio::test]
     async fn runner_restart_yield_waits_for_call_ledger_admission() {
+        crate::subc::lower_hooks::register();
         use crate::subc::*;
         let (dir, root) = test_support::test_root("yield-during-admission");
         let ctx = test_support::test_ctx();
@@ -11000,7 +11001,7 @@ mod ledger_terminal_tests {
         let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
         let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
         let signal = metrics.watch_yields.register(route, 7);
-        crate::subc::call_yield::watch_waiting(
+        crate::commands::bash_watch::restart::watch_waiting(
             &signal,
             crate::subc::call_yield::WatchWait::new(
                 ctx.clone(),

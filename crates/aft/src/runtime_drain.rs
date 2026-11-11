@@ -1,4 +1,5 @@
 use crate as aft;
+pub(crate) mod configure;
 use crate::context::{
     AppContext, SemanticIndexStatus, SemanticRefreshRequest, WatcherDrainApplyPhase,
     WatcherDrainPhase, WatcherDrainSliceState,
@@ -371,13 +372,13 @@ fn delay_watcher_receive_for_test() {}
 /// query, and a rebind compares its files with the disk again.
 pub fn standalone_root_configured(ctx: &AppContext) {
     crate::data_layer::runtime::root_bound(ctx);
-    crate::data_layer::outline::root_bound(ctx);
+    crate::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
 }
 
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
-    crate::commands::configure::drain_deferred_configure_maintenance(ctx);
+    (configure::hooks().drain)(ctx);
     crate::data_layer::runtime::root_bound(ctx);
-    crate::data_layer::outline::root_bound(ctx);
+    crate::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
 }
 
 /// Once per configure of a standalone AFT: the root's checkout binds and
@@ -397,35 +398,35 @@ pub fn follow_configure_with_data_layer(ctx: &AppContext) {
 /// returns `true` when the drain stepped aside for a queued interactive
 /// writer on the same root and left the rest parked for a requeued drain.
 pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) -> bool {
-    crate::commands::configure::drain_deferred_configure_maintenance_yielding(ctx)
+    (configure::hooks().drain_yielding)(ctx)
 }
 
 /// Tracks deferred configure work for the standalone NDJSON loop. The attached-
 /// daemon (`subc`) path schedules this work through its executor instead.
 #[derive(Debug)]
 pub struct StandaloneConfigureMaintenance {
-    inner: crate::commands::configure::ConfigureMaintenanceState,
+    inner: configure::ConfigureMaintenanceState,
 }
 
 impl Default for StandaloneConfigureMaintenance {
     fn default() -> Self {
         Self {
-            inner: crate::commands::configure::ConfigureMaintenanceState::default(),
+            inner: configure::ConfigureMaintenanceState::default(),
         }
     }
 }
 
 impl StandaloneConfigureMaintenance {
     pub fn has_pending(&mut self, ctx: &AppContext) -> bool {
-        crate::commands::configure::standalone_configure_maintenance_pending(ctx, &mut self.inner)
+        (configure::hooks().pending)(ctx, &mut self.inner)
     }
 
     pub fn drain_prefix(&mut self, ctx: &Arc<AppContext>) -> bool {
-        crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner)
+        (configure::hooks().prefix)(ctx, &mut self.inner)
     }
 
     pub fn drain_one(&mut self, ctx: &Arc<AppContext>) -> bool {
-        crate::commands::configure::drain_standalone_configure_unit(ctx, &mut self.inner)
+        (configure::hooks().unit)(ctx, &mut self.inner)
     }
 }
 
@@ -536,7 +537,7 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
             // normalized root, so look the todos result up under the same form.
             let todos = ctx.inspect_manager().latest_project_todos_count(
                 ctx.inspect_dir(),
-                crate::inspect::job::canonicalize_normalized(&project_root),
+                crate::path_identity::canonicalize_normalized(&project_root),
             );
             ctx.update_status_bar_todos(todos);
             ctx.signal_status_changed();
@@ -4170,7 +4171,7 @@ mod idle_lsp_tests {
     fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
         let started = Instant::now();
         while started.elapsed() < timeout {
-            if !crate::bash_background::process::is_process_alive(pid) {
+            if !crate::process_identity::is_process_alive(pid) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -4200,7 +4201,7 @@ mod idle_lsp_tests {
         let root = tmp.path().join("project");
         let (ctx, tx) = deleted_root_context(&root);
         let pid = spawn_sleep_client(&ctx, root.clone());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         std::fs::remove_dir_all(&root).unwrap();
         tx.send(crate::watcher_filter::WatcherDispatchEvent::RootDeleted)
@@ -4278,7 +4279,7 @@ mod idle_lsp_tests {
         drain_watcher_events_bounded(&ctx, 1);
         assert_eq!(ctx.lsp().server_count(), 1);
         assert!(ctx.watcher_rx().lock().is_some());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         ctx.mark_subc_bound();
         drain_watcher_events_bounded(&ctx, 1);
@@ -4307,7 +4308,7 @@ mod idle_lsp_tests {
 
         assert_eq!(ctx.lsp().server_count(), 1);
         assert!(ctx.watcher_rx().lock().is_some());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
         assert!(ctx.watcher_drain_has_work());
         let inconclusive_logs = logs
             .iter()
@@ -4319,7 +4320,7 @@ mod idle_lsp_tests {
         assert!(!outcome.has_more);
         assert!(ctx.watcher_rx().lock().is_some());
         assert_eq!(ctx.lsp().server_count(), 1);
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
     }
 
     #[test]
@@ -4375,7 +4376,7 @@ mod idle_lsp_tests {
             1,
             "stale cleanup must not touch the replacement"
         );
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         assert!(ctx.try_cleanup_deleted_root(ctx.configure_generation()));
         assert!(wait_until_dead(pid, Duration::from_secs(6)));
@@ -4500,7 +4501,7 @@ mod idle_lsp_tests {
             last_activity,
         );
         assert_eq!(ctx.lsp().server_count(), 1);
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
         ctx.lsp().shutdown_all();
     }
 }

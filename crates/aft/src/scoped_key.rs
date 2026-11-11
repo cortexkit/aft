@@ -233,7 +233,7 @@ pub fn classify_resolved_standing_root(
 
 /// Observe a root in the default storage namespace without creating a binding.
 pub fn resolve_standing_root(literal_path: &str) -> Result<ResolvedStandingRoot, ScopedKeyError> {
-    let storage = crate::bash_background::storage_dir(None);
+    let storage = crate::storage_path::storage_dir(None);
     resolve_standing_root_in_storage(literal_path, &storage, false)
 }
 

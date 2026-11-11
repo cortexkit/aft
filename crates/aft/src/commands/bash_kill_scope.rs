@@ -170,7 +170,7 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
         }
     }
     let queued = speech_databases.into_iter().try_fold(0_u64, |total, path| {
-        crate::db::gh_speech::Store::new(path)
+        crate::gh_shim_speech::store::Store::new(path)
             .pending_legacy_for_scope(&params.scope)
             .ok()
             .map(|count| total.saturating_add(count))

@@ -1,6 +1,10 @@
 //! Route-local filesystem authority. Resolution belongs to the caller; every
 //! resolved target is decided here before a tool mutates it or a shell launches.
 
+pub(crate) mod directory_scope;
+pub(crate) use directory_scope::directory_scope;
+pub(crate) mod environment;
+
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -147,7 +151,7 @@ fn resolve_worker_rust_root(root: &Path, subtree: &str) -> Option<AccessGrant> {
     }
     let path = joined.canonicalize().ok()?;
     path.is_dir().then(|| AccessGrant {
-        path: crate::inspect::job::normalize_path(&path),
+        path: crate::path_identity::normalize_path(&path),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     })
@@ -650,7 +654,7 @@ impl AccessPolicy {
         let mut floor_rules = Vec::new();
         let roots = roots
             .into_iter()
-            .map(|root| crate::inspect::job::normalize_path(&root))
+            .map(|root| crate::path_identity::normalize_path(&root))
             .collect::<Vec<_>>();
         let shell_write_floor = [
             (".ssh", FloorRule::CredentialPath),
@@ -725,7 +729,7 @@ impl AccessPolicy {
         })
         .collect();
         if config.cache_dir.is_some() {
-            let path = policy_path(&crate::root_cache::cache_root(config));
+            let path = policy_path(&crate::cache_location::cache_root(config));
             floor_rules.push(PolicyFloor {
                 path: path.clone(),
                 rule: FloorRule::AftStorage,
@@ -758,21 +762,7 @@ impl AccessPolicy {
             }
         }
         let mut read_allow = roots.clone();
-        let mut managed_paths = Vec::new();
-        if config.github.shim {
-            managed_paths.push(crate::pinned_executable::shims_dir(&storage));
-            if let Ok(binary) = crate::agent_child_env::shim_binary(config) {
-                managed_paths.push(binary);
-            }
-        }
-        if config.git.co_author != "off" {
-            managed_paths.push(crate::agent_child_env::managed_git_hooks_dir(storage));
-            if config.git.co_author == "auto" {
-                if let Ok(binary) = crate::agent_child_env::shim_binary(config) {
-                    managed_paths.push(binary);
-                }
-            }
-        }
+        let managed_paths = environment::managed_read_paths(config, storage);
         read_allow.extend(
             managed_paths
                 .into_iter()
@@ -983,7 +973,7 @@ impl AccessPolicy {
         owned_artifact: bool,
         contains: fn(&Path, &Path) -> bool,
     ) -> Option<PolicyFloor> {
-        if crate::bash_background::registry::is_task_environment(path) {
+        if crate::task_temp_reads::is_task_environment(path) {
             return Some(PolicyFloor {
                 path: path.to_path_buf(),
                 rule: FloorRule::TaskEnvironment,
@@ -1316,8 +1306,8 @@ pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
             ignore_case: i32,
         ) -> i32;
     }
-    let path = crate::inspect::job::normalize_path(path);
-    let prefix = crate::inspect::job::normalize_path(prefix);
+    let path = crate::path_identity::normalize_path(path);
+    let prefix = crate::path_identity::normalize_path(prefix);
     let mut components = path.components();
     prefix.components().all(|expected| {
         let Some(actual) = components.next() else {
@@ -1418,9 +1408,21 @@ pub(crate) fn policy_path(path: &Path) -> PathBuf {
         }
         // The enclosing resolution must reject this entire policy. Do not run
         // more filesystem work after its first failure.
-        return crate::inspect::job::normalize_path(path);
+        return crate::path_identity::normalize_path(path);
     }
     resolve_policy_path(path)
+}
+
+pub(crate) struct StoragePaths;
+
+impl crate::read_policy::StoragePathPolicy for StoragePaths {
+    fn identity(&self, path: &Path) -> PathBuf {
+        policy_path(path)
+    }
+
+    fn contains(&self, path: &Path, prefix: &Path) -> bool {
+        floor_contains(path, prefix)
+    }
 }
 
 struct BoundedPolicyPaths {
@@ -1474,14 +1476,14 @@ fn resolve_policy_path(path: &Path) -> PathBuf {
             for component in tail.iter().rev() {
                 canonical.push(component);
             }
-            return crate::inspect::job::normalize_path(&canonical);
+            return crate::path_identity::normalize_path(&canonical);
         }
         let Some(name) = ancestor.file_name().map(ToOwned::to_owned) else {
-            return crate::inspect::job::normalize_path(&path);
+            return crate::path_identity::normalize_path(&path);
         };
         tail.push(name);
         if !ancestor.pop() {
-            return crate::inspect::job::normalize_path(&path);
+            return crate::path_identity::normalize_path(&path);
         }
     }
 }

@@ -33,7 +33,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                     break;
                 }
                 if progress {
-                    crate::run_tool_call::progress::report();
+                    crate::tool_progress::report();
                 }
                 let _ = job.ack.send(());
             }

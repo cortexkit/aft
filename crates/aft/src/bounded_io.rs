@@ -1118,7 +1118,7 @@ impl HelperJobScope {
             directories: DIRECTORIES.with(|cache| cache.replace(Default::default())),
             mutation_admission: MUTATION_ADMISSION.with(|flag| flag.replace(false)),
             #[cfg(test)]
-            canonicalize_calls: crate::inspect::job::CANONICALIZE_CALLS
+            canonicalize_calls: crate::path_identity::CANONICALIZE_CALLS
                 .with(|calls| calls.replace(None)),
             #[cfg(test)]
             _read: crate::commands::read::helper_state_scope(),
@@ -1134,7 +1134,7 @@ impl Drop for HelperJobScope {
         DIRECTORIES.with(|cache| cache.replace(std::mem::take(&mut self.directories)));
         MUTATION_ADMISSION.with(|flag| flag.set(self.mutation_admission));
         #[cfg(test)]
-        crate::inspect::job::CANONICALIZE_CALLS
+        crate::path_identity::CANONICALIZE_CALLS
             .with(|calls| *calls.borrow_mut() = self.canonicalize_calls.take());
     }
 }

@@ -231,7 +231,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
-        requires: Some(crate::subc::result_body::RESULT_FORMAT),
+        requires: Some(crate::protocol::RESULT_FORMAT),
         command: "ast_search",
         mode: "matches",
         list_id: "payload.matches",
@@ -359,13 +359,55 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "parser/todo_markers.rs",
+        enclosing_item: "markers_lexical",
+        location_or_primitive: ".take(MAX_LINES_PER_FILE)",
+        reason: "Bounds per-file lexical comment scanning when producing stored TODO marker facts; it is not response pagination.",
+    },
+    ExclusionEntry {
+        file: "parser/todo_markers.rs",
+        enclosing_item: "truncate_text",
+        location_or_primitive: ".take(MAX_TEXT_CHARS)",
+        reason: "Bounds the text of one TODO marker in its stored content record, not the number of findings returned by inspect.",
+    },
+    ExclusionEntry {
+        file: "parser/dead_code_facts.rs",
+        enclosing_item: "collect_rust_macro_token_refs",
+        location_or_primitive: "scope_stack.truncate(scope_len)",
+        reason: "Restores the syntax walk's lexical scope after leaving a node; it does not cut findings or stored references.",
+    },
+    ExclusionEntry {
+        file: "parent_search/mod.rs",
+        enclosing_item: "discover,walk,note_outside,DEFAULT_MAX_CHILD_REPOS,MAX_DISCOVERY_DEPTH,MAX_DISCOVERY_ENTRIES,MAX_OUTSIDE_PATHS",
+        location_or_primitive: "bounded parent repository discovery and split_off(cap)",
+        reason: "Parent discovery bounds filesystem work and the served child set. Repositories past the child cap remain in Discovery.skipped and queries disclose them as parent_children_over_cap gaps; outside paths are bounded discovery diagnostics, not a paged result list.",
+    },
+    ExclusionEntry {
+        file: "commands/data_search.rs",
+        enclosing_item: "lexical_rank_at_depth",
+        location_or_primitive: ".take(depth), truncate(depth)",
+        reason: "Internal lexical candidate pool at the engine's requested depth; final search pagination and completeness are reported by the search result envelope, not this intermediate pool.",
+    },
+    ExclusionEntry {
+        file: "commands/data_search.rs",
+        enclosing_item: "rarest",
+        location_or_primitive: ".take(3)",
+        reason: "Selects three trigram keys to plan an index lookup, not files or findings in an agent-visible list.",
+    },
+    ExclusionEntry {
+        file: "commands/parent_query/engine.rs",
+        enclosing_item: "search",
+        location_or_primitive: ".take()",
+        reason: "Option::take transfers the embedding model between the parent and child search contexts; it does not cut a list.",
+    },
+    ExclusionEntry {
         file: "gh_shim_speech/start_view/sweep.rs",
         enclosing_item: "sweep_entries",
         location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",
         reason: "Internal crash-file housekeeping bounds directory iteration per detached pass, retaining its iterator for continuation; it never truncates an agent-visible result list.",
     },
     ExclusionEntry {
-        file: "commands/semantic_search/memo.rs",
+        file: "search_state/memo.rs",
         enclosing_item: "DigestProofCache::insert",
         location_or_primitive: "MAX_DIGEST_PROOF_BYTES",
         reason: "Internal verified-content proof retention budget; eviction or bypass always falls back to reading and hashing the complete served page, never truncates search candidates or output.",
@@ -443,7 +485,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal cwd analysis retains at most eight folder/mode states per exit-status branch; exceeding that bound makes the folder unknown rather than removing alternatives, and no response list is shortened",
     },
     ExclusionEntry {
-        file: "bash_background/watch_lines.rs",
+        file: "task_watch_lines.rs",
         enclosing_item: "LineDelivery",
         location_or_primitive: "MAX_LINES_PER_NOTIFICATION, MAX_NOTIFICATIONS_PER_MINUTE, MAX_LINE_BYTES",
         reason: "Async push notifications are not command-response lists. LineBatch reports exact cap drops and the source stream/byte offset; oversized lines explicitly mark scanning incomplete.",
@@ -665,7 +707,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal retention candidates beyond the budget remain indexed for the next maintenance request; no agent-visible records are truncated",
     },
     ExclusionEntry {
-        file: "commands/semantic_search/memo.rs",
+        file: "search_state/memo.rs",
         enclosing_item: "make_room_for, store_literal_presence, prune_lifecycle",
         location_or_primitive: "MAX_EXACT_MEMO_BYTES, MAX_LITERAL_PRESENCE_BYTES, MAX_RETIRED_POISONED_BYTES and obsolete-generation cache retirement",
         reason: "internal reconstructible cache ownership only; complete verified results still feed ranking and oversized entries are served without retention, while evicted literal-presence answers are recomputed; no agent-visible result is cut",
@@ -695,7 +737,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "remote document previews use an explicit truncated-at-N-of-M-bytes footer with URL and symbol narrowing advice; this is a byte cut, not a paginated list of records",
     },
     ExclusionEntry {
-        file: "commands/file_read_exact.rs",
+        file: "file_read_exact.rs",
         enclosing_item: "bounded_bytes",
         location_or_primitive: "exact binary read byte ceiling",
         reason: "the module operation refuses oversized files after at most one lookahead byte; no truncated list or partial file is returned",
@@ -731,6 +773,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a transport-independent text byte budget, not a list surface; preserves list envelopes and saves the uncut reply in a session-private file with a recovery trailer; read instead reclaims whole source lines for its native paging footer and notices without saving a copy; failure reasons have a bounded UTF-8 prefix, artifact reads have a separate 64 MiB allocation guard, and retention cleanup resumes each bounded directory scan",
     },
     ExclusionEntry {
+        file: "output_store.rs",
+        enclosing_item: "read, cleanup_expired, SCAN_ENTRIES",
+        location_or_primitive: "saved tool result storage bounds",
+        reason: "Saved-file byte limits and bounded artifact cleanup do not truncate response lists.",
+    },
+    ExclusionEntry {
         file: "hashline/snapshot/mod.rs",
         enclosing_item: "read_body_limit, render_tagged_snapshot_with_options, render_tagless_snapshot_with_options",
         location_or_primitive: "hashline read byte budget with reserved finalization headroom",
@@ -741,6 +789,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "output_tail",
         location_or_primitive: "worker watch tail byte and line preview",
         reason: "a recent-output prose preview, not a result list; limits bytes as well as lines so a single huge log line cannot bypass the preview budget; full task output remains on disk",
+    },
+    ExclusionEntry {
+        file: "commands/bash_watch/restart.rs",
+        enclosing_item: "watch_unknown",
+        location_or_primitive: "watch_unknown state.held.take() and state.wait.take()",
+        reason: "Option::take consuming the held-call identity and its wait before settling an unknown result; no list is cut",
     },
     ExclusionEntry {
         file: "cold_build_limiter/progress.rs",
@@ -785,7 +839,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal marker liveness and cleanup, not result lists; incomplete or oversized marker reads protect the cache rather than authorize deletion",
     },
     ExclusionEntry {
-        file: "bash_background/persistence.rs",
+        file: "pinned_dir.rs",
         enclosing_item: "RepairBudget, DirectoryEntries, unix_entries, unix_names, repair_names, directory_identities, collect_directory_identities, repair_measure, repair_remove_contents, windows_repair_names, repair_descendant, repair_validate_descendants",
         location_or_primitive: "repair traversal depth, entry and deadline bounds",
         reason: "internal cache repair and retention walks, not result lists; an incomplete identity census or inventory refuses deletion and interrupted removal reports partial progress",
@@ -1090,9 +1144,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal watcher exclusion budget, not an agent-visible result list; paths without a kernel exclusion slot remain rejected at the walk boundary",
     },
     ExclusionEntry {
-        file: "commands/bash_orchestrate.rs",
+        file: "shell_format.rs",
         enclosing_item: "format_seconds",
-        location_or_primitive: "commands::bash_orchestrate::seconds.truncate",
+        location_or_primitive: "shell_format::seconds.truncate",
         reason: "string manipulation trimming timestamp representation, not a list truncation",
     },
     ExclusionEntry {

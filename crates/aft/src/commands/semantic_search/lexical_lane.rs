@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::comparator::{score_free_r3_cmp, CandidateResult, SymbolOffsetRange};
 use super::evidence_descriptor::EvidenceDescriptor;
 use super::plan_table::SearchLaneKind;
-use crate::data_layer::tools::search::TextIndex;
+use crate::commands::data_search::TextIndex;
 use crate::search_index::SearchIndexSnapshot;
 
 /// Keep the initial emitted batch at 50 candidates; deeper tiers reveal more.

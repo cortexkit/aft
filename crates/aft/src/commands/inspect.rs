@@ -203,7 +203,7 @@ pub(crate) fn deferred_inspect_root_count_for_test(ctx: &AppContext) -> usize {
     // Unrelated inspect tests may hold permits for other roots in parallel.
     // Only this fixture's normalized root is evidence of its worker's lifetime.
     let config = ctx.config();
-    let root = crate::inspect::job::canonicalize_normalized(
+    let root = crate::path_identity::canonicalize_normalized(
         config
             .project_root
             .as_deref()
@@ -447,7 +447,7 @@ fn capture_inspect_root_stats_while(
                 ));
             }
         }
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
     // An exhausted iterator may mean timeout, including roots with no source
     // files at all. Never mistake a partial census for a fresh empty snapshot.
@@ -469,7 +469,7 @@ fn capture_inspect_root_stats_while(
             )
         })?;
         manifests.push((manifest.clone(), blake3::hash(&contents)));
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
     if !has_work_budget() {
         return Err(timeout_detail());
@@ -844,7 +844,7 @@ fn handle_inspect_payload(
             scope_walk_deadline,
             observed_stats,
         );
-        let project_root = crate::inspect::job::canonicalize_normalized(&snapshot.project_root);
+        let project_root = crate::path_identity::canonicalize_normalized(&snapshot.project_root);
         // External directory roots contribute only files with a registered
         // diagnostics producer; explicit file roots remain counted even when
         // no producer can analyze that file.
@@ -867,7 +867,7 @@ fn handle_inspect_payload(
 
     let manager = ctx.inspect_manager();
     // Dead code reads its call graph from the root's checkout (see
-    // `data_layer::tools::inspect`).
+    // `inspect::data_sources`).
     if snapshot
         .config
         .inspect
@@ -3081,7 +3081,7 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
     // Normalized, not bare-canonical: the diagnostics collection filters
     // LSP-reported (normalized) paths against this root with starts_with,
     // so a Windows verbatim root here silently drops every diagnostic.
-    let project_root = crate::inspect::job::canonicalize_normalized(&project_root);
+    let project_root = crate::path_identity::canonicalize_normalized(&project_root);
     Ok(InspectSnapshot::new_with_capabilities(
         project_root,
         ctx.inspect_dir(),
@@ -3155,7 +3155,7 @@ fn receive_tier2_completion_until(
         let next = manager.work_progress(category);
         if next.is_some() && next != progress {
             progress = next;
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
         }
         // Another category may have used this wait's budget after the worker
         // finished. Keep an already published result even at the deadline.
@@ -3404,7 +3404,7 @@ fn parse_scope(
         // Never `fs::canonicalize` directly: its Windows result is a verbatim
         // path, and every downstream comparison (workspace ownership, job
         // scope, analyzed-file membership) is against non-verbatim roots.
-        roots.push(crate::inspect::job::canonicalize_normalized(&validated));
+        roots.push(crate::path_identity::canonicalize_normalized(&validated));
     }
 
     if !missing.is_empty() {
@@ -4942,12 +4942,13 @@ fn dead_code_callgraph_observation(
     ctx: &AppContext,
 ) -> (crate::feature_status::IndexObservation, bool) {
     let (query_observation, transient_lock_contention) =
-        crate::feature_status::observe_callgraph_query_with_contention(ctx);
+        crate::feature_status::observe_callgraph_query_with_contention(ctx, ctx);
     if transient_lock_contention {
         (query_observation, true)
     } else {
         (
             crate::feature_status::observed_index_status(
+                ctx,
                 ctx,
                 crate::feature_status::IndexPlane::Callgraph,
             ),
@@ -8211,7 +8212,7 @@ mod deferred_terminal_tests {
         let snapshot = build_snapshot(&ctx).unwrap();
         assert_eq!(
             snapshot.project_root,
-            crate::inspect::job::canonicalize_normalized(&root)
+            crate::path_identity::canonicalize_normalized(&root)
         );
         assert!(snapshot.inspect_writer && snapshot.callgraph_writer);
         let scope = JobScope::for_project(root.clone());
@@ -8639,7 +8640,7 @@ mod deferred_terminal_tests {
     #[test]
     fn scoped_in_root_inventory_timeout_reports_lower_bound_and_gap() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         std::fs::write(root.join("main.ts"), "export const main = 1;").unwrap();
         let roots = vec![root.clone()];
         let scope = JobScope::from_roots(root.clone(), roots.clone());
@@ -8698,11 +8699,11 @@ mod deferred_terminal_tests {
         let scope_roots = vec![scope_root];
         let scope = JobScope::from_roots(root.clone(), scope_roots.clone());
 
-        crate::inspect::job::CANONICALIZE_CALLS.with(|calls| {
+        crate::path_identity::CANONICALIZE_CALLS.with(|calls| {
             *calls.borrow_mut() = Some(Vec::new());
         });
         let count = scoped_in_root_file_count(&root, &scope_roots, &scope, None, None);
-        let canonicalized = crate::inspect::job::CANONICALIZE_CALLS.with(|calls| {
+        let canonicalized = crate::path_identity::CANONICALIZE_CALLS.with(|calls| {
             calls
                 .borrow_mut()
                 .take()
@@ -9100,7 +9101,7 @@ mod deferred_terminal_tests {
     #[test]
     fn inspect_cold_build_limiter_timeout_is_pending_then_ready() {
         let dir = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        let root = crate::path_identity::canonicalize_normalized(dir.path());
         std::fs::write(
             root.join("main.ts"),
             "export function spare() { return 1; }\n",

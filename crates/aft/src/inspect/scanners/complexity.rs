@@ -331,7 +331,7 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
 
 pub fn run_complexity_scan(job: &InspectJob) -> InspectResult {
     let started = Instant::now();
-    let progress = crate::run_tool_call::progress::FileProgress::current();
+    let progress = crate::tool_progress::FileProgress::current();
     let scans = job
         .scope_files
         .par_iter()

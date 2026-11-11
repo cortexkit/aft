@@ -1673,6 +1673,17 @@ impl InspectCache {
     }
 }
 
+impl crate::data_layer::parent_session::InspectCacheView for ReadonlyInspectCache {
+    fn project_aggregate(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.get_aggregated_for_config(&JobKey::for_project_category(category), config)
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl ReadonlyInspectCache {
     fn from_inner(inner: InspectCache) -> Self {
         Self { inner }
@@ -2782,7 +2793,7 @@ fn update_manifest_fingerprint_hash(
     // verbatim (`\\?\`) on Windows, so mixing it with those non-verbatim
     // manifests makes `strip_prefix` hash an absolute path instead of its
     // project-relative name.
-    let manifest_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let manifest_root = crate::path_identity::canonicalize_normalized(project_root);
     hasher.update(b"entry-point-manifests\0");
     for manifest in super::entry_points::collect_entry_point_manifests(project_root) {
         let relative_path = manifest
@@ -3503,7 +3514,7 @@ pub(crate) mod tests {
         let content = br#"{"name":"fixture"}"#;
         fs::write(&manifest, content).expect("write package manifest");
 
-        let normalized_project = crate::inspect::job::canonicalize_normalized(&project);
+        let normalized_project = crate::path_identity::canonicalize_normalized(&project);
         let mut actual = blake3::Hasher::new();
         update_manifest_fingerprint_hash(&mut actual, &verbatim_path(&normalized_project))
             .expect("hash entry-point manifest");

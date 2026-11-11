@@ -427,7 +427,7 @@ fn audit_killing_revokes_before_term_grace() {
                 .unwrap()
                 .info
                 .status,
-            crate::bash_background::BgTaskStatus::Killing
+            crate::protocol::BgTaskStatus::Killing
         );
         let closed_while_alive = disconnected(address);
         std::fs::write(f.root.path().join("during-kill"), b"go").unwrap();
@@ -598,10 +598,10 @@ fn audit_epoch_rebind_revokes_secret_not_ordinary_job() {
                 .unwrap();
             assert_eq!(
                 snapshot.info.status,
-                crate::bash_background::BgTaskStatus::Running,
+                crate::protocol::BgTaskStatus::Running,
                 "rebind killed a command"
             );
-            assert!(crate::bash_background::process::is_process_alive(
+            assert!(crate::process_identity::is_process_alive(
                 snapshot.child_pid.unwrap()
             ));
         }

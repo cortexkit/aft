@@ -754,18 +754,6 @@ fn a_user_file_edit_asks_every_live_root_to_reload() {
 }
 
 #[test]
-fn signal_debounces_until_quiet() {
-    let signal = ConfigReloadSignal::default();
-    assert!(!signal.take_if_due());
-    signal.request();
-    assert!(signal.is_pending());
-    assert!(!signal.take_if_due(), "not due inside the debounce window");
-    std::thread::sleep(CONFIG_RELOAD_DEBOUNCE + Duration::from_millis(50));
-    assert!(signal.take_if_due());
-    assert!(!signal.is_pending());
-}
-
-#[test]
 fn config_file_watch_sees_edits_and_a_directory_created_later() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = std::fs::canonicalize(temp.path()).expect("canonical temp");
@@ -800,44 +788,6 @@ fn config_file_watch_sees_edits_and_a_directory_created_later() {
     let before = hits.load(std::sync::atomic::Ordering::SeqCst);
     write(&file, r#"{ "format_on_edit": true }"#);
     wait_for_hit_after(before, "an edit");
-}
-
-#[test]
-fn project_watcher_filter_recognises_the_config_file() {
-    let root = Path::new("/r");
-    assert!(is_project_config_event_path(
-        root,
-        Path::new("/r/.cortexkit/aft.jsonc")
-    ));
-    assert!(is_project_config_event_path(
-        root,
-        Path::new("/r/.cortexkit/aft.jsonc.tmp.123")
-    ));
-    assert!(!is_project_config_event_path(
-        root,
-        Path::new("/r/.cortexkit/other.json")
-    ));
-    assert!(!is_project_config_event_path(
-        root,
-        Path::new("/r/aft.jsonc")
-    ));
-    for directory in [".opencode", ".pi"] {
-        for filename in [
-            "aft.jsonc",
-            "aft.json",
-            "aft.json.tmp.123",
-            ".aft.jsonc.tmp.123",
-        ] {
-            assert!(is_project_config_event_path(
-                root,
-                &root.join(directory).join(filename)
-            ));
-        }
-        assert!(!is_project_config_event_path(
-            root,
-            &root.join(directory).join("other.json")
-        ));
-    }
 }
 
 #[test]

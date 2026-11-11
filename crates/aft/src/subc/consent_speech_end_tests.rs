@@ -422,7 +422,7 @@ async fn audit_started_shell_is_killed_by_scope_cleanup_and_never_not_started() 
         .unwrap();
     assert_eq!(
         snapshot.info.status,
-        crate::bash_background::BgTaskStatus::Killed
+        crate::protocol::BgTaskStatus::Killed
     );
     assert_eq!(
         snapshot.info.status_reason.as_deref(),

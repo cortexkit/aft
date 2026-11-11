@@ -219,7 +219,7 @@ pub(crate) mod simulated_volumes {
         }
         let resolved = [
             std::fs::canonicalize(existing).ok(),
-            crate::bash_background::persistence::canonical_root_path(existing).ok(),
+            crate::pinned_dir::canonical_root_path(existing).ok(),
         ];
         for mut spelling in resolved.into_iter().flatten() {
             for name in missing.iter().rev() {
@@ -280,7 +280,7 @@ mod tests {
         let _volume = super::simulated_volumes::simulate(&spelled, u64::MAX - 90);
         // AFT opens configured roots under this spelling (plain `C:\...` on
         // Windows, not the verbatim `\\?\C:\...` that fs::canonicalize gives).
-        let resolved = crate::bash_background::persistence::canonical_root_path(&spelled).unwrap();
+        let resolved = crate::pinned_dir::canonical_root_path(&spelled).unwrap();
         assert_eq!(
             super::simulated_volumes::device_of(&resolved),
             Some(u64::MAX - 90)
@@ -293,7 +293,7 @@ mod tests {
         let later = temp.path().join("detour").join("..").join("created-later");
         let _later = super::simulated_volumes::simulate(&later, u64::MAX - 91);
         std::fs::create_dir(&later).unwrap();
-        let resolved = crate::bash_background::persistence::canonical_root_path(&later).unwrap();
+        let resolved = crate::pinned_dir::canonical_root_path(&later).unwrap();
         assert_eq!(
             super::simulated_volumes::device_of(&resolved),
             Some(u64::MAX - 91)

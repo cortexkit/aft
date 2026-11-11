@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, SemanticBackendConfig};
 use crate::context::{AppContext, ConfigureMaintenanceJob, SemanticIndexStatus};
@@ -21,10 +21,38 @@ use crate::lsp::registry::{
 };
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
+pub(crate) use crate::runtime_drain::configure::ConfigureMaintenanceState;
+use crate::runtime_drain::configure::{
+    ConfigureMaintenanceContinuation, ConfigureMaintenanceStage,
+};
 use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
 use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Install the callbacks before admitting database retries. Binary startup and
+/// configure do this automatically; library hosts using the retry API without a
+/// configure request must register the callbacks explicitly.
+pub fn register_runtime_hooks() {
+    crate::runtime_drain::configure::register(crate::runtime_drain::configure::Hooks {
+        drain: drain_deferred_configure_maintenance,
+        drain_yielding: drain_deferred_configure_maintenance_yielding,
+        pending: standalone_configure_maintenance_pending,
+        prefix: drain_standalone_configure_prefix,
+        unit: drain_standalone_configure_unit,
+        database_runtime: configure_database_runtime_with_mode,
+    });
+}
+
+#[cfg(test)]
+mod runtime_hook_tests {
+    #[test]
+    fn configure_registers_its_runtime_hooks() {
+        super::register_runtime_hooks();
+        assert!(crate::runtime_drain::configure::registered());
+        assert!(crate::runtime_drain::configure::database_runtime().is_some());
+    }
+}
 
 static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -270,15 +298,7 @@ fn resolve_home_dir() -> Option<PathBuf> {
     Some(std::fs::canonicalize(&raw).unwrap_or(raw))
 }
 
-pub(crate) fn resolve_account_home_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    let home = crate::production_storage::account_home().ok()?;
-    #[cfg(windows)]
-    let home = resolve_windows_profile_dir().ok()?;
-
-    let canonical = std::fs::canonicalize(home).ok()?;
-    canonical.is_dir().then_some(canonical)
-}
+pub(crate) use crate::production_storage::resolve_account_home_dir;
 
 pub(crate) fn project_root_is_too_broad(
     canonical_root: &Path,
@@ -300,49 +320,6 @@ pub(crate) fn project_root_is_too_broad(
                     &volume,
                 ) != Some(true)
             })
-}
-
-#[cfg(windows)]
-fn resolve_windows_profile_dir() -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{
-        FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY,
-    };
-
-    struct FolderPath(*mut u16);
-    impl Drop for FolderPath {
-        fn drop(&mut self) {
-            // SAFETY: SHGetKnownFolderPath allocates its result with the COM allocator.
-            unsafe { CoTaskMemFree(self.0.cast()) };
-        }
-    }
-
-    let mut raw = std::ptr::null_mut();
-    // SAFETY: the folder identifier is valid and raw is writable.
-    let status = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_Profile,
-            KF_FLAG_DONT_VERIFY as u32,
-            std::ptr::null_mut(),
-            &mut raw,
-        )
-    };
-    let path = FolderPath(raw);
-    if status < 0 || path.0.is_null() {
-        return Err(std::io::Error::other(format!(
-            "SHGetKnownFolderPath(FOLDERID_Profile) lookup failed (HRESULT 0x{:08x})",
-            status as u32
-        )));
-    }
-    let mut len = 0;
-    // SAFETY: a successful lookup returns an allocated NUL-terminated path.
-    while unsafe { *path.0.add(len) } != 0 {
-        len += 1;
-    }
-    // SAFETY: the scan above found the end of the allocated path.
-    let units = unsafe { std::slice::from_raw_parts(path.0, len) };
-    Ok(PathBuf::from(std::ffi::OsString::from_wide(units)))
 }
 
 fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBuf> {
@@ -1524,7 +1501,7 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
 #[test]
 fn lsp_warnings_probe_each_biome_folder_once_per_pass() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join("biome.json"), "{}").unwrap();
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1589,7 +1566,7 @@ fn configure_warnings_canonicalize_biome_directories_not_each_file() {
         session_id: None,
     }
     .run(|boundary| {
-        crate::inspect::job::CANONICALIZE_CALLS.with(|counter| match boundary {
+        crate::path_identity::CANONICALIZE_CALLS.with(|counter| match boundary {
             WarningBoundary::ResolvingLsp => *counter.borrow_mut() = Some(Vec::new()),
             WarningBoundary::Publication => calls = counter.borrow_mut().take().unwrap(),
             _ => {}
@@ -1643,13 +1620,13 @@ fn configure_warnings_cpu_measurement() {
         tx,
         session_id: None,
     };
-    crate::inspect::job::CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+    crate::path_identity::CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
     let cpu = cpu_seconds();
     let wall = Instant::now();
     work.run(|_| {});
     let cpu = cpu_seconds() - cpu;
     let wall = wall.elapsed().as_secs_f64();
-    let canonicalizations = crate::inspect::job::CANONICALIZE_CALLS
+    let canonicalizations = crate::path_identity::CANONICALIZE_CALLS
         .with(|calls| calls.borrow_mut().take().unwrap().len());
     let warnings = rx
         .try_recv()
@@ -1734,7 +1711,7 @@ impl ConfigureWarningWork {
     /// one. Configure can run before the checkout publishes, so the first
     /// configure of a new root usually walks.
     fn source_files(&self) -> Vec<PathBuf> {
-        let miss = match crate::data_layer::tools::inspect::bound_inventory(&self.root) {
+        let miss = match crate::inspect::data_sources::bound_inventory(&self.root) {
             Ok(inventory) => return inventory.sources,
             Err(miss) => miss,
         };
@@ -1846,7 +1823,7 @@ fn audit01_warning_current_generation_publishes() {
 #[test]
 fn configure_warnings_list_files_from_the_published_index_store_without_walking() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     for (path, contents) in [
         ("src/main.rs", "fn main() {}\n"),
         ("web/app.ts", "export const app = 1;\n"),
@@ -1883,7 +1860,7 @@ fn configure_warnings_list_files_from_the_published_index_store_without_walking(
 
     // No checkout is bound yet: the pass walks, as it always has.
     assert_eq!(
-        crate::data_layer::tools::inspect::bound_inventory(&root).err(),
+        crate::inspect::data_sources::bound_inventory(&root).err(),
         Some(crate::inspect::inventory::StoreListMiss::NotBound)
     );
     let (walked, walk_entries) = warn();
@@ -1903,7 +1880,7 @@ fn configure_warnings_list_files_from_the_published_index_store_without_walking(
         },
     );
     crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
-    assert!(crate::data_layer::tools::inspect::bound_inventory(&root).is_ok());
+    assert!(crate::inspect::data_sources::bound_inventory(&root).is_ok());
     let (listed, store_entries) = warn();
     assert_eq!(store_entries, 0, "a published checkout lists the files");
     assert_eq!(listed, walked);
@@ -2300,6 +2277,7 @@ fn handle_configure_prepared(
     ctx: &AppContext,
     prepared: Option<&Config>,
 ) -> Response {
+    register_runtime_hooks();
     let response = configure_prepared(req, ctx, prepared);
     if response.success {
         // The rebind's rescan runs in the configure tail, after this reply;
@@ -2635,8 +2613,7 @@ fn handle_configure_inner(
     // storage resolver. This keeps AFT_STORAGE_DIR ahead of a wire value and
     // gives every artifact lane one concrete absolute root.
     ctx.begin_configure_ack_step("storage_root");
-    let resolved_storage_dir =
-        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let resolved_storage_dir = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
     if resolved_storage_dir.exists() {
         crate::reader_floor::prepare(&resolved_storage_dir);
     }
@@ -2792,7 +2769,7 @@ fn handle_configure_inner(
                         req.session().to_string(),
                     );
                 let storage_root =
-                    crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+                    crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
                 let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
                     generation: ctx.configure_generation(),
                     root_path: root_path.clone(),
@@ -2919,7 +2896,7 @@ fn handle_configure_inner(
     }
     // A context that binds another root stops holding the parent folder
     // session it held before; a session no context holds stops.
-    crate::data_layer::parent_session::release_context_except(ctx, &canonical_cache_root);
+    crate::parent_search::release_context_except(ctx, &canonical_cache_root);
     // With views on, a plain folder of repositories is a parent folder: it is
     // served from its child repositories' own indexes and, like HOME, builds
     // none of its own. The index types the user enabled are passed to the
@@ -2927,9 +2904,9 @@ fn handle_configure_inner(
     // The decision is a probe bounded by a short wall-clock budget; the full
     // walk for every child runs on the parent session's worker.
     let parent_folder = !root_too_broad
-        && crate::data_layer::parent_session::prepare(
+        && crate::parent_search::prepare(
             &canonical_cache_root,
-            crate::data_layer::parent_session::RequestedPlanes {
+            crate::parent_search::RequestedPlanes {
                 trigram: next_config.indexes.trigram,
                 semantic: next_config.indexes.semantic,
                 callgraph: next_config.indexes.callgraph,
@@ -2966,8 +2943,7 @@ fn handle_configure_inner(
     );
     if ctx.configure_generation() > 0
         && !root_too_broad
-        && (!parent_folder
-            || crate::data_layer::parent_session::held_by(ctx, &canonical_cache_root))
+        && (!parent_folder || crate::parent_search::held_by(ctx, &canonical_cache_root))
         && !ctx.database_runtime_failed()
         && !ctx.artifact_identity_provisional()
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
@@ -3028,8 +3004,7 @@ fn handle_configure_inner(
         debug_assert!(ctx.has_configure_session_binding(&canonical_cache_root, req.session()));
         let generation = ctx.configure_generation();
         if first_session_bind || repair_artifacts {
-            let storage_root =
-                crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+            let storage_root = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
             let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
                 generation,
                 root_path: root_path.clone(),
@@ -3100,8 +3075,7 @@ fn handle_configure_inner(
     // equivalent fast paths above never need them (the configuration they
     // accept is the one already applied), so they run only here, with
     // exclusive use of the root, and still before any build worker starts.
-    let child_storage_root =
-        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let child_storage_root = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
     if let Err(error) = crate::agent_child_env::maintain(&next_config, &child_storage_root) {
         return Response::error(&req.id, "child_environment_unavailable", error);
     }
@@ -3128,7 +3102,7 @@ fn handle_configure_inner(
     let format_tool_cache_clear_needed = effective_configure_changed;
 
     let storage_root = crate::root_cache::cache_root(&next_config);
-    let durable_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let durable_root = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
     let cache_reason = crate::root_cache::cache_unavailable(&next_config);
     let cache_available = cache_reason.is_none();
     if let Some(reason) = cache_reason {
@@ -3261,7 +3235,7 @@ fn handle_configure_inner(
     ctx.begin_configure_ack_step("database_runtime");
     ctx.begin_database_runtime(
         canonical_cache_root.clone(),
-        crate::bash_background::storage_dir(next_config.storage_dir.as_deref()),
+        crate::storage_path::storage_dir(next_config.storage_dir.as_deref()),
         req.session().to_string(),
     );
     // Commit phase: no validation returns after this point.
@@ -3295,12 +3269,12 @@ fn handle_configure_inner(
             max_depth: next_config
                 .backup
                 .max_depth
-                .unwrap_or(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
+                .unwrap_or(crate::config::DEFAULT_MAX_UNDO_DEPTH),
             max_file_size: Some(
                 next_config
                     .backup
                     .max_file_size
-                    .unwrap_or(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
+                    .unwrap_or(crate::config::DEFAULT_MAX_BACKUP_FILE_SIZE),
             ),
         });
         backup.set_db_harness(harness.clone());
@@ -3358,19 +3332,14 @@ fn handle_configure_inner(
     ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
     if root_too_broad {
         ctx.stop_watcher_runtime();
-        crate::data_layer::parent_session::deactivate(&canonical_cache_root);
+        crate::parent_search::deactivate(&canonical_cache_root);
     }
     // Past the commit seal: start (or join) the parent session now, so the
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
     if cache_available && !root_too_broad && !identity_provisional {
-        crate::data_layer::parent_session::activate(
-            ctx,
-            &canonical_cache_root,
-            &storage_root,
-            &parent_semantic,
-        );
+        crate::parent_search::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
     }
     ctx.begin_configure_ack_step("warm_key");
     let warm_key = configure_warm_key(
@@ -3533,7 +3502,7 @@ fn handle_configure_inner(
     }
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
-    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let storage_root = crate::storage_path::storage_dir(next_config.storage_dir.as_deref());
     ctx.begin_configure_ack_phase("maintenance_enqueue");
     let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
@@ -3920,153 +3889,6 @@ pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
     let cancelled = jobs.len();
     cancel_unbound_configure_jobs(ctx, jobs);
     cancelled
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ConfigureMaintenanceStage {
-    #[default]
-    Admission,
-    DatabaseRuntime,
-    SessionReplay,
-    BashRuntime,
-    ProjectRuntime,
-    Watcher,
-    ProcessFlags,
-    Status,
-}
-
-impl ConfigureMaintenanceStage {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Admission => "admission",
-            Self::DatabaseRuntime => "database_runtime",
-            Self::SessionReplay => "session_replay",
-            Self::BashRuntime => "bash_runtime",
-            Self::ProjectRuntime => "project_runtime",
-            Self::Watcher => "watcher",
-            Self::ProcessFlags => "process_flags",
-            Self::Status => "status",
-        }
-    }
-
-    /// Initial work that runs before the first request after configure: bash
-    /// replay restores the DB tasks and one bounded disk batch, so an immediate
-    /// `bash_drain_completions` sees those results. Disk-only tasks beyond that
-    /// batch arrive through later maintenance and completion delivery rather
-    /// than delaying requests for a full disk scan. The prefix also prepares the
-    /// project runtime (a queued `outline`/`glob` must see the rebuilt gitignore
-    /// matcher), and the watcher start. The watcher only observes changes made
-    /// after it subscribes, so a file written between the configure ack and the
-    /// first request is lost for good if the start waits for a later yield: on a
-    /// small tree the index is ready after one request, an ignore-rule change
-    /// written right after it was never seen, and the ignored file stayed in
-    /// grep results. Everything after these is housekeeping and yields to
-    /// requests.
-    fn is_non_yielding_prefix(self) -> bool {
-        matches!(
-            self,
-            Self::Admission
-                | Self::DatabaseRuntime
-                | Self::SessionReplay
-                | Self::BashRuntime
-                | Self::ProjectRuntime
-                | Self::Watcher
-        )
-    }
-}
-
-#[derive(Debug)]
-struct ConfigureMaintenanceContinuation {
-    job: ConfigureMaintenanceJob,
-    stage: ConfigureMaintenanceStage,
-    replay_retry_at: Option<Instant>,
-    lexical_bind_retry_at: Option<Instant>,
-    callgraph_upgrade_retry_at: Option<Instant>,
-    replay_error_logged: bool,
-}
-
-impl ConfigureMaintenanceContinuation {
-    fn new(job: ConfigureMaintenanceJob) -> Self {
-        Self {
-            job,
-            stage: ConfigureMaintenanceStage::Admission,
-            replay_retry_at: None,
-            lexical_bind_retry_at: None,
-            callgraph_upgrade_retry_at: None,
-            replay_error_logged: false,
-        }
-    }
-
-    fn retry_at(&self) -> Option<Instant> {
-        self.callgraph_upgrade_retry_at
-            .or(self.lexical_bind_retry_at)
-            .or(self.replay_retry_at)
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct ConfigureMaintenanceState {
-    jobs: VecDeque<ConfigureMaintenanceContinuation>,
-    // Freeze retry eligibility across one full drain so a deferred unit cannot
-    // become due again while other units run and monopolize the same drain.
-    replay_retry_cutoff: Option<Instant>,
-}
-
-impl ConfigureMaintenanceState {
-    pub(crate) fn jobs_is_empty(&self) -> bool {
-        self.jobs.is_empty()
-    }
-
-    pub(crate) fn has_ready_job(&self) -> bool {
-        let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
-        self.jobs.iter().any(|continuation| {
-            continuation
-                .retry_at()
-                .is_none_or(|deadline| deadline <= now)
-        })
-    }
-
-    fn select_ready_job(&mut self, ctx: &AppContext) -> bool {
-        let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
-        let Some(index) = self.jobs.iter().position(|continuation| {
-            ctx.subc_unbound_quiesced()
-                || continuation
-                    .retry_at()
-                    .is_none_or(|deadline| deadline <= now)
-        }) else {
-            return false;
-        };
-        self.jobs.rotate_left(index);
-        true
-    }
-
-    fn absorb_enqueued(&mut self, ctx: &AppContext) {
-        self.jobs.extend(
-            ctx.drain_configure_maintenance()
-                .into_iter()
-                .map(ConfigureMaintenanceContinuation::new),
-        );
-    }
-
-    /// True when the next unit to run starts a job or continues one past its
-    /// request-critical prefix, so stopping here leaves no prefix half done.
-    ///
-    /// Why the remaining stops are safe: stopping before a job's Admission
-    /// leaves the root exactly as it is between a bind ack and the tail's
-    /// first submission, which every bind already passes through. Past the
-    /// prefix, the standalone loop already lets requests (configures and edits
-    /// included) run between units. A writer that runs meanwhile either keeps
-    /// the configure generation (an equivalent rebind, an LSP-path update or
-    /// an edit, none of which touch what the remaining stages read) or
-    /// advances it, in which case `drop_superseded_parked_continuations`
-    /// discards the rest and the newer configure's own tail repeats every
-    /// root-scoped stage.
-    fn can_step_aside(&self) -> bool {
-        self.jobs.front().is_none_or(|continuation| {
-            continuation.stage == ConfigureMaintenanceStage::Admission
-                || !continuation.stage.is_non_yielding_prefix()
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4923,11 +4745,7 @@ mod tests {
                 true,
                 true,
             );
-            metadata.mark_terminal(
-                crate::bash_background::BgTaskStatus::Completed,
-                Some(0),
-                None,
-            );
+            metadata.mark_terminal(crate::protocol::BgTaskStatus::Completed, Some(0), None);
             write_task(&paths.json, &metadata).unwrap();
             fs::write(&paths.stdout, "recovered\n").unwrap();
             fs::write(&paths.stderr, "").unwrap();
@@ -4979,7 +4797,7 @@ mod tests {
             true,
         );
         metadata.harness = Some("opencode".into());
-        metadata.status = crate::bash_background::BgTaskStatus::Running;
+        metadata.status = crate::protocol::BgTaskStatus::Running;
         metadata.completion_has_env_secrets = Some(false);
         metadata.completion_has_non_ticket_env_secrets = Some(false);
         write_task(&paths.json, &metadata).unwrap();
@@ -5043,17 +4861,14 @@ mod tests {
         assert_eq!(completions[0].task_id, task_id);
         assert_eq!(
             completions[0].status,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
         assert_eq!(completions[0].exit_code, Some(0));
         assert!(completions[0]
             .output_preview
             .contains("recovered after restart"));
         let recovered = read_task(&paths.json).unwrap();
-        assert_eq!(
-            recovered.status,
-            crate::bash_background::BgTaskStatus::Completed
-        );
+        assert_eq!(recovered.status, crate::protocol::BgTaskStatus::Completed);
         assert_eq!(recovered.exit_code, Some(0));
         assert!(runner_completions.is_empty());
         assert!(!runner_adopted, "runner adopted the opencode task");
@@ -5132,11 +4947,7 @@ mod tests {
                 true,
                 true,
             );
-            task.mark_terminal(
-                crate::bash_background::BgTaskStatus::Completed,
-                Some(0),
-                None,
-            );
+            task.mark_terminal(crate::protocol::BgTaskStatus::Completed, Some(0), None);
             write_task(&layout.paths.json, &task).unwrap();
             fs::write(&layout.paths.stdout, "recovered\n").unwrap();
             fs::write(&layout.paths.stderr, "").unwrap();
@@ -6090,7 +5901,7 @@ mod tests {
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config {
-                storage_dir: Some(crate::bash_background::storage_dir(None)),
+                storage_dir: Some(crate::storage_path::storage_dir(None)),
                 ..Config::default()
             },
         );
@@ -6630,7 +6441,7 @@ mod tests {
                         crate::feature_status::IndexPlane::Callgraph,
                     ] {
                         assert_eq!(
-                            crate::feature_status::observed_index_status(&ctx, plane)
+                            crate::feature_status::observed_index_status(&ctx, &ctx, plane)
                                 .unavailable_reason
                                 .as_deref(),
                             Some(crate::root_cache::CACHE_DIR_BUSY)
@@ -6711,7 +6522,7 @@ mod tests {
             "XDG_DATA_HOME",
             default_data_root.to_str().expect("temporary path is UTF-8"),
         );
-        let default_storage = crate::bash_background::storage_dir(None);
+        let default_storage = crate::storage_path::storage_dir(None);
         let project = temp.path().join("project");
         let storage = temp.path().join("configured-storage");
         init_git_fixture(&project);
@@ -8315,7 +8126,7 @@ mod tests {
                 "broad root must bind no checkout"
             );
             assert!(true);
-            assert!(crate::data_layer::parent_session::session_for_root(root).is_none());
+            assert!(crate::parent_search::session_for_root(root).is_none());
             assert!(!ctx.watcher_runtime_active());
         };
         assert_no_workers();
@@ -8332,7 +8143,7 @@ mod tests {
         }
         for plane in crate::feature_status::IndexPlane::ALL {
             let observation =
-                crate::feature_status::observed_index_status(&ctx, plane).consumer_json();
+                crate::feature_status::observed_index_status(&*ctx, &*ctx, plane).consumer_json();
             assert_eq!(observation["status"], "off");
             assert_eq!(observation["reason"], "root_too_broad");
         }

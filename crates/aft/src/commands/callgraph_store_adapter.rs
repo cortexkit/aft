@@ -15,7 +15,7 @@ use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::feature_status::{cause, IndexObservation};
-use crate::inspect::job::is_test_file;
+use crate::file_kind::is_test_file;
 use crate::list_envelope::{ListEnvelope, Unit};
 use crate::parser::{
     detect_language_from_source, extract_symbols_from_tree, parse_resolved_source, FileParser,
@@ -2680,6 +2680,7 @@ pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Respo
         // a borrowed read-only root, or a root that is being unbound): report
         // the plane's observed cause rather than "not configured".
         let observation = match crate::feature_status::observed_index_status(
+            ctx,
             ctx,
             crate::feature_status::IndexPlane::Callgraph,
         ) {

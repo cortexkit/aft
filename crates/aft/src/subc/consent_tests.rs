@@ -4693,7 +4693,7 @@ async fn standalone_plugins_receive_in_process_two_phase_ask_without_cingulate()
 #[tokio::test]
 async fn standalone_plugin_exemptions_skip_outside_asks_for_both_protocol_versions() {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture_in(
         FakeCingulate::up(),
@@ -4723,7 +4723,7 @@ async fn standalone_plugin_exemptions_skip_outside_asks_for_both_protocol_versio
         .bash_background()
         .replay_session(&storage, "standalone")
         .unwrap();
-    assert!(!crate::bash_permissions::is_system_temp_path(&paths.stdout));
+    assert!(!crate::system_temp::is_system_temp_path(&paths.stdout));
     for role in [
         tool_provider::RouteRole::Legacy,
         tool_provider::RouteRole::ToolProviderV1,
@@ -7298,7 +7298,7 @@ async fn consent_answered_call_returns_while_another_scope_open_is_held() {
 #[tokio::test]
 async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
     use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
 
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());

@@ -4,9 +4,10 @@ use aft::commands::semantic_search::extensions::{
     ExactMode, QueryFacts, RawQuery, Readiness, RetainedReadinessSnapshots, Span,
 };
 use aft::commands::semantic_search::plan_table::{SearchLaneKind, SearchShape};
-use aft::search_b2::lane_plan::legal_lanes;
-use aft::search_b2::readiness::selected_lane_disclosures;
-use aft::search_b2::{install_defaults, router};
+use aft::commands::semantic_search::planner::install_defaults;
+use aft::commands::semantic_search::planner::lane_plan::legal_lanes;
+use aft::commands::semantic_search::planner::readiness::selected_lane_disclosures;
+use aft::search_b2::router;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]

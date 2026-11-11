@@ -183,7 +183,7 @@ fn protected_dormant_invalid_regressed_and_operator_arms_never_delegate_ambient(
     );
     let token = "11111111111111111111111111111111";
     let _ticket = Env::set(
-        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+        crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
         Some(OsStr::new(token)),
     );
     let view = dir.path().join("start.json");
@@ -485,7 +485,7 @@ impl RunWithFixture {
                 Some(view.as_os_str()),
             ),
             Env::set(
-                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+                crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
                 Some(OsStr::new(token)),
             ),
         ];

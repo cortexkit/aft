@@ -1,7 +1,6 @@
 //! Bounded, observational shell-change reporting. No tree walk or file snapshots.
 use crate::config::BashChangedFiles;
-use crate::list_envelope::{ListEnvelope, Reason};
-use serde::Serialize;
+use crate::list_envelope::Reason;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -154,24 +153,7 @@ impl Journal {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ChangedFile {
-    pub path: String,
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub diff: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub diff_lines_list_envelope: Option<ListEnvelope>,
-}
-#[derive(Debug, Clone, Serialize)]
-pub struct Report {
-    pub text: String,
-    pub files: Vec<ChangedFile>,
-    pub incomplete: Vec<String>,
-    pub changed_files_list_envelope: ListEnvelope,
-}
+pub use crate::protocol::{ChangedFile, Report};
 
 fn render_file(file: &ChangedFile) -> String {
     let path = if file.path.chars().any(char::is_control) {
@@ -264,7 +246,7 @@ impl ReadPolicy {
     fn allows(&self, path: &Path) -> bool {
         // Compare normalized copies: Windows canonicalization can add a path
         // prefix that is absent from watcher paths. Keep launch paths unchanged.
-        let path = crate::inspect::job::normalize_path(path);
+        let path = crate::path_identity::normalize_path(path);
         self.access
             .decide(crate::access_policy::AccessOperation::Read, &path, false)
             == crate::access_policy::AccessDecision::Allow
@@ -272,13 +254,13 @@ impl ReadPolicy {
                 !data
                     .deny
                     .iter()
-                    .any(|denied| path.starts_with(crate::inspect::job::normalize_path(denied)))
+                    .any(|denied| path.starts_with(crate::path_identity::normalize_path(denied)))
                     || data.read_allow.iter().any(|allowed| {
-                        path.starts_with(crate::inspect::job::normalize_path(allowed))
+                        path.starts_with(crate::path_identity::normalize_path(allowed))
                     })
             })
             && !self.deny_prefixes.iter().any(|prefix| {
-                let prefix = crate::inspect::job::normalize_path(prefix);
+                let prefix = crate::path_identity::normalize_path(prefix);
                 path.as_os_str()
                     .to_string_lossy()
                     .starts_with(prefix.as_os_str().to_string_lossy().as_ref())
@@ -640,11 +622,8 @@ impl Capture {
             changed_files_list_envelope: list_envelope,
         }
     }
-    fn verified_file(
-        &self,
-        path: &Path,
-    ) -> Result<Option<crate::commands::file_read_exact::OpenedFile>, ()> {
-        use crate::commands::file_read_exact::{open_no_follow, opened_location, ReadExactRefusal};
+    fn verified_file(&self, path: &Path) -> Result<Option<crate::file_read_exact::OpenedFile>, ()> {
+        use crate::file_read_exact::{open_no_follow, opened_location, ReadExactRefusal};
         let policy = self.read_policy.as_ref().ok_or(())?;
         let root = self.root.canonicalize().map_err(|_| ())?;
         let target = root.join(path);

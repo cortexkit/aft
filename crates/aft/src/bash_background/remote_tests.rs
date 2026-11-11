@@ -2103,6 +2103,8 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
         .snapshot()
         .uncaptured_terminal
         .expect("replayed terminal drain reply");
+    let cached =
+        crate::commands::bash_orchestrate::foreground_result_response("", (*cached).clone());
     assert_eq!(cached.data, expected.data);
     assert_eq!(cached.success, expected.success);
 }
@@ -10429,7 +10431,7 @@ async fn assert_saved_pause_reply(
         .unwrap_or_else(|| panic!("{reply:?}"));
     assert!(local["remote"].is_null(), "{reply:?}");
     wait_for("the saved local command must be stopped", || {
-        (!crate::bash_background::process::is_process_alive(local_pid)).then_some(())
+        (!crate::process_identity::is_process_alive(local_pid)).then_some(())
     })
     .await;
 }

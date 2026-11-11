@@ -510,12 +510,12 @@ mod tests {
     use crate::bash_background::persistence::{
         create_task_layout, write_task_at, PersistedTask, TaskPaths,
     };
-    use crate::bash_background::BgTaskStatus;
     use crate::config::Config;
     use crate::context::AppContext;
     use crate::harness::Harness;
     use crate::parser::TreeSitterProvider;
     use crate::persisted_format::{PersistedStore, UnsupportedPersistedFormat};
+    use crate::protocol::BgTaskStatus;
     use crate::protocol::{RawRequest, Response};
     use std::fs;
     use std::path::Path;

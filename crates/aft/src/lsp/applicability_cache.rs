@@ -166,7 +166,7 @@ thread_local! {
 pub(super) fn observe_path(path: &Path) {
     DEPENDENCIES.with_borrow_mut(|capture| {
         if let Some(capture) = capture {
-            let path = crate::inspect::job::normalize_path(path);
+            let path = crate::path_identity::normalize_path(path);
             if capture.inputs.insert(path.clone()) && path.starts_with(&capture.root) {
                 // Watcher paths are canonicalized. File identity also recognizes
                 // a changed target reached through a marker symlink or hard link,
@@ -187,7 +187,7 @@ pub(super) fn observe_path(path: &Path) {
                         if let Ok(target) = std::fs::canonicalize(&path) {
                             capture
                                 .inputs
-                                .insert(crate::inspect::job::normalize_path(&target));
+                                .insert(crate::path_identity::normalize_path(&target));
                         }
                     }
                 }
@@ -249,7 +249,7 @@ impl Capture {
             id,
             // Probed paths are recorded in normalized form (no Windows `\\?\`
             // prefix), so the in-root test must compare against the same form.
-            root: crate::inspect::job::normalize_path(root),
+            root: crate::path_identity::normalize_path(root),
             paths: HashMap::new(),
             inputs: HashSet::new(),
             input_identities: HashSet::new(),
@@ -470,7 +470,7 @@ impl ApplicabilityCache {
         // Windows verbatim (`\\?\C:\...`) form that `fs::canonicalize` returns.
         let normalized_paths: Vec<_> = paths
             .iter()
-            .map(|path| crate::inspect::job::normalize_path(path))
+            .map(|path| crate::path_identity::normalize_path(path))
             .collect();
         let file_states: Vec<_> = if content_only {
             paths.iter().map(|path| PathState::read(path)).collect()
@@ -519,7 +519,7 @@ impl ApplicabilityCache {
                         bases.push(TopologyBasis {
                             flight: Arc::clone(flight),
                             generation: state.generation,
-                            root: crate::inspect::job::normalize_path(cached_root),
+                            root: crate::path_identity::normalize_path(cached_root),
                             walk: walk.clone(),
                             config: Arc::clone(config),
                             input_dirs: Arc::clone(&state.input_dirs),
@@ -850,7 +850,7 @@ impl ApplicabilityCache {
                 root.display(), cause, root_walk_number, elapsed.as_micros(), inputs.len(), result.is_ok()
             );
             let input_dirs = Arc::new(input_directories(
-                &crate::inspect::job::normalize_path(root),
+                &crate::path_identity::normalize_path(root),
                 &inputs,
             ));
             let mut state = flight.state.lock();

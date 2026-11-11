@@ -682,7 +682,7 @@ impl TrackedConnection {
         let file_identity_key = connection
             .path()
             .filter(|path| !path.is_empty() && *path != ":memory:")
-            .map(|path| crate::db::file_identity::note_open(Path::new(path), store));
+            .map(|path| crate::db::file_identity::note_open(Path::new(path), store.label()));
         let page_size = connection
             .pragma_query_value(None, "page_size", |row| row.get::<_, u64>(0))
             .unwrap_or(4096);
@@ -896,7 +896,7 @@ impl Drop for TrackedConnection {
         // closed while rusqlite still owns the descriptor and page cache.
         drop(self.connection.take());
         if let Some(key) = self.file_identity_key.take() {
-            crate::db::file_identity::note_close(&key, self.store);
+            crate::db::file_identity::note_close(&key, self.store.label());
         }
         register_close(self.store);
     }

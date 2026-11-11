@@ -32,61 +32,7 @@ pub const LIVE_DESCENDANT_NAME_CAP: usize = 64;
 /// Appended to a member's shown command when it had arguments AFT left out.
 pub const OMITTED_ARGUMENTS_MARKER: &str = "…";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LiveDescendant {
-    pub pid: u32,
-    pub comm: String,
-    /// The first word of the process's first argument (normally the program
-    /// path it was started as), or its command name when that argument cannot
-    /// be read. Never any later argument.
-    pub argv0: String,
-    /// Name of the user that owns the process (its real user ID), or the
-    /// numeric ID when the account has no name. Absent when it could not be
-    /// read, and on records written before AFT recorded it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    /// The process's executable name, followed by `…` when it was started
-    /// with arguments. The arguments themselves are never kept: they can hold
-    /// a credential (`--token "$DEPLOY_TOKEN"`, a value read from a file) that
-    /// no pattern can recognise, and this field reaches the task record, the
-    /// status reply and the completion notice. Absent on older records.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-}
-
-/// Why a task has no list of surviving process-group members. A list, even an
-/// empty one, always means AFT checked; this says why it could not.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveDescendantsUnavailable {
-    /// This platform has no process-group listing AFT can use (Windows, and
-    /// Unix systems other than Linux and macOS).
-    UnsupportedPlatform,
-    /// The task has no recorded process group.
-    NoProcessGroup,
-    /// Listing the group's members failed, for example because `/proc`
-    /// could not be read.
-    ListingFailed,
-    /// The listing could not account for every process that may belong to the
-    /// group: some were hidden or unreadable, for example because `/proc` is
-    /// mounted with `hidepid`. Any members it did identify are still listed;
-    /// others may also be running.
-    ListingIncomplete,
-    /// AFT did not check this task's group: a remote job, a pseudoterminal
-    /// task that ended on its own, or a record written by an older AFT.
-    NotChecked,
-}
-
-impl LiveDescendantsUnavailable {
-    /// The reason to record when a task has no process group to list.
-    pub fn without_group() -> Self {
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
-            Self::NoProcessGroup
-        } else {
-            Self::UnsupportedPlatform
-        }
-    }
-}
+pub use crate::protocol::{LiveDescendant, LiveDescendantsUnavailable};
 
 /// One check of a task's process group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,7 +501,7 @@ impl ProcessIdentity {
     pub fn of(pid: u32) -> Option<Self> {
         Some(Self {
             pid,
-            started_at_ms: crate::root_cache::process_start_time_ms(pid)?,
+            started_at_ms: crate::process_identity::process_start_time_ms(pid)?,
         })
     }
 
@@ -1022,49 +968,7 @@ pub fn terminate_pid(pid: u32) {
         .status();
 }
 
-#[cfg(unix)]
-pub fn is_process_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    (unsafe { libc::kill(pid, 0) == 0 })
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(windows)]
-pub fn is_process_alive(pid: u32) -> bool {
-    use std::ffi::c_void;
-
-    type Handle = *mut c_void;
-
-    extern "system" {
-        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
-        fn GetExitCodeProcess(hProcess: Handle, lpExitCode: *mut u32) -> i32;
-        fn CloseHandle(hObject: Handle) -> i32;
-    }
-
-    const FALSE: i32 = 0;
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 0x103;
-
-    if pid == 0 {
-        return false;
-    }
-
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let mut exit_code = 0;
-        let ok = GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == STILL_ACTIVE;
-        let _ = CloseHandle(handle);
-        ok
-    }
-}
+pub use crate::process_identity::is_process_alive;
 
 #[cfg(test)]
 mod tests {
@@ -1079,6 +983,7 @@ mod tests {
             super::TERMINATE_GRACE.as_secs()
         )));
     }
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(target_os = "linux")]
@@ -1118,11 +1023,6 @@ mod tests {
         );
         assert!(selected.is_none());
         assert_eq!(probes.get(), 1);
-    }
-
-    #[test]
-    fn is_process_alive_returns_true_for_self() {
-        assert!(is_process_alive(std::process::id()));
     }
 
     #[cfg(unix)]
@@ -1387,26 +1287,6 @@ mod tests {
         let _ = child.wait();
     }
 
-    #[test]
-    fn is_process_alive_returns_false_for_dead_pid() {
-        #[cfg(unix)]
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "true"])
-            .spawn()
-            .expect("spawn true");
-
-        #[cfg(windows)]
-        let mut child = std::process::Command::new("cmd.exe")
-            .args(["/D", "/C", "exit 0"])
-            .spawn()
-            .expect("spawn cmd");
-
-        let pid = child.id();
-        child.wait().expect("wait for child");
-
-        assert!(!is_process_alive(pid));
-    }
-
     /// Regression: when the process-group LEADER exits during the SIGTERM grace
     /// window, `terminate_pgid` must still SIGKILL the rest of the group. A
     /// TERM-ignoring descendant (the wrapper-shell / CLI-spawns-child orphan
@@ -1480,7 +1360,7 @@ pub fn is_recorded_process_alive(pid: u32, task_started_at_ms: u64) -> bool {
     if !is_process_alive(pid) {
         return false;
     }
-    crate::root_cache::process_start_time_ms(pid).is_none_or(|started_at_ms| {
+    crate::process_identity::process_start_time_ms(pid).is_none_or(|started_at_ms| {
         started_at_ms <= task_started_at_ms.saturating_add(PROCESS_START_GRACE_MS)
     })
 }

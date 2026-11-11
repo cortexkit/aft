@@ -559,7 +559,7 @@ fn canonical_or_normalized(path: &Path) -> PathBuf {
     // \?\-prefixed paths on Windows while the lexical fallback is clean, so
     // membership decisions flipped with filesystem luck. Route the canonical
     // branch through the same verbatim-stripping normalizer.
-    crate::inspect::job::canonicalize_normalized(path)
+    crate::path_identity::canonicalize_normalized(path)
 }
 
 #[cfg(test)]

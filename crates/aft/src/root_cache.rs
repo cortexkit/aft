@@ -56,12 +56,9 @@ pub use location::{
     CACHE_DIR_BUSY_MESSAGE, CACHE_DIR_UNAVAILABLE,
 };
 pub(crate) use location::{
-    acquire_speech_serving_lease, release_quiescent_speech_serving_lease, SpeechServingLease,
-};
-pub(crate) use location::{
-    cache_status_code, check_cache_access, durable_route, ensure_config_storage_lease,
-    identity_storage_root, prepare_process_cache_root, prepare_third_party_cache_dir,
-    unavailable_code, unavailable_warning,
+    cache_status_code, check_cache_access, ensure_config_storage_lease, identity_storage_root,
+    prepare_process_cache_root, prepare_third_party_cache_dir, unavailable_code,
+    unavailable_warning,
 };
 use location::{canonical_process_lease_dir, existing_ancestor};
 

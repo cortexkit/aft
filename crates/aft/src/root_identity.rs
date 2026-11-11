@@ -53,7 +53,7 @@ struct Record {
 }
 
 pub(crate) fn canonical_root(root: &Path) -> PathBuf {
-    crate::root_cache::canonical_root(root)
+    crate::cache_location::canonical_root(root)
 }
 
 fn record_path(root: &Path, storage: &Path) -> PathBuf {

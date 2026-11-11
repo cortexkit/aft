@@ -33,20 +33,7 @@ pub use types::{
 
 pub(crate) const FACTS_FORMAT_VERSION: u32 = 6;
 
-#[derive(Debug, Clone, Default)]
-pub struct AnalyzeOptions {
-    pub entry_points: Vec<PathBuf>,
-    pub public_api_files: Vec<PathBuf>,
-    pub executable_root_exports: BTreeMap<PathBuf, BTreeSet<String>>,
-    /// Files already proven stale by the inspect freshness layer. These paths
-    /// bypass the path metadata fast path so same-size/same-mtime edits are
-    /// still re-read and content-hashed before facts are reused.
-    pub force_reparse_files: Vec<PathBuf>,
-    /// When true, imports/re-exports only make targets live after execution is
-    /// reachable from entry/public files. Used by dead_code; unused_exports keeps
-    /// the default import-usage semantics.
-    pub entry_reachability: bool,
-}
+pub use crate::data_layer::dead_code_snapshot::AnalyzeOptions;
 
 #[derive(Debug, Clone, Default)]
 pub struct OxcFactsCache {
@@ -269,7 +256,7 @@ pub fn analyze_files_with_cache(
     let mut cache_stats = OxcFactsCacheStats::default();
     let mut errors = Vec::new();
     let mut facts = Vec::with_capacity(files.len());
-    let progress = crate::run_tool_call::progress::FileProgress::current();
+    let progress = crate::tool_progress::FileProgress::current();
 
     for (idx, path) in files.iter().enumerate() {
         if crate::inspect::scanners::source_text::graph_source_excluded(&project_root, path) {

@@ -408,7 +408,7 @@ fn review_stamped_worker_reaches_governed_read_instead_of_native_gh() {
     )
     .unwrap();
     let _ticket = Env::set(
-        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+        crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
         Some(OsStr::new("worker-ticket")),
     );
     let status = run_with(
@@ -515,8 +515,8 @@ fn run_probe_child(mode: &str, clear_all: bool) -> (std::process::Output, tempfi
         command.env_clear();
     } else {
         command
-            .env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
-            .env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+            .env_remove(crate::gh_shim_paths::GH_SHIM_TICKET_ENV)
+            .env_remove(crate::gh_shim_paths::GH_SHIM_WORKER_ENV);
     }
     #[cfg(target_os = "linux")]
     {
@@ -649,8 +649,8 @@ fn confine_with_seatbelt(source: &str) {
 #[test]
 #[ignore]
 fn stripped_worker_probe_child() {
-    assert!(std::env::var_os(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).is_none());
-    assert!(std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_none());
+    assert!(std::env::var_os(crate::gh_shim_paths::GH_SHIM_TICKET_ENV).is_none());
+    assert!(std::env::var_os(crate::gh_shim_paths::GH_SHIM_WORKER_ENV).is_none());
     let cwd = std::env::current_dir().unwrap();
     let mode = fs::read_to_string(cwd.join("probe-mode")).unwrap();
     let home = PathBuf::from(String::from_utf8(fs::read(cwd.join("probe-home")).unwrap()).unwrap());
@@ -888,7 +888,7 @@ fn audit_worker_marker_is_injected_from_daemon_jail_state_not_inherited() {
     .unwrap();
     assert_eq!(
         environment
-            .get(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV)
+            .get(crate::gh_shim_paths::GH_SHIM_WORKER_ENV)
             .map(String::as_str),
         Some("1")
     );
@@ -896,7 +896,7 @@ fn audit_worker_marker_is_injected_from_daemon_jail_state_not_inherited() {
         crate::agent_child_env::inject(&config, root.path(), &mut environment, None)
     })
     .unwrap();
-    assert!(!environment.contains_key(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV));
+    assert!(!environment.contains_key(crate::gh_shim_paths::GH_SHIM_WORKER_ENV));
 }
 
 #[test]
@@ -977,7 +977,7 @@ fn audit_ticket_snapshot_uses_primary_config_not_worktree_override() {
 fn audit_head_child_adapters_do_not_inherit_worker_markers() {
     let _lock = crate::test_env::process_env_lock();
     let _marker = Env::set(
-        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
         Some(OsStr::new("1")),
     );
     let mut child = Command::new("/bin/sh");
@@ -996,7 +996,7 @@ fn audit_head_child_adapters_do_not_inherit_worker_markers() {
     .unwrap();
     assert!(pty
         .iter_full_env_as_str()
-        .all(|(key, _)| key != crate::gh_shim_ticket::GH_SHIM_WORKER_ENV));
+        .all(|(key, _)| key != crate::gh_shim_paths::GH_SHIM_WORKER_ENV));
 }
 
 /// A worker shell carries a read broker, never a write ticket. Every
@@ -1033,7 +1033,7 @@ fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
     .unwrap();
     // The worker shell: read-broker env present, no ticket.
     let _worker = Env::set(
-        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
         Some(OsStr::new("1")),
     );
     let socket = fixture.home.path().join("broker.sock");
@@ -1047,7 +1047,7 @@ fn audit_worker_write_is_refused_before_any_broker_or_relay_traffic() {
         crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
         Some(capability.as_os_str()),
     );
-    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let _no_ticket = Env::set(crate::gh_shim_paths::GH_SHIM_TICKET_ENV, None);
     let (_sink, lines) = capture_refusals_for_test();
     let context = relay_client::RelayContext::from_process();
     assert!(
@@ -1157,7 +1157,7 @@ fn audit_worker_write_opens_no_broker_connection() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(20);
     let _worker = Env::set(
-        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
         Some(OsStr::new("1")),
     );
     let socket = fixture.home.path().join("broker.sock");
@@ -1171,7 +1171,7 @@ fn audit_worker_write_opens_no_broker_connection() {
         crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
         Some(capability.as_os_str()),
     );
-    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let _no_ticket = Env::set(crate::gh_shim_paths::GH_SHIM_TICKET_ENV, None);
     let (_sink, lines) = capture_refusals_for_test();
     let listener = UnixListener::bind(&socket).unwrap();
     let status = run_with(
@@ -1210,7 +1210,7 @@ fn audit_worker_read_still_reaches_the_broker() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(20);
     let _worker = Env::set(
-        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
         Some(OsStr::new("1")),
     );
     let socket = fixture.home.path().join("broker.sock");
@@ -1224,7 +1224,7 @@ fn audit_worker_read_still_reaches_the_broker() {
         crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
         Some(capability.as_os_str()),
     );
-    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let _no_ticket = Env::set(crate::gh_shim_paths::GH_SHIM_TICKET_ENV, None);
     let (_sink, refusals) = capture_refusals_for_test();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let served = seen.clone();
@@ -1375,11 +1375,11 @@ fn audit_head_write_still_routes_through_the_relay() {
         json!({"subc":{"connection_file":connection}}).to_string(),
     )
     .unwrap();
-    let _no_worker = Env::set(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV, None);
+    let _no_worker = Env::set(crate::gh_shim_paths::GH_SHIM_WORKER_ENV, None);
     let _no_socket = Env::set(crate::gh_shim_worker_broker::SOCKET_ENV, None);
     let _no_capability = Env::set(crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV, None);
     let _ticket = Env::set(
-        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+        crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
         Some(OsStr::new("head-ticket")),
     );
     let argv = args(&[
@@ -1452,10 +1452,10 @@ fn audit_worker_credential_command_keeps_the_credential_refusal() {
     // credential arm needs an active manifest, nothing else from the fixture.
     let _fixture = Fixture::new(20);
     let _worker = Env::set(
-        crate::gh_shim_ticket::GH_SHIM_WORKER_ENV,
+        crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
         Some(OsStr::new("1")),
     );
-    let _no_ticket = Env::set(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, None);
+    let _no_ticket = Env::set(crate::gh_shim_paths::GH_SHIM_TICKET_ENV, None);
     let _no_bypass = Env::set("GH_SHIM_BYPASS", None);
     let (_sink, lines) = capture_refusals_for_test();
     let mut lookups = 0;

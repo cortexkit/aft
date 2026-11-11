@@ -932,8 +932,7 @@ mod startup_storage_tests {
         let ctx = super::super::test_support::test_ctx();
         let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()))
             .with_startup_storage_dir(root.path());
-        let default =
-            crate::bash_background::storage_dir_without_overrides_for_test().join("aft.db");
+        let default = crate::storage_path::storage_dir_without_overrides_for_test().join("aft.db");
         // Other tests in the same process may already have created a database
         // at the default root (CI shares one hermetic home), so compare its
         // state before and after instead of requiring it to be absent.

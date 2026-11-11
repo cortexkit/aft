@@ -201,6 +201,7 @@ mod rayon_thread_tests {
 }
 
 fn main() {
+    aft::commands::policy_environment::register();
     // The subc daemon hands a supervised module its launch nonce through an
     // inherited pipe (and, for now, an environment copy). Take it before
     // anything else can run: this is the only moment the process has one
@@ -481,6 +482,8 @@ fn main() {
         // A single AppContext serves the attached routes (N=1); subc tool calls
         // are routed through the per-actor executor once the first route binds.
         startup_phase("context_start");
+        aft::commands::configure::register_runtime_hooks();
+        aft::commands::register_shell_handlers();
         let app = App::default_shared();
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         startup_phase("context_done");
@@ -597,6 +600,8 @@ fn main() {
 
     aft::slog_info!("started, pid {}", std::process::id());
 
+    aft::commands::configure::register_runtime_hooks();
+    aft::commands::register_shell_handlers();
     let app = App::default_shared();
     let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
     // Same catalog as in subc mode, written before the first request.
@@ -1080,7 +1085,7 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     aft::logging::perf_tick(None);
     aft::runtime_drain::spawn_standalone_log_maintenance();
     aft::db::write_ledger::maybe_spawn_fold(runtime.db());
-    aft::db::compression_events::maybe_spawn_retention(
+    aft::bash_background::persistence::retention::maybe_spawn_retention(
         runtime.db(),
         Some(signal_bg_registries(registry)),
     );
@@ -1506,7 +1511,7 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
     aft::commands::tool_call::register_dispatch(dispatch);
     // A parent folder session answers index-backed commands from its child
     // repositories' own indexes (grep and glob fan out inside their handlers).
-    if let Some(response) = aft::data_layer::parent_session::route(&req, ctx) {
+    if let Some(response) = aft::commands::parent_query::route(&req, ctx) {
         return response;
     }
     match req.command.as_str() {
@@ -4704,5 +4709,17 @@ mod config_pin_tests {
         assert_eq!(*seen.lock().unwrap(), vec![false, false]);
         // The next request sees the publication.
         assert!(ctx.config().restrict_to_project_root);
+    }
+}
+
+#[cfg(test)]
+mod policy_environment_startup_tests {
+    #[test]
+    fn both_entry_modes_register_policy_environment_before_config_or_context() {
+        let source = include_str!("main.rs");
+        let main = source.split_once("fn main() {").unwrap().1;
+        let first_statement = main.trim_start().lines().next().unwrap();
+        assert_eq!(first_statement, "aft::commands::policy_environment::register();",
+            "both NDJSON and subc enter through main: register before parsing the mode or resolving config");
     }
 }

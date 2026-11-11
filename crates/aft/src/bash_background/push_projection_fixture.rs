@@ -61,7 +61,7 @@ fn build() -> BusyRoot {
             .unwrap();
     }
     ctx.inspect_manager()
-        .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
+        .set_tier2_in_flight_for_test(crate::inspect_category::InspectCategory::DeadCode, true);
     *ctx.semantic_index_status().write().unwrap() = crate::context::SemanticIndexStatus::Building {
         stage: "embedding".into(),
         files: Some(6200),

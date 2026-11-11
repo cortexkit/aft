@@ -67,6 +67,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
 
     // 1. crates/aft/src/commands/**
     files_to_scan.extend(collect_rs_files(&src_dir.join("commands")));
+    files_to_scan.extend(collect_rs_files(&src_dir.join("search_state")));
     // 2. dispatch module (run_tool_call.rs)
     files_to_scan.push(src_dir.join("run_tool_call.rs"));
     // 3. crates/aft/src/subc_format.rs
@@ -78,7 +79,12 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     files_to_scan.push(src_dir.join("url_fetch.rs"));
     files_to_scan.push(src_dir.join("response_finalize.rs"));
     files_to_scan.push(src_dir.join("tool_output.rs"));
+    files_to_scan.push(src_dir.join("output_store.rs"));
+    files_to_scan.push(src_dir.join("file_read_exact.rs"));
     files_to_scan.push(src_dir.join("runtime_drain.rs"));
+    files_to_scan.push(src_dir.join("parent_search/mod.rs"));
+    files_to_scan.push(src_dir.join("parser/todo_markers.rs"));
+    files_to_scan.push(src_dir.join("parser/dead_code_facts.rs"));
     files_to_scan.push(src_dir.join("edit.rs"));
     files_to_scan.push(src_dir.join("bash_permissions/scan.rs"));
     // 4. crates/aft/src/compress/**

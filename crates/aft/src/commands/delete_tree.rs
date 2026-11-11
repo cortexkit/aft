@@ -255,7 +255,7 @@ impl Walk<'_> {
             self.count_entry()?;
             // `DirEntry::metadata` does not follow a symlink either.
             let identity = recorded_identity(&entry.metadata()?);
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
             if file_type.is_dir() {
                 if self.boundary.should_descend(&path)? {
                     self.manifest.entries.push(TreeEntry {
@@ -954,7 +954,7 @@ pub(crate) mod win {
     /// names the link entry, not what it points at.
     pub(crate) fn location(entry: &File) -> io::Result<PathBuf> {
         crate::commands::file_read_exact::opened_location(entry)
-            .map(|path| crate::inspect::job::normalize_path(&path))
+            .map(|path| crate::path_identity::normalize_path(&path))
     }
 
     /// Delete the open entry through its handle: POSIX semantics where the
@@ -1044,7 +1044,7 @@ mod platform {
         let judged = authorize(&located).map_err(|response| refused(root, response))?;
         #[cfg(test)]
         crate::commands::delete_file::unlink_seam(UnlinkStage::AfterAuthorize);
-        if crate::inspect::job::normalize_path(&judged) != located
+        if crate::path_identity::normalize_path(&judged) != located
             || location(&root_handle).ok().as_deref() != Some(located.as_path())
         {
             return Err(root_changed(req_id, root));
@@ -1191,7 +1191,7 @@ mod tests {
         let sent = Arc::new(AtomicU64::new(0));
         let origin = Instant::now();
         let token = crate::executor::JobCancellation::new();
-        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+        token.set_progress(crate::tool_progress::Progress::with_clock(
             {
                 let clock = clock.clone();
                 move || origin + Duration::from_secs(clock.fetch_add(30, Ordering::SeqCst))

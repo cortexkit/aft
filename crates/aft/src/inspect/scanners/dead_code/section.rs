@@ -81,7 +81,7 @@ pub(crate) enum Use {
     /// work out every file; keep the result.
     Kept,
     /// Work out every file and keep nothing: what the dead-code gate
-    /// (`data_layer::dead_code_gate`) checks a patched rollup against.
+    /// (`inspect::dead_code_gate`) checks a patched rollup against.
     Nothing,
 }
 

@@ -57,7 +57,7 @@ pub(crate) fn inject(
         .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
     {
         env.insert(WORKER_POLICY_ENV.into(), "1".into());
-        env.insert(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV.into(), "1".into());
+        env.insert(crate::gh_shim_paths::GH_SHIM_WORKER_ENV.into(), "1".into());
         return None;
     }
     let speech = crate::gh_shim_ticket::speech_for_ticket(ticket)?;
@@ -114,7 +114,7 @@ pub(crate) fn protected(args: &[std::ffi::OsString]) -> bool {
     let view = crate::environment::non_empty_var(START_VIEW_ENV)
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<View>(&bytes).ok());
-    let ticket = crate::environment::non_empty_var(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+    let ticket = crate::environment::non_empty_var(crate::gh_shim_paths::GH_SHIM_TICKET_ENV)
         .and_then(|ticket| crate::gh_shim_ticket::speech_digest(&ticket));
     if let (Some(view), Some(ticket)) = (view, ticket) {
         if view.ticket_digest.as_slice() == ticket.as_slice() {

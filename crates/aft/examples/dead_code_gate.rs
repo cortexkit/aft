@@ -1,4 +1,4 @@
-//! Runs the dead-code gate (`aft::data_layer::dead_code_gate`) on one
+//! Runs the dead-code gate (`aft::inspect::dead_code_gate`) on one
 //! directory: dead code as `aft_inspect` computes it, checked against an
 //! independent computation field by field, before and after a few edits.
 //!
@@ -16,7 +16,7 @@
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
-use aft::data_layer::dead_code_gate::{run, Mode};
+use aft::inspect::dead_code_gate::{run, Mode};
 
 fn main() {
     let mut args = std::env::args().skip(1);

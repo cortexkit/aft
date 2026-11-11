@@ -17,16 +17,10 @@ use crate::protocol::RawRequest;
 
 thread_local! {
     static TEST_BACKEND: RefCell<Option<SelectedBackend>> = const { RefCell::new(None) };
-    static IO_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Counts a file or network access made on the calling thread.
-pub(super) fn count_io() {
-    IO_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
 }
 
 fn io_on_this_thread() -> usize {
-    IO_ON_THIS_THREAD.with(std::cell::Cell::get)
+    crate::search_state::rerank::io_on_this_thread()
 }
 
 /// The backend a test installed for its own thread, if any.
@@ -738,7 +732,7 @@ fn print_gate_decisions_when_asked() {
         } else {
             "skip"
         };
-        let (shape, _) = crate::search_b2::install_defaults()
+        let (shape, _) = crate::commands::semantic_search::planner::install_defaults()
             .classify(&super::super::extensions::RawQuery::new(&query));
         let kind = crate::query_shape::classify(&query).kind;
         println!(

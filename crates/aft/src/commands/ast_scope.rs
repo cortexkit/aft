@@ -284,7 +284,7 @@ fn walk_root(
     builder
         .build()
         .filter_map(|entry| entry.ok())
-        .inspect(|_| crate::run_tool_call::progress::report())
+        .inspect(|_| crate::tool_progress::report())
         .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
         .map(|entry| entry.into_path())
         .filter(|path| lang.matches_path(path))

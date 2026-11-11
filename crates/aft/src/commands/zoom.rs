@@ -484,7 +484,7 @@ fn handle_zoom_targets(
                                 include_callgraph,
                                 &mut memo,
                             );
-                            crate::run_tool_call::progress::report();
+                            crate::tool_progress::report();
                             // An access ask must reach the host unchanged so it
                             // can ask and retry; inside one batch entry nobody
                             // would see it.
@@ -1391,7 +1391,7 @@ fn zoom_batch_symbols(
             include_callgraph,
             &mut enrichments,
         );
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
         let json = match serde_json::to_value(&resp) {
             Ok(v) => v,
             Err(err) => {
@@ -1853,7 +1853,7 @@ fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     }
     // Timing hooks for the read-bound test. Unconfigured test contexts have no
     // cache root, so the hooks are skipped there instead of panicking.
-    let observation = observe_callgraph_query(ctx);
+    let observation = observe_callgraph_query(ctx, ctx);
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",
@@ -3067,7 +3067,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // Without a project root, a manifest names each file at its canonical
         // location, so build the fixture there.
-        let dir = crate::inspect::job::canonicalize_normalized(root.path());
+        let dir = crate::path_identity::canonicalize_normalized(root.path());
         let barrel = dir.join("barrel.ts");
         let secret = dir.join("secret.ts");
         let allowed = dir.join("allowed.ts");
@@ -3312,7 +3312,7 @@ mod tests {
             "export function hidden() { return 'PRIVATE_BODY'; }\n",
         )
         .unwrap();
-        let canonical = crate::inspect::job::canonicalize_normalized(&real);
+        let canonical = crate::path_identity::canonicalize_normalized(&real);
 
         // Neither a missing project root nor a root that does not contain the
         // sources may lend the request's alias spelling to the manifest.

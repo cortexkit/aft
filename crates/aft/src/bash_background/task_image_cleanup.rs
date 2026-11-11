@@ -71,7 +71,7 @@ fn quiescent(metadata: &PersistedTask) -> bool {
     // survivor, but an unreadable start time or group cannot prove its exit.
     !metadata.group_member_identities.iter().any(|identity| {
         super::super::process::is_process_alive(identity.pid)
-            && crate::root_cache::process_start_time_ms(identity.pid)
+            && crate::process_identity::process_start_time_ms(identity.pid)
                 .is_none_or(|start| start == identity.started_at_ms)
             && !identity.is_running_in_group(pgid)
     })

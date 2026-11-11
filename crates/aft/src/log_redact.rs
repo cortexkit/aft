@@ -1016,7 +1016,7 @@ pub(crate) struct SecretValues(Vec<String>);
 
 /// Whether an environment variable name marks its value as a completion secret.
 pub fn is_secret_environment_key(key: &str) -> bool {
-    if key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV) {
+    if key.eq_ignore_ascii_case(crate::gh_shim_paths::GH_SHIM_TICKET_ENV) {
         return true;
     }
     // The SSH agent's socket path is an address, not credential material.

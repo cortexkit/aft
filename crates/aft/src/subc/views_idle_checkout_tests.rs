@@ -63,7 +63,7 @@ fn idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_first_rep
     // this test drains, and which blocks the release as a build in flight.)
     ctx.data_checkout().expect("the data layer binds the root");
     let started = Instant::now();
-    while crate::data_layer::tools::search::DataText::ready(&ctx).is_none() {
+    while crate::commands::data_search::DataText::ready(&ctx).is_none() {
         assert!(
             started.elapsed() < Duration::from_secs(60),
             "the checkout never published its text plane"

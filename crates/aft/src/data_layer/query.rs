@@ -1090,7 +1090,7 @@ impl<S: SliceSource> SliceReader<S> {
                             .and_then(|handle| slice.node(handle))
                             .and_then(|node| node.is_test())
                             .unwrap_or(false);
-                        !caller_is_test && !crate::inspect::job::is_test_file(file)
+                        !caller_is_test && !crate::file_kind::is_test_file(file)
                     });
                 if counted {
                     count += 1;
@@ -1111,3 +1111,11 @@ aft_store::heap_bytes_of_fields!(MemorySlices {
     symbol_names,
     languages,
 });
+
+/// How long a call-graph command waits for recorded edits to be resolved
+/// before it answers that the call graph is still building. The call graph
+/// is refreshed lazily, so the first read after a stretch of edits pays for
+/// all of them in one update (seconds at worst on AFT's own checkout); the
+/// command waits for it rather than answering from a graph that misses
+/// them, and gives up only if the update takes far longer than that.
+pub(crate) const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(30);

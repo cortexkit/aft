@@ -6,7 +6,7 @@
 
 use super::super::test_support::*;
 use super::*;
-use crate::bash_background::BgTaskStatus;
+use crate::protocol::BgTaskStatus;
 
 const SESSION: &str = "runner-head-session";
 

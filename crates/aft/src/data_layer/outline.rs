@@ -28,7 +28,7 @@ use aft_store::ids::ContentKey;
 use super::checkout::{CheckoutView, DataError};
 use super::content::EXTRACTOR_VERSION;
 use super::runtime::DataCheckout;
-use crate::context::AppContext;
+use crate::data_layer::host::IndexHost;
 use crate::parser::{SharedSymbolCache, SymbolCache};
 
 /// One file's outline as its stored content record holds it.
@@ -333,7 +333,10 @@ const WAIT_STEP: Duration = Duration::from_millis(250);
 /// It waits for the checkout's first call graph when none is published yet,
 /// since records are stored with it, and stops when the cache is reset, the
 /// checkout is replaced or the root is abandoned.
-pub(crate) fn root_bound(ctx: &AppContext) {
+pub(crate) fn root_bound(
+    ctx: &dyn IndexHost,
+    lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
+) {
     let Some(checkout) = ctx.data_checkout() else {
         return;
     };
@@ -345,7 +348,7 @@ pub(crate) fn root_bound(ctx: &AppContext) {
     let Some(claim) = Claim::take(&cache, generation, &root) else {
         return;
     };
-    let lifecycle = ctx.subc_lifecycle_admission();
+
     let checkout = Arc::downgrade(&checkout);
     let session = crate::log_ctx::current_session();
     let spawned = std::thread::Builder::new()
@@ -756,7 +759,7 @@ pub fn separator() -> char {
         let sources = fixture(&root);
         let (ctx, _storage) = published_then_restarted(&root);
         let cache = ctx.symbol_cache();
-        root_bound(&ctx);
+        root_bound(&ctx, ctx.subc_lifecycle_admission());
         let deadline = Instant::now() + Duration::from_secs(60);
         while cache.read().unwrap().len() < sources.len() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -767,7 +770,7 @@ pub fn separator() -> char {
 
         // A reset (a reconfigure, an idle eviction) is filled again.
         cache.write().unwrap().reset();
-        root_bound(&ctx);
+        root_bound(&ctx, ctx.subc_lifecycle_admission());
         let deadline = Instant::now() + Duration::from_secs(60);
         while cache.read().unwrap().len() < sources.len() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));

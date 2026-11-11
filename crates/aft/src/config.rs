@@ -464,8 +464,8 @@ impl InspectCategories {
         "complexity",
     ];
 
-    pub fn enabled(&self, category: crate::inspect::InspectCategory) -> bool {
-        use crate::inspect::InspectCategory::*;
+    pub fn enabled(&self, category: crate::inspect_category::InspectCategory) -> bool {
+        use crate::inspect_category::InspectCategory::*;
         match category {
             Diagnostics => self.diagnostics,
             Todos => self.todos,
@@ -483,7 +483,7 @@ impl InspectCategories {
 }
 
 impl InspectConfig {
-    pub fn category_enabled(&self, category: crate::inspect::InspectCategory) -> bool {
+    pub fn category_enabled(&self, category: crate::inspect_category::InspectCategory) -> bool {
         self.enabled && self.categories.enabled(category)
     }
 }
@@ -512,8 +512,8 @@ impl Default for BackupConfig {
     fn default() -> Self {
         Self {
             enabled: Some(true),
-            max_depth: Some(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
-            max_file_size: Some(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
+            max_depth: Some(DEFAULT_MAX_UNDO_DEPTH),
+            max_file_size: Some(DEFAULT_MAX_BACKUP_FILE_SIZE),
         }
     }
 }
@@ -1341,3 +1341,7 @@ mod tests {
         );
     }
 }
+
+pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
+/// Default upper bound for one automatic undo snapshot (64 MiB).
+pub const DEFAULT_MAX_BACKUP_FILE_SIZE: u64 = 64 * 1024 * 1024;

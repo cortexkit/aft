@@ -161,7 +161,7 @@ fn normalize_lookup_path(path: &Path) -> PathBuf {
     // store keys and lookups must share one canonical form or Windows verbatim
     // spellings silently miss.
     std::fs::canonicalize(path)
-        .map(|canonical| crate::inspect::job::normalize_path(&canonical))
+        .map(|canonical| crate::path_identity::normalize_path(&canonical))
         .unwrap_or_else(|_| path.to_path_buf())
 }
 

@@ -1,3 +1,4 @@
+pub(crate) mod root_lifecycle;
 mod single_flight;
 
 #[cfg(test)]
@@ -574,13 +575,13 @@ pub struct BindBlockerSnapshot {
 pub struct JobCancellation {
     inner: Arc<JobCancellationInner>,
     root: Option<Arc<std::path::PathBuf>>,
-    lifecycle: Option<crate::context::SubcLifecycleAdmission>,
+    lifecycle: Option<crate::executor::root_lifecycle::SubcLifecycleAdmission>,
 }
 
 #[derive(Debug)]
 struct JobCancellationInner {
     state: AtomicU8,
-    progress: Mutex<Option<crate::run_tool_call::progress::Progress>>,
+    progress: Mutex<Option<crate::tool_progress::Progress>>,
     wait_lock: Mutex<()>,
     wake: Condvar,
     #[cfg(test)]
@@ -613,7 +614,7 @@ impl JobCancellation {
         self
     }
 
-    pub(crate) fn set_progress(&self, progress: crate::run_tool_call::progress::Progress) {
+    pub(crate) fn set_progress(&self, progress: crate::tool_progress::Progress) {
         *self.inner.progress.lock() = Some(progress);
     }
 
@@ -636,7 +637,7 @@ impl JobCancellation {
 
     pub(crate) fn with_lifecycle(
         mut self,
-        lifecycle: crate::context::SubcLifecycleAdmission,
+        lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
     ) -> Self {
         self.lifecycle = Some(lifecycle);
         self
@@ -1158,7 +1159,7 @@ pub struct Executor {
 /// A root may submit maintenance without keeping its owning executor alive.
 /// The weak link avoids a cycle through the executor's actor context.
 #[derive(Clone)]
-pub(crate) struct RootMaintenanceExecutor {
+pub struct RootMaintenanceExecutor {
     inner: std::sync::Weak<ExecutorInner>,
     root_id: ProjectRootId,
 }

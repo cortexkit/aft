@@ -8,12 +8,18 @@ use std::time::{Duration, Instant};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 
-use crate::commands::multi_path::{
+pub(crate) mod git_exclude;
+pub mod multi_path;
+
+use self::multi_path::{
     canonical_key, dedupe_nested_paths, resolve_path_or_multi, SearchPathResolution,
 };
+#[cfg(test)]
 use crate::context::AppContext;
+use crate::data_layer::host::IndexHost;
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
+use crate::read_policy::ReadPolicy;
 use crate::search_index::{
     build_path_filters, decompose_grep_pattern, resolve_search_scope,
     sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, GrepMatch, GrepPathExclusion,
@@ -209,7 +215,7 @@ impl ScopeFileCounts {
         }
         if reasons.is_empty() {
             if self.examined == 0 {
-                return crate::commands::grep::NO_FILES_IN_SCOPE_NOTE.to_string();
+                return NO_FILES_IN_SCOPE_NOTE.to_string();
             }
             reasons.push(format!(
                 "{} files were examined but none were searched",
@@ -290,7 +296,7 @@ pub struct ResolvedRoot {
     authorized_task_artifact: bool,
 }
 
-pub fn project_root(ctx: &AppContext) -> PathBuf {
+pub fn project_root(ctx: &impl IndexHost) -> PathBuf {
     let project_root = ctx
         .config()
         .project_root
@@ -340,15 +346,15 @@ pub(crate) mod scan_order_for_test {
 }
 
 pub(crate) fn resolve_grep_scope(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     paths: Option<&serde_json::Value>,
     max_results: usize,
     req_id: &str,
     session_id: &str,
-    search_tool: Option<crate::context::WorkerSearchTool>,
+    policy: &dyn ReadPolicy,
 ) -> Result<GrepScope, Response> {
     let project_root = project_root(ctx);
-    let search_roots = resolve_roots(ctx, paths, &project_root, req_id, session_id, search_tool)?;
+    let search_roots = resolve_roots(paths, &project_root, req_id, session_id, policy)?;
 
     if let Some(missing_root) = search_roots
         .iter()
@@ -369,18 +375,15 @@ pub(crate) fn resolve_grep_scope(
     // also skips the shortcut that answers from the session's own bash task
     // output files, because that shortcut reads them without walking.
     for search_root in &search_roots {
-        crate::context::confinement::check_walk_root(req_id, search_root)?;
+        crate::data_layer::read_fence::check_walk_root(req_id, search_root)?;
     }
-    let confined = crate::context::confinement::active();
+    let confined = crate::data_layer::read_fence::active();
     let roots = search_roots
         .into_iter()
         .flat_map(|search_root| {
             let outputs = paths
                 .filter(|paths| !confined && !paths.is_null())
-                .and_then(|_| {
-                    ctx.bash_background()
-                        .explicit_task_artifacts(session_id, &search_root)
-                });
+                .and_then(|_| ctx.explicit_task_artifacts(session_id, &search_root));
             match outputs {
                 Some(outputs) => {
                     let filter_root = if search_root.is_dir() {
@@ -399,7 +402,7 @@ pub(crate) fn resolve_grep_scope(
         .map(|(search_root, task_filter_root)| {
             let scope = resolve_search_scope(&project_root, Some(&search_root.to_string_lossy()));
             let is_external = !scope.use_index;
-            let ignored_target = !crate::context::confinement::active()
+            let ignored_target = !crate::data_layer::read_fence::active()
                 && paths.is_some_and(|paths| !paths.is_null())
                 && !is_same_directory(&scope.root, &project_root)
                 && target_is_ignored(&scope.root);
@@ -444,7 +447,7 @@ pub(crate) fn resolve_grep_scope(
 /// can show what the search itself does with a starting path.
 #[cfg(all(test, unix))]
 pub(crate) fn grep_root_for_test(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     search_root: &Path,
     pattern: &str,
 ) -> GrepResult {
@@ -493,7 +496,7 @@ pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Optio
     let mut unknown = false;
     for root in &scope.roots {
         // A starting path a confined walk may not use has nothing in scope.
-        if !crate::context::confinement::admits_walk_root(&root.search_root) {
+        if !crate::data_layer::read_fence::admits_walk_root(&root.search_root) {
             continue;
         }
         // An explicitly-named existing file is always in scope (it's searched
@@ -586,7 +589,7 @@ fn scope_has_files_unbounded(
     };
     let walker = builder.build();
     for (visited, entry) in walker.enumerate() {
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
         if visited >= MAX_FALLBACK_WALK_FILES.saturating_mul(8)
             || Instant::now() >= deadline
             || crate::executor::current_job_cancelled()
@@ -606,7 +609,7 @@ fn scope_has_files_unbounded(
 }
 
 pub fn execute(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     pattern: &CompiledPattern,
     scope: &GrepScope,
     params: &GrepParams,
@@ -615,7 +618,7 @@ pub fn execute(
 }
 
 pub(crate) fn execute_profiled(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     pattern: &CompiledPattern,
     scope: &GrepScope,
     params: &GrepParams,
@@ -626,7 +629,7 @@ pub(crate) fn execute_profiled(
 }
 
 pub(crate) fn execute_profiled_with_filters(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     pattern: &CompiledPattern,
     scope: &GrepScope,
     params: &GrepParams,
@@ -646,7 +649,7 @@ pub(crate) fn execute_profiled_with_filters(
 /// once the search passes `params.max_results`: the first found, or the
 /// first by path and line.
 pub(crate) fn execute_profiled_with_filters_in_order(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     pattern: &CompiledPattern,
     scope: &GrepScope,
     params: &GrepParams,
@@ -703,12 +706,11 @@ pub(crate) fn execute_profiled_with_filters_in_order(
 }
 
 fn resolve_roots(
-    ctx: &AppContext,
     paths: Option<&serde_json::Value>,
     project_root: &Path,
     req_id: &str,
     session_id: &str,
-    search_tool: Option<crate::context::WorkerSearchTool>,
+    policy: &dyn ReadPolicy,
 ) -> Result<Vec<PathBuf>, Response> {
     let Some(paths) = paths else {
         return Ok(vec![resolve_search_scope(project_root, None).root]);
@@ -720,12 +722,7 @@ fn resolve_roots(
         return match resolve_path_or_multi(
             path,
             project_root,
-            |candidate| match search_tool {
-                Some(search_tool) => {
-                    ctx.validate_search_path(req_id, session_id, candidate, search_tool)
-                }
-                None => ctx.validate_read_path(req_id, session_id, candidate),
-            },
+            |candidate| policy.validate_read_path(req_id, session_id, candidate),
             req_id,
         )? {
             SearchPathResolution::Single(root) => Ok(vec![root]),
@@ -742,12 +739,7 @@ fn resolve_roots(
                     "grep: path array entries must be strings",
                 ));
             };
-            let validated = match search_tool {
-                Some(search_tool) => {
-                    ctx.validate_search_path(req_id, session_id, Path::new(path), search_tool)?
-                }
-                None => ctx.validate_read_path(req_id, session_id, Path::new(path))?,
-            };
+            let validated = policy.validate_read_path(req_id, session_id, Path::new(path))?;
             let raw = validated.to_string_lossy();
             roots.push(resolve_search_scope(project_root, Some(raw.as_ref())).root);
         }
@@ -767,7 +759,7 @@ fn resolve_roots(
 }
 
 fn execute_root_profiled(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     pattern: &CompiledPattern,
     query: &RegexQuery,
     root: &ResolvedRoot,
@@ -779,7 +771,7 @@ fn execute_root_profiled(
 ) -> (GrepResult, GrepExecutionPhaseTimings) {
     // A confined search never starts outside its fence, whether at a named
     // file (read directly below, not walked) or at a directory.
-    if !crate::context::confinement::admits_walk_root(&root.search_root) {
+    if !crate::data_layer::read_fence::admits_walk_root(&root.search_root) {
         return (
             empty_grep_result(IndexStatus::Fallback, false),
             GrepExecutionPhaseTimings::default(),
@@ -790,7 +782,7 @@ fn execute_root_profiled(
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary detection still applies.
     if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-        let index_status = if root.use_index && !crate::context::confinement::active() {
+        let index_status = if root.use_index && !crate::data_layer::read_fence::active() {
             current_index_status(ctx)
         } else {
             IndexStatus::Fallback
@@ -814,7 +806,7 @@ fn execute_root_profiled(
         return (result, GrepExecutionPhaseTimings::default());
     }
 
-    if crate::context::confinement::active() {
+    if crate::data_layer::read_fence::active() {
         let mut counts = ScopeFileCounts::default();
         let result = fallback_grep_counted(
             project_root,
@@ -839,7 +831,7 @@ fn execute_root_profiled(
     }
 
     if root.use_index && !root.ignored_target {
-        if let Some(view) = crate::data_layer::tools::grep::ready_view(ctx) {
+        if let Some(view) = crate::data_layer::text_scope::ready_view(ctx) {
             if let Some(answer) = execute_root_from_view(
                 ctx,
                 view,
@@ -899,7 +891,7 @@ fn execute_root_profiled(
 /// the view's checkout, so today's path answers instead.
 #[allow(clippy::too_many_arguments)]
 fn execute_root_from_view(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     view: crate::data_layer::checkout::CheckoutView,
     pattern: &CompiledPattern,
     query: &RegexQuery,
@@ -911,7 +903,7 @@ fn execute_root_from_view(
     order: GrepScanOrder,
 ) -> Option<(GrepResult, GrepExecutionPhaseTimings)> {
     let snapshot_started = Instant::now();
-    let scope = crate::data_layer::tools::grep::ViewScope::of(view, &root.search_root)?;
+    let scope = crate::data_layer::text_scope::ViewScope::of(view, &root.search_root)?;
     if !scope.is_whole_checkout() && !scope.has_files() {
         // The checkout holds no file under this explicitly named directory,
         // so walk it, as below when today's index lacks the directory.
@@ -947,7 +939,7 @@ fn execute_root_from_view(
             ctx.note_view_load_failure("trigram", &error);
             return Some((
                 failed_index_grep(std::io::Error::other(
-                    crate::context::view_load_failure_message(error),
+                    crate::data_layer::status::view_load_failure_message(error),
                 )),
                 GrepExecutionPhaseTimings::default(),
             ));
@@ -1223,7 +1215,7 @@ fn fallback_target_walk_builder(
     ignore_ancestors: bool,
     filter_root: Option<&Path>,
 ) -> Option<WalkBuilder> {
-    if !crate::context::confinement::admits_walk_root(search_root) {
+    if !crate::data_layer::read_fence::admits_walk_root(search_root) {
         return None;
     }
     Some(target_walk_builder(
@@ -1251,12 +1243,12 @@ fn target_walk_builder(
     // A confined walk loads none of the crate's ignore files (see
     // `apply_project_ignore_rules`); it applies the confined root's own
     // ignore files here and checks every entry against the read policy.
-    let confined = crate::context::confinement::ConfinedIgnoreRules::current(
-        crate::context::confinement::SEARCH_IGNORE_FILES,
+    let confined = crate::data_layer::read_fence::ConfinedIgnoreRules::current(
+        crate::data_layer::read_fence::SEARCH_IGNORE_FILES,
     );
     let ignore_root = ignore_ancestors.then(|| search_root.to_path_buf());
     let floor_disclosure = filter_root
-        .map(|root| crate::context::confinement::capture().for_floor_filter_root(root))
+        .map(|root| crate::data_layer::read_fence::capture().for_floor_filter_root(root))
         .unwrap_or_default();
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
@@ -1268,8 +1260,8 @@ fn target_walk_builder(
     // explicitly named ignored directory.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
     let permission_root = search_root.to_path_buf();
-    crate::context::apply_project_ignore_rules(&mut builder, search_root)
-        .parents(!crate::context::confinement::active())
+    crate::data_layer::ignore_rules::apply_project_ignore_rules(&mut builder, search_root)
+        .parents(!crate::data_layer::read_fence::active())
         .filter_entry(move |entry| {
             if !crate::bounded_io::walk_path(entry.path()) {
                 return false;
@@ -1375,7 +1367,9 @@ impl TargetIgnoreRules {
         if !global.is_empty() {
             rules.git.push(Arc::new(global));
         }
-        if let Some((repo, exclude)) = crate::commands::outline::git_info_exclude_for_target(root) {
+        if let Some((repo, exclude)) =
+            crate::grep_executor::git_exclude::git_info_exclude_for_target(root)
+        {
             Self::load(&mut rules.git, &repo, &exclude);
         }
         for ancestor in root.ancestors().collect::<Vec<_>>().into_iter().rev() {
@@ -1473,7 +1467,7 @@ fn diagnose_scope_counts_unbounded(
     };
     // A starting path a confined walk may not use has nothing in scope; it is
     // checked before the file test below, which would stat it.
-    if !crate::context::confinement::admits_walk_root(search_root) {
+    if !crate::data_layer::read_fence::admits_walk_root(search_root) {
         return Some(counts);
     }
     if search_root.is_file() {
@@ -1615,7 +1609,7 @@ pub(crate) fn source_first_fallback_walk_files(
         let builder = fallback_project_walk_builder(root, Arc::clone(&skipped_foreign_mounts));
         for entry in builder.build() {
             entries_visited += 1;
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
             if Instant::now() >= deadline {
                 walk_truncated = true;
                 walk_time_limit_reached = true;
@@ -2156,7 +2150,7 @@ fn fallback_grep_with_limits_counted(
     // Files for a path-ordered scan, searched one at a time after the walk.
     let mut ordered: Vec<PathBuf> = Vec::new();
     let io_budget = crate::bounded_io::current();
-    let confinement = crate::context::confinement::capture();
+    let confinement = crate::data_layer::read_fence::capture();
 
     let flush_batch = |batch: &mut Vec<PathBuf>, matches: &mut Vec<GrepMatch>| {
         if batch.is_empty() {
@@ -2168,10 +2162,10 @@ fn fallback_grep_with_limits_counted(
             .map_init(
                 || crate::bounded_io::enter(io_budget.clone()),
                 |_scope, file| {
-                    crate::context::confinement::inherit(confinement.clone(), || {
+                    crate::data_layer::read_fence::inherit(confinement.clone(), || {
                         #[cfg(test)]
                         assert_eq!(
-                            crate::context::confinement::capture(),
+                            crate::data_layer::read_fence::capture(),
                             confinement,
                             "grep scan worker lost the confinement fence"
                         );
@@ -2306,7 +2300,7 @@ fn fallback_grep_with_limits_counted(
                 .map_init(
                     || crate::bounded_io::enter(io_budget.clone()),
                     |_scope, file| {
-                        crate::context::confinement::inherit(confinement.clone(), || {
+                        crate::data_layer::read_fence::inherit(confinement.clone(), || {
                             search_one(file)
                         })
                     },
@@ -2631,7 +2625,7 @@ pub(crate) fn ripgrep_glob(
 /// How the checkout's text index stands for a reply that did not come from
 /// it: `Building` while its first publication is on the way, `Ready` once it
 /// serves (a walk then replaced it for this call), `Fallback` otherwise.
-fn current_index_status(ctx: &AppContext) -> IndexStatus {
+fn current_index_status(ctx: &impl IndexHost) -> IndexStatus {
     if ctx.cache_unavailable_reason().is_some() {
         return IndexStatus::Fallback;
     }
@@ -3002,7 +2996,7 @@ mod tests {
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_canonical_cache_root(root.to_path_buf());
         let deadline = Instant::now() + Duration::from_secs(600);
-        while crate::data_layer::tools::grep::ready_view(&ctx).is_none() {
+        while crate::data_layer::text_scope::ready_view(&ctx).is_none() {
             assert!(
                 Instant::now() < deadline,
                 "the data layer never published the fixture's text index"
@@ -3569,7 +3563,7 @@ mod tests {
         let paths = serde_json::json!([left.display().to_string(), right.display().to_string()]);
 
         let scope =
-            resolve_grep_scope(&ctx, Some(&paths), 10, "test", "test", None).expect("scope");
+            resolve_grep_scope(&ctx, Some(&paths), 10, "test", "test", &ctx).expect("scope");
 
         assert!(scope.multi_root);
         assert_eq!(scope.per_root_max, 20);
@@ -4271,3 +4265,7 @@ mod tests {
         );
     }
 }
+
+/// Text note for a grep or glob whose search path holds no searchable file.
+pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
+    "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";

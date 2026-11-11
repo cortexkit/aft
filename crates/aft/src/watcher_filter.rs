@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use ignore::gitignore::Gitignore;
 
+pub mod config_events;
 mod directory_arrival;
 
 pub type SharedGitignore = Arc<RwLock<Option<Arc<Gitignore>>>>;
@@ -108,16 +109,16 @@ pub(crate) fn rewrite_nested_ignore_line(relative_dir: &Path, line: &str) -> Opt
 pub struct WatcherFilterConfig {
     pub project_root: PathBuf,
     pub git_common_dir: Option<PathBuf>,
-    counters: Arc<crate::context::WatcherCounters>,
+    counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     /// Raised when `<root>/.cortexkit/aft.jsonc` changes, so the root re-reads
     /// its config. Checked before any ignore filtering: the file is config
     /// whether or not the project ignores `.cortexkit`.
-    config_reload: Option<Arc<crate::config_live::ConfigReloadSignal>>,
+    config_reload: Option<Arc<crate::watcher_filter::config_events::ConfigReloadSignal>>,
 }
 
 impl WatcherFilterConfig {
     pub fn new(project_root: PathBuf, git_common_dir: Option<PathBuf>) -> Self {
-        let counters = crate::context::watcher_counters_for_root(&project_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&project_root);
         Self {
             project_root,
             git_common_dir,
@@ -128,7 +129,7 @@ impl WatcherFilterConfig {
 
     pub fn with_config_reload_signal(
         mut self,
-        signal: Arc<crate::config_live::ConfigReloadSignal>,
+        signal: Arc<crate::watcher_filter::config_events::ConfigReloadSignal>,
     ) -> Self {
         self.config_reload = Some(signal);
         self
@@ -138,10 +139,12 @@ impl WatcherFilterConfig {
         let Some(signal) = self.config_reload.as_ref() else {
             return;
         };
-        if raw_paths
-            .into_iter()
-            .any(|path| crate::config_live::is_project_config_event_path(&self.project_root, path))
-        {
+        if raw_paths.into_iter().any(|path| {
+            crate::watcher_filter::config_events::is_project_config_event_path(
+                &self.project_root,
+                path,
+            )
+        }) {
             signal.request();
         }
     }
@@ -1131,7 +1134,7 @@ impl WatcherExclusionRetry {
         &mut self,
         root: &Path,
         generation: u64,
-        counters: &crate::context::WatcherCounters,
+        counters: &crate::watcher_backend::counters::WatcherCounters,
         installed: &mut WatcherExclusionPaths,
         matcher: &SharedGitignore,
         derive: impl FnOnce() -> ExclusionPlanOutcome,
@@ -1151,7 +1154,7 @@ impl WatcherExclusionRetry {
         &mut self,
         root: &Path,
         generation: u64,
-        counters: &crate::context::WatcherCounters,
+        counters: &crate::watcher_backend::counters::WatcherCounters,
         installed: &mut WatcherExclusionPaths,
         matcher: &SharedGitignore,
         now: Instant,
@@ -1174,7 +1177,7 @@ impl WatcherExclusionRetry {
         &mut self,
         root: &Path,
         generation: u64,
-        counters: &crate::context::WatcherCounters,
+        counters: &crate::watcher_backend::counters::WatcherCounters,
         derive: impl FnOnce() -> ExclusionPlanOutcome,
     ) -> Option<ExclusionPlanOutcome> {
         self.attempt_at(root, generation, counters, Instant::now(), derive)
@@ -1184,7 +1187,7 @@ impl WatcherExclusionRetry {
         &mut self,
         root: &Path,
         generation: u64,
-        counters: &crate::context::WatcherCounters,
+        counters: &crate::watcher_backend::counters::WatcherCounters,
         now: Instant,
         derive: impl FnOnce() -> ExclusionPlanOutcome,
     ) -> Option<ExclusionPlanOutcome> {
@@ -1213,7 +1216,7 @@ impl WatcherExclusionRetry {
         &mut self,
         root: &Path,
         generation: u64,
-        counters: &crate::context::WatcherCounters,
+        counters: &crate::watcher_backend::counters::WatcherCounters,
         reason: ExclusionPlanUnavailable,
     ) {
         self.record_outcome(root, generation, counters, &Err::<(), _>(reason));
@@ -1223,7 +1226,7 @@ impl WatcherExclusionRetry {
         &mut self,
         root: &Path,
         generation: u64,
-        counters: &crate::context::WatcherCounters,
+        counters: &crate::watcher_backend::counters::WatcherCounters,
         outcome: &Result<T, ExclusionPlanUnavailable>,
     ) {
         let (status, last_failure) = match outcome {
@@ -1254,13 +1257,15 @@ impl WatcherExclusionRetry {
                 )
             }
         };
-        counters.set_exclusion_planning(crate::context::WatcherExclusionPlanningSnapshot {
-            matcher_generation: generation,
-            attempts: self.attempts,
-            attempt_limit: EXCLUSION_PLAN_MAX_ATTEMPTS,
-            status,
-            last_failure,
-        });
+        counters.set_exclusion_planning(
+            crate::watcher_backend::counters::WatcherExclusionPlanningSnapshot {
+                matcher_generation: generation,
+                attempts: self.attempts,
+                attempt_limit: EXCLUSION_PLAN_MAX_ATTEMPTS,
+                status,
+                last_failure,
+            },
+        );
     }
 }
 
@@ -1631,7 +1636,7 @@ fn derive_exclusion_plan_cancellable(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let observed = crate::context::watcher_counters_for_root(&root)
+    let observed = crate::watcher_backend::counters::watcher_counters_for_root(&root)
         .observed_exclusion_prefixes()
         .into_iter()
         .map(|prefix| (PathBuf::from(prefix.prefix), prefix.count))
@@ -2137,7 +2142,9 @@ fn watcher_observation_state_key(root: &Path) -> String {
     format!("{WATCHER_OBSERVATION_STATE_PREFIX}:{repository_key}")
 }
 
-fn valid_observed_exclusion_prefix(prefix: &crate::context::WatcherOverflowPrefix) -> bool {
+fn valid_observed_exclusion_prefix(
+    prefix: &crate::watcher_backend::counters::WatcherOverflowPrefix,
+) -> bool {
     prefix.count > 0
         && !prefix.prefix.is_empty()
         && Path::new(&prefix.prefix)
@@ -2147,7 +2154,7 @@ fn valid_observed_exclusion_prefix(prefix: &crate::context::WatcherOverflowPrefi
 
 pub(crate) fn load_watcher_observations(
     root: &Path,
-    counters: &crate::context::WatcherCounters,
+    counters: &crate::watcher_backend::counters::WatcherCounters,
     db: Option<&Arc<Mutex<crate::db::TrackedConnection>>>,
 ) {
     let Some(db) = db else {
@@ -2159,7 +2166,8 @@ pub(crate) fn load_watcher_observations(
     else {
         return;
     };
-    let Ok(mut prefixes) = serde_json::from_str::<Vec<crate::context::WatcherOverflowPrefix>>(&raw)
+    let Ok(mut prefixes) =
+        serde_json::from_str::<Vec<crate::watcher_backend::counters::WatcherOverflowPrefix>>(&raw)
     else {
         return;
     };
@@ -2170,7 +2178,7 @@ pub(crate) fn load_watcher_observations(
 
 pub(crate) fn persist_watcher_observations(
     root: &Path,
-    counters: &crate::context::WatcherCounters,
+    counters: &crate::watcher_backend::counters::WatcherCounters,
     db: Option<&Arc<Mutex<crate::db::TrackedConnection>>>,
 ) {
     let Some(db) = db else {
@@ -2645,7 +2653,7 @@ impl WatcherFilterThread {
         }
     }
 
-    fn overflow_prefixes(&self) -> Vec<crate::context::WatcherOverflowPrefix> {
+    fn overflow_prefixes(&self) -> Vec<crate::watcher_backend::counters::WatcherOverflowPrefix> {
         let mut counts = BTreeMap::<String, u64>::new();
         for (path, _) in &self.recent_paths {
             // Root-relative, first two components, joined with `/` on every
@@ -2669,7 +2677,12 @@ impl WatcherFilterThread {
         }
         let mut prefixes = counts
             .into_iter()
-            .map(|(prefix, count)| crate::context::WatcherOverflowPrefix { prefix, count })
+            .map(
+                |(prefix, count)| crate::watcher_backend::counters::WatcherOverflowPrefix {
+                    prefix,
+                    count,
+                },
+            )
             .collect::<Vec<_>>();
         prefixes.sort_by(|left, right| {
             right
@@ -2681,7 +2694,9 @@ impl WatcherFilterThread {
         prefixes
     }
 
-    fn observed_exclusion_prefixes(&self) -> Vec<crate::context::WatcherOverflowPrefix> {
+    fn observed_exclusion_prefixes(
+        &self,
+    ) -> Vec<crate::watcher_backend::counters::WatcherOverflowPrefix> {
         let matcher = self
             .matcher
             .read()
@@ -2727,7 +2742,12 @@ impl WatcherFilterThread {
         }
         let mut prefixes = counts
             .into_iter()
-            .map(|(prefix, count)| crate::context::WatcherOverflowPrefix { prefix, count })
+            .map(
+                |(prefix, count)| crate::watcher_backend::counters::WatcherOverflowPrefix {
+                    prefix,
+                    count,
+                },
+            )
             .collect::<Vec<_>>();
         prefixes.sort_by(|left, right| {
             right
@@ -4608,7 +4628,7 @@ mod tests {
             let pool = pool.clone();
             let started = started.clone();
             callers.push(thread::spawn(move || {
-                let counters = crate::context::WatcherCounters::default();
+                let counters = crate::watcher_backend::counters::WatcherCounters::default();
                 let mut retry = WatcherExclusionRetry::default();
                 let worker_path = path.clone();
                 let worker_matcher = matcher.clone();
@@ -4743,7 +4763,7 @@ mod tests {
                 .collect(),
             dropped: Vec::new(),
         };
-        let counters = crate::context::WatcherCounters::default();
+        let counters = crate::watcher_backend::counters::WatcherCounters::default();
         let mut retry = WatcherExclusionRetry::default();
         let initial = retry
             .attempt(root.path(), 1, &counters, || Ok(initial))
@@ -4850,7 +4870,7 @@ mod tests {
             .collect(),
             dropped: Vec::new(),
         };
-        let counters = crate::context::WatcherCounters::default();
+        let counters = crate::watcher_backend::counters::WatcherCounters::default();
         let mut retry = WatcherExclusionRetry::default();
         let initial = retry
             .attempt(root.path(), 1, &counters, || Ok(initial))
@@ -4960,7 +4980,7 @@ mod tests {
                 .collect(),
             dropped: Vec::new(),
         };
-        let counters = crate::context::WatcherCounters::default();
+        let counters = crate::watcher_backend::counters::WatcherCounters::default();
         let mut retry = WatcherExclusionRetry::default();
         let initial = retry
             .attempt(root.path(), 1, &counters, || {
@@ -5062,7 +5082,7 @@ mod tests {
             ExclusionPlanUnavailable::WorkerDisconnected,
         ] {
             EXCLUSION_RETRY_LOGS.with(|logs| logs.borrow_mut().clear());
-            let counters = crate::context::WatcherCounters::default();
+            let counters = crate::watcher_backend::counters::WatcherCounters::default();
             let mut retry = WatcherExclusionRetry::default();
             for attempt in 1..=EXCLUSION_PLAN_MAX_ATTEMPTS {
                 let now = Instant::now() + Duration::from_secs(u64::from(attempt) * 10);
@@ -5262,11 +5282,13 @@ mod tests {
             directory_size_signal(&boundary, &link.join("packages/deep/target")),
             0
         );
-        let counters = crate::context::watcher_counters_for_root(root.path());
-        counters.set_observed_exclusion_prefixes(vec![crate::context::WatcherOverflowPrefix {
-            prefix: "linked/packages/deep".into(),
-            count: 42,
-        }]);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(root.path());
+        counters.set_observed_exclusion_prefixes(vec![
+            crate::watcher_backend::counters::WatcherOverflowPrefix {
+                prefix: "linked/packages/deep".into(),
+                count: 42,
+            },
+        ]);
         EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
         let plan = derive_exclusion_plan(
             root.path(),
@@ -5551,14 +5573,16 @@ mod tests {
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let hot = std::fs::canonicalize(hot).unwrap();
         let matcher = shared_matcher(&canonical_root);
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         let db = Arc::new(Mutex::new(
             crate::db::open(&storage.path().join("aft.db")).unwrap(),
         ));
-        counters.set_observed_exclusion_prefixes(vec![crate::context::WatcherOverflowPrefix {
-            prefix: "packages/opencode-plugin/tmp".to_string(),
-            count: 37,
-        }]);
+        counters.set_observed_exclusion_prefixes(vec![
+            crate::watcher_backend::counters::WatcherOverflowPrefix {
+                prefix: "packages/opencode-plugin/tmp".to_string(),
+                count: 37,
+            },
+        ]);
         persist_watcher_observations(&canonical_root, &counters, Some(&db));
         counters.set_observed_exclusion_prefixes(Vec::new());
 
@@ -5566,7 +5590,7 @@ mod tests {
 
         assert_eq!(
             counters.observed_exclusion_prefixes(),
-            vec![crate::context::WatcherOverflowPrefix {
+            vec![crate::watcher_backend::counters::WatcherOverflowPrefix {
                 prefix: "packages/opencode-plugin/tmp".to_string(),
                 count: 37,
             }]
@@ -5634,22 +5658,23 @@ mod tests {
         let db = Arc::new(Mutex::new(
             crate::db::open(&storage.path().join("aft.db")).unwrap(),
         ));
-        let main_counters = crate::context::watcher_counters_for_root(&main);
+        let main_counters = crate::watcher_backend::counters::watcher_counters_for_root(&main);
         main_counters.set_observed_exclusion_prefixes(vec![
-            crate::context::WatcherOverflowPrefix {
+            crate::watcher_backend::counters::WatcherOverflowPrefix {
                 prefix: relative_hot.to_string(),
                 count: 91,
             },
         ]);
         persist_watcher_observations(&main, &main_counters, Some(&db));
 
-        let sibling_counters = crate::context::watcher_counters_for_root(&sibling);
+        let sibling_counters =
+            crate::watcher_backend::counters::watcher_counters_for_root(&sibling);
         sibling_counters.set_observed_exclusion_prefixes(Vec::new());
         load_watcher_observations(&sibling, &sibling_counters, Some(&db));
 
         assert_eq!(
             sibling_counters.observed_exclusion_prefixes(),
-            vec![crate::context::WatcherOverflowPrefix {
+            vec![crate::watcher_backend::counters::WatcherOverflowPrefix {
                 prefix: relative_hot.to_string(),
                 count: 91,
             }]
@@ -6034,12 +6059,13 @@ mod tests {
         // What the ring recorded in the specimen: two components of the
         // flooding path, naming a tracked package directory that no exclusion
         // can ever cover.
-        crate::context::watcher_counters_for_root(&canonical_root).set_observed_exclusion_prefixes(
-            vec![crate::context::WatcherOverflowPrefix {
-                prefix: "packages/plugin".to_string(),
-                count: 42,
-            }],
-        );
+        crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root)
+            .set_observed_exclusion_prefixes(vec![
+                crate::watcher_backend::counters::WatcherOverflowPrefix {
+                    prefix: "packages/plugin".to_string(),
+                    count: 42,
+                },
+            ]);
 
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
@@ -6062,7 +6088,7 @@ mod tests {
                 .any(|exclusion| exclusion.path() == canonical_root.join("packages/plugin")),
             "a tracked directory must never be excluded"
         );
-        crate::context::watcher_counters_for_root(&canonical_root)
+        crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root)
             .set_observed_exclusion_prefixes(Vec::new());
     }
 
@@ -6128,7 +6154,7 @@ mod tests {
             std::fs::write(alfonso.join(format!("ledger-{index}.md")), "").unwrap();
         }
         let matcher = shared_matcher(&canonical_root);
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         let generation = Arc::new(AtomicU64::new(1));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
@@ -6210,11 +6236,11 @@ mod tests {
         assert_eq!(
             counters.observed_exclusion_prefixes(),
             vec![
-                crate::context::WatcherOverflowPrefix {
+                crate::watcher_backend::counters::WatcherOverflowPrefix {
                     prefix: ".cortexkit/alfonso/prompts".to_string(),
                     count: 200,
                 },
-                crate::context::WatcherOverflowPrefix {
+                crate::watcher_backend::counters::WatcherOverflowPrefix {
                     prefix: ".cortexkit/alfonso/athena".to_string(),
                     count: 80,
                 },
@@ -6363,7 +6389,7 @@ mod tests {
             ".cortexkit/alfonso/\nnode_modules/\ndist/\n/target/\n",
         );
         let matcher = shared_matcher(&canonical_root);
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         record_overflow_burst(
             &canonical_root,
             &matcher,
@@ -6372,7 +6398,7 @@ mod tests {
 
         assert_eq!(
             counters.observed_exclusion_prefixes(),
-            vec![crate::context::WatcherOverflowPrefix {
+            vec![crate::watcher_backend::counters::WatcherOverflowPrefix {
                 prefix: ".cortexkit/alfonso".to_string(),
                 count: 490,
             }]
@@ -6428,7 +6454,7 @@ mod tests {
             ".cortexkit/alfonso/*\n!.cortexkit/alfonso/rules/\nnode_modules/\ndist/\n/target/\n",
         );
         let matcher = shared_matcher(&canonical_root);
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         let alfonso = canonical_root.join(".cortexkit/alfonso");
         let mut burst = agent_scratch_burst(&canonical_root);
         burst.extend((0..20).map(|index| alfonso.join(format!("rules/{index}.md"))));
@@ -6500,7 +6526,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("generated-cache")).unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let matcher = shared_matcher(&canonical_root);
-        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root);
         let busy = canonical_root.join("src/generated");
         record_overflow_burst(
             &canonical_root,
@@ -6516,10 +6542,12 @@ mod tests {
         );
 
         // A ranking stored by an older build could still name the folder.
-        counters.set_observed_exclusion_prefixes(vec![crate::context::WatcherOverflowPrefix {
-            prefix: "src/generated".to_string(),
-            count: 300,
-        }]);
+        counters.set_observed_exclusion_prefixes(vec![
+            crate::watcher_backend::counters::WatcherOverflowPrefix {
+                prefix: "src/generated".to_string(),
+                count: 300,
+            },
+        ]);
         for coverage in [
             WatcherExclusionCoverage::ExactPath,
             WatcherExclusionCoverage::Subtree,
@@ -6774,12 +6802,13 @@ mod tests {
         assert_eq!(generated.source(), WatcherExclusionSource::Gitignore);
 
         let observed_nested = PathBuf::from("packages/four/node_modules");
-        crate::context::watcher_counters_for_root(&canonical_root).set_observed_exclusion_prefixes(
-            vec![crate::context::WatcherOverflowPrefix {
-                prefix: observed_nested.to_string_lossy().into_owned(),
-                count: 200,
-            }],
-        );
+        crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root)
+            .set_observed_exclusion_prefixes(vec![
+                crate::watcher_backend::counters::WatcherOverflowPrefix {
+                    prefix: observed_nested.to_string_lossy().into_owned(),
+                    count: 200,
+                },
+            ]);
         // Pin the exact-path coverage: this test is about copies that an
         // exact-path kernel filter must each name, and the compiled-in default
         // is Subtree on Linux, where the root copy covers the nested ones.
@@ -6807,7 +6836,7 @@ mod tests {
             "a directory the ring observed must outrank a plain ignored boundary: {:?}",
             watcher_exclusion_paths(&exclusions)
         );
-        crate::context::watcher_counters_for_root(&canonical_root)
+        crate::watcher_backend::counters::watcher_counters_for_root(&canonical_root)
             .set_observed_exclusion_prefixes(Vec::new());
     }
 
