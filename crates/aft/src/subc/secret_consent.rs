@@ -249,8 +249,8 @@ impl SubcSecretConsent {
             card.answered = Some(outcome.clone());
         }
         if cancel.is_some() && matches!(outcome, ConsentOutcome::Unavailable { .. }) {
-            // An unsuccessful await still leaves a live card. Settle it before
-            // reporting failure, while its requester scope can still be bound.
+            // An unsuccessful await still leaves a live phone card. Withdraw it
+            // before returning an error, using the same authorization scope as consent.request.
             if self
                 .call(
                     request,
