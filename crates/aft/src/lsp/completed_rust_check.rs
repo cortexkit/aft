@@ -13,10 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use super::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 
+mod inputs;
+use inputs::{SourceInputs, UnresolvedInput};
+
 pub(crate) const BUDGET: Duration = Duration::from_secs(2);
-// The first completed check has no trusted hash ledger yet. Parsing literal
-// include dependencies is a one-time cost; later requests reuse the ledger and
-// retain the much smaller serving budget.
+// The first completed check has no trusted hash ledger yet. Later requests
+// reuse content hashes, but still resolve macros against current source files.
 const INITIAL_CAPTURE_BUDGET: Duration = Duration::from_secs(15);
 // Filesystem timestamps can round a write down to a tick before the wall-clock
 // instant at which it actually happened. Two seconds covers coarse timestamp
@@ -248,84 +250,7 @@ fn workspace_packages(root: &Path, deadline: Instant) -> Option<Vec<PathBuf>> {
     Some(packages)
 }
 
-fn source_inputs(
-    path: &Path,
-    bytes: &[u8],
-    deadline: Instant,
-) -> Option<(Vec<PathBuf>, Vec<String>)> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    if !text.contains("include") && !text.contains("env") {
-        return Some((Vec::new(), Vec::new()));
-    }
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
-    let mut progress = |_: &tree_sitter::ParseState| {
-        if Instant::now() >= deadline {
-            std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
-        }
-    };
-    let tree = parser.parse_with_options(
-        &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
-        None,
-        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-    )?;
-    expired(deadline)?;
-    let mut nodes = vec![tree.root_node()];
-    let mut included = Vec::new();
-    let mut env_keys = Vec::new();
-    while let Some(node) = nodes.pop() {
-        expired(deadline)?;
-        for index in 0..u32::try_from(node.child_count()).ok()? {
-            let child = node.child(index)?;
-            nodes.push(child);
-            if !matches!(child.kind(), "identifier" | "scoped_identifier") {
-                continue;
-            }
-            let name = child.utf8_text(bytes).ok()?.rsplit("::").next()?;
-            if !matches!(
-                name,
-                "include" | "include_str" | "include_bytes" | "env" | "option_env"
-            ) {
-                continue;
-            }
-            if node.child(index + 1).is_none_or(|bang| bang.kind() != "!") {
-                continue;
-            }
-            let tokens = node.child(index + 2)?;
-            let mut cursor = tokens.walk();
-            let values = tokens
-                .named_children(&mut cursor)
-                .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
-                .collect::<Vec<_>>();
-            // A generated/dynamic include path is uncertain. Do not guess what
-            // concat!, env!, or a procedural macro will read from disk.
-            if values.is_empty() || (values.len() != 1 && !matches!(name, "env" | "option_env")) {
-                return None;
-            }
-            let literal = values[0].utf8_text(bytes).ok()?;
-            let relative = match values[0].kind() {
-                "string_literal" => serde_json::from_str::<String>(literal).ok()?,
-                "raw_string_literal" => {
-                    let start = literal.find('"')?;
-                    let end = literal.rfind('"')?;
-                    literal.get(start + 1..end)?.to_string()
-                }
-                _ => return None,
-            };
-            if matches!(name, "env" | "option_env") {
-                env_keys.push(relative);
-            } else {
-                included.push(canonical(&path.parent()?.join(relative))?);
-            }
-        }
-    }
-    Some((included, env_keys))
-}
-
+#[cfg(test)]
 pub(crate) fn fingerprint(
     root: &Path,
     runtime: String,
@@ -334,6 +259,17 @@ pub(crate) fn fingerprint(
     // When capturing a check's inputs after reading its begin event, no file
     // or directory may have changed since the reader observed that event.
     began: Option<SystemTime>,
+) -> Option<Fingerprint> {
+    fingerprint_with_reason(root, runtime, previous, deadline, began, &mut None)
+}
+
+fn fingerprint_with_reason(
+    root: &Path,
+    runtime: String,
+    previous: Option<&Fingerprint>,
+    deadline: Instant,
+    began: Option<SystemTime>,
+    unresolved: &mut Option<UnresolvedInput>,
 ) -> Option<Fingerprint> {
     let latest_safe_time = match began {
         Some(begin) => Some(begin.checked_sub(CHECK_BEGIN_TIMESTAMP_MARGIN)?),
@@ -348,6 +284,7 @@ pub(crate) fn fingerprint(
         started: Instant::now(),
     };
     let mut hashed = 0;
+    let mut source_inputs = SourceInputs::default();
     let mut pending = workspace_packages(root, deadline)?;
     let mut inputs = vec![root.join("Cargo.toml")];
     let extra_inputs = previous.map_or_else(Vec::new, |p| p.extra_inputs.clone());
@@ -435,10 +372,21 @@ pub(crate) fn fingerprint(
             }
         }
     }
-    while let Some(path) = inputs.pop() {
+    loop {
+        if inputs.is_empty() {
+            for path in source_inputs.resolve(root, deadline, unresolved)? {
+                expired(deadline)?;
+                if !files.contains_key(&path) || source_inputs.needs_parse(&path) {
+                    inputs.push(path);
+                }
+            }
+        }
+        let Some(path) = inputs.pop() else {
+            break;
+        };
         report.last = path.clone();
         expired(deadline)?;
-        if files.contains_key(&path) {
+        if files.contains_key(&path) && !source_inputs.needs_parse(&path) {
             continue;
         }
         let metadata = fs::symlink_metadata(&path).ok()?;
@@ -479,6 +427,7 @@ pub(crate) fn fingerprint(
             }
         }
         let old = previous.and_then(|p| p.files.get(&path));
+        let mut source_bytes = None;
         // Manifests are always read, because their path dependencies also need
         // validating. Index hashes with no inode-change proof cannot be reused.
         let manifest = path.file_name().is_some_and(|name| name == "Cargo.toml");
@@ -499,10 +448,23 @@ pub(crate) fn fingerprint(
                 return None;
             }
             current.hash = blake3::hash(&bytes).to_hex().to_string();
-            if path.extension().is_some_and(|extension| extension == "rs") {
-                (current.included, current.env_keys) = source_inputs(&path, &bytes, deadline)?;
-            }
+            source_bytes = Some(bytes);
             hashed += 1;
+        }
+        if source_inputs.needs_parse(&path) {
+            // Macro invocations in another source file can change the paths a
+            // definition reads, even when the definition's own bytes did not.
+            let bytes = source_bytes.or_else(|| read_bounded(&path, deadline))?;
+            let observed = stamp(&fs::metadata(&path).ok()?)?;
+            if (observed.size, observed.modified, observed.changed)
+                != (current.size, current.modified, current.changed)
+            {
+                return None;
+            }
+            let (included, env_keys) =
+                source_inputs.add(root, &path, &bytes, deadline, unresolved)?;
+            current.included = included;
+            current.env_keys = env_keys;
         }
         inputs.extend(current.included.clone());
         files.insert(path, current);
@@ -705,6 +667,17 @@ impl Runtime {
         deadline: Instant,
         began: Option<SystemTime>,
     ) -> Option<Fingerprint> {
+        self.capture_with_reason(root, previous, deadline, began, &mut None)
+    }
+
+    fn capture_with_reason(
+        &self,
+        root: &Path,
+        previous: Option<&Fingerprint>,
+        deadline: Instant,
+        began: Option<SystemTime>,
+        unresolved: &mut Option<UnresolvedInput>,
+    ) -> Option<Fingerprint> {
         let runtime = self.hash(root, deadline)?;
         let mut seed = previous.cloned().unwrap_or(Fingerprint {
             files: BTreeMap::new(),
@@ -738,7 +711,8 @@ impl Runtime {
         }
         seed.extra_inputs.sort();
         seed.extra_inputs.dedup();
-        let captured = fingerprint(root, runtime, Some(&seed), deadline, began)?;
+        let captured =
+            fingerprint_with_reason(root, runtime, Some(&seed), deadline, began, unresolved)?;
         for key in captured
             .files
             .values()
@@ -1224,11 +1198,13 @@ impl CompletedRustCheck {
         // Capture before spawning, not after receiving a progress event. This
         // also works on platforms without inode change timestamps.
         self.reports.clear();
-        let before = self.runtime.capture(
+        let mut unresolved = None;
+        let before = self.runtime.capture_with_reason(
             &self.root,
             self.saved.as_ref().map(|saved| &saved.fingerprint),
             deadline,
             None,
+            &mut unresolved,
         );
         let mut args = vec![
             "check".to_string(),
@@ -1265,14 +1241,19 @@ impl CompletedRustCheck {
         self.reports = reports;
         let Some(before) = before else {
             self.abort();
+            if let Some(unresolved) = unresolved {
+                return Err(format!("aft_inspect: {}", unresolved.note(&self.root)));
+            }
             return Err("aft_inspect: cargo check completed, but Rust inputs cannot be fingerprinted; diagnostics are provisional".into());
         };
-        let after = self
-            .runtime
-            .capture(&self.root, Some(&before), deadline, None)
-            .ok_or_else(|| {
-                "aft_inspect: cannot validate Rust inputs after cargo check; retry".to_string()
-            })?;
+        let after =
+            self.runtime
+                .capture_with_reason(&self.root, Some(&before), deadline, None, &mut unresolved)
+                .ok_or_else(|| match unresolved {
+                    Some(unresolved) => format!("aft_inspect: {}", unresolved.note(&self.root)),
+                    None => "aft_inspect: cannot validate Rust inputs after cargo check; retry"
+                        .to_string(),
+                })?;
         if cancelled() || before.files != after.files || before.digest != after.digest {
             self.abort();
             return Err("aft_inspect: Rust inputs changed during cargo check; retry".into());
@@ -2435,6 +2416,331 @@ mod tests {
         .unwrap();
         assert!(valid(&cache).is_some());
         write(&cache.root, "member/src/data.md", "after!");
+        assert!(valid(&cache).is_none());
+    }
+
+    fn capture_inputs(cache: &CompletedRustCheck) -> Option<Fingerprint> {
+        fingerprint(
+            &cache.root,
+            "v1".into(),
+            None,
+            Instant::now() + BUDGET,
+            None,
+        )
+    }
+
+    fn unresolved_input(cache: &CompletedRustCheck) -> String {
+        let mut unresolved = None;
+        assert!(fingerprint_with_reason(
+            &cache.root,
+            "v1".into(),
+            None,
+            Instant::now() + BUDGET,
+            None,
+            &mut unresolved,
+        )
+        .is_none());
+        unresolved
+            .expect("the source causing uncertainty must be named")
+            .note(&cache.root)
+    }
+
+    #[test]
+    fn literal_concat_includes_track_exact_files() {
+        for name in ["include", "include_str", "include_bytes"] {
+            let (_temp, mut cache) = fixture();
+            write(&cache.root, "member/src/data/a.txt", "before");
+            write(&cache.root, "member/src/data/unused.txt", "unrelated");
+            write(
+                &cache.root,
+                "member/src/lib.rs",
+                &format!("const DATA: &str = {name}!(concat!(r#\"data/\"#, \"a\", \".txt\",));\n"),
+            );
+            cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+            assert!(valid(&cache).is_some());
+            write(
+                &cache.root,
+                "member/src/data/unused.txt",
+                "changed unrelated",
+            );
+            assert!(
+                valid(&cache).is_some(),
+                "only the exact concat path is an input"
+            );
+            write(&cache.root, "member/src/data/a.txt", "after!");
+            assert!(
+                valid(&cache).is_none(),
+                "{name} input must invalidate the check"
+            );
+        }
+    }
+
+    #[test]
+    fn concat_manifest_dir_uses_nearest_member_manifest() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "member/data/a.txt", "before");
+        write(
+            &cache.root,
+            "member/src/nested/inputs.rs",
+            r#"
+            const DATA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/", "a.txt"));
+        "#,
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(cache
+            .saved
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .files
+            .contains_key(&cache.root.join("member/data/a.txt")));
+        assert!(valid(&cache).is_some());
+        write(&cache.root, "member/data/a.txt", "after!");
+        assert!(valid(&cache).is_none());
+    }
+
+    #[test]
+    fn reporter_fixture_macro_tracks_all_literal_invocations_across_files() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "tests/fixtures/a.txt", "one");
+        write(&cache.root, "tests/fixtures/b.txt", "two");
+        write(&cache.root, "tests/fixtures/unread.txt", "not an input");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture {
+                ($fixture:literal) => { include_str!(concat!("../../tests/fixtures/", $fixture)) };
+            }
+            const A: &str = fixture!("a.txt");
+        "#,
+        );
+        write(
+            &cache.root,
+            "member/src/calls.rs",
+            "const B: &str = fixture!(\"b.txt\");\n",
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        write(
+            &cache.root,
+            "tests/fixtures/unread.txt",
+            "still not an input",
+        );
+        assert!(valid(&cache).is_some());
+        for (file, original) in [("a.txt", "one"), ("b.txt", "two")] {
+            write(&cache.root, &format!("tests/fixtures/{file}"), "changed");
+            assert!(
+                valid(&cache).is_none(),
+                "every resolved invocation is an input"
+            );
+            write(&cache.root, &format!("tests/fixtures/{file}"), original);
+        }
+        write(&cache.root, "tests/fixtures/new.txt", "new input");
+        write(
+            &cache.root,
+            "member/src/calls.rs",
+            "const B: &str = fixture!(\"new.txt\");\n",
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        write(&cache.root, "tests/fixtures/new.txt", "changed new input");
+        assert!(
+            valid(&cache).is_none(),
+            "unchanged definitions must use the current calls"
+        );
+    }
+
+    #[test]
+    fn macro_paths_and_manifest_dir_are_relative_to_the_invocation() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "member/tests/data/a.txt", "before");
+        write(&cache.root, "member/data/b.txt", "before");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! relative { ($name:literal) => { include_bytes!(concat!("data/", $name)) }; }
+            macro_rules! absolute { ($name:literal) => { include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/", $name)) }; }
+        "#,
+        );
+        write(
+            &cache.root,
+            "member/tests/check.rs",
+            r#"
+            const A: &[u8] = relative!("a.txt");
+            const B: &str = absolute!("b.txt");
+        "#,
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        write(&cache.root, "member/tests/data/a.txt", "after!");
+        assert!(valid(&cache).is_none());
+        write(&cache.root, "member/tests/data/a.txt", "before");
+        write(&cache.root, "member/data/b.txt", "after!");
+        assert!(valid(&cache).is_none());
+    }
+
+    #[test]
+    fn unused_fixture_macro_contributes_no_include_input() {
+        let (_temp, cache) = fixture();
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture { ($fixture:literal) => { include_str!(concat!("missing/", $fixture)) }; }
+        "#,
+        );
+        assert!(capture_inputs(&cache).is_some());
+    }
+
+    #[test]
+    fn unresolved_include_names_its_source_with_approved_wording() {
+        let (_temp, cache) = fixture();
+        for source in [
+            "const DATA: &str = include_str!(some_macro!());",
+            "const DATA: &str = include_str!(concat!(\"data/\", some_macro!()));",
+            "const DATA: &str = include_str!(concat!(\"data/\", \"missing.txt\"));",
+        ] {
+            write(&cache.root, "member/src/lib.rs", source);
+            assert_eq!(unresolved_input(&cache), "cargo check completed, but member/src/lib.rs includes a file whose path can't be resolved; diagnostics are provisional");
+        }
+    }
+
+    #[test]
+    fn non_literal_environment_keys_name_their_source_with_approved_wording() {
+        let (_temp, cache) = fixture();
+        for source in [
+            "const DATA: &str = env!(key!());",
+            "const DATA: Option<&str> = option_env!(concat!(\"A\", \"B\"));",
+            "const DATA: &str = include_str!(concat!(env!(key!()), \"/data.txt\"));",
+        ] {
+            write(&cache.root, "member/src/lib.rs", source);
+            assert_eq!(unresolved_input(&cache), "cargo check completed, but member/src/lib.rs reads an environment variable whose name can't be resolved; diagnostics are provisional");
+        }
+    }
+
+    #[test]
+    fn unresolved_fixture_invocations_stay_provisional() {
+        for invocation in [
+            "fixture!(name)",
+            "fixture!(concat!(\"a\", \".txt\"))",
+            "forward!(fixture!(\"a.txt\"))",
+            "macro_rules! forward { () => { fixture!(\"a.txt\") }; }",
+            "forward!(fixture)",
+            "use fixture as alias; alias!(\"a.txt\")",
+        ] {
+            let (_temp, cache) = fixture();
+            write(&cache.root, "member/src/data/a.txt", "input");
+            write(
+                &cache.root,
+                "member/src/lib.rs",
+                r#"
+                macro_rules! fixture { ($fixture:literal) => { include_str!(concat!("data/", $fixture)) }; }
+            "#,
+            );
+            write(&cache.root, "member/src/calls.rs", invocation);
+            assert_eq!(unresolved_input(&cache), "cargo check completed, but member/src/lib.rs includes a file whose path can't be resolved; diagnostics are provisional", "{invocation}");
+        }
+    }
+
+    #[test]
+    fn literal_macro_traversal_is_resolved_exactly_or_refused_outside_workspace() {
+        let (temp, mut cache) = fixture();
+        write(&cache.root, "member/src/data/placeholder.txt", "not read");
+        write(&cache.root, "member/src/outside.txt", "before");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture { ($fixture:literal) => { include_str!(concat!("data/", $fixture)) }; }
+            const DATA: &str = fixture!("../outside.txt");
+        "#,
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        write(&cache.root, "member/src/outside.txt", "after!");
+        assert!(valid(&cache).is_none());
+        fs::write(temp.path().join("outside.txt"), "external").unwrap();
+        write(
+            &cache.root,
+            "member/src/calls.rs",
+            "const DATA: &str = fixture!(\"../../../../outside.txt\");\n",
+        );
+        assert_eq!(unresolved_input(&cache), "cargo check completed, but member/src/lib.rs includes a file whose path can't be resolved; diagnostics are provisional");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn computed_include_refuses_symlink_components() {
+        let (temp, cache) = fixture();
+        let input = temp.path().join("external.txt");
+        fs::write(&input, "external").unwrap();
+        fs::create_dir_all(cache.root.join("target")).unwrap();
+        std::os::unix::fs::symlink(input, cache.root.join("target/link.txt")).unwrap();
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            const DATA: &str = include_str!(concat!("../../target/", "link.txt"));
+        "#,
+        );
+        assert_eq!(unresolved_input(&cache), "cargo check completed, but member/src/lib.rs includes a file whose path can't be resolved; diagnostics are provisional");
+    }
+
+    #[test]
+    fn complex_fixture_matchers_stay_provisional_when_invoked() {
+        for definition in [
+            r#"macro_rules! fixture { ($($fixture:literal),*) => { include_str!(concat!("data/", $($fixture),*)) }; }"#,
+            r#"macro_rules! fixture { ($fixture:literal) => { include_str!(concat!("data/", $fixture)) }; () => { "empty" }; }"#,
+        ] {
+            let (_temp, cache) = fixture();
+            write(
+                &cache.root,
+                "member/src/lib.rs",
+                &format!("{definition}\nconst DATA: &str = fixture!(\"a.txt\");"),
+            );
+            assert_eq!(unresolved_input(&cache), "cargo check completed, but member/src/lib.rs includes a file whose path can't be resolved; diagnostics are provisional");
+        }
+    }
+
+    #[test]
+    fn macro_calls_in_included_rust_with_non_rust_extension_are_scanned() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "member/src/data/a.txt", "before");
+        write(
+            &cache.root,
+            "member/src/calls.inc",
+            "const DATA: &str = fixture!(\"a.txt\");",
+        );
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture { ($fixture:literal) => { include_str!(concat!("data/", $fixture)) }; }
+            include!(concat!("calls", ".inc"));
+        "#,
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        write(&cache.root, "member/src/data/a.txt", "after!");
+        assert!(valid(&cache).is_none());
+    }
+
+    #[test]
+    fn concat_paths_decode_rust_string_escapes() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "member/src/data/a.txt", "before");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            const DATA: &str = include_str!(concat!("d\x61ta/", "\u{61}.txt"));
+        "#,
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        write(&cache.root, "member/src/data/a.txt", "after!");
         assert!(valid(&cache).is_none());
     }
 

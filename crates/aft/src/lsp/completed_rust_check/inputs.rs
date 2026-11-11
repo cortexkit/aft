@@ -1,0 +1,559 @@
+//! Resolve compiler inputs only when the source proves every concrete path.
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use super::{canonical, expired};
+
+const INCLUDE_PROVISIONAL: &str = "cargo check completed, but {file} includes a file whose path can't be resolved; diagnostics are provisional";
+const ENV_PROVISIONAL: &str = "cargo check completed, but {file} reads an environment variable whose name can't be resolved; diagnostics are provisional";
+
+pub(super) struct UnresolvedInput {
+    path: PathBuf,
+    environment: bool,
+}
+
+impl UnresolvedInput {
+    pub(super) fn note(&self, root: &Path) -> String {
+        let file = self.path.strip_prefix(root).unwrap_or(&self.path);
+        let template = if self.environment {
+            ENV_PROVISIONAL
+        } else {
+            INCLUDE_PROVISIONAL
+        };
+        template.replace("{file}", &file.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Token {
+    Literal(String),
+    Text(String),
+    Group(Vec<Token>),
+}
+
+impl Token {
+    fn text(&self, expected: &str) -> bool {
+        matches!(self, Self::Text(text) if text == expected)
+    }
+}
+
+fn tokens(node: tree_sitter::Node<'_>, bytes: &[u8], deadline: Instant) -> Option<Vec<Token>> {
+    let mut result = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        expired(deadline)?;
+        let text = child.utf8_text(bytes).ok()?;
+        match child.kind() {
+            "line_comment" | "block_comment" | "(" | ")" | "[" | "]" | "{" | "}" => {}
+            "string_literal" => result.push(Token::Literal(string_literal(text, deadline)?)),
+            "raw_string_literal" => result.push(Token::Literal(
+                text.get(text.find('"')? + 1..text.rfind('"')?)?
+                    .replace("\r\n", "\n"),
+            )),
+            "token_tree" | "token_tree_pattern" => {
+                result.push(Token::Group(tokens(child, bytes, deadline)?))
+            }
+            "token_binding" => result.extend(tokens(child, bytes, deadline)?),
+            _ => result.push(Token::Text(text.into())),
+        }
+    }
+    Some(result)
+}
+
+fn arguments(tokens: &[Token], deadline: Instant) -> Option<Vec<&[Token]>> {
+    let mut args = Vec::new();
+    let mut start = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        expired(deadline)?;
+        if token.text(",") {
+            if start == index {
+                return None;
+            }
+            args.push(&tokens[start..index]);
+            start = index + 1;
+        }
+    }
+    if start < tokens.len() {
+        args.push(&tokens[start..]);
+    }
+    Some(args)
+}
+
+fn manifest_dir(path: &Path, deadline: Instant) -> Option<String> {
+    for parent in path.parent()?.ancestors() {
+        expired(deadline)?;
+        match fs::symlink_metadata(parent.join("Cargo.toml")) {
+            Ok(meta) if meta.is_file() => return Some(parent.to_str()?.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn expression(
+    tokens: &[Token],
+    path: &Path,
+    bindings: &BTreeMap<String, String>,
+    deadline: Instant,
+) -> Option<String> {
+    expired(deadline)?;
+    match tokens {
+        [Token::Literal(value)] => Some(value.clone()),
+        [Token::Text(name)] => bindings.get(name).cloned(),
+        [name, bang, Token::Group(args)] if name.text("concat") && bang.text("!") => {
+            let mut value = String::new();
+            for arg in arguments(args, deadline)? {
+                value.push_str(&expression(arg, path, bindings, deadline)?);
+            }
+            Some(value)
+        }
+        [name, bang, Token::Group(args)] if name.text("env") && bang.text("!") => {
+            match arguments(args, deadline)?.as_slice() {
+                [[Token::Literal(key)]] if key == "CARGO_MANIFEST_DIR" => {
+                    manifest_dir(path, deadline)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+// Canonicalization alone would hide a symlink in an include's parent directory.
+// Check every component first, including components cancelled by `..`.
+fn include_path(root: &Path, source: &Path, relative: &str, deadline: Instant) -> Option<PathBuf> {
+    let joined = source.parent()?.join(relative);
+    let mut current = PathBuf::new();
+    for component in joined.components() {
+        expired(deadline)?;
+        current.push(component);
+        if fs::symlink_metadata(&current).ok()?.is_symlink() {
+            return None;
+        }
+    }
+    let path = canonical(&joined)?;
+    (path.starts_with(root) && path.is_file()).then_some(path)
+}
+
+struct Definition {
+    name: String,
+    path: PathBuf,
+    parameters: Option<Vec<String>>,
+    includes: Vec<(Vec<Token>, bool)>,
+}
+
+struct Invocation {
+    name: String,
+    path: PathBuf,
+    args: Vec<Token>,
+    nested: bool,
+}
+
+#[derive(Default)]
+pub(super) struct SourceInputs {
+    definitions: Vec<Definition>,
+    invocations: Vec<Invocation>,
+    references: Vec<String>,
+    rust_sources: BTreeSet<PathBuf>,
+    parsed: BTreeSet<PathBuf>,
+}
+
+impl SourceInputs {
+    pub(super) fn needs_parse(&self, path: &Path) -> bool {
+        !self.parsed.contains(path)
+            && (path.extension().is_some_and(|extension| extension == "rs")
+                || self.rust_sources.contains(path))
+    }
+
+    fn refuse<T>(
+        path: &Path,
+        environment: bool,
+        unresolved: &mut Option<UnresolvedInput>,
+    ) -> Option<T> {
+        *unresolved = Some(UnresolvedInput {
+            path: path.into(),
+            environment,
+        });
+        None
+    }
+}
+
+impl SourceInputs {
+    pub(super) fn add(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        bytes: &[u8],
+        deadline: Instant,
+        unresolved: &mut Option<UnresolvedInput>,
+    ) -> Option<(Vec<PathBuf>, Vec<String>)> {
+        std::str::from_utf8(bytes).ok()?;
+        self.parsed.insert(path.into());
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .ok()?;
+        let mut progress = |_: &tree_sitter::ParseState| {
+            if Instant::now() >= deadline {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        };
+        let tree = parser.parse_with_options(
+            &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+        )?;
+        let mut nodes = vec![tree.root_node()];
+        let mut included = Vec::new();
+        let mut env_keys = Vec::new();
+        while let Some(node) = nodes.pop() {
+            expired(deadline)?;
+            if node.kind() == "macro_definition" {
+                let name = node
+                    .child_by_field_name("name")?
+                    .utf8_text(bytes)
+                    .ok()?
+                    .into();
+                let mut cursor = node.walk();
+                let mut rule = None;
+                let mut single = true;
+                for child in node.named_children(&mut cursor) {
+                    expired(deadline)?;
+                    if child.kind() == "macro_rule" {
+                        if rule.is_some() {
+                            single = false;
+                        }
+                        rule = Some(child);
+                    }
+                }
+                let mut definition = Definition {
+                    name,
+                    path: path.into(),
+                    parameters: None,
+                    includes: Vec::new(),
+                };
+                if single {
+                    if let Some(left) = rule.and_then(|rule| rule.child_by_field_name("left")) {
+                        definition.parameters =
+                            parameters(&tokens(left, bytes, deadline)?, deadline);
+                    }
+                }
+                let index = self.definitions.len();
+                self.definitions.push(definition);
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    expired(deadline)?;
+                    if child.kind() == "macro_rule" {
+                        let right = child.child_by_field_name("right")?;
+                        self.scan(
+                            root,
+                            path,
+                            &tokens(right, bytes, deadline)?,
+                            Some(index),
+                            false,
+                            deadline,
+                            &mut included,
+                            &mut env_keys,
+                            unresolved,
+                        )?;
+                    }
+                }
+                continue;
+            }
+            if node.kind() == "macro_invocation" {
+                self.scan(
+                    root,
+                    path,
+                    &tokens(node, bytes, deadline)?,
+                    None,
+                    false,
+                    deadline,
+                    &mut included,
+                    &mut env_keys,
+                    unresolved,
+                )?;
+                continue;
+            }
+            if node.kind() == "identifier" {
+                self.references.push(node.utf8_text(bytes).ok()?.into());
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                expired(deadline)?;
+                nodes.push(child);
+            }
+        }
+        Some((included, env_keys))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        tokens: &[Token],
+        definition: Option<usize>,
+        nested: bool,
+        deadline: Instant,
+        included: &mut Vec<PathBuf>,
+        env_keys: &mut Vec<String>,
+        unresolved: &mut Option<UnresolvedInput>,
+    ) -> Option<()> {
+        let mut index = 0;
+        while index < tokens.len() {
+            expired(deadline)?;
+            if let [Token::Text(name), bang, Token::Group(args), ..] = &tokens[index..] {
+                if bang.text("!") {
+                    let name = name.rsplit("::").next()?;
+                    match name {
+                        "include" | "include_str" | "include_bytes" => {
+                            if !environment_inputs(args, env_keys, deadline)? {
+                                return Self::refuse(path, true, unresolved);
+                            }
+                            let arguments = arguments(args, deadline)?;
+                            let [args] = arguments.as_slice() else {
+                                return Self::refuse(path, false, unresolved);
+                            };
+                            // A prefix is not containment: an unknown tail can
+                            // contain `..`. Expand proven literal calls instead.
+                            if let Some(definition) = definition {
+                                if nested {
+                                    self.definitions[definition].parameters = None;
+                                }
+                                self.definitions[definition]
+                                    .includes
+                                    .push((args.to_vec(), name == "include"));
+                            } else {
+                                let empty = BTreeMap::new();
+                                let target =
+                                    expression(args, path, &empty, deadline).and_then(|relative| {
+                                        include_path(root, path, &relative, deadline)
+                                    });
+                                match target {
+                                    Some(target) => {
+                                        if name == "include" {
+                                            self.rust_sources.insert(target.clone());
+                                        }
+                                        included.push(target);
+                                    }
+                                    None => return Self::refuse(path, false, unresolved),
+                                }
+                            }
+                        }
+                        "env" | "option_env" => {
+                            let args = arguments(args, deadline)?;
+                            match args.first().copied() {
+                                Some([Token::Literal(key)]) => env_keys.push(key.clone()),
+                                _ => return Self::refuse(path, true, unresolved),
+                            }
+                        }
+                        _ => {
+                            self.invocations.push(Invocation {
+                                name: name.into(),
+                                path: path.into(),
+                                args: args.clone(),
+                                nested: nested || definition.is_some(),
+                            });
+                            self.scan(
+                                root, path, args, definition, true, deadline, included, env_keys,
+                                unresolved,
+                            )?;
+                        }
+                    }
+                    index += 3;
+                    continue;
+                }
+            }
+            if let Token::Group(group) = &tokens[index] {
+                self.scan(
+                    root, path, group, definition, nested, deadline, included, env_keys, unresolved,
+                )?;
+            } else if let Token::Text(name) = &tokens[index] {
+                self.references.push(name.clone());
+            }
+            index += 1;
+        }
+        Some(())
+    }
+
+    pub(super) fn resolve(
+        &mut self,
+        root: &Path,
+        deadline: Instant,
+        unresolved: &mut Option<UnresolvedInput>,
+    ) -> Option<Vec<PathBuf>> {
+        let mut included = Vec::new();
+        for definition in &self.definitions {
+            expired(deadline)?;
+            if definition.includes.is_empty() {
+                continue;
+            }
+            for name in &self.references {
+                expired(deadline)?;
+                // Passing a macro by name (including a `use ... as ...`
+                // alias) can hide calls from this deliberately small resolver.
+                if name.rsplit("::").next() == Some(&definition.name) {
+                    return Self::refuse(&definition.path, false, unresolved);
+                }
+            }
+            for invocation in &self.invocations {
+                expired(deadline)?;
+                if invocation.name != definition.name {
+                    continue;
+                }
+                let Some(parameters) = definition
+                    .parameters
+                    .as_ref()
+                    .filter(|_| !invocation.nested)
+                else {
+                    return Self::refuse(&definition.path, false, unresolved);
+                };
+                let Some(args) = arguments(&invocation.args, deadline)
+                    .filter(|args| args.len() == parameters.len())
+                else {
+                    return Self::refuse(&definition.path, false, unresolved);
+                };
+                let mut bindings = BTreeMap::new();
+                for (parameter, arg) in parameters.iter().zip(args) {
+                    expired(deadline)?;
+                    let [Token::Literal(value)] = arg else {
+                        return Self::refuse(&definition.path, false, unresolved);
+                    };
+                    bindings.insert(parameter.clone(), value.clone());
+                }
+                for (input, rust_source) in &definition.includes {
+                    expired(deadline)?;
+                    let target = expression(input, &invocation.path, &bindings, deadline).and_then(
+                        |relative| include_path(root, &invocation.path, &relative, deadline),
+                    );
+                    match target {
+                        Some(target) => {
+                            if *rust_source {
+                                self.rust_sources.insert(target.clone());
+                            }
+                            included.push(target);
+                        }
+                        None => return Self::refuse(&definition.path, false, unresolved),
+                    }
+                }
+            }
+        }
+        Some(included)
+    }
+}
+
+fn parameters(tokens: &[Token], deadline: Instant) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for arg in arguments(tokens, deadline)? {
+        expired(deadline)?;
+        match arg {
+            [Token::Text(name), colon, kind]
+                if name.starts_with('$')
+                    && colon.text(":")
+                    && (kind.text("literal") || kind.text("expr")) =>
+            {
+                if names.contains(name) {
+                    return None;
+                }
+                names.push(name.clone());
+            }
+            _ => return None,
+        }
+    }
+    Some(names)
+}
+
+fn environment_inputs(tokens: &[Token], keys: &mut Vec<String>, deadline: Instant) -> Option<bool> {
+    let mut index = 0;
+    while index < tokens.len() {
+        expired(deadline)?;
+        if let [name, bang, Token::Group(args), ..] = &tokens[index..] {
+            if (name.text("env") || name.text("option_env")) && bang.text("!") {
+                match arguments(args, deadline)?.first().copied() {
+                    Some([Token::Literal(key)]) => keys.push(key.clone()),
+                    _ => return Some(false),
+                }
+                index += 3;
+                continue;
+            }
+        }
+        if let Token::Group(args) = &tokens[index] {
+            if !environment_inputs(args, keys, deadline)? {
+                return Some(false);
+            }
+        }
+        index += 1;
+    }
+    Some(true)
+}
+
+fn string_literal(text: &str, deadline: Instant) -> Option<String> {
+    let normalized = text
+        .strip_prefix('"')?
+        .strip_suffix('"')?
+        .replace("\r\n", "\n");
+    let mut chars = normalized.chars().peekable();
+    let mut value = String::new();
+    while let Some(ch) = chars.next() {
+        expired(deadline)?;
+        if ch != '\\' {
+            value.push(ch);
+            continue;
+        }
+        value.push(match chars.next()? {
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '0' => '\0',
+            'x' => {
+                let code = chars.next()?.to_digit(16)? * 16 + chars.next()?.to_digit(16)?;
+                if code > 0x7f {
+                    return None;
+                }
+                char::from_u32(code)?
+            }
+            'u' => {
+                if chars.next()? != '{' {
+                    return None;
+                }
+                let mut code = 0u32;
+                let mut digits = 0;
+                loop {
+                    expired(deadline)?;
+                    match chars.next()? {
+                        '}' if digits > 0 => break,
+                        '_' if digits > 0 => {}
+                        ch => {
+                            digits += 1;
+                            if digits > 6 {
+                                return None;
+                            }
+                            code = code.checked_mul(16)?.checked_add(ch.to_digit(16)?)?;
+                        }
+                    }
+                }
+                char::from_u32(code)?
+            }
+            '\n' => {
+                while chars
+                    .peek()
+                    .is_some_and(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'))
+                {
+                    expired(deadline)?;
+                    chars.next();
+                }
+                continue;
+            }
+            _ => return None,
+        });
+    }
+    Some(value)
+}
