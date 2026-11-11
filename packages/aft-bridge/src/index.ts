@@ -24,6 +24,7 @@ export {
 export {
   formatForegroundResult,
   formatSeconds,
+  formatUnknownPtyExit,
   isLiveBackgroundTaskReply,
   isTerminalStatus,
   monotonicNowMs,

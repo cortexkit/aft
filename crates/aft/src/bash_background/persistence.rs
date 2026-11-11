@@ -1968,6 +1968,7 @@ fn is_zero(value: &usize) -> bool {
 pub enum ExitMarker {
     Code(i32),
     Killed,
+    Unknown,
 }
 
 impl PersistedTask {
@@ -4709,6 +4710,9 @@ pub(super) fn read_exit_marker_with_reason(
     if content == "killed" {
         return Ok(Some(ExitMarker::Killed));
     }
+    if content == "unknown" {
+        return Ok(Some(ExitMarker::Unknown));
+    }
     Ok(content.parse::<i32>().ok().map(ExitMarker::Code))
 }
 
@@ -7232,6 +7236,18 @@ mod tests {
         assert_eq!(counts.metadata_reads, 1);
         // A missing marker still needs only one typed metadata decode.
         assert_eq!(counts.parses, 1);
+    }
+
+    #[test]
+    fn pty_unknown_exit_marker_round_trips() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        let mut handles = TaskIoHandles::create(&task, BgMode::Pty, false).unwrap();
+        handles.write(TaskArtifact::Exit, b"unknown").unwrap();
+        assert_eq!(
+            read_exit_marker(&task.paths).unwrap(),
+            Some(ExitMarker::Unknown)
+        );
     }
 
     #[cfg(unix)]

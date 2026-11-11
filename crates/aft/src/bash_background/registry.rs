@@ -17996,6 +17996,11 @@ fn terminal_metadata_from_marker(
             terminal_exit_code_for_status(&BgTaskStatus::Killed),
             reason,
         ),
+        ExitMarker::Unknown => metadata.mark_terminal(
+            BgTaskStatus::FateUnknown,
+            None,
+            Some(super::PTY_EXIT_STATUS_UNKNOWN_REASON.to_owned()),
+        ),
     }
     metadata
 }
@@ -21421,6 +21426,47 @@ mod tests {
 
         assert_eq!(terminal.status, BgTaskStatus::Killed);
         assert_eq!(terminal.exit_code, Some(137));
+    }
+
+    #[test]
+    fn pty_unknown_exit_marker_has_no_exit_code_and_preserves_real_kills() {
+        let mut metadata = PersistedTask::starting(
+            "bash-lost".to_string(),
+            "session".to_string(),
+            "interactive".to_string(),
+            PathBuf::from("."),
+            None,
+            None,
+            true,
+            true,
+        );
+        metadata.mode = BgMode::Pty;
+        let terminal = terminal_metadata_from_marker(metadata.clone(), ExitMarker::Unknown, None);
+        assert_eq!(terminal.status, BgTaskStatus::FateUnknown);
+        assert_eq!(terminal.exit_code, None);
+        assert_eq!(
+            crate::subc_format::format_bash_task_status_header(
+                &terminal.task_id,
+                "fate_unknown",
+                terminal.exit_code,
+                terminal.status_reason.as_deref(),
+            ),
+            "Task bash-lost: exit status unknown (AFT could not read how it ended)"
+        );
+        let killed =
+            terminal_metadata_from_marker(metadata, ExitMarker::Killed, Some("bash_kill".into()));
+        assert_eq!(killed.status, BgTaskStatus::Killed);
+        assert_eq!(killed.exit_code, Some(137));
+        assert_eq!(killed.status_reason.as_deref(), Some("bash_kill"));
+        assert_eq!(
+            crate::subc_format::format_bash_task_status_header(
+                &killed.task_id,
+                "killed",
+                killed.exit_code,
+                killed.status_reason.as_deref(),
+            ),
+            "Task bash-lost: killed (exit 137)"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ import {
   coerceBoolean,
   escalationAskText,
   formatBashOutputPages,
+  formatUnknownPtyExit,
   formatWatchWaited,
   interruptedWatchTail,
   isBridgeTransportTimeout,
@@ -2097,7 +2098,8 @@ async function formatBashStatus(
   const exit = typeof details.exit_code === "number" ? ` (exit ${details.exit_code})` : "";
   const dur =
     typeof details.duration_ms === "number" ? ` ${Math.round(details.duration_ms / 1000)}s` : "";
-  let text = `Task ${taskId}: ${details.status}${exit}${dur}`;
+  let text =
+    formatUnknownPtyExit(taskId, details) ?? `Task ${taskId}: ${details.status}${exit}${dur}`;
   if (details.live_descendants_summary) {
     text += ` · ${details.live_descendants_summary}`;
   }

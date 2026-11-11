@@ -1100,6 +1100,8 @@ pub struct BgTaskInfo {
     pub status_reason: Option<String>,
 }
 
+pub(crate) const PTY_EXIT_STATUS_UNKNOWN_REASON: &str = "AFT could not read how it ended";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BgTaskStatus {

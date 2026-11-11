@@ -138,7 +138,7 @@ fn assert_floor(response: crate::protocol::Response, path: &Path) {
     assert_eq!(
         response.data["message"],
         format!(
-            "path '{}' is denied by the access policy floor",
+            "path '{}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.",
             path.display()
         )
     );

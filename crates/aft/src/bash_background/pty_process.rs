@@ -771,7 +771,11 @@ pub(crate) fn spawn_waiter(
                         coordinator.session_id,
                         coordinator.task_id
                     );
-                    break ExitMarker::Killed;
+                    break if was_killed.load(Ordering::SeqCst) {
+                        ExitMarker::Killed
+                    } else {
+                        ExitMarker::Unknown
+                    };
                 }
             }
         };
@@ -796,6 +800,7 @@ fn write_exit_marker(file: &mut File, marker: &ExitMarker) -> io::Result<()> {
     let content = match marker {
         ExitMarker::Code(code) => code.to_string(),
         ExitMarker::Killed => "killed".to_string(),
+        ExitMarker::Unknown => "unknown".to_string(),
     };
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
@@ -833,6 +838,7 @@ mod tests {
     #[derive(Debug)]
     struct InterruptedOnceChild {
         waits: usize,
+        lost_exit: bool,
     }
 
     impl ChildKiller for InterruptedOnceChild {
@@ -851,6 +857,9 @@ mod tests {
         }
 
         fn wait(&mut self) -> io::Result<ExitStatus> {
+            if self.lost_exit {
+                return Err(io::Error::from_raw_os_error(libc::ECHILD));
+            }
             self.waits += 1;
             if self.waits == 1 {
                 Err(io::Error::from(io::ErrorKind::Interrupted))
@@ -884,7 +893,10 @@ mod tests {
         let exit_observed = Arc::new(AtomicBool::new(false));
 
         spawn_waiter(
-            Box::new(InterruptedOnceChild { waits: 0 }),
+            Box::new(InterruptedOnceChild {
+                waits: 0,
+                lost_exit: false,
+            }),
             exit_file,
             was_killed,
             Arc::clone(&exit_observed),
@@ -901,6 +913,36 @@ mod tests {
         }
         wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(fs::read_to_string(exit_path).unwrap(), "0");
+    }
+
+    #[test]
+    fn pty_waiter_lost_exit_is_unknown_but_real_kill_stays_killed() {
+        for (killed, expected) in [(false, "unknown"), (true, "killed")] {
+            let temp = tempfile::tempdir().unwrap();
+            let exit_path = temp.path().join("task.exit");
+            let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+            let coordinator = Arc::new(CompletionCoordinator::new(
+                "task".to_string(),
+                "session".to_string(),
+                wake_tx,
+            ));
+            let exit_observed = Arc::new(AtomicBool::new(false));
+            spawn_waiter(
+                Box::new(InterruptedOnceChild {
+                    waits: 0,
+                    lost_exit: true,
+                }),
+                File::create(&exit_path).unwrap(),
+                Arc::new(AtomicBool::new(killed)),
+                Arc::clone(&exit_observed),
+                Arc::clone(&coordinator),
+            )
+            .unwrap();
+            coordinator.signal_one_done();
+            wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(exit_observed.load(Ordering::SeqCst));
+            assert_eq!(fs::read_to_string(exit_path).unwrap(), expected);
+        }
     }
 
     #[derive(Debug)]

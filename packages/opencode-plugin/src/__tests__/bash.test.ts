@@ -1668,6 +1668,29 @@ describe("bash_status tool", () => {
     }
   });
 
+  test("PTY lost exit status uses the approved line and real kills stay killed", async () => {
+    for (const [status, exitCode, reason, expected] of [
+      [
+        "fate_unknown",
+        null,
+        "AFT could not read how it ended",
+        "Task bash-lost: exit status unknown (AFT could not read how it ended)",
+      ],
+      ["killed", 137, "bash_kill", "Task bash-lost: killed (exit 137) 1s"],
+    ] as const) {
+      const { statusTool } = makeCtx(() => ({
+        success: true,
+        status,
+        mode: "pty",
+        exit_code: exitCode,
+        duration_ms: 1000,
+        status_reason: reason,
+      }));
+      const text = await statusTool.execute({ taskId: "bash-lost" }, createMockSdkContext());
+      expect(text).toBe(expected);
+    }
+  });
+
   test("bash_kill preserves its outcome and appends the durable-revocation warning", async () => {
     const warning =
       "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";

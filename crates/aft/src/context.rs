@@ -12062,10 +12062,7 @@ impl AppContext {
             AccessDecision::Deny(AccessDenial::Floor) => Err(crate::protocol::Response::error(
                 req_id,
                 "denied_floor",
-                format!(
-                    "path '{}' is denied by the access policy floor",
-                    original.display()
-                ),
+                policy.floor_denial_message(operation, &identity, original, owned_artifact),
             )),
             AccessDecision::Deny(AccessDenial::OutsideRoots | AccessDenial::ScopeGrants(_)) => {
                 let root = self

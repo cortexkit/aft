@@ -4,6 +4,17 @@ import { isTerminalBashStatus } from "./protocol.js";
 
 export { TERMINAL_BG_TASK_STATUSES } from "./protocol.js";
 
+/** Only a lost PTY wait status means the process ended without an observed exit code. */
+export function formatUnknownPtyExit(
+  taskId: string,
+  data: { status?: unknown; status_reason?: unknown },
+): string | undefined {
+  if (data.status !== "fate_unknown" || data.status_reason !== "AFT could not read how it ended") {
+    return undefined;
+  }
+  return `Task ${taskId}: exit status unknown (AFT could not read how it ended)`;
+}
+
 /** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
 export function formatSeconds(ms: number): string {
   return `${Number((ms / 1000).toFixed(1))}s`;
