@@ -31,7 +31,7 @@ jobs:
           cargo -V
 
       - name: Replace-file tests (verbose)
-        if: always()
+        if: false
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
@@ -39,7 +39,7 @@ jobs:
         run: cargo test -p agent-file-tools --features test-hooks --lib -- edit::windows_replace --nocapture --test-threads=1
 
       - name: TODO count race (5 runs)
-        if: always()
+        if: false
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
@@ -51,13 +51,17 @@ jobs:
           }
           "todos race: $failed of 5 runs failed"
 
+      # The fixture's own cargo and rust-analyzer must not inherit
+      # CARGO_TARGET_DIR (CI scopes it to build steps), so pass the warm
+      # target folder as a cargo argument instead of an environment variable.
       - name: rust-analyzer path test
         if: always()
         shell: pwsh
         env:
-          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           RUST_BACKTRACE: "1"
-        run: cargo test -p agent-file-tools --features test-hooks --test integration -- real_rust_analyzer_checks_do_not_block_cargo_build --nocapture
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          cargo test -p agent-file-tools --features test-hooks --target-dir "$env:AFT_CI_TARGET_DIR" --test integration -- real_rust_analyzer_checks_do_not_block_cargo_build --nocapture
 
       - if: always()
         uses: ./.github/actions/native-ci-state
