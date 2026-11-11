@@ -128,6 +128,29 @@ fn unconfigured_binding_refusal_is_info_once_per_session_and_agent() {
         unconfigured_binding_refusals_total() >= before + 4,
         "count suppressed attempts too"
     );
+
+    let mut logged = HashSet::new();
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        for (session, expected_keys) in [
+            ("session-a", 1),
+            ("session-a", 1),
+            ("session-b", 2),
+            ("session-b", 2),
+            ("session-c", 1),
+            ("session-a", 2),
+        ] {
+            log_unconfigured_binding_refusal(&mut logged, session, "agent", "no_binding_row", 2);
+            assert_eq!(logged.len(), expected_keys);
+        }
+    });
+    assert_eq!(lines.len(), 4, "a cleared session may log again: {lines:?}");
+    assert!(
+        lines.iter().all(|line| line.starts_with("INFO ")),
+        "{lines:?}"
+    );
+    assert!(lines[0].contains("session-a"), "{lines:?}");
+    assert!(lines[2].contains("session-c"), "{lines:?}");
+    assert!(lines[3].contains("session-a"), "{lines:?}");
 }
 
 #[test]

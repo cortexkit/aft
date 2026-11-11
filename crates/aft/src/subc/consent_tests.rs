@@ -4283,6 +4283,26 @@ fn consent_scope_vanished_directory_is_info_once_even_after_memo_pruning() {
         lines.iter().all(|line| line.starts_with("WARN ")),
         "{lines:?}"
     );
+
+    let mut probes = DirectoryScopeProbes::default();
+    for index in 0..DIRECTORY_SCOPE_MISSING_LOG_CAP {
+        assert!(probes.note_fallback(&parent.join(index.to_string()), "directory does not exist"));
+        assert_eq!(probes.missing_logged.len(), index + 1);
+    }
+    assert!(!probes.note_fallback(&parent.join("0"), "directory does not exist"));
+    assert_eq!(probes.missing_logged.len(), DIRECTORY_SCOPE_MISSING_LOG_CAP);
+    assert!(probes.note_fallback(&parent.join("next"), "directory does not exist"));
+    assert_eq!(
+        probes.missing_logged.len(),
+        1,
+        "a new scope clears the full set"
+    );
+    assert!(probes.note_fallback(&parent.join("0"), "directory does not exist"));
+    assert_eq!(
+        probes.missing_logged.len(),
+        2,
+        "an older scope may log again"
+    );
 }
 
 #[cfg(unix)]

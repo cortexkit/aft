@@ -365,6 +365,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Internal permission-error scan stops after 1,000 matching lines to select one explanatory note; it never truncates the command output or returns a result list.",
     },
     ExclusionEntry {
+        file: "gh_shim_speech/service.rs",
+        enclosing_item: "log_unconfigured_binding_refusal",
+        location_or_primitive: "UNCONFIGURED_BINDING_LOG_CAP, cap, clear",
+        reason: "Internal INFO-log deduplication history is cleared at capacity; older sessions may log again, but refusals and agent-visible result lists are unchanged.",
+    },
+    ExclusionEntry {
+        file: "subc/consent.rs",
+        enclosing_item: "DirectoryScopeProbes::note_fallback",
+        location_or_primitive: "DIRECTORY_SCOPE_MISSING_LOG_CAP, clear",
+        reason: "Internal vanished-directory INFO-log history is cleared at capacity; older scopes may log again, without changing the original file grant or any agent-visible result list.",
+    },
+    ExclusionEntry {
         file: "gh_shim_speech/start_view/sweep.rs",
         enclosing_item: "sweep_entries",
         location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",

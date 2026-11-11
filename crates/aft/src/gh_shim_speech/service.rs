@@ -50,26 +50,50 @@ pub(crate) fn unconfigured_binding_refusals_total() -> u64 {
     UNCONFIGURED_BINDING_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+const UNCONFIGURED_BINDING_LOG_CAP: usize = 4_096;
+
 fn unconfigured_binding_refusal(session: &str, agent: &str, detail: String) -> Refusal {
     static LOGGED: std::sync::OnceLock<Mutex<HashSet<(String, String)>>> =
         std::sync::OnceLock::new();
     UNCONFIGURED_BINDING_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Ordinary sessions need not bind any repository to the launching agent.
-    // Keep the refusal intact, but report that expected absence only once.
-    if LOGGED
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert((session.to_owned(), agent.to_owned()))
-    {
-        crate::slog_info!(
-            "gh speech binding verification refused: {}",
-            serde_json::json!({"reason": "binding_unverifiable", "detail": detail, "session": session, "agent": agent})
-        );
-    }
+    // Keep the refusal intact and suppress repeats while the log key is retained.
+    log_unconfigured_binding_refusal(
+        &mut LOGGED
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        session,
+        agent,
+        &detail,
+        UNCONFIGURED_BINDING_LOG_CAP,
+    );
     let mut refusal = Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable");
     refusal.detail = Some(detail);
     refusal
+}
+
+fn log_unconfigured_binding_refusal(
+    logged: &mut HashSet<(String, String)>,
+    session: &str,
+    agent: &str,
+    detail: &str,
+    cap: usize,
+) {
+    let key = (session.to_owned(), agent.to_owned());
+    if logged.contains(&key) {
+        return;
+    }
+    // Bound history to 4,096 session/agent keys in the long-lived daemon.
+    // A new key clears a full set; an older session may log once more after that.
+    if logged.len() >= cap {
+        logged.clear();
+    }
+    logged.insert(key);
+    crate::slog_info!(
+        "gh speech binding verification refused: {}",
+        serde_json::json!({"reason": "binding_unverifiable", "detail": detail, "session": session, "agent": agent})
+    );
 }
 
 #[cfg(test)]

@@ -2027,6 +2027,8 @@ impl DirectoryScopeProbe {
     }
 }
 
+const DIRECTORY_SCOPE_MISSING_LOG_CAP: usize = 4_096;
+
 #[derive(Default)]
 struct DirectoryScopeProbes {
     probes: HashMap<PathBuf, Arc<DirectoryScopeProbe>>,
@@ -2059,6 +2061,14 @@ impl DirectoryScopeProbes {
 
     fn note_fallback(&mut self, directory: &Path, reason: &'static str) -> bool {
         if reason == "directory does not exist" {
+            if self.missing_logged.contains(directory) {
+                return false;
+            }
+            // Bound vanished-scope log history in the long-lived daemon.
+            // A new scope clears the full set; older scopes may then log again.
+            if self.missing_logged.len() >= DIRECTORY_SCOPE_MISSING_LOG_CAP {
+                self.missing_logged.clear();
+            }
             return self.missing_logged.insert(directory.to_path_buf());
         }
         match self.logged.entry((directory.to_path_buf(), reason)) {
