@@ -11,7 +11,49 @@ use crate::bash_rewrite::rules::{
     SedRule, TailRule,
 };
 use crate::context::AppContext;
-use crate::protocol::Response;
+use crate::protocol::{RawRequest, Response};
+
+/// The application registers the four handlers that can execute a rewrite.
+pub struct RewriteDispatch {
+    pub read: fn(&RawRequest, &AppContext) -> Response,
+    pub grep: fn(&RawRequest, &AppContext) -> Response,
+    pub glob: fn(&RawRequest, &AppContext) -> Response,
+    pub edit_match: fn(&RawRequest, &AppContext) -> Response,
+}
+
+static HANDLERS: OnceLock<RewriteDispatch> = OnceLock::new();
+
+pub fn register(handlers: RewriteDispatch) {
+    let _ = HANDLERS.set(handlers);
+}
+
+fn run_with(
+    handlers: Option<&RewriteDispatch>,
+    request: &RawRequest,
+    ctx: &AppContext,
+) -> Response {
+    let Some(handlers) = handlers else {
+        // An accepted rewrite must never turn into native shell execution,
+        // even when the application has not registered rewrite handlers.
+        return Response::error(
+            &request.id,
+            "bash_rewrite_unavailable",
+            "bash rewrite handlers are not registered; command was not started",
+        );
+    };
+    let handler = match request.command.as_str() {
+        "read" => handlers.read,
+        "grep" => handlers.grep,
+        "glob" => handlers.glob,
+        "edit_match" => handlers.edit_match,
+        _ => unreachable!("rewrite target is declared by a built-in rule"),
+    };
+    handler(request, ctx)
+}
+
+pub(super) fn run(request: &RawRequest, ctx: &AppContext) -> Response {
+    run_with(HANDLERS.get(), request, ctx)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -120,6 +162,24 @@ pub fn dispatch_for_request(
     host_tool_names: &crate::host_tool_names::HostToolNames,
     ctx: &AppContext,
 ) -> Option<Response> {
+    dispatch_for_request_with_handlers(
+        command,
+        request_id,
+        session_id,
+        host_tool_names,
+        ctx,
+        HANDLERS.get(),
+    )
+}
+
+fn dispatch_for_request_with_handlers(
+    command: &str,
+    request_id: &str,
+    session_id: Option<&str>,
+    host_tool_names: &crate::host_tool_names::HostToolNames,
+    ctx: &AppContext,
+    handlers: Option<&RewriteDispatch>,
+) -> Option<Response> {
     if !ctx.config().experimental_bash_rewrite {
         record_native(
             request_id,
@@ -128,6 +188,17 @@ pub fn dispatch_for_request(
             "experimental bash rewriting is disabled",
         );
         return None;
+    }
+
+    // Shape checks may themselves query a typed handler (for example find's
+    // glob comparison). Refuse before those checks can mistake an unavailable
+    // handler for an unfaithful rewrite and choose native bash instead.
+    if handlers.is_none() {
+        return Some(Response::error(
+            request_id,
+            "bash_rewrite_unavailable",
+            "bash rewrite handlers are not registered; command was not started",
+        ));
     }
 
     let parsed = crate::bash_rewrite::parser::parse(command);
@@ -200,6 +271,38 @@ pub fn dispatch_for_request(
 mod tests {
     use super::*;
     use crate::bash_rewrite::catalog::ControlRole;
+
+    #[test]
+    fn unregistered_rewrite_refuses_without_native_execution_or_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("notes.txt");
+        std::fs::write(&file, "before\n").unwrap();
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(root.path().join("storage")),
+                experimental_bash_rewrite: true,
+                ..crate::config::Config::default()
+            },
+        );
+        // None is the caller's native-shell route; an accepted but unavailable
+        // rewrite must instead return an error carrying the request id.
+        let response = dispatch_for_request_with_handlers(
+            "echo after >> notes.txt",
+            "unregistered",
+            None,
+            &crate::host_tool_names::HostToolNames::default(),
+            &ctx,
+            None,
+        )
+        .expect("accepted rewrite must not fall back to bash");
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "bash_rewrite_unavailable");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "before\n");
+        assert_eq!(response.id, "unregistered");
+        assert!(route_record("unregistered").is_none());
+    }
 
     #[test]
     fn dispatch_parses_once_even_when_every_rule_declines() {

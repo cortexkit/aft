@@ -77,6 +77,7 @@ fn hard_kill_for(params: &BashParams) -> crate::bash_background::HardKill {
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
+    super::register_shell_handlers();
     let launch_started = std::time::Instant::now();
     let raw_params = req
         .params
