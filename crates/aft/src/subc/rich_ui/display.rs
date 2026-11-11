@@ -191,6 +191,7 @@ impl Drop for Guard {
 }
 
 pub(crate) fn enter(key_value: Option<&crate::db::call_ledger::Key>) -> Guard {
+    crate::subc::lower_hooks::register();
     let capture = key_value.and_then(|key_value| CALLS.lock().ok()?.get(&key(key_value)).cloned());
     if let Some(capture) = &capture {
         if let Ok(mut capture) = capture.lock() {
@@ -781,15 +782,7 @@ fn retry_reply(bytes: &[u8]) -> bool {
     )
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct TaskDisplay {
-    pub identity: Identity,
-    pub capture_key: String,
-    pub reply_produced: bool,
-    pub deferred: bool,
-    pub held_ms: Option<u64>,
-    pub attempted: bool,
-}
+pub(crate) use crate::bash_background::frames::TaskDisplay;
 
 pub(crate) fn current_task() -> Option<TaskDisplay> {
     ACTIVE.with(|slot| {
@@ -806,80 +799,7 @@ pub(crate) fn current_task() -> Option<TaskDisplay> {
     })
 }
 
-/// Build only scalar facts from execution metadata. Unknown fate never implies
-/// an exit code; a kill AFT performed is distinguished from an ordinary exit.
-pub(crate) fn bash_bodies(
-    metadata: &crate::bash_background::persistence::PersistedTask,
-    output_bytes: Option<u64>,
-    streams: Option<(String, String)>,
-) -> (Value, Value) {
-    use crate::protocol::BgTaskStatus;
-    let remote = metadata
-        .remote
-        .as_ref()
-        .filter(|_| !metadata.local_fallback_started);
-    let execution = if remote.is_some() { "remote" } else { "local" };
-    let terminal = metadata.is_terminal();
-    let mut record = json!({"outcome":if metadata.status == BgTaskStatus::Completed && metadata.exit_code == Some(0) {"success"} else if terminal {"error"} else {"success"},"phase":if terminal {"foreground_finished"} else {"background_started"},"execution":execution});
-    let mut detail =
-        json!({"schema":"aft/bash-detail/1","revision":1,"phase":"foreground_finished"});
-    if let Some(remote) = remote {
-        if let Some(platform) = remote
-            .accepted_platform
-            .as_ref()
-            .or(remote.requested_platform.as_ref())
-        {
-            record["target"] = serde_json::to_value(platform).unwrap_or(Value::Null);
-            detail["target"] = record["target"].clone();
-        }
-        detail["execution"] = json!("remote");
-    }
-    if let Some(bytes) = output_bytes {
-        record["outputBytes"] = json!(bytes);
-    }
-    if !terminal {
-        record["taskId"] = json!(metadata.task_id);
-    }
-    if metadata.status == BgTaskStatus::FateUnknown
-        || (metadata.status == BgTaskStatus::Killed
-            && (!metadata.group_kill_sent
-                || metadata
-                    .live_descendants
-                    .as_ref()
-                    .is_some_and(|processes| !processes.is_empty())))
-    {
-        record["reason"] = json!("fate_unknown");
-    } else if terminal {
-        let reason = match metadata.status {
-            BgTaskStatus::Killed => "killed",
-            BgTaskStatus::TimedOut => "timed_out",
-            _ => "exited",
-        };
-        if reason != "exited"
-            || metadata.exit_code.is_some()
-            || metadata.status == BgTaskStatus::Completed
-        {
-            record["endReason"] = json!(reason);
-        }
-        if reason != "exited" {
-            record["reason"] = json!(reason);
-        }
-        if let Some(exit) = metadata.exit_code {
-            record["exitCode"] = json!(exit);
-        }
-    }
-    if let Some((stdout, stderr)) = streams {
-        if metadata.mode == crate::bash_background::persistence::BgMode::Pty {
-            detail["pty"] = json!(stdout);
-        } else {
-            detail["stdout"] = json!(stdout);
-            detail["stderr"] = json!(stderr);
-        }
-    } else {
-        detail["outputUnavailable"] = json!("not_retained");
-    }
-    (record, detail)
-}
+pub(crate) use crate::bash_background::frames::bash_bodies;
 
 pub(crate) fn bash_reply(display: &mut TaskDisplay, body: (Value, Value), deferred: bool) {
     let capture = CALLS

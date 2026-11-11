@@ -2,6 +2,8 @@
 //! reaps them, output buffering/compression, and on-disk persistence so tasks
 //! survive a bridge restart.
 
+pub(crate) mod frames;
+
 pub mod buffer;
 #[cfg(unix)]
 mod exit_observer;

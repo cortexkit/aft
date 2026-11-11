@@ -42,9 +42,9 @@ use crate::runtime_drain;
 use crate::sandbox_spawn::{AuthenticatedPrincipal, PrincipalTrust};
 
 use subc_protocol::manifest::{
-    Bindings, Concurrency, ConsumerRole, ExecutionMode, IdentityBinding, IdentityScope,
-    ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding,
-    StorageKind, StorageScope, Tool, TrustTier,
+    Bindings, Concurrency, ConsumerRole, IdentityBinding, IdentityScope, ManagementOperation,
+    ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+    StorageScope, Tool, TrustTier,
 };
 use subc_protocol::session::{
     HealthReport, HealthStatus, ModuleControlCommand, ModuleControlRequest, ModuleControlResponse,
@@ -210,6 +210,7 @@ mod bind_log;
 mod call_policy;
 pub(crate) mod call_yield;
 mod carrier_read_only;
+pub(crate) mod lower_hooks;
 #[cfg(test)]
 mod tool_result_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
@@ -219,7 +220,6 @@ mod bash_grant_tests;
 mod bash_selector_tests;
 mod codemode;
 mod consent;
-pub(crate) use consent::directory_scope;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
 mod diagnostics_findings;
@@ -243,9 +243,6 @@ mod views_idle_checkout_tests;
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;
-pub(crate) use secret_consent::{
-    current_call_scopes, current_secret_audit_scope, resolve_current_secret_label, LaunchDecision,
-};
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
@@ -278,16 +275,12 @@ mod tool_provider;
 mod wire;
 mod work_step;
 
-pub(crate) use self::tool_provider::WORKER_REPLY_MARGIN_MS;
-
 use self::health::{
     build_health_report, route_bind_deadline_refusal, warn_slow_pending_binds,
     warn_slow_running_interactive_jobs, DeferredBashWaitGuard, DispatchPathMetrics,
     HealthRollupCache, HealthRollupWorker, ReapBlockerCensus, ResponseTaskGuard, UnboundRetention,
 };
-pub(crate) use self::manifest::is_native_plumbing_call;
 pub(crate) use self::manifest::is_subc_native_plumbing_tool;
-pub(crate) use self::manifest::tool_call_is_mutating;
 use self::manifest::{
     build_manifest_without, command_lane, control_flags, control_ops, is_bash_family_tool,
     is_subc_agent_core_tool,
@@ -4445,6 +4438,7 @@ fn run_subc_mode_with_probe(
     user_config_path: Option<PathBuf>,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    lower_hooks::register();
     // One watch on the user config file serves every root in this process:
     // an edit asks each live root to reload its config.
     let _user_config_watch = user_config_path.clone().map(|path| {

@@ -13,12 +13,7 @@ const MAX_CALLS: usize = 64;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Identity {
-    pub runner: Principal,
-    pub call_key: String,
-    pub schema_pin: String,
-}
+pub(crate) use crate::bash_background::frames::Identity;
 
 #[derive(Clone)]
 pub(crate) struct Entry {
