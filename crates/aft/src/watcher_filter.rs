@@ -162,17 +162,6 @@ pub use crate::logging::RescanReason;
 
 pub(crate) const DIRECTORY_ARRIVAL_INFO: &str = "directory arrival";
 
-impl RescanReason {
-    fn from_event_info(info: Option<&str>) -> Self {
-        match info {
-            Some("rescan: buffer overflow") => Self::BufferOverflow,
-            Some("rescan: kernel dropped") => Self::KernelDropped,
-            Some("rescan: user dropped") => Self::UserDropped,
-            _ => Self::Unknown,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatcherDispatchEvent {
     Paths(Vec<PathBuf>),

@@ -4425,3 +4425,14 @@ impl RescanReason {
         }
     }
 }
+
+impl RescanReason {
+    pub(crate) fn from_event_info(info: Option<&str>) -> Self {
+        match info {
+            Some("rescan: buffer overflow") => Self::BufferOverflow,
+            Some("rescan: kernel dropped") => Self::KernelDropped,
+            Some("rescan: user dropped") => Self::UserDropped,
+            _ => Self::Unknown,
+        }
+    }
+}
