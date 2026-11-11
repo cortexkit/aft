@@ -966,6 +966,7 @@ mod tests {
         let guard = SpawnedPtyChild {
             master: Some(pair.master),
             child: Some(Box::new(MasterCloseCheckedChild(fd))),
+            root: None,
         };
         drop(guard);
     }
