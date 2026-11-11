@@ -264,7 +264,14 @@ pub(crate) fn fingerprint(
     // or directory may have changed since the reader observed that event.
     began: Option<SystemTime>,
 ) -> Option<Fingerprint> {
-    fingerprint_with_reason(root, runtime, previous, deadline, began, &mut None)
+    let mut unresolved = None;
+    let captured =
+        fingerprint_with_reason(root, runtime, previous, deadline, began, &mut unresolved);
+    #[cfg(feature = "test-hooks")]
+    if let Some(unresolved) = unresolved {
+        eprintln!("{}", unresolved.note(root));
+    }
+    captured
 }
 
 /// Test-only access to the production fingerprint for paired release probes.
