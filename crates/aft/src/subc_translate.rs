@@ -1111,36 +1111,7 @@ fn agent_args_map(args: Value) -> Map<String, Value> {
     }
 }
 
-pub(crate) fn supports_tool(bare_name: &str) -> bool {
-    matches!(
-        bare_name,
-        "bash"
-            | "powershell"
-            | "status"
-            | "read"
-            | "write"
-            | "edit"
-            | "apply_patch"
-            | "grep"
-            | "glob"
-            | "search"
-            | "outline"
-            | "zoom"
-            | "inspect"
-            | "callgraph"
-            | "conflicts"
-            | "ast_search"
-            | "ast_replace"
-            | "delete"
-            | "move"
-            | "import"
-            | "safety"
-            | "bash_status"
-            | "bash_kill"
-            | "bash_write"
-            | "bash_watch"
-    )
-}
+pub(crate) use crate::host_tool_names::supports_tool;
 
 fn insert_resolved_file(map: &mut Map<String, Value>, project_root: &Path, file_path: &str) {
     let resolved = resolve_path_from_project_root(project_root, file_path);

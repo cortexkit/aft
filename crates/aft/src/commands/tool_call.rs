@@ -121,7 +121,7 @@ fn handle_on_route(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>
 
     let sanitized_arguments = strip_agent_preview_arg_owned(arguments);
     let agent_visible =
-        !preview && !crate::subc::is_native_plumbing_call(name, &sanitized_arguments);
+        !preview && !crate::host_tool_names::is_native_plumbing_call(name, &sanitized_arguments);
     let format_context = crate::subc_format::FormatContext::from_tool_call(
         name,
         &sanitized_arguments,

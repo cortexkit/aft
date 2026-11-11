@@ -69,13 +69,13 @@ pub fn canonical_tool_name(call_name: &str) -> Option<&'static str> {
 ///
 /// `bash_status`, `bash_kill` and `bash_write` are both agent tools and the
 /// plugins' own background-task plumbing. Only the agent's call (catalog
-/// spelling, see [`crate::subc::is_native_plumbing_call`]) is gated; the
+/// spelling, see [`crate::host_tool_names::is_native_plumbing_call`]) is gated; the
 /// plugins' native calls, and every other plumbing command such as
 /// `bash_drain_completions`, always go through.
 pub fn gating_name(call_name: &str, arguments: &Value) -> Option<&'static str> {
     let canonical = canonical_tool_name(call_name)?;
     let bare = call_name.strip_prefix("aft_").unwrap_or(call_name);
-    if crate::subc::is_native_plumbing_call(bare, arguments) {
+    if crate::host_tool_names::is_native_plumbing_call(bare, arguments) {
         return None;
     }
     Some(canonical)
