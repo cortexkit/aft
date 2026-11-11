@@ -12,6 +12,8 @@
 //!     restart <repo> <dir> [threads]
 //! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
 //!     replay <pack.jsonl.gz> [publish_every|daemon] [threads]
+//! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
+//!     transition <base-root> <target-root> [threads]
 //! ```
 //!
 //! `overhead` runs two workloads in one process and prints one JSON line
@@ -744,6 +746,7 @@ fn restart(mut args: impl Iterator<Item = String>) {
 }
 
 fn main() {
+    let _ = env_logger::try_init();
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("overhead") => overhead(args),
@@ -751,6 +754,27 @@ fn main() {
         Some("refresh") => refresh(args),
         Some("restart") => restart(args),
         Some("replay") => replay(args),
-        _ => panic!("usage: alloc_trace_probe overhead|burst|refresh|restart|replay ..."),
+        Some("transition") => transition(args),
+        _ => panic!("usage: alloc_trace_probe overhead|burst|refresh|restart|replay|transition ..."),
     }
+}
+
+/// Measures a new checkout whose revision differs from its published sibling.
+/// The supplied roots stay intact; the store is private to this run.
+fn transition(mut args: impl Iterator<Item = String>) {
+    let base = std::fs::canonicalize(args.next().unwrap()).unwrap();
+    let target = std::fs::canonicalize(args.next().unwrap()).unwrap();
+    let threads = args.next().map_or(8, |threads| threads.parse().unwrap());
+    start_tracing();
+    let scratch = tempfile::tempdir().unwrap();
+    let store = scratch.path().join("store");
+    let family = FamilyId::from_digest(Digest128::of(b"alloc trace transition"));
+    let layer = Arc::new(DataLayer::new(256 << 20, threads));
+    let sibling = Checkout::bind(Arc::clone(&layer), &store, family, &base).unwrap();
+    phase("base_build", || format!("{:?}", sibling.build().unwrap()));
+    let worktree = Checkout::bind(Arc::clone(&layer), &store, family, &target).unwrap();
+    phase("target_build", || {
+        with_cache_counts(&layer, || format!("{:?}", worktree.build().unwrap()))
+    });
+    println!("engine parts {:?}", worktree.engine_memory_parts());
 }

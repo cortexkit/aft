@@ -1861,7 +1861,8 @@ impl Checkout {
         let text_ready_ms = elapsed_ms(build_started);
         checkpoint()?;
         let started = Instant::now();
-        self.refresh_callgraph()?;
+        let update = self.refresh_callgraph()?;
+        log::debug!("sibling callgraph update: {update:?}");
         let resolve_ms = elapsed_ms(started);
         let started = Instant::now();
         let delta = self.publish_changes_as(true)?;
