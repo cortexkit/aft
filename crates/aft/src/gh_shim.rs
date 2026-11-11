@@ -33,6 +33,8 @@ use crate::db::github_read_cache::{invalidate_github_read_cache_resource, Github
 use subc_protocol::{BindIdentity, RouteTarget};
 
 mod native_guard;
+pub(crate) mod manifest_sync;
+mod manifest_wire;
 pub(crate) mod read_contract;
 mod rename_guard;
 mod v22_rows;
@@ -4307,9 +4309,42 @@ fn load_manifest_with_trust_set(
     now: u64,
     trust_set: &[Option<ManifestTrustKey>],
 ) -> Result<VerifiedManifest, ManifestProblem> {
+    if !paths.root.exists() {
+        return Err(ManifestProblem::Missing);
+    }
+    let _acceptance_lock = manifest_acceptance_lock(paths)
+        .map_err(|_| ManifestProblem::Invalid("manifest acceptance lock unavailable".into()))?;
     let bytes = fs::read(&paths.manifest).map_err(|_| ManifestProblem::Missing)?;
     let envelope: SignedManifest = serde_json::from_slice(&bytes)
         .map_err(|error| ManifestProblem::Invalid(error.to_string()))?;
+    let verified = validate_manifest_candidate(paths, &envelope, now, trust_set)?;
+    let manifest = &verified.manifest;
+    if manifest.manifest_version > version_high_water(paths) {
+        write_version_high_water(paths, manifest.manifest_version);
+    }
+    write_last_valid_manifest(paths, manifest, &bytes);
+    retain_manifest(paths, &envelope, manifest.manifest_version);
+    Ok(verified)
+}
+
+// The daemon publisher and short-lived shim processes share this OS lock so a
+// newer acceptance cannot race a publisher's high-water check and rename.
+fn manifest_acceptance_lock(paths: &StatePaths) -> io::Result<crate::fs_lock::AdvisoryLockGuard> {
+    crate::private_storage::open_root(&paths.root)?;
+    let file = crate::private_storage::options().read(true).write(true).create(true)
+        .truncate(false).open(paths.root.join("manifest-acceptance.lock"))?;
+    file.lock()?;
+    Ok(crate::fs_lock::AdvisoryLockGuard::from_locked_file(file))
+}
+
+// Sync preflights a candidate without changing any accepted state. The shim's
+// status and execution paths use this same verifier before recording acceptance.
+fn validate_manifest_candidate(
+    paths: &StatePaths,
+    envelope: &SignedManifest,
+    now: u64,
+    trust_set: &[Option<ManifestTrustKey>],
+) -> Result<VerifiedManifest, ManifestProblem> {
     if envelope.artifact_id != MANIFEST_ARTIFACT_ID {
         return Err(ManifestProblem::Invalid("artifact id mismatch".to_string()));
     }
@@ -4323,7 +4358,7 @@ fn load_manifest_with_trust_set(
     let VerifiedManifest {
         manifest,
         verified_by_key_id,
-    } = verify_manifest_envelope(&envelope, trust_set)?;
+    } = verify_manifest_envelope(envelope, trust_set)?;
     manifest.validate().map_err(ManifestProblem::Invalid)?;
     if manifest.schema_floor < SCHEMA_FLOOR {
         return Err(ManifestProblem::BelowFloor {
@@ -4347,18 +4382,6 @@ fn load_manifest_with_trust_set(
             ISSUED_AT_FUTURE_SKEW.as_secs()
         )));
     }
-    // Accepted: advance the high-water mark and refresh the last-valid cache
-    // that the regressed-manifest arm classifies from. Both are local state
-    // under the dormancy-valve argument documented above.
-    if manifest.manifest_version > newest_accepted {
-        write_version_high_water(paths, manifest.manifest_version);
-    }
-    write_last_valid_manifest(paths, &manifest, &bytes);
-    // Retain the exact verified bytes for later reproducibility checks. The
-    // signature already verified above; the admission filter re-checks that the
-    // version inside the verified payload matches the filing name. This never
-    // affects activation.
-    retain_manifest(paths, &envelope, manifest.manifest_version);
     Ok(VerifiedManifest {
         manifest,
         verified_by_key_id,

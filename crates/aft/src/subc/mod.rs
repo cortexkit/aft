@@ -5463,6 +5463,7 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    let _manifest_sync = crate::gh_shim::manifest_sync::start(connection_file_path.to_path_buf());
     // Withdraw the macOS access cards earlier builds filed. It runs beside the
     // route loop, never before it: each withdrawal waits on Cingulate, and a
     // slow or absent Cingulate must not delay route binds.

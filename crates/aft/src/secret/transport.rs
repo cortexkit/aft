@@ -5,7 +5,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use subc_client_rs::{CallError, CallOptions, ConsumerIdentity, ConsumerOptions};
+use subc_client_rs::{
+    CallError, CallOptions, CloseRouteOptions, ConsumerIdentity, ConsumerOptions, RouteHandle,
+    SubcConsumer, SubscribeOptions, Subscription,
+};
 use subc_protocol::scope::{ScopeSelector, ScopeStamp};
 use subc_protocol::{BindIdentity, RouteTarget};
 use zeroize::Zeroizing;
@@ -60,6 +63,78 @@ struct ConnectionConfig {
     connection_file: PathBuf,
     identity: BindIdentity,
     timeout: Duration,
+}
+
+// Both scoped secret use and daemon-owned manifest delivery use the attested
+// claustrum management surface. A manifest watch deliberately has no agent scope.
+async fn open_vault_route(
+    consumer: &SubcConsumer,
+    identity: BindIdentity,
+    principal: ConsumerIdentity,
+    scope: Option<ScopeSelector>,
+    timeout: Duration,
+) -> Result<RouteHandle, CallError> {
+    let target = RouteTarget::ManagementSurface { module_id: "claustrum".into() };
+    let options = CallOptions {
+        consumer_identity: Some(principal),
+        timeout,
+        route_retry_deadline: timeout,
+        ..CallOptions::default()
+    };
+    match scope {
+        Some(scope) => consumer.open_route_scoped(target, identity, scope, options).await,
+        None => consumer.open_route(target, identity, options).await,
+    }
+}
+
+/// A held daemon-owned route on the existing vault transport. Closing it also
+/// closes its consumer so reconnects never leave an old watch subscribed.
+pub(crate) struct ManagementSession {
+    consumer: SubcConsumer,
+    route: RouteHandle,
+}
+
+impl ManagementSession {
+    pub(crate) async fn connect(connection_file: &std::path::Path) -> Result<Self, ()> {
+        let principal = aft_identity().ok_or(())?;
+        Self::connect_as(connection_file, principal).await
+    }
+
+    async fn connect_as(connection_file: &std::path::Path, principal: ConsumerIdentity) -> Result<Self, ()> {
+        let consumer = crate::fleet_status::connect_subc_consumer(
+            connection_file, ConsumerOptions::default(),
+        ).await.map_err(|_| ())?;
+        let route = match open_vault_route(
+            &consumer, BindIdentity::new("aft-manifest-sync", "daemon"), principal, None,
+            Duration::from_secs(15),
+        ).await {
+            Ok(route) => route,
+            Err(_) => { let _ = consumer.close().await; return Err(()); }
+        };
+        Ok(Self { consumer, route })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn for_test(connection_file: &std::path::Path) -> Result<Self, ()> {
+        Self::connect_as(connection_file, ConsumerIdentity {
+            module_id: "aft".into(), launch_nonce: "manifest-sync-test-nonce".into(),
+        }).await
+    }
+
+    pub(crate) async fn request(&self, body: Vec<u8>) -> Result<Vec<u8>, CallError> {
+        self.consumer.request(&self.route, body, CallOptions {
+            timeout: Duration::from_secs(15), ..CallOptions::default()
+        }).await
+    }
+
+    pub(crate) async fn watch(&self, body: Vec<u8>) -> Result<Subscription, CallError> {
+        self.consumer.subscribe_route(&self.route, body, SubscribeOptions::default()).await
+    }
+
+    pub(crate) async fn close(self) {
+        let _ = self.consumer.close_handle(&self.route, CloseRouteOptions::default()).await;
+        let _ = self.consumer.close().await;
+    }
 }
 
 impl SubcSecretUseTransport {
@@ -117,20 +192,7 @@ impl SubcSecretUseTransport {
         let scope = ScopeSelector::new(stamp.owner, stamp.scope_ref, Some(stamp.scope_epoch));
         let body = serde_json::to_vec(&json!({"method": "secret.use", "params": params}))
             .map_err(|_| UNAVAILABLE.to_owned())?;
-        let route = consumer
-            .open_route_scoped(
-                RouteTarget::ManagementSurface {
-                    module_id: "claustrum".into(),
-                },
-                config.identity.clone(),
-                scope,
-                CallOptions {
-                    consumer_identity: Some(principal),
-                    timeout: config.timeout,
-                    route_retry_deadline: config.timeout,
-                    ..CallOptions::default()
-                },
-            )
+        let route = open_vault_route(consumer, config.identity.clone(), principal, Some(scope), config.timeout)
             .await
             .map_err(|_| UNAVAILABLE.to_owned())?;
         let reply = consumer

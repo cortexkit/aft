@@ -4229,6 +4229,7 @@ fn assemble_health_report(
         None => cached_mutating_lanes.unwrap_or_else(|| json!({ "scheduler_busy": true })),
     };
     metrics.insert("snapshot_age_ms".to_string(), json!(snapshot_age_ms));
+    metrics.insert("manifest_sync".into(), crate::gh_shim::manifest_sync::health());
     metrics.insert("age_ms".to_string(), json!(snapshot_age_ms));
     metrics.insert("generated_at_ms".to_string(), json!(rollup.generated_at_ms));
     metrics.insert("stale".to_string(), json!(stale_reason.is_some()));
@@ -9029,6 +9030,24 @@ mod tests {
                 .expect("ready progress timestamp")
                 > building_progress
         );
+    }
+
+    #[test]
+    fn manifest_sync_health_stays_inside_existing_budget() {
+        let sync = crate::gh_shim::manifest_sync::health();
+        for key in ["active_version", "newest_version_seen", "last_report", "last_report_outcome", "last_refusal_code"] {
+            assert!(sync.get(key).is_some(), "missing manifest sync field {key}");
+        }
+        let mut metrics = json!({
+            "manifest_sync": sync,
+            "roots": (0..100).map(|i| json!({
+                "project_root": format!("/workspace/{i}/{}", "long-path".repeat(20)),
+                "health": "ready"
+            })).collect::<Vec<_>>()
+        }).as_object().unwrap().clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["manifest_sync"], sync);
+        assert!(encoded_health_metrics_len(&metrics) <= HEALTH_METRICS_BUDGET_BYTES);
     }
 
     #[test]
