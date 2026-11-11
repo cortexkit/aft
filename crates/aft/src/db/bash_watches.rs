@@ -467,6 +467,23 @@ mod delivery_ack_tests {
     use super::*;
 
     #[test]
+    fn existing_delivery_ack_keeps_legacy_epoch_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        const EPOCH: &[u8] = b"8731:1794411200123456789";
+        conn.execute("INSERT INTO bash_watch_delivery_acks VALUES('opencode','session','task','fixture',17,unixepoch(),'8731:1794411200123456789',23)", []).unwrap();
+        let (version, epoch, through) =
+            delivery_ack_version(&conn, "opencode", "session", "task", "fixture")
+                .unwrap()
+                .unwrap();
+        assert_eq!((version, through), (17, 23));
+        assert_eq!(epoch.as_bytes(), EPOCH);
+        acknowledge_delivery(&conn, "opencode", "session", "task", "current", 19, None).unwrap();
+        let saved: Vec<u8> = conn.query_row("SELECT CAST(eviction_epoch AS BLOB) FROM bash_watch_delivery_acks WHERE watch_id='fixture'", [], |row| row.get(0)).unwrap();
+        assert_eq!(saved, EPOCH);
+    }
+
+    #[test]
     fn retry_overflow_ack_tombstones_survive_a_long_lived_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
