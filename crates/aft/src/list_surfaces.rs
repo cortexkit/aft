@@ -14,6 +14,37 @@ pub mod search;
 pub mod trace_data;
 pub mod trace_to;
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn callgraph_caps_keep_the_twenty_trigger_and_fifteen_limit() {
+        let mut items: Vec<_> = (0..20).collect();
+        assert_eq!(super::callgraph::cap_items(&mut items), (20, 20));
+        items.push(20);
+        assert_eq!(super::callgraph::cap_items(&mut items), (15, 21));
+        assert_eq!(items, (0..15).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn foreground_annotations_and_rendered_grep_rows_keep_their_counts() {
+        assert!(super::bash::is_foreground_task_line("[task bash-1]"));
+        assert!(super::bash::is_foreground_task_line(
+            "[task bash-1 (job job-2)]"
+        ));
+        assert!(!super::bash::is_foreground_task_line("[task ]"));
+        assert_eq!(
+            super::bash::count_output_lines("one\n[task bash-1]\ntwo\n"),
+            2
+        );
+        let mut data = serde_json::json!({"matches": [1, 2, 3]});
+        assert_eq!(super::grep::rendered_grep_match_count(&data), 3);
+        data["rendered_matches"] = serde_json::json!(2);
+        assert_eq!(super::grep::rendered_grep_match_count(&data), 2);
+        data["rendered_matches"] = serde_json::json!(9);
+        assert_eq!(super::grep::rendered_grep_match_count(&data), 3);
+    }
+}
+
 pub fn ast_search_envelope(
     shown: usize,
     total: usize,
