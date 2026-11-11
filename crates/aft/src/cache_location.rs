@@ -11,6 +11,31 @@ use std::time::Duration;
 pub(crate) mod markers;
 use crate::pinned_dir::{PinnedDir, RepairBudget};
 
+pub(crate) struct ReaderFloorHooks {
+    pub prepare: fn(&Path),
+    pub prepare_artifact_root: fn(&Path, &Path),
+}
+
+static READER_FLOOR_HOOKS: OnceLock<ReaderFloorHooks> = OnceLock::new();
+
+pub(crate) fn register_reader_floor_hooks(hooks: ReaderFloorHooks) {
+    let _ = READER_FLOOR_HOOKS.set(hooks);
+}
+
+fn reader_floor_hooks(slot: &OnceLock<ReaderFloorHooks>) -> io::Result<&ReaderFloorHooks> {
+    slot.get().ok_or_else(|| {
+        const MESSAGE: &str = "Storage preparation requires reader_floor::register_cache_hooks; no reader-floor check was run";
+        static MISSING_REGISTRATION: std::sync::Once = std::sync::Once::new();
+        MISSING_REGISTRATION.call_once(|| log::error!("{MESSAGE}"));
+        io::Error::other(MESSAGE)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn reader_floor_hooks_registered() -> bool {
+    READER_FLOOR_HOOKS.get().is_some()
+}
+
 #[cfg(test)]
 #[path = "cache_location_tests.rs"]
 mod tests;
@@ -48,6 +73,7 @@ pub(crate) fn unavailable_code(reason: &str) -> &'static str {
 pub(crate) fn prepare_cache_root_for_test(
     config: &mut crate::config::Config,
 ) -> Option<crate::config_resolve::ConfigWarning> {
+    crate::reader_floor::register_cache_hooks();
     let _volume = config
         .cache_dir
         .as_ref()
@@ -898,6 +924,13 @@ fn overlap(left: &Path, right: &Path) -> io::Result<bool> {
 pub fn prepare_cache_root(
     config: &mut crate::config::Config,
 ) -> Option<crate::config_resolve::ConfigWarning> {
+    prepare_cache_root_with_floor_hooks(config, &READER_FLOOR_HOOKS)
+}
+
+fn prepare_cache_root_with_floor_hooks(
+    config: &mut crate::config::Config,
+    floor_hooks: &OnceLock<ReaderFloorHooks>,
+) -> Option<crate::config_resolve::ConfigWarning> {
     let storage = crate::storage_path::storage_dir(config.storage_dir.as_deref());
     if let Some(reason) = &config.cache_config_unknown {
         // The cache configuration is unknown. Treat durable storage as split
@@ -955,6 +988,7 @@ pub fn prepare_cache_root(
     let configured_root = requested.as_ref().map(|parent| parent.join("aft"));
     let mut root = cache_root(config);
     let result = (|| -> io::Result<Arc<CacheLease>> {
+        let floor_hooks = reader_floor_hooks(floor_hooks)?;
         if let Some(parent) = requested.as_ref() {
             if !parent.is_absolute() {
                 return Err(io::Error::other("path must be absolute after ~ expansion"));
@@ -1093,7 +1127,7 @@ pub fn prepare_cache_root(
             } else {
                 pin_storage_root(&storage)?
             };
-            crate::reader_floor::prepare(&storage);
+            (floor_hooks.prepare)(&storage);
             reconcile_root_history(&storage_pin)?;
             let (root_pin, enrollment) = match parent_pin.repair_child(std::ffi::OsStr::new("aft"))
             {
@@ -1235,7 +1269,7 @@ pub fn prepare_cache_root(
         } else {
             crate::private_storage::open_root(&storage)?;
             let storage_pin = pin_storage_root(&storage)?;
-            crate::reader_floor::prepare(&storage);
+            (floor_hooks.prepare)(&storage);
             reconcile_root_history(&storage_pin)?;
             take_shared_pinned(storage_pin)
         }
@@ -1259,7 +1293,7 @@ pub fn prepare_cache_root(
             config.semantic.local_cache_dir =
                 requested.as_ref().map(|_| root.join("semantic/models"));
             crate::project_content::register_storage_root(&root);
-            crate::reader_floor::prepare_artifact_root(&storage, &root);
+            (floor_hooks.get().expect("storage preparation checked reader-floor registration").prepare_artifact_root)(&storage, &root);
             None
         }
         Err(error) => {

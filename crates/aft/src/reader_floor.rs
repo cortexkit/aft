@@ -543,6 +543,15 @@ pub fn prepare(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     prepare_uncached(storage_root)
 }
 
+/// Install the floor checks before preparing any durable or artifact storage.
+/// Library hosts that prepare cache roots directly must register these checks too.
+pub fn register_cache_hooks() {
+    crate::cache_location::register_reader_floor_hooks(crate::cache_location::ReaderFloorHooks {
+        prepare: |storage| { prepare(storage); },
+        prepare_artifact_root,
+    });
+}
+
 /// A floor lives in durable storage, and its refusals also cover artifacts on
 /// a separate `storage.cache_dir` volume: refusal routing spells paths inside
 /// a prepared cache root under the durable root that owns it (see

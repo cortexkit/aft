@@ -34,6 +34,7 @@ static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// configure do this automatically; library hosts using the retry API without a
 /// configure request must register the callbacks explicitly.
 pub fn register_runtime_hooks() {
+    crate::reader_floor::register_cache_hooks();
     crate::runtime_drain::configure::register(crate::runtime_drain::configure::Hooks {
         drain: drain_deferred_configure_maintenance,
         drain_yielding: drain_deferred_configure_maintenance_yielding,
@@ -41,6 +42,9 @@ pub fn register_runtime_hooks() {
         prefix: drain_standalone_configure_prefix,
         unit: drain_standalone_configure_unit,
         database_runtime: configure_database_runtime_with_mode,
+        database_open: Some(open_database_runtime),
+        identity_retry: Some(handle_configure),
+        cache_retry: Some(handle_cache_recovery),
     });
 }
 
@@ -51,6 +55,8 @@ mod runtime_hook_tests {
         super::register_runtime_hooks();
         assert!(crate::runtime_drain::configure::registered());
         assert!(crate::runtime_drain::configure::database_runtime().is_some());
+        assert!(crate::runtime_drain::configure::command_hooks().is_some());
+        assert!(crate::cache_location::reader_floor_hooks_registered());
     }
 }
 

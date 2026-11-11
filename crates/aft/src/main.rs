@@ -215,6 +215,7 @@ fn main() {
     #[cfg(feature = "test-hooks")]
     aft::grammar::initialize_test_identity();
     aft::commands::policy_environment::register();
+    aft::reader_floor::register_cache_hooks();
     // Take the daemon handoff before any threads or children start. Standalone
     // mode never touches the inherited descriptors.
     let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));

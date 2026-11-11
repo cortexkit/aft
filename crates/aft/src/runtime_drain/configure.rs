@@ -9,6 +9,21 @@ use std::time::Instant;
 use crate::context::{AppContext, ConfigureMaintenanceJob};
 
 pub(crate) type DatabaseRuntime = fn(&AppContext, &Path, &Path, crate::db::OpenMode);
+pub(crate) type DatabaseOpen = fn(
+    &AppContext,
+    &Path,
+    &Path,
+    crate::db::OpenMode,
+    u64,
+) -> crate::database_open::DatabaseOpenReport;
+pub(crate) type IdentityRetry =
+    fn(&crate::protocol::RawRequest, &AppContext) -> crate::protocol::Response;
+pub(crate) type CacheRetry = fn(
+    &crate::protocol::RawRequest,
+    u64,
+    &AppContext,
+    &crate::config::Config,
+) -> crate::protocol::Response;
 
 pub(crate) struct Hooks {
     pub drain: fn(&AppContext),
@@ -17,6 +32,9 @@ pub(crate) struct Hooks {
     pub prefix: fn(&AppContext, &mut ConfigureMaintenanceState) -> bool,
     pub unit: fn(&Arc<AppContext>, &mut ConfigureMaintenanceState) -> bool,
     pub database_runtime: DatabaseRuntime,
+    pub database_open: Option<DatabaseOpen>,
+    pub identity_retry: Option<IdentityRetry>,
+    pub cache_retry: Option<CacheRetry>,
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
@@ -29,6 +47,9 @@ static IDLE_HOOKS: Hooks = Hooks {
     prefix: |_, _| false,
     unit: |_, _| false,
     database_runtime: |_, _, _, _| {},
+    database_open: None,
+    identity_retry: None,
+    cache_retry: None,
 };
 
 pub(crate) fn register(hooks: Hooks) {
@@ -37,6 +58,22 @@ pub(crate) fn register(hooks: Hooks) {
 
 pub(crate) fn hooks() -> &'static Hooks {
     HOOKS.get().unwrap_or(&IDLE_HOOKS)
+}
+
+pub(crate) const MISSING_CONFIGURE_REGISTRATION: &str =
+    "Operation requires commands::configure::register_runtime_hooks; no open or retry was started";
+
+pub(crate) fn command_hooks() -> Option<&'static Hooks> {
+    let hooks = HOOKS.get().filter(|hooks| {
+        hooks.database_open.is_some()
+            && hooks.identity_retry.is_some()
+            && hooks.cache_retry.is_some()
+    });
+    if hooks.is_none() {
+        static MISSING_REGISTRATION: Once = Once::new();
+        MISSING_REGISTRATION.call_once(|| log::error!("{MISSING_CONFIGURE_REGISTRATION}"));
+    }
+    hooks
 }
 
 pub(crate) fn database_runtime() -> Option<DatabaseRuntime> {

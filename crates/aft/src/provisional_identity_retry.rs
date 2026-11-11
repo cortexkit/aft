@@ -500,21 +500,25 @@ impl PreparedReplay {
         if retry.kind == RetryKind::CacheCoordination {
             retry.attempts = retry.attempts.saturating_add(1);
         }
+        let Some(hooks) = crate::runtime_drain::configure::command_hooks() else {
+            return crate::protocol::Response::error(id, crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION);
+        };
         let run = || match retry.kind {
             RetryKind::Identity => {
-                crate::commands::configure::handle_configure(&retry.request, ctx)
+                match hooks.identity_retry {
+                    Some(replay) => replay(&retry.request, ctx),
+                    None => crate::protocol::Response::error(self.request_id(), crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION),
+                }
             }
             RetryKind::CacheCoordination => {
                 // Cache recovery must preserve the running configuration,
                 // including edits deferred until the next real connect.
                 let mut prepared = (*ctx.config()).clone();
                 crate::cache_location::prepare_cache_root(&mut prepared);
-                crate::commands::configure::handle_cache_recovery(
-                    &retry.request,
-                    retry.connect_generation,
-                    ctx,
-                    &prepared,
-                )
+                match hooks.cache_retry {
+                    Some(replay) => replay(&retry.request, retry.connect_generation, ctx, &prepared),
+                    None => crate::protocol::Response::error(self.request_id(), crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION),
+                }
             }
         };
         let response = match retry.prepared_bind.as_ref() {

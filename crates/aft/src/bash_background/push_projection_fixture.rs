@@ -101,7 +101,7 @@ fn build() -> BusyRoot {
         app.register_memory_context(path, &other);
         contexts.push(other);
     }
-    app.publish_lifecycle_census(crate::lifecycle_census::collect(&app, &contexts));
+    app.collect_and_publish_lifecycle_census_for_test(&contexts);
     assert_eq!(ctx.bash_background().inner.tasks.lock().unwrap().len(), 256);
     assert_eq!(ctx.lsp_server_count(), 5);
     BusyRoot {

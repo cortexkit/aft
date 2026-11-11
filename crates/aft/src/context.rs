@@ -2539,6 +2539,11 @@ impl App {
         self.lifecycle_census.publish(snapshot);
     }
 
+    #[cfg(test)]
+    pub(crate) fn collect_and_publish_lifecycle_census_for_test(&self, contexts: &[Arc<AppContext>]) {
+        self.publish_lifecycle_census(crate::lifecycle_census::collect(self, contexts));
+    }
+
     pub(crate) fn lifecycle_census_snapshot(
         &self,
     ) -> crate::lifecycle_census::LifecycleCensusSnapshot {
@@ -3421,6 +3426,7 @@ impl AppContext {
     ) -> Self {
         #[cfg(unix)]
         crate::shell_env_provider::sweep_preflight_layouts_on_startup();
+        crate::reader_floor::register_cache_hooks();
         #[cfg(test)]
         let config = app.isolate_test_config(config);
         let mut config = config;

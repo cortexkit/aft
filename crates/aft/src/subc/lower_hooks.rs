@@ -1,6 +1,7 @@
 //! Install the optional daemon services declared by lower layers before serving routes.
 
 pub(crate) fn register() {
+    crate::reader_floor::register_cache_hooks();
     crate::commands::configure::register_runtime_hooks();
     crate::bash_background::frames::register(crate::bash_background::frames::Hooks {
         enabled: super::rich_ui::display::enabled,
@@ -21,6 +22,8 @@ mod tests {
         super::register();
         assert!(crate::runtime_drain::configure::registered());
         assert!(crate::runtime_drain::configure::database_runtime().is_some());
+        assert!(crate::runtime_drain::configure::command_hooks().is_some());
+        assert!(crate::cache_location::reader_floor_hooks_registered());
         assert!(crate::bash_background::frames::registered());
         assert!(crate::edit::file_reporter_registered());
         assert!(crate::db::call_ledger::held_result_projector_registered());
@@ -42,5 +45,16 @@ mod tests {
             assert_eq!(old.ty, new.ty);
             assert_eq!(old.body, new.body);
         }
+    }
+
+    #[test]
+    fn every_process_entry_registers_floor_checks_before_storage() {
+        let main = include_str!("../main.rs").split_once("fn main() {").unwrap().1;
+        let registration = main.find("aft::reader_floor::register_cache_hooks();").unwrap();
+        for entry in ["if aft::gh_shim::is_shim_invocation_from_env()", "parse_subc_arg(std::env::args_os()", "cli::index::run(args)", "Config::default()"] {
+            assert!(registration < main.find(entry).unwrap(), "reader-floor registration must precede {entry}");
+        }
+        let shim = include_str!("../gh_shim.rs").split_once("pub fn run_from_env() -> i32 {").unwrap().1;
+        assert!(shim.trim_start().starts_with("crate::reader_floor::register_cache_hooks();"));
     }
 }

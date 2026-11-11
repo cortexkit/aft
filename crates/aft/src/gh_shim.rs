@@ -743,6 +743,7 @@ pub fn is_shim_invocation_from_env() -> bool {
 /// before logging initialization so delegating invocations cannot add shim bytes
 /// to upstream stderr.
 pub fn run_from_env() -> i32 {
+    crate::reader_floor::register_cache_hooks();
     let mut argv = std::env::args_os();
     let Some(program) = argv.next() else {
         return refuse(RefusalCode::NoRealGh, "the executing image was unavailable");

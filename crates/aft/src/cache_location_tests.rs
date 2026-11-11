@@ -2,6 +2,43 @@ use super::clean_old_for_test as clean_old;
 use super::prepare_cache_root_for_test as prepare_cache_root;
 
 #[test]
+fn missing_reader_floor_registration_refuses_storage_preparation() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    let mut config = crate::config::Config {
+        storage_dir: Some(storage.clone()),
+        ..Default::default()
+    };
+    let hooks = std::sync::OnceLock::new();
+    let warning = super::prepare_cache_root_with_floor_hooks(&mut config, &hooks).unwrap();
+    assert!(warning.message.contains("reader_floor::register_cache_hooks"));
+    assert!(config.cache_unavailable.as_deref().unwrap().contains("reader_floor::register_cache_hooks"));
+    assert!(config.cache_lease.is_none());
+    assert!(!storage.exists(), "missing floor checks must not prepare storage");
+}
+
+#[test]
+fn registered_floor_hook_preserves_newer_reader_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    fs::create_dir(&storage).unwrap();
+    let floor = storage.join(crate::reader_floor::FLOOR_FILE);
+    let saved = serde_json::to_vec(&serde_json::json!({
+        "floor_schema": crate::reader_floor::FLOOR_SCHEMA,
+        "stores": {"aft.db": crate::db::CURRENT_SCHEMA_VERSION + 1}
+    })).unwrap();
+    fs::write(&floor, &saved).unwrap();
+    let mut config = crate::config::Config {
+        storage_dir: Some(storage.clone()),
+        ..Default::default()
+    };
+    assert!(prepare_cache_root(&mut config).is_none());
+    let database = storage.join("aft.db");
+    assert!(crate::persisted_format::gate(crate::persisted_format::PersistedStore::AftDb, &database, &database, None).is_err());
+    assert_eq!(fs::read(floor).unwrap(), saved);
+}
+
+#[test]
 fn legacy_cleanup_refuses_a_non_resolved_storage_root() {
     let (_temp, storage, artifacts, config) = fixture();
     fs::write(storage.join("aft.db"), "AFT database").unwrap();
