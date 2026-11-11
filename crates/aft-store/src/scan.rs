@@ -203,6 +203,7 @@ pub struct PathScan {
 /// Brings `previous` up to date for `paths` (relative, such as a watcher or
 /// an edit reports them): each path, and everything under it when it is a
 /// folder, is walked again under exactly the rules a full [`scan`] applies.
+/// An empty relative path names the root and rescans the whole checkout.
 /// A path that is gone, ignored, or inside a skipped folder leaves the
 /// state; a folder that appeared is walked whole. Every other record is kept
 /// as it is. Files are read only when their stat no longer proves the
@@ -299,14 +300,13 @@ impl Restrict {
                     }
                     path
                 })
-                .filter(|path| !path.is_empty())
                 .collect(),
         }
     }
 
     /// Whether `path` is one of the paths or under one of them.
     fn covers(&self, path: &[u8]) -> bool {
-        if self.paths.contains(path) {
+        if self.paths.contains(b"".as_slice()) || self.paths.contains(path) {
             return true;
         }
         path.iter()
@@ -345,10 +345,19 @@ fn walk_records(
     restrict: Option<Arc<Restrict>>,
     sink: &dyn ContentSink,
 ) -> Result<WalkRecords, ScanError> {
-    std::fs::read_dir(root).map_err(|source| ScanError::Walk {
-        path: root.to_path_buf(),
-        source,
-    })?;
+    if let Err(source) = std::fs::read_dir(root) {
+        if source.kind() == io::ErrorKind::PermissionDenied {
+            return Ok((
+                Vec::new(),
+                [(Vec::new(), source.to_string().to_lowercase())].into(),
+                ScanCounters::default(),
+            ));
+        }
+        return Err(ScanError::Walk {
+            path: root.to_path_buf(),
+            source,
+        });
+    }
     let common_dir = git_common_dir(root);
     let mut builder = WalkBuilder::new(root);
     builder
@@ -416,7 +425,6 @@ fn walk_records(
                             return WalkState::Continue;
                         }
                         if io.kind() == io::ErrorKind::PermissionDenied
-                            && path != root
                             && let Ok(relative) = relative_bytes(root, &path)
                         {
                             skipped
@@ -937,6 +945,44 @@ mod tests {
         assert!(
             matches!(scan(&missing, &ScanPolicy::default(), None, &Collect::default()), Err(ScanError::Walk { source, .. }) if source.kind() == io::ErrorKind::NotFound)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn walk_an_unreadable_root_is_a_gap_and_is_retried_after_access_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("readable-later.txt"), "needle\n").unwrap();
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let restore = Restore(root.to_path_buf());
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(root)
+                .err()
+                .expect("run without DAC override privileges")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let sink = Collect::default();
+        let policy = ScanPolicy::default();
+        let first = scan(root, &policy, None, &sink).unwrap().state;
+        assert!(first.paths().is_empty());
+        assert_eq!(
+            first.skipped_directories()[b"".as_slice()],
+            "permission denied (os error 13)"
+        );
+        drop(restore);
+        let recovered = scan_paths(root, &policy, &first, &[Vec::new()], &sink)
+            .unwrap()
+            .state;
+        assert!(recovered.skipped_directories().is_empty());
+        assert_eq!(paths(&recovered), vec!["readable-later.txt"]);
     }
 
     /// The members of `state` with what identifies each, for comparing a

@@ -1579,6 +1579,73 @@ mod tests {
         assert_eq!(INDEX_GAP_NOTE.replace("{folders}", &folder_count(2)).replace("{paths}", "a: permission denied\nb: operation not permitted"), "(Index skipped 2 unreadable folders; results may miss files in them:\na: permission denied\nb: operation not permitted\n)");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_root_publishes_a_named_gap_and_rescan_retries_after_access_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = context_with(&root, storage.path(), |config| {
+            config.indexes.semantic = false
+        });
+        write(&root, "readable-later.txt", "needle\n");
+        let hold = super::super::runtime::hold_builds_for_test(&root);
+        bind_for_test(&ctx);
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let restore = Restore(root.clone());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .err()
+                .expect("run without DAC override privileges")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        drop(hold);
+        serve_text_index_for_test(&ctx);
+        let checkout = ctx.data_checkout().unwrap();
+        assert!(checkout.view().unwrap().current_state().paths().is_empty());
+        let health = report(&ctx).unwrap().health();
+        assert_eq!(
+            health.skipped_folder_note,
+            Some(format!(
+                "{}: index skipped 1 unreadable folder",
+                root.display()
+            ))
+        );
+        assert_eq!(health.reason, None);
+        assert!(health.failure.is_none());
+        let req = serde_json::from_value(
+            serde_json::json!({"id":"root-gap", "command":"grep", "pattern":"needle"}),
+        )
+        .unwrap();
+        let response = crate::commands::grep::handle_grep(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["gaps"][0]["path"], serde_json::json!(root));
+        assert_eq!(response.data["text"].as_str().unwrap().split("\n\n").next().unwrap(), format!("(Index skipped 1 unreadable folder; results may miss files in them:\n{}: permission denied (os error 13)\n)", root.display()));
+        drop(restore);
+        checkout.checkout().rescan().unwrap();
+        let recovered = crate::commands::grep::handle_grep(&req, &ctx);
+        assert!(recovered.success, "{:?}", recovered.data);
+        assert!(
+            recovered.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("readable-later.txt"),
+            "{:?}",
+            recovered.data
+        );
+        assert!(recovered.data["skipped_folders"].is_null());
+        assert_eq!(report(&ctx).unwrap().health().skipped_folders, 0);
+    }
+
     /// As [`context`], with `edit` applied to its configuration.
     fn context_with(
         root: &Path,
