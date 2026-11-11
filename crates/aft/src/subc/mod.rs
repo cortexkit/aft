@@ -6053,6 +6053,18 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        // Flow routes keep their operation allowlist refusal even
+                        // when an operation has a separate operator-only gate.
+                        if let Some(identity) = management_routes.get(&route) {
+                            if identity.admission == ManagementAdmission::FlowOnly {
+                                if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                    if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                        break Err(error);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         if let Ok(body) = decoded.body() {
                             if shells::is_request(body) {
                                 let result = if let Some(identity) = management_routes.get(&route) {

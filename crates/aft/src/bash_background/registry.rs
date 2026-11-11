@@ -19133,16 +19133,11 @@ mod tests {
         let layout =
             create_task_layout(dir.path(), "signal-session", "bash-0000000000000008").unwrap();
         let handles = TaskIoHandles::create(&layout, BgMode::Pipes, false).unwrap();
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child: Child = std::process::Command::new("/bin/sh")
             .args(["-c", command])
             .spawn()
-            .unwrap();
-        let exit = child.wait().unwrap();
-        match command {
-            "kill -TERM $$" => assert_eq!(exit.signal(), Some(libc::SIGTERM)),
-            "kill -KILL $$" => assert_eq!(exit.signal(), Some(libc::SIGKILL)),
-            _ => assert_eq!(exit.code(), Some(7)),
-        }
+            .unwrap()
+            .into();
         let mut metadata = PersistedTask::starting(
             layout.paths.task_id.clone(),
             "signal-session".into(),
@@ -19154,6 +19149,13 @@ mod tests {
             false,
         );
         metadata.mark_running(child.id(), child.id() as i32);
+        assert!(metadata.child_start_time_ms.is_some());
+        let exit = child.wait().unwrap();
+        match command {
+            "kill -TERM $$" => assert_eq!(exit.signal(), Some(libc::SIGTERM)),
+            "kill -KILL $$" => assert_eq!(exit.signal(), Some(libc::SIGKILL)),
+            _ => assert_eq!(exit.code(), Some(7)),
+        }
         write_task_at(&layout, &metadata).unwrap();
         registry
             .insert_rehydrated_task(metadata, layout.paths, false)
@@ -19163,7 +19165,7 @@ mod tests {
             .unwrap();
         {
             let mut state = task.lock_state().unwrap();
-            state.runtime = TaskRuntime::Piped(Some(child.into()));
+            state.runtime = TaskRuntime::Piped(Some(child));
             state.io_handles = Some(handles);
         }
         (dir, registry, task)
@@ -23542,7 +23544,7 @@ mod tests {
     /// it has terminated. Used by reap_child tests to simulate the
     /// "child exists and is dead" state when the watchdog has already
     /// nulled out the original child handle.
-    fn spawn_dead_child() -> std::process::Child {
+    fn spawn_dead_child() -> (Child, ProcessIdentity) {
         #[cfg(unix)]
         let mut cmd = std::process::Command::new("true");
         #[cfg(windows)]
@@ -23554,7 +23556,11 @@ mod tests {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
-        let mut child = cmd.spawn().expect("spawn replacement child for reap test");
+        let mut child: Child = cmd
+            .spawn()
+            .expect("spawn replacement child for reap test")
+            .into();
+        let identity = ProcessIdentity::of(child.id()).expect("read owned child start time");
         // Poll try_wait() until the child actually exits, instead of calling
         // wait() which closes the OS handle. On Windows, after wait()
         // closes the handle, subsequent try_wait() calls (which reap_child
@@ -23576,12 +23582,13 @@ mod tests {
                 Err(error) => panic!("dead-child try_wait failed: {error}"),
             }
         }
-        child
+        (child, identity)
     }
 
     #[test]
     fn terminal_child_reaper_observes_exit_before_releasing_handle() {
-        let mut child = Some(spawn_dead_child().into());
+        let (child, _identity) = spawn_dead_child();
+        let mut child = Some(child);
 
         assert!(
             reap_piped_child(&mut child),
@@ -24730,7 +24737,8 @@ mod tests {
 
         // This test exercises reaping, not shell startup. Own a direct child
         // and wait for its exit instead of racing a wrapper and the watchdog.
-        // Child::wait leaves its exit status observable through try_wait.
+        // The production wrapper must observe the first wait so it can retain
+        // the exit status after the kernel has reaped the process.
         #[cfg(unix)]
         let mut command = std::process::Command::new("true");
         #[cfg(windows)]
@@ -24739,14 +24747,13 @@ mod tests {
             command.args(["/c", "exit", "0"]);
             command
         };
-        let mut child = command
+        let mut child: Child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn child for reap test");
-        assert!(child.wait().expect("wait for child exit").success());
-        assert!(child.try_wait().unwrap().is_some());
+            .expect("spawn child for reap test")
+            .into();
 
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
@@ -24758,8 +24765,10 @@ mod tests {
             true,
             false,
         );
-        metadata.status = BgTaskStatus::Running;
-        metadata.child_pid = Some(child.id());
+        metadata.mark_running(child.id(), child.id() as i32);
+        assert!(metadata.child_start_time_ms.is_some());
+        assert!(child.wait().expect("wait for child exit").success());
+        assert!(child.try_wait().unwrap().is_some());
         write_task_at(&layout, &metadata).unwrap();
         // Restore the task from metadata without starting the watchdog. Restored
         // tasks have no open output handles, so reaping cannot write an exit
@@ -24769,7 +24778,7 @@ mod tests {
             .insert_rehydrated_task(metadata, layout.paths.clone(), false)
             .unwrap();
         let task = registry.task_for_session(&task_id, "session").unwrap();
-        task.lock_state().unwrap().runtime = TaskRuntime::Piped(Some(child.into()));
+        task.lock_state().unwrap().runtime = TaskRuntime::Piped(Some(child));
 
         // Sanity: task is still Running per metadata (replay/poll hasn't
         // observed the missing marker yet).
@@ -24911,7 +24920,11 @@ mod tests {
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
             if matches!(state.runtime, TaskRuntime::Piped(None)) {
-                state.runtime = TaskRuntime::Piped(Some(spawn_dead_child().into()));
+                let (child, identity) = spawn_dead_child();
+                state.metadata.child_pid = Some(identity.pid);
+                state.metadata.child_start_time_ms = Some(identity.started_at_ms);
+                state.metadata.pgid = Some(identity.pid as i32);
+                state.runtime = TaskRuntime::Piped(Some(child));
             }
         }
         *task.terminal_at.lock().unwrap() = None;
