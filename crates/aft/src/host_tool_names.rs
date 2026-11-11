@@ -252,6 +252,29 @@ pub(crate) fn is_native_plumbing_call(name: &str, arguments: &Value) -> bool {
     !agent_spelled
 }
 
+use subc_protocol::manifest::ExecutionMode;
+
+/// Classify externally observable effects, not AFT's internal cache/index writes.
+/// The catalog conservatively classifies tools; individual calls can narrow that
+/// classification when their operation is explicitly read-only.
+pub(crate) fn tool_execution_mode(name: &str) -> ExecutionMode {
+    match crate::tool_gate::canonical_tool_name(name).unwrap_or(name) {
+        "bash" | "powershell" | "write" | "edit" | "apply_patch" | "ast_grep_replace"
+        | "aft_delete" | "aft_move" | "aft_import" | "aft_safety" | "bash_kill" | "bash_write" => {
+            ExecutionMode::Mutating
+        }
+        _ => ExecutionMode::Pure,
+    }
+}
+
+pub(crate) fn tool_call_is_mutating(name: &str, args: &Value) -> bool {
+    match crate::tool_gate::canonical_tool_name(name) {
+        Some("aft_safety") if matches!(args["op"].as_str(), Some("history" | "list")) => false,
+        Some("ast_grep_replace") if args["dryRun"].as_bool() == Some(true) => false,
+        _ => tool_execution_mode(name) == ExecutionMode::Mutating,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
