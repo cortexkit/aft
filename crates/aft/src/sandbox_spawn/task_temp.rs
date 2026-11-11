@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+pub(super) use crate::task_temp_reads::is_managed;
+use crate::task_temp_reads::{provider_root, task_name};
 use crate::task_temp_reads::MANAGED_TEMP_ROOT as ROOT;
-use crate::task_temp_reads::{is_managed, provider_root, task_name};
 const SWEEP_BUDGET: usize = 128;
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
