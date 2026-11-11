@@ -211,7 +211,7 @@ fn identity(path: &Path) -> io::Result<Identity> {
     {
         return Ok(Identity { device, inode });
     }
-    crate::config_live::dir_identity(path)
+    crate::dir_identity::dir_identity(path)
         .map(|(device, inode)| Identity { device, inode })
         .ok_or_else(|| io::Error::other(format!("cannot identify directory {}", path.display())))
 }

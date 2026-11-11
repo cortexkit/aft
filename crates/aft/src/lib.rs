@@ -91,6 +91,7 @@ pub mod data_layer;
 pub(crate) mod database_open;
 pub mod db;
 pub mod developer_tools;
+pub(crate) mod dir_identity;
 pub mod disk_floor;
 pub(crate) mod durability;
 pub(crate) mod durable_dir;

@@ -155,7 +155,7 @@ enum ProbeLocation {
     Missing(std::path::PathBuf),
 }
 fn probe_location(path: &std::path::Path) -> ProbeLocation {
-    crate::config_live::dir_identity(path).map_or_else(
+    crate::dir_identity::dir_identity(path).map_or_else(
         || ProbeLocation::Missing(path.to_path_buf()),
         |(dev, ino)| ProbeLocation::Identity(dev, ino),
     )
