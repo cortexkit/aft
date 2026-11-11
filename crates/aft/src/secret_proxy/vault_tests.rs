@@ -907,3 +907,56 @@ async fn a_fetch_and_proxy_request_share_one_once_card_then_raise_exactly_one_su
         .unwrap()
         .contains(std::str::from_utf8(K1).unwrap())));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_proxy_with_a_held_request_withdraws_the_card_and_removes_status() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let mut proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = request_in_thread(client, false);
+    phone.phone.card(1).await;
+    assert!(!proxy.approval_status().is_empty());
+    proxy.stop();
+    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
+    assert!(proxy.approval_status().is_empty());
+    assert!(server.seen.lock().is_empty());
+    let _ = worker.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_statement_location_is_planned_before_filing_or_consuming_a_release() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("json_pointer:/key"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let reply = client.request(
+        "/approved",
+        json!({"content-type":"application/json"}),
+        "{\"key\":42,\"other\":\"{{ck-secret:test}}\"}",
+    );
+    assert_eq!(reply["status"], 403);
+    assert_eq!(
+        daemon.state.lock().unwrap().calls,
+        1,
+        "read location from approval_required, without a releasing retry"
+    );
+    assert!(phone.phone.state.lock().unwrap().requests.is_empty());
+    assert!(server.seen.lock().is_empty());
+}

@@ -903,3 +903,18 @@ pub(crate) fn use_current_secret_labels(
     };
     result.unwrap_or_else(unavailable)
 }
+
+#[cfg(test)]
+pub(crate) fn use_current_secret_label(
+    vault: &dyn crate::secret::SecretVault,
+    label: &str,
+    target: &crate::secret::ApiKeyTarget,
+) -> LaunchDecision {
+    CURRENT_IDENTITY.with(|slot| match slot.borrow().as_ref() {
+        Some(identity) => use_label_for_fetch(identity, vault, label, target),
+        None => LaunchDecision::Refuse(crate::secret::refuse_ineligible(
+            label,
+            Ineligibility::NoScope,
+        )),
+    })
+}

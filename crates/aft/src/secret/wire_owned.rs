@@ -9,20 +9,52 @@ use zeroize::{Zeroize, Zeroizing};
 struct Text(Zeroizing<String>);
 impl<'de> Deserialize<'de> for Text {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = Text;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a string")
-            }
-            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Text, E> {
-                Ok(Text(Zeroizing::new(s.to_owned())))
-            }
-            fn visit_string<E: serde::de::Error>(self, s: String) -> Result<Text, E> {
-                Ok(Text(Zeroizing::new(s)))
-            }
+        // RawValue borrows the wire bytes without serde_json's ordinary decoded
+        // string scratch buffer, including when the peer uses JSON escapes.
+        let raw = <&serde_json::value::RawValue>::deserialize(d)?;
+        let raw = raw.get();
+        if !raw.starts_with('"') || !raw.ends_with('"') {
+            return Err(serde::de::Error::custom("expected a string"));
         }
-        d.deserialize_string(Visitor)
+        let mut text = Zeroizing::new(String::with_capacity(raw.len() - 2));
+        let mut chars = raw[1..raw.len() - 1].chars();
+        fn hex(chars: &mut std::str::Chars<'_>) -> Option<u32> {
+            (0..4).try_fold(0, |value, _| Some(value * 16 + chars.next()?.to_digit(16)?))
+        }
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                text.push(ch);
+                continue;
+            }
+            let decoded = match chars.next() {
+                Some('"') => '"',
+                Some('\\') => '\\',
+                Some('/') => '/',
+                Some('b') => '\u{0008}',
+                Some('f') => '\u{000c}',
+                Some('n') => '\n',
+                Some('r') => '\r',
+                Some('t') => '\t',
+                Some('u') => {
+                    let mut code = hex(&mut chars)
+                        .ok_or_else(|| serde::de::Error::custom("invalid escape"))?;
+                    if (0xd800..=0xdbff).contains(&code) {
+                        if chars.next() != Some('\\') || chars.next() != Some('u') {
+                            return Err(serde::de::Error::custom("invalid surrogate"));
+                        }
+                        let low = hex(&mut chars)
+                            .filter(|low| (0xdc00..=0xdfff).contains(low))
+                            .ok_or_else(|| serde::de::Error::custom("invalid surrogate"))?;
+                        code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                    }
+                    char::from_u32(code)
+                        .ok_or_else(|| serde::de::Error::custom("invalid character"))?
+                }
+                _ => return Err(serde::de::Error::custom("invalid escape")),
+            };
+            text.push(decoded);
+        }
+        Ok(Text(text))
     }
 }
 impl Text {
@@ -227,5 +259,27 @@ mod contract_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod escaped_tests {
+    use super::*;
+    #[test]
+    fn escaped_credential_text_decodes_directly_into_its_zeroizing_owner() {
+        let bytes = Zeroizing::new(br#"{"result":{"status":"released","kind":"agent_api_key","key_b64url":"\u00632stZXhhbXBsZQ","location":"authorization_bearer"}}"#.to_vec());
+        let SecretUseAnswer::Reply(SecretUseReply::ReleasedApiKey(key)) = parse(&bytes).unwrap()
+        else {
+            panic!("escaped JSON credential is still strict base64url");
+        };
+        assert_eq!(key.material(), b"sk-example");
+        let text: Text = serde_json::from_slice(br#""\ud83d\ude00\u002f\t""#).unwrap();
+        assert_eq!(text.as_str(), "😀/\t");
+        WIPES.with(|n| n.set(0));
+        assert!(parse(br#"{"result":{"key_b64url":"c2stZXhhbXBsZQ","status":"released","kind":"agent_api_key","location":42}}"#).is_err());
+        assert!(
+            WIPES.with(|n| n.get()) >= 3,
+            "earlier parsed credential fields are wiped when a later field is malformed"
+        );
     }
 }
