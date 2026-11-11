@@ -1,7 +1,6 @@
 //! Durable speech state. History/task JSON cannot recreate these associations.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
@@ -509,8 +508,8 @@ impl Store {
         rows::record_end(
             &tx,
             &ScopeEndRow {
-                owner: key.owner,
-                scope_ref: key.scope_ref,
+                owner: key.owner.clone(),
+                scope_ref: key.scope_ref.clone(),
                 epoch: key.epoch.to_string(),
                 evidence_json: proof.evidence().to_string(),
                 recorded_at_ms: crate::db::call_ledger::now_ms(),
