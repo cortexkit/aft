@@ -9,6 +9,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  statfsSync,
   symlinkSync,
   unlinkSync,
   utimesSync,
@@ -16,13 +17,40 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { type CacheUsage, cacheUsageSnapshot, pidAlive } from "./image-cache-usage.js";
 
 const cacheRoot = join(tmpdir(), "aft-test-executables");
 const retentionMs = 24 * 60 * 60 * 1000;
+const pressureRetentionMs = 30 * 60 * 1000;
+const leaseRetentionMs = 3 * 60 * 60 * 1000;
+const freeFloor = 40 * 1024 ** 3;
 
 function refresh(directory: string): void {
   const now = new Date();
+  const leases = join(directory, ".leases");
+  mkdirSync(leases, { recursive: true });
+  writeFileSync(join(leases, String(process.pid)), "");
   utimesSync(directory, now, now);
+}
+
+function leased(directory: string, now: number, usage: CacheUsage): boolean {
+  const leases = join(directory, ".leases");
+  let entries: string[];
+  try {
+    entries = readdirSync(leases);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  let active = false;
+  for (const name of entries) {
+    if (!/^[1-9]\d*$/.test(name)) continue;
+    const path = join(leases, name);
+    if (now - statSync(path).mtimeMs < leaseRetentionMs && usage.pidAlive(Number(name)))
+      active = true;
+    else rmSync(path, { force: true });
+  }
+  return active;
 }
 
 export function pruneExecutableCache(
@@ -32,22 +60,78 @@ export function pruneExecutableCache(
   claim: (source: string, destination: string) => void = renameSync,
   cleanup: (directory: string) => void = (directory) =>
     rmSync(directory, { recursive: true, force: true }),
+  probes: { usage?: CacheUsage; freeBytes?: (root: string) => number } = {},
 ): void {
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    const directory = join(root, entry.name);
-    if (directory === current || !entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name))
-      continue;
+  let free = Number.POSITIVE_INFINITY;
+  try {
+    free = probes.freeBytes
+      ? probes.freeBytes(root)
+      : Number(statfsSync(root).bavail) * Number(statfsSync(root).bsize);
+  } catch {
+    /* Count and normal age limits still apply when free space is unknown. */
+  }
+  const entries = readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name))
+    .flatMap((entry) => {
+      const directory = join(root, entry.name);
+      try {
+        return [{ directory, modified: statSync(directory).mtimeMs }];
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      }
+    })
+    .sort((a, b) => b.modified - a.modified || a.directory.localeCompare(b.directory));
+  const leaseUsage = probes.usage ?? { pidAlive, inUse: () => false };
+  const candidates = entries.filter((entry) => {
+    try {
+      const active = leased(entry.directory, now, leaseUsage);
+      return entry.directory !== current && !active;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  });
+  if (
+    candidates.length <= 4 &&
+    !candidates.some(({ modified }) => {
+      const age = now - modified;
+      return age > retentionMs || (free < freeFloor && age > pressureRetentionMs);
+    })
+  )
+    return;
+  let usage: CacheUsage;
+  try {
+    usage = probes.usage ?? cacheUsageSnapshot();
+  } catch {
+    return;
+  }
+  let unused = 0;
+  for (const { directory, modified } of entries) {
+    if (directory === current) continue;
     let quarantine: string | undefined;
     let preserve = false;
     let failure: { error: unknown } | undefined;
     try {
-      if (now - statSync(directory).mtimeMs <= retentionMs) continue;
+      if (leased(directory, now, usage) || usage.inUse(directory)) continue;
+      const age = now - modified;
+      if (unused++ < 4 && age <= retentionMs && !(free < freeFloor && age > pressureRetentionMs))
+        continue;
       quarantine = mkdtempSync(join(root, ".pruning-"));
       const removed = join(quarantine, "image");
       // Recheck after claiming the pathname: a concurrent reader may have
       // refreshed it after the scan, or may republish while it is absent.
       claim(directory, removed);
-      if (now - statSync(removed).mtimeMs <= retentionMs) {
+      let retain = true;
+      try {
+        retain =
+          statSync(removed).mtimeMs > modified ||
+          leased(removed, now, usage) ||
+          usage.inUse(removed);
+      } catch {
+        // Uncertain ownership must restore the claimed image, not delete it.
+      }
+      if (retain) {
         try {
           renameSync(removed, directory);
         } catch (error) {

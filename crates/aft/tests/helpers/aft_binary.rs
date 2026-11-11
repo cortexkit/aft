@@ -182,6 +182,7 @@ fn deploy_with_warmup(
         }
         unchanged(&input, &source, &identity)?;
         image_cache::refresh(&directory)?;
+        image_cache::prune_real_images(&cache, &directory, SystemTime::now())?;
         return Ok(image);
     }
     let pending = tempfile::Builder::new()
@@ -226,7 +227,7 @@ fn deploy_with_warmup(
         return Err(error);
     }
     image_cache::refresh(&directory)?;
-    image_cache::prune(&cache, &directory, SystemTime::now())?;
+    image_cache::prune_real_images(&cache, &directory, SystemTime::now())?;
     Ok(image)
 }
 

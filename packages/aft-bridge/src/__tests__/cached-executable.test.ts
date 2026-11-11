@@ -11,6 +11,7 @@ import {
   statSync,
   symlinkSync,
   utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -73,11 +74,21 @@ test("pruning restores an identity refreshed between scan and claim", () => {
     const image = cachedExecutableBytes(Buffer.from("retained"), root);
     const directory = dirname(image);
     utimesSync(directory, new Date(0), new Date(0));
-    pruneExecutableCache(root, "another identity", Date.now(), (source, destination) => {
-      const refreshed = new Date();
-      utimesSync(source, refreshed, refreshed);
-      renameSync(source, destination);
-    });
+    let claims = 0;
+    pruneExecutableCache(
+      root,
+      "another identity",
+      Date.now(),
+      (source, destination) => {
+        claims++;
+        const refreshed = new Date();
+        utimesSync(source, refreshed, refreshed);
+        renameSync(source, destination);
+      },
+      undefined,
+      { usage: { pidAlive: () => false, inUse: () => false }, freeBytes: () => 40 * 1024 ** 3 },
+    );
+    expect(claims).toBe(1);
     expect(readFileSync(image).toString()).toBe("retained");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -92,6 +103,10 @@ test("executable cache body errors take precedence over unexpected cleanup error
     const bodyError = new Error("claim failed");
     const cleanupError = new Error("cleanup failed");
     let cleanups = 0;
+    const probes = {
+      usage: { pidAlive: () => false, inUse: () => false },
+      freeBytes: () => 40 * 1024 ** 3,
+    };
     expect(() =>
       pruneExecutableCache(
         root,
@@ -104,14 +119,90 @@ test("executable cache body errors take precedence over unexpected cleanup error
           cleanups++;
           throw cleanupError;
         },
+        probes,
       ),
     ).toThrow(bodyError);
     expect(cleanups).toBe(1);
     expect(() =>
-      pruneExecutableCache(root, "another identity", Date.now(), renameSync, () => {
-        throw cleanupError;
-      }),
+      pruneExecutableCache(
+        root,
+        "another identity",
+        Date.now(),
+        renameSync,
+        () => {
+          throw cleanupError;
+        },
+        probes,
+      ),
     ).toThrow(cleanupError);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executable cache count cap keeps live leases and ignores expired reused PIDs", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-count-"));
+  try {
+    const now = 1_700_000_000_000;
+    const directory = (number: number, age: number) => {
+      const path = join(root, number.toString(16).padStart(64, "0"));
+      mkdirSync(path);
+      writeFileSync(join(path, "image"), "fixture");
+      utimesSync(path, new Date(now - age), new Date(now - age));
+      return path;
+    };
+    const lease = (path: string, age: number) => {
+      const modified = statSync(path).mtime;
+      mkdirSync(join(path, ".leases"));
+      const marker = join(path, ".leases", "123");
+      writeFileSync(marker, "");
+      utimesSync(marker, new Date(now - age), new Date(now - age));
+      utimesSync(path, modified, modified);
+    };
+    const unused = Array.from({ length: 6 }, (_, index) =>
+      directory(index + 1, (index + 1) * 1000),
+    );
+    const active = directory(20, 4 * 3600_000);
+    lease(active, 0);
+    const expired = directory(21, 4 * 3600_000);
+    lease(expired, 3 * 3600_000);
+    const opened = directory(22, 25 * 3600_000);
+    pruneExecutableCache(root, "current", now, renameSync, undefined, {
+      usage: { pidAlive: (pid) => pid === 123, inUse: (path) => path === opened },
+      freeBytes: () => 40 * 1024 ** 3,
+    });
+    for (const [index, path] of unused.entries()) expect(existsSync(path)).toBe(index < 4);
+    expect(existsSync(active)).toBe(true);
+    expect(existsSync(expired)).toBe(false);
+    expect(existsSync(opened)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executable cache low disk evicts unused images only after thirty minutes", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-pressure-"));
+  try {
+    const now = 1_700_000_000_000;
+    const paths = [1801, 1800, 1799].map((age, index) => {
+      const path = join(root, String(index).repeat(64));
+      mkdirSync(path);
+      utimesSync(path, new Date(now - age * 1000), new Date(now - age * 1000));
+      return path;
+    });
+    const usage = { pidAlive: () => false, inUse: () => false };
+    pruneExecutableCache(root, "current", now, renameSync, undefined, {
+      usage,
+      freeBytes: () => 40 * 1024 ** 3,
+    });
+    expect(paths.every(existsSync)).toBe(true);
+    pruneExecutableCache(root, "current", now, renameSync, undefined, {
+      usage,
+      freeBytes: () => 40 * 1024 ** 3 - 1,
+    });
+    expect(existsSync(paths[0]!)).toBe(false);
+    expect(existsSync(paths[1]!)).toBe(true);
+    expect(existsSync(paths[2]!)).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

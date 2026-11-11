@@ -161,8 +161,42 @@ def prune_run_archives(root: Path, run_dir: Path) -> None:
         print(f"CI archive disk free after pruning: {after / 1024**3:.1f} GiB", flush=True)
 
 
+def target_bytes(target: Path) -> int:
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for directory, children, files in os.walk(target, followlinks=False):
+        children[:] = [name for name in children if not (Path(directory) / name).is_symlink()]
+        for name in files:
+            path = Path(directory) / name
+            try:
+                if path.is_symlink():
+                    continue
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            identity = (stat.st_dev, stat.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += stat.st_blocks * 512 if hasattr(stat, "st_blocks") else stat.st_size
+    return total
+
+
+def clean_oversized_target(target: Path) -> None:
+    if os.environ.get("RUNNER_ENVIRONMENT") != "self-hosted":
+        return
+    size = target_bytes(target)
+    if size > 50 * 1024**3:
+        print(f"CI shared target size before cargo clean: {size / 1024**3:.1f} GiB ({size} bytes)", flush=True)
+        # Cargo owns the dependency graph and fingerprints. Cleaning the whole
+        # target is safe; deleting apparently old deps individually is not.
+        subprocess.run(["cargo", "clean", "--target-dir", str(target)], check=True)
+
+
 def setup(root: Path, run_dir: Path) -> None:
     target = root / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    clean_oversized_target(target)
     target.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")

@@ -1238,6 +1238,50 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.state.run_directory(root, "../target", "1")
 
+    def test_shared_target_is_cleaned_whole_only_above_fifty_gib_on_self_hosted(self) -> None:
+        target = Path("native-target")
+        for environment, size, expected in (("github-hosted", 78, False), ("self-hosted", 50, False),
+                                             ("self-hosted", 78, True)):
+            with self.subTest(environment=environment, size=size), \
+                 unittest.mock.patch.dict(os.environ, {"RUNNER_ENVIRONMENT": environment}), \
+                 unittest.mock.patch.object(self.state, "target_bytes", return_value=size * 1024**3) as measure, \
+                 unittest.mock.patch.object(self.state.subprocess, "run") as run, \
+                 unittest.mock.patch("builtins.print") as output:
+                self.state.clean_oversized_target(target)
+                self.assertEqual(measure.call_count, int(environment == "self-hosted"))
+                if expected:
+                    run.assert_called_once_with(["cargo", "clean", "--target-dir", str(target)], check=True)
+                    self.assertIn("78.0 GiB", output.call_args.args[0])
+                else:
+                    run.assert_not_called()
+
+    def test_setup_checks_shared_target_before_publishing_build_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "aft-ci"
+            env_file = Path(tmp) / "env"
+            def clean(target):
+                self.assertEqual(target, root / "target")
+                self.assertFalse(env_file.exists())
+                target.rmdir()
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file)}), \
+                 unittest.mock.patch.object(self.state, "setup_windows_tool_paths", return_value={}), \
+                 unittest.mock.patch.object(self.state, "prune_run_archives"), \
+                 unittest.mock.patch.object(self.state, "clean_oversized_target", side_effect=clean) as cleanup:
+                self.state.setup(root, self.state.run_directory(root, "100", "1"))
+            cleanup.assert_called_once()
+            self.assertTrue((root / "target").is_dir())
+            self.assertTrue(env_file.exists())
+
+    def test_target_size_deduplicates_hardlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / "image"
+            image.write_bytes(b"artifact" * 1024)
+            os.link(image, root / "alias")
+            stat = image.stat()
+            expected = stat.st_blocks * 512 if hasattr(stat, "st_blocks") else stat.st_size
+            self.assertEqual(self.state.target_bytes(root), expected)
+
     def test_archive_pruning_keeps_fresh_boundary_and_current_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "aft-ci"
