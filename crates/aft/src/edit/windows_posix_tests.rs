@@ -503,7 +503,19 @@ fn windows_posix_metadata_matches_replace_file() {
         std::fs::write(&dacl_copy, b"").unwrap();
         super::super::windows_dacl::copy_protected(&path, &dacl_copy).unwrap();
         if guarded {
-            assert!(replace(&path, &temp).unwrap());
+            let original_attributes = information(&File::open(&path).unwrap())
+                .unwrap()
+                .dwFileAttributes;
+            let replacement_attributes = information(&File::open(&temp).unwrap())
+                .unwrap()
+                .dwFileAttributes;
+            assert!(
+                replace(&path, &temp).unwrap(),
+                "method={:?}, reason={}, original attributes={original_attributes:#x}, replacement attributes={replacement_attributes:#x}, fixture={}",
+                LAST_METHOD.get(),
+                LAST_REASON.with(|reason| reason.borrow().clone()),
+                dir.path().display(),
+            );
             assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
         } else {
             use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
