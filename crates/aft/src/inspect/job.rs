@@ -669,4 +669,3 @@ impl ExcludedTestTally {
 pub(crate) use crate::file_kind::is_test_file;
 
 pub(crate) use crate::path_identity::{canonicalize_normalized, normalize_path};
-

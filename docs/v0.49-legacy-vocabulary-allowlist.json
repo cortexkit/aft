@@ -1547,12 +1547,12 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/data_layer/parent_session/query.rs",
-      "line": 510,
+      "path": "crates/aft/src/commands/parent_query/mod.rs",
+      "line": 237,
       "column": 52,
       "token": "toFile",
       "text": "let to_file = match string_param(req, \"toFile\") {",
-      "location": "line 510, column 52",
+      "location": "line 237, column 52",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
