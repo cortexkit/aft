@@ -6258,7 +6258,7 @@ fn read_with<T>(consume: impl FnOnce(bool) -> T) -> T { consume(crate::guard::is
             ),
             (
                 "src/read.rs",
-                include_str!("../../commands/file_read_exact.rs"),
+                include_str!("../../file_read_exact.rs"),
             ),
             (
                 "src/db/file_identity.rs",

@@ -307,7 +307,7 @@ fn check_metadata(metadata: &std::fs::Metadata) -> io::Result<()> {
 fn open_verified(
     path: &Path,
     identity: FileIdentity,
-) -> io::Result<crate::commands::file_read_exact::OpenedFile> {
+) -> io::Result<crate::file_read_exact::OpenedFile> {
     if identity == FileIdentity::Unavailable {
         return Err(io::Error::other("tool result file identity unavailable"));
     }
@@ -316,13 +316,12 @@ fn open_verified(
         .ok_or_else(|| io::Error::other("tool result has no parent"))?;
     // Walk with O_NOFOLLOW on Unix; on Windows open reparse points without
     // following them. Verify the actual handle before reading any bytes.
-    let file = crate::commands::file_read_exact::open_no_follow(root, path)
+    let file = crate::file_read_exact::open_no_follow(root, path)
         .map_err(|error| io::Error::other(format!("tool result open refused: {error:?}")))?;
     check_metadata(&file.metadata()?)?;
     if FileIdentity::of_file(&file) != identity
-        || crate::path_identity::normalize_path(&crate::commands::file_read_exact::opened_location(
-            &file,
-        )?) != path
+        || crate::path_identity::normalize_path(&crate::file_read_exact::opened_location(&file)?)
+            != path
     {
         return Err(io::Error::other("tool result file was replaced"));
     }
