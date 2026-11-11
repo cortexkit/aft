@@ -8,6 +8,7 @@ use cortexkit_role_tool_display::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use subc_protocol::Principal;
 
 use super::display::counters::{count, Counter::*};

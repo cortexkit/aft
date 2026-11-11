@@ -5241,7 +5241,7 @@ mod grant_path_tests {
             );
             assert_eq!(response.data["resolve_calls"], usize::from(stamped));
             assert!(matches!(
-                super::super::secret_consent::current_call_scopes(),
+                crate::context::call_context::current_call_scopes(),
                 Err(crate::secret::Ineligibility::NoScope)
             ));
         }

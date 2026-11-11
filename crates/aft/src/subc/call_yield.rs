@@ -225,8 +225,10 @@ impl WatchYields {
     }
 }
 
+#[cfg(test)]
+use crate::commands::bash_watch::restart::{copy_watch_response, watch_is_held};
 pub(crate) use crate::commands::bash_watch::restart::{
-    copy_watch_response, watch_can_hold, watch_finished, watch_is_held, watch_unknown, WatchWait,
+    watch_can_hold, watch_finished, watch_unknown, WatchWait,
 };
 
 #[allow(clippy::too_many_arguments)]
