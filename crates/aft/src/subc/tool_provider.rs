@@ -1925,6 +1925,7 @@ pub(super) fn note_native_outcome(
 /// pass through the same edge and are committed before reaching the socket.
 pub(super) struct LedgerEdge {
     calls: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerCall>>,
+    received: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), ReceivedCall>>,
     waiting: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerWait>>,
     authorizing: std::sync::Mutex<std::collections::HashSet<super::ReverseCorrKey>>,
     ready: tokio::sync::mpsc::UnboundedSender<super::DecodedFrame>,
@@ -1962,9 +1963,12 @@ fn copy_terminal_body(body: &[u8]) -> Vec<u8> {
     });
     body.to_vec()
 }
-struct LedgerWait {
+struct ReceivedCall {
     key: crate::db::call_ledger::Key,
     live: tokio::sync::watch::Sender<bool>,
+}
+
+struct LedgerWait {
     admission: super::AdmissionWait,
     cancel: super::PersistentCancelSignal,
     terminal_claim: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2472,6 +2476,7 @@ impl LedgerEdge {
         (
             std::sync::Arc::new(Self {
                 calls: Default::default(),
+                received: Default::default(),
                 waiting: Default::default(),
                 recent_sweeps: Default::default(),
                 authorizing: Default::default(),
@@ -2528,6 +2533,49 @@ impl LedgerEdge {
             carrier,
             call_key: call_key.into(),
         }
+    }
+
+    /// Track received keys before waiting for stored access rules or database work.
+    /// The observers neither send replies nor count as held requests.
+    pub(super) fn note_received(
+        &self,
+        decoded: &super::DecodedFrame,
+        routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
+    ) {
+        let route = super::route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let Some(identity) = routes
+            .get(&route)
+            .filter(|identity| identity.role == RouteRole::ToolProviderV1)
+        else {
+            return;
+        };
+        let Ok(body) = decoded.body() else {
+            return;
+        };
+        if body
+            .get("op")
+            .is_some_and(|op| op.as_str() != Some("tool.call"))
+            || body
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(recognized_operation)
+        {
+            return;
+        }
+        let Some(call_key) = body.get("call_key").and_then(Value::as_str) else {
+            return;
+        };
+        if cortexkit_role_tool_provider::call::validate_call_key(call_key).is_err() {
+            return;
+        }
+        self.received
+            .lock()
+            .unwrap()
+            .entry((route, decoded.frame.header.corr))
+            .or_insert_with(|| ReceivedCall {
+                key: Self::key(identity, call_key),
+                live: tokio::sync::watch::channel(false).0,
+            });
     }
 
     /// Returns the frame unchanged for keyless, legacy and refused calls.
@@ -2690,11 +2738,10 @@ impl LedgerEdge {
         let cancel = PersistentCancelSignal::new();
         let terminal_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let admission = AdmissionWait::from_decoded(&decoded, &call.name);
+        self.note_received(&decoded, routes);
         self.waiting.lock().unwrap().insert(
             (route, decoded.frame.header.corr),
             LedgerWait {
-                key: response_key.clone(),
-                live: tokio::sync::watch::channel(false).0,
                 admission,
                 cancel: cancel.clone(),
                 terminal_claim: terminal_claim.clone(),
@@ -2793,9 +2840,14 @@ impl LedgerEdge {
                                     detached: false,
                                 },
                             );
-                            let _ = waiting[&(route, decoded.frame.header.corr)]
-                                .live
-                                .send_replace(true);
+                            if let Some(received) = edge
+                                .received
+                                .lock()
+                                .unwrap()
+                                .get(&(route, decoded.frame.header.corr))
+                            {
+                                let _ = received.live.send_replace(true);
+                            }
                         }
                         admitted
                     };
@@ -3186,9 +3238,6 @@ impl LedgerEdge {
         route: super::RouteChannel,
         key: &crate::db::call_ledger::Key,
     ) -> Option<tokio::sync::watch::Receiver<bool>> {
-        // Match admission's waiting -> calls lock order. Subscribe while the
-        // registration lock is held so a completion cannot lose its wakeup.
-        let waiting = self.waiting.lock().unwrap();
         if self
             .calls
             .lock()
@@ -3198,10 +3247,16 @@ impl LedgerEdge {
         {
             return None;
         }
-        waiting.iter().find_map(|((call_route, _), wait)| {
-            (*call_route == route && wait.key == *key && !*wait.live.borrow())
-                .then(|| wait.live.subscribe())
-        })
+        // The watch retains transitions even when admission finishes before
+        // the new waiter is first polled. Do not hold calls and received together.
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|((call_route, _), wait)| {
+                (*call_route == route && wait.key == *key && !*wait.live.borrow())
+                    .then(|| wait.live.subscribe())
+            })
     }
 
     fn call_yield_ready(
@@ -3420,6 +3475,10 @@ impl LedgerEdge {
         executor: &std::sync::Arc<crate::executor::Executor>,
         route: Option<super::RouteChannel>,
     ) {
+        self.received
+            .lock()
+            .unwrap()
+            .retain(|(channel, _), _| route.is_some_and(|route| *channel != route));
         let calls: Vec<_> = self
             .calls
             .lock()
@@ -3451,6 +3510,12 @@ impl LedgerEdge {
         &self,
         routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
     ) -> std::collections::HashSet<super::RouteChannel> {
+        // Policy waits own their own cancellation. Forget only their key
+        // observations when a route retires, without taking over any replies.
+        self.received
+            .lock()
+            .unwrap()
+            .retain(|(route, _), _| routes.contains_key(route));
         self.calls
             .lock()
             .unwrap()
@@ -3525,6 +3590,7 @@ impl LedgerEdge {
     }
 
     pub(super) fn close(&self) {
+        self.received.lock().unwrap().clear();
         for signal in self.waiting.lock().unwrap().values() {
             signal.cancel.cancel();
         }
@@ -3563,6 +3629,10 @@ impl LedgerEdge {
     }
 
     pub(super) fn finish_waiting(&self, request: &subc_protocol::Frame) -> bool {
+        self.received.lock().unwrap().remove(&(
+            super::route_key(request.header.channel, request.header.epoch),
+            request.header.corr,
+        ));
         self.waiting
             .lock()
             .unwrap()
@@ -3739,6 +3809,12 @@ impl LedgerEdge {
                     outgoing.header.ty,
                     FrameType::Response | FrameType::Error | FrameType::StreamEnd
                 );
+                if terminal {
+                    edge.received
+                        .lock()
+                        .unwrap()
+                        .remove(&(route, outgoing.header.corr));
+                }
                 let permission_hold = outgoing.header.ty == FrameType::Response
                     && serde_json::from_slice::<Value>(&outgoing.body).is_ok_and(|body| {
                         body.get("held").is_some() && body.get("isError").is_none()
@@ -10939,10 +11015,11 @@ mod ledger_terminal_tests {
                 10000,
             ),
         );
-        assert!(edge.defer(
-            yield_admission_request(7, json!({"name":"bash_watch", "preset":"worker", "call_key":key.call_key, "arguments":{"taskId":"pending-watch", "timeoutMs":10000}})),
-            &routes, &executor, &writer, &metrics,
-        ).is_ok());
+        let watch = yield_admission_request(
+            7,
+            json!({"name":"bash_watch", "preset":"worker", "call_key":key.call_key, "arguments":{"taskId":"pending-watch", "timeoutMs":10000}}),
+        );
+        edge.note_received(&watch, &routes);
         assert!(edge.calls.lock().unwrap().is_empty());
         assert!(ready.try_recv().is_err());
         let sent = Instant::now();
@@ -10955,6 +11032,15 @@ mod ledger_terminal_tests {
                 .await
                 .is_err(),
             "a received call must not answer unknown_call while its admission is blocked"
+        );
+        assert!(edge
+            .defer(watch, &routes, &executor, &writer, &metrics)
+            .is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err(),
+            "the same yield must stay pending across policy and ledger admission waits"
         );
         release_tx.send(()).unwrap();
         blocked.await.unwrap();
@@ -11014,23 +11100,21 @@ mod ledger_terminal_tests {
         let (_dir, root) = test_support::test_root("yield-admission-bounds");
         for completed in [false, true] {
             let mut identity = test_support::route_identity(&root, "session");
-            std::sync::Arc::get_mut(&mut identity.0).unwrap().call_yield = true;
+            let data = std::sync::Arc::get_mut(&mut identity.0).unwrap();
+            data.role = RouteRole::ToolProviderV1;
+            data.call_yield = true;
             let key = LedgerEdge::key(&identity, "pending-watch");
             let (edge, _) = LedgerEdge::new();
             let request = yield_admission_request(
                 7,
                 json!({"name":"bash_watch", "call_key":key.call_key, "arguments":{"taskId":"pending-watch"}}),
             );
-            edge.waiting.lock().unwrap().insert(
-                (route_key(42, 1), 7),
-                LedgerWait {
-                    key: key.clone(),
-                    live: tokio::sync::watch::channel(false).0,
-                    admission: AdmissionWait::from_decoded(&request, "bash_watch"),
-                    cancel: PersistentCancelSignal::new(),
-                    terminal_claim: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                },
+            edge.note_received(
+                &request,
+                &std::collections::HashMap::from([(route_key(42, 1), identity.clone())]),
             );
+            assert!(edge.held_since().is_empty());
+            assert!(edge.drain_for_module_drain().unwrap().is_empty());
             let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
             let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
             let body = json!({"name":"tool.yield", "arguments":{"call_key":key.call_key, "reason":"runner_restart"}});
@@ -11046,7 +11130,7 @@ mod ledger_terminal_tests {
                 // Admission and completion can both happen before the waiter
                 // first polls. Its subscription must retain that notification.
                 let pending = edge
-                    .waiting
+                    .received
                     .lock()
                     .unwrap()
                     .remove(&(route_key(42, 1), 7))
@@ -11063,6 +11147,15 @@ mod ledger_terminal_tests {
                 "completed={completed}"
             );
             assert!(sent.elapsed() < Duration::from_secs(3));
+            if !completed {
+                let pending = edge.admission_for_yield(route_key(42, 1), &key).unwrap();
+                assert!(edge.unrouted_shells(&Default::default()).is_empty());
+                assert!(edge.received.lock().unwrap().is_empty());
+                assert!(
+                    pending.has_changed().is_err(),
+                    "retired routes must drop their observation senders"
+                );
+            }
             let unknown = json!({"name":"tool.yield", "arguments":{"call_key":"never-received", "reason":"runner_restart"}});
             edge.call_yield(
                 yield_admission_request(9, unknown.clone()),
@@ -11182,8 +11275,6 @@ mod ledger_terminal_tests {
         edge.waiting.lock().unwrap().insert(
             (route_key(42, 1), 7),
             LedgerWait {
-                key: key(),
-                live: tokio::sync::watch::channel(false).0,
                 admission: crate::subc::AdmissionWait::from_decoded(
                     &crate::subc::DecodedFrame {
                         parsed_body: Default::default(),
@@ -11228,8 +11319,6 @@ mod ledger_terminal_tests {
         edge.waiting.lock().unwrap().insert(
             (route_key(42, 1), 7),
             LedgerWait {
-                key: key(),
-                live: tokio::sync::watch::channel(false).0,
                 admission: crate::subc::AdmissionWait::from_decoded(
                     &crate::subc::DecodedFrame {
                         parsed_body: Default::default(),

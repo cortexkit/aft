@@ -6079,6 +6079,7 @@ where
                         // access (the head agent's, or a worker run's own worker's):
                         // every step below sees the owner-derived identity.
                         let codemode_routes;
+                        ledger_edge.note_received(&decoded, &routes);
                         let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok(), |identity| {
                             let Some(ctx) = executor.actor_context(&identity.root) else {
                                 return Some(Err(remote_policy::policy_unavailable()));
