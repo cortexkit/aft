@@ -1323,14 +1323,7 @@ async fn proxy_unavailable_release_refuses_and_tunnel_closes_on_stop() {
         client.command(json!({"op":"connect","authority":server.address.to_string()}))["ok"],
         true
     );
-    assert_eq!(
-        client.request(
-            "/approved",
-            json!({"authorization":format!("Bearer {MARKER}")}),
-            ""
-        )["status"],
-        200
-    );
+    assert_eq!(client.command(json!({"op":"request", "authority":server.address.to_string(), "path":"/approved", "headers":{"authorization":format!("Bearer {MARKER}")}}))["status"], 200);
     proxy.process_tree_ended();
     assert_post_stop_connect_is_not_served(&proxy, server.address).await;
     assert_eq!(client.request("/approved", json!({}), "")["error"], true);

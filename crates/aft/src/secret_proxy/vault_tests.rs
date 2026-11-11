@@ -453,11 +453,7 @@ async fn live_vault_redirect_to_another_host_asks_again_and_sends_no_key() {
         )["ok"],
         true
     );
-    let second = client.request(
-        location.path(),
-        json!({"authorization":format!("Bearer {MARKER}")}),
-        "",
-    );
+    let second = client.command(json!({"op":"request", "authority":format!("127.0.0.1:{}", server.address.port()), "path":location.path(), "headers":{"authorization":format!("Bearer {MARKER}")}}));
     assert_eq!(second["status"], 200);
     assert_eq!(
         server.seen.lock()[1]["headers"]["authorization"],

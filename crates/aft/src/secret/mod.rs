@@ -14,7 +14,6 @@
 pub mod consent;
 pub mod eligibility;
 pub mod outcome;
-#[cfg(unix)]
 pub(crate) mod requests;
 pub mod scope;
 pub mod transport;

@@ -186,11 +186,7 @@ fn resolve_secret_fetch(
         authorization,
         labels: labels.to_vec(),
         #[cfg(test)]
-        test_https_port: if options.allow_private {
-            url::Url::parse(file).ok().and_then(|url| url.port())
-        } else {
-            None
-        },
+        test_https_port: url::Url::parse(file).ok().and_then(|url| url.port()),
         call_id: req.id.clone(),
     };
     let document = crate::url_fetch::fetch_url_with_secrets(file, &document_dir, options, &secrets)

@@ -41,8 +41,9 @@ use subc_protocol::scope::ScopeStamp;
 
 const SECRET_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Use the same scoped daemon connection and reserved AFT filer as permission
-/// asks, retaining the card id so a held call never files it twice.
+/// Use the daemon connection that files filesystem-access questions with
+/// Cingulate as its reserved AFT module principal. Retain each secret card's id
+/// so a held call waits for the existing card instead of filing another.
 pub(super) fn install_subc_transport(transport: Arc<dyn super::consent::ConsentTransport>) {
     crate::secret::consent::install_transport(Some(Arc::new(SubcSecretConsent {
         transport,
