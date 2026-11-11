@@ -812,6 +812,34 @@ fn blob_ref_kind(kind: RefKind) -> BlobRefKind {
 mod tests {
     use super::*;
 
+    #[test]
+    fn syntax_fact_record_bytes_stay_compatible() {
+        let corpus = [
+            ("main.rs", "// TODO(alice): keep entry facts\n#[derive(serde::Serialize)]\nstruct Message { value: u32 }\nfn main() { helper(); }\nfn helper() {}\n#[cfg(test)] mod tests { fn check() {} }\n"),
+            ("lib.rs", "pub mod api;\nmod private { pub fn callback() {} }\npub use private::callback;\nmacro_rules! invoke { ($f:ident) => { $f() }; }\n// FIXME: keep macro references\nfn run() { invoke!(callback); }\n"),
+            ("main.go", "package main\n// TODO: keep dispatch facts\ntype Reader interface { Read() int }\ntype File struct {}\nfunc (f File) Read() int { return 1 }\nfunc main() { var r Reader = File{}; r.Read() }\n"),
+            ("main.js", "import { helper } from './lib.js';\n// TODO(bob): keep imports\nexport { helper as run };\nexport const value = helper();\n"),
+            ("lib.ts", "import type { Shape } from './types';\nexport * from './other';\n// FIXME: keep type references\nexport function draw(shape: Shape): Shape { return shape; }\n"),
+            ("notes.md", "# Notes\n<!-- TODO(writer): document the API -->\n<!-- FIXME: check examples -->\n"),
+        ];
+        let mut hashes = Vec::new();
+        for (path, source) in corpus {
+            let language = language_for(path, source.as_bytes()).unwrap();
+            let record = extract(source.as_bytes(), &language).unwrap();
+            let (surface, body) = record.encode();
+            hashes.push((
+                path,
+                blake3::hash(&surface).to_hex().to_string(),
+                blake3::hash(&body).to_hex().to_string(),
+            ));
+            println!(
+                "record {path}: {}",
+                serde_json::to_string(&(surface, body)).unwrap()
+            );
+        }
+        println!("record hashes: {hashes:?}");
+    }
+
     /// The record's version names the call-graph producer it extracts with,
     /// so a producer bump cannot leave records of its old output under the
     /// new name; the suffix keeps them apart from views' blobs of the same
