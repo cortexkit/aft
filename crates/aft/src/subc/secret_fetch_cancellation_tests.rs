@@ -154,6 +154,8 @@ async fn held_foreground_fetch_late_allow(expire: bool) {
     let f = fixture(FakeCingulate::up());
     let _restore = Restore;
     let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().pending_expires_at_ms =
+        Some(crate::secret::vault::now_ms() + 600_000);
     for label in ["first", "second"] {
         daemon.state.lock().unwrap().records.push(Record {
             name: label.into(),

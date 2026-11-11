@@ -50,6 +50,7 @@ pub(crate) struct State {
     pub records: Vec<Record>,
     pub once: bool,
     pub next_request: usize,
+    pub pending_expires_at_ms: Option<u64>,
     approved: HashSet<PendingKey>,
     pub(super) pending: HashMap<PendingKey, Value>,
 }
@@ -243,6 +244,10 @@ impl State {
             statement["durations"] = json!(["permanent"]);
         }
         statement["agent_id"] = json!(stamp.attributes.agent_id);
+        if let Some(expires) = self.pending_expires_at_ms {
+            pending["expires_at_ms"] = json!(expires);
+            statement["expires_at_ms"] = json!(expires);
+        }
         if let Some(record) = &record {
             statement["secret"]["name"] = json!(record.name);
             statement["use"] =
