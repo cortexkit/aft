@@ -808,6 +808,14 @@ impl LiveCheckout {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if budget.is_some() {
+            // A module move can invalidate thousands of method readers even
+            // when few paths changed. Admit those declaration readers before
+            // binding or resolving bystanders, not only at the sites pass.
+            let keys = MethodCallInputs::changed_parse_method_keys(&old, inputs, &contents);
+            let readers = self.reverse.sites_of(&keys);
+            admit(&mut budget, &readers)?;
+        }
         // Configuration files added or removed. A content change of an
         // existing one reaches its readers through their recorded field
         // answers, which are asked again below. Adding or removing one

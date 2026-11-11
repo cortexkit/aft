@@ -1746,6 +1746,29 @@ pub(crate) struct MethodCallInputs {
 const SMALL_SITE_RUN: usize = 64;
 
 impl MethodCallInputs {
+    /// Declaration changes already identify method readers before resolving
+    /// any importer. Compare raw facts on both sides: import/type targets are
+    /// filled by resolution and are admitted separately when they are known.
+    pub(crate) fn changed_parse_method_keys(
+        old: &CheckoutInputs,
+        next: &CheckoutInputs,
+        changed: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        for path in changed {
+            let before = old
+                .parses
+                .read(path)
+                .map(|(_, parse)| FileFacts::new(&parse));
+            let after = next
+                .parses
+                .read(path)
+                .map(|(_, parse)| FileFacts::new(&parse));
+            FileFacts::changed_keys_by_method(path, before.as_ref(), after.as_ref(), &mut keys);
+        }
+        keys
+    }
+
     /// The files whose inputs the resolver computed itself since the last
     /// call.
     #[cfg(test)]
