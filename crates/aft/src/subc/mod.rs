@@ -10731,6 +10731,7 @@ impl PlainToolRun {
         }
         let run_spec = self.clone();
         let runtime = tokio::runtime::Handle::current();
+        let secret_scopes = Some(secret_consent::call_scopes(&self.identity));
         Box::new(move |ctx| {
             let PlainToolRun {
                 progress,
@@ -10793,6 +10794,9 @@ impl PlainToolRun {
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(reply_deadline);
+            let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes);
+            let _secret_identity =
+                secret_consent::SecretIdentityGuard::install(identity_for_run.clone());
             // Translation resolves tool paths before dispatch. Keep the agent's
             // spelling for messages about folders a walk could not read, without
             // changing the translated paths.

@@ -16,10 +16,9 @@ fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
         tokio::runtime::Handle::try_current().is_err(),
         Ordering::SeqCst,
     );
-    let response =
-        crate::commands::with_secret_fetch_for_test(vault, options, || {
-            crate::commands::outline::handle_outline(&request, ctx)
-        });
+    let response = crate::commands::with_secret_fetch_for_test(vault, options, || {
+        crate::commands::outline::handle_outline(&request, ctx)
+    });
     FINISHED.fetch_add(1, Ordering::SeqCst);
     response
 }
