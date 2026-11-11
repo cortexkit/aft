@@ -3358,6 +3358,8 @@ impl AppContext {
     }
 
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
+        #[cfg(test)]
+        crate::commands::register_shell_handlers();
         Self::with_app_and_provider(App::default_shared(), provider, config)
     }
 

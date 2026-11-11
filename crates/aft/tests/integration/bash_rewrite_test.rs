@@ -34,6 +34,7 @@ use crate::test_helpers::{
 };
 
 fn context(root: &std::path::Path, enabled: bool) -> AppContext {
+    aft::commands::register_shell_handlers();
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config {
@@ -47,6 +48,7 @@ fn context(root: &std::path::Path, enabled: bool) -> AppContext {
 }
 
 fn context_with_search(root: &std::path::Path, aft_search_registered: bool) -> AppContext {
+    aft::commands::register_shell_handlers();
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config {

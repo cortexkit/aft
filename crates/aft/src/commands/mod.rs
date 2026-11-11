@@ -4,6 +4,16 @@ pub mod ast_replace;
 pub mod ast_scope;
 pub mod ast_search;
 pub mod bash;
+
+/// Install typed rewrite targets before serving bash in a process or embedder.
+pub fn register_shell_handlers() {
+    crate::bash_rewrite::dispatch::register(crate::bash_rewrite::dispatch::RewriteDispatch {
+        read: read::handle_read,
+        grep: grep::handle_grep,
+        glob: glob::handle_glob,
+        edit_match: edit_match::handle_edit_match,
+    });
+}
 pub mod bash_abort_inflight;
 pub mod bash_artifact_owned;
 pub mod bash_drain_completions;
