@@ -9,19 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-#[cfg(target_os = "macos")]
-const ROOT: &str = "/private/tmp/aft-w";
-#[cfg(not(target_os = "macos"))]
-const ROOT: &str = "/tmp/aft-w";
+use crate::task_temp_reads::MANAGED_TEMP_ROOT as ROOT;
+use crate::task_temp_reads::{is_managed, provider_root, task_name};
 const SWEEP_BUDGET: usize = 128;
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(super) fn root() -> &'static Path {
     Path::new(ROOT)
-}
-
-fn provider_root() -> PathBuf {
-    root().join("env-provider")
 }
 
 /// Provider preflights have their own namespace so restart cleanup can inspect
@@ -241,28 +235,6 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
     }
-}
-
-fn task_name(name: &str) -> bool {
-    name.len() == 12
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-pub(super) fn is_managed(path: &Path) -> bool {
-    let provider_parent = path.parent().is_some_and(|parent| {
-        parent.parent() == Some(provider_root().as_path())
-            && parent
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(task_name)
-    });
-    (path.parent() == Some(Path::new(ROOT)) || provider_parent)
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(task_name)
 }
 
 pub(super) fn create(task_io: &Path) -> io::Result<PathBuf> {

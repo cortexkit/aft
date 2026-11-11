@@ -5852,15 +5852,7 @@ exec /usr/bin/mktemp "$@" "${TMPDIR:?}/tmp.XXXXXXXX"
     })
 }
 
-pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
-    #[cfg(unix)]
-    if task_temp::is_managed(path) {
-        return true;
-    }
-    path.file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.starts_with(".sandbox-tmp-"))
-}
+pub(crate) use crate::task_temp_reads::is_managed_task_temp_dir;
 
 pub(crate) fn cleanup_task_temp_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]

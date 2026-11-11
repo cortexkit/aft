@@ -294,72 +294,7 @@ fn open_contents(_root: &Path, target: &Path) -> Result<File, ReadExactRefusal> 
         .map_err(open_error)
 }
 
-/// Where an open file really is, asked of the kernel through its handle.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
-    use std::os::fd::AsRawFd;
-    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-}
-
-/// Where an open file really is, asked of the kernel through its handle.
-#[cfg(target_os = "macos")]
-pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL-terminated, into
-    // the buffer, and the descriptor stays open for the whole call.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let len = buffer
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(|| io::Error::other("unterminated F_GETPATH result"))?;
-    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..len])))
-}
-
-/// Other Unix systems have no handle-to-path query wired up here, so the
-/// read fails closed rather than trusting the path walk alone.
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
-))]
-pub(crate) fn opened_location(_file: &File) -> io::Result<PathBuf> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
-/// Where an open file really is, with every junction and symlink resolved.
-#[cfg(windows)]
-pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
-    };
-    let mut buffer = vec![0u16; 512];
-    loop {
-        let capacity = u32::try_from(buffer.len()).map_err(io::Error::other)?;
-        // SAFETY: the buffer holds `capacity` UTF-16 units and the handle is
-        // open for the whole call.
-        let len = unsafe {
-            GetFinalPathNameByHandleW(
-                file.as_raw_handle(),
-                buffer.as_mut_ptr(),
-                capacity,
-                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-            )
-        } as usize;
-        if len == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if len < buffer.len() {
-            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])));
-        }
-        // Too small: `len` is the size needed, including the terminator.
-        buffer.resize(len, 0);
-    }
-}
+pub(crate) use crate::task_temp_reads::opened_location;
 
 #[cfg(unix)]
 fn path_identity(path: &Path) -> io::Result<(u64, u64)> {

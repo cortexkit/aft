@@ -10,8 +10,7 @@ pub(crate) struct OpenCheck {
 }
 
 pub(crate) fn is_scratch(path: &Path) -> bool {
-    path.ancestors()
-        .any(crate::sandbox_spawn::is_managed_task_temp_dir)
+    path.ancestors().any(is_managed_task_temp_dir)
 }
 
 pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
@@ -30,7 +29,7 @@ pub(crate) fn check_path(path: &Path) -> io::Result<Option<OpenCheck>> {
     // always lands on the registry root for registry-authorized paths.
     let Some(absolute_root) = absolute_path
         .ancestors()
-        .filter(|path| crate::sandbox_spawn::is_managed_task_temp_dir(path))
+        .filter(|path| is_managed_task_temp_dir(path))
         .last()
     else {
         return Ok(None);
@@ -67,9 +66,7 @@ pub(crate) fn open(path: &Path) -> io::Result<File> {
 }
 
 fn validate_opened(path: &Path, check: &OpenCheck, file: &File) -> io::Result<()> {
-    let opened = crate::path_identity::normalize_path(
-        &crate::commands::file_read_exact::opened_location(file)?,
-    );
+    let opened = crate::path_identity::normalize_path(&opened_location(file)?);
     // Judge the descriptor, not a second canonicalization of the input: a
     // parent directory may have become a symlink after permission was checked.
     if !opened.starts_with(&check.root) || opened != check.expected || !file.metadata()?.is_file() {
@@ -148,6 +145,48 @@ pub(crate) fn is_task_environment(path: &Path) -> bool {
 
 #[cfg(test)]
 mod task_path_tests {
+    #[test]
+    fn managed_temp_predicates_preserve_legacy_and_private_root_names() {
+        use super::*;
+        assert!(is_managed_task_temp_dir(Path::new(
+            "/task/.sandbox-tmp-old"
+        )));
+        assert!(!is_managed_task_temp_dir(Path::new(
+            "/task/sandbox-tmp-old"
+        )));
+        #[cfg(unix)]
+        {
+            assert!(is_managed_task_temp_dir(
+                &Path::new(MANAGED_TEMP_ROOT).join("012345abcdef")
+            ));
+            for path in [
+                Path::new(MANAGED_TEMP_ROOT).join("012345ABCDEF"),
+                Path::new("/other").join("012345abcdef"),
+            ] {
+                assert!(!is_managed_task_temp_dir(&path), "{}", path.display());
+            }
+        }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    ))]
+    #[test]
+    fn opened_location_still_resolves_the_open_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("content");
+        std::fs::write(&path, "content").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let actual = super::opened_location(&file).unwrap();
+        assert_eq!(
+            crate::path_identity::normalize_path(&actual),
+            crate::path_identity::normalize_path(&std::fs::canonicalize(path).unwrap())
+        );
+    }
+
     use super::*;
     #[test]
     fn task_id_validation_is_exact() {
@@ -162,4 +201,115 @@ mod task_path_tests {
             assert!(validate_task_id(invalid).is_err(), "accepted {invalid}");
         }
     }
+}
+
+pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
+    #[cfg(unix)]
+    if is_managed(path) {
+        return true;
+    }
+    path.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.starts_with(".sandbox-tmp-"))
+}
+
+/// Where an open file really is, asked of the kernel through its handle.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Where an open file really is, asked of the kernel through its handle.
+#[cfg(target_os = "macos")]
+pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL-terminated, into
+    // the buffer, and the descriptor stays open for the whole call.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| io::Error::other("unterminated F_GETPATH result"))?;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..len])))
+}
+
+/// Other Unix systems have no handle-to-path query wired up here, so the
+/// read fails closed rather than trusting the path walk alone.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+pub(crate) fn opened_location(_file: &File) -> io::Result<PathBuf> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Where an open file really is, with every junction and symlink resolved.
+#[cfg(windows)]
+pub(crate) fn opened_location(file: &File) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+    let mut buffer = vec![0u16; 512];
+    loop {
+        let capacity = u32::try_from(buffer.len()).map_err(io::Error::other)?;
+        // SAFETY: the buffer holds `capacity` UTF-16 units and the handle is
+        // open for the whole call.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                capacity,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len < buffer.len() {
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])));
+        }
+        // Too small: `len` is the size needed, including the terminator.
+        buffer.resize(len, 0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const MANAGED_TEMP_ROOT: &str = "/private/tmp/aft-w";
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) const MANAGED_TEMP_ROOT: &str = "/tmp/aft-w";
+
+#[cfg(unix)]
+pub(crate) fn task_name(name: &str) -> bool {
+    name.len() == 12
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(unix)]
+pub(crate) fn provider_root() -> std::path::PathBuf {
+    Path::new(MANAGED_TEMP_ROOT).join("env-provider")
+}
+
+#[cfg(unix)]
+pub(crate) fn is_managed(path: &Path) -> bool {
+    let provider_parent = path.parent().is_some_and(|parent| {
+        parent.parent() == Some(provider_root().as_path())
+            && parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(task_name)
+    });
+    (path.parent() == Some(Path::new(MANAGED_TEMP_ROOT)) || provider_parent)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(task_name)
 }
