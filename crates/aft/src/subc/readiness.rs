@@ -620,6 +620,10 @@ impl DaemonControl {
         corr: u64,
         body: Vec<u8>,
     ) -> Result<ModuleControlResponseToModule, ControlError> {
+        decode_control_reply(&self.request_frame(corr, body).await?)
+    }
+
+    async fn request_frame(&self, corr: u64, body: Vec<u8>) -> Result<Frame, ControlError> {
         let rx = self.pending.register(corr);
         let _guard = PendingGuard {
             pending: &self.pending,
@@ -638,8 +642,54 @@ impl DaemonControl {
         send_reliable_writer_frame(&self.writer, &self.metrics, frame, "readiness request")
             .await
             .map_err(|_| ControlError::ConnectionClosed)?;
-        let reply = rx.await.map_err(|_| ControlError::ConnectionClosed)?;
-        decode_control_reply(&reply)
+        rx.await.map_err(|_| ControlError::ConnectionClosed)
+    }
+
+    pub(super) async fn agent_commands(
+        &self,
+        batch: crate::agent_commands::Batch,
+    ) -> Result<(), subc_client_rs::AgentCommandsError> {
+        use subc_client_rs::AgentCommandsError;
+        if !self.advertises("supervisor.agent_commands") {
+            return Err(AgentCommandsError::Unsupported);
+        }
+        let body = ModuleControlRequestFromModule::AgentCommands {
+            started: batch.started,
+            finished: batch.finished,
+            known: batch.known,
+        };
+        let (corr, body) = self
+            .prepare_request(&body)
+            .map_err(agent_commands_transport_error)?;
+        let frame = tokio::time::timeout(Duration::from_secs(5), self.request_frame(corr, body))
+            .await
+            .map_err(|_| AgentCommandsError::Timeout)?
+            .map_err(agent_commands_transport_error)?;
+        match frame.header.ty {
+            FrameType::Response => {
+                let value: serde_json::Value = serde_json::from_slice(&frame.body)
+                    .map_err(|error| AgentCommandsError::Protocol(error.to_string()))?;
+                if value.is_object() {
+                    Ok(())
+                } else {
+                    Err(AgentCommandsError::Protocol("expected an object".into()))
+                }
+            }
+            FrameType::Error => {
+                let body: ErrorBody = serde_json::from_slice(&frame.body)
+                    .map_err(|error| AgentCommandsError::Protocol(error.to_string()))?;
+                Err(match body.code.as_str() {
+                    "unsupported_control_frame" | "unknown_control_op" => {
+                        AgentCommandsError::Unsupported
+                    }
+                    "not_supervised" | "not_registered" => AgentCommandsError::NotSupervised,
+                    _ => AgentCommandsError::Refused(Box::new(body)),
+                })
+            }
+            other => Err(AgentCommandsError::Protocol(format!(
+                "unexpected terminal frame: {other:?}"
+            ))),
+        }
     }
 
     #[cfg(feature = "test-timing-hooks")]
@@ -703,6 +753,15 @@ fn scope_clock_event_for_test(
 ) -> Result<(), ControlError> {
     std::fs::write(directory.join(format!("{event}-{corr}")), b"observed")
         .map_err(|error| ControlError::Decode(format!("scope describe test clock: {error}")))
+}
+
+fn agent_commands_transport_error(error: ControlError) -> subc_client_rs::AgentCommandsError {
+    use subc_client_rs::AgentCommandsError;
+    match error {
+        ControlError::ConnectionClosed => AgentCommandsError::ConnectionClosed,
+        ControlError::Timeout => AgentCommandsError::Timeout,
+        other => AgentCommandsError::Protocol(other.to_string()),
+    }
 }
 
 fn decode_control_reply(frame: &Frame) -> Result<ModuleControlResponseToModule, ControlError> {
@@ -1227,7 +1286,7 @@ mod tests {
         );
     }
 
-    fn wire_control(
+    pub(super) fn wire_control(
         advertised: &[&str],
     ) -> (
         DaemonControl,
@@ -1248,7 +1307,7 @@ mod tests {
         (control, rx, pending)
     }
 
-    fn reply_frame(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {
+    pub(super) fn reply_frame(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {
         Frame::build(ty, control_flags(), 0, 0, corr, body).expect("reply frame")
     }
 
@@ -1453,5 +1512,139 @@ mod no_warmer_tests {
         .await;
         assert_eq!(report.cause, FlipCause::NoWarmerInstalled);
         assert_eq!(report.flip_attempts, 1);
+    }
+}
+
+#[cfg(test)]
+mod agent_commands_tests {
+    use super::*;
+    use subc_client_rs::{AgentCommandFinished, AgentCommandRoot, AgentCommandsError};
+
+    #[tokio::test]
+    async fn agent_commands_wire_uses_shared_correlation_and_exact_crate_bodies() {
+        let (control, mut rx, pending) =
+            super::tests::wire_control(&["supervisor.agent_commands", LIVE_ROOTS_OP]);
+        let root = AgentCommandRoot {
+            pid: 42,
+            start_time_ms: 1_700_000_000_123,
+        };
+        let finished = AgentCommandFinished {
+            pid: 41,
+            start_time_ms: 1_700_000_000_000,
+            cpu_ms: Some(250),
+        };
+        let mut batch = crate::agent_commands::Batch::default();
+        batch.started = vec![root];
+        batch.finished = vec![finished];
+        batch.known = Some(vec![root]);
+        let daemon = async {
+            let first = rx.recv().await.unwrap();
+            let second = rx.recv().await.unwrap();
+            assert_ne!(first.header.corr, second.header.corr);
+            for request in [first, second] {
+                assert_eq!(request.header.channel, 0);
+                let body: ModuleControlRequestFromModule =
+                    serde_json::from_slice(&request.body).unwrap();
+                let response = match body {
+                    ModuleControlRequestFromModule::AgentCommands {
+                        started,
+                        finished: done,
+                        known,
+                    } => {
+                        assert_eq!(started, [root]);
+                        assert_eq!(done, [finished]);
+                        assert_eq!(known, Some(vec![root]));
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+                            serde_json::json!({
+                                "op":"supervisor.agent_commands", "started":[{"pid":42,"start_time_ms":1_700_000_000_123_u64}],
+                                "finished":[{"pid":41,"start_time_ms":1_700_000_000_000_u64,"cpu_ms":250}],
+                                "known":[{"pid":42,"start_time_ms":1_700_000_000_123_u64}]
+                            })
+                        );
+                        b"{}".to_vec()
+                    }
+                    ModuleControlRequestFromModule::LiveRoots {} => {
+                        serde_json::to_vec(&ModuleControlResponseToModule::LiveRoots {
+                            roots: vec![],
+                            unknown_root_bindings: 0,
+                            total_bindings: 0,
+                        })
+                        .unwrap()
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                assert!(pending.resolve(super::tests::reply_frame(
+                    FrameType::Response,
+                    request.header.corr,
+                    response
+                )));
+            }
+        };
+        let (declaration, roots, ()) =
+            tokio::join!(control.agent_commands(batch), control.live_roots(), daemon);
+        assert!(declaration.is_ok());
+        assert!(roots.is_ok());
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_commands_wire_classifies_busy_unsupported_and_permanent_refusals() {
+        for code in [
+            "busy",
+            "unsupported_control_frame",
+            "not_supervised",
+            "invalid_request",
+        ] {
+            let (control, mut rx, pending) =
+                super::tests::wire_control(&["supervisor.agent_commands"]);
+            let daemon = async {
+                let request = rx.recv().await.unwrap();
+                pending.resolve(super::tests::reply_frame(
+                    FrameType::Error,
+                    request.header.corr,
+                    serde_json::to_vec(&ErrorBody::new(code, "refused")).unwrap(),
+                ));
+            };
+            let (result, ()) = tokio::join!(
+                control.agent_commands(crate::agent_commands::Batch::default()),
+                daemon
+            );
+            let error = result.unwrap_err();
+            match code {
+                "busy" => assert!(error.is_retryable()),
+                "unsupported_control_frame" => {
+                    assert!(matches!(error, AgentCommandsError::Unsupported))
+                }
+                "not_supervised" => assert!(matches!(error, AgentCommandsError::NotSupervised)),
+                _ => assert!(!error.is_retryable()),
+            }
+            assert_eq!(pending.len(), 0);
+        }
+        let (old, mut rx, _) = super::tests::wire_control(&[]);
+        assert!(matches!(
+            old.agent_commands(crate::agent_commands::Batch::default())
+                .await,
+            Err(AgentCommandsError::Unsupported)
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn agent_commands_wire_timeout_removes_shared_pending_entry() {
+        let (control, mut rx, pending) = super::tests::wire_control(&["supervisor.agent_commands"]);
+        assert!(matches!(
+            control
+                .agent_commands(crate::agent_commands::Batch::default())
+                .await,
+            Err(AgentCommandsError::Timeout)
+        ));
+        let request = rx.recv().await.unwrap();
+        assert_eq!(pending.len(), 0);
+        assert!(!pending.resolve(super::tests::reply_frame(
+            FrameType::Response,
+            request.header.corr,
+            b"{}".to_vec()
+        )));
     }
 }

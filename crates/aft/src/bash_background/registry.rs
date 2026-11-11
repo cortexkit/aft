@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
 #[path = "launch_tests.rs"]
 mod launch_tests;
+#[cfg(windows)]
+use crate::agent_commands::WindowsChild as Child;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -11,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
 #[cfg(windows)]
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -5736,6 +5738,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        crate::agent_commands::started(child_pid);
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
             let _ = child.wait();
@@ -6568,6 +6571,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        crate::agent_commands::started(child_pid);
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 let _ = child.kill();
@@ -18299,7 +18303,7 @@ fn spawn_detached_child(
                         AFT process group is killed."
                     );
                 }
-                Ok(child)
+                Ok(child.into())
             }
             Err(CandidateFailure::Stopped {
                 error: PipedAttemptError::Setup(message),

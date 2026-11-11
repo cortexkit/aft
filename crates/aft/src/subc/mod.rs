@@ -4540,6 +4540,9 @@ fn run_subc_mode_on_runtime_thread(
         let shared_app = ctx.app();
         // Stall captures land under `<storage>/diagnostics`.
         let storage_dir = ctx.storage_dir();
+        if crate::launch_nonce::current().is_some() {
+            crate::agent_commands::enable(&storage_dir);
+        }
         drop(ctx);
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
@@ -5307,6 +5310,13 @@ where
         HELLO_CORR + 1,
     ));
     let run_scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
+    let agent_commands = crate::launch_nonce::current().map(|_| {
+        let control = control.clone();
+        crate::agent_commands::connect(move |batch| {
+            let control = control.clone();
+            async move { control.agent_commands(batch).await }
+        })
+    });
     let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
     let speech_control = Arc::clone(&control);
     let speech = crate::gh_shim_speech::service::start(
@@ -7042,6 +7052,9 @@ where
     // The daemon control handle also holds a writer sender. The loop keeps it
     // so flow reads can ask the daemon whether their parent scope is still
     // live; the writer tasks cannot drain while the handle is alive.
+    if let Some(sender) = agent_commands {
+        sender.stop().await;
+    }
     drop(control);
     a0.stop();
     drop(a0);

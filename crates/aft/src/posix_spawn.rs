@@ -8,7 +8,6 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +27,7 @@ enum Handle {
 pub(crate) struct Child {
     handle: Handle,
     pub(crate) stdin: Option<File>,
+    reaped: Option<ExitStatus>,
 }
 impl From<std::process::Child> for Child {
     fn from(mut child: std::process::Child) -> Self {
@@ -38,12 +38,19 @@ impl From<std::process::Child> for Child {
         Self {
             handle: Handle::Std(child),
             stdin,
+            reaped: None,
         }
     }
 }
 impl Child {
     #[cfg(test)]
     pub(crate) fn kill(&mut self) -> io::Result<()> {
+        if self.reaped.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "child already reaped",
+            ));
+        }
         match &mut self.handle {
             Handle::Std(child) => child.kill(),
             Handle::Native {
@@ -76,35 +83,13 @@ impl Child {
             .ok_or_else(|| io::Error::other("waitpid returned no status"))
     }
     fn wait_inner(&mut self, flags: libc::c_int) -> io::Result<Option<ExitStatus>> {
-        match &mut self.handle {
-            Handle::Std(child) => {
-                if flags == 0 {
-                    child.wait().map(Some)
-                } else {
-                    child.try_wait()
-                }
-            }
-            Handle::Native { pid, status } => {
-                if status.is_some() {
-                    return Ok(*status);
-                }
-                loop {
-                    let mut raw = 0;
-                    let rc = unsafe { libc::waitpid(*pid, &mut raw, flags) };
-                    if rc == *pid {
-                        *status = Some(ExitStatus::from_raw(raw));
-                        return Ok(*status);
-                    }
-                    if rc == 0 {
-                        return Ok(None);
-                    }
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
+        if self.reaped.is_none() {
+            self.reaped = crate::agent_commands::wait4(self.id(), flags)?;
+            if let Handle::Native { status, .. } = &mut self.handle {
+                *status = self.reaped;
             }
         }
+        Ok(self.reaped)
     }
 }
 
@@ -576,6 +561,7 @@ fn spawn_native(
         Ok(Child {
             handle: Handle::Native { pid, status: None },
             stdin: parent_stdin,
+            reaped: None,
         })
     }
 }

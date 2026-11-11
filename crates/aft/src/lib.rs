@@ -50,6 +50,7 @@ pub mod access_policy;
 #[cfg(test)]
 mod access_policy_tests;
 pub mod agent_child_env;
+pub(crate) mod agent_commands;
 pub mod agent_data;
 pub mod alert_records;
 pub mod alert_state;

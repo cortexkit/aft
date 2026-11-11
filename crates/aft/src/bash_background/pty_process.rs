@@ -78,7 +78,7 @@ fn reap_killed_child(
     let pid = child.process_id();
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match child.try_wait() {
+        match crate::agent_commands::try_wait_pty(child.as_mut()) {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -419,6 +419,9 @@ fn try_spawn_pty(
         master: Some(pair.master),
     };
     let child_pid = child.child.as_ref().unwrap().process_id();
+    if let Some(pid) = child_pid {
+        crate::agent_commands::started(pid);
+    }
     #[cfg(unix)]
     if spawn_plan
         .prepared_task()
@@ -746,7 +749,7 @@ pub(crate) fn spawn_waiter(
     super::worker_thread::spawn(super::worker_thread::Worker::PtyWaiter, move || {
         let mut child = owned_child.child.take().unwrap();
         let marker = loop {
-            match child.wait() {
+            match crate::agent_commands::wait_pty(child.as_mut()) {
                 Ok(status) => {
                     if was_killed.load(Ordering::SeqCst) {
                         break ExitMarker::Killed;
