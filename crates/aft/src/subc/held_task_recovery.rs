@@ -326,10 +326,7 @@ pub(crate) mod tests {
         let actor = executor
             .actor_context(&ProjectRootId::from_path(&root).unwrap())
             .unwrap();
-        assert!(actor
-            .bash_background()
-            .task_for_session(&task_id, "held-worker")
-            .is_some());
+        assert!(actor.bash_background().task_registration_exists(&task_id));
         std::fs::write(root.join("release"), "").unwrap();
         let result: Value = serde_json::from_slice(&settled(&restarted, &key).await.body).unwrap();
         assert!(
@@ -364,7 +361,7 @@ pub(crate) mod tests {
             false,
         );
         metadata.status = crate::bash_background::BgTaskStatus::Running;
-        metadata.child_pid = Some(i32::MAX);
+        metadata.child_pid = Some(i32::MAX as u32);
         write_task_at(&layout, &metadata).unwrap();
         let key = hold_task(&old, &layout, "missing-held");
         drop(old);
