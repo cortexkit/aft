@@ -1493,6 +1493,11 @@ jobs:
       - name: Bun test (all packages)
         run: |
           unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          # Several plugin tests spawn the debug binary at the repository's
+          # target/debug/aft. This lane builds into a target folder outside the
+          # checkout, so link that path to the binary it built.
+          mkdir -p target/debug
+          ln -sfn "$AFT_BINARY_PATH" target/debug/aft
           bun run test:unit
         env:
           AFT_TEST_NATIVE_FIXTURE_TIMING: "1"

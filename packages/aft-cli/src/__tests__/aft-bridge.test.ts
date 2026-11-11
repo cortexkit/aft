@@ -347,9 +347,12 @@ describe("createNdjsonLineSplitter", () => {
 
 describe("bridge request deadline", () => {
   test("a nonresponding child is reaped and rejects with pending request context", async () => {
-    const binary = makeFakeBinary("stalled", "echo fixture-error >&2\nexec /bin/sleep 1");
+    // The deadline must outlast the child's start, so its stderr line is in the
+    // error: a freshly written script can take a few hundred milliseconds to
+    // start on a loaded macOS machine. The child is killed at the deadline.
+    const binary = makeFakeBinary("stalled", "echo fixture-error >&2\nexec /bin/sleep 30");
     try {
-      await sendAftRequests(binary, [{ id: "pending", command: "configure" }], 20);
+      await sendAftRequests(binary, [{ id: "pending", command: "configure" }], 2_000);
       throw new Error("stalled child unexpectedly responded");
     } catch (error) {
       expect((error as Error).message).toMatch(/deadline.*configure/s);
