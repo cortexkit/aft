@@ -1,4 +1,4 @@
-//! Admission by the files an incremental engine has invalidated since publication.
+//! Limits an incremental update by the files invalidated since publication.
 
 use std::collections::BTreeSet;
 

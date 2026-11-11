@@ -80,7 +80,8 @@ pub(crate) struct SourceWork {
     /// Passes over the files: a scan reads every file whose stat does not
     /// prove its recorded content, and a build's scan parses what it reads.
     pub(crate) scans: usize,
-    /// Whole call-graph cold builds, excluding text-only scans and sibling admission.
+    /// Full graph rebuilds, not text-only scans or incremental builds from
+    /// another checkout's published graph.
     pub(crate) cold_builds: usize,
     /// Call-graph resolutions: a build's, or a refresh's update.
     pub(crate) resolutions: usize,
@@ -2651,7 +2652,8 @@ impl Checkout {
                 if let Some(reservation) = reservation {
                     self.build_reserved(false, reservation)?;
                 } else {
-                    // Sibling admission already owns the build reservation.
+                    // The outer build is reusing another checkout's publication
+                    // and already holds the reservation.
                     self.build_inner(false)?;
                 }
                 return Ok(Some(UpdateStats {
