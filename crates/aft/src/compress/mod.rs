@@ -44,7 +44,6 @@ pub mod trust;
 pub mod tsc;
 pub mod vitest;
 
-use crate::context::AppContext;
 use crate::harness::Harness;
 use biome::BiomeCompressor;
 use bun::BunCompressor;
@@ -392,29 +391,28 @@ pub trait Compressor: Send + Sync {
 }
 /// Top-level dispatch: try specific Rust modules, output-shape sniffers, package-manager modules, TOML filters, then generic fallback.
 ///
-/// Convenience wrapper for command handlers that already hold an `AppContext`.
-/// Backs onto [`compress_with_registry`] which is thread-safe for use from the
-/// `BgTaskRegistry` watchdog.
-pub fn compress(command: &str, output: String, ctx: &AppContext) -> CompressionResult {
-    compress_with_exit_code(command, output, None, ctx)
+/// The caller supplies the compression gate and the current filter snapshot.
+pub fn compress(
+    command: &str,
+    output: String,
+    enabled: bool,
+    registry: &FilterRegistry,
+) -> CompressionResult {
+    compress_with_exit_code(command, output, None, enabled, registry)
 }
 
 pub fn compress_with_exit_code(
     command: &str,
     output: String,
     exit_code: Option<i64>,
-    ctx: &AppContext,
+    enabled: bool,
+    registry: &FilterRegistry,
 ) -> CompressionResult {
-    if !ctx.config().experimental_bash_compress {
+    if !enabled {
         let count = output.lines().count();
         return CompressionResult::new(output).with_input_line_count(count);
     }
-    let registry_handle = ctx.shared_filter_registry();
-    let guard = match registry_handle.read() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    compress_with_registry_exit_code(command, &output, exit_code, &guard)
+    compress_with_registry_exit_code(command, &output, exit_code, registry)
 }
 
 /// Thread-safe dispatch that does not need `AppContext`. Caller is responsible
@@ -759,25 +757,23 @@ fn is_word_char(ch: char) -> bool {
 }
 
 /// Build the registry of TOML filters from the standard sources for the
-/// active context. Called lazily by [`AppContext::filter_registry`].
+/// selected harness and configuration paths.
 ///
 /// Layering (highest priority first):
 /// 1. Project filters at `<project_root>/.cortexkit/aft/filters/*.toml` — loaded only
 ///    when the project is in the trusted set (see [`trust`]).
 /// 2. User filters at `<storage_dir>/<harness>/filters/*.toml`.
 /// 3. Builtin filters compiled into the binary via [`builtin_filters`].
-pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
-    let harness = ctx.harness.lock().clone().unwrap_or(Harness::Opencode);
-    let config = ctx.config();
-    let storage_dir = config.storage_dir.clone();
-    let project_root = config.project_root.clone();
-    drop(config);
-
-    let user_dir = storage_dir.as_ref().map(|dir| {
+pub fn build_registry_for_paths(
+    harness: Harness,
+    storage_dir: Option<&Path>,
+    project_root: Option<&Path>,
+) -> FilterRegistry {
+    let user_dir = storage_dir.map(|dir| {
         repair_legacy_user_filter_dir(dir, harness.clone());
         user_filter_dir(dir, harness)
     });
-    let project_dir = match (project_root.as_ref(), storage_dir.as_ref()) {
+    let project_dir = match (project_root, storage_dir) {
         (Some(root), Some(storage)) => {
             if trust::is_project_trusted(Some(storage), root) {
                 Some(project_filter_dir(root))

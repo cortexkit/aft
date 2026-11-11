@@ -4399,7 +4399,14 @@ impl AppContext {
     /// changes the project root, storage_dir, or trust state so subsequent
     /// `compress::compress` calls pick up new filters.
     pub fn reset_filter_registry(&self) {
-        let new_registry = crate::compress::build_registry_for_context(self);
+        let harness = self.harness.lock().clone().unwrap_or(Harness::Opencode);
+        let config = self.config();
+        let storage_dir = config.storage_dir.clone();
+        let project_root = config.project_root.clone();
+        drop(config);
+        let new_registry = crate::compress::build_registry_for_paths(
+            harness, storage_dir.as_deref(), project_root.as_deref(),
+        );
         self.filter_registry_rebuild_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut slot = self
@@ -4418,7 +4425,14 @@ impl AppContext {
         }
         // Build outside the lock to avoid blocking other readers during a
         // multi-file TOML parse.
-        let new_registry = crate::compress::build_registry_for_context(self);
+        let harness = self.harness.lock().clone().unwrap_or(Harness::Opencode);
+        let config = self.config();
+        let storage_dir = config.storage_dir.clone();
+        let project_root = config.project_root.clone();
+        drop(config);
+        let new_registry = crate::compress::build_registry_for_paths(
+            harness, storage_dir.as_deref(), project_root.as_deref(),
+        );
         self.filter_registry_rebuild_count
             .fetch_add(1, Ordering::SeqCst);
         self.install_lazy_filter_registry(new_registry);
