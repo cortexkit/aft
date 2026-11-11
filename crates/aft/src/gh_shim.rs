@@ -32,9 +32,9 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
-mod native_guard;
 pub(crate) mod manifest_sync;
 mod manifest_wire;
+mod native_guard;
 pub(crate) mod read_contract;
 mod rename_guard;
 mod v22_rows;
@@ -4331,8 +4331,12 @@ fn load_manifest_with_trust_set(
 // newer acceptance cannot race a publisher's high-water check and rename.
 fn manifest_acceptance_lock(paths: &StatePaths) -> io::Result<crate::fs_lock::AdvisoryLockGuard> {
     crate::private_storage::open_root(&paths.root)?;
-    let file = crate::private_storage::options().read(true).write(true).create(true)
-        .truncate(false).open(paths.root.join("manifest-acceptance.lock"))?;
+    let file = crate::private_storage::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.root.join("manifest-acceptance.lock"))?;
     file.lock()?;
     Ok(crate::fs_lock::AdvisoryLockGuard::from_locked_file(file))
 }

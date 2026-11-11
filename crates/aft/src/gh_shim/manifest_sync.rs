@@ -1,7 +1,7 @@
 //! Background vault delivery; never runs on a tool or route dispatch thread.
 
-use super::manifest_wire::{Latest, Notice, Report};
 use super::manifest_wire::{self as wire, Recorded, Reply, ResultBody};
+use super::manifest_wire::{Latest, Notice, Report};
 use super::*;
 use crate::secret::transport::ManagementSession;
 use sha2::{Digest, Sha256};
@@ -27,8 +27,13 @@ static HEALTH: Mutex<Health> = Mutex::new(Health {
 });
 
 pub(crate) fn health() -> Value {
-    serde_json::to_value(HEALTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
-        .unwrap_or(Value::Null)
+    serde_json::to_value(
+        HEALTH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .unwrap_or(Value::Null)
 }
 
 fn digest(bytes: &str) -> String {
@@ -40,9 +45,15 @@ fn problem_reason(problem: &ManifestProblem) -> &'static str {
         ManifestProblem::Missing => "manifest missing",
         ManifestProblem::RolledBack { .. } => "manifest below high-water version",
         ManifestProblem::BelowFloor { .. } => "manifest below schema floor",
-        ManifestProblem::Invalid(reason) if reason.starts_with("untrusted manifest key id") => "untrusted manifest key",
-        ManifestProblem::Invalid(reason) if reason == "detached signature verification failed" => "detached signature verification failed",
-        ManifestProblem::Invalid(reason) if reason == "invalid detached signature encoding" => "invalid detached signature encoding",
+        ManifestProblem::Invalid(reason) if reason.starts_with("untrusted manifest key id") => {
+            "untrusted manifest key"
+        }
+        ManifestProblem::Invalid(reason) if reason == "detached signature verification failed" => {
+            "detached signature verification failed"
+        }
+        ManifestProblem::Invalid(reason) if reason == "invalid detached signature encoding" => {
+            "invalid detached signature encoding"
+        }
         _ => "shim rejected manifest",
     }
 }
@@ -50,7 +61,9 @@ fn problem_reason(problem: &ManifestProblem) -> &'static str {
 fn local_report(paths: &StatePaths, now: u64) -> Option<Report> {
     // Use the same status path as gh --status, including its acceptance writes.
     let status = cached_manifest_report_at(paths, now);
-    let mut health = HEALTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut health = HEALTH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     health.active_version = status.version;
     let envelope = fs::read(&paths.manifest)
         .ok()
@@ -65,7 +78,8 @@ fn local_report(paths: &StatePaths, now: u64) -> Option<Report> {
         return None;
     };
     let version = serde_json::from_str::<Value>(&envelope.manifest_bytes)
-        .ok().and_then(|manifest| manifest["manifest_version"].as_u64())
+        .ok()
+        .and_then(|manifest| manifest["manifest_version"].as_u64())
         .filter(|version| *version > 0);
     let Some(version) = version else {
         health.active_version = None;
@@ -97,10 +111,17 @@ fn write_candidate(
     before_rename: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     crate::private_storage::open_root(&paths.root)?;
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(io::Error::other)?.as_nanos();
-    let temporary = paths.root.join(format!("manifest-sync-{}-{stamp}.tmp", std::process::id()));
-    let mut file = crate::private_storage::options().write(true).create_new(true).open(&temporary)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let temporary = paths
+        .root
+        .join(format!("manifest-sync-{}-{stamp}.tmp", std::process::id()));
+    let mut file = crate::private_storage::options()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
     std::io::Write::write_all(&mut file, &serde_json::to_vec(envelope)?)?;
     file.sync_all()?;
     drop(file);
@@ -113,7 +134,12 @@ fn activate(paths: &StatePaths, latest: &Latest, now: u64) -> Option<Report> {
     let current = local_report(paths, now);
     let acceptance_lock = match manifest_acceptance_lock(paths) {
         Ok(lock) => lock,
-        Err(_) => return Some(candidate_report(latest, "manifest acceptance lock unavailable")),
+        Err(_) => {
+            return Some(candidate_report(
+                latest,
+                "manifest acceptance lock unavailable",
+            ))
+        }
     };
     if latest.version <= version_high_water(paths) {
         return current;
@@ -126,12 +152,16 @@ fn activate(paths: &StatePaths, latest: &Latest, now: u64) -> Option<Report> {
         signature: latest.envelope.signature.clone(),
         manifest_bytes: latest.envelope.manifest_bytes.clone(),
     };
-    let verified = match validate_manifest_candidate(paths, &envelope, now, compiled_manifest_trust_set()) {
-        Ok(verified) => verified,
-        Err(problem) => return Some(candidate_report(latest, problem_reason(&problem))),
-    };
+    let verified =
+        match validate_manifest_candidate(paths, &envelope, now, compiled_manifest_trust_set()) {
+            Ok(verified) => verified,
+            Err(problem) => return Some(candidate_report(latest, problem_reason(&problem))),
+        };
     if latest.version == 0 || verified.manifest.manifest_version != latest.version {
-        return Some(candidate_report(latest, "manifest version differs from vault version"));
+        return Some(candidate_report(
+            latest,
+            "manifest version differs from vault version",
+        ));
     }
     if latest.version <= version_high_water(paths) {
         return current;
@@ -154,7 +184,10 @@ struct Cursor {
 impl Cursor {
     fn observe(&mut self, notice: &Notice) -> bool {
         let reread = notice.version != self.read_version
-            || self.epoch.as_ref().is_some_and(|epoch| epoch != &notice.epoch)
+            || self
+                .epoch
+                .as_ref()
+                .is_some_and(|epoch| epoch != &notice.epoch)
             || notice.seq != self.seq.saturating_add(1);
         self.epoch = Some(notice.epoch.clone());
         self.seq = notice.seq;
@@ -197,13 +230,16 @@ impl Failure {
     }
 
     fn record(self) {
-        HEALTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner).last_refusal_code = Some(self.code);
+        HEALTH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_refusal_code = Some(self.code);
     }
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Failure> {
-    let reply: Reply<T> = serde_json::from_slice(bytes)
-        .map_err(|_| Failure::new("transport_unavailable", true))?;
+    let reply: Reply<T> =
+        serde_json::from_slice(bytes).map_err(|_| Failure::new("transport_unavailable", true))?;
     match reply.result {
         ResultBody::Success(value) => Ok(value),
         ResultBody::Refused { error } => Err(Failure::new(&error.code, error.class == "transient")),
@@ -225,11 +261,16 @@ async fn report(session: &ManagementSession, report: &Report) -> Result<(), Fail
     let mut backoff = Backoff::default();
     loop {
         {
-            let mut health = HEALTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut health = HEALTH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             health.last_report = Some(report.clone());
             health.last_report_outcome = Some("sending");
         }
-        let result = match session.request(serde_json::to_vec(&wire::report_request(report)).expect("report JSON")).await {
+        let result = match session
+            .request(serde_json::to_vec(&wire::report_request(report)).expect("report JSON"))
+            .await
+        {
             Ok(bytes) => decode::<Recorded>(&bytes).and_then(|recorded| {
                 if recorded.status == "recorded" && recorded.version == report.version {
                     Ok(())
@@ -240,10 +281,17 @@ async fn report(session: &ManagementSession, report: &Report) -> Result<(), Fail
             Err(error) => Err(Failure::transport(error)),
         };
         {
-            let mut health = HEALTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut health = HEALTH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             health.last_report_outcome = Some(match result {
                 Ok(()) => "recorded",
-                Err(failure) if failure.code == "home_unavailable" || failure.code == "transport_unavailable" => "unknown",
+                Err(failure)
+                    if failure.code == "home_unavailable"
+                        || failure.code == "transport_unavailable" =>
+                {
+                    "unknown"
+                }
                 Err(_) => "refused",
             });
         }
@@ -254,7 +302,9 @@ async fn report(session: &ManagementSession, report: &Report) -> Result<(), Fail
                 if failure.stop() {
                     return Err(failure);
                 }
-                if !failure.transient { return Ok(()); }
+                if !failure.transient {
+                    return Ok(());
+                }
                 // Reports are idempotent. Keep the exact tuple after an unknown
                 // outcome; do not replace it with a newer activation's report.
                 tokio::time::sleep(backoff.delay()).await;
@@ -267,13 +317,17 @@ async fn report(session: &ManagementSession, report: &Report) -> Result<(), Fail
 }
 
 async fn latest(session: &ManagementSession) -> Result<Latest, Failure> {
-    let bytes = session.request(serde_json::to_vec(&wire::latest_request()).expect("latest JSON"))
-        .await.map_err(Failure::transport)?;
+    let bytes = session
+        .request(serde_json::to_vec(&wire::latest_request()).expect("latest JSON"))
+        .await
+        .map_err(Failure::transport)?;
     let latest: Latest = decode(&bytes)?;
     if latest.version == 0 {
         return Err(Failure::new("transport_unavailable", true));
     }
-    let mut health = HEALTH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut health = HEALTH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     health.newest_version_seen = Some(health.newest_version_seen.unwrap_or(0).max(latest.version));
     Ok(latest)
 }
@@ -285,16 +339,22 @@ async fn refresh(
     notice: Option<&Notice>,
 ) -> Result<Option<Report>, Failure> {
     let mut fetched = latest(session).await?;
-    let disagrees = |fetched: &Latest| notice.is_some_and(|notice| {
-        notice.version == Some(fetched.version)
-            && notice.manifest_sha256.as_deref() != Some(digest(&fetched.envelope.manifest_bytes).as_str())
-    });
+    let disagrees = |fetched: &Latest| {
+        notice.is_some_and(|notice| {
+            notice.version == Some(fetched.version)
+                && notice.manifest_sha256.as_deref()
+                    != Some(digest(&fetched.envelope.manifest_bytes).as_str())
+        })
+    };
     if disagrees(&fetched) {
         fetched = latest(session).await?;
         if disagrees(&fetched) {
             cursor.read_version = Some(fetched.version);
             cursor.read_sha256 = Some(digest(&fetched.envelope.manifest_bytes));
-            return Ok(Some(candidate_report(&fetched, "digest differs from the vault's notice")));
+            return Ok(Some(candidate_report(
+                &fetched,
+                "digest differs from the vault's notice",
+            )));
         }
     }
     cursor.read_version = Some(fetched.version);
@@ -323,7 +383,7 @@ where
             }
         };
         let mut cursor = Cursor::default();
-        let result = async {
+        let result: Result<(), Failure> = async {
             if let Some(pending) = pending_report.as_ref() {
                 report(&session, pending).await?;
                 pending_report = None;
@@ -342,8 +402,10 @@ where
                 report(&session, pending).await?;
                 pending_report = None;
             }
-            let mut subscription = session.watch(serde_json::to_vec(&wire::watch_request()).expect("watch JSON"))
-                .await.map_err(Failure::transport)?;
+            let mut subscription = session
+                .watch(serde_json::to_vec(&wire::watch_request()).expect("watch JSON"))
+                .await
+                .map_err(Failure::transport)?;
             loop {
                 let Some(bytes) = subscription.events().recv().await else {
                     // The SDK closes this receiver after a normal STREAM_END
@@ -358,9 +420,12 @@ where
                         return Err(Failure::new(&error.code, error.class == "transient"));
                     }
                 }
-                let notice: Notice = serde_json::from_slice(&bytes).map_err(|_| Failure::new("transport_unavailable", true))?;
-                if notice.kind != "changed" || notice.seq == 0
-                    || notice.version.is_some() != notice.manifest_sha256.is_some() {
+                let notice: Notice = serde_json::from_slice(&bytes)
+                    .map_err(|_| Failure::new("transport_unavailable", true))?;
+                if notice.kind != "changed"
+                    || notice.seq == 0
+                    || notice.version.is_some() != notice.manifest_sha256.is_some()
+                {
                     return Err(Failure::new("transport_unavailable", true));
                 }
                 backoff = Backoff::default();
@@ -374,7 +439,8 @@ where
                     }
                 }
             }
-        }.await;
+        }
+        .await;
         session.close().await;
         if let Err(failure) = result {
             failure.record();
@@ -397,10 +463,15 @@ pub(crate) fn start(connection_file: PathBuf) -> Option<Worker> {
     crate::launch_nonce::consumer_identity().filter(|identity| identity.module_id == "aft")?;
     let (stop, stopped) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        if gh_shim_enabled_from_config_doc(&read_user_config_doc().unwrap_or_default()) == Some(false) {
+        if gh_shim_enabled_from_config_doc(&read_user_config_doc().unwrap_or_default())
+            == Some(false)
+        {
             return;
         }
-        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             let paths = StatePaths::from_process();
             let _ = local_report(&paths, unix_seconds());
             runtime.block_on(async {

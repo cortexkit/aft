@@ -74,7 +74,9 @@ async fn open_vault_route(
     scope: Option<ScopeSelector>,
     timeout: Duration,
 ) -> Result<RouteHandle, CallError> {
-    let target = RouteTarget::ManagementSurface { module_id: "claustrum".into() };
+    let target = RouteTarget::ManagementSurface {
+        module_id: "claustrum".into(),
+    };
     let options = CallOptions {
         consumer_identity: Some(principal),
         timeout,
@@ -82,7 +84,11 @@ async fn open_vault_route(
         ..CallOptions::default()
     };
     match scope {
-        Some(scope) => consumer.open_route_scoped(target, identity, scope, options).await,
+        Some(scope) => {
+            consumer
+                .open_route_scoped(target, identity, scope, options)
+                .await
+        }
         None => consumer.open_route(target, identity, options).await,
     }
 }
@@ -100,39 +106,68 @@ impl ManagementSession {
         Self::connect_as(connection_file, principal).await
     }
 
-    async fn connect_as(connection_file: &std::path::Path, principal: ConsumerIdentity) -> Result<Self, ()> {
-        let consumer = crate::fleet_status::connect_subc_consumer(
-            connection_file, ConsumerOptions::default(),
-        ).await.map_err(|_| ())?;
+    async fn connect_as(
+        connection_file: &std::path::Path,
+        principal: ConsumerIdentity,
+    ) -> Result<Self, ()> {
+        let consumer =
+            crate::fleet_status::connect_subc_consumer(connection_file, ConsumerOptions::default())
+                .await
+                .map_err(|_| ())?;
         let route = match open_vault_route(
-            &consumer, BindIdentity::new("aft-manifest-sync", "daemon"), principal, None,
+            &consumer,
+            BindIdentity::new("aft-manifest-sync", "daemon"),
+            principal,
+            None,
             Duration::from_secs(15),
-        ).await {
+        )
+        .await
+        {
             Ok(route) => route,
-            Err(_) => { let _ = consumer.close().await; return Err(()); }
+            Err(_) => {
+                let _ = consumer.close().await;
+                return Err(());
+            }
         };
         Ok(Self { consumer, route })
     }
 
     #[cfg(test)]
     pub(crate) async fn for_test(connection_file: &std::path::Path) -> Result<Self, ()> {
-        Self::connect_as(connection_file, ConsumerIdentity {
-            module_id: "aft".into(), launch_nonce: "manifest-sync-test-nonce".into(),
-        }).await
+        Self::connect_as(
+            connection_file,
+            ConsumerIdentity {
+                module_id: "aft".into(),
+                launch_nonce: "manifest-sync-test-nonce".into(),
+            },
+        )
+        .await
     }
 
     pub(crate) async fn request(&self, body: Vec<u8>) -> Result<Vec<u8>, CallError> {
-        self.consumer.request(&self.route, body, CallOptions {
-            timeout: Duration::from_secs(15), ..CallOptions::default()
-        }).await
+        self.consumer
+            .request(
+                &self.route,
+                body,
+                CallOptions {
+                    timeout: Duration::from_secs(15),
+                    ..CallOptions::default()
+                },
+            )
+            .await
     }
 
     pub(crate) async fn watch(&self, body: Vec<u8>) -> Result<Subscription, CallError> {
-        self.consumer.subscribe_route(&self.route, body, SubscribeOptions::default()).await
+        self.consumer
+            .subscribe_route(&self.route, body, SubscribeOptions::default())
+            .await
     }
 
     pub(crate) async fn close(self) {
-        let _ = self.consumer.close_handle(&self.route, CloseRouteOptions::default()).await;
+        let _ = self
+            .consumer
+            .close_handle(&self.route, CloseRouteOptions::default())
+            .await;
         let _ = self.consumer.close().await;
     }
 }
@@ -192,9 +227,15 @@ impl SubcSecretUseTransport {
         let scope = ScopeSelector::new(stamp.owner, stamp.scope_ref, Some(stamp.scope_epoch));
         let body = serde_json::to_vec(&json!({"method": "secret.use", "params": params}))
             .map_err(|_| UNAVAILABLE.to_owned())?;
-        let route = open_vault_route(consumer, config.identity.clone(), principal, Some(scope), config.timeout)
-            .await
-            .map_err(|_| UNAVAILABLE.to_owned())?;
+        let route = open_vault_route(
+            consumer,
+            config.identity.clone(),
+            principal,
+            Some(scope),
+            config.timeout,
+        )
+        .await
+        .map_err(|_| UNAVAILABLE.to_owned())?;
         let reply = consumer
             .request(
                 &route,

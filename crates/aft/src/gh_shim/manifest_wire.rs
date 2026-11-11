@@ -110,21 +110,34 @@ mod tests {
         round_trip::<Reply<Latest>>(&samples["latest.reply"]);
         let latest: Reply<Latest> =
             serde_json::from_value(samples["latest.reply"].clone()).unwrap();
-        let ResultBody::Success(latest) = latest.result else { panic!("latest refused") };
-        assert_eq!(format!("{:x}", Sha256::digest(latest.envelope.manifest_bytes.as_bytes())),
-            samples["watch.stored"]["manifest_sha256"].as_str().unwrap());
+        let ResultBody::Success(latest) = latest.result else {
+            panic!("latest refused")
+        };
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(latest.envelope.manifest_bytes.as_bytes())
+            ),
+            samples["watch.stored"]["manifest_sha256"].as_str().unwrap()
+        );
         round_trip::<Reply<Recorded>>(&samples["report.reply"]);
-        let report: Report = serde_json::from_value(samples["report.request"]["params"].clone()).unwrap();
-        assert_eq!(serde_json::to_vec(&report_request(&report)).unwrap(),
-            serde_json::to_vec(&samples["report.request"]).unwrap());
+        let report: Report =
+            serde_json::from_value(samples["report.request"]["params"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&report_request(&report)).unwrap(),
+            serde_json::to_vec(&samples["report.request"]).unwrap()
+        );
         for name in ["watch.empty", "watch.stored"] {
             round_trip::<Notice>(&samples[name]);
         }
         for name in [
-            "refusal.home_unavailable", "refusal.not_found",
-            "refusal.remote_setup_incomplete", "refusal.remote_setup_incomplete.forwarded",
+            "refusal.home_unavailable",
+            "refusal.not_found",
+            "refusal.remote_setup_incomplete",
+            "refusal.remote_setup_incomplete.forwarded",
             "refusal.remote_setup_incomplete.forwarded_with_remedy",
-            "refusal.remote_setup_incomplete.with_remedy", "refusal.secret_setup_incomplete",
+            "refusal.remote_setup_incomplete.with_remedy",
+            "refusal.secret_setup_incomplete",
             "refusal.store_error",
         ] {
             round_trip::<Reply<Latest>>(&samples[name]);
@@ -134,9 +147,13 @@ mod tests {
         round_trip::<ModuleError>(&samples["refusal.invalid_params"]);
         assert_eq!(samples["refusal.invalid_params"]["code"], "invalid_params");
         assert!(samples["refusal.invalid_params"].get("class").is_none());
-        assert_eq!(serde_json::to_vec(&latest_request()).unwrap(),
-            br#"{"method":"manifest.latest","params":{}}"#);
-        assert_eq!(serde_json::to_vec(&watch_request()).unwrap(),
-            br#"{"method":"manifest.watch","params":{}}"#);
+        assert_eq!(
+            serde_json::to_vec(&latest_request()).unwrap(),
+            br#"{"method":"manifest.latest","params":{}}"#
+        );
+        assert_eq!(
+            serde_json::to_vec(&watch_request()).unwrap(),
+            br#"{"method":"manifest.watch","params":{}}"#
+        );
     }
 }

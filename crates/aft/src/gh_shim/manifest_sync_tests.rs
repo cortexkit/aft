@@ -1,5 +1,5 @@
-use super::*;
 use super::super::manifest_wire::Envelope;
+use super::*;
 use serde_json::json;
 
 fn paths(directory: &tempfile::TempDir) -> StatePaths {
@@ -10,9 +10,14 @@ fn candidate(version: u64, now: u64) -> Latest {
     let mut manifest = super::super::tests::fixture_manifest();
     manifest.manifest_version = version;
     let signed = super::super::tests::signed(&manifest, now);
-    Latest { version, envelope: Envelope {
-        key_id: signed.key_id, manifest_bytes: signed.manifest_bytes, signature: signed.signature,
-    } }
+    Latest {
+        version,
+        envelope: Envelope {
+            key_id: signed.key_id,
+            manifest_bytes: signed.manifest_bytes,
+            signature: signed.signature,
+        },
+    }
 }
 
 #[test]
@@ -24,7 +29,10 @@ fn manifest_sync_newer_valid_is_accepted_by_shim_equal_and_older_never_write() {
     let report = activate(&paths, &latest, now).unwrap();
     assert_eq!(report.verdict, "valid");
     assert_eq!(report.version, 29);
-    assert_eq!(report.payload_sha256, digest(&latest.envelope.manifest_bytes));
+    assert_eq!(
+        report.payload_sha256,
+        digest(&latest.envelope.manifest_bytes)
+    );
     assert_eq!(version_high_water(&paths), 29);
     assert_eq!(cached_manifest_report_at(&paths, now).state, Some("valid"));
     let original = fs::read(&paths.manifest).unwrap();
@@ -35,7 +43,10 @@ fn manifest_sync_newer_valid_is_accepted_by_shim_equal_and_older_never_write() {
     assert_eq!(fs::read(&paths.manifest).unwrap(), original);
     fs::remove_file(&paths.manifest).unwrap();
     assert!(activate(&paths, &latest, now).is_none());
-    assert!(!paths.manifest.exists(), "no hash is persisted, so equal-version restore is forbidden");
+    assert!(
+        !paths.manifest.exists(),
+        "no hash is persisted, so equal-version restore is forbidden"
+    );
 }
 
 #[test]
@@ -70,11 +81,17 @@ fn manifest_sync_crash_before_atomic_rename_keeps_old_manifest_valid() {
     let original = fs::read(&paths.manifest).unwrap();
     let next = candidate(29, now);
     let envelope = SignedManifest {
-        artifact_id: MANIFEST_ARTIFACT_ID.into(), envelope_version: ENVELOPE_VERSION,
-        fetched_at_unix_secs: now, key_id: next.envelope.key_id,
-        signature: next.envelope.signature, manifest_bytes: next.envelope.manifest_bytes,
+        artifact_id: MANIFEST_ARTIFACT_ID.into(),
+        envelope_version: ENVELOPE_VERSION,
+        fetched_at_unix_secs: now,
+        key_id: next.envelope.key_id,
+        signature: next.envelope.signature,
+        manifest_bytes: next.envelope.manifest_bytes,
     };
-    assert!(write_candidate(&paths, &envelope, || Err(io::Error::other("crash before rename"))).is_err());
+    assert!(write_candidate(&paths, &envelope, || Err(io::Error::other(
+        "crash before rename"
+    )))
+    .is_err());
     assert_eq!(fs::read(&paths.manifest).unwrap(), original);
     assert_eq!(cached_manifest_report_at(&paths, now).state, Some("valid"));
     assert_eq!(version_high_water(&paths), 28);
@@ -82,8 +99,15 @@ fn manifest_sync_crash_before_atomic_rename_keeps_old_manifest_valid() {
     {
         use std::os::unix::fs::PermissionsExt;
         for entry in fs::read_dir(&paths.root).unwrap().flatten() {
-            if entry.file_name().to_string_lossy().starts_with("manifest-sync-") {
-                assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("manifest-sync-")
+            {
+                assert_eq!(
+                    entry.metadata().unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
             }
         }
     }
@@ -91,7 +115,10 @@ fn manifest_sync_crash_before_atomic_rename_keeps_old_manifest_valid() {
 
 #[test]
 fn manifest_sync_cursor_detects_version_seq_gap_and_epoch_change() {
-    let mut cursor = Cursor { read_version: Some(29), ..Cursor::default() };
+    let mut cursor = Cursor {
+        read_version: Some(29),
+        ..Cursor::default()
+    };
     let mut notice: Notice = serde_json::from_value(samples()["watch.stored"].clone()).unwrap();
     assert!(!cursor.observe(&notice));
     notice.seq = 3;
@@ -105,7 +132,11 @@ fn manifest_sync_cursor_detects_version_seq_gap_and_epoch_change() {
 }
 
 fn samples() -> Value {
-    serde_json::from_slice::<Value>(include_bytes!("../../../../test-vectors/manifest-binding-v1.json")).unwrap()["samples"].clone()
+    serde_json::from_slice::<Value>(include_bytes!(
+        "../../../../test-vectors/manifest-binding-v1.json"
+    ))
+    .unwrap()["samples"]
+        .clone()
 }
 
 #[cfg(unix)]
