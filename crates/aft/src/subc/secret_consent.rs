@@ -262,7 +262,12 @@ impl SubcSecretConsent {
                 .await
             {
                 Ok(filed) => filed,
-                Err(_) => return self.recover_lost_filing(request, params, &mut card).await,
+                Err(super::consent::ConsentError::Unavailable(_)) => {
+                    return self.recover_lost_filing(request, params, &mut card).await
+                }
+                Err(_) => {
+                    return consent_unavailable("Cingulate could not file the secret-use card")
+                }
             };
             let Some(id) = decode_secret_elicitation(&filed) else {
                 return self.recover_lost_filing(request, params, &mut card).await;

@@ -106,6 +106,7 @@ fn each_approved_fetch_line_scrubs_both_name_and_host_against_an_earlier_release
         };
         assert!(!message.contains(KEY));
         assert!(message.starts_with("secret {{ck-secret:first}}:"));
-        assert!(message.contains("{{ck-secret:first}}.test; the request was not sent"));
+        assert!(message.contains("{{ck-secret:first}}.test"));
+        assert!(message.ends_with("; the request was not sent"));
     }
 }
