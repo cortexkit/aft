@@ -17,7 +17,7 @@ pub(crate) fn resolve_git_root_from_user_path(
     raw_path: &str,
     scan_root_is_protected: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf, GitRootResolutionError> {
-    let account_home = crate::commands::configure::resolve_account_home_dir();
+    let account_home = crate::production_storage::resolve_account_home_dir();
     let environment_home = home_dir();
     resolve_git_root_from_user_path_with_homes(
         project_root,
@@ -402,7 +402,7 @@ mod tests {
     fn real_account_home_is_refused_when_available() {
         // A host's account home may also be a Git checkout. Check the broad-root
         // policy directly so Git-root resolution cannot bypass this assertion.
-        match crate::commands::configure::resolve_account_home_dir() {
+        match crate::production_storage::resolve_account_home_dir() {
             Some(home) => assert!(
                 crate::commands::configure::project_root_is_too_broad(&home, false, Some(&home),),
                 "account home must be treated as too broad: {}",
