@@ -1074,6 +1074,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "scope.background_tasks shares its bounded scan budget with saved records and returns complete false on exhaustion, never a complete empty done-gate snapshot",
     },
     ExclusionEntry {
+        file: "commands/bash_watch/restart.rs",
+        enclosing_item: "watch_unknown",
+        location_or_primitive: "watch_unknown state.held.take() and state.wait.take()",
+        reason: "Option::take consuming the held-call identity and its wait before settling an unknown result; no list is cut",
+    },
+    ExclusionEntry {
         file: "cold_build_limiter/progress.rs",
         enclosing_item: "snapshot",
         location_or_primitive: "take(LIST_CAP)",
