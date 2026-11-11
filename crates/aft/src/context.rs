@@ -5670,8 +5670,8 @@ impl AppContext {
             return false;
         }
         let state = self.database_runtime_state.load(Ordering::Acquire);
-        if !matches!(state, 3 | 5)
-            || crate::runtime_drain::configure::database_runtime().is_none()
+        // Only the registered database-open callback can finish an initializing retry.
+        if !matches!(state, 3 | 5) || crate::runtime_drain::configure::database_runtime().is_none()
         {
             return false;
         }
@@ -14203,7 +14203,9 @@ mod shared_db_tests {
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         for busy in [false, true] {
             ctx.finish_database_runtime_error("database unavailable".into(), busy);
-            if !busy {
+            if busy {
+                assert!(persistence_call(&ctx).is_some());
+            } else {
                 make_database_retry_due(&ctx);
             }
             let state = ctx.database_runtime_state.load(Ordering::Acquire);
