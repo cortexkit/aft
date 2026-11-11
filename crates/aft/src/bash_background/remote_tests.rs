@@ -113,7 +113,7 @@ fn runon_read_only_note_precedes_the_single_final_list_trailer() {
         Outcome::Exit { code: 1 },
         "../src/x.rs: Operation not permitted\n",
         stdout.as_bytes(),
-        false,
+        true,
     );
     for text in [foreground, completion] {
         assert_eq!(text.matches(READ_ONLY_NOTE).count(), 1, "{text}");
