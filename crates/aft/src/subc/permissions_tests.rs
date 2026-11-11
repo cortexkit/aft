@@ -812,6 +812,7 @@ async fn permissions_cingulate_route_serves_only_permissions_operations() {
             QuiescedLsp::ReapInBackground,
             None,
             None,
+            None,
         ))
     });
     assert_eq!(

@@ -954,6 +954,7 @@ mod tests {
                 QuiescedLsp::ReapInBackground,
                 None,
                 None,
+                None,
             ))
         });
         assert_eq!(

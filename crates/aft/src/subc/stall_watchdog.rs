@@ -24,6 +24,14 @@ pub(super) const STALL_THRESHOLD: Duration = Duration::from_secs(15);
 /// A wedged subc frame loop cannot answer supervisor health requests. Fail
 /// after this much owed work without a new turn so the supervisor restarts it.
 pub(super) const FRAME_LOOP_EXIT_THRESHOLD: Duration = Duration::from_secs(30);
+/// Even host starvation must not suppress recovery forever: five minutes of
+/// continuously owed work is the unconditional restart ceiling.
+const FRAME_LOOP_HARD_CEILING: Duration = Duration::from_secs(5 * 60);
+/// Linux cold-mmap calibration: an 8 MiB sequential scan incurred one major
+/// fault (4 KiB pages, readahead); an idle 250 ms window incurred zero. More
+/// than eight faults in one stalled turn is a conservative paging signal,
+/// not an incident-derived rate. The hard ceiling bounds false deferrals.
+const PAGING_MAJFLT_THRESHOLD: u64 = 8;
 pub(super) const STALL_EXIT_CODE: i32 = 1;
 /// How often the watchdog samples the markers.
 pub(super) const WATCHDOG_TICK: Duration = Duration::from_secs(1);
@@ -69,6 +77,24 @@ impl StallStats {
 /// Where watchdog lines go. Production writes directly to stderr; tests record.
 pub(super) type StallLogSink = Arc<dyn Fn(&str) + Send + Sync>;
 pub(super) type StallExit = Arc<dyn Fn(i32) + Send + Sync>;
+
+#[cfg(unix)]
+fn process_major_faults() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage initializes the output on success; no references to it
+    // escape this thread. The syscall does not use the daemon's locks.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+        u64::try_from(unsafe { usage.assume_init() }.ru_majflt).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn process_major_faults() -> u64 {
+    // Windows has no ru_majflt equivalent; runtime parking still protects it.
+    0
+}
 
 /// What a capture produced.
 pub(super) enum CaptureStarted {
@@ -162,10 +188,19 @@ pub(super) struct StallWatchdogConfig {
     pub(super) frame_loop_exit_threshold: Duration,
     pub(super) stderr: StallLogSink,
     pub(super) exit: StallExit,
+    pub(super) major_faults: Arc<dyn Fn() -> u64 + Send + Sync>,
+    pub(super) now: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 
 impl StallWatchdogConfig {
     pub(super) fn production(storage_dir: &Path) -> Self {
+        // Resolve the path before watching starts, never from a stalled exit
+        // path where the logger's control lock might be held by the runtime.
+        let log_path = crate::logging::daemon_log_path();
+        let output: StallLogSink = Arc::new(move |line| {
+            write_stderr_line(line);
+            let _ = crate::logging::write_watchdog_line(&log_path, line);
+        });
         Self {
             tick: WATCHDOG_TICK,
             threshold: STALL_THRESHOLD,
@@ -176,15 +211,17 @@ impl StallWatchdogConfig {
             capture: Arc::new(PlatformCapture),
             // Never wait for the logger's lock from the recovery thread: the
             // frame loop may be stalled while holding that very lock.
-            log: Arc::new(write_stderr_line),
+            log: Arc::clone(&output),
             frame_loop_exit_threshold: FRAME_LOOP_EXIT_THRESHOLD,
-            stderr: Arc::new(write_stderr_line),
+            stderr: output,
             // No unwinding, registry locks, or native exit handlers. In
             // particular, BgTaskRegistry/PTY drop glue must not kill detached
             // bash children. Calling detach here would itself take task locks
             // that the stalled loop might hold; bypassing all cleanup preserves
             // the children and their already-persisted recovery records.
             exit: Arc::new(|code| crate::ort_lifecycle::exit_without_native_teardown(code)),
+            major_faults: Arc::new(process_major_faults),
+            now: Arc::new(Instant::now),
         }
     }
 }
@@ -291,10 +328,13 @@ fn run_watchdog(
     stop_rx: mpsc::Receiver<()>,
 ) {
     let mut detector = StallDetector::new(config.threshold, markers.len());
-    let mut expected_wake = Instant::now() + config.tick;
+    let mut expected_wake = (config.now)() + config.tick;
     let mut last_capture_at: Option<Instant> = None;
     let mut last_capture = "none".to_string();
     let mut capture_children: Vec<CaptureChild> = Vec::new();
+    let mut previous_faults = (config.major_faults)();
+    let mut restart_watches: Vec<RestartWatch> =
+        markers.iter().map(|_| RestartWatch::default()).collect();
     loop {
         match stop_rx.recv_timeout(config.tick) {
             Err(RecvTimeoutError::Timeout) => {}
@@ -318,7 +358,7 @@ fn run_watchdog(
                 return;
             }
         }
-        let now = Instant::now();
+        let now = (config.now)();
         // Reap finished profiler children so they do not linger as zombies.
         reap_capture_children(&config, &mut capture_children);
         // If the watchdog itself woke far later than it asked to, the whole
@@ -326,9 +366,12 @@ fn run_watchdog(
         // a stall can be told apart from process-wide descheduling.
         let wake_late = now.saturating_duration_since(expected_wake);
         expected_wake = now + config.tick;
+        let major_faults = (config.major_faults)();
         for (index, marker) in markers.iter().enumerate() {
             let pending = marker.has_pending_work();
             let progress_age = marker.progress_age();
+            let restart = &mut restart_watches[index];
+            restart.observe_progress(marker.progress_token(), pending, previous_faults);
             match detector.observe(index, pending, progress_age, now) {
                 None => {}
                 Some(StallTransition::Began { stalled_for, .. }) => {
@@ -376,18 +419,29 @@ fn run_watchdog(
             let stalled_for =
                 StallDetector::stalled_for(&detector.watches[index], progress_age, now);
             if marker.restart_on_stall() && stalled_for >= config.frame_loop_exit_threshold {
-                // A process-wide suspension ages both the promised wake and the
-                // watchdog. Keep the evidence, but let a punctual tick decide
-                // whether the frame loop is still stalled after resume.
-                if wake_late >= config.frame_loop_exit_threshold {
-                    (config.log)(&format!(
-                        "stall watchdog: exit deferred marker={} because watchdog itself woke late watchdog_wake_late_ms={}",
-                        marker.name(), wake_late.as_millis(),
-                    ));
+                let parked_for = marker.runtime_parked_for();
+                let majflt_delta = major_faults.saturating_sub(restart.faults_at_progress);
+                let reason = exit_deferral(
+                    stalled_for, config.frame_loop_exit_threshold, wake_late,
+                    parked_for, majflt_delta,
+                );
+                let evidence = format!(
+                    "runtime_parked={} parked_for_ms={} majflt_delta={majflt_delta}",
+                    parked_for.is_some(), parked_for.unwrap_or_default().as_millis(),
+                );
+                if let Some(reason) = reason {
+                    if !restart.deferral_logged {
+                        (config.log)(&format!(
+                            "stall watchdog: exit deferred marker={} because {reason} stalled_for_ms={} {} watchdog_wake_late_ms={} {evidence} capture={}",
+                            marker.name(), stalled_for.as_millis(), marker.context(),
+                            wake_late.as_millis(), last_capture,
+                        ));
+                        restart.deferral_logged = true;
+                    }
                     continue;
                 }
                 (config.stderr)(&format!(
-                    "stall watchdog: exiting marker={} stalled_for_ms={} {} watchdog_wake_late_ms={} capture={} exit_code={}",
+                    "stall watchdog: exiting marker={} stalled_for_ms={} {} watchdog_wake_late_ms={} {evidence} capture={} exit_code={}",
                     marker.name(),
                     stalled_for.as_millis(),
                     marker.context(),
@@ -401,6 +455,47 @@ fn run_watchdog(
                 return;
             }
         }
+        previous_faults = major_faults;
+    }
+}
+
+#[derive(Default)]
+struct RestartWatch {
+    progress_token: Option<u64>,
+    faults_at_progress: u64,
+    deferral_logged: bool,
+}
+
+impl RestartWatch {
+    fn observe_progress(&mut self, token: u64, pending: bool, previous_faults: u64) {
+        if !pending || self.progress_token != Some(token) {
+            // The preceding sample includes faults incurred between the last
+            // observed turn and this one, rather than losing the first tick of
+            // a page-in burst before the stalled turn was noticed.
+            self.faults_at_progress = previous_faults;
+            self.deferral_logged = false;
+        }
+        self.progress_token = Some(token);
+    }
+}
+
+fn exit_deferral(
+    stalled_for: Duration,
+    exit_threshold: Duration,
+    wake_late: Duration,
+    parked_for: Option<Duration>,
+    majflt_delta: u64,
+) -> Option<&'static str> {
+    if stalled_for >= FRAME_LOOP_HARD_CEILING {
+        None
+    } else if wake_late >= exit_threshold {
+        Some("watchdog itself woke late")
+    } else if parked_for.is_some() {
+        Some("its runtime is parked (host starvation)")
+    } else if majflt_delta > PAGING_MAJFLT_THRESHOLD {
+        Some("paging")
+    } else {
+        None
     }
 }
 
@@ -597,6 +692,12 @@ pub(super) trait LivenessMarker: Send + Sync {
     fn restart_on_stall(&self) -> bool {
         false
     }
+    fn runtime_parked_for(&self) -> Option<Duration> {
+        None
+    }
+    fn progress_token(&self) -> u64 {
+        0
+    }
     fn context(&self) -> String {
         "phase=unknown frame=unknown".to_string()
     }
@@ -626,6 +727,14 @@ impl LivenessMarker for FrameLoopMarker {
 
     fn restart_on_stall(&self) -> bool {
         true
+    }
+
+    fn runtime_parked_for(&self) -> Option<Duration> {
+        self.0.frame_loop_runtime_parked_for()
+    }
+
+    fn progress_token(&self) -> u64 {
+        self.0.frame_loop_last_tick_ms.load(Ordering::Relaxed)
     }
 
     fn context(&self) -> String {
@@ -979,6 +1088,8 @@ mod tests {
             frame_loop_exit_threshold: TEST_THRESHOLD * 2,
             stderr: log.sink(),
             exit: Arc::new(|_| panic!("unexpected frame loop exit")),
+            major_faults: Arc::new(|| 0),
+            now: Arc::new(Instant::now),
         }
     }
 
@@ -1057,10 +1168,7 @@ mod tests {
             let executor = Arc::new(crate::executor::Executor::new());
             let module_executor = Arc::clone(&executor);
             let module = thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
+                let runtime = hooks.metrics.frame_loop_runtime().unwrap();
                 let (read, write) = tokio::io::split(module_stream);
                 runtime.block_on(run_module_loop(
                     read,
@@ -1075,6 +1183,7 @@ mod tests {
                     None,
                     &path,
                     QuiescedLsp::ReapInBackground,
+                    None,
                     None,
                     Some(hooks),
                 ))
@@ -1969,6 +2078,181 @@ mod tests {
 
     fn secs(value: u64) -> Duration {
         Duration::from_secs(value)
+    }
+
+    #[test]
+    fn current_thread_runtime_event_wait_reports_parked_and_clears_on_wake() {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let worker_metrics = Arc::clone(&metrics);
+        let (wake, wait) = tokio::sync::oneshot::channel();
+        let worker = thread::spawn(move || {
+            let runtime = worker_metrics.frame_loop_runtime().unwrap();
+            runtime.block_on(async {
+                wait.await.unwrap();
+                assert_eq!(worker_metrics.frame_loop_runtime_parked_for(), None);
+            });
+        });
+        wait_until("runtime event wait park hook", || {
+            metrics.frame_loop_runtime_parked_for().is_some()
+        });
+        thread::sleep(Duration::from_millis(10));
+        assert!(metrics.frame_loop_runtime_parked_for().unwrap() >= Duration::from_millis(10));
+        wake.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    struct InjectedMarker {
+        clock_ms: AtomicU64,
+        last_turn_ms: AtomicU64,
+        parked: std::sync::atomic::AtomicBool,
+        observations: AtomicUsize,
+    }
+
+    impl LivenessMarker for Arc<InjectedMarker> {
+        fn name(&self) -> &'static str { "subc_frame_loop" }
+        fn progress_age(&self) -> Duration {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            Duration::from_millis(self.clock_ms.load(Ordering::SeqCst)
+                .saturating_sub(self.last_turn_ms.load(Ordering::SeqCst)))
+        }
+        fn has_pending_work(&self) -> bool { true }
+        fn restart_on_stall(&self) -> bool { true }
+        fn runtime_parked_for(&self) -> Option<Duration> {
+            self.parked.load(Ordering::SeqCst).then(|| self.progress_age())
+        }
+        fn progress_token(&self) -> u64 { self.last_turn_ms.load(Ordering::SeqCst) }
+    }
+
+    struct InjectedWatchdog {
+        marker: Arc<InjectedMarker>,
+        faults: Arc<AtomicU64>,
+        log: RecordedLog,
+        stderr: RecordedLog,
+        exits: Arc<AtomicUsize>,
+        watchdog: StallWatchdog,
+        _dir: tempfile::TempDir,
+    }
+
+    impl InjectedWatchdog {
+        fn start(parked: bool) -> Self {
+            let marker = Arc::new(InjectedMarker {
+                clock_ms: AtomicU64::new(0), last_turn_ms: AtomicU64::new(0),
+                parked: std::sync::atomic::AtomicBool::new(parked),
+                observations: AtomicUsize::new(0),
+            });
+            let log = RecordedLog::default();
+            let stderr = RecordedLog::default();
+            let faults = Arc::new(AtomicU64::new(100));
+            let exits = Arc::new(AtomicUsize::new(0));
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(&log, &Arc::new(RecordingCapture::default()), dir.path());
+            config.tick = Duration::from_millis(1);
+            config.threshold = STALL_THRESHOLD;
+            config.frame_loop_exit_threshold = FRAME_LOOP_EXIT_THRESHOLD;
+            config.stderr = stderr.sink();
+            let exit_count = Arc::clone(&exits);
+            config.exit = Arc::new(move |code| {
+                assert_eq!(code, STALL_EXIT_CODE);
+                exit_count.fetch_add(1, Ordering::SeqCst);
+            });
+            let fault_count = Arc::clone(&faults);
+            config.major_faults = Arc::new(move || fault_count.load(Ordering::SeqCst));
+            let clock = Arc::clone(&marker);
+            let origin = Instant::now();
+            config.now = Arc::new(move || origin + Duration::from_millis(clock.clock_ms.load(Ordering::SeqCst)));
+            let watchdog = StallWatchdog::spawn(vec![Box::new(Arc::clone(&marker))], Arc::new(StallStats::default()), config).unwrap();
+            wait_until("first watchdog observation", || marker.observations.load(Ordering::SeqCst) >= 2);
+            Self { marker, faults, log, stderr, exits, watchdog, _dir: dir }
+        }
+
+        fn advance(&self, seconds: u64) {
+            let observed = self.marker.observations.load(Ordering::SeqCst);
+            self.marker.clock_ms.fetch_add(seconds * 1000, Ordering::SeqCst);
+            wait_until("injected watchdog tick", || {
+                self.marker.observations.load(Ordering::SeqCst) >= observed + 4
+                    || self.exits.load(Ordering::SeqCst) != 0
+            });
+        }
+
+        fn deferrals(&self) -> Vec<String> {
+            self.log.lines().into_iter().filter(|line| line.contains("exit deferred")).collect()
+        }
+    }
+
+    #[test]
+    fn parked_runtime_defers_once_per_stall_then_exits_at_hard_ceiling() {
+        let probe = InjectedWatchdog::start(true);
+        probe.advance(29);
+        probe.advance(1);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
+        let lines = probe.deferrals();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("because its runtime is parked (host starvation)"));
+        assert!(lines[0].contains("runtime_parked=true parked_for_ms=30000 majflt_delta=0"));
+        probe.advance(1);
+        assert_eq!(probe.deferrals().len(), 1);
+
+        // Starting a new turn ends the stall and permits one fresh diagnostic.
+        probe.marker.last_turn_ms.store(31_000, Ordering::SeqCst);
+        probe.advance(1);
+        probe.advance(28);
+        probe.advance(1);
+        assert_eq!(probe.deferrals().len(), 2);
+        probe.advance(270);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        let exits = probe.stderr.lines();
+        assert_eq!(exits.len(), 1);
+        assert!(exits[0].contains("stalled_for_ms=300000"), "{exits:?}");
+        assert!(exits[0].contains("runtime_parked=true"));
+        probe.watchdog.stop_and_join();
+    }
+
+    #[test]
+    fn unparked_runtime_without_faults_exits_at_normal_bound() {
+        let probe = InjectedWatchdog::start(false);
+        probe.advance(29);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
+        probe.advance(1);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        assert!(probe.deferrals().is_empty());
+        let lines = probe.stderr.lines();
+        assert!(lines[0].contains("runtime_parked=false parked_for_ms=0 majflt_delta=0"));
+        probe.watchdog.stop_and_join();
+    }
+
+    #[test]
+    fn unparked_runtime_with_fault_burst_defers_until_ceiling() {
+        let probe = InjectedWatchdog::start(false);
+        probe.faults.store(100 + PAGING_MAJFLT_THRESHOLD + 1, Ordering::SeqCst);
+        probe.advance(29);
+        probe.advance(1);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
+        let lines = probe.deferrals();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("because paging"));
+        assert!(lines[0].contains("runtime_parked=false parked_for_ms=0 majflt_delta=9"));
+        probe.advance(270);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.deferrals().len(), 1);
+        probe.watchdog.stop_and_join();
+    }
+
+    #[test]
+    fn process_wide_late_wake_defers_but_next_punctual_tick_exits() {
+        let probe = InjectedWatchdog::start(false);
+        probe.advance(31);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
+        assert!(probe.deferrals()[0].contains("because watchdog itself woke late"));
+        probe.advance(1);
+        assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
+        probe.watchdog.stop_and_join();
+    }
+
+    #[test]
+    fn paging_threshold_is_strict_and_hard_ceiling_overrides_all_deferrals() {
+        assert_eq!(exit_deferral(secs(30), secs(30), secs(0), None, PAGING_MAJFLT_THRESHOLD), None);
+        assert_eq!(exit_deferral(secs(30), secs(30), secs(0), None, PAGING_MAJFLT_THRESHOLD + 1), Some("paging"));
+        assert_eq!(exit_deferral(FRAME_LOOP_HARD_CEILING, secs(30), secs(300), Some(secs(300)), 1000), None);
     }
 
     #[test]

@@ -4530,9 +4530,9 @@ fn run_subc_mode_on_runtime_thread(
     crate::db::call_ledger::mark_provider_process();
     let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    let runtime = dispatch_path_metrics
+        .frame_loop_runtime()
         .map_err(SubcError::Runtime)?;
 
     let executor_for_loop = Arc::clone(&executor);
@@ -4569,6 +4569,7 @@ fn run_subc_mode_on_runtime_thread(
                 &storage_dir,
                 // The exit phase below takes and shuts down every root's servers.
                 QuiescedLsp::LeaveForExitSweep,
+                Some(dispatch_path_metrics),
                 #[cfg(test)]
                 None,
                 #[cfg(test)]
@@ -5176,6 +5177,7 @@ async fn run_module_loop<R, W>(
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
     connection_end_lsp: QuiescedLsp,
+    runtime_metrics: Option<Arc<DispatchPathMetrics>>,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
     #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
 ) -> Result<ModuleLoopExit, SubcError>
@@ -5241,7 +5243,8 @@ where
         },
     };
 
-    let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    let dispatch_path_metrics =
+        runtime_metrics.unwrap_or_else(|| Arc::new(DispatchPathMetrics::new()));
     dispatch_path_metrics.watch_delivery.install(&executor);
     if let Some(probe) = lifecycle_probe.clone() {
         *dispatch_path_metrics
@@ -15603,6 +15606,7 @@ mod tests {
                 None,
                 &fixture_path.join("storage"),
                 QuiescedLsp::ReapInBackground,
+                None,
                 Some(actor),
                 None,
             ))
@@ -15778,6 +15782,7 @@ mod tests {
                 None,
                 &fixture_path.join("storage"),
                 QuiescedLsp::ReapInBackground,
+                None,
                 Some(actor),
                 None,
             ))
@@ -23287,6 +23292,7 @@ mod pong_priority_tests {
                 None,
                 &storage_path,
                 QuiescedLsp::ReapInBackground,
+                None,
                 None,
                 Some(hooks),
             ))

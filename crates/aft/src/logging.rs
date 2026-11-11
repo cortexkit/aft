@@ -1002,6 +1002,21 @@ pub(crate) fn daemon_log_path() -> PathBuf {
         .join(format!("aft-{}.log", std::process::id()))
 }
 
+/// Best-effort watchdog evidence, independent of the logger and writer locks.
+/// Reopen for each line so normal log rotation does not strand later evidence
+/// on a renamed file. The caller must write its guaranteed stderr copy first.
+pub(crate) fn write_watchdog_line(path: &Path, message: &str) -> io::Result<()> {
+    let mut line = Vec::new();
+    write_log_line(
+        &mut line,
+        &format_utc_timestamp(),
+        log::Level::Warn,
+        "aft::subc::stall_watchdog",
+        &format_args!("{message}"),
+    )?;
+    open_private_log_file(path, false)?.write_all(&crate::log_redact::aft_redact_bytes(&line))
+}
+
 /// The standalone gh shim runs before logger initialization. Preserve its rare
 /// authority diagnostics in the process log without adding agent-visible stderr.
 pub(crate) fn write_preinit_warning(message: &str) -> io::Result<()> {
@@ -2668,6 +2683,28 @@ fn perf_tick_interval() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watchdog_append_bypasses_held_logger_control_and_follows_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watchdog.log");
+        let control = super::FILE_CONTROL.lock().unwrap();
+        super::write_watchdog_line(&path, "stall watchdog: stall detected marker=subc_frame_loop").unwrap();
+        let rotated = dir.path().join("watchdog.log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        super::write_watchdog_line(&path, "stall watchdog: exit deferred because paging").unwrap();
+        super::write_watchdog_line(&path, "stall watchdog: exiting Authorization: Bearer terminal-secret-value").unwrap();
+        drop(control);
+        let old = std::fs::read_to_string(rotated).unwrap();
+        let current = std::fs::read_to_string(path).unwrap();
+        assert!(old.contains("stall detected"));
+        assert!(!old.contains("exit deferred"));
+        assert_eq!(current.lines().count(), 2);
+        assert!(current.contains("exit deferred because paging"));
+        assert!(current.contains("stall watchdog: exiting"));
+        assert!(!current.contains("terminal-secret-value"));
+        assert!(current.contains(crate::log_redact::SECRET_PLACEHOLDER));
+    }
+
     #[test]
     fn gh_shim_preinit_warning_is_durable_and_file_only() {
         let dir = tempfile::tempdir().unwrap();
