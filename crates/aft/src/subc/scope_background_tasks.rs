@@ -165,6 +165,41 @@ fn authorize(params: &Value, principal: Option<&Principal>) -> Result<(), Respon
     Ok(())
 }
 
+pub(super) fn expected_roots(
+    params: &Value,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+) -> Result<Vec<ProjectRootId>, String> {
+    let params: Params =
+        serde_json::from_value(params.clone()).map_err(|error| error.to_string())?;
+    let mut roots = HashSet::new();
+    for (index, route) in routes.values().take(WALK_LIMIT + 1).enumerate() {
+        if index == WALK_LIMIT {
+            return Err("walk_limit_reached".into());
+        }
+        if route
+            .scope
+            .as_ref()
+            .is_some_and(|stamp| params.scope.matches(stamp))
+        {
+            roots.insert(route.root.clone());
+        }
+    }
+    Ok(roots.into_iter().collect())
+}
+
+fn registry_snapshot(
+    expected: Result<Vec<ProjectRootId>, String>,
+    registries: &HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>,
+) -> Result<Vec<crate::bash_background::BgTaskRegistry>, String> {
+    if expected?.iter().any(|root| !registries.contains_key(root)) {
+        return Err("registry_not_loaded".into());
+    }
+    if registries.len() > WALK_LIMIT {
+        return Err("walk_limit_reached".into());
+    }
+    Ok(registries.values().cloned().collect())
+}
+
 fn scan_saved(
     storage: &Path,
     scope: &Selector,
@@ -305,6 +340,7 @@ pub(super) fn spawn(
     principal: Option<Principal>,
     params: Value,
     storage: PathBuf,
+    expected: Result<Vec<ProjectRootId>, String>,
 ) {
     let tx = tx.clone();
     let frame = frame.clone();
@@ -319,9 +355,9 @@ pub(super) fn spawn(
             .completion_delivery
             .registries
             .try_lock()
-            .ok()
-            .map(|registries| registries.values().cloned().collect::<Vec<_>>());
-        let result = if let Some(registries) = registries {
+            .map_err(|_| "registry_busy".into())
+            .and_then(|registries| registry_snapshot(expected, &registries));
+        let result = if let Ok(registries) = registries {
             tokio::time::timeout(
                 Duration::from_millis(1500),
                 tokio::task::spawn_blocking(move || {
@@ -340,7 +376,7 @@ pub(super) fn spawn(
         } else {
             Response::success(
                 "management-scope-background-tasks",
-                serde_json::to_value(Reply::incomplete("registry_busy")).unwrap(),
+                serde_json::to_value(Reply::incomplete(registries.err().unwrap())).unwrap(),
             )
         };
         if let Err(error) = send_management_response(&tx, &frame, OPERATION, result, &metrics).await
@@ -557,6 +593,32 @@ mod tests {
         );
         assert_eq!(reply.data["complete"], true);
         assert_eq!(reply.data["running"], json!([]));
+    }
+
+    #[test]
+    fn scope_background_tasks_bound_root_without_registry_is_incomplete_even_without_saved_tasks() {
+        let (_dir, root) = super::super::test_support::test_root("scope-root-not-ready");
+        let selected = selector();
+        let mut route = super::super::test_support::route_identity_with_harness(
+            &root,
+            "session",
+            BindTrust::FirstParty,
+            "runner",
+        );
+        Arc::get_mut(&mut route.0).unwrap().scope = Some(subc_protocol::scope::ScopeStamp::new(
+            selected.owner.clone(),
+            selected.scope_ref.clone(),
+            selected.epoch,
+            subc_protocol::scope::ScopeKind::Worker,
+        ));
+        let expected = expected_roots(
+            &json!({"scope":selected}),
+            &HashMap::from([(route_key(1, 1), route)]),
+        );
+        assert_eq!(expected.as_ref().unwrap(), &vec![root]);
+        assert!(
+            matches!(registry_snapshot(expected, &HashMap::new()), Err(reason) if reason == "registry_not_loaded")
+        );
     }
 
     #[test]

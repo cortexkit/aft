@@ -9249,6 +9249,7 @@ async fn handle_management_request(
                 .and_then(|value| value.get("params"))
                 .cloned()
                 .unwrap_or(Value::Null);
+            let expected_roots = scope_background_tasks::expected_roots(&params, routes);
             scope_background_tasks::spawn(
                 tx,
                 frame,
@@ -9256,6 +9257,7 @@ async fn handle_management_request(
                 principal.cloned(),
                 params,
                 storage_dir.to_path_buf(),
+                expected_roots,
             );
             return Ok(());
         }

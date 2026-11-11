@@ -2219,18 +2219,18 @@ impl From<BashTaskRow> for PersistedTask {
 }
 
 fn decode_persisted_task(content: &str) -> serde_json::Result<PersistedTask> {
-    let mut value: serde_json::Value = serde_json::from_str(content)?;
-    // Older records kept the route label only inside launching_identity. Save
-    // it before TaskIdentity's decoder canonicalizes ownership to Runner.
-    if value
-        .get("launching_raw_harness")
-        .is_none_or(serde_json::Value::is_null)
-    {
-        if let Some(raw) = value.pointer("/launching_identity/harness").cloned() {
-            value["launching_raw_harness"] = raw;
-        }
+    let value: serde_json::Value = serde_json::from_str(content)?;
+    let mut task: PersistedTask = serde_json::from_str(content)?;
+    // Older records kept the original route harness in launching_identity.
+    // Read that string from JSON because the decoded TaskIdentity replaces
+    // runner aliases with "runner" for ownership comparisons.
+    if task.launching_raw_harness.is_none() {
+        task.launching_raw_harness = value
+            .pointer("/launching_identity/harness")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
     }
-    serde_json::from_value(value)
+    Ok(task)
 }
 
 #[cfg(test)]

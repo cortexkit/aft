@@ -750,9 +750,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/scope_background_tasks.rs",
-        enclosing_item: "running, scan_saved",
+        enclosing_item: "running, scan_saved, expected_roots, registry_snapshot",
         location_or_primitive: "COMMAND_BYTES and WALK_LIMIT",
         reason: "owner-only management snapshot, not an agent result list; command_truncated identifies the UTF-8 command ceiling and complete false with a reason discloses every bounded or failed walk",
+    },
+    ExclusionEntry {
+        file: "subc/bash_notice_text.rs",
+        enclosing_item: "long_running",
+        location_or_primitive: "120 UTF-16 code-unit command preview",
+        reason: "a command text preview rather than a result list; preserves the existing OpenCode reminder formatter, including its ellipsis and full-command inspection guidance",
     },
     ExclusionEntry {
         file: "db/runner_harness_keys.rs",
