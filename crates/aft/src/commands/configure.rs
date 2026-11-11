@@ -1589,7 +1589,7 @@ fn configure_warnings_canonicalize_biome_directories_not_each_file() {
         session_id: None,
     }
     .run(|boundary| {
-        crate::inspect::job::CANONICALIZE_CALLS.with(|counter| match boundary {
+        crate::path_identity::CANONICALIZE_CALLS.with(|counter| match boundary {
             WarningBoundary::ResolvingLsp => *counter.borrow_mut() = Some(Vec::new()),
             WarningBoundary::Publication => calls = counter.borrow_mut().take().unwrap(),
             _ => {}
@@ -1643,13 +1643,13 @@ fn configure_warnings_cpu_measurement() {
         tx,
         session_id: None,
     };
-    crate::inspect::job::CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+    crate::path_identity::CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
     let cpu = cpu_seconds();
     let wall = Instant::now();
     work.run(|_| {});
     let cpu = cpu_seconds() - cpu;
     let wall = wall.elapsed().as_secs_f64();
-    let canonicalizations = crate::inspect::job::CANONICALIZE_CALLS
+    let canonicalizations = crate::path_identity::CANONICALIZE_CALLS
         .with(|calls| calls.borrow_mut().take().unwrap().len());
     let warnings = rx
         .try_recv()
