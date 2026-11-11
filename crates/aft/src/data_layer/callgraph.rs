@@ -592,6 +592,22 @@ impl EncodedResolution {
 }
 
 impl Resolutions {
+    pub(crate) fn profile_parts(&self) -> [usize; 5] {
+        use aft_store::heap::HeapBytes as _;
+        let mut seen = aft_store::heap::Seen::new();
+        let mut parts = [0; 5];
+        for slot in self.map.values() {
+            if let Some(Some(file)) = slot.value.get() {
+                parts[0] += file.rows.heap_bytes(&mut seen);
+                parts[1] += file.binding.heap_bytes(&mut seen);
+                parts[2] += file.dispatch.heap_bytes(&mut seen);
+                parts[3] += file.sites.heap_bytes(&mut seen);
+                parts[4] += file.site_dependencies.heap_bytes(&mut seen);
+            }
+        }
+        parts
+    }
+
     /// Every file `stored` has a resolution for, each decoded on first read.
     pub(crate) fn stored(stored: &Arc<StoredSlices>) -> Self {
         Self {

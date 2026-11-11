@@ -714,6 +714,8 @@ impl LiveCheckout {
             ..UpdateStats::default()
         };
         let old = std::mem::replace(&mut self.inputs, next);
+        let mut profile_clock = Instant::now();
+        self.profile_refresh("start", &mut profile_clock);
         let inputs = &self.inputs;
         let membership = changed
             .iter()
@@ -864,6 +866,7 @@ impl LiveCheckout {
         stats.answers_checked = stale.checked;
         stats.answers_changed = stale.changed;
         stats.facts_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.profile_refresh("facts", &mut profile_clock);
 
         // Pass 1. A binding depends on the file's own parse, on which paths
         // exist, and on configuration it read.
@@ -986,6 +989,7 @@ impl LiveCheckout {
             self.bound.set(path, bound);
         }
         stats.bind_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.profile_refresh("bind", &mut profile_clock);
 
         // What a recorded answer can depend on that changed.
         let mut changed_keys = surface_keys.clone();
@@ -1092,6 +1096,7 @@ impl LiveCheckout {
         }
         drop(answers);
         drop(trace_answers);
+        self.profile_refresh("replay", &mut profile_clock);
         // Files kept whose binding was redone carry their resolution over.
         for path in &rebind {
             if resolve.contains(path) {
@@ -1132,6 +1137,7 @@ impl LiveCheckout {
             self.resolved.insert(path, file);
         }
         stats.resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.profile_refresh("resolve", &mut profile_clock);
 
         // Pass 3, for files whose rows were kept: each trace was replayed
         // with its file's surface answers above. Resolving files again
@@ -1174,6 +1180,7 @@ impl LiveCheckout {
         }
         drop(index);
         drop(facts);
+        self.profile_refresh("dispatch", &mut profile_clock);
 
         // Pass 4.
         let started = Instant::now();
@@ -1212,6 +1219,7 @@ impl LiveCheckout {
         }
         stats.sites_resolved = paths.len();
         stats.sites_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.profile_refresh("sites", &mut profile_clock);
         stats.touched = rebind
             .into_iter()
             .chain(resolve)
@@ -1220,6 +1228,23 @@ impl LiveCheckout {
             .chain(removed)
             .collect();
         Ok(stats)
+    }
+
+    fn profile_refresh(&self, stage: &str, clock: &mut Instant) {
+        if std::env::var_os("AFT_REFRESH_PROFILE").is_none() {
+            return;
+        }
+        let wall_ms = clock.elapsed().as_millis();
+        let cpu = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|line| {
+                let rest = line.get(line.rfind(')')? + 2..)?;
+                let fields = rest.split_whitespace().collect::<Vec<_>>();
+                Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
+            });
+        let parts = self.memory_parts(&mut aft_store::heap::Seen::new());
+        log::info!("refresh profile {stage}: wall_ms={wall_ms} cpu_ticks={cpu:?} decoded_parses={} decoded_resolutions={} parts={parts:?} resolution_parts={:?}", self.inputs.parses.decoded_count(), self.resolved.decoded_count(), self.resolved.profile_parts());
+        *clock = Instant::now();
     }
 }
 
