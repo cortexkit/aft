@@ -2285,7 +2285,7 @@ mod tests {
         let probe = InjectedWatchdog::start(false);
         probe.advance(31);
         // Only the first tick is late. Subsequent ticks at the frozen clock
-        // are punctual and may already have requested exit before we observe.
+        // are punctual and may request exit before advance returns to this test.
         assert_eq!(probe.deferrals().len(), 1);
         assert!(probe.deferrals()[0].contains("because watchdog itself woke late"));
         assert_eq!(probe.exits.load(Ordering::SeqCst), 1);
