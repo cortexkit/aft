@@ -1,6 +1,7 @@
 //! Only the three AFT operations, using the pinned vault response shapes.
 
 use super::*;
+use serde_json::json;
 use std::sync::Arc;
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};

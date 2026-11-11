@@ -14,41 +14,41 @@ pub(super) struct Envelope {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Latest {
-    pub version: u64,
     pub envelope: Envelope,
+    pub version: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Report {
-    pub version: u64,
     pub payload_sha256: String,
-    pub verdict: String,
     pub reason: Option<String>,
+    pub verdict: String,
+    pub version: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Recorded {
-    pub status: String,
     pub member_id: String,
+    pub status: String,
     pub version: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Notice {
-    pub kind: String,
     pub epoch: String,
+    pub kind: String,
+    pub manifest_sha256: Option<String>,
     pub seq: u64,
     pub version: Option<u64>,
-    pub manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct Refusal {
-    pub code: String,
     pub class: String,
+    pub code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remedy_member: Option<String>,
 }

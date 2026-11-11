@@ -1,6 +1,5 @@
 use super::super::manifest_wire::Envelope;
 use super::*;
-use serde_json::json;
 
 fn paths(directory: &tempfile::TempDir) -> StatePaths {
     StatePaths::from_root(directory.path().join("gh-shim"))

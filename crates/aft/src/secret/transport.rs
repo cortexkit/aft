@@ -132,7 +132,7 @@ impl ManagementSession {
         Ok(Self { consumer, route })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn for_test(connection_file: &std::path::Path) -> Result<Self, ()> {
         Self::connect_as(
             connection_file,
