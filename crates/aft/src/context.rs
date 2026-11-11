@@ -11974,7 +11974,7 @@ impl AppContext {
                 "plugin filesystem access requires its admitted permission route",
             ));
         }
-        if let AccessDecision::Deny(denial) = decision {
+        if let AccessDecision::Deny(denial) = &decision {
             if let crate::access_policy::AskRoute::Plugin { scope, .. } =
                 crate::access_policy::current_ask_route()
             {
@@ -11982,7 +11982,7 @@ impl AppContext {
                     AccessDenial::Floor => "denied_floor",
                     AccessDenial::OutsideRoots => "outside_roots_denied",
                     AccessDenial::ReadOnly => "access_read_only",
-                    AccessDenial::UnsafeTemp => "unsafe_temp_path",
+                    AccessDenial::UnsafeTemp(_) => "unsafe_temp_path",
                     AccessDenial::ScopeGrants(_) => "scope_grants_denied",
                 };
                 scope.log_retry_refusal(operation, &identity, reason);
@@ -12050,14 +12050,11 @@ impl AppContext {
                     original.display()
                 ),
             )),
-            AccessDecision::Deny(AccessDenial::UnsafeTemp) => {
+            AccessDecision::Deny(AccessDenial::UnsafeTemp(denial)) => {
                 Err(crate::protocol::Response::error(
                     req_id,
                     "unsafe_temp_path",
-                    format!(
-                        "temporary path '{}' is not safe or not owned by this session",
-                        original.display()
-                    ),
+                    denial.message(original),
                 ))
             }
             AccessDecision::Deny(AccessDenial::Floor) => Err(crate::protocol::Response::error(

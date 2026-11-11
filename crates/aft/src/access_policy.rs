@@ -445,19 +445,19 @@ pub enum AccessOperation {
     Write,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessDecision {
     Allow,
     Ask,
     Deny(AccessDenial),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessDenial {
     Floor,
     OutsideRoots,
     ReadOnly,
-    UnsafeTemp,
+    UnsafeTemp(temp::TempDenial),
     ScopeGrants(ScopeGrantsDenial),
 }
 
@@ -888,16 +888,23 @@ impl AccessPolicy {
                 .any(|root| path.starts_with(root))
                 || crate::task_temp_reads::is_scratch(path);
             if managed && !self.standalone_owned_scratch {
-                return AccessDecision::Deny(AccessDenial::UnsafeTemp);
+                return AccessDecision::Deny(AccessDenial::UnsafeTemp(temp::TempDenial::new(
+                    path,
+                    temp::TempReason::OtherSessionScratch,
+                )));
             }
             if self
                 .standalone_temp_guard_roots
                 .iter()
                 .any(|root| path.starts_with(root))
-                && !crate::bounded_io::run(path, None, |path| Ok(temp::safe_file(&path)))
-                    .unwrap_or(false)
             {
-                return AccessDecision::Deny(AccessDenial::UnsafeTemp);
+                let checked = crate::bounded_io::run(path, None, |path| Ok(temp::safe_file(&path)))
+                    .unwrap_or_else(|_| {
+                        Err(temp::TempDenial::new(path, temp::TempReason::Unreadable))
+                    });
+                if let Err(denial) = checked {
+                    return AccessDecision::Deny(AccessDenial::UnsafeTemp(denial));
+                }
             }
         }
         let inside = self.roots.iter().any(|root| path.starts_with(root));
@@ -934,14 +941,14 @@ impl AccessPolicy {
         {
             AccessDecision::Allow
         } else {
-            match (self.mode, self.outside) {
+            match (self.mode, self.outside.clone()) {
                 (ApprovalMode::FullAccess, AccessDecision::Ask) => AccessDecision::Allow,
                 (_, AccessDecision::Deny(AccessDenial::OutsideRoots)) => self
                     .scope_grants_denial
                     .or(scope_grants_denial())
                     .map(|reason| AccessDecision::Deny(AccessDenial::ScopeGrants(reason)))
-                    .unwrap_or(self.outside),
-                _ => self.outside,
+                    .unwrap_or_else(|| self.outside.clone()),
+                _ => self.outside.clone(),
             }
         }
     }
@@ -1084,12 +1091,23 @@ impl AccessPolicy {
                 .iter()
                 .chain(&self.standalone_temp_roots)
                 .any(|root| path == root)
-                || self
+            {
+                return AccessDecision::Deny(AccessDenial::UnsafeTemp(temp::TempDenial::new(
+                    path,
+                    temp::TempReason::ProtectedRoot,
+                )));
+            }
+            if !self.standalone_owned_scratch {
+                if let Some(root) = self
                     .standalone_managed_temp_roots
                     .iter()
-                    .any(|root| root.starts_with(path) && !self.standalone_owned_scratch)
-            {
-                return AccessDecision::Deny(AccessDenial::UnsafeTemp);
+                    .find(|root| root.starts_with(path))
+                {
+                    return AccessDecision::Deny(AccessDenial::UnsafeTemp(temp::TempDenial::new(
+                        root,
+                        temp::TempReason::OtherSessionScratch,
+                    )));
+                }
             }
             if self
                 .standalone_temp_guard_roots
@@ -1098,12 +1116,12 @@ impl AccessPolicy {
             {
                 let managed = self.standalone_managed_temp_roots.clone();
                 let owned = self.standalone_owned_scratch;
-                if !crate::bounded_io::run(path, None, move |path| {
+                let checked = crate::bounded_io::run(path, None, move |path| {
                     Ok(temp::safe_tree(&path, &managed, owned))
                 })
-                .unwrap_or(false)
-                {
-                    return AccessDecision::Deny(AccessDenial::UnsafeTemp);
+                .unwrap_or_else(|_| Err(temp::TempDenial::new(path, temp::TempReason::Unreadable)));
+                if let Err(denial) = checked {
+                    return AccessDecision::Deny(AccessDenial::UnsafeTemp(denial));
                 }
             }
         }

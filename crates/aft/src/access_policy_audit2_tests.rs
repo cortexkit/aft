@@ -59,6 +59,89 @@ fn request(command: &str, params: Value) -> RawRequest {
     }
 }
 
+fn assert_temp_delete_denial(f: &Fixture, path: &Path, recursive: bool, message: &str) {
+    let response = crate::commands::delete_file::handle_delete_file(
+        &request("delete_file", json!({"file":path,"recursive":recursive})),
+        &f.ctx,
+    );
+    assert!(!response.success, "{:?}", response.data);
+    assert_eq!(response.data["code"], "unsafe_temp_path");
+    assert_eq!(response.data["message"], message);
+    assert!(path.exists());
+}
+
+#[test]
+fn audit2_temp_delete_sqlite_reason_names_first_failing_entry() {
+    let f = Fixture::new();
+    let temp = tempfile::tempdir().unwrap();
+    let _route = f.plugin();
+    for (folder, name) in [("with-db", "x.db"), ("named", "notes.sqlite.txt")] {
+        let dir = temp.path().join(folder);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        let entry = dir.join("a").join(name);
+        if folder == "with-db" {
+            let db = rusqlite::Connection::open(&entry).unwrap();
+            db.execute_batch("CREATE TABLE example (value TEXT);")
+                .unwrap();
+        } else {
+            std::fs::write(&entry, "not a database").unwrap();
+        }
+        for (requested, recursive) in [(&entry, false), (&dir, true)] {
+            assert_temp_delete_denial(&f, requested, recursive, &format!(
+                "temporary path '{}' contains a SQLite file ('{}'); AFT does not change SQLite files under the temporary directory, because they can be another program's live database",
+                requested.display(), entry.display()
+            ));
+        }
+    }
+    let dir = temp.path().join("no-db");
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::write(dir.join("a/x.txt"), "ordinary file").unwrap();
+    let response = crate::commands::delete_file::handle_delete_file(
+        &request("delete_file", json!({"file":dir,"recursive":true})),
+        &f.ctx,
+    );
+    assert!(response.success, "{:?}", response.data);
+    assert!(!dir.exists());
+}
+
+#[test]
+fn audit2_temp_delete_hard_link_reason_names_first_failing_entry() {
+    let f = Fixture::new();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("linked");
+    std::fs::create_dir(&dir).unwrap();
+    let entry = dir.join("alias.txt");
+    let source = temp.path().join("source.txt");
+    std::fs::write(&source, "shared inode").unwrap();
+    std::fs::hard_link(&source, &entry).unwrap();
+    let _route = f.plugin();
+    for (requested, recursive) in [(&entry, false), (&dir, true)] {
+        assert_temp_delete_denial(&f, requested, recursive, &format!(
+            "temporary path '{}' contains a file with more than one hard link ('{}'); AFT does not change hard-linked files under the temporary directory, because another link can be outside it",
+            requested.display(), entry.display()
+        ));
+    }
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "shared inode");
+}
+
+#[cfg(unix)]
+#[test]
+fn audit2_temp_delete_special_file_reason_names_first_failing_entry() {
+    let f = Fixture::new();
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("special");
+    std::fs::create_dir(&dir).unwrap();
+    let entry = dir.join("socket");
+    let _socket = std::os::unix::net::UnixListener::bind(&entry).unwrap();
+    let _route = f.plugin();
+    for (requested, recursive) in [(&entry, false), (&dir, true)] {
+        assert_temp_delete_denial(&f, requested, recursive, &format!(
+            "temporary path '{}' contains a special file ('{}'); AFT changes only regular files, folders, and symbolic links under the temporary directory",
+            requested.display(), entry.display()
+        ));
+    }
+}
+
 #[test]
 fn audit2_batch_delete_authorizes_every_member_before_unlink() {
     let f = Fixture::new();
@@ -239,6 +322,12 @@ fn audit2_foreign_registered_scratch_cannot_be_read_written_or_deleted() {
         &f.ctx,
     );
     assert_eq!(delete.data["code"], "unsafe_temp_path", "{:?}", delete.data);
+    for (requested, recursive) in [(&target, false), (&scratch, true)] {
+        assert_temp_delete_denial(&f, requested, recursive, &format!(
+            "temporary path '{}' is another session's scratch folder; AFT changes only this session's scratch folders",
+            requested.display()
+        ));
+    }
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "foreign secret");
     let _owner = ask_route_guard(Some(AskRoute::Plugin {
         scope: plugin::Scope::new(&f.owner, "foreign-session"),
@@ -331,7 +420,10 @@ fn audit2_temp_roots_cannot_be_recursively_deleted() {
     policy.standalone_managed_temp_roots.clear();
     assert_eq!(
         policy.decide_tree_write(&root),
-        AccessDecision::Deny(AccessDenial::UnsafeTemp)
+        AccessDecision::Deny(AccessDenial::UnsafeTemp(temp::TempDenial::new(
+            &root,
+            temp::TempReason::ProtectedRoot,
+        )))
     );
     #[cfg(unix)]
     {

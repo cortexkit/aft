@@ -102,28 +102,75 @@ pub(crate) fn managed_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Metadata-only checks run before a temp allowance, never after opening data.
-pub(crate) fn safe_file(path: &Path) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TempReason {
+    SqliteFile,
+    HardLink,
+    OtherSessionScratch,
+    Unreadable,
+    SpecialFile,
+    ProtectedRoot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempDenial {
+    pub entry: PathBuf,
+    pub reason: TempReason,
+}
+
+const SPECIAL_FILE_MESSAGE: &str =
+    "AFT changes only regular files, folders, and symbolic links under the temporary directory";
+const PROTECTED_ROOT_MESSAGE: &str = "AFT does not replace or remove temporary directory roots";
+
+impl TempDenial {
+    pub(crate) fn new(entry: &Path, reason: TempReason) -> Self {
+        Self {
+            entry: entry.to_path_buf(),
+            reason,
+        }
+    }
+
+    pub(crate) fn message(&self, requested: &Path) -> String {
+        let folder = requested.display();
+        let entry = self.entry.display();
+        match self.reason {
+            TempReason::SqliteFile => format!("temporary path '{folder}' contains a SQLite file ('{entry}'); AFT does not change SQLite files under the temporary directory, because they can be another program's live database"),
+            TempReason::HardLink => format!("temporary path '{folder}' contains a file with more than one hard link ('{entry}'); AFT does not change hard-linked files under the temporary directory, because another link can be outside it"),
+            TempReason::OtherSessionScratch => format!("temporary path '{folder}' is another session's scratch folder; AFT changes only this session's scratch folders"),
+            TempReason::Unreadable => format!("temporary path '{folder}' could not be fully checked ('{entry}' could not be read)"),
+            TempReason::SpecialFile => format!("temporary path '{folder}' contains a special file ('{entry}'); {SPECIAL_FILE_MESSAGE}"),
+            TempReason::ProtectedRoot => format!("temporary path '{folder}' is a temporary directory root; {PROTECTED_ROOT_MESSAGE}"),
+        }
+    }
+}
+
+/// Checks run before a temp allowance, never after opening data for modification.
+pub(crate) fn safe_file(path: &Path) -> Result<(), TempDenial> {
     let sqlite_name = path.file_name().is_some_and(|name| {
         name.to_string_lossy()
             .to_ascii_lowercase()
             .contains(".sqlite")
     });
     if sqlite_name || crate::project_content::is_sqlite_or_metadata(path) {
-        return false;
+        return Err(TempDenial::new(path, TempReason::SqliteFile));
     }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
-            return error.kind() == std::io::ErrorKind::NotFound
+            return if error.kind() == std::io::ErrorKind::NotFound
                 || names_nothing(&error, cfg!(windows))
+            {
+                Ok(())
+            } else {
+                Err(TempDenial::new(path, TempReason::Unreadable))
+            }
         }
     };
     if metadata.is_dir() || metadata.file_type().is_symlink() {
-        return true;
+        return Ok(());
     }
     if !metadata.is_file() {
-        return false;
+        return Err(TempDenial::new(path, TempReason::SpecialFile));
     }
     single_link(path, &metadata)
 }
@@ -139,13 +186,17 @@ fn names_nothing(error: &std::io::Error, windows: bool) -> bool {
 }
 
 #[cfg(unix)]
-fn single_link(_path: &Path, metadata: &std::fs::Metadata) -> bool {
+fn single_link(path: &Path, metadata: &std::fs::Metadata) -> Result<(), TempDenial> {
     use std::os::unix::fs::MetadataExt;
-    metadata.nlink() == 1
+    if metadata.nlink() == 1 {
+        Ok(())
+    } else {
+        Err(TempDenial::new(path, TempReason::HardLink))
+    }
 }
 
 #[cfg(windows)]
-fn single_link(path: &Path, _metadata: &std::fs::Metadata) -> bool {
+fn single_link(path: &Path, _metadata: &std::fs::Metadata) -> Result<(), TempDenial> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -157,21 +208,28 @@ fn single_link(path: &Path, _metadata: &std::fs::Metadata) -> bool {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(path)
     else {
-        return false;
+        return Err(TempDenial::new(path, TempReason::Unreadable));
     };
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    unsafe {
-        GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) != 0
-            && info.nNumberOfLinks == 1
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        Err(TempDenial::new(path, TempReason::Unreadable))
+    } else if info.nNumberOfLinks == 1 {
+        Ok(())
+    } else {
+        Err(TempDenial::new(path, TempReason::HardLink))
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn single_link(_path: &Path, _metadata: &std::fs::Metadata) -> bool {
-    false
+fn single_link(path: &Path, _metadata: &std::fs::Metadata) -> Result<(), TempDenial> {
+    Err(TempDenial::new(path, TempReason::Unreadable))
 }
 
-pub(crate) fn safe_tree(path: &Path, managed_roots: &[PathBuf], owned: bool) -> bool {
+pub(crate) fn safe_tree(
+    path: &Path,
+    managed_roots: &[PathBuf],
+    owned: bool,
+) -> Result<(), TempDenial> {
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return safe_file(path);
     }
@@ -181,24 +239,22 @@ pub(crate) fn safe_tree(path: &Path, managed_roots: &[PathBuf], owned: bool) -> 
             && (managed_roots.iter().any(|root| path.starts_with(root))
                 || crate::task_temp_reads::is_scratch(&path))
         {
-            return false;
+            return Err(TempDenial::new(&path, TempReason::OtherSessionScratch));
         }
-        if !safe_file(&path) {
-            return false;
-        }
+        safe_file(&path)?;
         if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
             let Ok(entries) = std::fs::read_dir(&path) else {
-                return false;
+                return Err(TempDenial::new(&path, TempReason::Unreadable));
             };
             for entry in entries {
                 let Ok(entry) = entry else {
-                    return false;
+                    return Err(TempDenial::new(&path, TempReason::Unreadable));
                 };
                 pending.push(entry.path());
             }
         }
     }
-    true
+    Ok(())
 }
 
 #[cfg(test)]
@@ -223,12 +279,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let src = temp.path().join("src");
         std::fs::create_dir(&src).unwrap();
-        assert!(safe_file(&src.join("*.ts")));
+        assert!(safe_file(&src.join("*.ts")).is_ok());
         let compound = PathBuf::from(format!("{} {}", src.display(), temp.path().display()));
-        assert!(safe_file(&compound));
+        assert!(safe_file(&compound).is_ok());
         let file = src.join("a.ts");
         std::fs::write(&file, "export {};\n").unwrap();
         std::fs::hard_link(&file, src.join("b.ts")).unwrap();
-        assert!(!safe_file(&file));
+        assert_eq!(
+            safe_file(&file),
+            Err(TempDenial::new(&file, TempReason::HardLink))
+        );
     }
 }
