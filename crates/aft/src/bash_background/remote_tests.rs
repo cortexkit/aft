@@ -5202,6 +5202,74 @@ async fn exec_remote_bash_terminal_gap_keeps_outcome_when_attach_is_unavailable(
 }
 
 #[test]
+fn exec_remote_bash_unchanged_metadata_saves_and_progress_skip_syncs_then_recover() {
+    use crate::bash_background::persistence::work_counts;
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let started = Started::new(0, 123, 1);
+    sink.started(&started).unwrap();
+    let saved = fs::read(&paths.json).unwrap();
+    work_counts::reset();
+    const RECORDS: u64 = 300;
+    for _ in 0..RECORDS {
+        // Repeated persistence requests must not sync the same durable state.
+        sink.started(&started).unwrap();
+    }
+    let unchanged = work_counts::get();
+    assert_eq!(
+        (
+            unchanged.metadata_writes,
+            unchanged.renames,
+            unchanged.syncs
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(fs::read(&paths.json).unwrap(), saved);
+
+    // Freeze the checkpoint deadline so this measures only in-memory progress.
+    sink.last_progress_persist = Instant::now() + Duration::from_secs(60);
+    work_counts::reset();
+    for seq in 1..=RECORDS {
+        sink.output(seq, OutputStream::Stdout, b"progress\n")
+            .unwrap();
+    }
+    let progress = work_counts::get();
+    eprintln!(
+        "remote metadata: {RECORDS} unchanged saves: writes={} renames={} syncs={}; {RECORDS} progress records: writes={} renames={} syncs={}",
+        unchanged.metadata_writes, unchanged.renames, unchanged.syncs,
+        progress.metadata_writes, progress.renames, progress.syncs,
+    );
+    assert_eq!(
+        (progress.metadata_writes, progress.renames, progress.syncs),
+        (0, 0, 0)
+    );
+    assert_eq!(fs::read(&paths.json).unwrap(), saved);
+    drop(sink);
+    drop(task);
+    drop(registry);
+
+    let restarted = self::registry();
+    let disk = read_task(&paths.json).unwrap();
+    let expected = serde_json::to_value(&disk).unwrap();
+    restarted
+        .insert_rehydrated_task(disk, paths.clone(), false)
+        .unwrap();
+    let task = restarted.task(&task_id).unwrap();
+    let sink = TaskSink::new(&restarted, task.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&task.state.lock().unwrap().metadata).unwrap(),
+        expected
+    );
+    assert_eq!(sink.output_progress.last_seq, Some(0));
+    assert_eq!(sink.output_progress.stdout_len, 0);
+    assert_eq!(fs::metadata(&paths.stdout).unwrap().len(), 0);
+    assert_eq!(fs::read(&paths.json).unwrap(), saved);
+}
+
+#[test]
 fn exec_remote_bash_plain_output_has_no_per_record_durable_io() {
     use crate::bash_background::persistence::work_counts;
     let dir = tempfile::tempdir().unwrap();

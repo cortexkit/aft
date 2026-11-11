@@ -3100,6 +3100,14 @@ enum ReplaceSync {
     FileAndDirectory,
 }
 
+/// Kept only while a registry owns the task. The file is still compared on
+/// every request: another registry can replace or acknowledge its metadata.
+pub(super) struct MetadataSync {
+    directory: DirectoryIdentity,
+    content: Vec<u8>,
+    sync: ReplaceSync,
+}
+
 impl ReplaceSync {
     /// Remote tasks and local fallbacks of remote tasks resume from their
     /// metadata after a crash, so their records are written durably.
@@ -3154,27 +3162,67 @@ fn write_task_in_dir(
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    if sync_unchanged_metadata(dir, name, &content, sync) {
+    let order = super::registry::DbWriteOrder::lookup(&task.session_id, &task.task_id);
+    let mut memo = order.as_ref().map(|order| {
+        order
+            .metadata_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    let directory = memo.as_ref().and_then(|_| dir.identity().ok());
+    let already_synced = memo
+        .as_deref()
+        .and_then(Option::as_ref)
+        .is_some_and(|saved| {
+            Some(&saved.directory) == directory.as_ref()
+                && saved.content == content
+                && (saved.sync == ReplaceSync::FileAndDirectory || saved.sync == sync)
+        });
+    if sync_unchanged_metadata(dir, name, &content, sync, already_synced) {
+        if !already_synced && sync != ReplaceSync::None {
+            if let (Some(memo), Some(directory)) = (memo.as_deref_mut(), directory) {
+                *memo = Some(MetadataSync {
+                    directory,
+                    content,
+                    sync,
+                });
+            }
+        }
         return Ok(());
+    }
+    // A different replacement, or a failed shortcut sync, invalidates the old
+    // durability even if the replacement later fails after its rename.
+    if let Some(memo) = memo.as_deref_mut() {
+        *memo = None;
     }
     #[cfg(test)]
     work_counts::record_metadata_write();
     super::gc_memo::metadata_written(&dir.path().join(name));
     let result = atomic_replace(dir, name, &content, sync);
     super::gc_memo::metadata_written(&dir.path().join(name));
+    if result.is_ok() && sync != ReplaceSync::None {
+        if let (Some(memo), Some(directory)) = (memo.as_deref_mut(), directory) {
+            *memo = Some(MetadataSync {
+                directory,
+                content,
+                sync,
+            });
+        }
+    }
     result
 }
 
 /// Compare the file, not an in-memory cache: another registry can acknowledge
 /// a completed task through the same pinned directory. Equal bytes need no
-/// replacement, but a durable state write must still sync an earlier checkpoint
-/// whose rename may not have reached disk yet. A failed shortcut sync falls
-/// back to replacement with the same durability requirements.
+/// replacement or repeated syncs, but a durable state write must still sync an
+/// earlier checkpoint whose rename may not have reached disk yet. A failed
+/// shortcut sync falls back to replacement with the same durability requirements.
 fn sync_unchanged_metadata(
     dir: &PinnedDir,
     name: &OsStr,
     content: &[u8],
     sync: ReplaceSync,
+    already_synced: bool,
 ) -> bool {
     let Ok(mut file) = dir.open_file(name, sync != ReplaceSync::None) else {
         // Missing, unreadable or non-regular metadata can still be replaced.
@@ -3186,6 +3234,9 @@ fn sync_unchanged_metadata(
         || file.read(&mut [0]).ok() != Some(0)
     {
         return false;
+    }
+    if already_synced {
+        return true;
     }
     if sync != ReplaceSync::None && sync_task_file(&file).is_err() {
         return false;

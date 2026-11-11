@@ -1810,6 +1810,9 @@ pub(crate) struct DbWriteOrder {
     /// the count while it holds `state`, then writes only if the count has
     /// not moved since (see [`BgTaskRegistry::persist_task_checkpoint`]).
     json_writes: Mutex<u64>,
+    /// Durability already completed for the current metadata bytes. Shared by
+    /// all registries holding this task, including direct acknowledgement writes.
+    pub(super) metadata_sync: Mutex<Option<super::persistence::MetadataSync>>,
     #[cfg(test)]
     before_fenced_change: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -1834,7 +1837,7 @@ fn db_write_orders() -> &'static Mutex<HashMap<DbWriteOrderKey, std::sync::Weak<
 impl DbWriteOrder {
     /// The shared write order for a task, created on first use. Entries whose
     /// tasks are all gone are swept as the map grows.
-    fn for_task(session_id: &str, task_id: &str) -> Arc<Self> {
+    pub(super) fn for_task(session_id: &str, task_id: &str) -> Arc<Self> {
         let mut orders = db_write_orders()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1850,7 +1853,7 @@ impl DbWriteOrder {
         order
     }
 
-    fn lookup(session_id: &str, task_id: &str) -> Option<Arc<Self>> {
+    pub(super) fn lookup(session_id: &str, task_id: &str) -> Option<Arc<Self>> {
         db_write_orders()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
