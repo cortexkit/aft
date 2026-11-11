@@ -14,7 +14,6 @@
 //! The view names paths relative to its root with `/` separators; the lanes
 //! work with absolute paths, joined to the view's root.
 
-use crate::context::AppContext;
 use crate::semantic_index::{SemanticIndex, SemanticResult};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
