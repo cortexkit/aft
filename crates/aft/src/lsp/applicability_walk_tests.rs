@@ -798,7 +798,10 @@ fn applicability_walk_running_burst_has_one_follow_up_that_sees_new_marker() {
                     let attempt = scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let result = scan(&root, &config);
                     if attempt == 0 {
-                        assert!(!result.candidates.iter().any(|c| c.key.kind == ServerKind::Go));
+                        assert!(!result
+                            .candidates
+                            .iter()
+                            .any(|c| c.key.kind == ServerKind::Go));
                         started_tx.send(()).unwrap();
                         release_rx
                             .lock()
@@ -834,7 +837,10 @@ fn applicability_walk_running_burst_has_one_follow_up_that_sees_new_marker() {
         )
     });
     assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert!(caller.candidates.iter().any(|c| c.key.kind == ServerKind::Go));
+    assert!(caller
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
     assert_eq!(signature(&caller), signature(&waiter));
     assert_eq!(cache.metrics(&root).absorbed_triggers, 33);
     let next = cache
@@ -850,12 +856,22 @@ fn applicability_walk_running_burst_has_one_follow_up_that_sees_new_marker() {
 
     std::fs::remove_file(root.join("go.mod")).unwrap();
     cache.invalidate(&root, InvalidationCause::SelectionInput);
-    let after = cache.walk(&root, &config, Instant::now() + Duration::from_secs(5), || {
-        scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(scan(&root, &config))
-    }).unwrap();
+    let after = cache
+        .walk(
+            &root,
+            &config,
+            Instant::now() + Duration::from_secs(5),
+            || {
+                scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(scan(&root, &config))
+            },
+        )
+        .unwrap();
     assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 3);
-    assert!(!after.candidates.iter().any(|c| c.key.kind == ServerKind::Go));
+    assert!(!after
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
 }
 
 #[test]
@@ -872,10 +888,16 @@ fn applicability_walk_cold_and_watcher_install_join_queued_in_both_orders() {
             cache.invalidate(&root, InvalidationCause::WatcherInstalled);
         }
         std::thread::scope(|scope| {
-            let caller = scope.spawn(|| cache.walk(
-                &root, &config, Instant::now() + Duration::from_secs(10),
-                || Ok(scan(&root, &config)),
-            ).unwrap());
+            let caller = scope.spawn(|| {
+                cache
+                    .walk(
+                        &root,
+                        &config,
+                        Instant::now() + Duration::from_secs(10),
+                        || Ok(scan(&root, &config)),
+                    )
+                    .unwrap()
+            });
             assert!(cache.wait_for_queue_for_test(Instant::now() + Duration::from_secs(5)));
             if !watcher_first {
                 cache.invalidate(&root, InvalidationCause::WatcherInstalled);
@@ -887,7 +909,10 @@ fn applicability_walk_cold_and_watcher_install_join_queued_in_both_orders() {
             assert_eq!(canonical(&caller.join().unwrap()), expected);
         });
         assert_eq!(cache.metrics(&root).full_walks, 1);
-        assert_eq!(cache.metrics(&root).absorbed_triggers, if watcher_first { 33 } else { 34 });
+        assert_eq!(
+            cache.metrics(&root).absorbed_triggers,
+            if watcher_first { 33 } else { 34 }
+        );
     }
 }
 
@@ -899,18 +924,28 @@ fn applicability_walk_watcher_install_during_cold_scan_requires_follow_up() {
     let config = config(&root);
     let cache = ApplicabilityCache::default();
     let mut scans = 0;
-    let result = cache.walk(&root, &config, Instant::now() + Duration::from_secs(5), || {
-        scans += 1;
-        let walk = scan(&root, &config);
-        if scans == 1 {
-            // The watcher gap includes a marker written after the walk read it.
-            std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
-            cache.invalidate(&root, InvalidationCause::WatcherInstalled);
-        }
-        Ok(walk)
-    }).unwrap();
+    let result = cache
+        .walk(
+            &root,
+            &config,
+            Instant::now() + Duration::from_secs(5),
+            || {
+                scans += 1;
+                let walk = scan(&root, &config);
+                if scans == 1 {
+                    // The watcher gap includes a marker written after the walk read it.
+                    std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
+                    cache.invalidate(&root, InvalidationCause::WatcherInstalled);
+                }
+                Ok(walk)
+            },
+        )
+        .unwrap();
     assert_eq!(scans, 2);
-    assert!(result.candidates.iter().any(|c| c.key.kind == ServerKind::Go));
+    assert!(result
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
 }
 
 #[test]
@@ -921,20 +956,30 @@ fn applicability_walk_trigger_during_follow_up_is_not_lost() {
     let config = config(&root);
     let cache = ApplicabilityCache::default();
     let mut scans = 0;
-    let result = cache.walk(&root, &config, Instant::now() + Duration::from_secs(5), || {
-        scans += 1;
-        let walk = scan(&root, &config);
-        if scans == 1 {
-            std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
-            cache.invalidate(&root, InvalidationCause::SelectionInput);
-        } else if scans == 2 {
-            std::fs::remove_file(root.join("go.mod")).unwrap();
-            cache.invalidate(&root, InvalidationCause::SelectionInput);
-        }
-        Ok(walk)
-    }).unwrap();
+    let result = cache
+        .walk(
+            &root,
+            &config,
+            Instant::now() + Duration::from_secs(5),
+            || {
+                scans += 1;
+                let walk = scan(&root, &config);
+                if scans == 1 {
+                    std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
+                    cache.invalidate(&root, InvalidationCause::SelectionInput);
+                } else if scans == 2 {
+                    std::fs::remove_file(root.join("go.mod")).unwrap();
+                    cache.invalidate(&root, InvalidationCause::SelectionInput);
+                }
+                Ok(walk)
+            },
+        )
+        .unwrap();
     assert_eq!(scans, 3);
-    assert!(!result.candidates.iter().any(|c| c.key.kind == ServerKind::Go));
+    assert!(!result
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
 }
 
 #[test]
@@ -2039,9 +2084,16 @@ fn applicability_walk_marker_ignore_burst_measurement() {
     let (temp, config) = cost_fixture(20, 50);
     let root = crate::inspect::job::canonicalize_normalized(temp.path());
     let cache = ApplicabilityCache::default();
-    let walk = || cache.walk(&root, &config, Instant::now() + Duration::from_secs(30), || {
-        Ok(scan(&root, &config))
-    }).unwrap();
+    let walk = || {
+        cache
+            .walk(
+                &root,
+                &config,
+                Instant::now() + Duration::from_secs(30),
+                || Ok(scan(&root, &config)),
+            )
+            .unwrap()
+    };
     walk();
     let before = cache.metrics(&root);
     let wall = Instant::now();
@@ -2057,12 +2109,20 @@ fn applicability_walk_marker_ignore_burst_measurement() {
         });
         for group in 0..16 {
             for event in 0..4 {
-                let path = root.join(if event % 2 == 0 { "go.mod" } else { ".gitignore" });
-                std::fs::write(&path, if event % 2 == 0 {
-                    format!("module example.test/app{group}\n")
+                let path = root.join(if event % 2 == 0 {
+                    "go.mod"
                 } else {
-                    format!("# burst {group}/{event}\n")
-                }).unwrap();
+                    ".gitignore"
+                });
+                std::fs::write(
+                    &path,
+                    if event % 2 == 0 {
+                        format!("module example.test/app{group}\n")
+                    } else {
+                        format!("# burst {group}/{event}\n")
+                    },
+                )
+                .unwrap();
                 cache.invalidate_batch(&root, &[path], true);
                 tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(10));
@@ -2074,10 +2134,12 @@ fn applicability_walk_marker_ignore_burst_measurement() {
     });
     let after = cache.metrics(&root);
     assert_eq!(canonical(&last), canonical(&scan(&root, &config)));
-    println!("marker_ignore_burst events=64 files=1000 full_walks={} full_walk_micros={} wall_micros={}",
+    println!(
+        "marker_ignore_burst events=64 files=1000 full_walks={} full_walk_micros={} wall_micros={}",
         after.full_walks - before.full_walks,
         after.full_walk_micros - before.full_walk_micros,
-        wall.elapsed().as_micros());
+        wall.elapsed().as_micros()
+    );
 }
 
 /// A fresh walk counts every directory it enters as well as every file, and

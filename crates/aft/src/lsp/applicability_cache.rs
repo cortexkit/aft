@@ -872,97 +872,105 @@ impl ApplicabilityCache {
                 return Err(ApplicabilityResolutionError::RequestDeadline { root: root.into() });
             };
             loop {
-            #[cfg(test)]
-            self.note_queue_for_test();
-            // Reserve the flight before settling. Invalidations in this fixed,
-            // bounded window join the queued scan rather than invalidate it.
-            std::thread::sleep(WALK_SETTLE.min(deadline.saturating_duration_since(Instant::now())));
-            let mut state = flight.state.lock();
-            if Instant::now() >= deadline {
-                return Err(ApplicabilityResolutionError::RequestDeadline { root: root.into() });
-            }
-            let generation = state.generation;
-            let absorbed_triggers = std::mem::take(&mut state.pending_triggers);
-            let cause = state.cause.take().map_or("cold_or_config", InvalidationCause::label);
-            drop(state);
-            let start = Instant::now();
-            let capture = Capture::start(root);
-            observe_ancestor_ignores(root);
-            let root_walk_number = {
-                let mut metrics = self.metrics.lock();
-                let metrics = metrics.entry(root.into()).or_default();
-                metrics.misses += 1;
-                metrics.full_walks += 1;
-                metrics.full_walks
-            };
-            let result = scan();
-            let elapsed = start.elapsed();
-            let (dependencies, inputs, input_identities) = capture.finish();
-            {
-                let mut metrics = self.metrics.lock();
-                let metrics = metrics.entry(root.into()).or_default();
-                metrics.full_walk_micros += elapsed.as_micros() as u64;
-                metrics.dependency_count = inputs.len();
-                metrics.absorbed_triggers += absorbed_triggers;
-            }
-            crate::slog_info!(
+                #[cfg(test)]
+                self.note_queue_for_test();
+                // Reserve the flight before settling. Invalidations in this fixed,
+                // bounded window join the queued scan rather than invalidate it.
+                std::thread::sleep(
+                    WALK_SETTLE.min(deadline.saturating_duration_since(Instant::now())),
+                );
+                let mut state = flight.state.lock();
+                if Instant::now() >= deadline {
+                    return Err(ApplicabilityResolutionError::RequestDeadline {
+                        root: root.into(),
+                    });
+                }
+                let generation = state.generation;
+                let absorbed_triggers = std::mem::take(&mut state.pending_triggers);
+                let cause = state
+                    .cause
+                    .take()
+                    .map_or("cold_or_config", InvalidationCause::label);
+                drop(state);
+                let start = Instant::now();
+                let capture = Capture::start(root);
+                observe_ancestor_ignores(root);
+                let root_walk_number = {
+                    let mut metrics = self.metrics.lock();
+                    let metrics = metrics.entry(root.into()).or_default();
+                    metrics.misses += 1;
+                    metrics.full_walks += 1;
+                    metrics.full_walks
+                };
+                let result = scan();
+                let elapsed = start.elapsed();
+                let (dependencies, inputs, input_identities) = capture.finish();
+                {
+                    let mut metrics = self.metrics.lock();
+                    let metrics = metrics.entry(root.into()).or_default();
+                    metrics.full_walk_micros += elapsed.as_micros() as u64;
+                    metrics.dependency_count = inputs.len();
+                    metrics.absorbed_triggers += absorbed_triggers;
+                }
+                crate::slog_info!(
                 "LSP applicability full walk root={} cause={} root_walk_number={} duration_micros={} dependencies={} success={} absorbed_triggers={}",
                 root.display(), cause, root_walk_number, elapsed.as_micros(), inputs.len(), result.is_ok(), absorbed_triggers
             );
-            let input_dirs = Arc::new(input_directories(
-                &crate::inspect::job::normalize_path(root),
-                &inputs,
-            ));
-            let mut state = flight.state.lock();
-            // Entry-limit failures throttle retries even if watcher events
-            // arrived during the scan. They never certify applicability.
-            if let Err(error @ ApplicabilityResolutionError::EntryLimitReached { entries, .. }) =
-                &result
-            {
-                let backoff = state
-                    .incomplete
-                    .as_ref()
-                    .map_or(INITIAL_INCOMPLETE_BACKOFF, |previous| {
-                        (previous.backoff * 2).min(MAX_INCOMPLETE_BACKOFF)
+                let input_dirs = Arc::new(input_directories(
+                    &crate::inspect::job::normalize_path(root),
+                    &inputs,
+                ));
+                let mut state = flight.state.lock();
+                // Entry-limit failures throttle retries even if watcher events
+                // arrived during the scan. They never certify applicability.
+                if let Err(
+                    error @ ApplicabilityResolutionError::EntryLimitReached { entries, .. },
+                ) = &result
+                {
+                    let backoff = state
+                        .incomplete
+                        .as_ref()
+                        .map_or(INITIAL_INCOMPLETE_BACKOFF, |previous| {
+                            (previous.backoff * 2).min(MAX_INCOMPLETE_BACKOFF)
+                        });
+                    // Frequent log or database writes must not shorten the delay.
+                    // Only a completed walk clears the failure's retry history.
+                    state.incomplete = Some(IncompleteWalk {
+                        error: error.clone(),
+                        retry_at: retry_clock() + backoff,
+                        backoff,
                     });
-                // Frequent log or database writes must not shorten the delay.
-                // Only a completed walk clears the failure's retry history.
-                state.incomplete = Some(IncompleteWalk {
-                    error: error.clone(),
-                    retry_at: retry_clock() + backoff,
-                    backoff,
-                });
-                crate::slog_warn!(
+                    crate::slog_warn!(
                     "language-server applicability walk incomplete: root={} entries={} retry_in_seconds={}",
                     root.display(), entries, backoff.as_secs()
                 );
-            } else if let Ok(walk) = &result {
-                state.incomplete = None;
-                // Only unchanged complete scans become applicability snapshots.
-                if state.generation == generation && unchanged(&dependencies) {
-                    state.input_dirs = input_dirs;
-                    state.config = Some(Arc::new(config.clone()));
-                    state.absorbed_entries = 0;
-                    state.result = Some(walk.clone());
-                    state.dependencies = dependencies;
-                    state.inputs = inputs;
-                    state.input_identities = input_identities;
+                } else if let Ok(walk) = &result {
+                    state.incomplete = None;
+                    // Only unchanged complete scans become applicability snapshots.
+                    if state.generation == generation && unchanged(&dependencies) {
+                        state.input_dirs = input_dirs;
+                        state.config = Some(Arc::new(config.clone()));
+                        state.absorbed_entries = 0;
+                        state.result = Some(walk.clone());
+                        state.dependencies = dependencies;
+                        state.inputs = inputs;
+                        state.input_identities = input_identities;
+                    }
                 }
-            }
-            if result.is_ok() && state.generation != generation {
-                // All triggers received during this scan share one next scan.
-                // Its generation is captured only after settling, so none of
-                // their filesystem changes can be certified by the old result.
+                if result.is_ok() && state.generation != generation {
+                    // All triggers received during this scan share one next scan.
+                    // Its generation is captured only after settling, so none of
+                    // their filesystem changes can be certified by the old result.
+                    drop(state);
+                    continue;
+                }
+                running.completion.lock().result = Some(result.clone());
+                // Clear the reservation while holding the invalidation lock. A
+                // trigger after this point belongs to a new flight, not this result.
+                state.running = None;
                 drop(state);
-                continue;
-            }
-            running.completion.lock().result = Some(result.clone());
-            // Clear the reservation while holding the invalidation lock. A
-            // trigger after this point belongs to a new flight, not this result.
-            state.running = None;
-            drop(state);
-            drop(guard);
-            return result;
+                drop(guard);
+                return result;
             }
         }
     }
