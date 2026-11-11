@@ -51,11 +51,19 @@ jobs:
           }
           "todos race: $failed of 5 runs failed"
 
+      - name: jq render diagnostics
+        if: always()
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          RUST_BACKTRACE: "1"
+        run: cargo test -p agent-file-tools --features test-hooks --lib -- gh_shim::worker_reads::tests::v20_native_json_aliases_and_jq_render_from_constrained_gets --exact --nocapture --test-threads=1
+
       # The fixture's own cargo and rust-analyzer must not inherit
       # CARGO_TARGET_DIR (CI scopes it to build steps), so pass the warm
       # target folder as a cargo argument instead of an environment variable.
       - name: rust-analyzer path test
-        if: always()
+        if: false
         shell: pwsh
         env:
           RUST_BACKTRACE: "1"
