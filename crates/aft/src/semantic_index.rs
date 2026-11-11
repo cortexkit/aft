@@ -15468,17 +15468,36 @@ public class Greeter {
 
     #[test]
     fn slow_backend_converges_without_being_marked_down() {
-        // The reporter's shape (2 s/item against a 25 s floor) scaled so the
-        // test exercises real HTTP deadlines in seconds, not minutes: a 64-item
-        // batch cannot fit the initial deadline, a 4-item batch can.
-        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(50));
-        let config = programmable_http_config(&server);
+        // A 3 s floor leaves a singleton 2.5 s of scheduling margin on loaded
+        // CI runners. Scale the per-item delay with it: a 64-item batch still
+        // takes 32 s against its initial 12 s deadline, while 4 items fit in
+        // the 3 s floor. The per-item latency EMA (exponential moving average)
+        // must raise the deadline to recover to 64.
+        // Keep the shared config's short deadlines for the never-answer test.
+        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(500));
+        let mut config = programmable_http_config(&server);
+        config.timeout_ms = 3_000;
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
 
-        for _ in 0..3 {
+        for _ in 0..2 {
             assert_eq!(model.embed(embedding_inputs(64)).unwrap().len(), 64);
         }
 
+        assert_eq!(model.adaptive_build_batch_size, config.max_batch_size);
+        assert!(
+            server.request_sizes().starts_with(&[64, 32, 16, 8, 4]),
+            "the initial deadline must force smaller batches: requests={:?}",
+            server.request_sizes(),
+        );
+        // Start at the recovered size and require the client to receive all
+        // rows; a timed-out server handler can still finish writing a response.
+        let requests_before_recovery = server.request_sizes().len();
+        assert_eq!(model.embed(embedding_inputs(64)).unwrap().len(), 64);
+        assert_eq!(
+            &server.request_sizes()[requests_before_recovery..],
+            &[64],
+            "the recovered 64-item request must complete without another downshift",
+        );
         assert_eq!(model.adaptive_build_batch_size, config.max_batch_size);
         assert!(
             server.completed_sizes().contains(&64),
