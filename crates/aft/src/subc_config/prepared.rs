@@ -131,8 +131,8 @@ impl PreparedBindConfig {
     pub(crate) fn sources(
         &self,
         config: &crate::config::Config,
-    ) -> crate::config_live::ConfigSources {
-        let mut sources = crate::config_live::ConfigSources::from_observed_paths(
+    ) -> crate::config_sources::ConfigSources {
+        let mut sources = crate::config_sources::ConfigSources::from_observed_paths(
             self.user_path.clone(),
             self.project_path.clone(),
             &self.tiers,
