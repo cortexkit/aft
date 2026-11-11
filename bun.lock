@@ -115,14 +115,6 @@
         "@earendil-works/pi-tui": "*",
         "typebox": "*",
       },
-      "unresolved": [
-        "@cortexkit/aft-darwin-arm64",
-        "@cortexkit/aft-darwin-x64",
-        "@cortexkit/aft-linux-arm64",
-        "@cortexkit/aft-linux-x64",
-        "@cortexkit/aft-win32-arm64",
-        "@cortexkit/aft-win32-x64",
-      ],
     },
     "tests/pi-rpc": {
       "name": "@cortexkit/aft-pi-rpc-e2e",
@@ -286,23 +278,11 @@
 
     "@cortexkit/aft-bridge": ["@cortexkit/aft-bridge@workspace:packages/aft-bridge"],
 
-    "@cortexkit/aft-darwin-arm64": ["@cortexkit/aft-darwin-arm64@0.64.0", "", { "os": "darwin", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-7mQVtczzdrimk6ftgyQKxtrYMJKTBJhhCmbtUpUEeGrPKDvuY3Fp8Ye3xsqbGmdhVuQJa6ymI39UcEwxugjgRg=="],
-
-    "@cortexkit/aft-darwin-x64": ["@cortexkit/aft-darwin-x64@0.64.0", "", { "os": "darwin", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-8P308p2yfHJvZzTKT9O5H307N/iUZtVV86/NsJHn23OWZc+J9e9hlzXchZawbMjIztFBikGF3NAgkTSwk+ajPA=="],
-
-    "@cortexkit/aft-linux-arm64": ["@cortexkit/aft-linux-arm64@0.64.0", "", { "os": "linux", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-uc9+NMS5K0o41vXREcNI0FFepMiY1de4WnsIWy/4SHg/XWwyPcllMATH1KedWalK/lbkoJBuo45FH3XEViuGBA=="],
-
-    "@cortexkit/aft-linux-x64": ["@cortexkit/aft-linux-x64@0.64.0", "", { "os": "linux", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-PwHrqOd40gvMP/DI8Bf/QNoZqkLvwken9Bwkwi17MfA6izFEY4bzdt28IbgvHYT+E2QAwpmgZvSJNIJuxOFEDA=="],
-
     "@cortexkit/aft-opencode": ["@cortexkit/aft-opencode@workspace:packages/opencode-plugin"],
 
     "@cortexkit/aft-pi": ["@cortexkit/aft-pi@workspace:packages/pi-plugin"],
 
     "@cortexkit/aft-pi-rpc-e2e": ["@cortexkit/aft-pi-rpc-e2e@workspace:tests/pi-rpc"],
-
-    "@cortexkit/aft-win32-arm64": ["@cortexkit/aft-win32-arm64@0.64.0", "", { "os": "win32", "cpu": "arm64", "bin": { "aft": "bin/aft.exe" } }, "sha512-GysPz0wyajR1/pH/pqAJ1DmT+N/HNeRznX1dXuqWDIDi2vOkaprG6LI7Js5Zb+IZbsyNgBHSC89ha210VLWSqg=="],
-
-    "@cortexkit/aft-win32-x64": ["@cortexkit/aft-win32-x64@0.64.0", "", { "os": "win32", "cpu": "x64", "bin": { "aft": "bin/aft.exe" } }, "sha512-hMTV8OFdbdpj+8mkey/EaDjChiyCPUMdagU7mJNi01Vm91t3ZTGz3q3WjQTVDP8o5JECDqevXW0e9LB8Ru3iaA=="],
 
     "@cortexkit/subc-client": ["@cortexkit/subc-client@0.21.2", "", {}, "sha512-xQLfwFBOigFRF1VMgta7Dr/640H34EHexRtFLDkH42yAAMvtXJFmQ4bsjin6CDmfXiKeItsuQqjYFRMEZs4Aaw=="],
 
