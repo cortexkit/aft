@@ -213,8 +213,7 @@ pub(crate) mod tests {
             crate::db::open(&storage.join("aft.db")).unwrap(),
         ));
         ctx.set_db(db.clone());
-        ctx.bash_background()
-            .set_harness(crate::harness::Harness::Runner);
+        ctx.set_harness(crate::harness::Harness::Runner);
         ctx.bash_background().set_db_pool(db);
         ctx
     }
