@@ -3012,13 +3012,12 @@ fn search_candidate_file(
                     let needle = &literal.needle;
                     if !needle.contains(&b'\n') {
                         let haystack: &[u8] = content;
-                        let finder = literal.finder();
+                        let finder = literal.finder(haystack);
                         let mut start = 0;
                         while start <= haystack.len() {
-                            let Some(position) = finder.find(&haystack[start..]) else {
+                            let Some(offset) = finder.find_from(start) else {
                                 break;
                             };
-                            let offset = start + position;
                             start = match visit(offset, offset + needle.len()) {
                                 MatchVisit::Stop => break,
                                 MatchVisit::SameLine => offset + 1,
@@ -3113,13 +3112,12 @@ fn matching_lines_in_content_at(
             let needle = &literal.needle;
             if !needle.contains(&b'\n') {
                 let haystack: &[u8] = content;
-                let finder = literal.finder();
+                let finder = literal.finder(haystack);
                 let mut start = 0;
                 while start <= haystack.len() {
-                    let Some(position) = finder.find(&haystack[start..]) else {
+                    let Some(offset) = finder.find_from(start) else {
                         break;
                     };
-                    let offset = start + position;
                     start = record(offset, offset + needle.len())
                         .map_or(offset + 1, |next_line_start| {
                             next_line_start.max(offset + 1)

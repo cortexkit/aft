@@ -2594,10 +2594,10 @@ fn search_literal_in_text<'a>(
 
     let content_bytes = content;
     let haystack = content_bytes;
-    let finder = literal.finder();
+    let finder = literal.finder(haystack);
     let mut start = 0usize;
     while start <= haystack.len() {
-        let Some(position) = finder.find(&haystack[start..]) else {
+        let Some(offset) = finder.find_from(start) else {
             break;
         };
         if deadline.is_some_and(|deadline| Instant::now() >= deadline)
@@ -2607,7 +2607,6 @@ fn search_literal_in_text<'a>(
             break;
         }
 
-        let offset = start + position;
         // Grep reports one match per line. Once a line is recorded, resume at
         // the next line start instead of scanning its remaining occurrences.
         if offset < *reported_line_end {

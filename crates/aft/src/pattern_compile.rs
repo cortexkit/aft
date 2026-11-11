@@ -18,44 +18,208 @@ pub struct LiteralSearch {
     pub case_insensitive_ascii: bool,
 }
 
-pub(crate) enum LiteralFinder<'a> {
-    Exact(memchr::memmem::Finder<'a>),
-    Folded(&'a [u8]),
+pub(crate) struct LiteralFinder<'a> {
+    finder: memchr::memmem::Finder<'a>,
+    haystack: &'a [u8],
+    folded: Option<std::cell::RefCell<FoldedWindow>>,
+}
+
+struct FoldedWindow {
+    start: usize,
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    bytes_folded: usize,
 }
 
 impl LiteralSearch {
-    pub(crate) fn finder(&self) -> LiteralFinder<'_> {
-        if self.case_insensitive_ascii {
-            // ASCII-only folding is the literal path's contract. Inspect
-            // candidate starts without making a lowercase haystack copy.
-            LiteralFinder::Folded(&self.needle)
-        } else {
-            LiteralFinder::Exact(memchr::memmem::Finder::new(&self.needle))
+    pub(crate) fn finder<'a>(&'a self, haystack: &'a [u8]) -> LiteralFinder<'a> {
+        LiteralFinder {
+            finder: memchr::memmem::Finder::new(&self.needle),
+            haystack,
+            folded: self.case_insensitive_ascii.then(|| {
+                std::cell::RefCell::new(FoldedWindow {
+                    start: 0,
+                    bytes: Vec::new(),
+                    #[cfg(test)]
+                    bytes_folded: 0,
+                })
+            }),
         }
     }
 }
 
 impl LiteralFinder<'_> {
-    pub(crate) fn find(&self, content: &[u8]) -> Option<usize> {
-        match self {
-            Self::Exact(finder) => finder.find(content),
-            Self::Folded(needle) => {
-                if needle.is_empty() {
-                    return Some(0);
+    const FOLDED_WINDOW_BYTES: usize = 4 << 20;
+
+    /// Absolute match offset at or after `start`, with ASCII-only folding.
+    /// Search bounded lowercase windows with memmem instead of comparing the
+    /// whole needle at every candidate byte. This avoids quadratic repeated-
+    /// prefix behavior without making a whole-haystack lowercase copy.
+    pub(crate) fn find_from(&self, start: usize) -> Option<usize> {
+        let content = self.haystack.get(start..)?;
+        let Some(folded) = &self.folded else {
+            return self.finder.find(content).map(|offset| start + offset);
+        };
+        let needle_len = self.finder.needle().len();
+        if needle_len == 0 {
+            return Some(start);
+        }
+        if needle_len > content.len() {
+            return None;
+        }
+        let mut window = folded.borrow_mut();
+        let mut cursor = start;
+        loop {
+            let cached_end = window.start + window.bytes.len();
+            if cursor < window.start
+                || cursor >= cached_end
+                || (cached_end < self.haystack.len() && needle_len > cached_end - cursor)
+            {
+                // At least half the window is new input after preserving the
+                // needle-length overlap. Every input byte is folded at most
+                // twice in a forward scan, even when the needle is very long.
+                let size = Self::FOLDED_WINDOW_BYTES.max(needle_len.saturating_mul(2));
+                let end = cursor.saturating_add(size).min(self.haystack.len());
+                window.start = cursor;
+                window.bytes.clear();
+                window.bytes.extend_from_slice(&self.haystack[cursor..end]);
+                window.bytes.make_ascii_lowercase();
+                #[cfg(test)]
+                {
+                    window.bytes_folded += end - cursor;
                 }
-                let first = needle[0];
-                memchr::memchr2_iter(
-                    first.to_ascii_lowercase(),
-                    first.to_ascii_uppercase(),
-                    content,
-                )
-                .find(|&start| {
-                    content
-                        .get(start..start + needle.len())
-                        .is_some_and(|window| window.eq_ignore_ascii_case(needle))
-                })
+            }
+            let offset = cursor - window.start;
+            if let Some(found) = self.finder.find(&window.bytes[offset..]) {
+                return Some(cursor + found);
+            }
+            let end = window.start + window.bytes.len();
+            if end == self.haystack.len() {
+                return None;
+            }
+            cursor = end - (needle_len - 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod literal_finder_tests {
+    use super::*;
+
+    fn old_find(content: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+        memchr::memmem::find(content.get(start..)?, needle).map(|offset| start + offset)
+    }
+
+    #[test]
+    fn folded_windows_match_old_whole_lowercase_on_random_inputs() {
+        let mut seed = 0x5c8f_7241_b0ad_9613u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        let alphabet = b"aAbBcCxyZ!\0\n\xe2\xff";
+        for case in 0..1000 {
+            let length = next() % 1024;
+            let needle_length = next() % 40;
+            let mut content = (0..length)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect::<Vec<_>>();
+            let needle = (0..needle_length)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect::<Vec<_>>();
+            if case % 3 == 0 && needle_length <= length {
+                let position = next() % (length - needle_length + 1);
+                content[position..position + needle_length].copy_from_slice(&needle);
+            }
+            for folded in [false, true] {
+                let literal = LiteralSearch {
+                    needle: if folded {
+                        needle.to_ascii_lowercase()
+                    } else {
+                        needle.clone()
+                    },
+                    case_insensitive_ascii: folded,
+                };
+                let reference = if folded {
+                    content.to_ascii_lowercase()
+                } else {
+                    content.clone()
+                };
+                let finder = literal.finder(&content);
+                for start in [0, 1, length / 2, length, length + 1, 0] {
+                    assert_eq!(
+                        finder.find_from(start),
+                        old_find(&reference, &literal.needle, start),
+                        "case={case} folded={folded} start={start}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn folded_windows_keep_matches_that_cross_a_window_boundary() {
+        let needle = [vec![b'a'; 1000], vec![b'b']].concat();
+        let mut content = vec![b'x'; LiteralFinder::FOLDED_WINDOW_BYTES + 2000];
+        let position = LiteralFinder::FOLDED_WINDOW_BYTES - 500;
+        content[position..position + needle.len()].copy_from_slice(&needle.to_ascii_uppercase());
+        let literal = LiteralSearch {
+            needle,
+            case_insensitive_ascii: true,
+        };
+        let finder = literal.finder(&content);
+        let reference = content.to_ascii_lowercase();
+        for start in [0, position, position + 1, 0] {
+            assert_eq!(
+                finder.find_from(start),
+                old_find(&reference, &literal.needle, start)
+            );
+        }
+    }
+
+    #[test]
+    fn folded_windows_bound_work_for_adversarial_needle_lengths() {
+        for motif in [b"a".as_slice(), b"ab".as_slice()] {
+            let content = motif.repeat((8 << 20) / motif.len());
+            let reference = content.to_ascii_lowercase();
+            for length in [7, 127, 1001, 4097, (2 << 20) + 1] {
+                let mut needle = motif.repeat(length / motif.len() + 1);
+                needle.resize(length, b'a');
+                needle[length - 1] = b'c';
+                let literal = LiteralSearch {
+                    needle,
+                    case_insensitive_ascii: true,
+                };
+                let finder = literal.finder(&content);
+                assert_eq!(
+                    finder.find_from(0),
+                    old_find(&reference, &literal.needle, 0)
+                );
+                assert!(
+                    finder.folded.as_ref().unwrap().borrow().bytes_folded <= 2 * content.len(),
+                    "motif={motif:?}, length={length}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folded_windows_reuse_lowercase_bytes_between_matched_lines() {
+        let content = b"nEeDlE\n".repeat(10000);
+        let literal = LiteralSearch {
+            needle: b"needle".to_vec(),
+            case_insensitive_ascii: true,
+        };
+        let finder = literal.finder(&content);
+        for line in 0..10000 {
+            assert_eq!(finder.find_from(line * 7), Some(line * 7));
+        }
+        assert_eq!(
+            finder.folded.as_ref().unwrap().borrow().bytes_folded,
+            content.len()
+        );
     }
 }
 
