@@ -308,7 +308,7 @@ fn parent_loading_child_walks_until_ready_then_returns_to_indexed_grep_and_glob(
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|file| file.as_str().unwrap().to_string())
+                    .map(|file| file.as_str().unwrap().replace('\\', "/"))
                     .collect(),
             )
         };
