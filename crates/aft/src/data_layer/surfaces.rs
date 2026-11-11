@@ -405,7 +405,11 @@ pub(crate) fn disclose_index_gaps(
     let mut lines = Vec::new();
     for view in &views {
         for (path, reason) in view.current_state().skipped_directories() {
-            let path = view.root().join(String::from_utf8_lossy(path).as_ref());
+            let path = if path.is_empty() {
+                view.root().to_path_buf()
+            } else {
+                view.root().join(String::from_utf8_lossy(path).as_ref())
+            };
             if !roots
                 .iter()
                 .any(|scope| path.starts_with(scope) || scope.starts_with(&path))
