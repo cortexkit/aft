@@ -37,6 +37,8 @@ On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool sh
 
 `bash.memory_limit_mib` optionally caps aggregate memory for each local command, including foreground, background, and PTY commands. It is off by default; set a positive integer in MiB (for example, `4096` for 4 GiB; maximum `4294967295`) in user config. Projects may tighten the cap, never raise or remove it. Changes affect future commands; there is no per-call override. Remote `runon` jobs use the build server's own limits and are not covered.
 
+On Linux, local agent shells always raise their `oom_score_adj` to `1000` before running the command, so the kernel prefers them and their descendants over AFT and desktop processes during an out-of-memory event; this has no setting and does not change AFT's own value. If the adjustment cannot be verified, the command still runs, AFT logs one warning per process, and the `bash_oom_priority_failures` health counter records the failures.
+
 - **Linux:** cgroup v2 `memory.max` (using a delegated transient systemd user scope when needed); if unavailable, the result explicitly names the process-group RSS watcher fallback.
 - **Windows:** a job-object aggregate memory limit refuses allocations; AFT stops the job when a limit notification or peak accounting confirms the cap was hit.
 - **macOS:** a physical-footprint process-group watcher samples every 500 ms. Fast allocations can overshoot for a fraction of a second, and processes that leave the group are not counted. The Linux watcher has the same limits. Watcher scans are bounded to 4096 processes and stop the command explicitly if accounting cannot complete.

@@ -168,6 +168,25 @@ pub(crate) fn spawn_pty_for_command(
         } else {
             shell_path.as_os_str()
         };
+        // PTY commands do not use PAYLOAD_WRAPPER. Adjust the outer shell before
+        // it execs the existing secret/memory gate or the requested user shell.
+        #[cfg(target_os = "linux")]
+        let program = {
+            let mut wrapped = vec![
+                OsString::from("-c"),
+                OsString::from(concat!(
+                    super::process::shell_oom_priority!("__aft_oom_failure=$1\nshift\n"),
+                    "exec \"$@\""
+                )),
+                OsString::from("aft-oom-priority"),
+                super::process::oom_priority_marker(spawn_plan.temp_dir(), &paths.io_dir)
+                    .into_os_string(),
+                program.to_owned(),
+            ];
+            wrapped.append(&mut args);
+            args = wrapped;
+            std::ffi::OsStr::new("/bin/sh")
+        };
         try_spawn_pty(
             registry,
             spawn_plan,

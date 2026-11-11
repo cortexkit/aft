@@ -4317,6 +4317,11 @@ fn assemble_health_report(
         );
         metrics.insert("bash_pty_spawn".to_string(), spawn["pty_backend"].clone());
     }
+    #[cfg(target_os = "linux")]
+    metrics.insert(
+        "bash_oom_priority_failures".to_string(),
+        crate::bash_background::process::oom_priority_failures().into(),
+    );
     metrics.insert(
         "cold_build_limiter".to_string(),
         render_cold_build_limiter_census(crate::cold_build_limiter::global_limiter().census()),

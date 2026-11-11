@@ -3272,6 +3272,22 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         #[cfg(unix)]
         self.stop_secret_proxy(&task.task_id);
+        #[cfg(target_os = "linux")]
+        {
+            let marker = task.lock_state().ok().and_then(|state| {
+                (state.metadata.remote.is_none() || state.metadata.local_fallback_started).then(
+                    || {
+                        super::process::oom_priority_marker(
+                            state.metadata.sandbox_temp_dir.as_deref(),
+                            &task.paths.io_dir,
+                        )
+                    },
+                )
+            });
+            if let Some(marker) = marker {
+                super::process::observe_oom_priority_failure(&marker);
+            }
+        }
         self.settle_memory_accounting(task)?;
         #[cfg(test)]
         {
@@ -18329,6 +18345,9 @@ fn spawn_detached_child(
                 LocalIdentityGate::Required => "wait-for-identity",
                 LocalIdentityGate::CommittedFallback => "",
             }),
+            #[cfg(target_os = "linux")]
+            super::process::oom_priority_marker(spawn_plan.temp_dir(), &paths.io_dir)
+                .into_os_string(),
         ];
         #[cfg(target_os = "linux")]
         let (executable, args) = if linux_scope && !memory_gated {
