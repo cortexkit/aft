@@ -31,6 +31,7 @@ struct Slice {
 }
 
 const SEMANTIC_MODULE_PREFIX: &str = "crates/aft/src/commands/semantic_search/";
+const SEARCH_STATE_PREFIX: &str = "crates/aft/src/search_state/";
 const ENGINE_FIXTURE_PREFIX: &str = "benchmarks/aft-search/engine-fixtures/";
 const ENGINE_TEST_PREFIX: &str = "crates/aft/tests/engine_";
 const RANKING_DIRECTORY: &str = "crates/aft/src/ranking";
@@ -512,11 +513,13 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
 
     let modules = constraint_paths(&root)
         .into_iter()
-        .filter(|path| path.starts_with(SEMANTIC_MODULE_PREFIX))
+        .filter(|path| {
+            path.starts_with(SEMANTIC_MODULE_PREFIX) || path.starts_with(SEARCH_STATE_PREFIX)
+        })
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        38,
+        41,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {
