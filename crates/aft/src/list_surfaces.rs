@@ -791,6 +791,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a recent-output prose preview, not a result list; limits bytes as well as lines so a single huge log line cannot bypass the preview budget; full task output remains on disk",
     },
     ExclusionEntry {
+        file: "commands/bash_watch/restart.rs",
+        enclosing_item: "watch_unknown",
+        location_or_primitive: "watch_unknown state.held.take() and state.wait.take()",
+        reason: "Option::take consuming the held-call identity and its wait before settling an unknown result; no list is cut",
+    },
+    ExclusionEntry {
         file: "cold_build_limiter/progress.rs",
         enclosing_item: "snapshot",
         location_or_primitive: "take(LIST_CAP)",
