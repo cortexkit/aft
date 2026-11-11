@@ -495,7 +495,7 @@ fn audit_runtime_built_unscanned_label_is_refused() {
             std::fs::read_to_string(f.root.path().join("result")).unwrap(),
             "22"
         );
-        assert_eq!(f.vault.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(f.vault.resolves.load(Ordering::SeqCst), 0);
         assert_eq!(f.vault.materials.load(Ordering::SeqCst), 0);
         assert!(f.seen.lock().unwrap().is_empty());
     });

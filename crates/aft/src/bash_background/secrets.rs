@@ -258,7 +258,9 @@ pub(crate) fn authorize(
         scanned_labels: labels.to_vec(),
         consent_context: crate::subc::current_secret_consent_context(),
         #[cfg(test)]
-        test_https_port: None,
+        test_https_port: TEST_HTTPS_PORT.with(std::cell::Cell::get),
+        #[cfg(test)]
+        approval_clock: None,
         origin: task.paths.task_id.clone(),
     })
     .map_err(|_| refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE))?;
@@ -423,6 +425,7 @@ fn native_roots() -> Result<Vec<u8>, ()> {
 
 #[cfg(test)]
 thread_local! {
+    static TEST_HTTPS_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
     static TEST_VAULT: std::cell::RefCell<Option<Arc<dyn SecretVault>>> = const { std::cell::RefCell::new(None) };
     #[cfg(unix)]
     static TEST_UPSTREAM: std::cell::RefCell<Option<rustls::ClientConfig>> = const { std::cell::RefCell::new(None) };

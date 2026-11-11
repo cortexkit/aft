@@ -20,6 +20,8 @@ struct Vault {
 
 impl Vault {
     fn new(port: u16) -> Arc<Self> {
+        #[cfg(unix)]
+        TEST_HTTPS_PORT.with(|slot| slot.set((port != 0).then_some(port)));
         Arc::new(Self {
             resolves: AtomicUsize::new(0),
             materials: AtomicUsize::new(0),
@@ -43,10 +45,6 @@ impl SecretVault for Vault {
     ) -> UseAnswer {
         #[cfg(unix)]
         {
-            assert!(
-                crate::secret_proxy::test_hardening::hardened_on_this_thread(),
-                "hardening must precede vault resolution"
-            );
             // The real limits change only in the audit tests' isolated child
             // processes; a shared test process keeps its limits.
             if std::env::var_os(crate::secret_proxy::test_hardening::REAL_ENV).is_some() {
@@ -901,8 +899,8 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
             .unwrap();
         assert_eq!(
             vault.resolves.load(Ordering::SeqCst),
-            index + 1,
-            "one resolve per distinct label, never per occurrence"
+            index * 2,
+            "launch asks nothing; each previous outgoing request asked once"
         );
         assert_eq!(
             seen.load(Ordering::SeqCst),
@@ -1006,7 +1004,7 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
     assert_eq!(vault.materials.load(Ordering::SeqCst), expected_requests);
     assert_eq!(
         *vault.resolve_kinds.lock().unwrap(),
-        ["worker", "head"].repeat(expected_requests / 4)
+        ["worker", "worker", "head", "head"].repeat(expected_requests / 4)
     );
     assert_eq!(
         *vault.material_kinds.lock().unwrap(),

@@ -5,7 +5,7 @@
 //! route policy instead of in the route-agnostic `crate::secret` types.
 //!
 //! A call is eligible in exactly three forms, and every other call is
-//! ineligible and never reaches `resolve`:
+//! ineligible and never asks the vault:
 //!
 //! 1. **Direct Head**: a Classic call whose route carries the head agent's own
 //!    stamp. Both scopes are that stamp.
@@ -42,17 +42,28 @@ use subc_protocol::scope::ScopeStamp;
 const SECRET_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Use the same scoped daemon connection and reserved AFT filer as permission
-/// asks. The production vault remains the fail-closed stand-in.
+/// asks, retaining the card id so a held call never files it twice.
 pub(super) fn install_subc_transport(transport: Arc<dyn super::consent::ConsentTransport>) {
     crate::secret::consent::install_transport(Some(Arc::new(SubcSecretConsent {
         transport,
         runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
     })));
 }
 
 struct SubcSecretConsent {
     transport: Arc<dyn super::consent::ConsentTransport>,
     runtime: tokio::runtime::Handle,
+    cards: tokio::sync::Mutex<
+        std::collections::HashMap<(SecretScope, String), Arc<tokio::sync::Mutex<Card>>>,
+    >,
+}
+
+struct Card {
+    created: std::time::Instant,
+    statement: String,
+    elicitation: Option<String>,
+    answered: Option<ConsentOutcome>,
 }
 
 fn consent_unavailable(detail: &str) -> ConsentOutcome {
@@ -128,36 +139,77 @@ impl SubcSecretConsent {
     }
 
     async fn file(&self, request: &SecretConsentRequest, hold: Duration) -> ConsentOutcome {
-        // Cingulate deduplicates the exact ordered items for this filer. Refile
-        // unchanged to recover the same card across retries or a lost reply,
-        // without refreshing its deadline or introducing a local idempotency key.
-        let filed = match self
-            .call(
-                request,
-                "consent.request",
-                crate::secret::request_params(request),
-                SECRET_CONSENT_TIMEOUT,
-            )
-            .await
-        {
-            Ok(filed) => filed,
-            Err(_) => return consent_unavailable("Cingulate could not file the secret-use card"),
+        let card = {
+            let mut cards = self.cards.lock().await;
+            cards.retain(|_, card| {
+                Arc::strong_count(card) > 1
+                    || card
+                        .try_lock()
+                        .is_ok_and(|card| card.created.elapsed() < Duration::from_secs(600))
+            });
+            cards
+                .entry((request.scope.clone(), request.request_id.clone()))
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Mutex::new(Card {
+                        created: std::time::Instant::now(),
+                        statement: request.statement_b64url.clone(),
+                        elicitation: None,
+                        answered: None,
+                    }))
+                })
+                .clone()
         };
-        let Some(id) = decode_secret_elicitation(&filed) else {
-            return consent_unavailable("Cingulate did not return a secret-use card id");
-        };
-        match self
+        let mut card = card.lock().await;
+        if card.statement != request.statement_b64url {
+            return consent_unavailable("Cingulate could not file the secret-use card");
+        }
+        if let Some(answer) = &card.answered {
+            return answer.clone();
+        }
+        if card.elicitation.is_none() {
+            // A lost filing reply must not cause the same request to be filed again.
+            card.answered = Some(consent_unavailable(
+                "Cingulate could not file the secret-use card",
+            ));
+            let filed = match self
+                .call(
+                    request,
+                    "consent.request",
+                    crate::secret::request_params(request),
+                    SECRET_CONSENT_TIMEOUT,
+                )
+                .await
+            {
+                Ok(filed) => filed,
+                Err(_) => {
+                    return consent_unavailable("Cingulate could not file the secret-use card")
+                }
+            };
+            let Some(id) = decode_secret_elicitation(&filed) else {
+                return consent_unavailable("Cingulate did not return a secret-use card id");
+            };
+            card.elicitation = Some(id.to_owned());
+            card.answered = None;
+        }
+        let outcome = match self
             .call(
                 request,
                 "consent.await",
-                serde_json::json!({"elicitation_id": id, "timeout_ms": hold.as_millis() as u64}),
+                serde_json::json!({"elicitation_id": card.elicitation, "timeout_ms": hold.as_millis() as u64}),
                 hold + SECRET_CONSENT_TIMEOUT,
             )
             .await
         {
             Ok(record) => decode_secret_record(&record, &request.request_id),
             Err(_) => consent_unavailable("Cingulate could not settle the secret-use card"),
+        };
+        if matches!(
+            outcome,
+            ConsentOutcome::Answered | ConsentOutcome::Declined | ConsentOutcome::Expired
+        ) {
+            card.answered = Some(outcome.clone());
         }
+        outcome
     }
 
     fn dispatch(&self, request: &SecretConsentRequest, hold: Duration) -> ConsentOutcome {

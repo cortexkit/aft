@@ -37,6 +37,7 @@ fn invalid() -> Value {
 pub(crate) struct State {
     pub opens: Vec<Value>,
     pub calls: usize,
+    pub params: Vec<Value>,
     pub connections: usize,
     pub hold_open: bool,
     pub hold_reply: bool,
@@ -45,8 +46,19 @@ pub(crate) struct State {
     pub setup_incomplete: bool,
     pub other_pending_in_scope: usize,
     pub other_pending_total: usize,
+    pub record: Option<Record>,
+    pub once: bool,
+    pub next_request: usize,
     approved: HashSet<PendingKey>,
     pub(super) pending: HashMap<PendingKey, Value>,
+}
+
+pub(crate) struct Record {
+    pub name: String,
+    pub host: String,
+    pub path: String,
+    pub location: String,
+    pub key: Vec<u8>,
 }
 
 impl State {
@@ -141,11 +153,14 @@ impl State {
         let matches = match &params.target {
             Target::ApiKey(target) => {
                 principal == "aft"
-                    && params.name == "key"
+                    && params.name == self.record.as_ref().map_or("key", |r| r.name.as_str())
                     && target.scheme == "https"
                     && target.port.unwrap_or(443) == 443
-                    && target.host == "x.test"
-                    && (target.path == "/repos/a" || target.path.starts_with("/repos/a/"))
+                    && target.host == self.record.as_ref().map_or("x.test", |r| r.host.as_str())
+                    && {
+                        let prefix = self.record.as_ref().map_or("/repos/a", |r| r.path.as_str());
+                        target.path == prefix || target.path.starts_with(&format!("{prefix}/"))
+                    }
             }
             Target::Login(_) => false,
         };
@@ -173,7 +188,17 @@ impl State {
             },
         );
         if covered {
-            return json!({"result":golden(3)});
+            if self.once {
+                self.approved.remove(&key);
+                self.pending.remove(&key);
+            }
+            let mut released = golden(3);
+            if let Some(record) = &self.record {
+                released["location"] = json!(record.location);
+                released["key_b64url"] =
+                    json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&record.key));
+            }
+            return json!({"result":released});
         }
         if self.setup_incomplete {
             return refusal("secret_setup_incomplete", "permanent");
@@ -194,7 +219,8 @@ impl State {
             return refusal("pending_limit", "transient");
         }
         let mut pending = golden(5);
-        pending["request_id"] = json!(format!("01HF7YAT{:018}", self.pending.len() + 1));
+        self.next_request += 1;
+        pending["request_id"] = json!(format!("01HF7YAT{:018}", self.next_request));
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let mut statement: Value = serde_json::from_slice(
             &engine
@@ -209,6 +235,11 @@ impl State {
             statement["durations"] = json!(["permanent"]);
         }
         statement["agent_id"] = json!(stamp.attributes.agent_id);
+        if let Some(record) = &self.record {
+            statement["secret"]["name"] = json!(record.name);
+            statement["use"] =
+                json!({"host":record.host, "path_prefix":record.path, "location":record.location});
+        }
         pending["statement_b64url"] = json!(engine.encode(serde_json::to_vec(&statement).unwrap()));
         self.pending.insert(key, pending.clone());
         json!({"result":pending})
@@ -362,7 +393,8 @@ impl FakeClaustrum {
                                     } else {
                                         assert_eq!(value["method"], "secret.use");
                                         let mut state = state.lock().unwrap();
-                                        state.calls += 1;
+                                         state.calls += 1;
+                                         state.params.push(value["params"].clone());
                                         if state.disconnect { break; }
                                         if state.hold_reply { continue; }
                                         let reply = state.serve(&principal, value["params"].clone());

@@ -23,6 +23,9 @@ pub(crate) fn install_connection_file(path: &std::path::Path) {
 
 pub(crate) fn for_current_command() -> Option<SubcSecretUseTransport> {
     let path = CONNECTION_FILE.read().ok()?.clone()?;
+    if !path.is_file() {
+        return None;
+    }
     let (_, session) = crate::subc::current_secret_consent_context()?;
     SubcSecretUseTransport::new(
         path,
@@ -31,7 +34,7 @@ pub(crate) fn for_current_command() -> Option<SubcSecretUseTransport> {
     )
 }
 
-/// A transport for a future request-addressed vault client. Construct it at call
+/// A request-addressed vault transport. Construct it at call
 /// time: a standalone process has no module identity and must not open as direct.
 /// One command owns one consumer connection; failed connections are discarded so
 /// a later request can reconnect after the daemon returns.

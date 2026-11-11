@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use super::{ApiKeyTarget, SecretConsentRequest, SecretScope, SecretVault, UseAnswer};
@@ -29,9 +30,13 @@ struct History {
     filed: Option<(String, u64)>,
     used_after_card: bool,
 }
-type Slot = tokio::sync::Mutex<History>;
-type SlotKey = (SecretScope, String);
-static SLOTS: LazyLock<Mutex<HashMap<SlotKey, Weak<Slot>>>> = LazyLock::new(Mutex::default);
+#[derive(Default)]
+struct Slot {
+    history: tokio::sync::Mutex<History>,
+    expires: AtomicU64,
+}
+type SlotKey = (String, String, u64, String);
+static SLOTS: LazyLock<Mutex<HashMap<SlotKey, Arc<Slot>>>> = LazyLock::new(Mutex::default);
 
 pub(crate) struct RequestSecrets {
     vault: Arc<dyn SecretVault>,
@@ -40,6 +45,7 @@ pub(crate) struct RequestSecrets {
     slots: Mutex<HashMap<String, Arc<Slot>>>,
     status: Mutex<BTreeMap<String, Vec<String>>>,
     clock: Arc<dyn ApprovalClock>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RequestSecrets {
@@ -55,6 +61,7 @@ impl RequestSecrets {
             slots: Mutex::default(),
             status: Mutex::default(),
             clock: Arc::new(WallClock),
+            active: Arc::default(),
         }
     }
 
@@ -69,13 +76,21 @@ impl RequestSecrets {
                 let mut slots = SLOTS
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                slots.retain(|_, slot| slot.strong_count() > 0);
-                let key = (self.scope.clone(), label.to_owned());
-                if let Some(slot) = slots.get(&key).and_then(Weak::upgrade) {
-                    return slot;
+                slots.retain(|_, slot| {
+                    Arc::strong_count(slot) > 1
+                        || slot.expires.load(Ordering::Acquire) > self.clock.now_ms()
+                });
+                let key = (
+                    self.scope.owner().into(),
+                    self.scope.reference().into(),
+                    self.scope.stamp().scope_epoch,
+                    label.to_owned(),
+                );
+                if let Some(slot) = slots.get(&key) {
+                    return slot.clone();
                 }
                 let slot = Arc::new(Slot::default());
-                slots.insert(key, Arc::downgrade(&slot));
+                slots.insert(key, slot.clone());
                 slot
             })
             .clone()
@@ -91,11 +106,31 @@ impl RequestSecrets {
             .collect()
     }
 
+    pub(crate) fn activity(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.active.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, clock: Option<Arc<dyn ApprovalClock>>) -> Self {
+        if let Some(clock) = clock {
+            self.clock = clock;
+        }
+        self
+    }
+
     pub(crate) async fn use_for_request(
         &self,
         label: &str,
         target: &ApiKeyTarget,
     ) -> Result<UseAnswer, ()> {
+        struct Active(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let _active = Active(self.active.clone());
         let result = tokio::select! {
             result = self.use_serial(label, target) => result,
             () = self.clock.deadline() => Err(()),
@@ -123,7 +158,7 @@ impl RequestSecrets {
 
     async fn use_serial(&self, label: &str, target: &ApiKeyTarget) -> Result<UseAnswer, ()> {
         let slot = self.slot(label);
-        let mut history = slot.lock().await;
+        let mut history = slot.history.lock().await;
         if history
             .filed
             .as_ref()
@@ -164,6 +199,7 @@ impl RequestSecrets {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(label.into(), lines);
         history.filed = Some((pending.request_id.clone(), pending.expires_at_ms));
+        slot.expires.store(pending.expires_at_ms, Ordering::Release);
         let (send, receive) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let _ = send.send(super::consent::hold_consent(&request));

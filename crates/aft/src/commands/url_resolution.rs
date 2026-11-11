@@ -1329,7 +1329,7 @@ mod url_tests {
             let denied = FakeVault::new();
             denied.set_answer("test", FakeReply::NotFound);
             let run_denied = run(&fixture, &denied, &routes, &req, true);
-            assert!(run_denied.success);
+            assert!(run_denied.response.success);
             assert_eq!(denied.material_calls(), 0);
             assert_eq!(
                 denied.audit_summary(),

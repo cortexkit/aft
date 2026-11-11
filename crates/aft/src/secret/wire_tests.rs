@@ -442,7 +442,7 @@ fn the_secret_use_client_sends_the_pinned_params_and_reads_a_release() {
     let UseAnswer::Released(released) = answer else {
         panic!("a release keeps material for this request only");
     };
-    assert_eq!(released.location(), "header:X-Api-Key");
+    assert_eq!(released.location, "header:X-Api-Key");
     assert_eq!(released.material(), b"sk-example");
     let sent = transport.0.lock().unwrap();
     assert_eq!(sent.len(), 1);

@@ -331,7 +331,7 @@ async fn audit_unscanned_header_refusal() {
 async fn audit_ipv6_literal() {
     let server = Server::new("ipv6-h1").await;
     let vault = Vault::new();
-    let mut cfg = config(
+    let cfg = config(
         vault.clone(),
         server.address.port(),
         &[("test", Location::Bearer)],

@@ -97,6 +97,8 @@ pub struct ProxyConfig {
     pub consent_context: Option<(std::path::PathBuf, String)>,
     #[cfg(test)]
     pub test_https_port: Option<u16>,
+    #[cfg(test)]
+    pub approval_clock: Option<Arc<dyn crate::secret::requests::ApprovalClock>>,
     pub origin: String,
 }
 
@@ -379,12 +381,15 @@ impl SecretProxy {
         let token =
             Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random[..]));
         let expected_auth = basic_credentials(&token)?;
+        let approvals = crate::secret::requests::RequestSecrets::new(
+            config.vault.clone(),
+            config.authorization_scope.clone(),
+            config.consent_context.clone(),
+        );
+        #[cfg(test)]
+        let approvals = approvals.with_clock(config.approval_clock.clone());
         let state = Arc::new(State {
-            approvals: crate::secret::requests::RequestSecrets::new(
-                config.vault.clone(),
-                config.authorization_scope.clone(),
-                config.consent_context.clone(),
-            ),
+            approvals,
             config,
             session: AtomicI32::new(0),
             session_birth: std::sync::atomic::AtomicU64::new(0),
@@ -535,7 +540,7 @@ async fn serve(
                 connections.spawn(async move {
                     let session = state.session.load(Ordering::Acquire);
                     if session <= 0 || !state.generation_valid() || !peer::authorized(&socket, session) || !state.generation_valid() { return; }
-                    let socket = limits::IdleIo::new(socket, state.idle_timeout());
+                    let socket = limits::IdleIo::new(socket, state.idle_timeout()).with_approval_waits(state.approvals.activity());
                     let service = service_fn(move |request| connect(request, state.clone(), lease.clone()));
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(socket), service).with_upgrades().await;

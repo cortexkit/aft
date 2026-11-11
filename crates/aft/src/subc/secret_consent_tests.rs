@@ -400,15 +400,13 @@ struct RecordingTransport {
     filed: StdMutex<Vec<SecretConsentRequest>>,
 }
 
-static SECRET_TRANSPORT_LOCK: StdMutex<()> = StdMutex::new(());
-
 struct TransportGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl TransportGuard {
     fn install(transport: Option<Arc<dyn SecretConsentTransport>>) -> Self {
-        let guard = SECRET_TRANSPORT_LOCK
+        let guard = crate::secret::consent::TEST_TRANSPORT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::secret::consent::install_transport(transport);
@@ -788,6 +786,7 @@ fn install_cards(runtime: &tokio::runtime::Runtime, cards: Arc<SecretCards>) -> 
     TransportGuard::install(Some(Arc::new(SubcSecretConsent {
         transport: cards,
         runtime: runtime.handle().clone(),
+        cards: Default::default(),
     })))
 }
 
@@ -811,7 +810,11 @@ fn a_refiled_secret_launch_recovers_the_same_card_and_exact_statement() {
     assert_eq!(cards.cards.lock().unwrap().len(), 1);
     assert_eq!(wire.calls.lock().unwrap().len(), 2);
     let calls = cards.calls.lock().unwrap();
-    assert_eq!(calls.len(), 4);
+    assert_eq!(
+        calls.len(),
+        3,
+        "resume awaits the existing card without filing it again"
+    );
     let item = phone_item();
     let expected = format!(
         r#"{{"method":"consent.request","params":{{"kind":"secret_use","secret_use":{{"items":[{{"request_id":"{}","statement_b64url":"{}"}}]}}}}}}"#,

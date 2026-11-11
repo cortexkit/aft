@@ -133,6 +133,7 @@ fn config(vault: Arc<Vault>, port: u16, locations: &[(&str, Location)]) -> Proxy
         scanned_labels: locations.iter().map(|(l, _)| (*l).to_owned()).collect(),
         consent_context: None,
         test_https_port: Some(port),
+        approval_clock: None,
         origin: "test-task".into(),
     }
 }
@@ -274,6 +275,25 @@ impl Server {
                                 .lock()
                                 .push(json!({"target":parts.uri.to_string(),"headers":fields,
                                 "body":String::from_utf8_lossy(&data)}));
+                            if mode == "redirect"
+                                && parts
+                                    .headers
+                                    .get("host")
+                                    .is_some_and(|v| v.as_bytes().starts_with(b"localhost:"))
+                            {
+                                let host = parts.headers["host"].to_str().unwrap();
+                                let port = host.rsplit_once(':').unwrap().1;
+                                let mut response = Response::new(full(Bytes::new()));
+                                *response.status_mut() = StatusCode::FOUND;
+                                response.headers_mut().insert(
+                                    "location",
+                                    HeaderValue::from_str(&format!(
+                                        "https://127.0.0.1:{port}/approved"
+                                    ))
+                                    .unwrap(),
+                                );
+                                return Ok::<_, std::convert::Infallible>(response);
+                            }
                             if let Some(upgrade) = upgrade {
                                 let mut response = Response::new(full(Bytes::new()));
                                 *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -688,6 +708,9 @@ fn client_child() {
 
 #[path = "audit_tests.rs"]
 mod audit_tests;
+
+#[path = "vault_tests.rs"]
+mod vault_tests;
 
 fn child_reply(line: &str) -> Option<Value> {
     // With a single test thread, libtest prefixes uncaptured output with the
@@ -1269,7 +1292,7 @@ async fn proxy_query_and_json_escape_material_without_partial_header_writes() {
 async fn proxy_unavailable_release_refuses_and_tunnel_closes_on_stop() {
     let server = Server::new("echo-request").await;
     let vault = Vault::new();
-    let mut cfg = config(
+    let cfg = config(
         vault.clone(),
         server.address.port(),
         &[("test", Location::Bearer)],
@@ -1408,31 +1431,24 @@ async fn proxy_requires_armed_session_token_and_canonical_connect_authority() {
 }
 
 #[test]
-fn proxy_only_accepts_grants_for_the_exact_launch_scan() {
+fn proxy_only_accepts_a_nonempty_unique_valid_launch_scan() {
     let vault = Vault::new();
     let make = || config(vault.clone(), 443, &[("test", Location::Bearer)]);
     let tls = rustls::ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
-    let mut cfg = make();
-    cfg.scanned_labels.clear();
-    assert_eq!(
-        SecretProxy::start_with_tls(cfg, tls.clone()).err(),
-        Some(ProxyError::InvalidRules)
-    );
-    let mut cfg = make();
-    cfg.scanned_labels.push("file-label".into());
-    assert_eq!(
-        SecretProxy::start_with_tls(cfg, tls.clone()).err(),
-        Some(ProxyError::InvalidRules)
-    );
-    let mut cfg = make();
-    vault.rules.lock().get_mut("test").unwrap().location =
-        Location::Header("Accept-Encoding".into());
-    assert_eq!(
-        SecretProxy::start_with_tls(cfg, tls).err(),
-        Some(ProxyError::InvalidRules)
-    );
+    for labels in [
+        vec![],
+        vec!["test".into(), "test".into()],
+        vec!["bad label".into()],
+    ] {
+        let mut cfg = make();
+        cfg.scanned_labels = labels;
+        assert_eq!(
+            SecretProxy::start_with_tls(cfg, tls.clone()).err(),
+            Some(ProxyError::InvalidRules)
+        );
+    }
 }
 
 /// A stopped proxy's listener is closed before `stop()` returns, so a fresh

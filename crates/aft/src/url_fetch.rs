@@ -22,7 +22,8 @@ use reqwest::header::{
 use reqwest::redirect::Policy;
 use secret_rules::audit::{AuditReason, AuditRecordV1, Decision};
 use secret_rules::location::{
-    evaluate_request_with_connect, LabelOutcome, LabelRule, Location, RequestView,
+    evaluate_request_with_connect, location_kind_token, LabelOutcome, LabelRule, Location,
+    RequestView,
 };
 use secret_rules::material::{check_admissible, encode_for_location};
 use secret_rules::scrub::{MatcherSet, ScrubError, Scrubber};
@@ -1417,14 +1418,14 @@ fn secret_hop(
                 .map(|host| ConnectAuthority { host, port })
         });
     let Some(authority) = authority else {
-        emit_hop_audit(secrets, held, hop, None, |_| {
+        emit_hop_audit(secrets, held, hop, None, &[], |_| {
             (Decision::Literal, AuditReason::OutOfScope)
         })
         .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
         return Ok(None);
     };
     let refused = |held: &HeldKeys, reason: &str| {
-        let _ = emit_hop_audit(secrets, held, hop, Some(&authority), |_| {
+        let _ = emit_hop_audit(secrets, held, hop, Some(&authority), &[], |_| {
             (Decision::Refused, AuditReason::Refused)
         });
         secret_fetch_refused(reason, logical)
@@ -1441,26 +1442,28 @@ fn secret_hop(
         path: String::from_utf8(normalized.wire).map_err(|_| refused(held, "malformed_path"))?,
     };
     for label in &secrets.labels {
-        let mut https_port = authority.port == 443;
+        let https_port = authority.port == 443;
         #[cfg(test)]
-        {
-            https_port |= secrets.test_https_port == Some(authority.port);
-        }
+        let https_port = https_port || secrets.test_https_port == Some(authority.port);
         if !https_port || !present.contains(label) {
             continue;
         }
         let answer = match crate::subc::use_current_secret_label(secrets.vault, label, &addressed) {
             crate::subc::LaunchDecision::Proceed(answer) => answer,
             crate::subc::LaunchDecision::Pending(pending) => {
+                let _ = refused(held, "missing_material");
                 return Err(UrlFetchError::secret(
                     crate::secret::SECRET_ACCESS_PENDING,
                     pending.message,
-                ))
+                ));
             }
             crate::subc::LaunchDecision::Refuse(crate::secret::LabelOutcome::Refuse {
                 code,
                 message,
-            }) => return Err(UrlFetchError::secret(code, message)),
+            }) => {
+                let _ = refused(held, "missing_material");
+                return Err(UrlFetchError::secret(code, message));
+            }
             _ => return Err(refused(held, "missing_material")),
         };
         if let crate::secret::UseAnswer::Released(released) = answer {
@@ -1486,7 +1489,7 @@ fn secret_hop(
         }
     }
     // Plan with a stand-in key first: the rules decide where a key would go,
-    // and refuse an ambiguous request, before the vault releases anything.
+    // and refuse an ambiguous request before copying released bytes into a URL.
     let planning: Vec<(String, Vec<u8>)> = rules
         .iter()
         .map(|rule| (rule.label.clone(), SECRET_PLANNING_KEY.to_vec()))
@@ -1530,7 +1533,7 @@ fn secret_hop(
         }
     };
     if edits.is_empty() {
-        emit_hop_audit(secrets, held, hop, Some(&authority), decide)
+        emit_hop_audit(secrets, held, hop, Some(&authority), &rules, decide)
             .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
         return Ok(None);
     }
@@ -1559,7 +1562,7 @@ fn secret_hop(
     let mut outbound = current.clone();
     outbound.set_path(wire_path);
     outbound.set_query(Some(substituted));
-    emit_hop_audit(secrets, held, hop, Some(&authority), decide)
+    emit_hop_audit(secrets, held, hop, Some(&authority), &rules, decide)
         .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
     Ok(Some(outbound))
 }
@@ -1571,6 +1574,7 @@ fn emit_hop_audit(
     held: &HeldKeys,
     hop: usize,
     authority: Option<&ConnectAuthority>,
+    rules: &[LabelRule],
     decide: impl Fn(&str) -> (Decision, AuditReason),
 ) -> Result<(), ()> {
     let origin = format!("{}#{hop}", secrets.call_id);
@@ -1595,6 +1599,10 @@ fn emit_hop_audit(
         if let Some(authority) = authority {
             record.host = Some(authority.host.clone());
             record.port = Some(authority.port);
+        }
+        if let Some(rule) = rules.iter().find(|rule| &rule.label == label) {
+            record.path_prefix = Some(rule.path_prefix.clone());
+            record.location_kind = Some(location_kind_token(&rule.location).to_owned());
         }
         if record.to_json_line_with_keys(&keys).is_err() || secrets.vault.audit(&record).is_err() {
             failed = true;
