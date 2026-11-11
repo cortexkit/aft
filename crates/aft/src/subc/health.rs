@@ -7164,6 +7164,9 @@ mod tests {
             .collect();
         let mut rollup =
             build_health_diagnostic_rollup_from_actors(&cache, &executor, &app, actors);
+        // Seed an empty retention measurement: no retention worker runs in this
+        // fixture, and missing cleanup evidence is independently unknown.
+        rollup.findings_metrics["storage_retention"] = json!({});
         assert_eq!(
             rollup.findings_metrics["roots"].as_array().unwrap().len(),
             200
