@@ -1,1 +1,1 @@
-Test shell gates now stop when their release directory disappears or their deadline expires, preventing orphaned polling processes.
+Test shell commands waiting for release files now stop when their parent directory disappears or their deadline expires, preventing orphaned polling processes.
