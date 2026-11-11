@@ -1,21 +1,24 @@
 //! Persistent aggregation and reporting of process-wide write attribution.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{atomic::AtomicU64, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::process_io::Bytes;
+#[cfg(test)]
+use crate::write_counters::now_ms;
 pub use crate::write_counters::{
     credit, note_process_unmeasurable, process_root_counter, register, Counter, Domain, WriterRow,
     DEFAULT_WINDOW_MS, RETENTION_MS,
 };
 use crate::write_counters::{
-    now_ms, registry, saturating_add, Entry, ProcessBaseline, RecentRow, UnmeasurableEntry,
-    MINUTE_MS,
+    registry, saturating_add, Entry, ProcessBaseline, RecentRow, UnmeasurableEntry, MINUTE_MS,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
