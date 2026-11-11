@@ -2624,8 +2624,8 @@ fn pi_erased_bundle_notification_is_not_replayed_after_ack_and_second_restart() 
         let mut aft = AftProcess::spawn();
         configure_background_for_harness(&mut aft, project.path(), storage.path(), SESSION, "pi");
         let command = format!(
-            "while [ ! -e {} ]; do sleep 0.05; done; printf 'completed\\n'",
-            shell_quote_path(&release)
+            "{}; printf 'completed\\n'",
+            crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05")
         );
         let task_id = spawn_bg(&mut aft, SESSION, &command, Some(30_000));
         let registered = notify_once(&mut aft, SESSION, &task_id, "never-matches");
@@ -3057,8 +3057,9 @@ fn per_match_ack_preserves_sibling_watch_and_rejects_stale_offset() {
     let release_guard = ReleaseOnDrop::new(release.clone());
     let _exit_guard = ReleaseOnDrop::new(exit.clone());
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done; printf 'READY\\n'; while [ ! -e {} ]; do sleep 0.05; done",
-        shell_quote_path(&release), shell_quote_path(&exit),
+        "{}; printf 'READY\\n'; {}",
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05"),
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&exit), "sleep 0.05"),
     );
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);
@@ -3133,12 +3134,12 @@ fn mid_run_ack_from_rebound_root_preserves_later_watch_and_completion() {
     let _release_b_guard = ReleaseOnDrop::new(release_b.clone());
     let _release_exit_guard = ReleaseOnDrop::new(release_exit.clone());
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s\\n' '{}'; while [ ! -e {} ]; do sleep 0.05; done; printf '%s\\n' '{}'; while [ ! -e {} ]; do sleep 0.05; done",
-        shell_quote_path(&release_a),
+        "{}; printf '%s\\n' '{}'; {}; printf '%s\\n' '{}'; {}",
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release_a), "sleep 0.05"),
         WATCH_A,
-        shell_quote_path(&release_b),
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release_b), "sleep 0.05"),
         WATCH_B,
-        shell_quote_path(&release_exit),
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release_exit), "sleep 0.05"),
     );
 
     let mut owner = AftProcess::spawn();
@@ -4031,8 +4032,8 @@ fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
         format!("finished {MASKED}\n")
     );
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done; printf 'READY %s\\n' \"$DEPLOY_tOkEn\"",
-        shell_quote_path(&release),
+        "{}; printf 'READY %s\\n' \"$DEPLOY_tOkEn\"",
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05"),
     );
     let watch_forensics = TaskForensics {
         storage: storage.path(),
@@ -4112,11 +4113,11 @@ fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
     // before printf has written to it.
     let ticket_staging = project.path().join("seen-ticket.partial");
     let command = format!(
-        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; mv {} {}; while [ ! -e {} ]; do sleep 0.05; done; printf 'ticket=%s md5=0123456789abcdef0123456789abcdef\\n' \"$AFT_GH_SHIM_TICKET\"",
+        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; mv {} {}; {}; printf 'ticket=%s md5=0123456789abcdef0123456789abcdef\\n' \"$AFT_GH_SHIM_TICKET\"",
         shell_quote_path(&ticket_staging),
         shell_quote_path(&ticket_staging),
         shell_quote_path(&ticket_path),
-        shell_quote_path(&release),
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05"),
     );
     let mut owner = AftProcess::spawn();
     configure_background(&mut owner, project.path(), storage.path(), SESSION);
@@ -4164,8 +4165,8 @@ fn redaction_replay_rebuilds_long_classifier_secret_after_preview_cut() {
     let release = project.path().join("release-long-classifier-secret");
     let release_guard = ReleaseOnDrop::new(release.clone());
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s' \"$LONG_PREFIX\"; printf '{{\"api_key\":\"%s\"}}\\n' \"$LONG_VALUE\"",
-        shell_quote_path(&release),
+        "{}; printf '%s' \"$LONG_PREFIX\"; printf '{{\"api_key\":\"%s\"}}\\n' \"$LONG_VALUE\"",
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05"),
     );
     let mut owner = AftProcess::spawn();
     configure_background(&mut owner, project.path(), storage.path(), SESSION);
@@ -4211,8 +4212,8 @@ fn redaction_replay_withholds_new_secret_output() {
     let mut owner = AftProcess::spawn();
     configure_background(&mut owner, project.path(), storage.path(), SESSION);
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s\\n' \"$DEPLOY_tOkEn\"",
-        shell_quote_path(&release),
+        "{}; printf '%s\\n' \"$DEPLOY_tOkEn\"",
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05"),
     );
     let id = spawn_redaction_task(&mut owner, &command, json!({"DEPLOY_tOkEn": SECRET}));
     let watched = spawn_redaction_task(&mut owner, &command, json!({"DEPLOY_tOkEn": SECRET}));
@@ -4278,8 +4279,8 @@ fn redaction_replay_withholds_output_from_inherited_secret_environment() {
     let mut owner = AftProcess::spawn_with_env(&[("OPENAI_API_KEY", std::ffi::OsStr::new(SECRET))]);
     configure_background(&mut owner, project.path(), storage.path(), SESSION);
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s\\n' \"$OPENAI_API_KEY\"",
-        shell_quote_path(&release),
+        "{}; printf '%s\\n' \"$OPENAI_API_KEY\"",
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05"),
     );
     let id = spawn_redaction_task(&mut owner, &command, json!({}));
     wait_for_status(&mut owner, SESSION, &id, "running");
@@ -4320,8 +4321,8 @@ fn redaction_replay_shows_new_output_with_only_revoked_ticket() {
     let mut owner = AftProcess::spawn();
     configure_background(&mut owner, project.path(), storage.path(), SESSION);
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done; printf 'ordinary post-restart output\\n'",
-        shell_quote_path(&release),
+        "{}; printf 'ordinary post-restart output\\n'",
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05"),
     );
     let id = spawn_redaction_task(&mut owner, &command, json!({}));
     wait_for_status(&mut owner, SESSION, &id, "running");
@@ -4360,8 +4361,8 @@ fn per_match_ack_wire_reports_settlement_only_after_last_terminal_watch() {
     let release = project.path().join("release-terminal-matches");
     let release_guard = ReleaseOnDrop::new(release.clone());
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done; printf 'READY\\n'",
-        shell_quote_path(&release),
+        "{}; printf 'READY\\n'",
+        crate::test_helpers::test_gate::gate_exists(&shell_quote_path(&release), "sleep 0.05"),
     );
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);

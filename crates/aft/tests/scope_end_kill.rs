@@ -647,10 +647,7 @@ fn gated_shell(root: &Path, key: Option<&str>) -> Value {
         .to_string()
         .replace('\\', "/");
     #[cfg(windows)]
-    let command = format!(
-        "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 50 }}",
-        release.replace('\'', "''")
-    );
+    let command = crate::test_helpers::test_gate::powershell_gate(&release, 50);
     #[cfg(not(windows))]
     let command = crate::test_helpers::test_gate::gate(
         &format!("'{}'", release.replace('\'', "'\\''")),
