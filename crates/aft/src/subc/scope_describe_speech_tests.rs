@@ -41,7 +41,7 @@ async fn fenced_end_retries_one_failed_read_and_kills_tasks_with_scope_revoked_r
         )
     })
     .unwrap();
-    let store = crate::db::gh_speech::Store::new(&db_path);
+    let store = crate::gh_shim_speech::store::Store::new(&db_path);
     let answer = ModuleControlResponseToModule::ScopeDescribe {
         status: subc_protocol::scope::ScopeStatus::Ended,
         scope_epoch: Some(10),

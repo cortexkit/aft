@@ -476,7 +476,7 @@ fn recovered_harness_scope_cancel_records_revoked_in_the_module_database() {
     .unwrap();
     wait_for(|| pid_file.exists());
     let pid = read_pid(&pid_file);
-    let store = crate::db::gh_speech::Store::new(&db_path);
+    let store = crate::gh_shim_speech::store::Store::new(&db_path);
     store
         .capture(&AuthorityRecord {
             incarnation: "recovered-main-store".into(),
@@ -503,7 +503,7 @@ fn recovered_harness_scope_cancel_records_revoked_in_the_module_database() {
     assert!(reply.success, "{reply:?}");
     assert_eq!(reply.data["killed"][0]["task_id"], task);
     wait_for(|| !crate::process_identity::is_process_alive(pid));
-    let restarted = crate::db::gh_speech::Store::new(&db_path);
+    let restarted = crate::gh_shim_speech::store::Store::new(&db_path);
     assert_eq!(
         restarted
             .seal(

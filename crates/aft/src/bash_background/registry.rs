@@ -2524,7 +2524,7 @@ impl BgTaskRegistry {
         let mut queued = 0_u64;
         for path in paths {
             queued = queued.saturating_add(
-                crate::db::gh_speech::Store::new(path)
+                crate::gh_shim_speech::store::Store::new(path)
                     .pending_legacy_for_identity(session, task)
                     .ok()?,
             );
@@ -25921,7 +25921,7 @@ mod tests {
                 .with_delegates(true),
         )
         .with_owner_authorized(true);
-        let store = crate::db::gh_speech::Store::new(&path);
+        let store = crate::gh_shim_speech::store::Store::new(&path);
         store
             .capture(&AuthorityRecord {
                 incarnation: "cancel-inc".into(),

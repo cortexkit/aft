@@ -1,16 +1,5 @@
 use super::*;
 
-pub(crate) const MIGRATION: &str = r#"
-CREATE TABLE IF NOT EXISTS gh_speech_legacy_dispatch (
-    request_nonce TEXT PRIMARY KEY NOT NULL,
-    incarnation TEXT NOT NULL,
-    forwarding_run TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('queued','settled')),
-    enqueued_at_ms INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS gh_speech_legacy_pending ON gh_speech_legacy_dispatch(incarnation,state);
-"#;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LegacyDispatchStatus {
     Queued,
@@ -94,7 +83,7 @@ impl Store {
         )
         .map_err(GateError::BeforeSend)?;
         tx.execute("INSERT INTO gh_speech_legacy_dispatch(request_nonce,incarnation,forwarding_run,state,enqueued_at_ms) VALUES(?1,?2,?3,'queued',?4)",
-            params![nonce,incarnation,forwarding_run,super::super::call_ledger::now_ms()])
+            params![nonce,incarnation,forwarding_run,crate::db::call_ledger::now_ms()])
             .map_err(db_error).map_err(GateError::BeforeSend)?;
         let queued = enqueue().map_err(GateError::BeforeSend)?;
         tx.commit().map_err(|_| GateError::AfterSend)?;
