@@ -6700,6 +6700,17 @@ fn launcher_argv(
     marker_fds: Option<(RawFd, RawFd)>,
     _prepared: Option<&PreparedTask>,
 ) -> Result<(OsString, Vec<OsString>, Option<File>), String> {
+    #[cfg(feature = "test-hooks")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::metadata(launcher_path) {
+            crate::bash_background::trace_phase_for_test(
+                "launcher_image",
+                serde_json::json!({"path": launcher_path, "size": metadata.len(),
+                    "device": metadata.dev(), "inode": metadata.ino(), "links": metadata.nlink()}),
+            );
+        }
+    }
     let profile_json = serde_json::to_string(profile)
         .map_err(|error| format!("failed to serialize sandbox profile: {error}"))?;
     // With marker descriptors, a `/bin/sh` supervisor records an exit status

@@ -76,8 +76,71 @@ jobs:
         run: |
           unset AFT_STORAGE_DIR
           export AFT_TEST_BASH_PHASE_TRACE=1
+          export NEXTEST_RUN_ID="classic-image-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           python3 - <<'PY'
-          import json, os, subprocess, time
+          import json, os, pathlib, shutil, subprocess, tempfile, threading, time
+
+          def image_metadata(path, label):
+              stat = os.stat(path)
+              print("AFT_IMAGE_METADATA " + json.dumps(dict(label=label, path=str(path), size=stat.st_size,
+                  device=stat.st_dev, inode=stat.st_ino, links=stat.st_nlink)), flush=True)
+
+          def time_image(path, label, args, sample=False):
+              image_metadata(path, label)
+              start = time.perf_counter()
+              process = subprocess.Popen([str(path), *args], stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              sampled = []
+              def sample_if_alive():
+                  time.sleep(0.5)
+                  if process.poll() is None:
+                      at_us = time.time_ns() // 1000
+                      try:
+                          result = subprocess.run(["/usr/bin/sample", str(process.pid), "1", "1"],
+                              capture_output=True, text=True, timeout=10)
+                          sampled.append(dict(wall_us=at_us, pid=process.pid, exit=result.returncode,
+                              stdout=result.stdout, stderr=result.stderr))
+                      except subprocess.TimeoutExpired:
+                          sampled.append(dict(wall_us=at_us, pid=process.pid, error="sample timeout"))
+              sampler = threading.Thread(target=sample_if_alive) if sample else None
+              if sampler:
+                  sampler.start()
+              try:
+                  stdout, stderr = process.communicate(timeout=30)
+                  detail = dict(exit=process.returncode, stdout=stdout, stderr=stderr)
+              except subprocess.TimeoutExpired:
+                  process.kill()
+                  stdout, stderr = process.communicate()
+                  detail = dict(timed_out=True, stdout=stdout, stderr=stderr)
+              wall_ms = (time.perf_counter()-start)*1000
+              if sampler:
+                  sampler.join()
+              print("AFT_IMAGE_EXEC " + json.dumps(dict(label=label, path=str(path), args=args,
+                  wall_ms=round(wall_ms, 3), **detail)), flush=True)
+              for result in sampled:
+                  print("AFT_IMAGE_SAMPLE " + json.dumps(dict(label=label, **result)), flush=True)
+
+          def describe_image(path, label):
+              image_metadata(path, label)
+              for command in (["/usr/bin/codesign", "-dv", "--verbose=4", str(path)], ["/usr/bin/xattr", "-l", str(path)]):
+                  result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+                  print("AFT_IMAGE_DESCRIPTION " + json.dumps(dict(label=label, command=command,
+                      exit=result.returncode, stdout=result.stdout, stderr=result.stderr)), flush=True)
+
+          def security_log():
+              try:
+                  result = subprocess.run(["/usr/bin/log", "show", "--last", "2m", "--predicate",
+                      'process == "syspolicyd" OR process == "amfid" OR process == "XprotectService"',
+                      "--style", "compact"], capture_output=True, text=True, timeout=20)
+                  print("AFT_SECURITY_LOG " + json.dumps(dict(exit=result.returncode,
+                      stdout="\n".join(result.stdout.splitlines()[-50:]), stderr=result.stderr)), flush=True)
+              except subprocess.TimeoutExpired:
+                  print("AFT_SECURITY_LOG skipped=read_timeout", flush=True)
+
+          target = pathlib.Path("target/debug/aft").resolve()
+          time_image(target, "target_version_first_observed", ["--version"], sample=True)
+          time_image(target, "target_version_warm", ["--version"])
+          describe_image(target, "build_target")
           for key in ("HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
                       "XDG_CACHE_HOME", "AFT_STORAGE_DIR", "CARGO_HOME", "RUSTUP_HOME", "CARGO_BUILD_JOBS"):
               print(f"{key}={os.environ.get(key, '<unset>')}", flush=True)
@@ -86,6 +149,7 @@ jobs:
               "subc_bridge_test::scope_revocation_test::call_modes_refuse_flow_writes_and_unknown_but_serve_read_and_classic",
               "--exact", "--nocapture"]
           paths = set()
+          images = set()
           failures = 0
           for iteration in range(1, 4):
               print(f"=== classic probe {iteration}/3 ===", flush=True)
@@ -97,7 +161,35 @@ jobs:
                   for line in result.stdout.splitlines():
                       if "event=registry_begin detail=" in line:
                           paths.add(json.loads(line.split("detail=", 1)[1])["shell_path"])
+                      if "event=launcher_image detail=" in line:
+                          images.add(json.loads(line.split("detail=", 1)[1])["path"])
                   print(f"probe_result iteration={iteration} exit={result.returncode} wall_ms={(time.perf_counter()-start)*1000:.3f}", flush=True)
+                  if iteration == 1:
+                      security_log()
+                      for image in sorted(images):
+                          time_image(image, "exact_fixture_first_uncapped_after_timeout", ["sandbox-launch", "--support"], sample=True)
+                          time_image(image, "exact_fixture_warm", ["sandbox-launch", "--support"])
+                          describe_image(image, "exact_fixture")
+                          root = target.parent.parent / "scratch"
+                          root.mkdir(exist_ok=True)
+                          with tempfile.TemporaryDirectory(prefix="classic-image-", dir=root) as temporary:
+                              copied = pathlib.Path(temporary) / "fresh-copy-aft"
+                              shutil.copyfile(image, copied)
+                              copied.chmod(0o500)
+                              time_image(copied, "fresh_copy_first", ["sandbox-launch", "--support"], sample=True)
+                              time_image(copied, "fresh_copy_warm", ["sandbox-launch", "--support"])
+                              describe_image(copied, "fresh_copy")
+                              linked = pathlib.Path(temporary) / "fresh-link-aft"
+                              try:
+                                  os.link(image, linked)
+                              except OSError as error:
+                                  print(f"AFT_IMAGE_LINK skipped={error}", flush=True)
+                              else:
+                                  image_metadata(image, "exact_fixture_after_link")
+                                  time_image(linked, "hard_link_first_path", ["sandbox-launch", "--support"], sample=True)
+                                  time_image(linked, "hard_link_warm_path", ["sandbox-launch", "--support"])
+                                  describe_image(linked, "hard_link")
+                      print("assessment_control: subsequent test processes reuse the same fixture image via NEXTEST_RUN_ID; no timeout or assertion changes", flush=True)
               except subprocess.TimeoutExpired as error:
                   print(error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout, flush=True)
                   print(f"probe_result iteration={iteration} outer_timeout=90s", flush=True)
@@ -109,6 +201,6 @@ jobs:
                   print("AFT_EXACT_SHELL_BASELINE " + json.dumps(dict(path=shell, iteration=iteration,
                       wall_ms=round((time.perf_counter()-start)*1000, 3), returncode=result.returncode,
                       stdout=result.stdout, stderr=result.stderr)), flush=True)
-          print(f"probe_summary tests=3 failed={failures} actual_shells={sorted(paths)}", flush=True)
+          print(f"probe_summary tests=3 failed={failures} actual_shells={sorted(paths)} actual_images={sorted(images)}", flush=True)
           raise SystemExit(1 if failures else 0)
           PY
