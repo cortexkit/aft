@@ -2,7 +2,7 @@
 
 use super::*;
 // Stdio carries only JSON and filter output for local jq; it is never used to
-// start gh. The jq child below receives an empty credential environment.
+// start gh. The jq child below receives no operator credentials.
 use std::process::Stdio;
 
 fn failed(text: impl Into<String>) -> ReadError {
@@ -1097,11 +1097,24 @@ fn select_fields(value: &Value, fields: &str) -> Value {
     Value::Object(selected)
 }
 
+fn jq_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command.env_clear();
+    #[cfg(windows)]
+    for key in ["SystemRoot", "WINDIR"] {
+        // Windows needs these directories to launch batch wrappers. Do not
+        // inherit PATH or credentials just to make a local data filter run.
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+}
+
 // Probe first so older Windows jq builds can use text-mode normalization.
 #[cfg(windows)]
 fn jq_supports_binary(executable: &Path) -> bool {
-    Command::new(executable)
-        .env_clear()
+    jq_command(executable)
         .args(["--binary", "--version"])
         .output()
         .is_ok_and(|result| result.status.success())
@@ -1123,15 +1136,14 @@ fn normalize_jq_newlines(bytes: &[u8]) -> Vec<u8> {
 fn write_json(value: &Value, jq: Option<&str>, output: &mut impl Write) -> Result<(), ReadError> {
     let bytes = serde_json::to_vec(value).map_err(|error| failed(error.to_string()))?;
     if let Some(filter) = jq {
-        // Run only the local data filter, with argv rather than a shell. gh's
-        // credentials and network are not involved in rendering a JSON value.
+        // Invoke only the resolved local data filter with separate arguments.
+        // gh's credentials and network are not involved in rendering a JSON value.
         let executable = which::which("jq")
             .map_err(|error| failed(format!("--jq needs the local jq executable: {error}")))?;
         // On Windows, use jq's --binary mode when available; otherwise normalize its output.
         #[cfg(windows)]
         let binary_mode = jq_supports_binary(&executable);
-        let mut command = Command::new(executable);
-        command.env_clear();
+        let mut command = jq_command(&executable);
         #[cfg(windows)]
         if binary_mode {
             command.arg("--binary");
@@ -1610,6 +1622,32 @@ impl<W: Write> Write for LogFormatter<'_, W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod jq_environment_tests {
+    use super::*;
+
+    #[test]
+    fn jq_child_explicit_environment_contains_only_windows_directories() {
+        let _lock = crate::test_env::process_env_lock();
+        let command = jq_command(Path::new("jq.cmd"));
+        let actual: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+            .collect();
+        let expected = BTreeMap::from([
+            (
+                OsString::from("SystemRoot"),
+                Some(std::env::var_os("SystemRoot").expect("Windows SystemRoot")),
+            ),
+            (
+                OsString::from("WINDIR"),
+                Some(std::env::var_os("WINDIR").expect("Windows WINDIR")),
+            ),
+        ]);
+        assert_eq!(actual, expected);
     }
 }
 
