@@ -810,54 +810,84 @@ pub(crate) fn uncached_aggregate_for_test(job: &InspectJob) -> serde_json::Value
             _ => unreachable!(),
         };
     };
-    let mut skipped = Vec::new();
-    let mut items = Vec::new();
+    let mut success = aggregate_uncached_for_test(job, files);
+    write_unindexed_gap(&mut success.aggregate, &unindexed);
+    std::hint::black_box(success).aggregate
+}
+
+/// This test-only copy retains the full-record aggregation's scanned-files
+/// collection and single-pass kind tally for baseline timing comparisons.
+#[cfg(test)]
+fn aggregate_uncached_for_test(job: &InspectJob, files: Vec<FileTodos>) -> InspectScanSuccess {
+    let mut scanned_files = Vec::new();
+    let mut skipped_files = Vec::new();
+    let mut all_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
     for (path, todos) in job.scope_files.iter().zip(files) {
-        let file = display_file_path(&job.project_root, path);
-        match todos {
-            FileTodos::NotScanned => {}
-            FileTodos::Skipped(reason) => skipped.push((file, reason.to_string())),
-            FileTodos::Scanned(markers) => {
-                for item in markers {
-                    if is_test_tree_file(&file) {
-                        excluded.record(&file);
-                    } else {
-                        items.push((file.clone(), item));
-                    }
-                }
+        let items = match todos {
+            FileTodos::NotScanned => continue,
+            FileTodos::Skipped(reason) => {
+                skipped_files.push((
+                    display_file_path(&job.project_root, path),
+                    reason.to_string(),
+                ));
+                continue;
             }
+            FileTodos::Scanned(items) => items,
             FileTodos::Counted { .. } => panic!("reference must read full records"),
+        };
+        scanned_files.push(path.clone());
+        let file = display_file_path(&job.project_root, path);
+        // Markers in test trees (generated fixtures, mutation notes in test
+        // comments) are not product work items; tally them separately.
+        for item in items {
+            if is_test_tree_file(&file) {
+                excluded.record(&file);
+            } else {
+                all_items.push((file.clone(), item));
+            }
         }
     }
-    let count = items.len();
-    let by_kind = MARKERS
+
+    let mut by_kind = BTreeMap::new();
+    for marker in MARKERS {
+        by_kind.insert(marker.to_string(), 0usize);
+    }
+    for (_, item) in &all_items {
+        if let Some(count) = by_kind.get_mut(item.marker.as_str()) {
+            *count += 1;
+        }
+    }
+
+    let total_count = all_items.len();
+    let drill_down_capped = total_count > MAX_ITEMS;
+    let items = all_items
         .into_iter()
-        .map(|kind| {
-            (
-                kind,
-                items
-                    .iter()
-                    .filter(|(_, marker)| marker.marker == kind)
-                    .count(),
-            )
+        .take(MAX_ITEMS)
+        .map(|(file, item)| {
+            serde_json::json!({
+                "file": file,
+                "line": item.line,
+                "marker": item.marker,
+                "author": item.author,
+                "text": item.text,
+            })
         })
-        .collect::<BTreeMap<_, _>>();
-    // Use truncation rather than the production count or its item iterator.
-    items.truncate(MAX_ITEMS);
-    let mut result = serde_json::json!({
-        "count": count,
+        .collect::<Vec<_>>();
+
+    let mut aggregate = serde_json::json!({
+        "count": total_count,
         "by_kind": by_kind,
-        "items": items.into_iter().map(|(file, item)| serde_json::json!({
-            "file": file, "line": item.line, "marker": item.marker,
-            "author": item.author, "text": item.text,
-        })).collect::<Vec<_>>(),
-        "drill_down_capped": count > MAX_ITEMS,
+        "items": items,
+        "drill_down_capped": drill_down_capped,
     });
-    excluded.write_into(&mut result);
-    super::source_text::write_skipped_files(&mut result, skipped, None);
-    write_unindexed_gap(&mut result, &unindexed);
-    result
+    excluded.write_into(&mut aggregate);
+    super::source_text::write_skipped_files(&mut aggregate, skipped_files, None);
+    InspectScanSuccess {
+        scanned_files,
+        contributions: Vec::new(),
+        aggregate,
+    }
 }
 
 /// What each count of a root found, in order, for tests that follow the

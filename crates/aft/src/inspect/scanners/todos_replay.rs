@@ -152,7 +152,10 @@ fn todo_count_release_replay() {
                         crate::data_layer::checkout::source_work_for_test(&root).todo_decodes;
                     let result = timed(|| {
                         if cached {
-                            run_todos_scan(&job).outcome.unwrap().aggregate
+                            std::hint::black_box(run_todos_scan(&job))
+                                .outcome
+                                .unwrap()
+                                .aggregate
                         } else {
                             uncached_aggregate_for_test(&job)
                         }
