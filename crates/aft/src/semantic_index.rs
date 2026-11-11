@@ -1038,13 +1038,7 @@ pub const SEMANTIC_INDEX_STATUS_WORDS: &[&str] = &[
     "unavailable",
 ];
 
-/// Opening words of every missing-runtime message this crate produces.
-///
-/// `is_onnx_runtime_unavailable` treats this prefix as proof on its own, and
-/// readers outside the daemon (the OpenCode sidebar) key on the same prefix to
-/// tell "the runtime is not installed" apart from an ordinary backend failure.
-/// Changing it changes that contract.
-pub const ONNX_RUNTIME_MISSING_PREFIX: &str = "ONNX Runtime not found.";
+pub use crate::ort_pin::ONNX_RUNTIME_MISSING_PREFIX;
 
 /// What the daemon tells a user whose ONNX Runtime is missing.
 ///

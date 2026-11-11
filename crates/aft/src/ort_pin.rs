@@ -86,7 +86,13 @@ use std::sync::{Mutex, Once, OnceLock};
 
 use sha2::{Digest, Sha256};
 
-use crate::semantic_index::ONNX_RUNTIME_MISSING_PREFIX;
+/// Opening words of every missing-runtime message this crate produces.
+///
+/// `is_onnx_runtime_unavailable` treats this prefix as proof on its own, and
+/// readers outside the daemon (the OpenCode sidebar) key on the same prefix to
+/// tell "the runtime is not installed" apart from an ordinary backend failure.
+/// Changing it changes that contract.
+pub const ONNX_RUNTIME_MISSING_PREFIX: &str = "ONNX Runtime not found.";
 
 /// Environment variable naming the ONNX Runtime library to load.
 pub const ORT_DYLIB_PATH_ENV: &str = "ORT_DYLIB_PATH";
