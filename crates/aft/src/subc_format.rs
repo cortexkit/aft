@@ -4305,22 +4305,7 @@ pub(crate) fn render_envelope_trailer(
     crate::list_envelope::render_trailer(envelope)
 }
 
-/// Count of rendered match rows in a grep response (R24).
-///
-/// `matches` holds the whole requested page; `rendered_matches` says how many
-/// of those rows fit the output byte budget and were printed. Replies without
-/// that field printed every row in `matches`.
-pub fn rendered_grep_match_count(data: &Value) -> usize {
-    let matches_len = data
-        .get("matches")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    data.get("rendered_matches")
-        .and_then(Value::as_u64)
-        .map(|rendered| (rendered as usize).min(matches_len))
-        .unwrap_or(matches_len)
-}
+pub use crate::list_surfaces::grep::rendered_grep_match_count;
 
 /// Count of rendered file rows in a glob response after applying display-only selectors (R24).
 pub fn rendered_glob_file_count(data: &Value) -> usize {

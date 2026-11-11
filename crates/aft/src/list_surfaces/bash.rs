@@ -52,7 +52,7 @@ pub fn count_output_lines(output: &str) -> usize {
             });
             !recovery_marker
                 && !trailer
-                && !crate::commands::bash_orchestrate::is_foreground_task_line(line)
+                && !is_foreground_task_line(line)
                 && !crate::compress::line_cut::is_omitted_lines_marker(line)
         })
         .count()
@@ -194,4 +194,23 @@ pub fn build_changed_files_envelope_with_time_limit(
         causes,
         &[],
     )
+}
+
+/// True for a foreground task annotation: `[task <id>]` or
+/// `[task <id> (job <job>)]`. It is AFT's annotation, not command output, so
+/// it does not affect output line counts or the hash used to detect repeated output.
+pub(crate) fn is_foreground_task_line(line: &str) -> bool {
+    let Some(inner) = line
+        .strip_prefix("[task ")
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let (id, rest) = inner.split_once(' ').unwrap_or((inner, ""));
+    !id.is_empty()
+        && (rest.is_empty()
+            || rest
+                .strip_prefix("(job ")
+                .and_then(|job| job.strip_suffix(')'))
+                .is_some_and(|job| !job.is_empty() && !job.contains(' ')))
 }

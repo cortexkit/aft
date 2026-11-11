@@ -1308,24 +1308,7 @@ pub(crate) fn foreground_task_line(snapshot: &BgTaskSnapshot) -> String {
     }
 }
 
-/// True for a line [`foreground_task_line`] writes: `[task <id>]` or
-/// `[task <id> (job <job>)]`. It is AFT's annotation, not command output, so
-/// output line counts and the repeat breaker's output hash leave it out.
-pub(crate) fn is_foreground_task_line(line: &str) -> bool {
-    let Some(inner) = line
-        .strip_prefix("[task ")
-        .and_then(|rest| rest.strip_suffix(']'))
-    else {
-        return false;
-    };
-    let (id, rest) = inner.split_once(' ').unwrap_or((inner, ""));
-    !id.is_empty()
-        && (rest.is_empty()
-            || rest
-                .strip_prefix("(job ")
-                .and_then(|job| job.strip_suffix(')'))
-                .is_some_and(|job| !job.is_empty() && !job.contains(' ')))
-}
+pub(crate) use crate::list_surfaces::bash::is_foreground_task_line;
 
 /// Appends `line` to `output` on a line of its own.
 fn push_line(output: &mut String, line: &str) {

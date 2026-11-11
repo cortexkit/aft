@@ -220,7 +220,7 @@ pub fn build_grep_envelope(data: &Value) -> Option<ListEnvelope> {
         .map(|v| v as usize)
         .unwrap_or(0);
 
-    let shown = crate::subc_format::rendered_grep_match_count(data);
+    let shown = rendered_grep_match_count(data);
 
     build_grep_envelope_with_counted(
         GrepPageCounts {
@@ -235,4 +235,21 @@ pub fn build_grep_envelope(data: &Value) -> Option<ListEnvelope> {
         walk_truncated,
         skipped_foreign_mounts,
     )
+}
+
+/// Count of rendered match rows in a grep response.
+///
+/// `matches` holds the whole requested page; `rendered_matches` says how many
+/// of those rows fit the output byte budget and were printed. Replies without
+/// that field printed every row in `matches`.
+pub fn rendered_grep_match_count(data: &Value) -> usize {
+    let matches_len = data
+        .get("matches")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    data.get("rendered_matches")
+        .and_then(Value::as_u64)
+        .map(|rendered| (rendered as usize).min(matches_len))
+        .unwrap_or(matches_len)
 }

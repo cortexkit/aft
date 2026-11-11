@@ -3,7 +3,8 @@
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use crate::list_surfaces::{ReasonEntry, ReasonKind, SurfaceEntry};
 
-pub use crate::commands::callgraph_store_adapter::{HUB_SUMMARY_LIMIT, HUB_SUMMARY_THRESHOLD};
+pub const HUB_SUMMARY_THRESHOLD: usize = 20;
+pub const HUB_SUMMARY_LIMIT: usize = 15;
 
 pub const SITES_LIST_ID: &str = "payload.sites";
 pub const CALLERS_LIST_ID: &str = "payload.callers";

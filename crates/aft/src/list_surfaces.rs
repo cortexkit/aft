@@ -3,6 +3,7 @@ use crate::list_envelope::{Reason, Unit};
 pub mod bash;
 pub mod call_tree;
 pub mod callers;
+pub mod callgraph;
 pub mod glob;
 pub mod grep;
 pub mod impact;
