@@ -27,10 +27,9 @@ use crate::symbols::Symbol;
 pub type StoreAdapterResult<T> = Result<T, CallGraphStoreError>;
 
 pub use crate::list_surfaces::callgraph as callgraph_surface;
-use callgraph_surface::*;
+pub use callgraph_surface::*;
 
 const TRACE_DATA_RESOLVER_PROVENANCE: &str = "treesitter+resolver";
-pub use crate::list_surfaces::callgraph::{HUB_SUMMARY_LIMIT, HUB_SUMMARY_THRESHOLD};
 // The agent only receives 15 representative paths once a trace becomes a hub. A
 // 10k expansion budget leaves ample room for ordinary traces while preventing a
 // layered call graph from unfolding millions of path prefixes synchronously.
