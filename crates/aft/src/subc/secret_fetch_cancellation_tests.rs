@@ -17,7 +17,7 @@ fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
         Ordering::SeqCst,
     );
     let response =
-        crate::commands::url_resolution::with_secret_fetch_for_test(vault, options, || {
+        crate::commands::with_secret_fetch_for_test(vault, options, || {
             crate::commands::outline::handle_outline(&request, ctx)
         });
     FINISHED.fetch_add(1, Ordering::SeqCst);
