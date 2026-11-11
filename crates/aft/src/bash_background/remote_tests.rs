@@ -8207,6 +8207,7 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
             .unwrap()
             .is_none()
     );
+    assert_eq!(return_paths_root(&main, outside.path()), main);
     let error = build_remote_request(
         &main,
         outside.path(),
@@ -15860,6 +15861,77 @@ fn return_call(paths: &[&str]) -> serde_json::Value {
         "foreground_orchestrate": true, "compressed": false,
         "return_paths": paths,
     })
+}
+
+#[tokio::test]
+async fn runon_return_paths_side_worktree_uses_copied_checkout_for_submit_and_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    git_fixture(&main);
+    let main = main.canonicalize().unwrap();
+    let linked = temp.path().join("linked");
+    add_git_worktree(&main, &linked, "returned-files");
+    let linked = linked.canonicalize().unwrap();
+    assert!(!linked.starts_with(&main));
+    assert!(linked.join(".git").is_file());
+    let ctx = restarted_context(&main);
+
+    // Both checkouts use the same project context. A subdirectory cwd must
+    // select its checkout's top level, not the session root or the cwd itself.
+    for checkout in [&main, &linked] {
+        let cwd = checkout.join("build");
+        fs::create_dir(&cwd).unwrap();
+        let daemon = return_daemon("failed-missing").await;
+        let mut call = return_call(&["dist/hello.txt", "dist/absent.txt"]);
+        call["workdir"] = serde_json::json!(cwd);
+        let (reply, _) = orchestrated_reply(&ctx, &daemon, call).await;
+        assert!(reply.success, "{reply:?}");
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["workspace_key"], checkout.to_str().unwrap());
+        assert_eq!(runs[0]["repository_root"], main.to_str().unwrap());
+        assert_eq!(runs[0]["cwd"], cwd.to_str().unwrap());
+        assert_eq!(fs::read(cwd.join("dist/hello.txt")).unwrap(), b"hello");
+        assert!(!cwd.join("dist/absent.txt").exists());
+        let task_id = reply.data["task_id"].as_str().unwrap();
+        let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
+        let report = saved.remote.unwrap().returned_files.unwrap();
+        assert_eq!(
+            report[0].checkout_path.as_deref(),
+            Some("build/dist/hello.txt")
+        );
+        assert_eq!(
+            report[0].outcome,
+            super::return_files::ReturnOutcome::Returned { bytes: 5 }
+        );
+        let mut refused = return_call(&["../../outside.txt"]);
+        refused["workdir"] = serde_json::json!(cwd);
+        let response = crate::bash_background::with_remote_policy(
+            Some(launch(daemon.connection.clone())),
+            || crate::commands::bash::handle(&orchestrated_request(refused), &ctx),
+        );
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "return_paths_refused");
+        assert_eq!(response.data["message"], "return_paths refused: return_paths path ../../outside.txt must not use ..; the command did not run");
+
+        if checkout == &linked {
+            // This points back into the session project: project containment
+            // alone would incorrectly allow a return outside the copied tree.
+            std::os::unix::fs::symlink(&main, cwd.join("link-to-main")).unwrap();
+            let mut refused = return_call(&["link-to-main/escaped.txt"]);
+            refused["workdir"] = serde_json::json!(cwd);
+            let response = crate::bash_background::with_remote_policy(
+                Some(launch(daemon.connection.clone())),
+                || crate::commands::bash::handle(&orchestrated_request(refused), &ctx),
+            );
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "return_paths_refused");
+            assert_eq!(response.data["message"], "return_paths refused: link-to-main/escaped.txt resolves outside the project; the command did not run");
+        }
+        assert_eq!(exec_runs(&daemon).len(), 1, "refused calls must not submit");
+        assert!(!main.join("escaped.txt").exists());
+    }
+    assert!(!temp.path().join("outside.txt").exists());
 }
 
 #[tokio::test]

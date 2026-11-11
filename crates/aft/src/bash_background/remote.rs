@@ -1405,7 +1405,7 @@ impl TaskSink {
                 remote.return_paths.clone(),
                 remote.return_max_bytes,
                 &workdir,
-                project_root.as_deref().unwrap_or(&workdir),
+                &return_paths_root(project_root.as_deref().unwrap_or(&workdir), &workdir),
                 worktree_root_containing(&workdir, exec::DirectoryKind::WorkingDirectory)
                     .ok()
                     .flatten()
@@ -5820,6 +5820,17 @@ fn build_remote_request(
         Some(timeout_seconds),
         preset,
     )
+}
+
+#[cfg(unix)]
+/// Use the same checkout boundary for submission checks and returned writes
+/// as the runner's workspace key. Non-git workdirs retain the project boundary;
+/// request construction separately refuses workdirs it cannot snapshot.
+pub(crate) fn return_paths_root(project_root: &Path, workdir: &Path) -> PathBuf {
+    worktree_root_containing(workdir, exec::DirectoryKind::WorkingDirectory)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| project_root.to_path_buf())
 }
 
 #[cfg(unix)]
