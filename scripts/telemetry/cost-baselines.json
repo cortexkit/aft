@@ -1,14 +1,14 @@
 {
   "schema": 1,
-  "generated_at": "2026-10-18T08:52:27Z",
+  "generated_at": "2026-11-11T19:59:27Z",
   "binary": {
-    "sha256": "f4b3817d4c560724bfae3e173914109bd9fb959389b78f07f0996dd71b21628b",
-    "source_commit": "ba93da9f44acd56418bea9c67a070babc8a7362f",
-    "date": "2026-10-18"
+    "sha256": "ad45af911bb2c1950826de3a2f840a4ac4a8d416cec9cefeb730cc235ad02886",
+    "source_commit": "6ff05a1bd8fac8fbea09cefa8aa130a10a7fc432",
+    "date": "2026-11-11"
   },
   "measured_on": {
     "platform": "linux-x86_64",
-    "provenance": "workflow run 39111963839 (Nightly OSS cost gate), 2026-10-18, github-hosted ubuntu24 runner image 20261012.334.1, head ba93da9f44acd56418bea9c67a070babc8a7362f; minimum observed value per metric over the run's two passes"
+    "provenance": "workflow run 43089284243 (Nightly OSS cost gate), 2026-11-11, github-hosted ubuntu24 runner image 20261101.360.1, head 6ff05a1bd8fac8fbea09cefa8aa130a10a7fc432; minimum observed value per metric over the run's two passes"
   },
   "repos": {
     "redox": {
@@ -17,39 +17,29 @@
       "sha": "af82439e08ebadd3f3540bc44b7b3f5bf68fb5d9",
       "metrics": {
         "callgraph_build_ready_ms": {
-          "value": 1844.0,
+          "value": 1495.978,
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_first_query_ms": {
-          "value": 1361.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "callgraph_resolution_ms": {
-          "value": 607.0,
+        "callgraph_refresh_ms": {
+          "value": 36.703,
           "tolerance_pct": 20.0,
           "absolute_floor": 500.0
         },
         "cpu_seconds": {
-          "value": 4.96,
+          "value": 3.8,
           "tolerance_pct": 25.0,
           "absolute_floor": 1.0
         },
+        "index_store_build_ready_ms": {
+          "value": 497.999,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
         "peak_rss_mb": {
-          "value": 99.1,
+          "value": 135.0,
           "tolerance_pct": 20.0,
           "absolute_floor": 128.0
-        },
-        "search_build_ready_ms": {
-          "value": 441.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "search_first_query_ms": {
-          "value": 1376.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
         },
         "waiting_on.artifact_load": {
           "value": 0.0,
@@ -77,50 +67,12 @@
           "absolute_floor": 1.0
         }
       },
-      "index_events": {
-        "search.build_started.count": 1.0,
-        "search.build_progress.count": 2.0,
-        "search.build_progress.stage.streaming.count": 2.0,
-        "search.build_ready.count": 1.0,
-        "callgraph.build_started.count": 1.0,
-        "callgraph.breaker_admitted.count": 1.0,
-        "callgraph.build_progress.count": 50.0,
-        "callgraph.build_progress.stage.inventory.count": 2.0,
-        "callgraph.build_progress.stage.staging-admission.count": 1.0,
-        "callgraph.build_progress.stage.extraction.count": 39.0,
-        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
-        "callgraph.build_progress.stage.resolution.count": 3.0,
-        "search.first_query.count": 1.0,
-        "callgraph.build_progress.stage.method-dispatch.count": 3.0,
-        "callgraph.breaker_reset.count": 1.0,
-        "callgraph.build_ready.count": 1.0,
-        "callgraph.first_query.count": 1.0,
-        "search.build_progress.elapsed_ms.p50": 0.0,
-        "search.build_progress.elapsed_ms.max": 440.0,
-        "search.build_progress.completed.p50": 0.0,
-        "search.build_progress.completed.max": 1.0,
-        "search.build_progress.total.p50": 1.0,
-        "search.build_progress.total.max": 1.0,
-        "search.build_ready.elapsed_ms.p50": 441.0,
-        "search.build_ready.elapsed_ms.max": 441.0,
-        "callgraph.build_progress.elapsed_ms.p50": 538.0,
-        "callgraph.build_progress.elapsed_ms.max": 1830.0,
-        "callgraph.build_progress.completed.p50": 1500.0,
-        "callgraph.build_progress.completed.max": 6179.0,
-        "callgraph.build_progress.total.p50": 3585.0,
-        "callgraph.build_progress.total.max": 6179.0,
-        "search.first_query.ready_to_first_query_ms.p50": 1606.0,
-        "search.first_query.ready_to_first_query_ms.max": 1606.0,
-        "callgraph.build_ready.elapsed_ms.p50": 1844.0,
-        "callgraph.build_ready.elapsed_ms.max": 1844.0,
-        "callgraph.first_query.ready_to_first_query_ms.p50": 1655.0,
-        "callgraph.first_query.ready_to_first_query_ms.max": 1655.0
-      },
+      "index_events": {},
       "sample": {
         "runs": 2,
         "selection": "minimum observed value per metric"
       },
-      "measurement_profile": "cold-index-no-inspect-v1"
+      "measurement_profile": "index-store-no-inspect-refresh-v3"
     },
     "typescript-eslint": {
       "kind": "git",
@@ -128,39 +80,29 @@
       "sha": "4586535ab24d7d5e9b3ba87e4adb8636f9314aca",
       "metrics": {
         "callgraph_build_ready_ms": {
-          "value": 12200.0,
+          "value": 5063.743,
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_first_query_ms": {
-          "value": 978.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "callgraph_resolution_ms": {
-          "value": 3766.0,
+        "callgraph_refresh_ms": {
+          "value": 35.129,
           "tolerance_pct": 20.0,
           "absolute_floor": 500.0
         },
         "cpu_seconds": {
-          "value": 19.27,
+          "value": 15.41,
           "tolerance_pct": 25.0,
           "absolute_floor": 1.0
         },
+        "index_store_build_ready_ms": {
+          "value": 745.73,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
         "peak_rss_mb": {
-          "value": 617.0,
+          "value": 303.5,
           "tolerance_pct": 20.0,
           "absolute_floor": 128.0
-        },
-        "search_build_ready_ms": {
-          "value": 1374.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "search_first_query_ms": {
-          "value": 581.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
         },
         "waiting_on.artifact_load": {
           "value": 0.0,
@@ -188,50 +130,12 @@
           "absolute_floor": 1.0
         }
       },
-      "index_events": {
-        "search.build_started.count": 1.0,
-        "search.build_progress.count": 2.0,
-        "search.build_progress.stage.streaming.count": 2.0,
-        "callgraph.build_started.count": 1.0,
-        "callgraph.breaker_admitted.count": 1.0,
-        "callgraph.build_progress.count": 63.0,
-        "callgraph.build_progress.stage.inventory.count": 2.0,
-        "callgraph.build_progress.stage.staging-admission.count": 1.0,
-        "callgraph.build_progress.stage.extraction.count": 35.0,
-        "search.build_ready.count": 1.0,
-        "search.first_query.count": 1.0,
-        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
-        "callgraph.build_progress.stage.resolution.count": 4.0,
-        "callgraph.build_progress.stage.method-dispatch.count": 19.0,
-        "callgraph.breaker_reset.count": 1.0,
-        "callgraph.build_ready.count": 1.0,
-        "callgraph.first_query.count": 1.0,
-        "search.build_progress.elapsed_ms.p50": 0.0,
-        "search.build_progress.elapsed_ms.max": 1476.0,
-        "search.build_progress.completed.p50": 0.0,
-        "search.build_progress.completed.max": 1.0,
-        "search.build_progress.total.p50": 1.0,
-        "search.build_progress.total.max": 1.0,
-        "callgraph.build_progress.elapsed_ms.p50": 6803.0,
-        "callgraph.build_progress.elapsed_ms.max": 12107.0,
-        "callgraph.build_progress.completed.p50": 1200.0,
-        "callgraph.build_progress.completed.max": 38386.0,
-        "callgraph.build_progress.total.p50": 3152.0,
-        "callgraph.build_progress.total.max": 38386.0,
-        "search.build_ready.elapsed_ms.p50": 1476.0,
-        "search.build_ready.elapsed_ms.max": 1476.0,
-        "search.first_query.ready_to_first_query_ms.p50": 581.0,
-        "search.first_query.ready_to_first_query_ms.max": 581.0,
-        "callgraph.build_ready.elapsed_ms.p50": 12200.0,
-        "callgraph.build_ready.elapsed_ms.max": 12200.0,
-        "callgraph.first_query.ready_to_first_query_ms.p50": 1312.0,
-        "callgraph.first_query.ready_to_first_query_ms.max": 1312.0
-      },
+      "index_events": {},
       "sample": {
         "runs": 2,
         "selection": "minimum observed value per metric"
       },
-      "measurement_profile": "cold-index-no-inspect-v1"
+      "measurement_profile": "index-store-no-inspect-refresh-v3"
     },
     "jupyterlab": {
       "kind": "git",
@@ -239,39 +143,29 @@
       "sha": "7848d05af740c18b5950a8d1b90e2ed580af8260",
       "metrics": {
         "callgraph_build_ready_ms": {
-          "value": 16531.0,
+          "value": 6242.258,
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_first_query_ms": {
-          "value": 1144.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "callgraph_resolution_ms": {
-          "value": 4477.0,
+        "callgraph_refresh_ms": {
+          "value": 35.97,
           "tolerance_pct": 20.0,
           "absolute_floor": 500.0
         },
         "cpu_seconds": {
-          "value": 20.87,
+          "value": 17.62,
           "tolerance_pct": 25.0,
           "absolute_floor": 1.0
         },
+        "index_store_build_ready_ms": {
+          "value": 634.622,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
         "peak_rss_mb": {
-          "value": 341.7,
+          "value": 284.2,
           "tolerance_pct": 20.0,
           "absolute_floor": 128.0
-        },
-        "search_build_ready_ms": {
-          "value": 953.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "search_first_query_ms": {
-          "value": 1092.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
         },
         "waiting_on.artifact_load": {
           "value": 0.0,
@@ -299,50 +193,12 @@
           "absolute_floor": 1.0
         }
       },
-      "index_events": {
-        "search.build_started.count": 1.0,
-        "search.build_progress.count": 2.0,
-        "search.build_progress.stage.streaming.count": 2.0,
-        "callgraph.build_started.count": 1.0,
-        "callgraph.breaker_admitted.count": 1.0,
-        "callgraph.build_progress.count": 53.0,
-        "callgraph.build_progress.stage.inventory.count": 2.0,
-        "callgraph.build_progress.stage.staging-admission.count": 1.0,
-        "callgraph.build_progress.stage.extraction.count": 24.0,
-        "search.build_ready.count": 1.0,
-        "search.first_query.count": 1.0,
-        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
-        "callgraph.build_progress.stage.resolution.count": 8.0,
-        "callgraph.build_progress.stage.method-dispatch.count": 16.0,
-        "callgraph.breaker_reset.count": 1.0,
-        "callgraph.build_ready.count": 1.0,
-        "callgraph.first_query.count": 1.0,
-        "search.build_progress.elapsed_ms.p50": 0.0,
-        "search.build_progress.elapsed_ms.max": 953.0,
-        "search.build_progress.completed.p50": 0.0,
-        "search.build_progress.completed.max": 1.0,
-        "search.build_progress.total.p50": 1.0,
-        "search.build_progress.total.max": 1.0,
-        "callgraph.build_progress.elapsed_ms.p50": 10593.0,
-        "callgraph.build_progress.elapsed_ms.max": 16308.0,
-        "callgraph.build_progress.completed.p50": 1000.0,
-        "callgraph.build_progress.completed.max": 116946.0,
-        "callgraph.build_progress.total.p50": 2079.0,
-        "callgraph.build_progress.total.max": 116946.0,
-        "search.build_ready.elapsed_ms.p50": 953.0,
-        "search.build_ready.elapsed_ms.max": 953.0,
-        "search.first_query.ready_to_first_query_ms.p50": 1120.0,
-        "search.first_query.ready_to_first_query_ms.max": 1120.0,
-        "callgraph.build_ready.elapsed_ms.p50": 16531.0,
-        "callgraph.build_ready.elapsed_ms.max": 16531.0,
-        "callgraph.first_query.ready_to_first_query_ms.p50": 1144.0,
-        "callgraph.first_query.ready_to_first_query_ms.max": 1144.0
-      },
+      "index_events": {},
       "sample": {
         "runs": 2,
         "selection": "minimum observed value per metric"
       },
-      "measurement_profile": "cold-index-no-inspect-v1"
+      "measurement_profile": "index-store-no-inspect-refresh-v3"
     },
     "hugo": {
       "kind": "git",
@@ -350,39 +206,29 @@
       "sha": "423e9cead1ce279dc1db3a4be4fff36cb49479ad",
       "metrics": {
         "callgraph_build_ready_ms": {
-          "value": 15386.0,
+          "value": 4300.675,
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_first_query_ms": {
-          "value": 122.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "callgraph_resolution_ms": {
-          "value": 5651.0,
+        "callgraph_refresh_ms": {
+          "value": 31.219,
           "tolerance_pct": 20.0,
           "absolute_floor": 500.0
         },
         "cpu_seconds": {
-          "value": 17.84,
+          "value": 12.23,
           "tolerance_pct": 25.0,
           "absolute_floor": 1.0
         },
+        "index_store_build_ready_ms": {
+          "value": 590.9,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
         "peak_rss_mb": {
-          "value": 175.1,
+          "value": 285.5,
           "tolerance_pct": 20.0,
           "absolute_floor": 128.0
-        },
-        "search_build_ready_ms": {
-          "value": 698.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "search_first_query_ms": {
-          "value": 1346.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
         },
         "waiting_on.artifact_load": {
           "value": 0.0,
@@ -410,89 +256,41 @@
           "absolute_floor": 1.0
         }
       },
-      "index_events": {
-        "search.build_started.count": 1.0,
-        "search.build_progress.count": 2.0,
-        "search.build_progress.stage.streaming.count": 2.0,
-        "callgraph.build_started.count": 1.0,
-        "callgraph.breaker_admitted.count": 1.0,
-        "callgraph.build_progress.count": 53.0,
-        "callgraph.build_progress.stage.inventory.count": 2.0,
-        "callgraph.build_progress.stage.staging-admission.count": 1.0,
-        "callgraph.build_progress.stage.extraction.count": 25.0,
-        "search.build_ready.count": 1.0,
-        "search.first_query.count": 1.0,
-        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
-        "callgraph.build_progress.stage.resolution.count": 11.0,
-        "callgraph.build_progress.stage.method-dispatch.count": 12.0,
-        "callgraph.breaker_reset.count": 1.0,
-        "callgraph.build_ready.count": 1.0,
-        "callgraph.first_query.count": 1.0,
-        "search.build_progress.elapsed_ms.p50": 0.0,
-        "search.build_progress.elapsed_ms.max": 698.0,
-        "search.build_progress.completed.p50": 0.0,
-        "search.build_progress.completed.max": 1.0,
-        "search.build_progress.total.p50": 1.0,
-        "search.build_progress.total.max": 1.0,
-        "callgraph.build_progress.elapsed_ms.p50": 8392.0,
-        "callgraph.build_progress.elapsed_ms.max": 15149.0,
-        "callgraph.build_progress.completed.p50": 916.0,
-        "callgraph.build_progress.completed.max": 172570.0,
-        "callgraph.build_progress.total.p50": 2102.0,
-        "callgraph.build_progress.total.max": 172570.0,
-        "search.build_ready.elapsed_ms.p50": 698.0,
-        "search.build_ready.elapsed_ms.max": 698.0,
-        "search.first_query.ready_to_first_query_ms.p50": 1357.0,
-        "search.first_query.ready_to_first_query_ms.max": 1357.0,
-        "callgraph.build_ready.elapsed_ms.p50": 15386.0,
-        "callgraph.build_ready.elapsed_ms.max": 15386.0,
-        "callgraph.first_query.ready_to_first_query_ms.p50": 332.0,
-        "callgraph.first_query.ready_to_first_query_ms.max": 332.0
-      },
+      "index_events": {},
       "sample": {
         "runs": 2,
         "selection": "minimum observed value per metric"
       },
-      "measurement_profile": "cold-index-no-inspect-v1"
+      "measurement_profile": "index-store-no-inspect-refresh-v3"
     },
     "synthetic-24k": {
       "kind": "synthetic",
       "version": "synthetic-v2",
       "metrics": {
         "callgraph_build_ready_ms": {
-          "value": 13.0,
+          "value": 598.974,
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_first_query_ms": {
-          "value": 1506.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "callgraph_resolution_ms": {
-          "value": 1.0,
+        "callgraph_refresh_ms": {
+          "value": 38.207,
           "tolerance_pct": 20.0,
           "absolute_floor": 500.0
         },
         "cpu_seconds": {
-          "value": 3.23,
+          "value": 1.35,
           "tolerance_pct": 25.0,
           "absolute_floor": 1.0
         },
+        "index_store_build_ready_ms": {
+          "value": 392.311,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
         "peak_rss_mb": {
-          "value": 59.6,
+          "value": 84.2,
           "tolerance_pct": 20.0,
           "absolute_floor": 128.0
-        },
-        "search_build_ready_ms": {
-          "value": 455.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
-        },
-        "search_first_query_ms": {
-          "value": 1577.0,
-          "tolerance_pct": 25.0,
-          "absolute_floor": 3000.0
         },
         "waiting_on.artifact_load": {
           "value": 0.0,
@@ -520,50 +318,12 @@
           "absolute_floor": 1.0
         }
       },
-      "index_events": {
-        "search.build_started.count": 1.0,
-        "search.build_progress.count": 2.0,
-        "search.build_progress.stage.streaming.count": 2.0,
-        "search.build_ready.count": 1.0,
-        "callgraph.build_started.count": 1.0,
-        "callgraph.breaker_admitted.count": 1.0,
-        "callgraph.build_progress.count": 15.0,
-        "callgraph.build_progress.stage.inventory.count": 2.0,
-        "callgraph.build_progress.stage.staging-admission.count": 1.0,
-        "callgraph.build_progress.stage.extraction.count": 4.0,
-        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
-        "callgraph.build_progress.stage.resolution.count": 3.0,
-        "callgraph.build_progress.stage.method-dispatch.count": 3.0,
-        "callgraph.breaker_reset.count": 1.0,
-        "callgraph.build_ready.count": 1.0,
-        "search.first_query.count": 1.0,
-        "callgraph.first_query.count": 1.0,
-        "search.build_progress.elapsed_ms.p50": 0.0,
-        "search.build_progress.elapsed_ms.max": 462.0,
-        "search.build_progress.completed.p50": 0.0,
-        "search.build_progress.completed.max": 1.0,
-        "search.build_progress.total.p50": 1.0,
-        "search.build_progress.total.max": 1.0,
-        "search.build_ready.elapsed_ms.p50": 462.0,
-        "search.build_ready.elapsed_ms.max": 462.0,
-        "callgraph.build_progress.elapsed_ms.p50": 5.0,
-        "callgraph.build_progress.elapsed_ms.max": 7.0,
-        "callgraph.build_progress.completed.p50": 1.0,
-        "callgraph.build_progress.completed.max": 2.0,
-        "callgraph.build_progress.total.p50": 1.0,
-        "callgraph.build_progress.total.max": 2.0,
-        "callgraph.build_ready.elapsed_ms.p50": 13.0,
-        "callgraph.build_ready.elapsed_ms.max": 13.0,
-        "search.first_query.ready_to_first_query_ms.p50": 1577.0,
-        "search.first_query.ready_to_first_query_ms.max": 1577.0,
-        "callgraph.first_query.ready_to_first_query_ms.p50": 1506.0,
-        "callgraph.first_query.ready_to_first_query_ms.max": 1506.0
-      },
+      "index_events": {},
       "sample": {
         "runs": 2,
         "selection": "minimum observed value per metric"
       },
-      "measurement_profile": "cold-index-no-inspect-v1"
+      "measurement_profile": "index-store-no-inspect-refresh-v3"
     }
   }
 }
