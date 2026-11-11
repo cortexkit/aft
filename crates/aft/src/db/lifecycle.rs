@@ -338,6 +338,30 @@ pub fn connection_snapshot() -> SqliteConnectionSnapshot {
 }
 
 #[derive(Debug)]
+pub(crate) struct CheckpointStats {
+    attempts: AtomicU64,
+    mutex_hold_ns: AtomicU64,
+}
+
+impl CheckpointStats {
+    pub(crate) fn record(&self, mutex_hold: std::time::Duration) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        self.mutex_hold_ns.fetch_add(
+            u64::try_from(mutex_hold.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> (u64, std::time::Duration) {
+        (
+            self.attempts.load(Ordering::Relaxed),
+            std::time::Duration::from_nanos(self.mutex_hold_ns.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+#[derive(Debug)]
 struct WalHookState {
     threshold_pages: AtomicI32,
     last_log_frames: AtomicI32,
@@ -349,6 +373,7 @@ struct WalHookState {
     residual_counter: WriteCounter,
     owner: OnceLock<Arc<super::deferred_checkpoint::Request>>,
     lag_reported: AtomicBool,
+    checkpoint_stats: Arc<CheckpointStats>,
     #[cfg(test)]
     inline_for_attribution_test: AtomicBool,
 }
@@ -728,6 +753,10 @@ impl TrackedConnection {
             residual_counter,
             owner: OnceLock::new(),
             lag_reported: AtomicBool::new(false),
+            checkpoint_stats: Arc::new(CheckpointStats {
+                attempts: AtomicU64::new(0),
+                mutex_hold_ns: AtomicU64::new(0),
+            }),
             #[cfg(test)]
             inline_for_attribution_test: AtomicBool::new(false),
         });
@@ -847,6 +876,10 @@ impl TrackedConnection {
                 self.wal_hook.owner.get().unwrap().schedule();
             }
         }
+    }
+
+    pub(crate) fn checkpoint_stats(&self) -> Arc<CheckpointStats> {
+        Arc::clone(&self.wal_hook.checkpoint_stats)
     }
 
     /// Return false while a reader pins the WAL or SQLite cannot checkpoint.

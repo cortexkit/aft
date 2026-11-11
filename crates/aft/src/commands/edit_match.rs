@@ -1267,6 +1267,18 @@ mod tests {
     #[test]
     #[ignore = "manual before/after WAL checkpoint latency measurement"]
     fn wal_checkpoint_edit_latency_probe() {
+        run_wal_checkpoint_edit_latency_probe(false);
+    }
+
+    #[test]
+    #[ignore = "manual WAL checkpoint measurement with concurrent fsync load"]
+    fn wal_checkpoint_edit_latency_probe_with_disk_writer() {
+        run_wal_checkpoint_edit_latency_probe(true);
+    }
+
+    fn run_wal_checkpoint_edit_latency_probe(disk_writer: bool) {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
         use std::time::Instant;
 
@@ -1289,6 +1301,36 @@ mod tests {
             backup.set_db_harness(crate::harness::Harness::Opencode);
             backup.set_db_project_key("checkpoint-probe".to_owned());
         }
+        let checkpoint_stats = pool.lock().unwrap().checkpoint_stats();
+        let checkpoint_before = checkpoint_stats.snapshot();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = disk_writer.then(|| {
+            let stop = Arc::clone(&stop);
+            let io_path = storage.path().join("checkpoint-io-load.bin");
+            let (started, ready) = std::sync::mpsc::sync_channel(1);
+            let writer = std::thread::spawn(move || {
+                let mut file = std::fs::File::create(io_path).unwrap();
+                let block = vec![0x5a; 1024 * 1024];
+                let mut rounds = 0;
+                let mut started = Some(started);
+                while !stop.load(Ordering::Relaxed) {
+                    file.set_len(0).unwrap();
+                    std::io::Seek::rewind(&mut file).unwrap();
+                    file.write_all(&block).unwrap();
+                    if let Some(started) = started.take() {
+                        started.send(()).unwrap();
+                    }
+                    for _ in 1..256 {
+                        file.write_all(&block).unwrap();
+                    }
+                    file.sync_all().unwrap();
+                    rounds += 1;
+                }
+                rounds
+            });
+            ready.recv().unwrap();
+            writer
+        });
         let before = crate::db::lifecycle::inline_checkpoints_on_this_thread();
         let mut durations = Vec::new();
         const N: usize = 200;
@@ -1315,6 +1357,15 @@ mod tests {
                 .unwrap();
             durations.push(started.elapsed().as_secs_f64() * 1000.0);
         }
+        stop.store(true, Ordering::Relaxed);
+        let writer_rounds = writer.map(|writer| writer.join().unwrap()).unwrap_or(0);
+        let checkpoint_after = checkpoint_stats.snapshot();
+        let checkpoint_attempts = checkpoint_after.0 - checkpoint_before.0;
+        let checkpoint_mutex_hold = checkpoint_after.1 - checkpoint_before.1;
+        assert!(checkpoint_attempts > 0);
+        if disk_writer {
+            assert!(writer_rounds > 0);
+        }
         durations.sort_by(f64::total_cmp);
         let page_size: usize = pool
             .lock()
@@ -1328,9 +1379,10 @@ mod tests {
         assert!(sqlite.wal_high_water_frames >= 1000);
         assert_eq!(request_checkpoints, 0);
         println!(
-            "wal_edit_probe n={N} payload_bytes={PAYLOAD} payload_pages={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} request_checkpoints={} wal_high_water_frames={} lag_events={}",
+            "wal_edit_probe n={N} disk_writer={disk_writer} fsynced_256mib_rounds={writer_rounds} payload_bytes={PAYLOAD} payload_pages={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} request_checkpoints={} wal_high_water_frames={} lag_events={} background_checkpoint_attempts={checkpoint_attempts} checkpoint_shared_mutex_hold_ms={:.6}",
             N * PAYLOAD / page_size, durations[N / 2], durations[N * 95 / 100],
             durations[N - 1], request_checkpoints, sqlite.wal_high_water_frames, sqlite.wal_checkpoint_lag_events,
+            checkpoint_mutex_hold.as_secs_f64() * 1000.0,
         );
         drop(ctx);
         drop(pool);

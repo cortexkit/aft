@@ -86,6 +86,7 @@ pub(crate) fn register(pool: &Arc<Mutex<TrackedConnection>>) {
     let conn = pool
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stats = conn.checkpoint_stats();
     conn.set_checkpoint_owner(Box::new(move || {
         let Some(pool) = weak.upgrade() else {
             return true;
@@ -95,7 +96,10 @@ pub(crate) fn register(pool: &Arc<Mutex<TrackedConnection>>) {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
-        conn.checkpoint_in_background()
+        let started = Instant::now();
+        let finished = conn.checkpoint_in_background();
+        stats.record(started.elapsed());
+        finished
     }));
 }
 
