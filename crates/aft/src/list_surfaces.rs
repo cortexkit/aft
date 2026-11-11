@@ -1251,12 +1251,6 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "shrinks an I/O buffer to the number of bytes read; later chunks retain the rest of the file, so no result rows are cut",
     },
     ExclusionEntry {
-        file: "bounded_io.rs",
-        enclosing_item: "Reader::append",
-        location_or_primitive: "take(size as u64)",
-        reason: "limits one incremental file read; later appends or rest read the remaining bytes, so no result rows are cut",
-    },
-    ExclusionEntry {
         file: "commands/semantic_search/snippet_bounds.rs",
         enclosing_item: "LineWindow",
         location_or_primitive: "SNIPPET_LINE_MAX_CHARS",
