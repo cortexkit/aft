@@ -3,8 +3,10 @@
 
 pub mod key;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +56,67 @@ struct Record {
 
 pub(crate) fn canonical_root(root: &Path) -> PathBuf {
     crate::cache_location::canonical_root(root)
+}
+
+#[derive(Clone)]
+pub(crate) struct ConfiguredArtifactAccess {
+    pub(crate) project_root: PathBuf,
+    pub(crate) shared_key: String,
+    pub(crate) private_key: String,
+    pub(crate) borrow_only_shared: bool,
+    pub(crate) registered: bool,
+}
+
+static CONFIGURED_ARTIFACT_ACCESS: OnceLock<Mutex<HashMap<PathBuf, ConfiguredArtifactAccess>>> =
+    OnceLock::new();
+
+fn configured_artifact_access() -> &'static Mutex<HashMap<PathBuf, ConfiguredArtifactAccess>> {
+    CONFIGURED_ARTIFACT_ACCESS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn artifact_access(project_root: &Path) -> Option<ConfiguredArtifactAccess> {
+    configured_artifact_access()
+        .lock()
+        .ok()?
+        .get(project_root)
+        .cloned()
+}
+
+/// Return the artifact key registered during configure without deriving a new
+/// key from Git or reading the older identity pin in aft.db.
+pub(crate) fn configured_artifact_key(project_root: &Path) -> Option<String> {
+    let project_root = canonical_root(project_root);
+    configured_artifact_access()
+        .lock()
+        .ok()?
+        .get(&project_root)
+        .filter(|access| !access.shared_key.is_empty())
+        .map(|access| access.shared_key.clone())
+}
+
+/// Register the worktree topology already detected by configure so artifact
+/// APIs can enforce it without repeating a Git subprocess on every write path.
+pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_only_shared: bool) {
+    let project_root = canonical_root(project_root);
+    let access = ConfiguredArtifactAccess {
+        private_key: crate::path_identity::project_scope_key(&project_root),
+        project_root,
+        shared_key: shared_key.to_string(),
+        borrow_only_shared,
+        registered: true,
+    };
+    if let Ok(mut configured) = configured_artifact_access().lock() {
+        // Bounded, but never a wholesale clear: dropping still-live roots'
+        // capabilities would silently flip them onto the fail-closed
+        // (shared-artifact-read-only) fallback. Evict an arbitrary other entry instead —
+        // any evicted-but-live root re-registers on its next configure.
+        if configured.len() >= 4_096 && !configured.contains_key(&access.project_root) {
+            if let Some(evict) = configured.keys().next().cloned() {
+                configured.remove(&evict);
+            }
+        }
+        configured.insert(access.project_root.clone(), access);
+    }
 }
 
 fn record_path(root: &Path, storage: &Path) -> PathBuf {
@@ -193,7 +256,7 @@ pub(crate) fn bind_with_recheck(
     }
     let path = record_path(&root, storage);
     let directory = path.parent().unwrap();
-    crate::backup::create_private_durable_dir(directory)?;
+    crate::durable_dir::create_private_durable_dir(directory)?;
     let lock_path = path.with_extension("lock");
     crate::production_storage::refuse_write(&lock_path)?;
     let mut options = crate::private_storage::options();

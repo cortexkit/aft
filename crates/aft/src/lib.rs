@@ -93,6 +93,7 @@ pub mod db;
 pub mod developer_tools;
 pub mod disk_floor;
 pub(crate) mod durability;
+pub(crate) mod durable_dir;
 pub mod edit;
 pub mod effective_path;
 pub mod engram_catalog;

@@ -131,7 +131,7 @@ pub fn artifact_cache_key(project_root: &Path) -> String {
 /// derive a key from Git at `project_root`. This fallback is for standalone build
 /// APIs whose callers have not configured a project or supplied a storage path.
 pub(crate) fn artifact_cache_key_for_build(project_root: &Path) -> String {
-    crate::root_cache::configured_artifact_key(project_root)
+    super::configured_artifact_key(project_root)
         .unwrap_or_else(|| artifact_cache_key(project_root))
 }
 
