@@ -93,13 +93,13 @@ impl std::fmt::Debug for ConsentOutcome {
 /// the ask through the daemon's Cingulate client and reports what happened.
 /// The trait exists so the outcome table can be tested without a daemon, and
 /// so a later transport shape changes only the installed dispatcher.
-pub trait SecretConsentTransport: Send + Sync {
+pub trait SecretConsentTransport: Send + Sync + 'static {
     /// Keep cleanup on the daemon runtime, not a command's short-lived proxy.
     fn runtime(&self) -> Option<tokio::runtime::Handle> {
         None
     }
     /// Await one shared card. Production observes cancellation while awaiting
-    /// Cingulate and withdraws before releasing its scoped transport.
+    /// the Cingulate consent service and withdraws before releasing its scoped transport.
     fn wait(
         self: std::sync::Arc<Self>,
         request: SecretConsentRequest,
@@ -198,6 +198,7 @@ impl Cancellation {
 
 type CardKey = (SecretScope, String);
 struct SharedCard {
+    created: std::time::Instant,
     statement: String,
     expires: u64,
     outcome: tokio::sync::watch::Sender<Option<ConsentOutcome>>,
@@ -236,13 +237,15 @@ pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcom
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cards.retain(|_, card| {
-            card.expires > super::vault::now_ms()
+            card.created.elapsed() < std::time::Duration::from_secs(600)
+                || card.expires > super::vault::now_ms()
                 || card.waiters.load(std::sync::atomic::Ordering::Acquire) > 0
         });
         let card = cards
             .entry((request.scope.clone(), request.request_id.clone()))
             .or_insert_with(|| {
                 let card = std::sync::Arc::new(SharedCard {
+                    created: std::time::Instant::now(),
                     statement: request.statement_b64url.clone(),
                     expires: request.expires_at_ms.unwrap_or(u64::MAX),
                     outcome: tokio::sync::watch::channel(None).0,

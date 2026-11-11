@@ -47,12 +47,14 @@ pub(crate) struct State {
     pub other_pending_in_scope: usize,
     pub other_pending_total: usize,
     pub record: Option<Record>,
+    pub records: Vec<Record>,
     pub once: bool,
     pub next_request: usize,
     approved: HashSet<PendingKey>,
     pub(super) pending: HashMap<PendingKey, Value>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Record {
     pub name: String,
     pub host: String,
@@ -144,6 +146,12 @@ impl State {
             }
         };
         let coverage = params.coverage;
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.name == params.name)
+            .or(self.record.as_ref())
+            .cloned();
         if coverage == Coverage::AgentAndWorkers && kind != "head" {
             return invalid();
         }
@@ -153,12 +161,12 @@ impl State {
         let matches = match &params.target {
             Target::ApiKey(target) => {
                 principal == "aft"
-                    && params.name == self.record.as_ref().map_or("key", |r| r.name.as_str())
+                    && params.name == record.as_ref().map_or("key", |r| r.name.as_str())
                     && target.scheme == "https"
                     && target.port.unwrap_or(443) == 443
-                    && target.host == self.record.as_ref().map_or("x.test", |r| r.host.as_str())
+                    && target.host == record.as_ref().map_or("x.test", |r| r.host.as_str())
                     && {
-                        let prefix = self.record.as_ref().map_or("/repos/a", |r| r.path.as_str());
+                        let prefix = record.as_ref().map_or("/repos/a", |r| r.path.as_str());
                         target.path == prefix || target.path.starts_with(&format!("{prefix}/"))
                     }
             }
@@ -193,7 +201,7 @@ impl State {
                 self.pending.remove(&key);
             }
             let mut released = golden(3);
-            if let Some(record) = &self.record {
+            if let Some(record) = &record {
                 released["location"] = json!(record.location);
                 released["key_b64url"] =
                     json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&record.key));
@@ -235,7 +243,7 @@ impl State {
             statement["durations"] = json!(["permanent"]);
         }
         statement["agent_id"] = json!(stamp.attributes.agent_id);
-        if let Some(record) = &self.record {
+        if let Some(record) = &record {
             statement["secret"]["name"] = json!(record.name);
             statement["use"] =
                 json!({"host":record.host, "path_prefix":record.path, "location":record.location});

@@ -227,7 +227,7 @@ impl SubcSecretConsent {
             () = cancelled => {
                 let result = self.call(request, "consent.withdraw", serde_json::json!({"elicitation_id": card.elicitation}), SECRET_CONSENT_TIMEOUT).await;
                 if result.is_err() {
-                    tracing::warn!("secret consent withdrawal failed");
+                    crate::slog_warn!("secret consent withdrawal failed");
                     return consent_unavailable("Cingulate could not settle the secret-use card");
                 }
                 card.answered = Some(ConsentOutcome::Expired);
@@ -292,7 +292,7 @@ impl crate::secret::SecretConsentTransport for SubcSecretConsent {
                 if outcome != ConsentOutcome::Pending {
                     return outcome;
                 }
-                // Cingulate returns pending at its per-await cap. Re-awaiting
+                // The Cingulate consent service returns pending at its per-await cap. Re-awaiting
                 // the same card is read-only; it never files another card.
                 tokio::task::yield_now().await;
             }
@@ -765,6 +765,7 @@ pub(crate) fn use_current_secret_labels(
     vault: Arc<dyn crate::secret::SecretVault>,
     labels: &[String],
     target: &crate::secret::ApiKeyTarget,
+    request_target: &str,
 ) -> Vec<LaunchDecision> {
     if labels.is_empty() {
         return Vec::new();
@@ -803,19 +804,66 @@ pub(crate) fn use_current_secret_labels(
     );
     let labels = labels.to_vec();
     let target = target.clone();
+    let request_target = request_target.to_owned();
     let future = async move {
         use futures_util::StreamExt;
         let mut budget = coordinator.budget();
         let mut pending = futures_util::stream::FuturesUnordered::new();
         for (index, label) in labels.iter().enumerate() {
             let target = &target;
+            let request_target = &request_target;
             let coordinator = &coordinator;
             let expires = budget.expires_at_ms;
             pending.push(async move {
                 (
                     index,
                     coordinator
-                        .use_in_request(label, target, expires, || async { Ok(()) })
+                        .use_planned_in_request(
+                            label,
+                            target,
+                            expires,
+                            |location| {
+                                let location =
+                                    secret_rules::location::parse_vault_location(location)
+                                        .ok_or(crate::secret::requests::UseError::Unavailable)?;
+                                if !matches!(location, secret_rules::location::Location::Query(_)) {
+                                    return Ok(());
+                                }
+                                let authority = secret_rules::target::ConnectAuthority {
+                                    host: target.host.clone(),
+                                    port: target.port.unwrap_or(443),
+                                };
+                                let rule = secret_rules::location::LabelRule {
+                                    label: label.clone(),
+                                    host: target.host.clone(),
+                                    port: 443,
+                                    path_prefix: target.path.clone(),
+                                    location,
+                                };
+                                let view = secret_rules::location::RequestView::new(
+                                    request_target,
+                                    Vec::new(),
+                                );
+                                let dummy =
+                                    [(label.clone(), b"proxy-planning-value-0000".to_vec())];
+                                // An already-covered request returns its location only with the release, so its location-dependent refusal can occur only afterwards.
+                                if secret_rules::location::evaluate_request_with_connect(
+                                    &view,
+                                    &authority,
+                                    &[rule],
+                                    &dummy,
+                                )
+                                .refusal
+                                .is_some()
+                                {
+                                    Err(crate::secret::requests::UseError::Unavailable)
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            |_| Ok(()),
+                            || async { Ok(()) },
+                        )
                         .await,
                 )
             });

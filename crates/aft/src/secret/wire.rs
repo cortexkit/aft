@@ -217,7 +217,7 @@ pub struct ReleasedLogin {
     pub(super) password: crate::secret::vault::Material,
     /// The current TOTP code, when the record holds a seed. The seed itself
     /// never leaves the vault.
-    pub totp: Option<String>,
+    pub totp: Option<zeroize::Zeroizing<String>>,
 }
 
 impl ReleasedLogin {
@@ -361,7 +361,7 @@ impl Serialize for SecretUseReply {
                 map.serialize_entry("username", &login.username)?;
                 map.serialize_entry("password", password)?;
                 if let Some(totp) = &login.totp {
-                    map.serialize_entry("totp", totp)?;
+                    map.serialize_entry("totp", totp.as_str())?;
                 }
             }
             Self::ApprovalRequired(request) => {
@@ -383,9 +383,13 @@ fn b64url() -> base64::engine::general_purpose::GeneralPurpose {
 /// Read `key_b64url`, which is strict unpadded base64url (nonzero trailing
 /// bits included).
 pub(super) fn decode_key(text: &str) -> Result<Vec<u8>, ReplyError> {
-    b64url()
-        .decode(text)
-        .map_err(|_| ReplyError::BadKeyEncoding)
+    let mut decoded = zeroize::Zeroizing::new(vec![0u8; base64::decoded_len_estimate(text.len())]);
+    let length = b64url()
+        .decode_slice(text, &mut decoded)
+        .map_err(|_| ReplyError::BadKeyEncoding)?;
+    crate::secret::vault::zeroize(&mut decoded[length..]);
+    decoded.truncate(length);
+    Ok(std::mem::take(&mut *decoded))
 }
 
 /// The canonical 26-character Crockford ULID the vault's ids use: 26 base32
@@ -522,7 +526,7 @@ fn parse_released(object: &serde_json::Map<String, Value>) -> Result<SecretUseRe
                 })?;
             let totp = match totp {
                 None | Some(Value::Null) => None,
-                Some(Value::String(code)) => Some(code),
+                Some(Value::String(code)) => Some(zeroize::Zeroizing::new(code)),
                 Some(_) => {
                     return Err(ReplyError::Malformed {
                         detail: "totp is not a string".into(),

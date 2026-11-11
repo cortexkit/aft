@@ -62,7 +62,7 @@ async fn audit_transfer_coding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn audit_one_addressed_release_is_consumed_by_one_request() {
+async fn audit_expiry_revocation_at_send() {
     let server = Server::new("delay-h1").await;
     let vault = Vault::new();
     let cfg = config(
@@ -87,16 +87,17 @@ async fn audit_one_addressed_release_is_consumed_by_one_request() {
         .unwrap();
     assert_eq!(
         vault.calls.load(Ordering::SeqCst),
-        1,
-        "ask before opening the upstream"
+        0,
+        "do not release material before the verified handshake finishes"
     );
     vault.denied.store(true, Ordering::SeqCst);
     server.tls_release.notify_one();
     let (reply, mut client) = worker.join().unwrap();
     assert_eq!(
-        reply["status"], 200,
-        "the release covers the request already admitted"
+        reply["status"], 403,
+        "a denial during the handshake must prevent credential dispatch"
     );
+    server.tls_release.notify_one();
     assert_eq!(
         client.request(
             "/approved",
@@ -105,7 +106,7 @@ async fn audit_one_addressed_release_is_consumed_by_one_request() {
         )["status"],
         403
     );
-    assert_eq!(server.seen.lock().len(), 1);
+    assert_eq!(server.seen.lock().len(), 0);
     assert_eq!(
         vault.calls.load(Ordering::SeqCst),
         2,

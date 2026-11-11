@@ -54,6 +54,7 @@ impl Vault {
 impl SecretVault for Vault {
     fn use_secret(&self, scope: &SecretScope, label: &str, target: &ApiKeyTarget) -> UseAnswer {
         assert_eq!(scope.reference(), "head");
+        let count = self.calls.fetch_add(1, Ordering::SeqCst);
         let Some(rule) = self.rules.lock().get(label).cloned() else {
             return UseAnswer::NotFound;
         };
@@ -64,7 +65,6 @@ impl SecretVault for Vault {
             return UseAnswer::NotFound;
         }
         let location = crate::secret::vault::fake::location_text(&rule.location);
-        let count = self.calls.fetch_add(1, Ordering::SeqCst);
         if self.block_material.load(Ordering::Acquire) {
             self.material_entered.notify_one();
             let mut released = self.material_released.lock().unwrap();

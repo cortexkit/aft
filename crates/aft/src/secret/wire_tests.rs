@@ -201,7 +201,10 @@ fn a_golden_released_login_reply_parses_with_and_without_totp() {
     };
     assert_eq!(login.username, "alice");
     assert_eq!(login.password(), b"correct horse");
-    assert_eq!(login.totp.as_deref(), Some("123456"));
+    assert_eq!(
+        login.totp.as_ref().map(|code| code.as_str()),
+        Some("123456")
+    );
 
     let without = parse_reply(&json!({
         "status": "released",

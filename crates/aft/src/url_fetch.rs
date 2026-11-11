@@ -990,7 +990,9 @@ fn fetch_with_secrets(
         let waiting = Instant::now();
         let outbound = secret_hop(&current, hop, secrets, &mut held)?;
         // Approval is a separate person-wait budget, not network time.
-        deadline.at += waiting.elapsed();
+        let waited = waiting.elapsed();
+        deadline.at += waited;
+        crate::bounded_io::exclude_secret_approval_wait(waited);
         if outbound.is_some() {
             key_sent.set(true);
         }
@@ -1454,8 +1456,12 @@ fn secret_hop(
         }
         eligible.push(label.clone());
     }
-    let answers =
-        crate::subc::use_current_secret_labels(secrets.vault.clone(), &eligible, &addressed);
+    let answers = crate::subc::use_current_secret_labels(
+        secrets.vault.clone(),
+        &eligible,
+        &addressed,
+        &target,
+    );
     for (label, answer) in eligible.iter().zip(answers) {
         let answer = match answer {
             crate::subc::LaunchDecision::Proceed(answer) => answer,
@@ -1549,20 +1555,8 @@ fn secret_hop(
 
     edits.sort_by_key(|(start, _, _)| *start);
     let query = current.query().unwrap_or_default().as_bytes();
-    let final_len = edits
-        .iter()
-        .try_fold(query.len(), |len, (start, end, value)| {
-            len.checked_sub(end - start)?.checked_add(value.len())
-        })
-        .ok_or_else(|| refused(held, "malformed_query"))?;
-    let mut substituted = Zeroizing::new(Vec::with_capacity(final_len));
-    let mut cursor = 0;
-    for (start, end, replacement) in &edits {
-        substituted.extend_from_slice(&query[cursor..*start]);
-        substituted.extend_from_slice(replacement);
-        cursor = *end;
-    }
-    substituted.extend_from_slice(&query[cursor..]);
+    let substituted =
+        substitute_query(query, &edits).ok_or_else(|| refused(held, "malformed_query"))?;
     let Ok(substituted) = std::str::from_utf8(&substituted) else {
         return Err(refused(&*held, "malformed_query"));
     };
@@ -1576,10 +1570,45 @@ fn secret_hop(
     };
     emit_hop_audit(secrets, held, hop, Some(&authority), &rules, decide)
         .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
+    Ok(Some(secret_outbound_url(current, wire_path, substituted)))
+}
+
+#[cfg(test)]
+thread_local! { static SECRET_URL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+fn secret_outbound_url(current: &Url, wire_path: &str, substituted: &str) -> Url {
+    #[cfg(test)]
+    SECRET_URL_BUILDS.with(|n| n.set(n.get() + 1));
     let mut outbound = current.clone();
     outbound.set_path(wire_path);
     outbound.set_query(Some(substituted));
-    Ok(Some(outbound))
+    outbound
+}
+
+fn substitute_query(
+    query: &[u8],
+    edits: &[(usize, usize, Zeroizing<Vec<u8>>)],
+) -> Option<Zeroizing<Vec<u8>>> {
+    let final_len = edits
+        .iter()
+        .try_fold(query.len(), |len, (start, end, value)| {
+            len.checked_sub(end.checked_sub(*start)?)?
+                .checked_add(value.len())
+        })?;
+    // Allocate the complete result before copying the first credential: growing
+    // a partially filled Vec would free an old, unwiped credential allocation.
+    let mut substituted = Zeroizing::new(Vec::with_capacity(final_len));
+    let mut cursor = 0;
+    for (start, end, replacement) in edits {
+        if *start < cursor || *end < *start || *end > query.len() {
+            return None;
+        }
+        substituted.extend_from_slice(&query[cursor..*start]);
+        substituted.extend_from_slice(replacement);
+        cursor = *end;
+    }
+    substituted.extend_from_slice(&query[cursor..]);
+    Some(substituted)
 }
 
 /// One audit record per scanned label for one hop. A record is handed to the
@@ -4119,6 +4148,88 @@ mod fetch_times_tests {
         assert_eq!(
             times.render(),
             "url_fetch=fetches:2,cache_hits:1,remembered:0,lookup:2.10,connect:40.00,first_byte:5800.00,body:300.00,bytes:51234,convert:4.00,redirects:1,retries:0,error:url_fetch_failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod secret_audit_regressions {
+    use super::*;
+    #[test]
+    fn substituted_query_allocates_its_exact_complete_size_before_copying_any_key() {
+        let first = Zeroizing::new(vec![b'a'; 1001]);
+        let second = Zeroizing::new(vec![b'b'; 2103]);
+        let result = substitute_query(b"a=x&b=y", &[(2, 3, first), (6, 7, second)]).unwrap();
+        assert_eq!(result.len(), 5 + 1001 + 2103);
+        assert_eq!(
+            result.capacity(),
+            result.len(),
+            "a later key must not reallocate a buffer that already contains an earlier key"
+        );
+        assert_eq!(&result[..2], b"a=");
+        assert_eq!(&result[1003..1006], b"&b=");
+    }
+    #[test]
+    fn approval_wait_preserves_the_fetch_and_read_back_network_budget() {
+        let _scope = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
+            Duration::from_secs(25),
+        )));
+        let before = crate::bounded_io::current().unwrap().deadline;
+        let deadline = FetchDeadline::for_current_call();
+        let person_wait = Duration::from_secs(360);
+        crate::bounded_io::exclude_secret_approval_wait(person_wait);
+        assert_eq!(
+            crate::bounded_io::current().unwrap().deadline,
+            before + person_wait
+        );
+        assert_eq!(deadline.allowed, URL_FETCH_CEILING);
+    }
+    #[test]
+    fn failed_audit_does_not_create_an_ordinary_key_bearing_url() {
+        struct NoAudit;
+        impl crate::secret::SecretVault for NoAudit {
+            fn use_secret(
+                &self,
+                _: &crate::secret::SecretScope,
+                _: &str,
+                _: &crate::secret::ApiKeyTarget,
+            ) -> crate::secret::UseAnswer {
+                crate::secret::UseAnswer::Released(crate::secret::ReleasedApiKey::new(
+                    "query:key".into(),
+                    crate::secret::Material::new(b"released-test-key-123456".to_vec()),
+                ))
+            }
+            fn audit(&self, _: &AuditRecordV1) -> Result<(), crate::secret::AuditError> {
+                Err(crate::secret::AuditError::Unavailable {
+                    detail: "offline".into(),
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(serde_json::json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"audit-url","kind":"head","scope_epoch":1,"owner_authorized":true})).unwrap();
+        let scope = crate::secret::SecretScope::from_stamp(&stamp);
+        SECRET_URL_BUILDS.with(|n| n.set(0));
+        crate::subc::with_secret_identity_for_test(root.path(), stamp, || {
+            let secrets = SecretFetch {
+                vault: Arc::new(NoAudit),
+                authorization: Some(scope),
+                labels: vec!["test".into()],
+                test_https_port: None,
+                call_id: "audit-url".into(),
+            };
+            let mut held = HeldKeys::default();
+            assert!(secret_hop(
+                &Url::parse("https://example.test/doc.md?key={{ck-secret:test}}").unwrap(),
+                0,
+                &secrets,
+                &mut held
+            )
+            .is_err());
+        });
+        assert_eq!(
+            SECRET_URL_BUILDS.with(std::cell::Cell::get),
+            0,
+            "audit refusal must precede construction of any Url that owns a key"
         );
     }
 }

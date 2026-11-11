@@ -218,17 +218,34 @@ async fn prepare_and_send(
         let addressed = &addressed;
         let reconnected = &reconnected;
         let expires = budget.expires_at_ms;
+        let (target, headers, body) = (&target, &parts.headers, &body);
         pending.push(async move {
             let answer = if state.is_https_port(authority.port) {
                 state
                     .approvals
-                    .use_in_request(label, addressed, expires, || async {
-                        let connection = connect_upstream(authority, state, ws)
-                            .await
-                            .map_err(|_| crate::secret::requests::UseError::Unavailable)?;
-                        reconnected.lock().await.push(connection);
-                        Ok(())
-                    })
+                    .use_planned_in_request(
+                        label,
+                        addressed,
+                        expires,
+                        |location| {
+                            plan_location(
+                                label, location, addressed, authority, target, headers, body,
+                            )
+                            .map_err(|_| crate::secret::requests::UseError::Unavailable)
+                        },
+                        |key| {
+                            state
+                                .install(label, key)
+                                .map_err(|_| crate::secret::requests::UseError::Unavailable)
+                        },
+                        || async {
+                            let connection = connect_upstream(authority, state, ws)
+                                .await
+                                .map_err(|_| crate::secret::requests::UseError::Unavailable)?;
+                            reconnected.lock().await.push(connection);
+                            Ok(())
+                        },
+                    )
                     .await
             } else {
                 Ok(crate::secret::UseAnswer::NotFound)
@@ -259,7 +276,7 @@ async fn prepare_and_send(
                 let (location, material) = released.into_parts();
                 let location = secret_rules::location::parse_vault_location(&location)
                     .ok_or_else(|| label.clone())?;
-                // Covered requests disclose their location only with the release,
+                // The vault returns the location with the released material,
                 // so a location-dependent refusal cannot precede that release.
                 let rule = secret_rules::location::LabelRule {
                     label: label.clone(),
@@ -325,6 +342,7 @@ async fn prepare_and_send(
     }
     // Earlier releases belong only to this request and are already spent: any
     // later refusal or deadline drops them without sending or reusing them.
+    drop(pending);
     let upstream = reconnected.into_inner().pop().unwrap_or(initial);
     let http2 = matches!(&upstream, Upstream::Http2(_));
     let response = {
@@ -457,6 +475,48 @@ fn not_approved(label: &str, host: &str, state: &State) -> Response<Body> {
     )));
     *response.status_mut() = hyper::StatusCode::FORBIDDEN;
     response
+}
+
+fn plan_location(
+    label: &str,
+    token: &str,
+    addressed: &crate::secret::ApiKeyTarget,
+    authority: &ConnectAuthority,
+    target: &str,
+    headers: &hyper::HeaderMap,
+    body: &[u8],
+) -> Result<(), ()> {
+    let location = secret_rules::location::parse_vault_location(token).ok_or(())?;
+    if let Location::Json(pointer) = &location {
+        let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
+        if value
+            .pointer(pointer)
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err(());
+        }
+    }
+    let rule = secret_rules::location::LabelRule {
+        label: label.into(),
+        host: addressed.host.clone(),
+        port: authority.port,
+        path_prefix: addressed.path.clone(),
+        location,
+    };
+    let headers = headers
+        .iter()
+        .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
+        .collect();
+    let view = RequestView::new(target, headers).with_body(body);
+    let dummy = [(label.to_owned(), b"proxy-planning-value-0000".to_vec())];
+    if evaluate_request_with_connect(&view, authority, &[rule], &dummy)
+        .refusal
+        .is_some()
+    {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn body_buffer(_has_json: bool) -> Zeroizing<Vec<u8>> {

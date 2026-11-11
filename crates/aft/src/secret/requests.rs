@@ -36,7 +36,7 @@ impl RequestBudget {
         self.deadline.as_mut().await;
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum UseError {
     NotApproved,
     Unavailable,
@@ -180,17 +180,47 @@ impl RequestSecrets {
         label: &str,
         target: &ApiKeyTarget,
         expires_at_ms: u64,
+        before_retry: F,
+    ) -> Result<UseAnswer, UseError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), UseError>>,
+    {
+        self.use_planned_in_request(
+            label,
+            target,
+            expires_at_ms,
+            |_| Ok(()),
+            |_| Ok(()),
+            before_retry,
+        )
+        .await
+    }
+
+    pub(crate) async fn use_planned_in_request<F, Fut, P, O>(
+        &self,
+        label: &str,
+        target: &ApiKeyTarget,
+        expires_at_ms: u64,
+        plan: P,
+        observe: O,
         mut before_retry: F,
     ) -> Result<UseAnswer, UseError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<(), UseError>>,
+        P: Fn(&str) -> Result<(), UseError>,
+        O: Fn(&[u8]) -> Result<(), UseError>,
     {
         let mut answered = std::collections::HashSet::new();
         let mut once = false;
         loop {
             let answer = self.ask(label, target).await;
             let UseAnswer::ApprovalRequired(pending) = answer else {
+                if let UseAnswer::Released(released) = &answer {
+                    observe(released.material())?;
+                    plan(&released.location)?;
+                }
                 if matches!(answer, UseAnswer::Released(_)) {
                     self.once
                         .lock()
@@ -203,6 +233,24 @@ impl RequestSecrets {
             // recorded decline/expiry (or the request deadline) means denial.
             if !answered.insert(pending.request_id.clone()) {
                 return Err(UseError::Unavailable);
+            }
+            // A pending statement already names the location. Check its plan
+            // before asking the person or consuming a subsequent release.
+            use base64::Engine;
+            if let Ok(bytes) =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&pending.statement_b64url)
+            {
+                if let Ok(statement) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(location) = statement["use"]["location"].as_str() {
+                        plan(location)?;
+                    }
+                }
+            }
+            if once {
+                self.once
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(label.into(), true);
             }
             once = self.approve(label, target, pending, expires_at_ms).await?
                 == ConsentOutcome::AnsweredOnce;

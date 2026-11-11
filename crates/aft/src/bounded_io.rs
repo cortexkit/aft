@@ -554,6 +554,16 @@ impl Drop for Scope {
 pub(crate) fn current() -> Option<Budget> {
     CURRENT.with(|current| current.borrow().clone())
 }
+
+/// Person approval has its own deadline; preserve the remaining filesystem and
+/// reply budget when a held fetch resumes on this tool thread.
+pub(crate) fn exclude_secret_approval_wait(elapsed: Duration) {
+    CURRENT.with(|current| {
+        if let Some(budget) = current.borrow_mut().as_mut() {
+            budget.deadline += elapsed;
+        }
+    });
+}
 pub(crate) fn enter_if_absent(duration: Duration) -> Scope {
     let budget = current().unwrap_or_else(|| Budget::after(duration));
     Scope(CURRENT.with(|current| current.replace(Some(budget))))

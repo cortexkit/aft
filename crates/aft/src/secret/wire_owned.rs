@@ -58,7 +58,7 @@ struct Envelope {
 #[serde(deny_unknown_fields)]
 struct Failure {
     code: Text,
-    class: Text,
+    class: Option<Text>,
 }
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -118,7 +118,7 @@ impl ResultBody {
             }
             return Ok(SecretUseAnswer::Refused(VaultError {
                 code: error.code.as_str().into(),
-                class: error.class.as_str().into(),
+                class: error.class.as_ref().map(|class| class.as_str().into()),
             }));
         }
         let text = |v: &Option<Text>| v.as_ref().map(Text::as_str).ok_or_else(malformed);
@@ -142,7 +142,7 @@ impl ResultBody {
                             .totp
                             .as_ref()
                             .and_then(|v| v.as_ref())
-                            .map(|v| v.as_str().into()),
+                            .map(|v| Zeroizing::new(v.as_str().into())),
                     })
                 }
                 _ => return Err(malformed()),
@@ -198,5 +198,32 @@ mod tests {
         WIPES.with(|n| n.set(0));
         assert!(matches!(parse(bytes), Err(ReplyError::BadKeyEncoding)));
         assert!(WIPES.with(|n| n.get()) >= 4);
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    #[test]
+    fn owned_decoder_reads_every_sender_reply_golden_and_refuses_contradictory_outer_envelopes() {
+        for golden in super::super::wire_tests::USE_GOLDENS.lines().skip(3) {
+            let bytes = Zeroizing::new(format!("{{\"result\":{golden}}}"));
+            let SecretUseAnswer::Reply(reply) = parse(bytes.as_bytes()).unwrap() else {
+                panic!("a documented sender reply must decode");
+            };
+            assert_eq!(serde_json::to_string(&reply).unwrap(), golden);
+            for extra in [
+                ",\"unexpected\":null",
+                ",\"code\":\"invalid_params\",\"message\":\"invalid params\"",
+                ",\"error\":{}",
+            ] {
+                let body = format!("{{\"result\":{golden}{extra}}}");
+                assert!(parse(body.as_bytes()).is_err());
+                assert!(
+                    super::super::wire::parse_answer(&serde_json::from_str(&body).unwrap())
+                        .is_err()
+                );
+            }
+        }
     }
 }
