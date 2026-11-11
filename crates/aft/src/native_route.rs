@@ -124,12 +124,13 @@ mod tests {
             ("tool_call", "read", false),
             ("tool_call", "powershell", true),
         ] {
-            let mut request: crate::protocol::RawRequest =
-                serde_json::from_value(serde_json::json!({
-                    "id": "route", "command": command,
-                    "params": {"name": name, "arguments": {"permissions_granted": ["host-token"]}}
-                }))
-                .unwrap();
+            let mut request = crate::protocol::RawRequest {
+                id: "route".into(),
+                command: command.into(),
+                lsp_hints: None,
+                session_id: None,
+                params: serde_json::json!({"name": name, "arguments": {"permissions_granted": ["host-token"]}}),
+            };
             strip_native_approval_metadata(&mut request);
             assert_eq!(
                 request.params["arguments"]
