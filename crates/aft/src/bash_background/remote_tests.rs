@@ -6051,6 +6051,60 @@ fn persist_accepted_with_snapshot(
     persist_accepted_with_snapshot_cap(dir, connection, command, None)
 }
 
+#[tokio::test]
+async fn held_call_startup_reattaches_remote_job_without_a_route_bind() {
+    held_call_startup_remote_result(false).await;
+}
+
+#[tokio::test]
+async fn held_call_startup_lost_remote_job_settles_as_unknown_outcome() {
+    held_call_startup_remote_result(true).await;
+}
+
+async fn held_call_startup_remote_result(lost: bool) {
+    use crate::subc::held_task_recovery::tests as recovery;
+    let daemon = daemon(
+        if lost { Script::Lost } else { Script::Restart },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    let root = storage.join("runner");
+    fs::create_dir_all(&root).unwrap();
+    let old = recovery::context(&root, &storage);
+    let (registry, task_id, _) = persist_accepted_with_snapshot(
+        &root,
+        daemon.connection.clone(),
+        "printf must-not-run-locally",
+    );
+    registry.detach();
+    drop(registry);
+    let layout = resolve_task_layout(&session_tasks_dir(&root, "session"), &task_id).unwrap();
+    let key = recovery::hold_task(&old, &layout, "remote-held");
+    drop(old);
+    let restarted = recovery::context(&root, &storage);
+    let executor = recovery::startup(&restarted).await;
+    let frame = recovery::settled(&restarted, &key).await;
+    if lost {
+        assert_eq!(
+            frame.body,
+            crate::db::call_ledger::unknown_held_result().body
+        );
+    } else {
+        let result: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert!(result["content"].to_string().contains("ABCD"), "{result}");
+        assert_eq!(result["structuredContent"]["exit_code"], 0, "{result}");
+    }
+    let log = daemon.log.lock().unwrap();
+    assert!(log.iter().any(|(_, body)| body["method"] == "exec.attach"));
+    assert!(!log.iter().any(|(_, body)| body["method"] == "exec.run"));
+    drop(log);
+    for actor in executor.actor_contexts() {
+        actor.bash_background().detach();
+    }
+}
+
 #[test]
 fn shells_v1_remote_acceptance_persists_only_a_reported_placement_host() {
     use exec::types::Placement;

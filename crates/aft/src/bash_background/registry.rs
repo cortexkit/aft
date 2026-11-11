@@ -1188,11 +1188,28 @@ impl ProjectReplayBatch<'_> {
         session_id: &str,
         project_root: &Path,
     ) -> Result<(), String> {
+        self.replay_saved_session_for_project(
+            storage_dir,
+            &harness.storage_segment(),
+            session_id,
+            project_root,
+        )
+    }
+
+    /// Saved task rows already name their storage namespace. MCP and federated
+    /// namespace slugs cannot be converted back into their original harness.
+    pub(crate) fn replay_saved_session_for_project(
+        self,
+        storage_dir: &Path,
+        harness_segment: &str,
+        session_id: &str,
+        project_root: &Path,
+    ) -> Result<(), String> {
         self.registry.replay_session_in_harness(
             storage_dir,
             session_id,
             Some(project_root),
-            Some(&harness.storage_segment()),
+            Some(harness_segment),
         )
     }
 
@@ -6921,6 +6938,15 @@ impl BgTaskRegistry {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
         Some(ProjectReplayBatch { registry: self })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_registration_identity_for_test(&self, task_id: &str) -> Option<usize> {
+        self.task(task_id).map(|task| Arc::as_ptr(&task) as usize)
+    }
+
+    pub(crate) fn task_registration_exists(&self, task_id: &str) -> bool {
+        self.task(task_id).is_some()
     }
 
     pub(crate) fn project_replay_pending(&self, storage_dir: &Path, project_root: &Path) -> bool {

@@ -228,6 +228,7 @@ mod diagnostics_findings;
 mod drain;
 mod flow_read;
 mod health;
+pub(crate) mod held_task_recovery;
 #[cfg(test)]
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
@@ -5532,6 +5533,13 @@ where
     // Arm the existing promised-wake marker before the first turn too: a lock
     // taken before the first select must be just as recoverable as a later one.
     dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
+    held_task_recovery::start(
+        shared_app.clone(),
+        executor.clone(),
+        push_senders.clone(),
+        storage_dir.to_path_buf(),
+        |_| {},
+    );
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
         dispatch_path_metrics.mark_frame_loop_step("LedgerEdge::detach_shells", "", 0);
         for route in ledger_edge.unrouted_shells(&routes) {
