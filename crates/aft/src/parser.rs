@@ -17,6 +17,9 @@ use crate::callgraph_store::join::syntax_index::{Direct, Nav};
 use crate::error::AftError;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
+pub(crate) mod dead_code_facts;
+pub(crate) mod todo_markers;
+
 const MAX_REEXPORT_DEPTH: usize = 10;
 
 /// Upper bound on the bytes kept for one symbol's signature.
