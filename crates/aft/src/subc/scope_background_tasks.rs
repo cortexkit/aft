@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn scope_background_tasks_serializer_vectors_do_not_drift() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let dir = Path::new(crate::test_support::manifest_dir())
             .join("../../test-vectors/scope-background-tasks-v1");
         let params = Params { scope: selector() };
         let request = json!({"op": OPERATION, "params": params});

@@ -420,7 +420,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn directory() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/shells-v1")
+    PathBuf::from(crate::test_support::manifest_dir()).join("../../test-vectors/shells-v1")
 }
 
 fn checksums(vectors: &[(&str, Vec<u8>)]) -> String {

@@ -4587,7 +4587,7 @@ async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
         .find(|f| f["name"] == format!("p1_runner{}", if available { "_pwsh" } else { "_no_pwsh" }))
         .unwrap();
     assert_eq!(reply, expected["reply"]);
-    assert!(bind_route(&restarted, &p1, "broca", "unsupported-harness")
+    assert!(bind_route(&restarted, &p1, "not-a-harness", "unsupported-harness")
         .await
         .is_err());
     // A tool-provider version AFT does not serve refuses the bind and names

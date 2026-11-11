@@ -25,6 +25,7 @@ pub(in crate::subc) fn operator(
 ) -> bool {
     !scoped
         && (matches!(principal, Some(Principal::Direct))
+            && !harness.is_some_and(crate::subc::harness_forces_untrusted)
             || matches!(principal, Some(Principal::Reserved { module_id }) if module_id == "callosum")
                 && harness
                     .is_some_and(|h| h.starts_with("fed-phone:") || h.starts_with("fed-sim:")))
@@ -115,6 +116,7 @@ mod tests {
         };
         for (principal, harness, expected) in [
             (Some(&direct), None, true),
+            (Some(&direct), Some("fed:facade"), false),
             (Some(&callosum), Some("fed-phone:person"), true),
             (Some(&callosum), Some("fed-sim:person"), true),
             (Some(&callosum), Some("fed-computer:person"), false),
