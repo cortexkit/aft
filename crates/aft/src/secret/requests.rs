@@ -42,7 +42,18 @@ pub(crate) enum UseError {
     Expired,
     Cancelled,
     Unavailable,
+    Indeterminate,
     InvalidPlan(&'static str),
+}
+
+/// The approved local refusal text, shared by fetches and proxy requests.
+pub(crate) fn consent_failure_message(label: &str, host: &str, reason: UseError) -> String {
+    match reason {
+        UseError::Declined => format!("secret {label}: approval was declined for {host}; the request was not sent"),
+        UseError::Expired => format!("secret {label}: approval expired for {host}; the request was not sent"),
+        UseError::Cancelled => format!("secret {label}: the request for {host} was cancelled; the request was not sent"),
+        _ => format!("secret {label}: the approval request for {host} could not be filed; the request was not sent"),
+    }
 }
 
 pub(crate) struct RequestSecrets {
@@ -194,6 +205,7 @@ impl RequestSecrets {
             ConsentOutcome::Declined => Err(UseError::Declined),
             ConsentOutcome::Expired => Err(UseError::Expired),
             ConsentOutcome::Cancelled => Err(UseError::Cancelled),
+            ConsentOutcome::Indeterminate => Err(UseError::Indeterminate),
             _ => Err(UseError::Unavailable),
         }
     }

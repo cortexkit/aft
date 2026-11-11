@@ -62,6 +62,9 @@ pub enum ConsentOutcome {
     Expired,
     /// The caller left or the card was withdrawn; this is not a phone answer.
     Cancelled,
+    /// The card was answered, but no trustworthy decision could be read.
+    /// This must not be retained as a person's answer or a filing failure.
+    Indeterminate,
     /// Still pending when the call's hold ended: the call ends
     /// `access_pending` and the retried call asks again.
     Pending,
@@ -81,6 +84,7 @@ impl std::fmt::Debug for ConsentOutcome {
             ConsentOutcome::Declined => f.write_str("Declined"),
             ConsentOutcome::Expired => f.write_str("Expired"),
             ConsentOutcome::Cancelled => f.write_str("Cancelled"),
+            ConsentOutcome::Indeterminate => f.write_str("Indeterminate"),
             ConsentOutcome::Pending => f.write_str("Pending"),
             ConsentOutcome::Unavailable { detail } => f
                 .debug_struct("Unavailable")
@@ -112,22 +116,40 @@ pub trait SecretConsentTransport: Send + Sync + 'static {
         Box::pin(async move {
             let worker = self.clone();
             let ask = request.clone();
-            let held = tokio::task::spawn_blocking(move || worker.hold(&ask));
-            tokio::select! {
-                result = held => result.unwrap_or(ConsentOutcome::Unavailable { detail: "Cingulate could not settle the secret-use card".into() }),
-                () = cancel.cancelled() => {
-                    let _ = tokio::task::spawn_blocking(move || self.withhold(&request)).await;
+            let held_cancel = cancel.clone();
+            let held = tokio::task::spawn_blocking(move || {
+                if held_cancel.is_cancelled() {
                     ConsentOutcome::Cancelled
+                } else {
+                    worker.hold(&ask, &held_cancel)
                 }
+            });
+            let outcome = tokio::select! {
+                biased;
+                () = cancel.cancelled() => ConsentOutcome::Cancelled,
+                result = held => result.unwrap_or(ConsentOutcome::Unavailable { detail: "Cingulate could not settle the secret-use card".into() }),
+            };
+            if matches!(
+                outcome,
+                ConsentOutcome::Cancelled
+                    | ConsentOutcome::Unavailable { .. }
+                    | ConsentOutcome::Indeterminate
+            ) {
+                let _ = tokio::task::spawn_blocking(move || self.withhold(&request)).await;
             }
+            outcome
         })
     }
     /// File `request` and wait for the answer, or for the hold to end.
     fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome;
 
     /// File once and hold a proxy request for the full approval window.
-    fn hold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
-        self.file(request)
+    fn hold(&self, request: &SecretConsentRequest, cancel: &Cancellation) -> ConsentOutcome {
+        if cancel.is_cancelled() {
+            ConsentOutcome::Cancelled
+        } else {
+            self.file(request)
+        }
     }
 
     /// Settle a pending ask the call left behind.
@@ -304,7 +326,7 @@ pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcom
             if card.waiters.load(std::sync::atomic::Ordering::Acquire) == 0
                 && matches!(
                     &*card.outcome.borrow(),
-                    Some(ConsentOutcome::Unavailable { .. })
+                    Some(ConsentOutcome::Unavailable { .. } | ConsentOutcome::Indeterminate)
                 )
             {
                 return false;

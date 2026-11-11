@@ -259,16 +259,18 @@ async fn prepare_and_send(
     while !pending.is_empty() {
         let (label, answer) = tokio::select! {
             biased;
-            () = budget.expired() => return Ok(not_approved(unsettled.first().map(String::as_str).unwrap_or(""), &authority.host, state)),
+            () = budget.expired() => return Ok(not_approved(unsettled.first().map(String::as_str).unwrap_or(""), &authority.host, state, crate::secret::requests::UseError::Expired)),
             result = pending.next() => result.ok_or_else(fail)?,
         };
         unsettled.retain(|name| name != label);
         let answer = match answer {
             Ok(answer) => answer,
             Err(
-                crate::secret::requests::UseError::Declined
-                | crate::secret::requests::UseError::Expired,
-            ) => return Ok(not_approved(label, &authority.host, state)),
+                reason @ (crate::secret::requests::UseError::Declined
+                | crate::secret::requests::UseError::Expired
+                | crate::secret::requests::UseError::Cancelled
+                | crate::secret::requests::UseError::Unavailable),
+            ) => return Ok(not_approved(label, &authority.host, state, reason)),
             Err(_) => return Err(label.clone()),
         };
         match answer {
@@ -465,9 +467,14 @@ async fn prepare_and_send(
         .map_err(|_| fail())
 }
 
-fn not_approved(label: &str, host: &str, state: &State) -> Response<Body> {
-    let body = Zeroizing::new(format!(
-        "secret {label} was not approved for {host}; the request was not sent"
+fn not_approved(
+    label: &str,
+    host: &str,
+    state: &State,
+    reason: crate::secret::requests::UseError,
+) -> Response<Body> {
+    let body = Zeroizing::new(crate::secret::requests::consent_failure_message(
+        label, host, reason,
     ));
     let mut response = Response::new(full(Bytes::from(
         state

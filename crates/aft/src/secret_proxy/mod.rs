@@ -175,7 +175,7 @@ pub(crate) struct State {
     config: ProxyConfig,
     session: AtomicI32,
     session_birth: std::sync::atomic::AtomicU64,
-    stopped: AtomicBool,
+    stopped: Arc<AtomicBool>,
     token: Zeroizing<String>,
     expected_auth: Zeroizing<Vec<u8>>,
     ca: rcgen::Certificate,
@@ -186,6 +186,8 @@ pub(crate) struct State {
     requests: Arc<tokio::sync::Semaphore>,
     // Keep each installed key as an exact-byte matcher for response scrubbers.
     // Rotation adds a matcher instead of replacing earlier key values.
+    // Retain these zeroizing patterns until the command ends solely to scrub
+    // echoed keys; they never authorize or supply another upstream request.
     patterns: Mutex<Vec<(String, Zeroizing<Vec<u8>>)>>,
     #[cfg(test)]
     headers_sensitive: AtomicBool,
@@ -383,11 +385,14 @@ impl SecretProxy {
         let token =
             Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random[..]));
         let expected_auth = basic_credentials(&token)?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let cancelled = stopped.clone();
         let approvals = crate::secret::requests::RequestSecrets::new(
             config.vault.clone(),
             config.authorization_scope.clone(),
             config.consent_context.clone(),
-        );
+        )
+        .with_request_cancellation(move || cancelled.load(Ordering::Acquire));
         #[cfg(test)]
         let approvals = approvals.with_clock(config.approval_clock.clone());
         let state = Arc::new(State {
@@ -395,7 +400,7 @@ impl SecretProxy {
             config,
             session: AtomicI32::new(0),
             session_birth: std::sync::atomic::AtomicU64::new(0),
-            stopped: AtomicBool::new(false),
+            stopped,
             token,
             expected_auth,
             ca,

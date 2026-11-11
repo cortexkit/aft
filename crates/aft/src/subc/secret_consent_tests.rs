@@ -1524,6 +1524,9 @@ async fn early_pending_secret_answers_back_off_before_reawaiting_the_same_card()
 #[path = "secret_consent_outcome_tests.rs"]
 mod fetch_outcome_lines;
 
+#[path = "secret_consent_audit_tests.rs"]
+mod audit_followups;
+
 struct LostFilingEndpoint {
     calls: StdMutex<Vec<super::super::consent::ConsentCall>>,
     files: std::sync::atomic::AtomicUsize,

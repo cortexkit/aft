@@ -81,13 +81,7 @@ impl Drop for Restore {
     }
 }
 
-async fn server() -> (
-    std::net::SocketAddr,
-    rustls::ClientConfig,
-    Arc<AtomicUsize>,
-    tokio::task::JoinHandle<()>,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+fn server_tls() -> (rustls::ClientConfig, tokio_rustls::TlsAcceptor) {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let key = rcgen::KeyPair::generate().unwrap();
     let certificate = rcgen::CertificateParams::new(vec!["api.secret.test".into()])
@@ -111,6 +105,17 @@ async fn server() -> (
         )
         .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    (client, acceptor)
+}
+
+async fn server() -> (
+    std::net::SocketAddr,
+    rustls::ClientConfig,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client, acceptor) = server_tls();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let sends = Arc::new(AtomicUsize::new(0));
@@ -138,6 +143,150 @@ async fn server() -> (
 async fn foreground_fetch_cancel_with_two_pending_labels_withdraws_both_and_a_late_allow_cannot_release_or_send(
 ) {
     held_foreground_fetch_late_allow(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_fetch_cancel_during_tls_setup_never_hands_the_keyed_request_to_http() {
+    use crate::secret::SecretVault;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _consent_lock = CONSENT_TEST_LOCK.lock().await;
+    let _secret_lock = crate::secret::consent::TEST_TRANSPORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The uncancelled control uses the same certificate and held handshake,
+    // so a TLS setup failure cannot make the no-request assertion pass.
+    for cancel in [true, false] {
+        let f = fixture(FakeCingulate::up());
+        let _restore = Restore;
+        let daemon = FakeClaustrum::start();
+        {
+            let mut state = daemon.state.lock().unwrap();
+            state.pending_expires_at_ms = Some(crate::secret::vault::now_ms() + 600_000);
+            state.once = true;
+            state.record = Some(Record {
+                name: "first".into(),
+                host: "api.secret.test".into(),
+                path: "/v1".into(),
+                location: "query:first".into(),
+                key: b"tls-stall-released-key-0123456789".to_vec(),
+            });
+        }
+        let transport = crate::secret::transport::SubcSecretUseTransport::for_test(
+            daemon.path.clone(),
+            subc_protocol::BindIdentity::new("test", "session"),
+            Duration::from_secs(2),
+            subc_client_rs::ConsumerIdentity {
+                module_id: "aft".into(),
+                launch_nonce: NONCE.into(),
+            },
+        );
+        let vault = Arc::new(SubcSecretVault::new(Arc::new(transport)));
+        let scope = crate::secret::SecretScope::from_stamp(f.head.scope.as_ref().unwrap());
+        let target = crate::secret::ApiKeyTarget {
+            scheme: "https".into(),
+            host: "api.secret.test".into(),
+            port: Some(443),
+            path: "/v1/doc.md".into(),
+        };
+        let crate::secret::UseAnswer::ApprovalRequired(pending) =
+            vault.use_secret(&scope, "first", &target)
+        else {
+            panic!("approval required")
+        };
+        daemon
+            .state
+            .lock()
+            .unwrap()
+            .approve(&pending.statement_b64url);
+        let (tls, acceptor) = server_tls();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, connected) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            resumed.await.unwrap();
+            let Ok(mut tls) = acceptor.accept(socket).await else {
+                return Vec::new();
+            };
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                match tokio::time::timeout(Duration::from_secs(2), tls.read(&mut byte)).await {
+                    Ok(Ok(1)) => request.push(byte[0]),
+                    _ => break,
+                }
+            }
+            if !request.is_empty() {
+                let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\nContent-Length: 8\r\nConnection: close\r\n\r\n# Fetch\n").await;
+            }
+            request
+        });
+        *FETCH_ENV.lock().unwrap() = Some((
+            vault,
+            UrlFetchOptions {
+                tls_config: Some(tls),
+                public_host_overrides: vec![(
+                    "api.secret.test".into(),
+                    vec!["93.184.216.34".parse().unwrap()],
+                )],
+                connect_overrides: vec![("api.secret.test".into(), address)],
+                ..Default::default()
+            },
+        ));
+        let url = format!(
+            "https://api.secret.test:{}/v1/doc.md?first={{{{ck-secret:first}}}}",
+            address.port()
+        );
+        let mut replies = f
+            .send_tool(&f.head, "outline", json!({"target":url}), 91, dispatch)
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), connected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            daemon.state.lock().unwrap().calls,
+            2,
+            "the covered key was released before the held connection setup"
+        );
+        if cancel {
+            assert!(cancel_active_tool_call(
+                &f.active,
+                &f.executor,
+                route_key(41, 1),
+                91,
+                "cancel during TLS setup"
+            )
+            .is_some());
+        }
+        resume.send(()).unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(4), server)
+            .await
+            .unwrap()
+            .unwrap();
+        if cancel {
+            assert!(
+                request.is_empty(),
+                "no HTTP request line may follow cancellation during TLS setup: {}",
+                String::from_utf8_lossy(&request)
+            );
+        } else {
+            assert!(
+                request.starts_with(
+                    b"GET /v1/doc.md?first=tls-stall-released-key-0123456789 HTTP/1.1\r\n"
+                ),
+                "the control must complete TLS and send the real keyed request"
+            );
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(3), replies.recv()).await;
+        assert_eq!(
+            daemon.state.lock().unwrap().calls,
+            2,
+            "neither cancellation nor a connect failure may retry the release"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

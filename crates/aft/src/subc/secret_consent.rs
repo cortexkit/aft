@@ -87,6 +87,7 @@ struct Card {
     statement: String,
     elicitation: Option<String>,
     answered: Option<ConsentOutcome>,
+    warned_unreadable: bool,
 }
 
 fn consent_unavailable(detail: &str) -> ConsentOutcome {
@@ -114,11 +115,18 @@ fn decode_secret_record(record: &serde_json::Value, request_id: &str) -> Consent
         Some("pending") => ConsentOutcome::Pending,
         Some("answered") => {
             let answer = &record["secret_use_answer"];
-            let decision = if let Some(items) = answer["items"].as_array() {
-                items
+            let decision = if let Some(items) = answer.get("items") {
+                let Some(items) = items.as_array() else {
+                    return ConsentOutcome::Indeterminate;
+                };
+                let mut matching = items
                     .iter()
-                    .find(|item| item["request_id"].as_str() == Some(request_id))
-                    .and_then(|item| item["decision"].as_str())
+                    .filter(|item| item["request_id"].as_str() == Some(request_id));
+                let decision = matching.next().and_then(|item| item["decision"].as_str());
+                if matching.next().is_some() {
+                    return ConsentOutcome::Indeterminate;
+                }
+                decision
             } else {
                 answer["decision"].as_str()
             };
@@ -128,8 +136,10 @@ fn decode_secret_record(record: &serde_json::Value, request_id: &str) -> Consent
                 } else {
                     ConsentOutcome::Answered
                 }
-            } else {
+            } else if decision == Some("decline") {
                 ConsentOutcome::Declined
+            } else {
+                ConsentOutcome::Indeterminate
             }
         }
         Some("expired") => ConsentOutcome::Expired,
@@ -175,7 +185,15 @@ impl SubcSecretConsent {
         request: &SecretConsentRequest,
         params: serde_json::Value,
         card: &mut Card,
+        cancel: Option<&crate::secret::consent::Cancellation>,
     ) -> ConsentOutcome {
+        if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+            // An unknown card id cannot be withdrawn. Never create or replay
+            // an ask after cancellation; its request-bounded expiry is the
+            // backstop for a card whose filing reply was lost.
+            card.answered = Some(ConsentOutcome::Cancelled);
+            return ConsentOutcome::Cancelled;
+        }
         // Cingulate deduplicates an identical secret_use body under the same
         // stamped scope, including its epoch. Recover its id once, then withdraw
         // rather than leaving an unobserved card able to approve a lost caller.
@@ -230,6 +248,7 @@ impl SubcSecretConsent {
                         statement: request.statement_b64url.clone(),
                         elicitation: None,
                         answered: None,
+                        warned_unreadable: false,
                     }))
                 })
                 .clone()
@@ -263,14 +282,18 @@ impl SubcSecretConsent {
             {
                 Ok(filed) => filed,
                 Err(super::consent::ConsentError::Unavailable(_)) => {
-                    return self.recover_lost_filing(request, params, &mut card).await
+                    return self
+                        .recover_lost_filing(request, params, &mut card, cancel)
+                        .await
                 }
                 Err(_) => {
                     return consent_unavailable("Cingulate could not file the secret-use card")
                 }
             };
             let Some(id) = decode_secret_elicitation(&filed) else {
-                return self.recover_lost_filing(request, params, &mut card).await;
+                return self
+                    .recover_lost_filing(request, params, &mut card, cancel)
+                    .await;
             };
             card.elicitation = Some(id.to_owned());
             card.answered = None;
@@ -301,7 +324,24 @@ impl SubcSecretConsent {
             response = await_card => response,
         };
         let outcome = match response {
-            Ok(record) => decode_secret_record(&record, &request.request_id),
+            Ok(record) => {
+                let outcome = decode_secret_record(&record, &request.request_id);
+                if outcome == ConsentOutcome::Indeterminate && !card.warned_unreadable {
+                    card.warned_unreadable = true;
+                    // Peer decision text is untrusted and can contain a key.
+                    // Fingerprint its value instead of copying it into logs.
+                    use sha2::{Digest, Sha256};
+                    let value = zeroize::Zeroizing::new(
+                        serde_json::to_vec(&record["secret_use_answer"]).unwrap_or_default(),
+                    );
+                    crate::slog_warn!(
+                        "unreadable secret consent answer: card={} decision_sha256={:x}",
+                        card.elicitation.as_deref().unwrap_or("unknown"),
+                        Sha256::digest(&*value)
+                    );
+                }
+                outcome
+            }
             Err(_) => consent_unavailable("Cingulate could not settle the secret-use card"),
         };
         if matches!(
@@ -400,8 +440,21 @@ impl crate::secret::SecretConsentTransport for SubcSecretConsent {
         self.dispatch(request, super::consent::hold_budget(None))
     }
 
-    fn hold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
-        self.dispatch(request, Duration::from_secs(600))
+    fn hold(
+        &self,
+        request: &SecretConsentRequest,
+        cancel: &crate::secret::consent::Cancellation,
+    ) -> ConsentOutcome {
+        let future = self.file_cancellable(request, Duration::from_secs(600), Some(cancel));
+        match tokio::runtime::Handle::try_current() {
+            Ok(current)
+                if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(|| self.runtime.block_on(future))
+            }
+            Ok(_) => consent_unavailable("secret consent cannot block a single-threaded runtime"),
+            Err(_) => self.runtime.block_on(future),
+        }
     }
 
     fn withhold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
@@ -579,6 +632,7 @@ pub(super) fn file_secret_consent(
         ConsentOutcome::Unavailable { .. }
         | ConsentOutcome::Declined
         | ConsentOutcome::Expired
+        | ConsentOutcome::Indeterminate
         | ConsentOutcome::Cancelled => Err(crate::secret::SECRET_ACCESS_UNAVAILABLE),
         ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce => {
             Ok(SecretConsentFiling::Answered)
@@ -617,12 +671,17 @@ fn fetch_consent_refusal(
     held: &crate::url_fetch::HeldKeys,
 ) -> LabelOutcome {
     use crate::secret::requests::UseError;
-    let message = match reason {
-        UseError::Declined => format!("secret {label}: approval was declined for {host}; the request was not sent"),
-        UseError::Expired => format!("secret {label}: approval expired for {host}; the request was not sent"),
-        UseError::Cancelled => format!("secret {label}: the request for {host} was cancelled; the request was not sent"),
-        _ => format!("secret {label}: the approval request for {host} could not be filed; the request was not sent"),
-    };
+    if matches!(reason, UseError::Indeterminate) {
+        let outcome = crate::secret::outcome_for(label, &crate::secret::UseAnswer::Unavailable);
+        return match outcome {
+            LabelOutcome::Refuse { code, message } => LabelOutcome::Refuse {
+                code,
+                message: held.sanitize_detail(&message),
+            },
+            other => other,
+        };
+    }
+    let message = crate::secret::requests::consent_failure_message(label, host, reason);
     LabelOutcome::Refuse {
         code: crate::secret::SECRET_ACCESS_UNAVAILABLE,
         message: held.sanitize_detail(&message),

@@ -890,6 +890,8 @@ impl SecretFetchCancellation {
 /// Keys the vault released during one placeholder fetch. They are kept, wiped
 /// on drop, only until the fetch returns, so every header and body read after
 /// a key was sent is scrubbed of it.
+/// These retained bytes are scrub patterns, never authorization or material
+/// for another send; every request obtains its own release from the vault.
 #[derive(Default)]
 pub(crate) struct HeldKeys(Vec<(String, Zeroizing<Vec<u8>>)>);
 
@@ -1042,6 +1044,7 @@ fn fetch_with_secrets(
         Arc::clone(&approved),
         Arc::clone(&progress),
         false,
+        Some(secrets.cancellation.clone()),
     )?;
     let mut held = HeldKeys::default();
     let mut hop = 0;
@@ -1058,13 +1061,14 @@ fn fetch_with_secrets(
         crate::bounded_io::exclude_secret_approval_wait(waited);
         let sent = send_request(
             &client,
-            outbound.as_deref().unwrap_or(&current),
+            &current,
             Some(SecretSend {
                 shown: current.as_str(),
                 held: &held,
                 released: outbound.is_some(),
                 cancellation: &secrets.cancellation,
                 key_sent,
+                outbound: outbound.as_ref(),
             }),
             &deadline,
             &progress,
@@ -1647,20 +1651,16 @@ fn secret_hop(
 #[cfg(test)]
 thread_local! { static SECRET_URL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-struct SecretOutboundUrl(Option<Url>);
+struct SecretOutboundUrl(sensitive::Bytes);
 impl std::ops::Deref for SecretOutboundUrl {
-    type Target = Url;
-    fn deref(&self) -> &Url {
-        self.0
-            .as_ref()
-            .expect("outbound URL remains owned until drop")
+    type Target = str;
+    fn deref(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("URL serialization is UTF-8")
     }
 }
-impl Drop for SecretOutboundUrl {
-    fn drop(&mut self) {
-        if let Some(url) = self.0.take() {
-            drop(Zeroizing::new(String::from(url)));
-        }
+impl SecretOutboundUrl {
+    fn as_str(&self) -> &str {
+        self
     }
 }
 impl fmt::Debug for SecretOutboundUrl {
@@ -1689,9 +1689,7 @@ fn secret_outbound_url(
     serialized.extend_from_slice(wire_path.as_bytes());
     serialized.extend_from_slice(b"?");
     serialized.extend_from_slice(substituted.as_bytes());
-    Some(SecretOutboundUrl(Some(
-        Url::parse(std::str::from_utf8(&serialized).ok()?).ok()?,
-    )))
+    Some(SecretOutboundUrl(serialized))
 }
 
 fn substitute_query(
@@ -2067,7 +2065,13 @@ fn fetch_with_redirects(
     approved: Arc<ApprovedHosts>,
 ) -> Result<HttpResponse, UrlFetchError> {
     let progress = Arc::new(ConnectProgress::default());
-    let client = build_client(options, Arc::clone(&approved), Arc::clone(&progress), true)?;
+    let client = build_client(
+        options,
+        Arc::clone(&approved),
+        Arc::clone(&progress),
+        true,
+        None,
+    )?;
     let mut current_url = start_url.clone();
 
     for redirect_count in 0..=MAX_REDIRECTS {
@@ -2135,6 +2139,7 @@ struct SecretSend<'a> {
     released: bool,
     cancellation: &'a SecretFetchCancellation,
     key_sent: &'a std::cell::Cell<bool>,
+    outbound: Option<&'a SecretOutboundUrl>,
 }
 
 /// [`send_with_transient_retries`] for one request. With `secret` set, the
@@ -2181,8 +2186,15 @@ fn send_request_attempts(
         // A per-request timeout replaces reqwest's default 30 s, which would
         // otherwise let one silent server hold each attempt for 30 s.
         progress.begin_attempt();
+        // Parse directly from protected serialization and move the Url into
+        // reqwest. AFT must not clone a key-bearing URL's ordinary String.
+        let outbound = match secret.and_then(|secret| secret.outbound) {
+            Some(outbound) => Url::parse(outbound.as_str())
+                .map_err(|_| secret_fetch_refused("malformed_query", named))?,
+            None => target.clone(),
+        };
         let mut request = client
-            .get(target.clone())
+            .get(outbound)
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, ACCEPT_HEADER)
             .timeout(remaining.min(HEADERS_TIMEOUT));
@@ -2309,6 +2321,7 @@ fn build_client(
     approved: Arc<ApprovedHosts>,
     progress: Arc<ConnectProgress>,
     automatic_replays: bool,
+    cancellation: Option<SecretFetchCancellation>,
 ) -> Result<Client, UrlFetchError> {
     let resolver = GuardedResolver {
         approved,
@@ -2322,6 +2335,7 @@ fn build_client(
         .connector_layer(TrackConnect {
             progress,
             delay: options.connect_delay,
+            cancellation,
         })
         .dns_resolver(Arc::new(resolver));
     let builder = if automatic_replays {
@@ -2453,6 +2467,7 @@ impl ConnectProgress {
 struct TrackConnect {
     progress: Arc<ConnectProgress>,
     delay: Option<Duration>,
+    cancellation: Option<SecretFetchCancellation>,
 }
 
 impl<S> tower_layer::Layer<S> for TrackConnect {
@@ -2463,6 +2478,7 @@ impl<S> tower_layer::Layer<S> for TrackConnect {
             inner,
             progress: Arc::clone(&self.progress),
             delay: self.delay,
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -2472,6 +2488,7 @@ struct TrackedConnector<S> {
     inner: S,
     progress: Arc<ConnectProgress>,
     delay: Option<Duration>,
+    cancellation: Option<SecretFetchCancellation>,
 }
 
 impl<S, Target> tower_service::Service<Target> for TrackedConnector<S>
@@ -2479,24 +2496,26 @@ where
     S: tower_service::Service<Target>,
     S::Future: Send + 'static,
     S::Response: Send + 'static,
-    S::Error: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
 {
     type Response = S::Response;
-    type Error = S::Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<S::Response, Self::Error>> + Send>,
+    >;
 
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
+        self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, target: Target) -> Self::Future {
         let attempt = self.progress.connect_started();
         let progress = Arc::clone(&self.progress);
         let delay = self.delay;
+        let cancellation = self.cancellation.clone();
         let connecting = self.inner.call(target);
         Box::pin(async move {
             // Records on drop too, so a connect a timeout abandons still
@@ -2508,11 +2527,18 @@ where
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            let connection = connecting.await;
-            if connection.is_ok() {
-                progress.connected(attempt);
+            let connection = connecting.await.map_err(Into::into)?;
+            // The inner connector includes DNS, TCP and TLS. Check again at
+            // its handover boundary, before hyper can write request bytes.
+            if cancellation.is_some_and(|cancel| cancel.is_cancelled()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "fetch cancelled",
+                )
+                .into());
             }
-            connection
+            progress.connected(attempt);
+            Ok(connection)
         })
     }
 }

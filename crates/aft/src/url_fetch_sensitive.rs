@@ -322,4 +322,47 @@ mod tests {
         assert_eq!(wipes[0].capacity, expected.len());
         assert!(wipes[0].zeroed);
     }
+
+    #[test]
+    fn secret_outbound_buffer_remains_zeroizing_until_reqwest_takes_its_url() {
+        let (trace, _scope) = super::testing::track(KEY);
+        let current = Url::parse("https://api.test/old?key={{ck-secret:test}}").unwrap();
+        let outbound =
+            secret_outbound_url(&current, "/normalized", "key=echo-fetch-key-0123456789").unwrap();
+        assert!(trace.wait_for(0).is_empty(), "the protected serialization must stay owned until handover, not be replaced by an ordinary Url string");
+        let request_url = Url::parse(outbound.as_str()).unwrap();
+        let client = Client::builder().build().unwrap();
+        let request = client.get(request_url).build().unwrap();
+        assert_eq!(request.url().query(), Some("key=echo-fetch-key-0123456789"));
+        drop(outbound);
+        let wipes = trace.wait_for(1);
+        assert_eq!(wipes.len(), 1);
+        assert!(wipes[0].zeroed && !wipes[0].growth);
+    }
+
+    #[test]
+    fn sanitize_detail_masks_raw_and_percent_encoded_key_spellings() {
+        let mut held = HeldKeys::default();
+        held.hold("test", KEY).unwrap();
+        let raw = std::str::from_utf8(KEY).unwrap();
+        for spelling in [
+            raw.to_owned(),
+            KEY.iter()
+                .map(|byte| format!("%{byte:02X}"))
+                .collect::<String>(),
+            KEY.iter()
+                .map(|byte| format!("%{byte:02x}"))
+                .collect::<String>(),
+            format!("%65{}", &raw[1..]),
+        ] {
+            let clean =
+                held.sanitize_detail(&format!("request https://api.test/?key={spelling} failed"));
+            assert!(!clean.contains(&spelling));
+            assert!(!clean.contains(raw));
+            assert!(
+                clean.is_empty() || clean.contains("{{ck-secret:test}}"),
+                "an encoded spelling is masked or dropped, never copied through"
+            );
+        }
+    }
 }

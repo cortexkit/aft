@@ -666,9 +666,16 @@ fn audit_live_vault_key_never_reaches_task_logs_previews_or_status() {
             }
             impl SecretConsentTransport for Phone {
                 fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
-                    self.hold(request)
+                    self.hold(request, &Default::default())
                 }
-                fn hold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+                fn hold(
+                    &self,
+                    request: &SecretConsentRequest,
+                    cancel: &crate::secret::consent::Cancellation,
+                ) -> ConsentOutcome {
+                    if cancel.is_cancelled() {
+                        return ConsentOutcome::Cancelled;
+                    }
                     self.cards.send(request.clone()).unwrap();
                     self.answer
                         .lock()
