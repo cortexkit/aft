@@ -2,6 +2,28 @@
 //!
 //! All operations use the actor's existing connection. State changes and late
 //! entries share a transaction: a crash cannot publish half a settlement.
+pub(crate) type HeldResultProjector =
+    fn(&RecordedFrame, Option<&[u8]>, bool) -> Result<RecordedFrame, String>;
+static HELD_RESULT_PROJECTOR: std::sync::OnceLock<HeldResultProjector> = std::sync::OnceLock::new();
+pub(crate) fn register_held_result_projector(project: HeldResultProjector) {
+    let _ = HELD_RESULT_PROJECTOR.set(project);
+}
+#[cfg(test)]
+pub(crate) fn held_result_projector_registered() -> bool {
+    HELD_RESULT_PROJECTOR.get().is_some()
+}
+pub(crate) fn project_held_result(
+    frame: &RecordedFrame,
+    source: Option<&[u8]>,
+    structured: bool,
+) -> Result<RecordedFrame, String> {
+    HELD_RESULT_PROJECTOR
+        .get()
+        .ok_or_else(|| "held result projection unavailable".to_string())?(
+        frame, source, structured
+    )
+}
+
 use cortexkit_role_tool_provider::late_results::{check_since, Cursor};
 use cortexkit_role_tool_provider::withdraw::{CompletedResult, StartedOutcome, WithdrawAnswer};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1431,13 +1453,9 @@ pub fn observe_task_with_tool_result_source(
                     .and_then(|row| row.frame.as_ref())
                     .and_then(|frame| serde_json::from_slice::<Value>(&frame.body).ok())
                     .is_some_and(|held| held["_aft_include_structured"] == true);
-                crate::subc::project_held_ledger_result(frame, body, structured).map_err(
-                    |error| {
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                            error,
-                        )))
-                    },
-                )?
+                project_held_result(frame, body, structured).map_err(|error| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+                })?
             };
             return settle_with_tool_result_source(
                 conn,
