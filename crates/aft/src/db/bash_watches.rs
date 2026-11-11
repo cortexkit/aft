@@ -399,7 +399,7 @@ pub(crate) fn list_delivery_gaps(
     conn: &Connection,
     harness: &str,
     session: Option<&str>,
-) -> rusqlite::Result<Vec<BashPatternWatchRow>> {
+) -> rusqlite::Result<Vec<(BashPatternWatchRow, crate::task_watch_lines::LineBatch)>> {
     let mut statement = conn.prepare("SELECT session_id, task_id, watch_id, batch FROM bash_watch_delivery_gaps WHERE harness=?1 AND (?2 IS NULL OR session_id=?2)")?;
     let rows = statement.query_map(params![harness, session], |row| {
         let session_id = row.get(0)?;
@@ -415,7 +415,7 @@ pub(crate) fn list_delivery_gaps(
                 )
             },
         )?;
-        Ok(BashPatternWatchRow {
+        Ok((BashPatternWatchRow {
             harness: harness.into(),
             session_id,
             task_id: task_id.clone(),
@@ -433,10 +433,8 @@ pub(crate) fn list_delivery_gaps(
             pending_match: true,
             match_text: Some("watch delivery gap".into()),
             match_offset: batch.version.map(|version| version as i64),
-            match_context: Some(crate::subc_format::format_watch_line_batch(
-                &task_id, &batch,
-            )),
-        })
+            match_context: None,
+        }, batch))
     })?;
     rows.collect()
 }
