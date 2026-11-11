@@ -2626,6 +2626,39 @@ mod tests {
             .contains_key(&cache.root.join("member/src/data/a.txt")));
     }
 
+    #[test]
+    fn new_macro_names_revisit_previously_cached_primary_files() {
+        let (_temp, cache) = fixture();
+        write(
+            &cache.root,
+            "member/src/calls.rs",
+            "// env prefilter\nconst DATA: &str = fixture!(\"a.txt\");",
+        );
+        write(&cache.root, "member/src/data/a.txt", "one");
+        inputs::take_parses();
+        let before = capture_inputs(&cache).unwrap();
+        assert_eq!(inputs::take_parses(), 1);
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture { ($name:literal) => { include_str!(concat!("data/", $name)) }; }
+        "#,
+        );
+        let after = fingerprint(
+            &cache.root,
+            "v1".into(),
+            Some(&before),
+            Instant::now() + BUDGET,
+            None,
+        )
+        .unwrap();
+        assert_eq!(inputs::take_parses(), 2);
+        assert!(after
+            .files
+            .contains_key(&cache.root.join("member/src/data/a.txt")));
+    }
+
     fn unresolved_input(cache: &CompletedRustCheck) -> String {
         let mut unresolved = None;
         assert!(fingerprint_with_reason(
@@ -2912,6 +2945,31 @@ mod tests {
         assert_eq!(unresolved_input(&cache), "cargo check completed, but member/src/lib.rs includes a file whose path can't be resolved; diagnostics are provisional");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn warm_fingerprint_rechecks_excluded_include_parent_symlinks() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "target/inputs/a.txt", "input");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"const DATA: &str = include_str!(concat!("../../target/inputs/", "a.txt"));"#,
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        fs::rename(
+            cache.root.join("target/inputs"),
+            cache.root.join("target/actual"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            cache.root.join("target/actual"),
+            cache.root.join("target/inputs"),
+        )
+        .unwrap();
+        assert!(valid(&cache).is_none());
+    }
+
     #[test]
     fn complex_fixture_matchers_stay_provisional_when_invoked() {
         for definition in [
@@ -2979,7 +3037,7 @@ mod tests {
             "member/src/lib.rs",
             r##"
             const DATA: &str = include_str!("data.txt");
-            opaque!(b"\xff", br#"raw bytes"#, c"c string", cr#"raw c string"#);
+            opaque!(b"\xff", br#"raw bytes"#, c"c string", cr#"raw c string"#, "include");
         "##,
         );
         cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();

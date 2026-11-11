@@ -1,5 +1,5 @@
 //! Resolve compiler inputs only when the source proves every concrete path.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -134,18 +134,33 @@ fn expression(
 
 // Canonicalization alone would hide a symlink in an include's parent directory.
 // Check every component first, including components cancelled by `..`.
-fn include_path(root: &Path, source: &Path, relative: &str, deadline: Instant) -> Option<PathBuf> {
+fn include_path(
+    root: &Path,
+    source: &Path,
+    relative: &str,
+    deadline: Instant,
+    checked: &mut HashSet<PathBuf>,
+    resolved: &mut HashMap<PathBuf, PathBuf>,
+) -> Option<PathBuf> {
+    expired(deadline)?;
     let joined = source.parent()?.join(relative);
+    if let Some(path) = resolved.get(&joined) {
+        return Some(path.clone());
+    }
     let mut current = PathBuf::new();
     for component in joined.components() {
         expired(deadline)?;
         current.push(component);
-        if fs::symlink_metadata(&current).ok()?.is_symlink() {
+        if checked.insert(current.clone()) && fs::symlink_metadata(&current).ok()?.is_symlink() {
             return None;
         }
     }
     let path = canonical(&joined)?;
-    (path.starts_with(root) && path.is_file()).then_some(path)
+    if !path.starts_with(root) || !path.is_file() {
+        return None;
+    }
+    resolved.insert(joined, path.clone());
+    Some(path)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +186,8 @@ struct FileFacts {
     references: BTreeSet<String>,
     direct: Vec<(Vec<Token>, bool)>,
     env_keys: Vec<String>,
+    #[serde(default)]
+    scanned_names: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +228,10 @@ pub(super) struct SourceInputs {
     parsed: BTreeSet<PathBuf>,
     pending: BTreeMap<PathBuf, Option<Vec<u8>>>,
     searched_names: BTreeSet<String>,
+    // Repeated includes share checks only inside this capture, never across
+    // fingerprints where a parent directory could have become a symlink.
+    checked_components: HashSet<PathBuf>,
+    resolved_paths: HashMap<PathBuf, PathBuf>,
 }
 
 impl FileFacts {
@@ -254,6 +275,7 @@ impl FileFacts {
         root: &Path,
         path: &Path,
         bytes: &[u8],
+        macro_names: &BTreeSet<String>,
         deadline: Instant,
         unresolved: &mut Option<UnresolvedInput>,
     ) -> Option<(Vec<PathBuf>, Vec<String>)> {
@@ -279,6 +301,7 @@ impl FileFacts {
         let mut nodes = vec![tree.root_node()];
         let mut included = Vec::new();
         let mut env_keys = Vec::new();
+        let mut calls = Vec::new();
         while let Some(node) = nodes.pop() {
             expired(deadline)?;
             if node.kind() == "macro_definition" {
@@ -334,17 +357,7 @@ impl FileFacts {
                 continue;
             }
             if node.kind() == "macro_invocation" {
-                self.scan(
-                    root,
-                    path,
-                    &tokens(node, bytes, deadline)?,
-                    None,
-                    false,
-                    deadline,
-                    &mut included,
-                    &mut env_keys,
-                    unresolved,
-                )?;
+                calls.push(node);
                 continue;
             }
             if node.kind() == "use_as_clause" {
@@ -357,6 +370,42 @@ impl FileFacts {
             for child in node.named_children(&mut cursor) {
                 expired(deadline)?;
                 nodes.push(child);
+            }
+        }
+        // Templates reveal local include-bearing names before ordinary calls
+        // are tokenized. Most assert!/format! arguments are irrelevant inputs.
+        self.scanned_names = macro_names.clone();
+        self.scanned_names.extend(
+            self.definitions
+                .iter()
+                .filter(|definition| !definition.includes.is_empty())
+                .map(|definition| definition.name.clone()),
+        );
+        for call in calls {
+            expired(deadline)?;
+            let text = call.utf8_text(bytes).ok()?;
+            let mut relevant = text.contains("include") || text.contains("env");
+            if !relevant {
+                for name in &self.scanned_names {
+                    expired(deadline)?;
+                    if text.contains(name) {
+                        relevant = true;
+                        break;
+                    }
+                }
+            }
+            if relevant {
+                self.scan(
+                    root,
+                    path,
+                    &tokens(call, bytes, deadline)?,
+                    None,
+                    false,
+                    deadline,
+                    &mut included,
+                    &mut env_keys,
+                    unresolved,
+                )?;
             }
         }
         self.env_keys = env_keys.clone();
@@ -426,20 +475,6 @@ impl FileFacts {
                                     .push((args.to_vec(), name == "include"));
                             } else {
                                 self.direct.push((args.to_vec(), name == "include"));
-                                let empty = BTreeMap::new();
-                                let target =
-                                    expression(args, path, &empty, deadline).and_then(|relative| {
-                                        include_path(root, path, &relative, deadline)
-                                    });
-                                match target {
-                                    Some(target) => {
-                                        included.push(target);
-                                    }
-                                    None => {
-                                        expired(deadline)?;
-                                        return Self::refuse(path, false, unresolved);
-                                    }
-                                }
                             }
                         }
                         "env" | "option_env" => {
@@ -508,7 +543,9 @@ impl SourceInputs {
             let text = std::str::from_utf8(&bytes).ok()?;
             if text.contains("include") || text.contains("env") {
                 let mut facts = FileFacts::default();
-                facts.parse(root, path, &bytes, deadline, unresolved)?;
+                let mut names = self.macro_names();
+                names.extend(self.searched_names.iter().cloned());
+                facts.parse(root, path, &bytes, &names, deadline, unresolved)?;
                 return self.load(
                     root,
                     path,
@@ -533,8 +570,16 @@ impl SourceInputs {
         let mut included = Vec::new();
         for (input, rust) in &facts.0.direct {
             expired(deadline)?;
-            let target = expression(input, path, &BTreeMap::new(), deadline)
-                .and_then(|relative| include_path(root, path, &relative, deadline));
+            let target = expression(input, path, &BTreeMap::new(), deadline).and_then(|relative| {
+                include_path(
+                    root,
+                    path,
+                    &relative,
+                    deadline,
+                    &mut self.checked_components,
+                    &mut self.resolved_paths,
+                )
+            });
             let Some(target) = target else {
                 expired(deadline)?;
                 return FileFacts::refuse(path, false, unresolved);
@@ -563,7 +608,10 @@ impl SourceInputs {
                 expired(deadline)?;
                 if (path.extension().is_some_and(|ext| ext == "rs")
                     || self.rust_sources.contains(path))
-                    && !self.facts.contains_key(path)
+                    && self
+                        .facts
+                        .get(path)
+                        .is_none_or(|facts| !added.is_subset(&facts.0.scanned_names))
                 {
                     self.pending.entry(path.clone()).or_insert(None);
                 }
@@ -600,7 +648,7 @@ impl SourceInputs {
                     return None;
                 }
                 let mut facts = FileFacts::default();
-                facts.parse(root, &path, &bytes, deadline, unresolved)?;
+                facts.parse(root, &path, &bytes, &names, deadline, unresolved)?;
                 self.load(
                     root,
                     &path,
@@ -663,7 +711,16 @@ impl SourceInputs {
                 for (input, rust_source) in &definition.includes {
                     expired(deadline)?;
                     let target = expression(input, &invocation.path, &bindings, deadline).and_then(
-                        |relative| include_path(root, &invocation.path, &relative, deadline),
+                        |relative| {
+                            include_path(
+                                root,
+                                &invocation.path,
+                                &relative,
+                                deadline,
+                                &mut self.checked_components,
+                                &mut self.resolved_paths,
+                            )
+                        },
                     );
                     match target {
                         Some(target) => {
@@ -798,6 +855,26 @@ fn string_literal(text: &str, deadline: Instant) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_macro_arguments_are_not_collected_as_input_facts() {
+        let mut facts = FileFacts::default();
+        let bytes = br#"// include input prefilter
+            fn example() { assert_eq!(b"a", b"b"); opaque!(1, 2); }
+        "#;
+        facts
+            .parse(
+                Path::new("workspace"),
+                Path::new("workspace/lib.rs"),
+                bytes,
+                &BTreeSet::new(),
+                Instant::now() + std::time::Duration::from_secs(2),
+                &mut None,
+            )
+            .unwrap();
+        assert!(facts.invocations.is_empty());
+        assert!(facts.references.is_empty());
+    }
 
     #[test]
     fn unsupported_invoked_matcher_refuses_during_file_scan() {
