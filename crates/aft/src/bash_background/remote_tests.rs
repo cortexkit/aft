@@ -16,7 +16,14 @@ fn read_only_result_case(
     let (registry, task_id, _) =
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
     let task = registry.task(&task_id).unwrap();
-    task.state.lock().unwrap().metadata.workdir = dir.path().join("package");
+    {
+        let mut state = task.state.lock().unwrap();
+        state.metadata.workdir = dir.path().join("package");
+        // The synthetic environment has no secrets, so notices may retain its captured output.
+        state.metadata.completion_has_env_secrets = Some(false);
+        state.metadata.completion_has_non_ticket_env_secrets = Some(false);
+        state.metadata.completion_has_secret_placeholders = Some(false);
+    }
     let error = error.replace("$ROOT", &dir.path().to_string_lossy());
     let mut record = TerminalRecord::new(id(), outcome, 2, 0, 0)
         .with_ran(Ran::Remote)
