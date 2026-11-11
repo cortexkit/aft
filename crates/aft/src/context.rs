@@ -2900,7 +2900,7 @@ pub struct AppContext {
     daemonless_query_mode: AtomicBool,
     /// The search reranker backend, rebuilt off the search path whenever the
     /// published config or the daemon mode changes.
-    rerank_slot: crate::commands::semantic_search::rerank::slot::BackendSlot,
+    rerank_slot: crate::search_state::rerank::slot::BackendSlot,
     callgraph_writer: AtomicBool,
     inspect_writer: AtomicBool,
     /// Reasons (if any) why heavy AFT subsystems were auto-disabled for the
@@ -6976,7 +6976,7 @@ impl AppContext {
     /// The search reranker's backend slot.
     pub(crate) fn rerank_slot(
         &self,
-    ) -> &crate::commands::semantic_search::rerank::slot::BackendSlot {
+    ) -> &crate::search_state::rerank::slot::BackendSlot {
         &self.rerank_slot
     }
 
@@ -6984,7 +6984,7 @@ impl AppContext {
     /// it differs from the one built or being built. Never blocks on the build.
     fn reconcile_rerank_backend(&self, config: &Config) {
         self.rerank_slot.reconcile(
-            crate::commands::semantic_search::rerank::slot::BuildInputs::from_config(
+            crate::search_state::rerank::slot::BuildInputs::from_config(
                 config,
                 !self.daemonless_query_mode(),
             ),

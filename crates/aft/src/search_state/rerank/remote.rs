@@ -2,9 +2,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use crate::commands::semantic_search::rerank::{
-    RerankBackend, RerankDoc, RerankError, RerankFingerprint,
-};
+use super::{RerankBackend, RerankDoc, RerankError, RerankFingerprint};
 
 /// `tei+http://` and `tei+https://` select the TEI wire format without a new config key.
 pub(crate) struct RemoteReranker {

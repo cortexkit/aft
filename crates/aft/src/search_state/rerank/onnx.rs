@@ -373,7 +373,7 @@ fn worker_main(shared: Arc<Shared>, loader: ScorerLoader, keep_alive: Option<Arc
 }
 
 impl OnnxReranker {
-    pub(super) fn enqueue(
+    pub(crate) fn enqueue(
         &self,
         query: &str,
         docs: &[RerankDoc<'_>],
@@ -408,7 +408,7 @@ impl OnnxReranker {
         Ok(response)
     }
 
-    pub(super) fn wait_for_reply(
+    pub(crate) fn wait_for_reply(
         response: &Receiver<Result<Vec<f32>, RerankError>>,
         deadline: Instant,
         now: Instant,
@@ -592,7 +592,7 @@ type ProvisionProbe = (&'static str, Arc<Mutex<Vec<PathBuf>>>);
 #[cfg(test)]
 static PROVISION_PROBE: OnceLock<Mutex<Option<ProvisionProbe>>> = OnceLock::new();
 #[cfg(test)]
-pub(super) fn with_provision_probe<T>(
+pub(crate) fn with_provision_probe<T>(
     model: &'static str,
     work: impl FnOnce() -> T,
 ) -> (T, Vec<PathBuf>) {
