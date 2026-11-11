@@ -950,3 +950,41 @@ fn overlay_base(path: &Path) -> Option<String> {
     lines.next()?.ok()?;
     lines.next()?.ok()
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn verification_rechecks_same_length_content_with_unchanged_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kept-body");
+        let bytes = b"the verified graph body";
+        std::fs::write(&path, bytes).unwrap();
+        let digest = blake3::hash(bytes);
+        let file = std::fs::File::open(&path).unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        assert!(super::verified(
+            &path,
+            &file,
+            bytes.len() as u64,
+            digest.as_bytes()
+        ));
+        drop(file);
+
+        let mut damaged = bytes.to_vec();
+        damaged[0] ^= 1;
+        std::fs::write(&path, damaged).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().modified().unwrap(), modified);
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        assert!(
+            !super::verified(&path, &file, bytes.len() as u64, digest.as_bytes()),
+            "unchanged length and mtime must not hide damaged graph bytes"
+        );
+    }
+}

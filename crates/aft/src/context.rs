@@ -14141,6 +14141,65 @@ mod shared_db_tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn an_unregistered_database_retry_preserves_the_failure_state() {
+        const CHILD: &str = "AFT_TEST_UNREGISTERED_DATABASE_RETRY";
+        if std::env::var_os(CHILD).is_none() {
+            // Hook registration is process-wide and other tests may install it.
+            // A child running only this test starts with an empty hook table.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "context::shared_db_tests::an_unregistered_database_retry_preserves_the_failure_state",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "unregistered retry child failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        assert!(!crate::runtime_drain::configure::registered());
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        for busy in [false, true] {
+            ctx.finish_database_runtime_error("database unavailable".into(), busy);
+            if !busy {
+                make_database_retry_due(&ctx);
+            }
+            let state = ctx.database_runtime_state.load(Ordering::Acquire);
+            let (error, retry_at, backoff) = {
+                let failure = ctx.database_runtime_failure.lock();
+                (failure.error.clone(), failure.retry_at, failure.backoff)
+            };
+            assert!(!ctx.claim_database_runtime_retry("db_set_host_state"));
+            ctx.retry_database_runtime();
+            assert!(persistence_call(&ctx).is_some());
+            assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), state);
+            assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 0);
+            let failure = ctx.database_runtime_failure.lock();
+            assert_eq!(failure.error, error);
+            assert_eq!(failure.retry_at, retry_at);
+            assert_eq!(failure.backoff, backoff);
+        }
+    }
+
     fn bound_database_root(app: Arc<App>, root: &Path, storage: &Path) -> Arc<AppContext> {
         let ctx = Arc::new(AppContext::from_app(
             app,

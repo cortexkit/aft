@@ -37,6 +37,11 @@ pub(crate) fn hooks() -> &'static Hooks {
     HOOKS.get().unwrap_or(&IDLE_HOOKS)
 }
 
+#[cfg(test)]
+pub(crate) fn registered() -> bool {
+    HOOKS.get().is_some()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ConfigureMaintenanceStage {
     #[default]
