@@ -260,7 +260,7 @@ fn with_loading_child(run: impl FnOnce(&AppContext, &Path, &Path)) {
     session.pause_refresh(true);
     settled(
         || grep(&parent, COMMON),
-        |reply| reply["index_status"] == "ready" && matched_files(reply).len() == 4,
+        |reply| reply["index_status"] == "Ready" && matched_files(reply).len() == 4,
     );
     let (refusing, _executor, _unbound, _dir) = refusing_executor();
     let held_storage = base.join("held-storage");
@@ -289,7 +289,7 @@ fn parent_loading_child_walks_until_ready_then_returns_to_indexed_grep_and_glob(
         );
         assert_eq!(loading["complete"], true, "{loading:#}");
         assert!(gaps(&loading).is_empty(), "{loading:#}");
-        assert_eq!(loading["index_status"], "building");
+        assert_eq!(loading["index_status"], "Building");
         assert_eq!(loading["fallback"], "filesystem");
         assert_eq!(loading["files_read_directly"], 4);
         assert!(
@@ -329,7 +329,7 @@ fn parent_loading_child_walks_until_ready_then_returns_to_indexed_grep_and_glob(
             .insert_for_test(root, &root.join("beta"), ready);
         let indexed = settled(
             || grep(parent, COMMON),
-            |reply| reply["index_status"] == "ready",
+            |reply| reply["index_status"] == "Ready",
         );
         assert_eq!(
             relative_files(root, matched_files(&indexed)),
@@ -688,7 +688,7 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     let loading = grep(&parent, COMMON);
     assert!(child_gaps(&loading).is_empty(), "{loading:#}");
     assert_eq!(matched_files(&loading).len(), 4, "{loading:#}");
-    assert_eq!(loading["index_status"], "building", "{loading:#}");
+    assert_eq!(loading["index_status"], "Building", "{loading:#}");
     std::thread::sleep(Duration::from_millis(500));
     let bound = parent.data_children().bound_for_test();
     assert_eq!(bound.len(), 2);
@@ -698,12 +698,12 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     );
     let still_loading = grep(&parent, COMMON);
     assert!(child_gaps(&still_loading).is_empty(), "{still_loading:#}");
-    assert_eq!(still_loading["index_status"], "building");
+    assert_eq!(still_loading["index_status"], "Building");
 
     parent.mark_subc_bound();
     let served = settled(
         || grep(&parent, COMMON),
-        |reply| reply["index_status"] == "ready" && matched_files(reply).len() == 4,
+        |reply| reply["index_status"] == "Ready" && matched_files(reply).len() == 4,
     );
     assert_eq!(served["complete"], true, "{served:#}");
 
