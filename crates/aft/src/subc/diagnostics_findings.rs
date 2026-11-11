@@ -292,10 +292,8 @@ pub(super) fn from_health(
         }
     }
     match metrics["embedding_backend"]["available"].as_bool() {
-        Some(false) if metrics["embedding_backend"]["state"] == "paused" && metrics["embedding_backend"]["pause_cause"] == "lane_paused" => findings.push(condition(
-            "semantic_backend", "paused", Severity::Info, 1, observed, now,
-            "The semantic embedding lane is intentionally paused.", vec![],
-            "Meaning fill will resume at health embedding_backend paused_until_ms; keyword search remains available.")),
+        // Planned downtime is information in health, not a warn/error finding.
+        Some(false) if metrics["embedding_backend"]["state"] == "paused" && metrics["embedding_backend"]["pause_cause"] == "lane_paused" => {},
         Some(false) => findings.push(condition("semantic_backend", "unavailable", Severity::Error, 1,
             metrics["embedding_backend"]["since_ms"].as_u64().unwrap_or(observed), now,
             "The semantic embedding backend is unavailable.", vec![],
@@ -588,10 +586,10 @@ mod tests {
         let mut metrics = healthy_metrics();
         metrics["embedding_backend"] = json!({"available": false, "state": "paused", "pause_cause": "lane_paused", "paused_until_ms": 2_000_000});
         let findings = snapshot(&metrics);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].check, "semantic_backend");
-        assert_eq!(findings[0].key, "paused");
-        assert_eq!(findings[0].severity, Severity::Info);
+        assert!(
+            findings.is_empty(),
+            "planned pauses are not failures: {findings:?}"
+        );
         for backend in [
             json!({"available": false, "state": "backend_unavailable"}),
             json!({"available": false, "state": "paused", "pause_cause": "transient"}),

@@ -8748,6 +8748,54 @@ mod tests {
     }
 
     #[test]
+    fn semantic_backend_planned_pause_is_information_but_does_not_hide_outages() {
+        let executor = Executor::new();
+        let (dir, root) = test_root("semantic-planned-pause-health");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("storage")),
+                project_root: Some(root.as_path().into()),
+                ..crate::config::Config::default()
+            },
+        ));
+        let until = crate::semantic_index::unix_millis_now() + 1_399_000;
+        crate::synapse_embed::share_lane_pause(
+            root.as_path(),
+            &crate::synapse_embed::LanePause {
+                lane_id: "health-planned-lane".into(),
+                fingerprint: None,
+                retry_after_ms: Some(1_399_000),
+                paused_until_ms: until,
+                reason: "Neural Engine maintenance".into(),
+                cause: crate::synapse_embed::PauseCause::LanePaused,
+                safe_to_retry_same_request: true,
+                record_id: 0,
+            },
+        );
+        assert!(executor.register_actor(root, ctx));
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        let report = refresh_until_root_count(&cache, &executor, &app, 1)
+            .metrics
+            .unwrap();
+        assert_eq!(report["embedding_backend"]["available"], false);
+        assert_eq!(report["embedding_backend"]["state"], "paused");
+        assert_eq!(report["embedding_backend"]["pause_cause"], "lane_paused");
+        assert_eq!(report["embedding_backend"]["paused_until_ms"], until);
+
+        let (_outage_dir, outage_root) = test_root("semantic-outage-with-pause-health");
+        let outage = test_ctx();
+        outage.trip_semantic_refresh_circuit(1, "connection refused");
+        assert!(executor.register_actor(outage_root, outage));
+        let report = refresh_until_root_count(&cache, &executor, &app, 2)
+            .metrics
+            .unwrap();
+        assert_eq!(report["embedding_backend"]["state"], "backend_unavailable");
+        assert!(report["embedding_backend"]["pause_cause"].is_null());
+    }
+
+    #[test]
     fn semantic_backend_outage_is_distinct_per_root_and_aggregated_once() {
         let executor = Executor::new();
         let (_dir, root) = test_root("semantic-backend-unavailable-health");
