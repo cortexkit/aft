@@ -39,11 +39,17 @@ fn sessions(db: &crate::db::TrackedConnection) -> rusqlite::Result<Vec<Session>>
     for row in rows {
         let (harness, session, root, task, metadata, keyed) = row?;
         let metadata: Value = serde_json::from_str(&metadata).unwrap_or(Value::Null);
-        let principal = metadata["launching_identity"]["principal"].as_str();
-        let runner = matches!(
-            principal,
-            Some("reserved:thalamus-harness" | "reserved:broca")
-        ) || [
+        let runner = [
+            metadata["launching_identity"]["principal"].as_str(),
+            metadata["call_key"]["requester"].as_str(),
+        ]
+        .into_iter()
+        .any(|carrier| {
+            matches!(
+                carrier,
+                Some("reserved:thalamus-harness" | "reserved:broca")
+            )
+        }) || [
             Some(harness.as_str()),
             metadata["launching_raw_harness"].as_str(),
             metadata["launching_identity"]["harness"].as_str(),
@@ -103,7 +109,24 @@ fn recover(
         sessions(&conn).map_err(|error| error.to_string())?
     };
     let mut replayed = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut missing_roots = std::collections::BTreeMap::<PathBuf, usize>::new();
     for session in pending {
+        if std::fs::metadata(&session.project_root)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            let count = missing_roots
+                .entry(session.project_root.clone())
+                .or_default();
+            match settle_missing_root(&db, &session.task_ids) {
+                Ok(settled) => *count += settled,
+                Err(error) => log::warn!(
+                    "held task startup settlement failed for {}/{}: {error}",
+                    session.harness,
+                    session.session_id
+                ),
+            }
+            continue;
+        }
         match replay(app, executor, push_senders, storage, &db, &session) {
             Ok(tasks) => replayed
                 .entry(session.session_id)
@@ -119,7 +142,51 @@ fn recover(
             }
         }
     }
+    for (root, settled) in missing_roots {
+        log::warn!(
+            "held task startup recovery reason=root_missing root={} settled_entries={settled}",
+            root.display()
+        );
+    }
     Ok(replayed.into_iter().collect())
+}
+
+fn settle_missing_root(
+    db: &Arc<StdMutex<crate::db::TrackedConnection>>,
+    task_ids: &[String],
+) -> rusqlite::Result<usize> {
+    use crate::db::call_ledger as ledger;
+    let conn = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut settled = 0;
+    for task in task_ids {
+        let mut stmt = conn.prepare(
+            "SELECT carrier,call_key FROM call_ledger
+             WHERE recovered=1 AND state='DispatchStarted' AND task_id=?1",
+        )?;
+        let keys = stmt
+            .query_map([task], |row| {
+                Ok(ledger::Key {
+                    carrier: row.get(0)?,
+                    call_key: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for key in keys {
+            // A missing project is not evidence that its command exited or was
+            // cancelled. Record the outcome as unknown, without signalling a
+            // process or contacting its build server.
+            settled += usize::from(ledger::settle(
+                &conn,
+                &key,
+                &ledger::unknown_held_result(),
+                "outcome_unknown",
+                None,
+                ledger::now_ms(),
+            )?);
+        }
+    }
+    Ok(settled)
 }
 
 fn replay(
@@ -383,6 +450,50 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_deleted_project_root_settles_as_unknown_without_a_route_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("deleted-project");
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        let old = context(&root, &storage);
+        let layout = crate::bash_background::persistence::create_task_layout(
+            &old.harness_dir(),
+            "deleted-root-worker",
+            "bash-0000000000000003",
+        )
+        .unwrap();
+        let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
+            layout.paths.task_id.clone(),
+            "deleted-root-worker".into(),
+            "lost command".into(),
+            root.clone(),
+            Some(root.clone()),
+            None,
+            true,
+            false,
+        );
+        metadata.status = crate::bash_background::BgTaskStatus::Running;
+        metadata.child_pid = Some(i32::MAX as u32);
+        write_task_at(&layout, &metadata).unwrap();
+        let key = hold_task(&old, &layout, "deleted-root-held");
+        drop(old);
+        std::fs::remove_dir(&root).unwrap();
+        let restarted = context(dir.path(), &storage);
+        assert!(!root.exists());
+        let executor = startup(&restarted).await;
+        assert_eq!(
+            settled(&restarted, &key).await.body,
+            ledger::unknown_held_result().body
+        );
+        assert_eq!(
+            executor.actor_count(),
+            0,
+            "missing roots must not start a registry worker"
+        );
+    }
+
     #[tokio::test]
     async fn runner_undelivered_completion_is_replayed_before_startup_callback_without_bind() {
         let dir = tempfile::tempdir().unwrap();
@@ -466,6 +577,67 @@ pub(crate) mod tests {
         .await
         .unwrap();
         received.await.unwrap();
+    }
+
+    #[test]
+    fn runner_saved_selection_includes_carriers_and_parsed_harnesses_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path(), &dir.path().join("storage"));
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        for (index, carrier, raw_harness, delivered) in [
+            (1, Some("reserved:broca"), None, false),
+            (2, Some("reserved:thalamus-harness"), None, false),
+            (3, None, Some("claude-code"), false),
+            (4, Some("direct"), Some("opencode"), false),
+            (5, Some("reserved:broca"), None, true),
+        ] {
+            let session = format!("saved-{index}");
+            let layout = crate::bash_background::persistence::create_task_layout(
+                &ctx.storage_dir().join("opencode"),
+                &session,
+                &format!("bash-{index:016x}"),
+            )
+            .unwrap();
+            let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
+                layout.paths.task_id.clone(),
+                session,
+                "finished".into(),
+                dir.path().into(),
+                Some(dir.path().into()),
+                None,
+                true,
+                false,
+            );
+            metadata.harness = Some("opencode".into());
+            metadata.launching_raw_harness = raw_harness.map(str::to_owned);
+            metadata.call_key = carrier.map(|carrier| crate::bash_background::TaskCallKey {
+                requester: carrier.into(),
+                key: "unlinked".into(),
+                minted: false,
+            });
+            metadata.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+            metadata.completion_delivered = delivered;
+            crate::db::bash_tasks::upsert_bash_task(
+                &conn,
+                &metadata
+                    .to_bash_task_row("opencode", &layout.paths)
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let selected = sessions(&conn).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["saved-1", "saved-2", "saved-3"]
+        );
     }
 
     #[cfg(unix)]
