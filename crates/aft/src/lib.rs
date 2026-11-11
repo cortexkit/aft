@@ -188,6 +188,7 @@ pub(crate) mod provisional_identity_retry;
 pub mod pty_render;
 pub mod query_shape;
 pub mod read_policy;
+pub mod repeat_state;
 pub mod reader_floor;
 pub mod response_finalize;
 pub(crate) mod revision_read;

@@ -3122,7 +3122,7 @@ pub struct AppContext {
     /// Authoritative diagnostics observations are retained per session and
     /// producer. Only explicit observation sources may mutate this state.
     alert_state: parking_lot::Mutex<AlertDeltaState>,
-    repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker,
+    repeat_breaker: crate::repeat_state::RepeatBreaker,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
     output_files: Arc<crate::output_store::OutputFiles>,
@@ -3555,7 +3555,7 @@ impl AppContext {
             status_bar_last_emitted: StatusBarEmission::default(),
             status_bar_cached: RwLock::new(StatusBarCache::default()),
             alert_state: parking_lot::Mutex::new(AlertDeltaState::default()),
-            repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker::default(),
+            repeat_breaker: crate::repeat_state::RepeatBreaker::default(),
             compression_aggregates,
             bash_background,
             output_files: crate::output_store::OutputFiles::shared(),
@@ -4720,7 +4720,7 @@ impl AppContext {
         self.repeat_breaker.clear_session(session_id);
     }
 
-    pub fn repeat_breaker(&self) -> &crate::response_finalize::repeat_breaker::RepeatBreaker {
+    pub fn repeat_breaker(&self) -> &crate::repeat_state::RepeatBreaker {
         &self.repeat_breaker
     }
 
