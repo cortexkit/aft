@@ -481,7 +481,7 @@ async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_
                 None,
                 &module_root.join("storage"),
                 QuiescedLsp::ReapInBackground,
-            None,
+                None,
                 None,
                 None,
             ))

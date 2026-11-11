@@ -928,19 +928,22 @@ impl DispatchPathMetrics {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .on_thread_park(move || {
-                parked.frame_loop_runtime_parked_ms_plus_one.store(
-                    parked.now_ms().saturating_add(1),
-                    Ordering::Release,
-                );
+                parked
+                    .frame_loop_runtime_parked_ms_plus_one
+                    .store(parked.now_ms().saturating_add(1), Ordering::Release);
             })
             .on_thread_unpark(move || {
-                unparked.frame_loop_runtime_parked_ms_plus_one.store(0, Ordering::Release);
+                unparked
+                    .frame_loop_runtime_parked_ms_plus_one
+                    .store(0, Ordering::Release);
             })
             .build()
     }
 
     pub(super) fn frame_loop_runtime_parked_for(&self) -> Option<Duration> {
-        let since = self.frame_loop_runtime_parked_ms_plus_one.load(Ordering::Acquire);
+        let since = self
+            .frame_loop_runtime_parked_ms_plus_one
+            .load(Ordering::Acquire);
         (since != 0).then(|| Duration::from_millis(self.now_ms().saturating_sub(since - 1)))
     }
 

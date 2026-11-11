@@ -422,12 +422,16 @@ fn run_watchdog(
                 let parked_for = marker.runtime_parked_for();
                 let majflt_delta = major_faults.saturating_sub(restart.faults_at_progress);
                 let reason = exit_deferral(
-                    stalled_for, config.frame_loop_exit_threshold, wake_late,
-                    parked_for, majflt_delta,
+                    stalled_for,
+                    config.frame_loop_exit_threshold,
+                    wake_late,
+                    parked_for,
+                    majflt_delta,
                 );
                 let evidence = format!(
                     "runtime_parked={} parked_for_ms={} majflt_delta={majflt_delta}",
-                    parked_for.is_some(), parked_for.unwrap_or_default().as_millis(),
+                    parked_for.is_some(),
+                    parked_for.unwrap_or_default().as_millis(),
                 );
                 if let Some(reason) = reason {
                     if !restart.deferral_logged {
@@ -2109,18 +2113,31 @@ mod tests {
     }
 
     impl LivenessMarker for Arc<InjectedMarker> {
-        fn name(&self) -> &'static str { "subc_frame_loop" }
+        fn name(&self) -> &'static str {
+            "subc_frame_loop"
+        }
         fn progress_age(&self) -> Duration {
             self.observations.fetch_add(1, Ordering::SeqCst);
-            Duration::from_millis(self.clock_ms.load(Ordering::SeqCst)
-                .saturating_sub(self.last_turn_ms.load(Ordering::SeqCst)))
+            Duration::from_millis(
+                self.clock_ms
+                    .load(Ordering::SeqCst)
+                    .saturating_sub(self.last_turn_ms.load(Ordering::SeqCst)),
+            )
         }
-        fn has_pending_work(&self) -> bool { true }
-        fn restart_on_stall(&self) -> bool { true }
+        fn has_pending_work(&self) -> bool {
+            true
+        }
+        fn restart_on_stall(&self) -> bool {
+            true
+        }
         fn runtime_parked_for(&self) -> Option<Duration> {
-            self.parked.load(Ordering::SeqCst).then(|| self.progress_age())
+            self.parked
+                .load(Ordering::SeqCst)
+                .then(|| self.progress_age())
         }
-        fn progress_token(&self) -> u64 { self.last_turn_ms.load(Ordering::SeqCst) }
+        fn progress_token(&self) -> u64 {
+            self.last_turn_ms.load(Ordering::SeqCst)
+        }
     }
 
     struct InjectedWatchdog {
@@ -2136,7 +2153,8 @@ mod tests {
     impl InjectedWatchdog {
         fn start(parked: bool) -> Self {
             let marker = Arc::new(InjectedMarker {
-                clock_ms: AtomicU64::new(0), last_turn_ms: AtomicU64::new(0),
+                clock_ms: AtomicU64::new(0),
+                last_turn_ms: AtomicU64::new(0),
                 parked: std::sync::atomic::AtomicBool::new(parked),
                 observations: AtomicUsize::new(0),
             });
@@ -2159,15 +2177,34 @@ mod tests {
             config.major_faults = Arc::new(move || fault_count.load(Ordering::SeqCst));
             let clock = Arc::clone(&marker);
             let origin = Instant::now();
-            config.now = Arc::new(move || origin + Duration::from_millis(clock.clock_ms.load(Ordering::SeqCst)));
-            let watchdog = StallWatchdog::spawn(vec![Box::new(Arc::clone(&marker))], Arc::new(StallStats::default()), config).unwrap();
-            wait_until("first watchdog observation", || marker.observations.load(Ordering::SeqCst) >= 2);
-            Self { marker, faults, log, stderr, exits, watchdog, _dir: dir }
+            config.now = Arc::new(move || {
+                origin + Duration::from_millis(clock.clock_ms.load(Ordering::SeqCst))
+            });
+            let watchdog = StallWatchdog::spawn(
+                vec![Box::new(Arc::clone(&marker))],
+                Arc::new(StallStats::default()),
+                config,
+            )
+            .unwrap();
+            wait_until("first watchdog observation", || {
+                marker.observations.load(Ordering::SeqCst) >= 2
+            });
+            Self {
+                marker,
+                faults,
+                log,
+                stderr,
+                exits,
+                watchdog,
+                _dir: dir,
+            }
         }
 
         fn advance(&self, seconds: u64) {
             let observed = self.marker.observations.load(Ordering::SeqCst);
-            self.marker.clock_ms.fetch_add(seconds * 1000, Ordering::SeqCst);
+            self.marker
+                .clock_ms
+                .fetch_add(seconds * 1000, Ordering::SeqCst);
             wait_until("injected watchdog tick", || {
                 self.marker.observations.load(Ordering::SeqCst) >= observed + 4
                     || self.exits.load(Ordering::SeqCst) != 0
@@ -2175,7 +2212,11 @@ mod tests {
         }
 
         fn deferrals(&self) -> Vec<String> {
-            self.log.lines().into_iter().filter(|line| line.contains("exit deferred")).collect()
+            self.log
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains("exit deferred"))
+                .collect()
         }
     }
 
@@ -2223,7 +2264,9 @@ mod tests {
     #[test]
     fn unparked_runtime_with_fault_burst_defers_until_ceiling() {
         let probe = InjectedWatchdog::start(false);
-        probe.faults.store(100 + PAGING_MAJFLT_THRESHOLD + 1, Ordering::SeqCst);
+        probe
+            .faults
+            .store(100 + PAGING_MAJFLT_THRESHOLD + 1, Ordering::SeqCst);
         probe.advance(29);
         probe.advance(1);
         assert_eq!(probe.exits.load(Ordering::SeqCst), 0);
@@ -2250,9 +2293,30 @@ mod tests {
 
     #[test]
     fn paging_threshold_is_strict_and_hard_ceiling_overrides_all_deferrals() {
-        assert_eq!(exit_deferral(secs(30), secs(30), secs(0), None, PAGING_MAJFLT_THRESHOLD), None);
-        assert_eq!(exit_deferral(secs(30), secs(30), secs(0), None, PAGING_MAJFLT_THRESHOLD + 1), Some("paging"));
-        assert_eq!(exit_deferral(FRAME_LOOP_HARD_CEILING, secs(30), secs(300), Some(secs(300)), 1000), None);
+        assert_eq!(
+            exit_deferral(secs(30), secs(30), secs(0), None, PAGING_MAJFLT_THRESHOLD),
+            None
+        );
+        assert_eq!(
+            exit_deferral(
+                secs(30),
+                secs(30),
+                secs(0),
+                None,
+                PAGING_MAJFLT_THRESHOLD + 1
+            ),
+            Some("paging")
+        );
+        assert_eq!(
+            exit_deferral(
+                FRAME_LOOP_HARD_CEILING,
+                secs(30),
+                secs(300),
+                Some(secs(300)),
+                1000
+            ),
+            None
+        );
     }
 
     #[test]

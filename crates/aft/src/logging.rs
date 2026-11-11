@@ -2688,11 +2688,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("watchdog.log");
         let control = super::FILE_CONTROL.lock().unwrap();
-        super::write_watchdog_line(&path, "stall watchdog: stall detected marker=subc_frame_loop").unwrap();
+        super::write_watchdog_line(
+            &path,
+            "stall watchdog: stall detected marker=subc_frame_loop",
+        )
+        .unwrap();
         let rotated = dir.path().join("watchdog.log.1");
         std::fs::rename(&path, &rotated).unwrap();
         super::write_watchdog_line(&path, "stall watchdog: exit deferred because paging").unwrap();
-        super::write_watchdog_line(&path, "stall watchdog: exiting Authorization: Bearer terminal-secret-value").unwrap();
+        super::write_watchdog_line(
+            &path,
+            "stall watchdog: exiting Authorization: Bearer terminal-secret-value",
+        )
+        .unwrap();
         drop(control);
         let old = std::fs::read_to_string(rotated).unwrap();
         let current = std::fs::read_to_string(path).unwrap();
