@@ -508,9 +508,10 @@ fn stream_action(queue: usize, stream: usize, start: bool) -> bool {
         start,
         started: false,
     };
-    // Synchronous execution on the delivery queue fences callbacks: after a
-    // stop returns no callback can still be using the released stream context.
-    // Stream owners are backend/config workers, never native callbacks.
+    // Serialize lifecycle changes with native delivery. Invalidation stops
+    // callbacks, but FSEvents may retain the stream until queued work drains,
+    // releasing its context after this synchronous call returns. Stream owners
+    // are backend/config workers, never native callbacks.
     unsafe {
         dispatch_sync_f(
             queue as *mut _,
@@ -1058,6 +1059,11 @@ mod tests {
         let start = Instant::now();
         let deadline = start + Duration::from_secs(5);
         loop {
+            assert!(
+                Instant::now() < deadline,
+                "stream sender retained after five seconds; release_context calls={}",
+                releases.load(Ordering::SeqCst)
+            );
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1124,6 +1130,7 @@ mod tests {
         let mut streams = Vec::new();
         let mut receivers = Vec::new();
         let mut paths = Vec::new();
+        let mut releases = Vec::new();
         for root in &roots {
             let root = std::fs::canonicalize(root.path()).unwrap();
             let (tx, rx) = mpsc::channel();
@@ -1136,6 +1143,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(stream.queue, delivery_queue().unwrap());
+            releases.push(Arc::clone(&stream.context_release_calls));
             paths.push(root.join("before-drop.rs"));
             streams.push(stream);
             receivers.push(rx);
@@ -1145,22 +1153,15 @@ mod tests {
             wait_for_raw_path(rx, path);
         }
         drop(streams.remove(0));
-        // Invalidation and release on the shared queue release the stream's
-        // callback context, so no sender or stream registration survives eviction.
-        while receivers[0].try_recv().is_ok() {}
-        assert!(matches!(
-            receivers[0].try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
+        // FSEvents can retain a stream until queued work drains, so its context
+        // may be released after Drop returns. Bound that deferred release and
+        // verify that context release runs exactly once and drops its sender.
+        wait_for_context_release(&receivers[0], &releases[0]);
         let survivor = paths[1].with_file_name("after-drop.rs");
         std::fs::write(&survivor, b"pub fn after() {}\n").unwrap();
         wait_for_raw_path(&receivers[1], &survivor);
         drop(streams);
-        while receivers[1].try_recv().is_ok() {}
-        assert!(matches!(
-            receivers[1].try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
+        wait_for_context_release(&receivers[1], &releases[1]);
     }
 
     fn symlink_replacement_fixture(
