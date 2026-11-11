@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::parser::detect_language;
+use crate::lang_id::language_by_extension;
 
 #[path = "url_fetch_sensitive.rs"]
 mod sensitive;
@@ -2834,7 +2834,7 @@ fn extension_from_url_path(url: &Url) -> Option<&'static str> {
         return None;
     }
     let probe = Path::new("file").with_extension(ext);
-    if detect_language(&probe).is_some() {
+    if language_by_extension(&probe).is_some() {
         static_extension_for_lang_ext(ext)
     } else {
         None
@@ -3673,6 +3673,24 @@ pub mod timing {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extension_only_url_decision_matches_parser() {
+        for ext in crate::lang_id::TEST_EXTENSIONS {
+            let probe = std::path::Path::new("file").with_extension(ext);
+            let expected = if crate::parser::detect_language(&probe).is_some() {
+                super::static_extension_for_lang_ext(ext)
+            } else {
+                None
+            };
+            let url = url::Url::parse(&format!("https://example.com/file.{ext}")).unwrap();
+            assert_eq!(super::extension_from_url_path(&url), expected, "{ext}");
+        }
+        for name in ["Jenkinsfile", "file", ".hidden"] {
+            let url = url::Url::parse(&format!("https://example.com/{name}")).unwrap();
+            assert_eq!(super::extension_from_url_path(&url), None, "{name}");
+        }
+    }
+
     #[test]
     fn h_header_url_cache_preserves_ambiguous_extension() {
         assert_eq!(super::static_extension_for_lang_ext("h"), Some(".h"));

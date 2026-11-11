@@ -725,44 +725,7 @@ const PERL_QUERY: &str = r#"
   variable: (_) @var.name) @var.def
 "#;
 
-/// Supported language identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LangId {
-    TypeScript,
-    Tsx,
-    JavaScript,
-    Python,
-    Rust,
-    Go,
-    C,
-    Cpp,
-    Cuda,
-    Metal,
-    Zig,
-    CSharp,
-    Bash,
-    Html,
-    Markdown,
-    Solidity,
-    Scss,
-    Vue,
-    Json,
-    Scala,
-    Java,
-    Ruby,
-    Kotlin,
-    Swift,
-    Php,
-    Lua,
-    Perl,
-    Yaml,
-    Pascal,
-    R,
-    Groovy,
-    ObjC,
-    Toml,
-    Luau,
-}
+pub use crate::lang_id::LangId;
 
 /// Detect a file's language, resolving ambiguous headers from their contents.
 pub fn detect_language(path: &Path) -> Option<LangId> {
@@ -819,49 +782,7 @@ fn is_h_header(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("h")
 }
 
-pub(crate) fn language_for_extension(path: &Path) -> Option<LangId> {
-    if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
-        return Some(LangId::Groovy);
-    }
-
-    let ext = path.extension()?.to_str()?;
-    match ext {
-        "ts" | "mts" | "cts" => Some(LangId::TypeScript),
-        "tsx" => Some(LangId::Tsx),
-        "js" | "jsx" | "mjs" | "cjs" => Some(LangId::JavaScript),
-        "py" | "pyi" => Some(LangId::Python),
-        "rs" => Some(LangId::Rust),
-        "go" => Some(LangId::Go),
-        "c" | "h" => Some(LangId::C),
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" => Some(LangId::Cpp),
-        "cu" | "cuh" => Some(LangId::Cuda),
-        "metal" => Some(LangId::Metal),
-        "zig" => Some(LangId::Zig),
-        "cs" => Some(LangId::CSharp),
-        "sh" | "bash" | "zsh" => Some(LangId::Bash),
-        "html" | "htm" => Some(LangId::Html),
-        "md" | "markdown" | "mdx" | "qmd" | "Qmd" | "rmd" | "Rmd" => Some(LangId::Markdown),
-        "sol" => Some(LangId::Solidity),
-        "scss" => Some(LangId::Scss),
-        "vue" => Some(LangId::Vue),
-        "json" | "jsonc" => Some(LangId::Json),
-        "scala" | "sc" => Some(LangId::Scala),
-        "java" => Some(LangId::Java),
-        "rb" => Some(LangId::Ruby),
-        "kt" | "kts" => Some(LangId::Kotlin),
-        "swift" => Some(LangId::Swift),
-        "inc" | "php" => Some(LangId::Php),
-        "lua" => Some(LangId::Lua),
-        "pl" | "pm" | "t" => Some(LangId::Perl),
-        "yaml" | "yml" => Some(LangId::Yaml),
-        "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(LangId::Pascal),
-        "R" | "r" => Some(LangId::R),
-        "groovy" | "gvy" | "gy" | "gsh" | "gradle" => Some(LangId::Groovy),
-        "m" | "mm" => Some(LangId::ObjC),
-        "toml" => Some(LangId::Toml),
-        _ => None,
-    }
-}
+pub(crate) use crate::lang_id::language_by_extension as language_for_extension;
 
 /// The most container blocks (block quotes and list items) a Markdown file
 /// may hold open at once and still be parsed. The Markdown grammar's block

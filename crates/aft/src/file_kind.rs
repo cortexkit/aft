@@ -444,9 +444,9 @@ impl ContentChecks {
 /// A source-language file whose header may mark it generated. Docs and
 /// config formats are excluded: their text is what a reader searches.
 fn is_source_file_name(file_name: &str) -> bool {
-    use crate::parser::LangId;
+    use crate::lang_id::LangId;
     matches!(
-        crate::parser::detect_language(Path::new(file_name)),
+        crate::lang_id::language_by_extension(Path::new(file_name)),
         Some(lang) if !matches!(lang, LangId::Markdown | LangId::Html | LangId::Yaml | LangId::Toml)
     )
 }
@@ -693,6 +693,20 @@ pub(crate) mod read_probe {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extension_only_source_classification_matches_parser() {
+        use crate::lang_id::{LangId, TEST_EXTENSIONS};
+        for name in TEST_EXTENSIONS
+            .iter()
+            .map(|ext| format!("file.{ext}"))
+            .chain(["Jenkinsfile", "file", ".hidden"].map(str::to_owned))
+        {
+            let expected = matches!(crate::parser::detect_language(std::path::Path::new(&name)),
+                Some(lang) if !matches!(lang, LangId::Markdown | LangId::Html | LangId::Yaml | LangId::Toml));
+            assert_eq!(super::is_source_file_name(&name), expected, "{name}");
+        }
+    }
+
     use super::*;
 
     fn kind_of(root: &Path, relative: &str) -> FileKind {

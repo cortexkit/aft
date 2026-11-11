@@ -146,6 +146,7 @@ pub mod inspect_category;
 pub(crate) mod io_accounting;
 pub mod jsonc;
 pub mod jsonc_edit;
+pub mod lang_id;
 pub mod language;
 pub(crate) mod large_read;
 pub(crate) mod late_result_bus;
