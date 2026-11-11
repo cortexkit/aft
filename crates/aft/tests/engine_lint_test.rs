@@ -203,14 +203,19 @@ fn get_workspace_root() -> PathBuf {
 pub fn collect_fence_rust_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
-    // 1. Every *.rs under crates/aft/src/commands/semantic_search/ (direct and nested)
-    let sem_search_dir = root.join("crates/aft/src/commands/semantic_search");
-    if sem_search_dir.is_dir() {
-        for entry in fs::read_dir(&sem_search_dir).expect("read_dir semantic_search") {
-            let entry = entry.expect("read_dir entry");
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                files.push(path);
+    // Audit the direct search-stage files and the shared search-state primitives.
+    for relative_dir in [
+        "crates/aft/src/commands/semantic_search",
+        "crates/aft/src/search_state",
+    ] {
+        let directory = root.join(relative_dir);
+        if directory.is_dir() {
+            for entry in fs::read_dir(&directory).expect("read_dir search source") {
+                let entry = entry.expect("read_dir entry");
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    files.push(path);
+                }
             }
         }
     }
