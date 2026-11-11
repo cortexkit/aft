@@ -260,6 +260,7 @@ pub(crate) mod walk_boundary;
 pub mod watcher;
 pub(crate) mod watcher_backend;
 pub mod watcher_filter;
+pub(crate) mod watcher_markers;
 pub mod write_counters;
 pub mod write_intent;
 pub mod write_ledger;
