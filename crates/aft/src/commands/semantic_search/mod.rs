@@ -7283,10 +7283,12 @@ fn execute_degraded_grep_fallback(
     let read_budget_reached = AtomicBool::new(walk_budget_reached);
     let cancellation = crate::executor::current_job_cancellation();
     let rayon_wait = waits::time(waits::SearchWait::Rayon);
+    let alloc_label = crate::alloc_trace::carry();
     let mut readable_files = files
         .par_iter()
         .enumerate()
         .filter_map(|(index, file)| {
+            let _alloc_label = alloc_label.enter();
             if cancellation
                 .as_ref()
                 .is_some_and(|token| token.cancel_requested_before_commit())

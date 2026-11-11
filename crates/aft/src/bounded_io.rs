@@ -1377,6 +1377,7 @@ fn run_with_timeout<T: Send + 'static>(
     };
     let owned = path.to_path_buf();
     let budget = current();
+    let alloc_label = crate::alloc_trace::carry();
     let confinement = crate::context::confinement::capture();
     #[cfg(test)]
     let measurements = budget.as_ref().map(|b| Arc::clone(&b.measurements));
@@ -1388,6 +1389,7 @@ fn run_with_timeout<T: Send + 'static>(
         counts.round_trips.fetch_add(1, Ordering::Relaxed);
     }
     permit.send(Box::new(move || {
+            let _alloc_label = alloc_label.enter();
             #[cfg(test)]
             regression_tests::before_helper(&owned);
             let result = crate::context::confinement::inherit(confinement, || with_budget(budget, || {
@@ -1839,7 +1841,131 @@ pub(crate) fn read(path: &Path, at: Option<Instant>) -> io::Result<Vec<u8>> {
         result => result,
     }
 }
-fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
+
+/// A regular file whose chunk reads retain the same access checks and helper
+/// deadlines as a whole-file read. The descriptor stays open between chunks.
+pub(crate) struct Reader {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    direct: bool,
+    at: Option<Instant>,
+}
+
+pub(crate) fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
+    if Instant::now() >= deadline(at) {
+        return Err(failure(
+            path,
+            "read_deadline_exceeded",
+            "scan deadline elapsed before file access",
+        ));
+    }
+    let access = parent(path, at)?;
+    let metadata = access
+        .direct
+        .then(|| std::fs::symlink_metadata(path))
+        .transpose()?;
+    let direct = metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.file_type().is_symlink());
+    if direct && !metadata.as_ref().unwrap().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let (file, direct) = if direct {
+        match regular_open(path, true) {
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                (run(path, at, |path| regular_open(&path, false))?, false)
+            }
+            result => (result?, true),
+        }
+    } else {
+        (run(path, at, |path| regular_open(&path, false))?, false)
+    };
+    Ok(Reader {
+        path: path.to_path_buf(),
+        file: Some(file),
+        direct,
+        at,
+    })
+}
+
+impl Reader {
+    pub(crate) fn rest(&mut self, mut bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+        if Instant::now() >= deadline(self.at) {
+            return Err(failure(
+                &self.path,
+                "read_deadline_exceeded",
+                "scan deadline elapsed during file read",
+            ));
+        }
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("file read already failed"))?;
+        let read = move || {
+            let size = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
+            bytes
+                .try_reserve(size.saturating_sub(bytes.len()))
+                .map_err(io::Error::other)?;
+            let before = bytes.len();
+            file.read_to_end(&mut bytes)?;
+            crate::io_accounting::WORK.content_read_bytes.fetch_add(
+                (bytes.len() - before) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok((file, bytes))
+        };
+        let (file, bytes) = if self.direct {
+            read()?
+        } else {
+            run(&self.path, self.at, move |_| read())?
+        };
+        self.file = Some(file);
+        Ok(bytes)
+    }
+
+    pub(crate) fn chunk(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
+        if Instant::now() >= deadline(self.at) {
+            return Err(failure(
+                &self.path,
+                "read_deadline_exceeded",
+                "scan deadline elapsed during file read",
+            ));
+        }
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("file read already failed"))?;
+        let read = move || {
+            buffer.resize(size, 0);
+            let mut count = 0;
+            while count < buffer.len() {
+                match file.read(&mut buffer[count..]) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Ok(0) => break,
+                    result => count += result?,
+                }
+            }
+            buffer.truncate(count);
+            crate::io_accounting::WORK
+                .content_read_bytes
+                .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok((file, buffer))
+        };
+        let (file, buffer) = if self.direct {
+            read()?
+        } else {
+            run(&self.path, self.at, move |_| read())?
+        };
+        self.file = Some(file);
+        Ok(buffer)
+    }
+}
+
+fn regular_open(path: &Path, _no_follow: bool) -> io::Result<std::fs::File> {
     if !_no_follow && !std::fs::metadata(path)?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1861,7 +1987,7 @@ fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
     crate::io_accounting::WORK
         .content_reads
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
     crate::task_temp_reads::check_opened(path, scratch_check.as_ref(), &file)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1870,6 +1996,12 @@ fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
             "not a regular file",
         ));
     }
+    Ok(file)
+}
+
+fn regular_read(path: &Path, no_follow: bool) -> io::Result<Vec<u8>> {
+    let mut file = regular_open(path, no_follow)?;
+    let metadata = file.metadata()?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve(usize::try_from(metadata.len()).map_err(io::Error::other)?)

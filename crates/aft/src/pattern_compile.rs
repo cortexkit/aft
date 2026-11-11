@@ -18,6 +18,68 @@ pub struct LiteralSearch {
     pub case_insensitive_ascii: bool,
 }
 
+pub(crate) enum LiteralFinder<'a> {
+    Exact(memchr::memmem::Finder<'a>),
+    Folded {
+        regex: Option<Regex>,
+        needle: &'a [u8],
+    },
+}
+
+impl LiteralSearch {
+    pub(crate) fn finder(&self) -> LiteralFinder<'_> {
+        if self.case_insensitive_ascii {
+            // ASCII-only folding is the literal path's contract. A regex
+            // automaton searches it without making a lowercase haystack copy.
+            let escaped = self
+                .needle
+                .iter()
+                .map(|byte| format!("\\x{byte:02x}"))
+                .collect::<String>();
+            LiteralFinder::Folded {
+                regex: RegexBuilder::new(&escaped)
+                    .unicode(false)
+                    .case_insensitive(true)
+                    .build()
+                    .ok(),
+                needle: &self.needle,
+            }
+        } else {
+            LiteralFinder::Exact(memchr::memmem::Finder::new(&self.needle))
+        }
+    }
+}
+
+impl LiteralFinder<'_> {
+    pub(crate) fn find(&self, content: &[u8]) -> Option<usize> {
+        match self {
+            Self::Exact(finder) => finder.find(content),
+            Self::Folded {
+                regex: Some(regex), ..
+            } => regex.find(content).map(|matched| matched.start()),
+            Self::Folded {
+                regex: None,
+                needle,
+            } => {
+                if needle.is_empty() {
+                    return Some(0);
+                }
+                let first = needle[0];
+                memchr::memchr2_iter(
+                    first.to_ascii_lowercase(),
+                    first.to_ascii_uppercase(),
+                    content,
+                )
+                .find(|&start| {
+                    content
+                        .get(start..start + needle.len())
+                        .is_some_and(|window| window.eq_ignore_ascii_case(needle))
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CompileOpts {
     pub literal: bool,
@@ -68,6 +130,17 @@ impl PartialEq for CompiledPattern {
 impl Eq for CompiledPattern {}
 
 impl CompiledPattern {
+    /// Whether complete newline-delimited blocks have the same match semantics
+    /// as the whole haystack. Unrecorded builder anchor flags are treated
+    /// conservatively: only explicit multiline anchors are eligible.
+    pub(crate) fn can_stream_lines(&self) -> bool {
+        let Self::Regex { compiled, .. } = self else {
+            return matches!(self, Self::Literal(literal) if !literal.needle.is_empty()
+                && !literal.needle.contains(&b'\n') && std::str::from_utf8(&literal.needle).is_ok());
+        };
+        regex_can_stream_lines(compiled)
+    }
+
     pub fn is_literal(&self) -> bool {
         matches!(self, CompiledPattern::Literal(_))
     }
@@ -89,6 +162,42 @@ impl CompiledPattern {
             CompiledPattern::Regex { raw_pattern, .. } => raw_pattern.clone(),
         }
     }
+}
+
+pub(crate) fn regex_can_stream_lines(compiled: &Regex) -> bool {
+    let Ok(hir) = regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(compiled.as_str())
+    else {
+        return false;
+    };
+    fn local(hir: &regex_syntax::hir::Hir) -> bool {
+        use regex_syntax::hir::{Class, HirKind, Look};
+        match hir.kind() {
+            HirKind::Literal(literal) => !literal.0.contains(&b'\n'),
+            HirKind::Class(Class::Unicode(class)) => !class
+                .ranges()
+                .iter()
+                .any(|range| range.start() <= '\n' && range.end() >= '\n'),
+            HirKind::Class(Class::Bytes(class)) => !class
+                .ranges()
+                .iter()
+                .any(|range| range.start() <= b'\n' && range.end() >= b'\n'),
+            HirKind::Look(Look::Start | Look::End) => false,
+            _ => hir.kind().subs().iter().all(local),
+        }
+    }
+    // Empty matches at the end of a block would also belong to the next
+    // block. Fallback grep rounds a byte-regex match back to a character
+    // boundary only when the whole file is valid UTF-8. A non-UTF-8 match
+    // could therefore acquire a different column when validity is tested
+    // on just one block, so those patterns keep the whole-file path.
+    hir.properties()
+        .minimum_len()
+        .is_some_and(|length| length > 0)
+        && hir.properties().is_utf8()
+        && local(&hir)
 }
 
 /// Search the whole input normally, repairing only matches that consumed an

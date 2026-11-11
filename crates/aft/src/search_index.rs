@@ -1364,6 +1364,99 @@ enum SearchMatcher {
     Regex(Regex),
 }
 
+impl SearchMatcher {
+    fn can_stream_lines(&self) -> bool {
+        match self {
+            Self::Literal(literal) => CompiledPattern::Literal(literal.clone()).can_stream_lines(),
+            Self::Regex(regex) => pattern_compile::regex_can_stream_lines(regex),
+        }
+    }
+}
+
+/// Complete lines in bounded blocks; only an individual overlong line grows
+/// beyond the block size. Patterns with whole-haystack semantics use one block.
+pub(crate) struct GrepBlocks {
+    reader: Option<crate::bounded_io::Reader>,
+    pending: Vec<u8>,
+    scratch: Vec<u8>,
+    end: usize,
+    eof: bool,
+    yielded: bool,
+    pub(crate) line_base: u32,
+}
+
+impl GrepBlocks {
+    pub(crate) const BLOCK_BYTES: usize = 4 << 20;
+
+    pub(crate) fn open(
+        path: &Path,
+        at: Option<Instant>,
+        artifact: bool,
+        stream: bool,
+    ) -> std::io::Result<Self> {
+        let mut reader = crate::project_content::reader_bounded(path, at, artifact)?;
+        // content_inspector examines only the first 1024 bytes (including BOM
+        // and magic checks). Reject the same binaries before reserving a file-
+        // sized buffer, even for patterns that require the whole haystack.
+        let prefix = reader.chunk(Vec::new(), 1024)?;
+        let binary = is_binary_bytes(&prefix);
+        let pending = if binary {
+            Vec::new()
+        } else if stream {
+            prefix
+        } else {
+            reader.rest(prefix)?
+        };
+        Ok(Self {
+            reader: stream.then_some(reader),
+            pending,
+            scratch: Vec::new(),
+            end: 0,
+            eof: !stream || binary,
+            yielded: binary,
+            line_base: 0,
+        })
+    }
+
+    pub(crate) fn next(&mut self) -> std::io::Result<Option<(u32, &[u8])>> {
+        if self.end > 0 {
+            self.line_base = self.line_base.saturating_add(
+                memchr::memchr_iter(b'\n', &self.pending[..self.end]).count() as u32,
+            );
+            self.pending.drain(..self.end);
+            self.end = 0;
+        }
+        loop {
+            if self.eof {
+                self.end = self.pending.len();
+                if self.end == 0 && self.yielded {
+                    return Ok(None);
+                }
+                self.yielded = true;
+                return Ok(Some((self.line_base, &self.pending[..])));
+            }
+            self.scratch = self
+                .reader
+                .as_mut()
+                .unwrap()
+                .chunk(std::mem::take(&mut self.scratch), Self::BLOCK_BYTES)?;
+            if self.scratch.is_empty() {
+                self.eof = true;
+                continue;
+            }
+            self.pending
+                .try_reserve_exact(self.scratch.len())
+                .map_err(std::io::Error::other)?;
+            self.pending.extend_from_slice(&self.scratch);
+            if let Some(end) = memchr::memrchr(b'\n', &self.pending) {
+                self.end = end + 1;
+                self.yielded = true;
+                return Ok(Some((self.line_base, &self.pending[..self.end])));
+            }
+        }
+    }
+}
+
 impl SearchIndex {
     pub fn new() -> Self {
         SearchIndex {
@@ -2043,6 +2136,7 @@ impl SearchIndexSnapshot {
         let stop_scan = Arc::new(AtomicBool::new(false));
         let deadline = make_deadline();
         let io_budget = crate::bounded_io::current();
+        let alloc_label = crate::alloc_trace::carry();
         let floor_disclosure = crate::context::confinement::capture();
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
@@ -2076,7 +2170,12 @@ impl SearchIndexSnapshot {
                 let per_file: Vec<(Vec<SharedGrepMatch>, bool)> = batch
                     .par_iter()
                     .map_init(
-                        || crate::bounded_io::enter(io_budget.clone()),
+                        || {
+                            (
+                                crate::bounded_io::enter(io_budget.clone()),
+                                alloc_label.enter(),
+                            )
+                        },
                         |_scope, file| {
                             if !claim_verification() {
                                 truncated.store(true, Ordering::Relaxed);
@@ -2164,7 +2263,12 @@ impl SearchIndexSnapshot {
             candidate_files
                 .par_iter()
                 .map_init(
-                    || crate::bounded_io::enter(io_budget.clone()),
+                    || {
+                        (
+                            crate::bounded_io::enter(io_budget.clone()),
+                            alloc_label.enter(),
+                        )
+                    },
                     |_scope, file| {
                         if grep_scan_should_stop(
                             Some(&stop_scan),
@@ -2357,6 +2461,7 @@ impl SearchIndexSnapshot {
         let started = Instant::now();
         let stopped_early = AtomicBool::new(false);
         let io_budget = crate::bounded_io::current();
+        let alloc_label = crate::alloc_trace::carry();
         let files_examined = AtomicUsize::new(0);
         let missing_on_disk = AtomicUsize::new(0);
         // Rayon tasks run on other threads, where the request's file set is
@@ -2366,7 +2471,12 @@ impl SearchIndexSnapshot {
         let files: Vec<GrepFileMatches> = examined_slice
             .par_iter()
             .map_init(
-                || crate::bounded_io::enter(io_budget.clone()),
+                || {
+                    (
+                        crate::bounded_io::enter(io_budget.clone()),
+                        alloc_label.enter(),
+                    )
+                },
                 |_scope, (_, file)| {
                     if started.elapsed() >= limits.budget
                         || job_cancellation
@@ -2377,6 +2487,66 @@ impl SearchIndexSnapshot {
                         return None;
                     }
                     let deadline = started.checked_add(limits.budget);
+                    // The request cache cannot retain these large files. Scan
+                    // their complete lines without allocating the whole file.
+                    if pattern.can_stream_lines()
+                        && request_files
+                            .and_then(|files| files.kept(&file.path))
+                            .is_none()
+                        && crate::bounded_io::metadata(&file.path)
+                            .is_ok_and(|metadata| metadata.len() > crate::commands::semantic_search::request_files::REQUEST_FILES_BUDGET_BYTES as u64)
+                    {
+                        files_examined.fetch_add(1, Ordering::Relaxed);
+                        let result = (|| {
+                            let mut blocks = GrepBlocks::open(&file.path, deadline, false, true)?;
+                            let mut rows = Vec::new();
+                            let mut count = 0;
+                            let mut first = true;
+                            while let Some((base, content)) = blocks.next()? {
+                                if first && is_binary_bytes(content) {
+                                    return Ok(None);
+                                }
+                                first = false;
+                                if job_cancellation
+                                    .as_ref()
+                                    .is_some_and(|token| token.cancel_requested_before_commit())
+                                {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "search cancelled",
+                                    ));
+                                }
+                                let (mut matches, lines) = matching_lines_in_content_at(
+                                    &file.path,
+                                    content,
+                                    &matcher,
+                                    limits.max_lines_per_file.saturating_sub(count),
+                                    keep_past_limit,
+                                    base,
+                                );
+                                rows.append(&mut matches);
+                                count += lines;
+                            }
+                            Ok((count > 0).then(|| GrepFileMatches {
+                                path: file.path.clone(),
+                                modified: file.modified,
+                                matches: rows,
+                                matched_lines: count,
+                            }))
+                        })();
+                        return match result {
+                            Ok(file) => file,
+                            Err(error) => {
+                                if error.kind() == std::io::ErrorKind::TimedOut {
+                                    stopped_early.store(true, Ordering::Relaxed);
+                                }
+                                if io_error_means_missing_on_disk(&error) {
+                                    missing_on_disk.fetch_add(1, Ordering::Relaxed);
+                                }
+                                None
+                            }
+                        };
+                    }
                     let fetched = crate::commands::semantic_search::request_files::read_through(
                         request_files,
                         &file.path,
@@ -2718,7 +2888,12 @@ fn search_candidate_file(
         return Vec::new();
     }
 
-    let content = match read_indexed_file_bytes(&file.path, deadline.read_at) {
+    let mut blocks = match GrepBlocks::open(
+        &file.path,
+        deadline.read_at,
+        false,
+        matcher.can_stream_lines(),
+    ) {
         Ok(content) => content,
         Err(error) => {
             if error.kind() == std::io::ErrorKind::PermissionDenied {
@@ -2734,103 +2909,124 @@ fn search_candidate_file(
             return Vec::new();
         }
     };
-    bytes_verified.fetch_add(content.len(), Ordering::Relaxed);
-    // Defense in depth: even though indexing tries to filter binaries via
-    // The index classifies bytes at ingestion; we double-check at
-    // query time. content_inspector is fast (~bytes-per-cycle on a small
-    // preview) and this guarantees we never surface matches inside binary
-    // files even if the indexer somehow let one through (e.g. file changed
-    // between indexing and query).
-    if is_binary_bytes(&content) {
-        return Vec::new();
-    }
-    files_searched.fetch_add(1, Ordering::Relaxed);
-
     let shared_path = Arc::new(file.path.clone());
     let mut matches = Vec::new();
-    let mut line_starts = None;
-    // Grep reports one match per line: the first one. Occurrences arrive in
-    // increasing offset order, so any occurrence before the start of the line
-    // after the last reported one is on that same line. Checking that offset
-    // first means a line with many occurrences (minified code, single-line
-    // JSON, lockfiles) costs one line lookup and one line text in total, not
-    // one per occurrence.
-    let mut reported_line_end = 0usize;
     let mut matched_this_file = false;
-
-    {
-        let mut visit = |offset: usize, end: usize| -> MatchVisit {
-            if grep_scan_should_stop(
-                stop_scan,
-                truncated,
-                total_matches,
-                stop_after,
-                job_cancellation,
-                deadline,
-            ) {
-                engine_capped.store(true, Ordering::Relaxed);
-                return MatchVisit::Stop;
+    let mut first = true;
+    loop {
+        let (line_base, content) = match blocks.next() {
+            Ok(Some(block)) => block,
+            Ok(None) => break,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    deadline.reached.store(true, Ordering::Relaxed);
+                    engine_capped.store(true, Ordering::Relaxed);
+                }
+                break;
             }
-            if offset < reported_line_end {
-                return MatchVisit::SameLine;
-            }
-
-            let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(&content));
-            let (line, column, line_text, next_line_start) =
-                line_details_bytes(&content, line_starts, offset);
-            reported_line_end = next_line_start;
-
-            matched_this_file = true;
-            let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
-            if match_number > max_results {
-                truncated.store(true, Ordering::Relaxed);
-                signal_grep_scan_cap(stop_scan, total_matches, stop_after);
-                return MatchVisit::Stop;
-            }
-
-            matches.push(SharedGrepMatch {
-                file: shared_path.clone(),
-                line,
-                column,
-                line_text,
-                match_text: String::from_utf8_lossy(&content[offset..end]).into_owned(),
-            });
-            MatchVisit::Recorded { next_line_start }
         };
+        bytes_verified.fetch_add(content.len(), Ordering::Relaxed);
+        // Defense in depth: even though indexing tries to filter binaries via
+        // The index classifies bytes at ingestion; we double-check at
+        // query time. content_inspector is fast (~bytes-per-cycle on a small
+        // preview) and this guarantees we never surface matches inside binary
+        // files even if the indexer somehow let one through (e.g. file changed
+        // between indexing and query).
+        if first && is_binary_bytes(content) {
+            return Vec::new();
+        }
+        if first {
+            files_searched.fetch_add(1, Ordering::Relaxed);
+            first = false;
+        }
+        let mut line_starts = None;
+        // Grep reports one match per line: the first one. Occurrences arrive in
+        // increasing offset order, so any occurrence before the start of the line
+        // after the last reported one is on that same line. Checking that offset
+        // first means a line with many occurrences (minified code, single-line
+        // JSON, lockfiles) costs one line lookup and one line text in total, not
+        // one per occurrence.
+        let mut reported_line_end = 0usize;
 
-        match matcher {
-            SearchMatcher::Literal(literal) => {
-                let needle = &literal.needle;
-                if !needle.contains(&b'\n') {
-                    let lowered;
-                    let haystack: &[u8] = if literal.case_insensitive_ascii {
-                        lowered = content.to_ascii_lowercase();
-                        &lowered
-                    } else {
-                        &content
-                    };
-                    let finder = memchr::memmem::Finder::new(needle);
-                    let mut start = 0;
-                    while start <= haystack.len() {
-                        let Some(position) = finder.find(&haystack[start..]) else {
-                            break;
-                        };
-                        let offset = start + position;
-                        start = match visit(offset, offset + needle.len()) {
-                            MatchVisit::Stop => break,
-                            MatchVisit::SameLine => offset + 1,
-                            MatchVisit::Recorded { next_line_start } => {
-                                next_line_start.max(offset + 1)
-                            }
-                        };
+        {
+            let mut visit = |offset: usize, end: usize| -> MatchVisit {
+                if grep_scan_should_stop(
+                    stop_scan,
+                    truncated,
+                    total_matches,
+                    stop_after,
+                    job_cancellation,
+                    deadline,
+                ) {
+                    engine_capped.store(true, Ordering::Relaxed);
+                    return MatchVisit::Stop;
+                }
+                if offset < reported_line_end {
+                    return MatchVisit::SameLine;
+                }
+
+                let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(&content));
+                let (line, column, line_text, next_line_start) =
+                    line_details_bytes(&content, line_starts, offset);
+                reported_line_end = next_line_start;
+
+                matched_this_file = true;
+                let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
+                if match_number > max_results {
+                    truncated.store(true, Ordering::Relaxed);
+                    signal_grep_scan_cap(stop_scan, total_matches, stop_after);
+                    return MatchVisit::Stop;
+                }
+
+                matches.push(SharedGrepMatch {
+                    file: shared_path.clone(),
+                    line: line.saturating_add(line_base),
+                    column,
+                    line_text,
+                    match_text: String::from_utf8_lossy(&content[offset..end]).into_owned(),
+                });
+                MatchVisit::Recorded { next_line_start }
+            };
+
+            match matcher {
+                SearchMatcher::Literal(literal) => {
+                    let needle = &literal.needle;
+                    if !needle.contains(&b'\n') {
+                        let haystack: &[u8] = content;
+                        let finder = literal.finder();
+                        let mut start = 0;
+                        while start <= haystack.len() {
+                            let Some(position) = finder.find(&haystack[start..]) else {
+                                break;
+                            };
+                            let offset = start + position;
+                            start = match visit(offset, offset + needle.len()) {
+                                MatchVisit::Stop => break,
+                                MatchVisit::SameLine => offset + 1,
+                                MatchVisit::Recorded { next_line_start } => {
+                                    next_line_start.max(offset + 1)
+                                }
+                            };
+                        }
                     }
                 }
+                SearchMatcher::Regex(regex) => {
+                    pattern_compile::for_each_line_match(regex, &content, |start, end| {
+                        !matches!(visit(start, end), MatchVisit::Stop)
+                    });
+                }
             }
-            SearchMatcher::Regex(regex) => {
-                pattern_compile::for_each_line_match(regex, &content, |start, end| {
-                    !matches!(visit(start, end), MatchVisit::Stop)
-                });
-            }
+        }
+
+        if grep_scan_should_stop(
+            stop_scan,
+            truncated,
+            total_matches,
+            stop_after,
+            job_cancellation,
+            deadline,
+        ) {
+            break;
         }
     }
 
@@ -2853,6 +3049,17 @@ fn matching_lines_in_content(
     max_lines: usize,
     keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
 ) -> (Vec<GrepMatch>, usize) {
+    matching_lines_in_content_at(path, content, matcher, max_lines, keep_past_limit, 0)
+}
+
+fn matching_lines_in_content_at(
+    path: &Path,
+    content: &[u8],
+    matcher: &SearchMatcher,
+    max_lines: usize,
+    keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
+    line_base: u32,
+) -> (Vec<GrepMatch>, usize) {
     let mut matches = Vec::new();
     let mut matched_lines = 0usize;
     let mut line_starts: Option<Vec<usize>> = None;
@@ -2872,7 +3079,7 @@ fn matching_lines_in_content(
         matched_lines += 1;
         let grep_match = GrepMatch {
             file: path.to_path_buf(),
-            line,
+            line: line.saturating_add(line_base),
             column,
             line_text,
             match_text: String::from_utf8_lossy(&content[start..end]).into_owned(),
@@ -2886,14 +3093,8 @@ fn matching_lines_in_content(
         SearchMatcher::Literal(literal) => {
             let needle = &literal.needle;
             if !needle.contains(&b'\n') {
-                let lowered;
-                let haystack: &[u8] = if literal.case_insensitive_ascii {
-                    lowered = content.to_ascii_lowercase();
-                    &lowered
-                } else {
-                    content
-                };
-                let finder = memchr::memmem::Finder::new(needle);
+                let haystack: &[u8] = content;
+                let finder = literal.finder();
                 let mut start = 0;
                 while start <= haystack.len() {
                     let Some(position) = finder.find(&haystack[start..]) else {
@@ -2915,6 +3116,110 @@ fn matching_lines_in_content(
         }
     }
     (matches, matched_lines)
+}
+
+#[cfg(test)]
+mod grep_block_tests {
+    use super::*;
+
+    fn compiled(pattern: &str) -> CompiledPattern {
+        match pattern_compile::compile(pattern, pattern_compile::CompileOpts::default()) {
+            pattern_compile::CompileResult::Ok(pattern) => pattern,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn grep_binary_prefix_skips_archive_before_allocating_its_body() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.tgz");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0]).unwrap();
+        file.set_len(100 << 20).unwrap();
+        drop(file);
+        for stream in [false, true] {
+            let mut blocks = GrepBlocks::open(&path, None, false, stream).unwrap();
+            assert_eq!(blocks.pending.capacity(), 0);
+            assert_eq!(blocks.scratch.capacity(), 0);
+            assert!(blocks.next().unwrap().is_none());
+        }
+        assert_eq!(
+            read_indexed_file_bytes(&path, None).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(is_binary_bytes(&std::fs::read(&path).unwrap()));
+    }
+
+    #[test]
+    fn grep_newline_blocks_preserve_whole_buffer_rows_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocks.txt");
+        let mut content = "café needle row\r\n".repeat(300_000).into_bytes();
+        content.extend_from_slice(&vec![b'x'; GrepBlocks::BLOCK_BYTES + 99]);
+        content.extend_from_slice(b"needle\r\nlast NEEDLE end");
+        std::fs::write(&path, &content).unwrap();
+        for expression in [
+            "needle",
+            "NEEDLE",
+            r"needle|end",
+            r"(?m)^café needle",
+            r"(?m)needle.*$",
+            r"\bneedle\b",
+        ] {
+            let pattern = compiled(expression);
+            assert!(pattern.can_stream_lines(), "{expression}");
+            let matcher = match &pattern {
+                CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
+                CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
+            };
+            let keep = |row: &GrepMatch| row.line % 70_001 == 0;
+            let expected = matching_lines_in_content(&path, &content, &matcher, 8, &keep);
+            let mut actual = (Vec::new(), 0usize);
+            let mut blocks = GrepBlocks::open(&path, None, false, true).unwrap();
+            while let Some((base, bytes)) = blocks.next().unwrap() {
+                let (mut rows, count) = matching_lines_in_content_at(
+                    &path,
+                    bytes,
+                    &matcher,
+                    8usize.saturating_sub(actual.1),
+                    &keep,
+                    base,
+                );
+                actual.0.append(&mut rows);
+                actual.1 += count;
+            }
+            let projection = |rows: &[GrepMatch]| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.line,
+                            row.column,
+                            row.line_text.clone(),
+                            row.match_text.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(actual.1, expected.1, "{expression}");
+            assert_eq!(
+                projection(&actual.0),
+                projection(&expected.0),
+                "{expression}"
+            );
+        }
+        for expression in [
+            r"\Aneedle",
+            r"needle\z",
+            "needle\\s+row",
+            "(?s)needle.*row",
+            "^needle",
+            "$",
+            "a*",
+        ] {
+            assert!(!compiled(expression).can_stream_lines(), "{expression}");
+        }
+    }
 }
 
 fn should_stop_search(
@@ -3870,7 +4175,14 @@ pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
 /// Read an indexed file for grep verification. Keep the original I/O error so
 /// callers distinguish a missing entry from blocked access or a scan timeout.
 fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
-    crate::project_content::read_bounded(path, deadline, false)
+    let blocks = GrepBlocks::open(path, deadline, false, false)?;
+    if blocks.yielded {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "binary grep input",
+        ));
+    }
+    Ok(blocks.pending)
 }
 
 /// Whether an I/O error says the path does not exist (including a path whose

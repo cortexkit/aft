@@ -406,6 +406,20 @@ pub(crate) fn read_bounded(
     deadline: Option<std::time::Instant>,
     authorized_task_artifact: bool,
 ) -> std::io::Result<Vec<u8>> {
+    admit_bounded(path, authorized_task_artifact)?;
+    crate::bounded_io::read(path, deadline)
+}
+
+pub(crate) fn reader_bounded(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+    authorized_task_artifact: bool,
+) -> std::io::Result<crate::bounded_io::Reader> {
+    admit_bounded(path, authorized_task_artifact)?;
+    crate::bounded_io::reader(path, deadline)
+}
+
+fn admit_bounded(path: &Path, authorized_task_artifact: bool) -> std::io::Result<()> {
     if authorized_task_artifact {
         if is_sqlite_or_metadata(path) || std::fs::symlink_metadata(path)?.file_type().is_symlink()
         {
@@ -419,7 +433,7 @@ pub(crate) fn read_bounded(
     }
     #[cfg(test)]
     record_open(path);
-    crate::bounded_io::read(path, deadline)
+    Ok(())
 }
 
 /// Guard direct source reads as well as enumeration. Watcher deltas and queued

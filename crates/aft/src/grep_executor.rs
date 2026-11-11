@@ -2156,6 +2156,7 @@ fn fallback_grep_with_limits_counted(
     // Files for a path-ordered scan, searched one at a time after the walk.
     let mut ordered: Vec<PathBuf> = Vec::new();
     let io_budget = crate::bounded_io::current();
+    let alloc_label = crate::alloc_trace::carry();
     let confinement = crate::context::confinement::capture();
 
     let flush_batch = |batch: &mut Vec<PathBuf>, matches: &mut Vec<GrepMatch>| {
@@ -2166,7 +2167,12 @@ fn fallback_grep_with_limits_counted(
         let partial: Vec<GrepMatch> = chunk
             .par_iter()
             .map_init(
-                || crate::bounded_io::enter(io_budget.clone()),
+                || {
+                    (
+                        crate::bounded_io::enter(io_budget.clone()),
+                        alloc_label.enter(),
+                    )
+                },
                 |_scope, file| {
                     crate::context::confinement::inherit(confinement.clone(), || {
                         #[cfg(test)]
@@ -2304,7 +2310,12 @@ fn fallback_grep_with_limits_counted(
             None => batch
                 .par_iter()
                 .map_init(
-                    || crate::bounded_io::enter(io_budget.clone()),
+                    || {
+                        (
+                            crate::bounded_io::enter(io_budget.clone()),
+                            alloc_label.enter(),
+                        )
+                    },
                     |_scope, file| {
                         crate::context::confinement::inherit(confinement.clone(), || {
                             search_one(file)
@@ -2415,8 +2426,12 @@ fn fallback_search_file(
         return Vec::new();
     }
 
-    let bytes = match crate::project_content::read_bounded(file, deadline, authorized_task_artifact)
-    {
+    let mut blocks = match crate::search_index::GrepBlocks::open(
+        file,
+        deadline,
+        authorized_task_artifact,
+        pattern.can_stream_lines(),
+    ) {
         Ok(bytes) => bytes,
         Err(error) => {
             if error.kind() == std::io::ErrorKind::TimedOut {
@@ -2425,88 +2440,114 @@ fn fallback_search_file(
             return Vec::new();
         }
     };
-    if crate::search_index::is_binary_bytes(&bytes) {
-        return Vec::new();
-    }
-    let content = bytes;
-    files_searched.fetch_add(1, Ordering::Relaxed);
-
-    let mut line_starts = None;
-    let mut valid_utf8 = None;
-    // Start of the line after the last reported one; see `search_literal_in_text`.
-    let mut reported_line_end = 0usize;
     let mut matched_this_file = false;
     let mut matches = Vec::new();
+    let mut first = true;
+    loop {
+        let (line_base, content) = match blocks.next() {
+            Ok(Some(block)) => block,
+            Ok(None) => break,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    engine_capped.store(true, Ordering::Relaxed);
+                }
+                break;
+            }
+        };
+        if first && crate::search_index::is_binary_bytes(content) {
+            return Vec::new();
+        }
+        if first {
+            files_searched.fetch_add(1, Ordering::Relaxed);
+            first = false;
+        }
+        let start_matches = matches.len();
 
-    match pattern {
-        CompiledPattern::Literal(literal) => search_literal_in_text(
-            file,
-            &content,
-            &mut line_starts,
-            &mut valid_utf8,
-            literal,
-            max_results,
-            stop_after,
-            total_matches,
-            &mut reported_line_end,
-            truncated,
-            engine_capped,
-            &mut matched_this_file,
-            &mut matches,
-            job_cancellation,
-            deadline,
-        ),
-        CompiledPattern::Regex { compiled, .. } => {
-            crate::pattern_compile::for_each_line_match(
-                compiled,
+        let mut line_starts = None;
+        let mut valid_utf8 = None;
+        // Start of the line after the last reported one; see `search_literal_in_text`.
+        let mut reported_line_end = 0usize;
+
+        match pattern {
+            CompiledPattern::Literal(literal) => search_literal_in_text(
+                file,
                 &content,
-                |match_start, match_end| {
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline)
-                        || should_stop_fallback_search(
-                            truncated,
-                            total_matches,
-                            stop_after,
-                            job_cancellation,
-                        )
-                    {
-                        engine_capped.store(true, Ordering::Relaxed);
-                        return false;
-                    }
+                &mut line_starts,
+                &mut valid_utf8,
+                literal,
+                max_results,
+                stop_after,
+                total_matches,
+                &mut reported_line_end,
+                truncated,
+                engine_capped,
+                &mut matched_this_file,
+                &mut matches,
+                job_cancellation,
+                deadline,
+            ),
+            CompiledPattern::Regex { compiled, .. } => {
+                crate::pattern_compile::for_each_line_match(
+                    compiled,
+                    &content,
+                    |match_start, match_end| {
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                            || should_stop_fallback_search(
+                                truncated,
+                                total_matches,
+                                stop_after,
+                                job_cancellation,
+                            )
+                        {
+                            engine_capped.store(true, Ordering::Relaxed);
+                            return false;
+                        }
 
-                    // Regex matches are not skipped ahead within a line: the
-                    // engine still decides where the next non-overlapping match
-                    // starts, while only the first match on each line is reported.
-                    if match_start < reported_line_end {
-                        return true;
-                    }
-                    let (line, column, line_text, next_line_start) = fallback_line_details_bytes(
-                        &content,
-                        line_starts.get_or_insert_with(|| {
-                            crate::search_index::line_starts_bytes(&content)
-                        }),
-                        match_start,
-                        &mut valid_utf8,
-                    );
-                    reported_line_end = next_line_start;
+                        // Regex matches are not skipped ahead within a line: the
+                        // engine still decides where the next non-overlapping match
+                        // starts, while only the first match on each line is reported.
+                        if match_start < reported_line_end {
+                            return true;
+                        }
+                        let (line, column, line_text, next_line_start) =
+                            fallback_line_details_bytes(
+                                &content,
+                                line_starts.get_or_insert_with(|| {
+                                    crate::search_index::line_starts_bytes(&content)
+                                }),
+                                match_start,
+                                &mut valid_utf8,
+                            );
+                        reported_line_end = next_line_start;
 
-                    matched_this_file = true;
-                    let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
-                    if match_number > max_results {
-                        truncated.store(true, Ordering::Relaxed);
-                        return false;
-                    }
+                        matched_this_file = true;
+                        let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
+                        if match_number > max_results {
+                            truncated.store(true, Ordering::Relaxed);
+                            return false;
+                        }
 
-                    matches.push(GrepMatch {
-                        file: file.clone(),
-                        line,
-                        column,
-                        line_text,
-                        match_text: String::from_utf8_lossy(&content[match_start..match_end])
-                            .into_owned(),
-                    });
-                    true
-                },
-            );
+                        matches.push(GrepMatch {
+                            file: file.clone(),
+                            line,
+                            column,
+                            line_text,
+                            match_text: String::from_utf8_lossy(&content[match_start..match_end])
+                                .into_owned(),
+                        });
+                        true
+                    },
+                );
+            }
+        }
+
+        for matched in &mut matches[start_matches..] {
+            matched.line = matched.line.saturating_add(line_base);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || should_stop_fallback_search(truncated, total_matches, stop_after, job_cancellation)
+        {
+            break;
         }
     }
 
@@ -2552,14 +2593,8 @@ fn search_literal_in_text<'a>(
     }
 
     let content_bytes = content;
-    let search_content;
-    let haystack = if literal.case_insensitive_ascii {
-        search_content = content_bytes.to_ascii_lowercase();
-        search_content.as_slice()
-    } else {
-        content_bytes
-    };
-    let finder = memchr::memmem::Finder::new(&literal.needle);
+    let haystack = content_bytes;
+    let finder = literal.finder();
     let mut start = 0usize;
     while start <= haystack.len() {
         let Some(position) = finder.find(&haystack[start..]) else {

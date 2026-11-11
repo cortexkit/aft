@@ -1577,7 +1577,7 @@ fn line_text_was_cut(line_text: &str) -> bool {
 /// The printed text of each row: the whole line when it is short, else a
 /// window of `GREP_MAX_LINE_CHARS` characters around the match. The engine
 /// keeps only the start of a long line, so a match past column 1 is windowed
-/// from the line read again from disk, once per file per batch of rows; if
+/// from a bounded streaming read, once per file per batch of rows; if
 /// the file cannot be read again, the kept start of the line is printed.
 #[derive(Default)]
 struct RowTexts {
@@ -1599,24 +1599,13 @@ impl RowTexts {
             }
         }
         for (file, rows) in reread {
-            let content = crate::project_content::read_bounded(file, None, false).ok();
+            let windows = read_line_windows(file, &rows).unwrap_or_default();
             #[cfg(test)]
             work_probe::record(file, |work| work.reads += 1);
-            // Every requested line of this file is located in one pass.
-            let lines: Vec<u32> = rows.iter().map(|row| row.line).collect();
-            let spans = content
-                .as_deref()
-                .map(|bytes| {
-                    #[cfg(test)]
-                    work_probe::record(file, |work| work.line_scans += 1);
-                    line_spans(bytes, &lines)
-                })
-                .unwrap_or_default();
             for row in rows {
-                let text = content
-                    .as_deref()
-                    .zip(spans.get(&row.line))
-                    .map(|(bytes, &(start, end))| windowed_line(&bytes[start..end], row.column))
+                let text = windows
+                    .get(&row.line)
+                    .cloned()
                     .unwrap_or_else(|| row.line_text.clone());
                 self.texts.insert((row.file.clone(), row.line), text);
             }
@@ -1631,8 +1620,91 @@ impl RowTexts {
     }
 }
 
+fn read_line_windows(file: &Path, rows: &[&GrepMatch]) -> std::io::Result<HashMap<u32, String>> {
+    use crate::commands::semantic_search::snippet_bounds::LineWindow;
+    let mut wanted = std::collections::BTreeMap::new();
+    for row in rows {
+        wanted.insert(row.line, row.column);
+    }
+    let mut wanted = wanted.into_iter().peekable();
+    let mut reader = crate::project_content::reader_bounded(file, None, false)?;
+    #[cfg(test)]
+    work_probe::record(file, |work| work.line_scans += 1);
+    let mut windows = HashMap::new();
+    let mut line = 1u32;
+    let mut window = None;
+    let mut pending = Vec::new();
+    let mut buffer = Vec::new();
+    loop {
+        buffer = reader.chunk(buffer, 64 << 10)?;
+        let eof = buffer.is_empty();
+        let mut start = 0;
+        loop {
+            let newline = memchr::memchr(b'\n', &buffer[start..]).map(|index| start + index);
+            let end = newline.unwrap_or(buffer.len());
+            if let Some(&(next, column)) = wanted.peek() {
+                if line == next {
+                    let active = window.get_or_insert_with(|| LineWindow::new(column));
+                    pending.extend_from_slice(&buffer[start..end]);
+                    push_window_bytes(active, &mut pending, eof || newline.is_some());
+                    if active.ready() || eof || newline.is_some() {
+                        windows.insert(line, window.take().unwrap().finish());
+                        wanted.next();
+                        pending.clear();
+                        if wanted.peek().is_none() {
+                            return Ok(windows);
+                        }
+                    }
+                }
+            }
+            let Some(end) = newline else {
+                break;
+            };
+            line = line.saturating_add(1);
+            start = end + 1;
+        }
+        if eof {
+            return Ok(windows);
+        }
+    }
+}
+
+fn push_window_bytes(
+    window: &mut crate::commands::semantic_search::snippet_bounds::LineWindow,
+    pending: &mut Vec<u8>,
+    final_piece: bool,
+) {
+    let mut consumed = 0;
+    while consumed < pending.len() {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(text) => {
+                window.push(text);
+                consumed = pending.len();
+            }
+            Err(error) => {
+                let valid_end = consumed + error.valid_up_to();
+                window.push(std::str::from_utf8(&pending[consumed..valid_end]).unwrap());
+                consumed = valid_end;
+                match error.error_len() {
+                    Some(length) => {
+                        window.push("\u{fffd}");
+                        consumed += length;
+                    }
+                    None if final_piece => {
+                        window.push("\u{fffd}");
+                        consumed = pending.len();
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    pending.drain(..consumed);
+}
+
 /// Byte ranges (without the newline) of the requested 1-based `lines` of
 /// `content`, found in one pass over it. Lines past the end are left out.
+#[cfg(test)]
 fn line_spans(content: &[u8], lines: &[u32]) -> HashMap<u32, (usize, usize)> {
     let mut wanted = lines.to_vec();
     wanted.sort_unstable();
@@ -1659,6 +1731,7 @@ fn line_spans(content: &[u8], lines: &[u32]) -> HashMap<u32, (usize, usize)> {
 
 /// One line's bytes, cut to a window around the character at 1-based
 /// `column`.
+#[cfg(test)]
 fn windowed_line(line: &[u8], column: u32) -> String {
     let mut bytes = line;
     if bytes.ends_with(b"\r") {
@@ -2265,6 +2338,44 @@ mod tests {
                 line_scans: 1
             }
         );
+    }
+
+    #[test]
+    fn streaming_row_windows_match_whole_file_lossy_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("windows.txt");
+        // Put UTF-8 and malformed sequences across the reader's chunk boundary.
+        let mut bytes = vec![b'x'; (64 << 10) - 1];
+        bytes.extend_from_slice("é中needle".as_bytes());
+        bytes.extend_from_slice(&[0xf0, 0x90, b'a', 0xff]);
+        bytes.extend_from_slice(&vec![b'y'; 2000]);
+        bytes.extend_from_slice(b"\r\nshort\r\n");
+        bytes.extend_from_slice(&vec![b'z'; 90_000]);
+        bytes.extend_from_slice(&[0xe2, 0x82]);
+        std::fs::write(&file, &bytes).unwrap();
+        let spans = line_spans(&bytes, &[1, 2, 3]);
+        for column in [1, 80, 81, 82, 500, 65_535, 67_500, 100_000] {
+            let rows = (1..=3)
+                .map(|line| GrepMatch {
+                    file: file.clone(),
+                    line,
+                    column,
+                    line_text: String::new(),
+                    match_text: String::new(),
+                })
+                .collect::<Vec<_>>();
+            let refs = rows.iter().collect::<Vec<_>>();
+            let windows = read_line_windows(&file, &refs).unwrap();
+            for row in &rows {
+                let (start, end) = spans[&row.line];
+                assert_eq!(
+                    windows[&row.line],
+                    windowed_line(&bytes[start..end], column),
+                    "line {} column {column}",
+                    row.line
+                );
+            }
+        }
     }
 
     #[test]

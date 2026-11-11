@@ -1244,6 +1244,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: ".take(3)",
         reason: "three-folder preview inside a gap note with the full skipped count, not a pageable list",
     },
+    ExclusionEntry {
+        file: "bounded_io.rs",
+        enclosing_item: "Reader::chunk",
+        location_or_primitive: "buffer.truncate(count)",
+        reason: "shrinks an I/O buffer to the number of bytes read; later chunks retain the rest of the file, so no result rows are cut",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/snippet_bounds.rs",
+        enclosing_item: "LineWindow",
+        location_or_primitive: "SNIPPET_LINE_MAX_CHARS",
+        reason: "incremental implementation of the existing per-line text window, with exactly the same ellipsis and truncation marker; bounds retained characters, not result rows",
+    },
 ];
 
 /// Look up a surface by command, mode, and list id.
