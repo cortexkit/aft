@@ -67,7 +67,8 @@ pub(crate) fn vault() -> Arc<dyn SecretVault> {
 
 pub(crate) fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Response {
     let vault = vault();
-    let scope = crate::subc::current_secret_audit_scope().map(|scope| scope.to_scope_ref());
+    let scope = crate::context::call_context::current_secret_audit_scope()
+        .map(|scope| scope.to_scope_ref());
     for label in labels {
         let mut record = secret_rules::audit::AuditRecordV1::new(
             crate::secret::now_ms(),
@@ -236,7 +237,7 @@ pub(crate) fn authorize(
     if env_conflicts(env) {
         return Err(refusal(id, labels, "secrets_env_conflict", ENV_CONFLICT));
     }
-    let (scopes, _) = crate::subc::current_call_scopes().map_err(|reason| {
+    let (scopes, _) = crate::context::call_context::current_call_scopes().map_err(|reason| {
         outcome_response(
             id,
             labels,
@@ -246,8 +247,8 @@ pub(crate) fn authorize(
     let vault = vault();
     let mut grants = Vec::new();
     for label in labels {
-        match crate::subc::resolve_current_secret_label(vault.as_ref(), label) {
-            crate::subc::LaunchDecision::Proceed {
+        match crate::context::call_context::resolve_current_secret_label(vault.as_ref(), label) {
+            crate::context::call_context::LaunchDecision::Proceed {
                 mut rule,
                 grant_id,
                 expires_at_ms,
@@ -258,10 +259,10 @@ pub(crate) fn authorize(
                     expires_at_ms,
                 });
             }
-            crate::subc::LaunchDecision::Refuse(outcome) => {
+            crate::context::call_context::LaunchDecision::Refuse(outcome) => {
                 return Err(outcome_response(id, labels, outcome))
             }
-            crate::subc::LaunchDecision::Pending(pending) => {
+            crate::context::call_context::LaunchDecision::Pending(pending) => {
                 return Err(refusal(
                     id,
                     labels,

@@ -828,6 +828,17 @@ fn finalize_prefix(
     (publish, counts)
 }
 
+pub(crate) const MAX_RESULT_BYTES: usize = cortexkit_role_tool_provider::result::MAX_RESULT_BYTES;
+pub(crate) const TOO_LARGE_SENTENCE: &str =
+    "reply too large to send ({size} MiB, limit 3 MiB); {action}";
+
+pub(crate) fn too_large(id: &str, size: usize, action: &str) -> Response {
+    let message = TOO_LARGE_SENTENCE
+        .replace("{size}", &format!("{:.2}", size as f64 / (1024.0 * 1024.0)))
+        .replace("{action}", action);
+    Response::error(id, "response_too_large", message)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

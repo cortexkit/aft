@@ -1,3 +1,5 @@
+pub(crate) mod call_context;
+
 pub use crate::callgraph_store::access::CallgraphStoreAccess;
 pub(crate) use crate::data_layer::status::EmbeddingBackendHealthSnapshot;
 pub(crate) use crate::data_layer::status::{
@@ -10639,7 +10641,7 @@ impl AppContext {
             // OpenCode's `*` includes every descendant. Use the same folder
             // eligibility as consent cards so saving a file approval cannot
             // silently approve home, a volume root, or a system tree.
-            let saved_scope = crate::subc::directory_scope(&grant);
+            let saved_scope = crate::access_policy::directory_scope(&grant);
             let pattern = match saved_scope.kind {
                 GrantKind::File => saved_scope.path,
                 GrantKind::Subtree => saved_scope.path.join("*"),

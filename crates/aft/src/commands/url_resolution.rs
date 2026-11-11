@@ -162,7 +162,7 @@ fn resolve_secret_fetch(
     let mut authorization = None;
     let mut rules = Vec::with_capacity(labels.len());
     if let Some(first) = labels.first() {
-        let scopes = match crate::subc::current_call_scopes() {
+        let scopes = match crate::context::call_context::current_call_scopes() {
             Ok((scopes, _)) => scopes,
             Err(reason) => {
                 let outcome = crate::secret::refuse_ineligible(first, reason);
@@ -175,14 +175,17 @@ fn resolve_secret_fetch(
             }
         };
         for label in labels {
-            match crate::subc::resolve_current_secret_label(vault.as_ref(), label) {
-                crate::subc::LaunchDecision::Proceed {
-                    mut rule, grant_id, ..
+            match crate::context::call_context::resolve_current_secret_label(vault.as_ref(), label)
+            {
+                crate::context::call_context::LaunchDecision::Proceed {
+                    mut rule,
+                    grant_id,
+                    ..
                 } => {
                     rule.grant_id = grant_id;
                     rules.push(rule);
                 }
-                crate::subc::LaunchDecision::Refuse(outcome) => {
+                crate::context::call_context::LaunchDecision::Refuse(outcome) => {
                     return Err(secret_outcome_refusal(
                         &req.id,
                         vault.as_ref(),
@@ -190,7 +193,7 @@ fn resolve_secret_fetch(
                         outcome,
                     ));
                 }
-                crate::subc::LaunchDecision::Pending(pending) => {
+                crate::context::call_context::LaunchDecision::Pending(pending) => {
                     return Err(secret_fetch_refusal(
                         &req.id,
                         vault.as_ref(),
@@ -269,7 +272,8 @@ fn secret_fetch_refusal(
     code: &str,
     message: &str,
 ) -> Response {
-    let scope = crate::subc::current_secret_audit_scope().map(|scope| scope.to_scope_ref());
+    let scope = crate::context::call_context::current_secret_audit_scope()
+        .map(|scope| scope.to_scope_ref());
     for label in labels {
         let record = secret_rules::audit::AuditRecordV1::new(
             crate::secret::now_ms(),

@@ -29,6 +29,10 @@ pub(super) fn with_tool_call_policy<T, R>(
     work: impl FnOnce(Value) -> T,
     finish: impl FnOnce(Result<T, Response>) -> R,
 ) -> R {
+    let _identity = super::secret_consent::SecretIdentityGuard::install(identity.clone());
+    let _scopes = super::secret_consent::SecretScopeGuard::install(Some(
+        super::secret_consent::call_scopes(identity),
+    ));
     if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
         ctx.mark_standalone_plugin_host();
     }
