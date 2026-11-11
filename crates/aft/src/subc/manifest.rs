@@ -911,6 +911,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn broca_scope_background_advertisement_and_harness_parse_ship_together() {
+        use crate::harness::Harness;
+        use std::str::FromStr;
+
+        // Broca sends the harness name `broca` only when the module manifest
+        // provides scope-background-tasks/v1. Advertising it without accepting
+        // that harness name would make every Broca bind be refused.
+        let manifest = build_manifest_for_host(true);
+        assert!(manifest
+            .capabilities
+            .as_ref()
+            .expect("capabilities")
+            .provides
+            .iter()
+            .any(|capability| capability == "scope-background-tasks/v1"));
+        assert_eq!(Harness::from_str("broca"), Ok(Harness::Runner));
+    }
+
     /// A session starter finds tool providers by this catalog field, so a
     /// manifest without it leaves every worker without a plan or preset.
     #[test]
