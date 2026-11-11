@@ -861,7 +861,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol 0.34.3",
+ "subc-protocol 0.35.0",
  "url",
 ]
 
@@ -876,7 +876,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2",
- "subc-protocol 0.34.3",
+ "subc-protocol 0.35.0",
 ]
 
 [[package]]
@@ -890,7 +890,7 @@ dependencies = [
  "cortexkit-role-tool-provider",
  "futures-util",
  "serde_json",
- "subc-protocol 0.34.3",
+ "subc-protocol 0.35.0",
  "tokio",
 ]
 
