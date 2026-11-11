@@ -3,6 +3,13 @@
 use crate::protocol::Response;
 use std::path::{Path, PathBuf};
 
+/// Storage-path comparison is not read authorization: retained storage roots
+/// need alias-aware identity and containment even without a request or session.
+pub(crate) trait StoragePathPolicy {
+    fn identity(&self, path: &Path) -> PathBuf;
+    fn contains(&self, path: &Path, prefix: &Path) -> bool;
+}
+
 /// A reader asks for the same path decision as the owning request's runtime.
 /// Search-specific approvals are selected by the runtime adapter, not the index.
 pub trait ReadPolicy {

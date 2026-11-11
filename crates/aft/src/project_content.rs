@@ -346,13 +346,16 @@ fn is_storage_path(path: &Path) -> bool {
 }
 
 /// Resolve aliases without opening file contents before checking retained stores.
-pub(crate) fn storage_root_for_path(path: &Path) -> Option<PathBuf> {
-    let path = crate::access_policy::policy_path(path);
+pub(crate) fn storage_root_for_path(
+    path: &Path,
+    policy: &dyn crate::read_policy::StoragePathPolicy,
+) -> Option<PathBuf> {
+    let path = policy.identity(path);
     storage_roots()
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
-        .find(|root| crate::access_policy::floor_contains(&path, root))
+        .find(|root| policy.contains(&path, root))
         .cloned()
 }
 
@@ -562,6 +565,54 @@ pub(crate) use open_probe::{record_open, Probe};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_root_lookup_uses_supplied_identity_and_containment() {
+        struct Policy {
+            original: PathBuf,
+            identity: PathBuf,
+            storage: PathBuf,
+            allow: bool,
+            compared: std::cell::Cell<bool>,
+        }
+        impl crate::read_policy::StoragePathPolicy for Policy {
+            fn identity(&self, path: &Path) -> PathBuf {
+                assert_eq!(path, self.original);
+                self.identity.clone()
+            }
+
+            fn contains(&self, path: &Path, prefix: &Path) -> bool {
+                assert_eq!(path, self.identity);
+                if prefix == self.storage {
+                    self.compared.set(true);
+                    self.allow
+                } else {
+                    false
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let storage = root.join("storage");
+        register_storage_root(&storage);
+        let mut policy = Policy {
+            original: root.join("alias"),
+            identity: root.join("opaque-identity"),
+            storage: storage.clone(),
+            allow: true,
+            compared: std::cell::Cell::new(false),
+        };
+        assert_eq!(
+            storage_root_for_path(&policy.original, &policy),
+            Some(storage)
+        );
+        assert!(policy.compared.get());
+        policy.allow = false;
+        policy.compared.set(false);
+        assert_eq!(storage_root_for_path(&policy.original, &policy), None);
+        assert!(policy.compared.get());
+    }
 
     #[test]
     fn sqlite_named_directories_remain_project_source() {

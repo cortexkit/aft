@@ -95,7 +95,11 @@ impl Fence {
 
     pub(crate) fn record_source_exclusion(&self, path: &Path) {
         if self.floor_omissions.is_some()
-            && (crate::project_content::storage_root_for_path(path).is_some()
+            && (crate::project_content::storage_root_for_path(
+                path,
+                &crate::access_policy::StoragePaths,
+            )
+            .is_some()
                 || crate::db::file_identity::is_live_sqlite_file(path))
         {
             self.record_floor(path);
@@ -104,7 +108,11 @@ impl Fence {
 
     pub(crate) fn record_matched_source_exclusion(&self, path: &Path) {
         if self.floor_omissions.is_some()
-            && (crate::project_content::storage_root_for_path(path).is_some()
+            && (crate::project_content::storage_root_for_path(
+                path,
+                &crate::access_policy::StoragePaths,
+            )
+            .is_some()
                 || crate::db::file_identity::is_live_sqlite_file(path))
         {
             self.record_matched_floor(path);

@@ -1423,6 +1423,18 @@ pub(crate) fn policy_path(path: &Path) -> PathBuf {
     resolve_policy_path(path)
 }
 
+pub(crate) struct StoragePaths;
+
+impl crate::read_policy::StoragePathPolicy for StoragePaths {
+    fn identity(&self, path: &Path) -> PathBuf {
+        policy_path(path)
+    }
+
+    fn contains(&self, path: &Path, prefix: &Path) -> bool {
+        floor_contains(path, prefix)
+    }
+}
+
 struct BoundedPolicyPaths {
     progress: std::sync::Arc<std::sync::Mutex<PathBuf>>,
     error: std::cell::RefCell<Option<std::io::Error>>,

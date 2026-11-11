@@ -1518,7 +1518,11 @@ fn build_outline_gitignore(
     if !ignore_file.is_file() {
         return None;
     }
-    if crate::project_content::storage_root_for_path(ignore_file).is_some()
+    if crate::project_content::storage_root_for_path(
+        ignore_file,
+        &crate::access_policy::StoragePaths,
+    )
+    .is_some()
         || crate::db::file_identity::is_live_sqlite_file(ignore_file)
     {
         return None;

@@ -5967,7 +5967,8 @@ fn refuse_storage_path_with_metadata(
     path: &Path,
     metadata: Option<&std::fs::Metadata>,
 ) -> Result<(), AftError> {
-    if crate::project_content::storage_root_for_path(path).is_some()
+    if crate::project_content::storage_root_for_path(path, &crate::access_policy::StoragePaths)
+        .is_some()
         || match metadata {
             Some(metadata) => {
                 crate::db::file_identity::is_live_sqlite_file_with_metadata(path, Some(metadata))
