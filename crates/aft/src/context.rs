@@ -5669,7 +5669,13 @@ impl AppContext {
         if !crate::persistence_gate::requires_database(command) {
             return false;
         }
-        if self.database_runtime_state.load(Ordering::Acquire) == 3 {
+        let state = self.database_runtime_state.load(Ordering::Acquire);
+        if !matches!(state, 3 | 5)
+            || crate::runtime_drain::configure::database_runtime().is_none()
+        {
+            return false;
+        }
+        if state == 3 {
             // Concurrent calls must neither queue on a retry nor start their
             // own open. Only the claimant changes failed to initializing.
             let Some(failure) = self.database_runtime_failure.try_lock() else {
@@ -5695,17 +5701,15 @@ impl AppContext {
             self.finish_database_runtime_error(error.into(), false);
             return;
         };
+        let Some(database_runtime) = crate::runtime_drain::configure::database_runtime() else {
+            return;
+        };
         let storage = crate::storage_path::storage_dir(self.config().storage_dir.as_deref());
         if let Err(error) = crate::reader_floor::refresh_refused(&storage) {
             self.finish_database_runtime_error(error.to_string(), false);
             return;
         }
-        (crate::runtime_drain::configure::hooks().database_runtime)(
-            self,
-            &root,
-            &storage,
-            crate::db::OpenMode::SingleAttempt,
-        );
+        database_runtime(self, &root, &storage, crate::db::OpenMode::SingleAttempt);
     }
 
     pub(crate) fn database_runtime_pending(&self, command: &str) -> bool {
@@ -14167,6 +14171,25 @@ mod shared_db_tests {
         }
 
         assert!(!crate::runtime_drain::configure::registered());
+        struct RegistrationErrors(AtomicUsize);
+        impl log::Log for RegistrationErrors {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() == log::Level::Error
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if record
+                    .args()
+                    .to_string()
+                    .contains("commands::configure::register_runtime_hooks")
+                {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn flush(&self) {}
+        }
+        static ERRORS: RegistrationErrors = RegistrationErrors(AtomicUsize::new(0));
+        log::set_logger(&ERRORS).unwrap();
+        log::set_max_level(log::LevelFilter::Error);
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let ctx = AppContext::from_app(
@@ -14198,9 +14221,11 @@ mod shared_db_tests {
             assert_eq!(failure.retry_at, retry_at);
             assert_eq!(failure.backoff, backoff);
         }
+        assert_eq!(ERRORS.0.load(Ordering::Relaxed), 1);
     }
 
     fn bound_database_root(app: Arc<App>, root: &Path, storage: &Path) -> Arc<AppContext> {
+        crate::commands::configure::register_runtime_hooks();
         let ctx = Arc::new(AppContext::from_app(
             app,
             Config {
@@ -14442,6 +14467,7 @@ mod shared_db_tests {
     }
 
     fn failed_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        crate::commands::configure::register_runtime_hooks();
         // Each context owns its storage fixture. A process-wide override would
         // redirect unrelated contexts while libtest runs them in parallel.
         let storage = tempdir().unwrap();
@@ -14552,6 +14578,7 @@ mod shared_db_tests {
     }
 
     fn failed_floor_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        crate::commands::configure::register_runtime_hooks();
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         std::fs::write(
@@ -14660,6 +14687,7 @@ mod shared_db_tests {
     }
 
     fn resident_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        crate::commands::configure::register_runtime_hooks();
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let ctx = AppContext::from_app(
@@ -14852,6 +14880,7 @@ mod shared_db_tests {
 
     #[test]
     fn busy_database_retry_recovers_from_brief_database_slot_contention() {
+        crate::commands::configure::register_runtime_hooks();
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let ctx = Arc::new(AppContext::from_app(
@@ -15018,6 +15047,7 @@ mod shared_db_tests {
 
     #[test]
     fn failed_database_retry_reuses_and_preserves_a_resident_connection() {
+        crate::commands::configure::register_runtime_hooks();
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let ctx = AppContext::from_app(
@@ -15111,6 +15141,7 @@ mod shared_db_tests {
 
     #[test]
     fn database_retry_without_configured_root_refuses_without_panicking() {
+        crate::commands::configure::register_runtime_hooks();
         let ctx = AppContext::from_app(App::default_shared(), Config::default());
         assert!(ctx.canonical_cache_root_opt().is_none());
         ctx.finish_database_runtime_error("database busy".into(), true);

@@ -41,6 +41,16 @@ pub fn register_runtime_hooks() {
     });
 }
 
+#[cfg(test)]
+mod runtime_hook_tests {
+    #[test]
+    fn configure_registers_its_runtime_hooks() {
+        super::register_runtime_hooks();
+        assert!(crate::runtime_drain::configure::registered());
+        assert!(crate::runtime_drain::configure::database_runtime().is_some());
+    }
+}
+
 static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static CONFIGURE_DEFERRED_DELAY_REACHED: AtomicUsize = AtomicUsize::new(0);
