@@ -24,9 +24,16 @@ fn main() {
         std::fs::canonicalize(std::env::args_os().nth(1).expect("corpus path required")).unwrap();
     let start_cpu = cpu();
     let start = Instant::now();
-    let cold = FingerprintProbe::capture(&root, None).expect("cold fingerprint must complete");
+    let cold = FingerprintProbe::capture(&root, None);
     let cold_wall_ms = start.elapsed().as_secs_f64() * 1000.0;
     let cold_cpu_ms = (cpu() - start_cpu).as_secs_f64() * 1000.0;
+    let Some(cold) = cold else {
+        println!(
+            "{}",
+            serde_json::json!({"complete": false, "cold_wall_ms": cold_wall_ms, "cold_cpu_ms": cold_cpu_ms})
+        );
+        return;
+    };
     let start_cpu = cpu();
     let start = Instant::now();
     let warm =
@@ -38,7 +45,7 @@ fn main() {
     let (_, _, _, _, warm_hashed) = warm.stats();
     println!(
         "{}",
-        serde_json::json!({"cold_wall_ms": cold_wall_ms, "cold_cpu_ms": cold_cpu_ms, "warm_wall_ms": warm_wall_ms, "warm_cpu_ms": warm_cpu_ms, "examined": examined, "inputs": inputs, "rust_files": rust_files, "rust_bytes": rust_bytes, "cold_hashed": cold_hashed, "warm_hashed": warm_hashed})
+        serde_json::json!({"complete": true, "cold_wall_ms": cold_wall_ms, "cold_cpu_ms": cold_cpu_ms, "warm_wall_ms": warm_wall_ms, "warm_cpu_ms": warm_cpu_ms, "examined": examined, "inputs": inputs, "rust_files": rust_files, "rust_bytes": rust_bytes, "cold_hashed": cold_hashed, "warm_hashed": warm_hashed})
     );
 }
 

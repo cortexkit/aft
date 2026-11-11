@@ -352,6 +352,23 @@ impl FileFacts {
             }
         }
         self.env_keys = env_keys.clone();
+        // An include-bearing macro invoked in this file with an unsupported
+        // matcher or a nested call is already uncertain. More files cannot
+        // resolve that call, so refuse before hashing the rest of the tree.
+        for definition in &self.definitions {
+            expired(deadline)?;
+            if definition.includes.is_empty() {
+                continue;
+            }
+            for invocation in &self.invocations {
+                expired(deadline)?;
+                if invocation.name == definition.name
+                    && (definition.parameters.is_none() || invocation.nested)
+                {
+                    return Self::refuse(&definition.path, false, unresolved);
+                }
+            }
+        }
         Some((included, env_keys))
     }
 
@@ -773,6 +790,25 @@ fn string_literal(text: &str, deadline: Instant) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_invoked_matcher_refuses_during_file_scan() {
+        let mut inputs = SourceInputs::default();
+        let mut unresolved = None;
+        let bytes = br#"macro_rules! many { ($($name:literal),*) => { $(include_str!(concat!("data/", $name)))* }; } many!("a.txt");"#;
+        assert!(inputs
+            .add(
+                Path::new("workspace"),
+                Path::new("workspace/vectors.rs"),
+                Some(bytes.to_vec()),
+                None,
+                Instant::now() + std::time::Duration::from_secs(2),
+                &mut unresolved
+            )
+            .is_none());
+        assert!(unresolved.is_some());
+        assert!(inputs.facts.is_empty());
+    }
 
     #[test]
     fn literal_macro_matcher_binds_its_metavariable() {
