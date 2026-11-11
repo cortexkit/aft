@@ -402,6 +402,10 @@ impl CheckoutState {
             out.str(&record.language);
             previous = Some(record);
         }
+        let has_gaps = !self.skipped_directories.is_empty();
+        if has_gaps {
+            out.byte(3);
+        }
         // Flag 2 adds a producer stamp before the optional digests. Older
         // readers reject this flag as unusable and rebuild the checkout.
         out.byte(if self.graph_extractor.is_some() {
@@ -421,7 +425,7 @@ impl CheckoutState {
                 None => out.byte(0),
             }
         }
-        if format >= 4 {
+        if has_gaps {
             out.usize(self.skipped_directories.len());
             for (path, reason) in self.skipped_directories.iter() {
                 out.blob(path);
@@ -444,6 +448,19 @@ impl CheckoutState {
     }
 
     fn decode_layout(payload: &[u8], stamped_graphs: bool) -> Result<Self, RecordError> {
+        Self::decode_sections(payload, stamped_graphs, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode_as_v064(payload: &[u8]) -> Result<Self, RecordError> {
+        Self::decode_sections(payload, true, false)
+    }
+
+    fn decode_sections(
+        payload: &[u8],
+        stamped_graphs: bool,
+        coverage_gaps: bool,
+    ) -> Result<Self, RecordError> {
         let invalid = |error: DecodeError| RecordError::Invalid(error.0);
         let mut input = Decoder::new(payload).map_err(invalid)?;
         let format = input.byte().map_err(invalid)?;
@@ -453,7 +470,7 @@ impl CheckoutState {
                 supported: u16::from(STATE_FORMAT),
             });
         }
-        // Format 2 has no root folder; format 3 has no walk gaps.
+        // Format 2 has no root folder.
         if !matches!(format, 2..=STATE_FORMAT) {
             return Err(RecordError::Invalid("unknown checkout state format"));
         }
@@ -543,7 +560,12 @@ impl CheckoutState {
         }
         let mut fragments = Vec::new();
         let mut graph_extractor = None;
-        match input.byte().map_err(invalid)? {
+        let mut flag = input.byte().map_err(invalid)?;
+        let has_gaps = flag == 3 && coverage_gaps;
+        if has_gaps {
+            flag = input.byte().map_err(invalid)?;
+        }
+        match flag {
             0 => {}
             flag @ (1 | 2) if flag == 1 || stamped_graphs => {
                 if flag == 2 {
@@ -571,7 +593,7 @@ impl CheckoutState {
             _ => return Err(RecordError::Invalid("fragment section flag")),
         }
         let mut skipped_directories = std::collections::BTreeMap::new();
-        if format >= 4 {
+        if has_gaps {
             let count = input.count_of(2).map_err(invalid)?;
             for _ in 0..count {
                 let path = input.blob().map_err(invalid)?.to_vec();
@@ -596,12 +618,16 @@ impl CheckoutState {
 /// the payload's string table. A reader refuses a payload naming a higher
 /// one, since a newer build wrote it. So every later layout must keep the
 /// string table's encoding and this byte where they are, and any other
-/// change to the layout must raise this number, except the stamped fragment
-/// flag 2: old readers deliberately treat that flag as unusable and rebuild,
-/// rather than refusing the whole family on rollback. The record envelope
-/// and the rest of the state layout are unchanged.
-/// Format 4 appends the skipped-directory paths and their permission errors.
-const STATE_FORMAT: u8 = 4;
+/// change to the layout must raise this number, except rebuildable fragment
+/// sections. Fragment-section flag 2 adds a producer stamp: older readers
+/// treat an unknown section flag as unusable and rebuild the checkout rather
+/// than refusing the whole family on rollback. The record envelope and the
+/// rest of the state layout are unchanged.
+/// Fragment-section flag 3 uses the same mechanism: it wraps the existing
+/// fragment section and appends skipped-directory paths and errors. Readers
+/// that do not know this section flag rebuild only that checkout instead of
+/// refusing the family. Gap-free states keep their original bytes and flags.
+const STATE_FORMAT: u8 = 3;
 
 /// How much of a state record [`newer_state_format`] reads to find the
 /// payload's format byte: the record header and the payload's string table,
@@ -699,6 +725,131 @@ crate::heap_bytes_of_fields!(CheckoutState {
 mod tests {
     use super::*;
 
+    // Frozen from v0.64.0's encode_layout, with its format fixed at 3.
+    // This oracle must not delegate to the current writer: gap-free bytes
+    // must remain compatible even as new optional sections are introduced.
+    fn encode_v064(state: &CheckoutState) -> Vec<u8> {
+        let mut out = Encoder::default();
+        out.byte(3);
+        out.blob(&state.git);
+        out.blob(state.conversion.as_bytes());
+        out.blob(&state.root);
+        out.usize(state.paths.len());
+        let mut previous: Option<&PathRecord> = None;
+        for record in state.paths.iter() {
+            let shared = previous.map_or(0, |previous| {
+                previous
+                    .path
+                    .iter()
+                    .zip(&record.path)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            });
+            out.usize(shared);
+            out.blob(&record.path[shared..]);
+            out.u32(record.mode);
+            out.byte(record.kind.code());
+            out.blob(record.content.digest().as_bytes());
+            out.blob(&record.link);
+            let stat = &record.stat;
+            let before = previous.map(|previous| &previous.stat);
+            out.u64(stat.size);
+            out.u64(zigzag(stat.mtime_ns));
+            out.u64(zigzag(stat.ctime_ns.wrapping_sub(stat.mtime_ns)));
+            put_optional(
+                &mut out,
+                stat.birth_ns
+                    .map(|birth| zigzag(birth.wrapping_sub(stat.mtime_ns))),
+            );
+            out.u64(stat.file_id);
+            out.u64(zigzag(
+                stat.device
+                    .wrapping_sub(before.map_or(0, |before| before.device))
+                    .cast_signed(),
+            ));
+            put_optional(&mut out, stat.usn);
+            put_optional(&mut out, stat.journal);
+            out.u64(zigzag(
+                stat.observed_ns
+                    .wrapping_sub(before.map_or(0, |before| before.observed_ns)),
+            ));
+            out.str(&record.language);
+            previous = Some(record);
+        }
+        out.byte(if state.graph_extractor.is_some() {
+            2
+        } else {
+            u8::from(!state.fragments.is_empty())
+        });
+        if let Some(extractor) = &state.graph_extractor {
+            out.blob(extractor.as_bytes());
+        }
+        for fragment in state.fragments.iter() {
+            match fragment {
+                Some(digest) => {
+                    out.byte(1);
+                    out.blob(digest.as_bytes());
+                }
+                None => out.byte(0),
+            }
+        }
+        out.finish()
+    }
+
+    #[test]
+    fn gap_free_states_keep_v064_bytes_for_every_fragment_section() {
+        for paths in [
+            Vec::new(),
+            vec![record("src/a.rs", "a"), record("src/b.rs", "b")],
+        ] {
+            let state = CheckoutState::new(b"git".to_vec(), Digest128::of(b"attrs"), paths)
+                .unwrap()
+                .with_root(Path::new("/work"));
+            let fragments = vec![Some(Digest128::of(b"fragment")); state.paths().len()];
+            let states = [
+                state.clone(),
+                state.clone().with_fragments(fragments.clone()).unwrap(),
+                state.with_fragments_for(fragments, "current").unwrap(),
+            ];
+            for state in states {
+                assert_eq!(state.encode(), encode_v064(&state));
+                assert_eq!(
+                    CheckoutState::decode_as_v064(&state.encode()).unwrap(),
+                    state
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gap_sections_round_trip_with_each_fragment_section_and_v064_rejects_them() {
+        for paths in [Vec::new(), vec![record("a.rs", "a")]] {
+            let state = CheckoutState::new(Vec::new(), Digest128::of(b""), paths).unwrap();
+            let fragments = vec![Some(Digest128::of(b"fragment")); state.paths().len()];
+            let states = [
+                state.clone(),
+                state.clone().with_fragments(fragments.clone()).unwrap(),
+                state.with_fragments_for(fragments, "current").unwrap(),
+            ];
+            for state in states {
+                let state = state.with_skipped_directories(
+                    [(
+                        b"locked".to_vec(),
+                        "permission denied (os error 13)".to_string(),
+                    )]
+                    .into(),
+                );
+                let payload = state.encode();
+                assert_eq!(Decoder::new(&payload).unwrap().byte().unwrap(), 3);
+                assert_eq!(CheckoutState::decode(&payload).unwrap(), state);
+                assert!(matches!(
+                    CheckoutState::decode_as_v064(&payload),
+                    Err(RecordError::Invalid("fragment section flag"))
+                ));
+            }
+        }
+    }
+
     fn record(path: &str, content: &str) -> PathRecord {
         PathRecord {
             path: path.as_bytes().to_vec(),
@@ -773,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_folders_survive_encoding_and_rebuilding_and_legacy_states_decode() {
+    fn skipped_folders_survive_encoding_and_rebuilding() {
         let state = CheckoutState::new(Vec::new(), Digest128::of(b""), vec![record("a", "a")])
             .unwrap()
             .with_root(Path::new("/work"))
@@ -790,9 +941,11 @@ mod tests {
             .unwrap()
             .with_root_of(&state);
         assert_eq!(rebuilt.skipped_directories(), state.skipped_directories());
-        let legacy = CheckoutState::decode(&state.encode_as(3)).unwrap();
-        assert_eq!(legacy.root(), state.root());
-        assert!(legacy.skipped_directories().is_empty());
+        assert_eq!(Decoder::new(&state.encode()).unwrap().byte().unwrap(), 3);
+        assert!(matches!(
+            CheckoutState::decode_sections(&state.encode(), true, false),
+            Err(RecordError::Invalid("fragment section flag"))
+        ));
     }
 
     #[test]
