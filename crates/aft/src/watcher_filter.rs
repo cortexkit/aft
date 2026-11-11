@@ -158,13 +158,7 @@ impl WatcherFilterConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RescanReason {
-    BufferOverflow,
-    KernelDropped,
-    UserDropped,
-    Unknown,
-}
+pub use crate::logging::RescanReason;
 
 pub(crate) const DIRECTORY_ARRIVAL_INFO: &str = "directory arrival";
 
@@ -175,15 +169,6 @@ impl RescanReason {
             Some("rescan: kernel dropped") => Self::KernelDropped,
             Some("rescan: user dropped") => Self::UserDropped,
             _ => Self::Unknown,
-        }
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::BufferOverflow => "buffer_overflow",
-            Self::KernelDropped => "kernel_dropped",
-            Self::UserDropped => "user_dropped",
-            Self::Unknown => "unknown",
         }
     }
 }

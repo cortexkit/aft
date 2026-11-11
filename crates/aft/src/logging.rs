@@ -573,7 +573,7 @@ pub(crate) fn log_index_event(event: IndexEvent) {
 
 pub(crate) fn log_watcher_rescan(
     root: &Path,
-    reason: crate::watcher_filter::RescanReason,
+    reason: RescanReason,
     cost_ms: u64,
     rss_delta_bytes: Option<i64>,
     raw_events_since_last: u64,
@@ -4162,7 +4162,7 @@ mod tests {
         let (_, lines) = capture_index_events(|| {
             log_watcher_rescan(
                 Path::new("/tmp/watcher root"),
-                crate::watcher_filter::RescanReason::KernelDropped,
+                RescanReason::KernelDropped,
                 42,
                 Some(-4096),
                 137,
@@ -4404,5 +4404,24 @@ mod tests {
             }),
             "tier2 must not emit synthetic build_progress: {lines:?}"
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanReason {
+    BufferOverflow,
+    KernelDropped,
+    UserDropped,
+    Unknown,
+}
+
+impl RescanReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BufferOverflow => "buffer_overflow",
+            Self::KernelDropped => "kernel_dropped",
+            Self::UserDropped => "user_dropped",
+            Self::Unknown => "unknown",
+        }
     }
 }
