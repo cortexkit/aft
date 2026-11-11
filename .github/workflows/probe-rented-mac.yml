@@ -95,11 +95,14 @@ jobs:
                   time.sleep(0.5)
                   if process.poll() is None:
                       at_us = time.time_ns() // 1000
+                      report = target.parent.parent / "scratch" / f"sample-{process.pid}.txt"
+                      report.parent.mkdir(exist_ok=True)
                       try:
-                          result = subprocess.run(["/usr/bin/sample", str(process.pid), "1", "1"],
+                          result = subprocess.run(["/usr/bin/sample", str(process.pid), "1", "1", "-file", str(report)],
                               capture_output=True, text=True, timeout=10)
                           sampled.append(dict(wall_us=at_us, pid=process.pid, exit=result.returncode,
-                              stdout=result.stdout, stderr=result.stderr))
+                              stdout=result.stdout, stderr=result.stderr,
+                              report=report.read_text(errors="replace") if report.exists() else "<not produced>"))
                       except subprocess.TimeoutExpired:
                           sampled.append(dict(wall_us=at_us, pid=process.pid, error="sample timeout"))
               sampler = threading.Thread(target=sample_if_alive) if sample else None
