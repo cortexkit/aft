@@ -1138,9 +1138,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal watcher exclusion budget, not an agent-visible result list; paths without a kernel exclusion slot remain rejected at the walk boundary",
     },
     ExclusionEntry {
-        file: "commands/bash_orchestrate.rs",
+        file: "shell_format.rs",
         enclosing_item: "format_seconds",
-        location_or_primitive: "commands::bash_orchestrate::seconds.truncate",
+        location_or_primitive: "shell_format::seconds.truncate",
         reason: "string manipulation trimming timestamp representation, not a list truncation",
     },
     ExclusionEntry {

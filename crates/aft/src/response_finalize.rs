@@ -288,19 +288,7 @@ pub(crate) fn append_cancelled_call_notices(
     }
 }
 
-fn append_trailing_line(text: &mut String, line: &str) {
-    if !text.is_empty() {
-        text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
-    }
-    text.push_str(line);
-}
-
-/// Schema lookups are AFT-added trailers, not command output. Both terminal
-/// snapshots and completion previews call this after their output size caps.
-#[cfg(unix)]
-pub(crate) fn append_db_schema_hint(text: &mut String, hint: &str) {
-    append_trailing_line(text, hint);
-}
+use crate::shell_format::append_trailing_line;
 
 /// Finalize an agent-visible response using the root selected by dispatch. The finalizer owns
 /// the alert transition and never reads `ctx.config().project_root` for alert state.

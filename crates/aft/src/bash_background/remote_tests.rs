@@ -2103,6 +2103,8 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
         .snapshot()
         .uncaptured_terminal
         .expect("replayed terminal drain reply");
+    let cached =
+        crate::commands::bash_orchestrate::foreground_result_response("", (*cached).clone());
     assert_eq!(cached.data, expected.data);
     assert_eq!(cached.success, expected.success);
 }

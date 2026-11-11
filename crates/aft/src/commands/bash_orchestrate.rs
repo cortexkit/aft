@@ -108,14 +108,7 @@ pub fn format_foreground_result(snapshot: &BgTaskSnapshot) -> String {
     rendered
 }
 
-/// Port of `packages/aft-bridge/src/bash-format.ts` `formatSeconds` (lines 3-6).
-pub fn format_seconds(ms: u64) -> String {
-    let mut seconds = format!("{:.1}", ms as f64 / 1000.0);
-    if seconds.ends_with(".0") {
-        seconds.truncate(seconds.len() - 2);
-    }
-    format!("{seconds}s")
-}
+pub use crate::shell_format::format_seconds;
 
 /// What happens to a task once it runs in the background, worded for the
 /// caller's role and available tools. A primary session is woken by a completion
@@ -141,14 +134,7 @@ fn format_background_handoff_tail(
     )
 }
 
-/// A wait limit in words: whole minutes as minutes, anything else in seconds.
-pub(crate) fn format_wait_limit(ms: u64) -> String {
-    match ms {
-        60_000 => "1 minute".to_string(),
-        ms if ms > 0 && ms % 60_000 == 0 => format!("{} minutes", ms / 60_000),
-        ms => format_seconds(ms),
-    }
-}
+pub(crate) use crate::shell_format::format_wait_limit;
 
 /// The sentence naming a task's own kill deadline, for every reply that hands
 /// a task back. It is kept apart from any wait on the task: a worker whose

@@ -748,3 +748,55 @@ mod tests {
         });
     }
 }
+pub(crate) fn resolve_account_home_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    let home = crate::production_storage::account_home().ok()?;
+    #[cfg(windows)]
+    let home = resolve_windows_profile_dir().ok()?;
+
+    let canonical = std::fs::canonicalize(home).ok()?;
+    canonical.is_dir().then_some(canonical)
+}
+
+#[cfg(windows)]
+fn resolve_windows_profile_dir() -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY,
+    };
+
+    struct FolderPath(*mut u16);
+    impl Drop for FolderPath {
+        fn drop(&mut self) {
+            // SAFETY: SHGetKnownFolderPath allocates its result with the COM allocator.
+            unsafe { CoTaskMemFree(self.0.cast()) };
+        }
+    }
+
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: the folder identifier is valid and raw is writable.
+    let status = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_Profile,
+            KF_FLAG_DONT_VERIFY as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    let path = FolderPath(raw);
+    if status < 0 || path.0.is_null() {
+        return Err(std::io::Error::other(format!(
+            "SHGetKnownFolderPath(FOLDERID_Profile) lookup failed (HRESULT 0x{:08x})",
+            status as u32
+        )));
+    }
+    let mut len = 0;
+    // SAFETY: a successful lookup returns an allocated NUL-terminated path.
+    while unsafe { *path.0.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: the scan above found the end of the allocated path.
+    let units = unsafe { std::slice::from_raw_parts(path.0, len) };
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(units)))
+}

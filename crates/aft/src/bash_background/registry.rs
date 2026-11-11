@@ -1574,9 +1574,9 @@ pub(crate) struct BashDrainReplyState {
     /// loop can name the build-server job without reading task state.
     pub(crate) remote: Option<remote::RemoteProgress>,
     /// Artifact-free terminal diagnostics, published with the metadata before
-    /// the full output renderer can finish the canonical response below.
-    pub(crate) uncaptured_terminal_facts: Option<Arc<crate::protocol::Response>>,
-    pub(crate) uncaptured_terminal: Option<Arc<crate::protocol::Response>>,
+    /// the full output renderer can finish the canonical snapshot below.
+    pub(crate) uncaptured_terminal_facts: Option<Arc<BgTaskSnapshot>>,
+    pub(crate) uncaptured_terminal: Option<Arc<BgTaskSnapshot>>,
 }
 
 impl BashDrainReplyCache {
@@ -1596,9 +1596,7 @@ impl BashDrainReplyCache {
                     snapshot.output_preview = format!("{note}\n");
                 }
                 append_remote_report(&mut snapshot.output_preview, metadata);
-                Arc::new(
-                    crate::commands::bash_orchestrate::foreground_result_response("", snapshot),
-                )
+                Arc::new(snapshot)
             });
         let mut published = self
             .0
@@ -2193,7 +2191,7 @@ impl BgTaskRegistry {
         #[cfg(unix)]
         if let Some(job) = self.db_hint_job(task_id) {
             if let Some(hint) = job.hint() {
-                crate::response_finalize::append_db_schema_hint(text, hint);
+                crate::shell_format::append_db_schema_hint(text, hint);
             }
         }
         #[cfg(not(unix))]
@@ -3565,13 +3563,12 @@ impl BgTaskRegistry {
             .as_ref()
             .is_some_and(|remote| remote.explicit_runon && !remote.accepted)
         {
-            // Use the same canonical terminal rendering as a state-reading
-            // capture reply, including diagnostics, hints and list envelopes.
+            // Publish the terminal diagnostics, hints and bounded-output metadata
+            // in the snapshot. The caller renders the reply without taking
+            // task-state locks.
             let snapshot = self
                 .snapshot_with_terminal_cache(task, super::output::RUNNING_OUTPUT_PREVIEW_BYTES);
-            let reply = Arc::new(
-                crate::commands::bash_orchestrate::foreground_result_response("", snapshot),
-            );
+            let reply = Arc::new(snapshot);
             task.drain_reply
                 .0
                 .lock()
@@ -3836,7 +3833,7 @@ impl BgTaskRegistry {
                 .project_root
                 .as_deref()
                 .unwrap_or(&metadata.workdir),
-            crate::tool_output::OutputScope::for_task(
+            crate::output_store::OutputScope::for_task(
                 &paths.session_dir,
                 &metadata.session_id,
                 self.clone(),
@@ -4818,7 +4815,7 @@ impl BgTaskRegistry {
         row.match_offset = Some(version as i64);
         row.match_text
             .get_or_insert_with(|| "watch delivery gap".to_string());
-        row.match_context = Some(crate::subc_format::format_watch_line_batch(
+        row.match_context = Some(crate::task_watch_lines::format_watch_line_batch(
             &frame.task_id,
             &batch,
         ));
@@ -4928,7 +4925,8 @@ impl BgTaskRegistry {
                 batch.pending_id = Some(format!("{}:{version}", pattern_match.watch_id));
             }
             pattern_match.match_offset = version;
-            pattern_match.context = crate::subc_format::format_watch_line_batch(task_id, batch);
+            pattern_match.context =
+                crate::task_watch_lines::format_watch_line_batch(task_id, batch);
         }
         row.stdout_offset = stdout_offset as i64;
         row.stderr_offset = stderr_offset as i64;
@@ -9220,7 +9218,7 @@ impl BgTaskRegistry {
                         Err(unavailable) => line.text = unavailable.reason.to_string(),
                     }
                 }
-                matched.context = crate::subc_format::format_watch_line_batch(task_id, batch);
+                matched.context = crate::task_watch_lines::format_watch_line_batch(task_id, batch);
             }
         }
         batches
@@ -9974,7 +9972,7 @@ impl BgTaskRegistry {
             }
         }
         for root in requested {
-            crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
+            crate::output_store::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
             self.request_persisted_gc(&root);
         }
     }
@@ -15042,7 +15040,10 @@ impl BgTaskRegistry {
                     &pattern_match.watch_id,
                     &pattern_match.match_text,
                     pattern_match.match_offset,
-                    crate::subc_format::format_watch_line_batch(&pattern_match.task_id, &summary),
+                    crate::task_watch_lines::format_watch_line_batch(
+                        &pattern_match.task_id,
+                        &summary,
+                    ),
                     pattern_match.once,
                 );
                 frame.batch = Some(summary);
@@ -17282,7 +17283,7 @@ fn task_bundle_is_absent(storage_dir: &Path, session_id: &str, task_id: &str) ->
 
 /// A task killed by its hard kill, named by the limit that killed it.
 pub(crate) fn hard_kill_reason(deadline: HardKillDeadline) -> String {
-    let limit = crate::commands::bash_orchestrate::format_wait_limit(deadline.limit_ms);
+    let limit = crate::shell_format::format_wait_limit(deadline.limit_ms);
     let default_ms = DEFAULT_BG_TIMEOUT.as_millis() as u64;
     match deadline.source {
         HardKillSource::Default if deadline.limit_ms > default_ms => format!(
@@ -18505,7 +18506,7 @@ mod tests {
         #[cfg(unix)]
         {
             let mut preview = "Error: no such table: widgets".to_string();
-            crate::response_finalize::append_db_schema_hint(&mut preview, "Schema: widget(id)");
+            crate::shell_format::append_db_schema_hint(&mut preview, "Schema: widget(id)");
             registry.save_completion_preview(task_id, &preview, false, &None);
             let saved = read_task(&paths.json).unwrap().completion_preview.unwrap();
             assert_eq!(

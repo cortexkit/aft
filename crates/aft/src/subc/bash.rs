@@ -387,7 +387,8 @@ mod frame_loop_lock_tests {
                 published
                     .uncaptured_terminal_facts
                     .as_ref()
-                    .is_some_and(|reply| reply.data["status"] == "failed"),
+                    .is_some_and(|snapshot| snapshot.info.status
+                        == crate::bash_background::BgTaskStatus::Failed),
                 "finished facts must accompany terminal metadata"
             );
             assert!(
@@ -1132,9 +1133,10 @@ fn background_handoff_frame(
             .uncaptured_terminal
             .or(cached.uncaptured_terminal_facts)
         {
-            let mut reply = copy_response(&terminal);
-            reply.id = target.request_id.clone();
-            reply
+            crate::commands::bash_orchestrate::foreground_result_response(
+                &target.request_id,
+                (*terminal).clone(),
+            )
         } else {
             with_capture_warning(&response)
         }
@@ -8784,6 +8786,10 @@ mod grant_path_tests {
                 .drain_reply_cache(&task_id, "deadline-session")
                 .snapshot();
             let terminal = cached.uncaptured_terminal.unwrap();
+            let terminal = crate::commands::bash_orchestrate::foreground_result_response(
+                "",
+                (*terminal).clone(),
+            );
             assert_eq!(
                 terminal.data, expected.data,
                 "uncaptured drain must reuse the canonical terminal diagnostics"

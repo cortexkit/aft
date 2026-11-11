@@ -210,6 +210,7 @@ pub mod secret_proxy;
 pub mod semantic_admission;
 pub mod semantic_index;
 pub mod setup_plan;
+pub mod shell_format;
 pub(crate) mod stage_timer;
 pub mod standing_roots;
 pub(crate) mod status_push;

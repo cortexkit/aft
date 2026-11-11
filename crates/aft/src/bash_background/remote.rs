@@ -2550,7 +2550,7 @@ fn runon_cd_refusal_with_git(
             siblings.push(crate::path_identity::lexical_normalize(&parent.join(name)));
         }
     }
-    let mut homes: Vec<PathBuf> = crate::commands::configure::resolve_account_home_dir()
+    let mut homes: Vec<PathBuf> = crate::production_storage::resolve_account_home_dir()
         .into_iter()
         .collect();
     if let Some(home) = std::env::var_os("HOME")
