@@ -266,6 +266,17 @@ mod retained_result;
 pub(crate) mod rich_ui;
 mod run_scope;
 mod runner_notices;
+
+/// Exercise the production notice consumer from a supervised test module.
+#[cfg(feature = "test-scope-owner")]
+#[doc(hidden)]
+pub async fn runner_notice_transport_for_test(
+    connection: &Path,
+    session: &str,
+    scope: subc_protocol::scope::ScopeSelector,
+) -> serde_json::Value {
+    runner_notices::transport_for_test(connection, session, scope).await
+}
 pub(crate) mod scope_background_tasks;
 mod scope_describe;
 mod shells;

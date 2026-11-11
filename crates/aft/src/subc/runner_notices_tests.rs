@@ -325,6 +325,59 @@ fn runner_notices_bounded_queue_defers_without_ack() {
 }
 
 #[test]
+fn runner_notices_startup_replay_offers_only_named_pending_runner_completions() {
+    let task = Completion::new("bash-00000000000b0007", 100);
+    let capture = test_endpoint::capture(&task.task, false);
+    let replayed = vec![(
+        task.task.clone(),
+        vec!["bash-not-present".into(), task.task.clone()],
+    )];
+    let _scope = crate::bash_background::task_identity_scope(None);
+    offer_replayed(task.registry.clone(), &[(task.task.clone(), vec![])]);
+    assert!(capture.receiver.try_recv().is_err());
+    offer_replayed(task.registry.clone(), &replayed);
+    capture
+        .receiver
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap();
+    wait_for(scheduler().unwrap(), &task.task, true);
+    assert!(task.delivered());
+    offer_replayed(task.registry.clone(), &replayed);
+    assert!(capture.receiver.try_recv().is_err());
+}
+
+#[test]
+fn runner_notices_decode_open_states_and_error_envelopes() {
+    for state in [
+        "pending",
+        "active",
+        "finished",
+        "paused",
+        "future_notice_state",
+    ] {
+        let bytes = serde_json::to_vec(&json!({"result":{"state":state,"notice":true}})).unwrap();
+        assert!(matches!(decode_send_reply(&bytes), Outcome::Accepted));
+    }
+    for body in [
+        json!({"error":{"code":"session_released","message":"gone"}}),
+        json!({"code":"session_released","message":"gone"}),
+    ] {
+        assert!(
+            matches!(decode_send_reply(&serde_json::to_vec(&body).unwrap()),
+            Outcome::Final(failure) if failure.code.as_deref() == Some("session_released") && failure.detail.contains("gone"))
+        );
+    }
+    assert!(
+        matches!(decode_send_reply(br#"{"error":{"code":"module_warming","message":"starting"}}"#),
+        Outcome::Retry(failure) if failure.code.as_deref() == Some("module_warming"))
+    );
+    assert!(
+        matches!(decode_send_reply(br#"{"result":{"status":"pending"}}"#),
+        Outcome::Retry(failure) if failure.class == FailureClass::ReplyDecode && failure.detail.contains("state"))
+    );
+}
+
+#[test]
 fn runner_alias_switch_preserves_task_ownership_and_persisted_keys() {
     let principal = |raw: &str| AuthenticatedPrincipal::RouteBind {
         trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
@@ -404,7 +457,7 @@ impl FakeRunner {
             self.stored.insert(request.send_id.clone(), bytes);
         }
         if self.lose_first_response && self.calls.len() == 1 {
-            return Outcome::Retry("response_lost");
+            return retry(FailureClass::TestEndpoint, "response lost");
         }
         let response = reply_body(&SendReply::new("pending").with_submission_id("send-7")).unwrap();
         read_reply::<SendReply>(&response).unwrap();
@@ -479,7 +532,7 @@ fn runner_notices_transients_keep_short_retry_budget() {
             "aft:warning:7",
             attempt,
             false,
-            Outcome::Retry("offline"),
+            retry(FailureClass::TestEndpoint, "offline"),
             &mut false,
         );
         assert_eq!(matches!(next, Next::Done), attempt + 1 == MAX_ATTEMPTS);

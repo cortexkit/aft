@@ -674,3 +674,70 @@ async fn tool_provider_subc_e2e_unscoped_slash_refuses_files_but_serves_catalog(
 async fn tool_provider_subc_e2e_scope_without_workdir_uses_filled_legacy_root() {
     legacy_root_case(false, true).await;
 }
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+#[tokio::test]
+#[ignore = "opt-in real-daemon runner transport; Linux only, needs test-scope-owner"]
+async fn runner_notice_real_daemon_scoped_carrier_authority() {
+    let (_temp, home, _project) = hermetic_home();
+    let config_path = home.join("config/cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let helper = option_env!("CARGO_BIN_EXE_aft-test-scope-owner").unwrap();
+    let mut module = config["modules"]["aft-test-scope-owner"].clone();
+    module["program"] = json!(helper);
+    module["env"]["AFT_TEST_RUNNER_NOTICE"] = json!("1");
+    module["env"]["AFT_TEST_CONNECTION"] = json!(home.join("runtime/subc-connection.json"));
+    for id in ["aft", "aft-test-scope-owner", "broca"] {
+        config["modules"][id] = module.clone();
+    }
+    std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let _daemon = HermeticDaemon::start(&home).await;
+    let result_path = home.join("runner-outcomes.json");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !result_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "runner transport timed out:\n{}",
+            fixture_logs(&home.join("logs"))
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let result: Value = serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
+    for name in ["denied", "denied_again"] {
+        assert_eq!(result[name]["outcome"], "final", "{result}");
+        assert_eq!(result[name]["class"], "RouteOpen", "{result}");
+        assert_eq!(
+            result[name]["code"], "scope_not_carrier",
+            "real daemon must enforce carrier authority: {result}"
+        );
+    }
+    assert_eq!(result["allowed"]["outcome"], "accepted", "{result}");
+    let received = std::fs::read_to_string(home.join("runner-received.jsonl")).unwrap();
+    assert_eq!(
+        received.lines().count(),
+        1,
+        "runner must receive exactly one send: {received}"
+    );
+    let body: Value = serde_json::from_str(received.lines().next().unwrap()).unwrap();
+    assert_eq!(body["method"], "session.send");
+    assert_eq!(body["params"]["send_id"], "aft:bash:notice-allowed");
+    assert_eq!(body["params"]["notice"], true);
+    let log = std::fs::read_to_string(home.join("runner-transport.log")).unwrap();
+    let refusals: Vec<_> = log
+        .lines()
+        .filter(|line| line.starts_with("ERROR runner notice route refused:"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "terminal route refusal is logged once per session: {log}"
+    );
+    for field in [
+        "code=scope_not_carrier",
+        "module=broca",
+        "scope=notice-denied",
+    ] {
+        assert!(refusals[0].contains(field), "missing {field}: {log}");
+    }
+    println!("real subc-daemon 0.39: denied scope_not_carrier (final, one ERROR); targeted reserved:aft carrier accepted; runner received 1 session.send");
+}

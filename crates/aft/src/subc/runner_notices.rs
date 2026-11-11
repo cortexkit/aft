@@ -328,7 +328,7 @@ pub(super) mod test_endpoint {
         stored: std::sync::Mutex<Option<Vec<u8>>>,
         lose_response: AtomicBool,
         effects: Arc<AtomicU64>,
-        retries: AtomicU64,
+        retries: std::sync::Mutex<u64>,
         active: AtomicU64,
         max_active: AtomicU64,
         gate:
@@ -356,7 +356,7 @@ pub(super) mod test_endpoint {
     }
     impl Capture {
         pub(super) fn retry(&self, count: u64) {
-            self.endpoint.retries.store(count, Ordering::Relaxed);
+            *self.endpoint.retries.lock().unwrap() = count;
         }
         pub(super) fn block_next(
             &self,
@@ -384,7 +384,7 @@ pub(super) mod test_endpoint {
             stored: Default::default(),
             lose_response: AtomicBool::new(lose_response),
             effects: effects.clone(),
-            retries: AtomicU64::new(0),
+            retries: Default::default(),
             active: AtomicU64::new(0),
             max_active: AtomicU64::new(0),
             gate: Default::default(),
@@ -429,14 +429,14 @@ pub(super) mod test_endpoint {
             entered.send(()).unwrap();
             release.recv_timeout(Duration::from_secs(3)).unwrap();
         }
-        if endpoint
-            .retries
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Some(Outcome::Retry("endpoint_unavailable"));
+        let should_retry = {
+            let mut remaining = endpoint.retries.lock().unwrap();
+            let retry = *remaining > 0;
+            *remaining = remaining.saturating_sub(1);
+            retry
+        };
+        if should_retry {
+            return Some(retry(FailureClass::TestEndpoint, "endpoint unavailable"));
         }
         let bytes = serde_json::to_vec(&decoded).unwrap();
         let mut stored = endpoint.stored.lock().unwrap();
@@ -449,7 +449,7 @@ pub(super) mod test_endpoint {
             endpoint.effects.fetch_add(1, Ordering::Relaxed);
         }
         if endpoint.lose_response.swap(false, Ordering::Relaxed) {
-            return Some(Outcome::Retry("response_lost"));
+            return Some(retry(FailureClass::TestEndpoint, "response lost"));
         }
         let reply = cortexkit_role_llm_runner::wire::reply_body(
             &SendReply::new("pending").with_submission_id("notice-1"),
@@ -463,8 +463,53 @@ pub(super) mod test_endpoint {
 #[derive(Debug)]
 enum Outcome {
     Accepted,
-    Final(String),
-    Retry(&'static str),
+    Final(Failure),
+    Retry(Failure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    ConsumerIdentity,
+    Connect,
+    RouteOpen,
+    Request,
+    ReplyDecode,
+    PeerRefusal,
+    Runtime,
+    Address,
+    Persistence,
+    Expired,
+    #[cfg(test)]
+    TestEndpoint,
+}
+
+#[derive(Debug)]
+struct Failure {
+    class: FailureClass,
+    code: Option<String>,
+    detail: String,
+}
+
+impl Failure {
+    fn new(class: FailureClass, detail: impl ToString) -> Self {
+        Self {
+            class,
+            code: None,
+            detail: detail.to_string(),
+        }
+    }
+
+    fn coded(class: FailureClass, code: &str, detail: impl ToString) -> Self {
+        Self {
+            class,
+            code: Some(code.into()),
+            detail: detail.to_string(),
+        }
+    }
+}
+
+fn retry(class: FailureClass, detail: impl ToString) -> Outcome {
+    Outcome::Retry(Failure::new(class, detail))
 }
 
 fn refusal(code: &str) -> Outcome {
@@ -474,8 +519,8 @@ fn refusal(code: &str) -> Outcome {
         | "session_released"
         | "send_id_reuse"
         | "delivery_unsupported"
-        | "invalid_params" => Outcome::Final(code.into()),
-        _ => Outcome::Retry("retryable_refusal"),
+        | "invalid_params" => Outcome::Final(Failure::coded(FailureClass::PeerRefusal, code, code)),
+        _ => Outcome::Retry(Failure::coded(FailureClass::PeerRefusal, code, code)),
     }
 }
 
@@ -486,9 +531,21 @@ fn deliver(
     outcome: Outcome,
     retry_logged: &mut bool,
 ) -> Next {
+    if completion && !*retry_logged {
+        if let Outcome::Final(failure) | Outcome::Retry(failure) = &outcome {
+            log::info!(
+                "runner notice {send_id} first failure: class={:?} code={} detail={}",
+                failure.class,
+                failure.code.as_deref().unwrap_or("none"),
+                failure.detail
+            );
+            *retry_logged = true;
+        }
+    }
     match outcome {
         Outcome::Accepted => Next::Done,
-        Outcome::Final(code) => {
+        Outcome::Final(failure) => {
+            let code = failure.code.as_deref().unwrap_or("unknown");
             if completion && code == "expired" {
                 EXPIRED.fetch_add(1, Ordering::Relaxed);
             }
@@ -499,11 +556,7 @@ fn deliver(
             }
             Next::Done
         }
-        Outcome::Retry(reason) => {
-            if completion && !*retry_logged {
-                log::info!("runner notice {send_id} awaiting retry: {reason}");
-                *retry_logged = true;
-            }
+        Outcome::Retry(_) => {
             if !completion && attempt.saturating_add(1) >= MAX_ATTEMPTS {
                 log::warn!("runner notice {send_id} retired: retry budget exhausted");
                 return Next::Done;
@@ -525,11 +578,85 @@ async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome 
         return outcome;
     }
     match call(path, address, envelope(request)).await {
-        Ok(bytes) => match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&bytes) {
-            Ok(_) => Outcome::Accepted,
-            Err(_) => Outcome::Retry("invalid_reply"),
-        },
+        Ok(bytes) => decode_send_reply(&bytes),
         Err(outcome) => outcome,
+    }
+}
+
+fn decode_send_reply(bytes: &[u8]) -> Outcome {
+    match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(bytes) {
+        Ok(_) => Outcome::Accepted,
+        Err(error) => {
+            if let Ok(body) = serde_json::from_slice::<Value>(bytes) {
+                let refusal_body = body.get("error").unwrap_or(&body);
+                if let Some(code) = refusal_body.get("code").and_then(Value::as_str) {
+                    let mut outcome = refusal(code);
+                    if let Outcome::Final(failure) | Outcome::Retry(failure) = &mut outcome {
+                        failure.detail = refusal_body.to_string();
+                    }
+                    return outcome;
+                }
+            }
+            retry(FailureClass::ReplyDecode, error)
+        }
+    }
+}
+
+#[cfg(feature = "test-scope-owner")]
+pub(super) async fn transport_for_test(path: &Path, session: &str, scope: ScopeSelector) -> Value {
+    let address = Address {
+        module: "broca".into(),
+        identity: BindIdentity::new("runner", session),
+        scope: Some(scope),
+        worker: true,
+    };
+    let request = request(
+        format!("aft:bash:{session}"),
+        "completion".into(),
+        true,
+        true,
+    );
+    let outcome = send(path, &address, &request).await;
+    let result = match &outcome {
+        Outcome::Accepted => json!({"outcome":"accepted"}),
+        Outcome::Final(failure) | Outcome::Retry(failure) => json!({
+            "outcome": if matches!(outcome, Outcome::Final(_)) { "final" } else { "retry" },
+            "class": format!("{:?}", failure.class), "code": failure.code, "detail": failure.detail,
+        }),
+    };
+    deliver(&request.send_id, 0, true, outcome, &mut false);
+    result
+}
+
+fn route_failure(address: &Address, error: CallError) -> Outcome {
+    let body = error.route_open_refusal().or_else(|| match &error {
+        CallError::Module(body) => Some(body),
+        _ => None,
+    });
+    if let Some(body) = body {
+        let failure = Failure::coded(FailureClass::RouteOpen, &body.code, &error);
+        if subc_protocol::error_codes::is_retryable_route_open(&body.code) {
+            return Outcome::Retry(failure);
+        }
+        log_route_refusal(address, &failure);
+        return Outcome::Final(failure);
+    }
+    retry(FailureClass::RouteOpen, error)
+}
+
+fn log_route_refusal(address: &Address, failure: &Failure) {
+    static LOGGED: OnceLock<std::sync::Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let key = (address.module.clone(), address.identity.session.clone());
+    if LOGGED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(key)
+    {
+        log::error!("runner notice route refused: session={} module={} scope={} class={:?} code={} detail={}",
+            address.identity.session, address.module,
+            address.scope.as_ref().map(|scope| scope.scope_ref.as_str()).unwrap_or("unscoped"),
+            failure.class, failure.code.as_deref().unwrap_or("none"), failure.detail);
     }
 }
 
@@ -551,10 +678,14 @@ async fn read_idle_start_grant(path: &Path, address: &Address) -> Option<bool> {
 
 async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, Outcome> {
     let Some(principal) = crate::launch_nonce::consumer_identity() else {
-        return Err(Outcome::Retry("identity_unavailable"));
+        return Err(retry(
+            FailureClass::ConsumerIdentity,
+            "AFT launch has no consumer identity",
+        ));
     };
-    let Ok(consumer) = SubcConsumer::connect(path, ConsumerOptions::default()).await else {
-        return Err(Outcome::Retry("connection_unavailable"));
+    let consumer = match SubcConsumer::connect(path, ConsumerOptions::default()).await {
+        Ok(consumer) => consumer,
+        Err(error) => return Err(retry(FailureClass::Connect, error)),
     };
     let target = target(address);
     let options = CallOptions {
@@ -593,12 +724,17 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
                 .await;
             match result {
                 Ok(bytes) => Ok(bytes),
-                Err(CallError::Module(error)) => Err(refusal(&error.code)),
-                Err(_) => Err(Outcome::Retry("request_failed")),
+                Err(CallError::Module(error)) => {
+                    let mut outcome = refusal(&error.code);
+                    if let Outcome::Final(failure) | Outcome::Retry(failure) = &mut outcome {
+                        failure.detail = error.message;
+                    }
+                    Err(outcome)
+                }
+                Err(error) => Err(retry(FailureClass::Request, error)),
             }
         }
-        Err(CallError::Module(error)) => Err(refusal(&error.code)),
-        Err(_) => Err(Outcome::Retry("route_unavailable")),
+        Err(error) => Err(route_failure(address, error)),
     };
     let _ = consumer.close().await;
     result
@@ -606,6 +742,35 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
 
 pub(super) fn enqueue(registry: crate::bash_background::BgTaskRegistry, frame: PushFrame) -> bool {
     enqueue_inner(registry, frame, false)
+}
+
+/// Offer only the undelivered completions explicitly recovered at startup;
+/// their launching identity supplies authority even before a session rebinds.
+pub(crate) fn offer_replayed(
+    registry: crate::bash_background::BgTaskRegistry,
+    replayed: &[(String, Vec<String>)],
+) {
+    for (session, tasks) in replayed {
+        for task in tasks {
+            let Some(metadata) = registry.notice_metadata(task) else {
+                continue;
+            };
+            let Some(owner) = metadata.launching_identity.filter(is_runner) else {
+                continue;
+            };
+            if owner.session != *session || metadata.completion_delivered {
+                continue;
+            }
+            let _identity = crate::bash_background::task_identity_scope(Some(owner));
+            if let Some(completion) = registry
+                .pending_completions_for_session(session)
+                .into_iter()
+                .find(|completion| completion.task_id == *task)
+            {
+                enqueue(registry.clone(), completion.into_push_frame());
+            }
+        }
+    }
 }
 
 pub(super) fn route_bound(registry: crate::bash_background::BgTaskRegistry, route: &RouteIdentity) {
@@ -729,7 +894,11 @@ fn offer(
             });
             let age = now().saturating_sub(metadata.finished_at.unwrap_or(metadata.started_at));
             let outcome = if completion && age >= MAX_AGE_MS {
-                Outcome::Final("expired".into())
+                Outcome::Final(Failure::coded(
+                    FailureClass::Expired,
+                    "expired",
+                    "task finish age reached 24 hours",
+                ))
             } else {
                 let outcome = (|| {
                     let raw = metadata
@@ -737,13 +906,14 @@ fn offer(
                         .clone()
                         .unwrap_or_else(|| owner.harness.clone());
                     let Some(address) = Address::new(&owner, raw, metadata.scope.as_ref()) else {
-                        return None;
+                        return retry(FailureClass::Address, "task has no runner notice address");
                     };
-                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                    else {
-                        return Some(Outcome::Retry("runtime_unavailable"));
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => return retry(FailureClass::Runtime, error),
                     };
                     let no_idle_grant = completion
                         && !address.worker
@@ -772,7 +942,7 @@ fn offer(
                                 log::warn!(
                                     "runner notice task={task_id} could not freeze send: {error}"
                                 );
-                                return Some(Outcome::Retry("notice_persistence"));
+                                return retry(FailureClass::Persistence, error);
                             }
                         }
                     } else {
@@ -781,20 +951,21 @@ fn offer(
                     if completion {
                         let Some(offers) = registry.reserve_runner_completion_offer(&task_id)
                         else {
-                            return None;
+                            return retry(
+                                FailureClass::Persistence,
+                                "could not reserve completion offer",
+                            );
                         };
-                        if registry
-                            .persist_runner_completion_offer(&owner.session, &task_id, offers)
-                            .is_err()
-                        {
-                            return Some(Outcome::Retry("offer_persistence"));
+                        if let Err(error) = registry.persist_runner_completion_offer(
+                            &owner.session,
+                            &task_id,
+                            offers,
+                        ) {
+                            return retry(FailureClass::Persistence, error);
                         }
                     }
-                    Some(runtime.block_on(send(&path, &address, &request)))
+                    runtime.block_on(send(&path, &address, &request))
                 })();
-                let Some(outcome) = outcome else {
-                    return Next::Done;
-                };
                 outcome
             };
             settled = completion && !matches!(outcome, Outcome::Retry(_));
