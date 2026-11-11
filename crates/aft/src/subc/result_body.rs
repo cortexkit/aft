@@ -4,14 +4,16 @@ pub(crate) use crate::protocol::RESULT_FORMAT;
 // Catalog declarations advertise support; replies follow each route's negotiated
 // capability. Routes that do not request RESULT_FORMAT keep their legacy bodies.
 pub(super) const DECLARE_RESULT_FORMAT: bool = true;
-pub(crate) use crate::response_finalize::{too_large, MAX_RESULT_BYTES, TOO_LARGE_SENTENCE};
+pub(crate) use crate::response_finalize::{too_large, MAX_RESULT_BYTES};
 pub(crate) const FALLBACK_ERROR_CODE: &str = "tool_error";
 
 pub(super) fn accepts(capabilities: Option<&[String]>) -> bool {
     capabilities.is_some_and(|items| items.iter().any(|item| item == RESULT_FORMAT))
 }
 
-pub(crate) use crate::context::call_context::{active, enter};
+#[cfg(test)]
+pub(crate) use crate::context::call_context::active;
+pub(crate) use crate::context::call_context::enter;
 
 pub(super) fn error_code(code: Option<&str>) -> String {
     let mut normalized = String::new();

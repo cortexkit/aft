@@ -4905,7 +4905,7 @@ mod grant_path_tests {
             }
         }
         let vault = Vault(std::sync::atomic::AtomicUsize::new(0));
-        let decision = super::super::secret_consent::resolve_current_secret_label(&vault, "test");
+        let decision = crate::context::call_context::resolve_current_secret_label(&vault, "test");
         let super::super::secret_consent::LaunchDecision::Refuse(outcome) = decision else {
             panic!("unavailable vault must refuse");
         };
@@ -5000,7 +5000,7 @@ mod grant_path_tests {
             );
             assert_eq!(response.data["resolve_calls"], usize::from(stamped));
             assert!(matches!(
-                super::super::secret_consent::current_call_scopes(),
+                crate::context::call_context::current_call_scopes(),
                 Err(crate::secret::Ineligibility::NoScope)
             ));
         }

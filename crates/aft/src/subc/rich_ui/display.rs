@@ -799,6 +799,7 @@ pub(crate) fn current_task() -> Option<TaskDisplay> {
     })
 }
 
+#[cfg(test)]
 pub(crate) use crate::bash_background::frames::bash_bodies;
 
 pub(crate) fn bash_reply(display: &mut TaskDisplay, body: (Value, Value), deferred: bool) {

@@ -11000,7 +11000,7 @@ mod ledger_terminal_tests {
         let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
         let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
         let signal = metrics.watch_yields.register(route, 7);
-        crate::subc::call_yield::watch_waiting(
+        crate::commands::bash_watch::restart::watch_waiting(
             &signal,
             crate::subc::call_yield::WatchWait::new(
                 ctx.clone(),

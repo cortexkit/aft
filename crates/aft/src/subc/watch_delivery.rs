@@ -1,5 +1,6 @@
 //! Coalesced retry-eviction work. SQLite never runs on the SubC frame loop.
 use super::*;
+#[cfg(test)]
 use crate::protocol::BashPatternMatchFrame;
 use std::sync::{Mutex, Weak};
 

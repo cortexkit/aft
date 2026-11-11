@@ -7,6 +7,7 @@ use cortexkit_role_tool_display::{
     canonical_body, validate_write, DisplayKind, DisplayLimits, DisplayWrite,
 };
 use serde_json::{json, Value};
+#[cfg(test)]
 use subc_protocol::Principal;
 
 const MAX_CALLS: usize = 64;
