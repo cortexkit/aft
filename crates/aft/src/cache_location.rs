@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 pub(crate) mod markers;
-use crate::bash_background::persistence::{PinnedDir, RepairBudget};
+use crate::pinned_dir::{PinnedDir, RepairBudget};
 
 #[cfg(test)]
 #[path = "cache_location_tests.rs"]
@@ -206,8 +206,8 @@ struct Identity {
 }
 fn identity(path: &Path) -> io::Result<Identity> {
     #[cfg(test)]
-    if let Some((device, inode)) = crate::bash_background::persistence::REPAIR_IDENTITIES
-        .with(|ids| ids.borrow().get(path).copied())
+    if let Some((device, inode)) =
+        crate::pinned_dir::REPAIR_IDENTITIES.with(|ids| ids.borrow().get(path).copied())
     {
         return Ok(Identity { device, inode });
     }
@@ -833,7 +833,7 @@ fn pinned_identity(root: &PinnedDir) -> io::Result<Identity> {
 /// boundary and retain the directory handle for every ownership comparison.
 /// Artifact descendants still use no-follow walks, not this resolver.
 fn pin_storage_root(storage: &Path) -> io::Result<PinnedDir> {
-    let resolved = crate::bash_background::persistence::resolve_configured_root(storage)?;
+    let resolved = crate::pinned_dir::resolve_configured_root(storage)?;
     PinnedDir::repair_open_path(&resolved)
 }
 /// How long preparation waits for a conflicting exclusive hold on a root's
@@ -848,9 +848,10 @@ fn take_shared_pinned(root: PinnedDir) -> io::Result<Arc<CacheLease>> {
         // A bounded create/reopen failure already carries its operation, path
         // and retryable type; do not flatten it into a cache-folder failure.
         #[cfg(unix)]
-        if error.get_ref().is_some_and(|error| {
-            error.is::<crate::bash_background::persistence::CoordinationCreateContended>()
-        }) {
+        if error
+            .get_ref()
+            .is_some_and(|error| error.is::<crate::pinned_dir::CoordinationCreateContended>())
+        {
             return error;
         }
         io::Error::new(
@@ -969,7 +970,7 @@ pub fn prepare_cache_root(
             // inode, remembered with the configured spelling, and a later
             // change of what that spelling names is refused below.
             let configured = parent;
-            let parent = crate::bash_background::persistence::resolve_configured_root(configured)?;
+            let parent = crate::pinned_dir::resolve_configured_root(configured)?;
             let expected_parent = real_directory(&parent)?;
             for ancestor in parent.ancestors() {
                 if fs::symlink_metadata(ancestor.join(OWNER)).is_ok() {
@@ -1022,7 +1023,7 @@ pub fn prepare_cache_root(
                     || Some(&other) == configured_root.as_ref()
                     || !other.exists()
                     // Another spelling of this same root is not an overlap.
-                    || crate::bash_background::persistence::canonical_root_path(&other)
+                    || crate::pinned_dir::canonical_root_path(&other)
                         .ok()
                         .as_ref()
                         == Some(&root)
@@ -1630,7 +1631,7 @@ pub(crate) fn deletion_protections(paths: &[PathBuf]) -> io::Result<Vec<(u64, u6
 fn deletion_protections_with_budget(
     paths: &[PathBuf],
     budget: &mut RepairBudget,
-    examined: &mut crate::bash_background::persistence::IdentityCensus,
+    examined: &mut crate::pinned_dir::IdentityCensus,
 ) -> io::Result<Vec<(u64, u64)>> {
     let mut protected = Vec::new();
     for path in paths {
@@ -2651,7 +2652,7 @@ mod prune_legacy {
         known_harness, marker_matches_pinned, paths_overlap, pin_storage_root, pinned_identity,
         storage_root_proven, DAEMON_USE,
     };
-    use crate::bash_background::persistence::{PinnedDir, RepairBudget, RepairLimitExceeded};
+    use crate::pinned_dir::{PinnedDir, RepairBudget, RepairLimitExceeded};
 
     /// The stores AFT kept directly under a storage or cache root before 0.64.
     /// `semantic/` is handled apart (see `SEMANTIC_DIR`).
@@ -3625,7 +3626,7 @@ mod prune_legacy_tests {
 
     #[test]
     fn prune_legacy_refuses_a_store_on_another_device() {
-        use crate::bash_background::persistence::REPAIR_IDENTITIES;
+        use crate::pinned_dir::REPAIR_IDENTITIES;
         let fixture = fixture();
         let blobs = fixture.storage.join("blobs");
         let (device, inode) = PinnedDir::open(&blobs)

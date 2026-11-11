@@ -91,7 +91,7 @@ pub struct ReadMarkerMetadata {
 #[derive(Debug)]
 pub struct ReadMarker {
     path: PathBuf,
-    generation: crate::bash_background::persistence::PinnedDir,
+    generation: crate::pinned_dir::PinnedDir,
     name: std::ffi::OsString,
     metadata: ReadMarkerMetadata,
     last_touched_at_ms: AtomicU64,
@@ -129,7 +129,7 @@ impl ReadMarker {
             crate::io_accounting::at("pinning reader marker directory", &dir, error)
         })? {
             Some(access) => access.directory(false),
-            None => crate::bash_background::persistence::PinnedDir::repair_open_path(&dir),
+            None => crate::pinned_dir::PinnedDir::repair_open_path(&dir),
         }
         .map_err(|error| {
             crate::io_accounting::at("opening reader marker directory", &dir, error)
@@ -205,12 +205,8 @@ fn read_marker_dir(cache_dir: &Path, generation_label: &str) -> PathBuf {
 /// Sweep generation markers through pinned handles without following links.
 #[cfg(test)]
 pub(crate) fn sweep_all_read_markers(cache_dir: &Path) -> ReadMarkerSweep {
-    let result = crate::bash_background::persistence::PinnedDir::open(cache_dir).and_then(|dir| {
-        sweep_all_read_markers_pinned(
-            &dir,
-            &mut crate::bash_background::persistence::RepairBudget::new(),
-            true,
-        )
+    let result = crate::pinned_dir::PinnedDir::open(cache_dir).and_then(|dir| {
+        sweep_all_read_markers_pinned(&dir, &mut crate::pinned_dir::RepairBudget::new(), true)
     });
     result.unwrap_or(ReadMarkerSweep {
         protected: true,
@@ -219,8 +215,8 @@ pub(crate) fn sweep_all_read_markers(cache_dir: &Path) -> ReadMarkerSweep {
 }
 
 pub(crate) fn sweep_all_read_markers_pinned(
-    cache: &crate::bash_background::persistence::PinnedDir,
-    budget: &mut crate::bash_background::persistence::RepairBudget,
+    cache: &crate::pinned_dir::PinnedDir,
+    budget: &mut crate::pinned_dir::RepairBudget,
     remove_stale: bool,
 ) -> io::Result<ReadMarkerSweep> {
     let readers = match cache.repair_child(std::ffi::OsStr::new("readers")) {
@@ -246,8 +242,8 @@ pub(crate) fn sweep_all_read_markers_pinned(
 }
 
 fn sweep_marker_generation(
-    generation: &crate::bash_background::persistence::PinnedDir,
-    budget: &mut crate::bash_background::persistence::RepairBudget,
+    generation: &crate::pinned_dir::PinnedDir,
+    budget: &mut crate::pinned_dir::RepairBudget,
     remove_stale: bool,
 ) -> io::Result<ReadMarkerSweep> {
     sweep_marker_generation_cached(
@@ -265,8 +261,8 @@ fn sweep_marker_generation(
 /// and keeps all three in its pass context instead of re-reading the hostname
 /// and each live pid's start time once per generation.
 fn sweep_marker_generation_cached(
-    generation: &crate::bash_background::persistence::PinnedDir,
-    budget: &mut crate::bash_background::persistence::RepairBudget,
+    generation: &crate::pinned_dir::PinnedDir,
+    budget: &mut crate::pinned_dir::RepairBudget,
     remove_stale: bool,
     now: u64,
     host: &str,
@@ -345,7 +341,7 @@ fn reader_census_does_not_treat_an_unavailable_cache_root_as_empty() {
 #[cfg(unix)]
 #[test]
 fn marker_sweep_stays_on_pinned_generation_after_ancestor_swap() {
-    use crate::bash_background::persistence::{PinnedDir, RepairBudget};
+    use crate::pinned_dir::{PinnedDir, RepairBudget};
     let temp = tempfile::tempdir().unwrap();
     let readers = temp.path().join("readers");
     let generation = readers.join("generation");
@@ -414,7 +410,7 @@ fn read_marker_protection(
         }
     });
     let result = (|| {
-        let cache = crate::bash_background::persistence::PinnedDir::open(cache_dir)?;
+        let cache = crate::pinned_dir::PinnedDir::open(cache_dir)?;
         let readers = match cache.repair_child_same_mount(std::ffi::OsStr::new("readers")) {
             Ok(readers) => readers,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -432,7 +428,7 @@ fn read_marker_protection(
             };
         sweep_marker_generation(
             &generation,
-            &mut crate::bash_background::persistence::RepairBudget::new(),
+            &mut crate::pinned_dir::RepairBudget::new(),
             remove_stale,
         )
     })();
@@ -536,7 +532,7 @@ fn marker_start_matches(
 
 #[cfg(test)]
 fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<()> {
-    let parent = crate::bash_background::persistence::PinnedDir::repair_open_path(
+    let parent = crate::pinned_dir::PinnedDir::repair_open_path(
         path.parent()
             .ok_or_else(|| io::Error::other("marker has no parent"))?,
     )?;
@@ -544,7 +540,7 @@ fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<(
 }
 
 fn write_marker_file_pinned(
-    generation: &crate::bash_background::persistence::PinnedDir,
+    generation: &crate::pinned_dir::PinnedDir,
     name: &std::ffi::OsStr,
     metadata: &ReadMarkerMetadata,
 ) -> io::Result<()> {
