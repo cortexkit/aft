@@ -12,6 +12,16 @@ fn read_only_result_case(
     outcome: Outcome,
     error: &str,
 ) -> (String, String, String) {
+    read_only_result_with_stdout(locked, outcome, error, b"command output\n", true)
+}
+
+fn read_only_result_with_stdout(
+    locked: Option<bool>,
+    outcome: Outcome,
+    error: &str,
+    stdout: &[u8],
+    compressed: bool,
+) -> (String, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let (registry, task_id, _) =
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
@@ -19,6 +29,7 @@ fn read_only_result_case(
     {
         let mut state = task.state.lock().unwrap();
         state.metadata.workdir = dir.path().join("package");
+        state.metadata.compressed = compressed;
         // The synthetic environment has no secrets, so notices may retain its captured output.
         state.metadata.completion_has_env_secrets = Some(false);
         state.metadata.completion_has_non_ticket_env_secrets = Some(false);
@@ -33,8 +44,7 @@ fn read_only_result_case(
     }
     let verdict = exec::grade(&record);
     let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
-    sink.output(1, OutputStream::Stdout, b"command output\n")
-        .unwrap();
+    sink.output(1, OutputStream::Stdout, stdout).unwrap();
     sink.output(2, OutputStream::Stderr, error.as_bytes())
         .unwrap();
     sink.terminal(&record, &verdict).unwrap();
@@ -93,6 +103,28 @@ fn runon_read_only_note_bsd_and_redirect_relative_paths() {
 #[test]
 fn runon_read_only_note_python_permission_error() {
     assert_read_only_note("PermissionError: [Errno 1] Operation not permitted: '../src/x.rs'\n");
+}
+
+#[test]
+fn runon_read_only_note_precedes_the_single_final_list_trailer() {
+    let stdout = "ordinary output\n".repeat(10_000);
+    let (foreground, completion, _) = read_only_result_with_stdout(
+        Some(true),
+        Outcome::Exit { code: 1 },
+        "../src/x.rs: Operation not permitted\n",
+        stdout.as_bytes(),
+        false,
+    );
+    for text in [foreground, completion] {
+        assert_eq!(text.matches(READ_ONLY_NOTE).count(), 1, "{text}");
+        let trailers: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("shown "))
+            .collect();
+        assert_eq!(trailers.len(), 1, "{text}");
+        assert_eq!(text.lines().last(), trailers.first().copied(), "{text}");
+        assert!(text.find(READ_ONLY_NOTE).unwrap() < text.find(trailers[0]).unwrap());
+    }
 }
 
 #[test]

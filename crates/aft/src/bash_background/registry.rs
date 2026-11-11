@@ -3104,11 +3104,6 @@ impl BgTaskRegistry {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
             append_remote_report(&mut snapshot.output_preview, &state.metadata);
-            append_source_read_only_note(
-                &mut snapshot.output_preview,
-                &state.metadata,
-                &state.buffer,
-            );
         }
         snapshot
     }
@@ -10609,6 +10604,9 @@ impl BgTaskRegistry {
         if let Some(cache) = self.ensure_terminal_output_cache(task) {
             let mut output_preview = cache.output_preview.clone();
             self.append_db_hint(&task.task_id, &mut output_preview);
+            if let Ok(state) = task.lock_state() {
+                append_source_read_only_note(&mut output_preview, &state.metadata, &state.buffer);
+            }
             let envelope = append_bash_output_envelope(&cache, &mut output_preview);
             snapshot.output_preview = output_preview;
             snapshot.bash_output_list_envelope = envelope;
