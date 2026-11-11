@@ -88,6 +88,10 @@ pub(crate) fn connect(path: &Path) -> rusqlite::Result<TrackedConnection> {
     Ok(conn)
 }
 
+pub(crate) fn schema_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
+    super::current_schema_version(conn)
+}
+
 pub(crate) struct AuthorityRow {
     pub(crate) record_json: String,
     pub(crate) record_digest: Vec<u8>,
