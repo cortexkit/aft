@@ -314,7 +314,11 @@ fn from_health_with_budget(
             .as_u64()
             .is_none_or(|reuse| age.saturating_add(age_ms.unwrap_or(0)) > reuse)
         {
-            findings.push(unknown("health_snapshot", "allocator_observation_expired", now));
+            findings.push(unknown(
+                "health_snapshot",
+                "allocator_observation_expired",
+                now,
+            ));
         }
     }
     match metrics["embedding_backend"]["available"].as_bool() {
@@ -331,7 +335,11 @@ fn from_health_with_budget(
         'roots: for root in roots {
             let key = root_key(root);
             if exhausted() {
-                findings.push(unknown("root_health", &format!("{key}/root_scan_deadline"), now));
+                findings.push(unknown(
+                    "root_health",
+                    &format!("{key}/root_scan_deadline"),
+                    now,
+                ));
                 continue;
             }
             if let Some(reserves) = root["view_storage_reserve"].as_object() {
@@ -373,7 +381,11 @@ fn from_health_with_budget(
             } else if let Some(domains) = root["suspended_domains"].as_array() {
                 for domain in domains {
                     if exhausted() {
-                        findings.push(unknown("root_health", &format!("{key}/domain_scan_deadline"), now));
+                        findings.push(unknown(
+                            "root_health",
+                            &format!("{key}/domain_scan_deadline"),
+                            now,
+                        ));
                         continue 'roots;
                     }
                     let domain_name = domain["domain"].as_str().unwrap_or("unknown");
@@ -404,7 +416,11 @@ fn from_health_with_budget(
             if let Some(failures) = evidence["lsp_start_failures"].as_object() {
                 for (server, count) in failures {
                     if exhausted() {
-                        findings.push(unknown("root_health", &format!("{key}/server_scan_deadline"), now));
+                        findings.push(unknown(
+                            "root_health",
+                            &format!("{key}/server_scan_deadline"),
+                            now,
+                        ));
                         continue 'roots;
                     }
                     if let Some(count) = count.as_u64().filter(|n| *n > 0) {
@@ -828,7 +844,10 @@ mod tests {
         let expired = snapshot(&metrics);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].check, "health_snapshot");
-        assert_eq!(expired[0].samples[0]["reason"], "allocator_observation_expired");
+        assert_eq!(
+            expired[0].samples[0]["reason"],
+            "allocator_observation_expired"
+        );
 
         metrics["memory"]["allocator_observation_age_ms"] = json!(120_000);
         assert!(snapshot(&metrics).is_empty());
@@ -844,43 +863,65 @@ mod tests {
         assert_eq!(findings[0].check, "semantic_backend");
         assert_eq!(findings[0].severity, Severity::Error);
         assert_eq!(findings[0].samples[0]["reason"], "backend_state_unmeasured");
-        assert_eq!(findings[0].summary, "AFT could not determine this check from its recorded evidence.");
+        assert_eq!(
+            findings[0].summary,
+            "AFT could not determine this check from its recorded evidence."
+        );
     }
 
     #[test]
     fn diagnostics_findings_root_deadline_names_every_unexamined_root() {
         let mut metrics = healthy_metrics();
         let root = metrics["roots"][0].clone();
-        metrics["roots"] = json!((0..200).map(|index| {
-            let mut root = root.clone();
-            root["project_root"] = json!(format!("/private/root-{index:03}"));
-            root
-        }).collect::<Vec<_>>());
+        metrics["roots"] = json!((0..200)
+            .map(|index| {
+                let mut root = root.clone();
+                root["project_root"] = json!(format!("/private/root-{index:03}"));
+                root
+            })
+            .collect::<Vec<_>>());
         let mut calls = 0;
         let findings = from_health_with_budget(&metrics, Some(0), None, 1_000_000, 1, || {
             calls += 1;
             calls > 1
         });
         assert_eq!(findings.len(), 199);
-        for (finding, root) in findings.iter().zip(metrics["roots"].as_array().unwrap().iter().skip(1)) {
+        for (finding, root) in findings
+            .iter()
+            .zip(metrics["roots"].as_array().unwrap().iter().skip(1))
+        {
             assert_eq!(finding.check, "root_health");
             assert_eq!(finding.severity, Severity::Error);
-            assert_eq!(finding.samples[0]["reason"], format!("{}/root_scan_deadline", root_key(root)));
+            assert_eq!(
+                finding.samples[0]["reason"],
+                format!("{}/root_scan_deadline", root_key(root))
+            );
         }
-        assert!(!serde_json::to_string(&findings).unwrap().contains("/private/"));
+        assert!(!serde_json::to_string(&findings)
+            .unwrap()
+            .contains("/private/"));
     }
 
     #[test]
     fn diagnostics_findings_nested_deadlines_keep_remaining_roots_and_cleanup() {
         for (field, entries, reason) in [
-            ("suspended_domains", json!([{"domain": "custom"}]), "domain_scan_deadline"),
-            ("diagnostics_evidence", json!({"database_open_failed": false, "lsp_start_failures": {"custom": 1}}), "server_scan_deadline"),
+            (
+                "suspended_domains",
+                json!([{"domain": "custom"}]),
+                "domain_scan_deadline",
+            ),
+            (
+                "diagnostics_evidence",
+                json!({"database_open_failed": false, "lsp_start_failures": {"custom": 1}}),
+                "server_scan_deadline",
+            ),
         ] {
             let mut metrics = healthy_metrics();
             let second = metrics["roots"][0].clone();
             metrics["roots"][0][field] = entries;
             metrics["roots"].as_array_mut().unwrap().push(second);
-            metrics["storage_retention"] = json!({"storage": {"at_ms": 1_000_000, "errors": ["failed"]}});
+            metrics["storage_retention"] =
+                json!({"storage": {"at_ms": 1_000_000, "errors": ["failed"]}});
             let mut calls = 0;
             let findings = from_health_with_budget(&metrics, Some(0), None, 1_000_000, 1, || {
                 calls += 1;
@@ -888,7 +929,10 @@ mod tests {
             });
             assert_eq!(findings.len(), 3);
             assert_eq!(findings[0].check, "root_health");
-            assert!(findings[0].samples[0]["reason"].as_str().unwrap().ends_with(reason));
+            assert!(findings[0].samples[0]["reason"]
+                .as_str()
+                .unwrap()
+                .ends_with(reason));
             assert_eq!(findings[1].check, "root_health");
             assert_eq!(findings[2].check, "cleanup_failures");
         }
