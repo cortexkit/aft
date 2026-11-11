@@ -2256,6 +2256,9 @@ struct HealthDiagnosticRollup {
     generation: u64,
     stale_reason: Option<&'static str>,
     metrics: Value,
+    /// Compact evidence for every root, independent of the public report's
+    /// root-count and byte budgets. Freshness metadata travels with the evidence.
+    findings_metrics: Value,
     /// The full memory census `memory.census` serves. It is measured at its
     /// own cadence (see [`HEALTH_MEMORY_CENSUS_INTERVAL_MS`]), so a rollup may
     /// carry forward the census an earlier rollup measured; sharing it by
@@ -2318,6 +2321,7 @@ impl HealthDiagnosticRollup {
             generated_at_ms: None,
             generation: 0,
             stale_reason: Some("not_yet_sampled"),
+            findings_metrics: metrics.clone(),
             metrics,
             memory_census: Arc::new(placeholder_memory_census()),
             memory_census_at_ms: None,
@@ -2439,7 +2443,7 @@ impl HealthRollupCache {
             snapshot.stale_reason
         };
         super::diagnostics_findings::from_health(
-            &snapshot.metrics,
+            &snapshot.findings_metrics,
             age_ms,
             reason,
             now_ms,
@@ -2476,7 +2480,7 @@ impl HealthRollupCache {
         }
     }
 
-    fn allocator_observation(&self) -> crate::memory::AllocatorObservation {
+    fn allocator_observation(&self) -> (crate::memory::AllocatorObservation, u64) {
         let mut cached = self
             .allocator
             .lock()
@@ -2489,7 +2493,7 @@ impl HealthRollupCache {
                 let mut reused = observation.clone();
                 // Unsupported platforms keep a null age, not a measured zero.
                 reused.age_ms = observation.age_ms.map(|_| age_ms);
-                return reused;
+                return (reused, cached.reuse_ms);
             }
         }
         let walk_started = Instant::now();
@@ -2502,15 +2506,16 @@ impl HealthRollupCache {
         };
         // The observation already includes time spent walking the allocator.
         // Start the reuse clock after that walk so its duration is not counted twice.
+        let reuse_ms = crate::memory::allocator_reuse_window_ms(
+            HEALTH_ALLOCATOR_MIN_REUSE_MS,
+            walk_ms,
+        );
         *cached = Some(CachedAllocatorObservation {
             cached_at_ms: self.now_ms(),
-            reuse_ms: crate::memory::allocator_reuse_window_ms(
-                HEALTH_ALLOCATOR_MIN_REUSE_MS,
-                walk_ms,
-            ),
+            reuse_ms,
             observation: observation.clone(),
         });
-        observation
+        (observation, reuse_ms)
     }
 
     fn step_log_due(&self) -> bool {
@@ -3679,6 +3684,12 @@ fn build_health_diagnostic_rollup_from_actors(
             .cmp(&left.attributed_bytes)
             .then_with(|| left.root_label.cmp(&right.root_label))
     });
+    // Only fields used by diagnosis are copied for all roots. Rich health and
+    // memory rendering stays capped, without discarding evidence for diagnosis.
+    let diagnostics_roots = candidates
+        .iter()
+        .map(|candidate| root_findings_evidence(&candidate.health, &candidate.diagnostics_evidence))
+        .collect::<Vec<_>>();
     let root_details_omitted = candidates.len().saturating_sub(HEALTH_ROOT_DETAIL_CAP);
     let roots: Vec<(String, Value)> = candidates
         .into_iter()
@@ -3775,7 +3786,8 @@ fn build_health_diagnostic_rollup_from_actors(
 
     let root_count = root_details_omitted.saturating_add(roots.len());
     rollup_mark!(timer, "root JSON assembly");
-    let allocator = cache.allocator_observation();
+    let (allocator, allocator_reuse_ms) = cache.allocator_observation();
+    let allocator_age_ms = allocator.age_ms;
     rollup_mark!(timer, "allocator observation");
     // Shared bases and semantic arenas are measured once for the compact
     // rollup; a rollup that also measures the census reuses that measurement.
@@ -3905,6 +3917,15 @@ fn build_health_diagnostic_rollup_from_actors(
     });
     insert_lifecycle_metrics(&mut metrics, lifecycle);
     data_store_failures.insert_into(&mut metrics);
+    let findings_metrics = json!({
+        "roots": diagnostics_roots,
+        "embedding_backend": metrics["embedding_backend"],
+        "storage_retention": metrics["storage_retention"],
+        "memory": {
+            "allocator_observation_age_ms": allocator_age_ms,
+            "allocator_reuse_ms": allocator_reuse_ms,
+        },
+    });
     rollup_mark!(timer, "metrics JSON assembly");
     let tick = timer.metrics();
     if log::log_enabled!(log::Level::Debug) && cache.step_log_due() {
@@ -3933,10 +3954,22 @@ fn build_health_diagnostic_rollup_from_actors(
         generation: 0,
         stale_reason: None,
         metrics,
+        findings_metrics,
         memory_census,
         memory_census_at_ms,
         memory_census_answers,
     }
+}
+
+fn root_findings_evidence(health: &RootHealthSnapshot, evidence: &Value) -> Value {
+    json!({
+        "project_root": health.project_root,
+        "state": health.state,
+        "cache_unavailable_reason": health.cache_unavailable_reason,
+        "view_storage_reserve": health.view_storage_reserve,
+        "suspended_domains": health.suspended_domains,
+        "diagnostics_evidence": evidence,
+    })
 }
 
 /// How many roots with a failed index store the health summary names, in
@@ -5217,6 +5250,7 @@ mod tests {
             "project_root": "standing", "state": "ready", "standing": true,
             "standing_refusal": "resolved-path-drift refusal", "diagnostics_evidence": evidence
         }]);
+        rollup.findings_metrics["roots"] = rollup.metrics["roots"].clone();
         cache.publish(Some(rollup));
 
         let report = build_health_report(
@@ -7076,6 +7110,62 @@ mod tests {
             &crate::context::App::default_shared(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn diagnostics_findings_allocator_window_travels_with_snapshot() {
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache.allocator_walk_ms_for_test.store(600, Ordering::Relaxed);
+        cache.publish(Some(allocator_rollup(&cache)));
+
+        cache.clock_ms.store(90_000, Ordering::Relaxed);
+        let rollup = allocator_rollup(&cache);
+        assert_eq!(rollup.findings_metrics["memory"]["allocator_reuse_ms"], 120_000);
+        #[cfg(target_os = "linux")]
+        assert!(rollup.findings_metrics["memory"]["allocator_observation_age_ms"].as_u64().unwrap() >= 90_000);
+        cache.publish(Some(rollup));
+        let has_snapshot_finding = || serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap()
+            .as_array().unwrap().iter().any(|finding| finding["check"] == "health_snapshot");
+        assert!(!has_snapshot_finding());
+        cache.clock_ms.store(120_001, Ordering::Relaxed);
+        assert!(has_snapshot_finding(), "a stopped rollup must still be unknown");
+    }
+
+    #[test]
+    fn diagnostics_findings_200_roots_are_independent_of_report_trimming() {
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let context = test_ctx();
+        let roots = (0..200).map(|index| test_root(&format!("diagnostics-root-{index:03}"))).collect::<Vec<_>>();
+        let actors = roots.iter().map(|(_, root)| (root.clone(), Arc::clone(&context))).collect();
+        let mut rollup = build_health_diagnostic_rollup_from_actors(&cache, &executor, &app, actors);
+        assert_eq!(rollup.findings_metrics["roots"].as_array().unwrap().len(), 200);
+        assert_eq!(rollup.metrics["root_details_omitted"], 200 - HEALTH_ROOT_DETAIL_CAP);
+        // Long cache paths also force the byte budget to omit cache entries.
+        rollup.metrics["cache_unavailable"] = json!((0..200).map(|index| {
+            (format!("/cache/{index:03}/{}", "segment/".repeat(30)), json!("unavailable"))
+        }).collect::<serde_json::Map<_, _>>());
+        cache.publish(Some(rollup));
+
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &DispatchPathMetrics::new(), &app);
+        let metrics = report.metrics.unwrap();
+        assert!(metrics["root_details_omitted"].as_u64().unwrap() > 0);
+        assert!(metrics["cache_unavailable_omitted"].as_u64().unwrap() > 0);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
+        assert!(findings.as_array().unwrap().iter().all(|finding| finding["check"] != "health_snapshot"), "{findings}");
+
+        // A failure beyond the rendered roots must not disappear with their detail.
+        let mut rollup = (*cache.snapshot().0).clone();
+        let hidden = rollup.findings_metrics["roots"].as_array().unwrap().iter().position(|root| {
+            !rollup.metrics["roots"].as_array().unwrap().iter().any(|shown| shown["project_root"] == root["project_root"])
+        }).unwrap();
+        rollup.findings_metrics["roots"][hidden]["diagnostics_evidence"]["database_open_failed"] = json!(true);
+        cache.publish(Some(rollup));
+        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
+        assert!(findings.as_array().unwrap().iter().any(|finding| finding["check"] == "database_open"), "{findings}");
     }
 
     #[test]

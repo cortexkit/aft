@@ -275,6 +275,20 @@ pub(super) fn from_health(
     now: u64,
     window: u64,
 ) -> Vec<Finding> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    from_health_with_budget(metrics, age_ms, stale_reason, now, window, || {
+        std::time::Instant::now() >= deadline
+    })
+}
+
+fn from_health_with_budget(
+    metrics: &Value,
+    age_ms: Option<u64>,
+    stale_reason: Option<&str>,
+    now: u64,
+    window: u64,
+    mut exhausted: impl FnMut() -> bool,
+) -> Vec<Finding> {
     let mut findings = vec![];
     if stale_reason.is_some() || age_ms.is_none_or(|age| age > SNAPSHOT_MAX_AGE_MS) {
         findings.push(unknown(
@@ -285,10 +299,22 @@ pub(super) fn from_health(
         return findings;
     }
     let observed = now.saturating_sub(age_ms.unwrap_or(0));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    // Omitted diagnostic evidence is still unknown. The caller must supply the
+    // complete in-memory snapshot, never the size-budgeted presentation report.
     for field in ["root_details_omitted", "cache_unavailable_omitted"] {
         if metrics[field].as_u64().unwrap_or(0) > 0 {
             findings.push(unknown("health_snapshot", field, now));
+        }
+    }
+    // The rollup clock covers backend/root/cleanup evidence. Allocator walks
+    // have their own adaptive reuse window, recorded with that observation.
+    // Unsupported allocator accounting has no age and is not a root-health check.
+    if let Some(age) = metrics["memory"]["allocator_observation_age_ms"].as_u64() {
+        if metrics["memory"]["allocator_reuse_ms"]
+            .as_u64()
+            .is_none_or(|reuse| age.saturating_add(age_ms.unwrap_or(0)) > reuse)
+        {
+            findings.push(unknown("health_snapshot", "allocator_observation_expired", now));
         }
     }
     match metrics["embedding_backend"]["available"].as_bool() {
@@ -302,12 +328,12 @@ pub(super) fn from_health(
         None => findings.push(unknown("semantic_backend", "backend_state_unmeasured", now)),
     }
     if let Some(roots) = metrics["roots"].as_array() {
-        for root in roots {
-            if std::time::Instant::now() >= deadline {
-                findings.push(unknown("health_snapshot", "root_scan_deadline", now));
-                break;
-            }
+        'roots: for root in roots {
             let key = root_key(root);
+            if exhausted() {
+                findings.push(unknown("root_health", &format!("{key}/root_scan_deadline"), now));
+                continue;
+            }
             if let Some(reserves) = root["view_storage_reserve"].as_object() {
                 for (plane, reserve) in reserves {
                     if let Some(message) = reserve["message"].as_str() {
@@ -346,9 +372,9 @@ pub(super) fn from_health(
                 findings.push(unknown("build_breaker", &format!("{key}/{reason}"), now));
             } else if let Some(domains) = root["suspended_domains"].as_array() {
                 for domain in domains {
-                    if std::time::Instant::now() >= deadline {
-                        findings.push(unknown("build_breaker", "domain_scan_deadline", now));
-                        return findings;
+                    if exhausted() {
+                        findings.push(unknown("root_health", &format!("{key}/domain_scan_deadline"), now));
+                        continue 'roots;
                     }
                     let domain_name = domain["domain"].as_str().unwrap_or("unknown");
                     // Hash labels rather than returning roots, custom server names or error text.
@@ -377,9 +403,9 @@ pub(super) fn from_health(
             }
             if let Some(failures) = evidence["lsp_start_failures"].as_object() {
                 for (server, count) in failures {
-                    if std::time::Instant::now() >= deadline {
-                        findings.push(unknown("lsp_start_failures", "server_scan_deadline", now));
-                        return findings;
+                    if exhausted() {
+                        findings.push(unknown("root_health", &format!("{key}/server_scan_deadline"), now));
+                        continue 'roots;
                     }
                     if let Some(count) = count.as_u64().filter(|n| *n > 0) {
                         let server_key = format!("{key}/{:x}", Sha256::digest(server.as_bytes()));
@@ -779,6 +805,93 @@ mod tests {
         assert!(findings
             .iter()
             .all(|f| f.severity == Severity::Error && f.key.contains("unavailable")));
+    }
+
+    #[test]
+    fn diagnostics_findings_freshness_is_per_part() {
+        let mut metrics = healthy_metrics();
+        metrics["memory"] = json!({
+            "rss_bytes": 6_000_000_000_u64,
+            "allocator_observation_age_ms": 90_000,
+            "allocator_reuse_ms": 120_000,
+        });
+        assert!(from_health(&metrics, Some(3_000), None, 1_000_000, 1).is_empty());
+        assert!(from_health(&metrics, Some(30_000), None, 1_000_000, 1).is_empty());
+
+        // A stopped rollup cannot borrow the allocator's longer reuse window.
+        let stale = from_health(&metrics, Some(30_001), None, 1_000_000, 1);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].check, "health_snapshot");
+        assert_eq!(stale[0].severity, Severity::Error);
+
+        metrics["memory"]["allocator_observation_age_ms"] = json!(120_001);
+        let expired = snapshot(&metrics);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].check, "health_snapshot");
+        assert_eq!(expired[0].samples[0]["reason"], "allocator_observation_expired");
+
+        metrics["memory"]["allocator_observation_age_ms"] = json!(120_000);
+        assert!(snapshot(&metrics).is_empty());
+        assert_eq!(from_health(&metrics, Some(1), None, 1_000_000, 1).len(), 1);
+    }
+
+    #[test]
+    fn diagnostics_findings_unmeasured_backend_is_unknown() {
+        let mut metrics = healthy_metrics();
+        metrics["embedding_backend"]["available"] = Value::Null;
+        let findings = snapshot(&metrics);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check, "semantic_backend");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].samples[0]["reason"], "backend_state_unmeasured");
+        assert_eq!(findings[0].summary, "AFT could not determine this check from its recorded evidence.");
+    }
+
+    #[test]
+    fn diagnostics_findings_root_deadline_names_every_unexamined_root() {
+        let mut metrics = healthy_metrics();
+        let root = metrics["roots"][0].clone();
+        metrics["roots"] = json!((0..200).map(|index| {
+            let mut root = root.clone();
+            root["project_root"] = json!(format!("/private/root-{index:03}"));
+            root
+        }).collect::<Vec<_>>());
+        let mut calls = 0;
+        let findings = from_health_with_budget(&metrics, Some(0), None, 1_000_000, 1, || {
+            calls += 1;
+            calls > 1
+        });
+        assert_eq!(findings.len(), 199);
+        for (finding, root) in findings.iter().zip(metrics["roots"].as_array().unwrap().iter().skip(1)) {
+            assert_eq!(finding.check, "root_health");
+            assert_eq!(finding.severity, Severity::Error);
+            assert_eq!(finding.samples[0]["reason"], format!("{}/root_scan_deadline", root_key(root)));
+        }
+        assert!(!serde_json::to_string(&findings).unwrap().contains("/private/"));
+    }
+
+    #[test]
+    fn diagnostics_findings_nested_deadlines_keep_remaining_roots_and_cleanup() {
+        for (field, entries, reason) in [
+            ("suspended_domains", json!([{"domain": "custom"}]), "domain_scan_deadline"),
+            ("diagnostics_evidence", json!({"database_open_failed": false, "lsp_start_failures": {"custom": 1}}), "server_scan_deadline"),
+        ] {
+            let mut metrics = healthy_metrics();
+            let second = metrics["roots"][0].clone();
+            metrics["roots"][0][field] = entries;
+            metrics["roots"].as_array_mut().unwrap().push(second);
+            metrics["storage_retention"] = json!({"storage": {"at_ms": 1_000_000, "errors": ["failed"]}});
+            let mut calls = 0;
+            let findings = from_health_with_budget(&metrics, Some(0), None, 1_000_000, 1, || {
+                calls += 1;
+                calls > 1
+            });
+            assert_eq!(findings.len(), 3);
+            assert_eq!(findings[0].check, "root_health");
+            assert!(findings[0].samples[0]["reason"].as_str().unwrap().ends_with(reason));
+            assert_eq!(findings[1].check, "root_health");
+            assert_eq!(findings[2].check, "cleanup_failures");
+        }
     }
 
     fn scope(kind: ScopeKind) -> ScopeStamp {
