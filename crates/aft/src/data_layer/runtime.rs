@@ -545,7 +545,8 @@ impl Work {
                         .is_ok_and(|stats| stats.as_ref().is_some_and(|stats| stats.cold_build))
                     {
                         // A cold fallback already published its content, just
-                        // as start_build does, so meaning search can fill it.
+                        // as start_build does, so semantic search can embed and
+                        // index the newly published content.
                         work.start_fill();
                     }
                     continue;
