@@ -27,6 +27,7 @@ pub(crate) struct LiteralFinder<'a> {
 struct FoldedWindow {
     start: usize,
     bytes: Vec<u8>,
+    whole_line: bool,
     #[cfg(test)]
     bytes_folded: usize,
 }
@@ -40,6 +41,13 @@ impl LiteralSearch {
                 std::cell::RefCell::new(FoldedWindow {
                     start: 0,
                     bytes: Vec::new(),
+                    // Match an overlong line in one lowercase buffer.
+                    // Restarting the matcher at each window costs CPU for
+                    // repeated-prefix needles; ordinary-line haystacks keep
+                    // bounded windows.
+                    whole_line: haystack.len() > LiteralFinder::FOLDED_WINDOW_BYTES
+                        && memchr::memchr(b'\n', &haystack[..LiteralFinder::FOLDED_WINDOW_BYTES])
+                            .is_none(),
                     #[cfg(test)]
                     bytes_folded: 0,
                 })
@@ -54,7 +62,8 @@ impl LiteralFinder<'_> {
     /// Absolute match offset at or after `start`, with ASCII-only folding.
     /// Search bounded lowercase windows with memmem instead of comparing the
     /// whole needle at every candidate byte. This avoids quadratic repeated-
-    /// prefix behavior without making a whole-haystack lowercase copy.
+    /// prefix behavior. Ordinary lines share cached windows; an overlong line
+    /// keeps one lowercase buffer to avoid repeated window restarts.
     pub(crate) fn find_from(&self, start: usize) -> Option<usize> {
         let content = self.haystack.get(start..)?;
         let Some(folded) = &self.folded else {
@@ -78,12 +87,21 @@ impl LiteralFinder<'_> {
                 // At least half the window is new input after preserving the
                 // needle-length overlap. Every input byte is folded at most
                 // twice in a forward scan, even when the needle is very long.
-                let size = Self::FOLDED_WINDOW_BYTES.max(needle_len.saturating_mul(2));
+                let size = if window.whole_line {
+                    self.haystack.len()
+                } else {
+                    Self::FOLDED_WINDOW_BYTES.max(needle_len.saturating_mul(2))
+                };
                 let end = cursor.saturating_add(size).min(self.haystack.len());
                 window.start = cursor;
-                window.bytes.clear();
-                window.bytes.extend_from_slice(&self.haystack[cursor..end]);
-                window.bytes.make_ascii_lowercase();
+                if window.whole_line {
+                    window.bytes = Vec::new();
+                    window.bytes = self.haystack[cursor..end].to_ascii_lowercase();
+                } else {
+                    window.bytes.clear();
+                    window.bytes.extend_from_slice(&self.haystack[cursor..end]);
+                    window.bytes.make_ascii_lowercase();
+                }
                 #[cfg(test)]
                 {
                     window.bytes_folded += end - cursor;
@@ -163,6 +181,7 @@ mod literal_finder_tests {
     fn folded_windows_keep_matches_that_cross_a_window_boundary() {
         let needle = [vec![b'a'; 1000], vec![b'b']].concat();
         let mut content = vec![b'x'; LiteralFinder::FOLDED_WINDOW_BYTES + 2000];
+        content[0] = b'\n';
         let position = LiteralFinder::FOLDED_WINDOW_BYTES - 500;
         content[position..position + needle.len()].copy_from_slice(&needle.to_ascii_uppercase());
         let literal = LiteralSearch {
@@ -182,7 +201,10 @@ mod literal_finder_tests {
     #[test]
     fn folded_windows_bound_work_for_adversarial_needle_lengths() {
         for motif in [b"a".as_slice(), b"ab".as_slice()] {
-            let content = motif.repeat((8 << 20) / motif.len());
+            let mut content = motif.repeat((8 << 20) / motif.len());
+            for newline in ((1 << 20) - 1..content.len()).step_by(1 << 20) {
+                content[newline] = b'\n';
+            }
             let reference = content.to_ascii_lowercase();
             for length in [7, 127, 1001, 4097, (2 << 20) + 1] {
                 let mut needle = motif.repeat(length / motif.len() + 1);
@@ -220,6 +242,24 @@ mod literal_finder_tests {
             finder.folded.as_ref().unwrap().borrow().bytes_folded,
             content.len()
         );
+    }
+
+    #[test]
+    fn folded_overlong_line_uses_one_lowercase_buffer() {
+        let content = vec![b'a'; 8 << 20];
+        let literal = LiteralSearch {
+            needle: [vec![b'a'; 1000], vec![b'b']].concat(),
+            case_insensitive_ascii: true,
+        };
+        let finder = literal.finder(&content);
+        assert_eq!(
+            finder.find_from(0),
+            old_find(&content.to_ascii_lowercase(), &literal.needle, 0)
+        );
+        let window = finder.folded.as_ref().unwrap().borrow();
+        assert!(window.whole_line);
+        assert_eq!(window.bytes.len(), content.len());
+        assert_eq!(window.bytes_folded, content.len());
     }
 }
 
