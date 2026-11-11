@@ -105,9 +105,8 @@ fn diagnose_jq_fixture(directory: &std::path::Path) {
             }
         };
         let mut input = child.stdin.take().unwrap();
-        let writer = std::thread::spawn(move || {
-            input.write_all(br#"{"number":42,"title":"A\r\nB"}"#)
-        });
+        let writer =
+            std::thread::spawn(move || input.write_all(br#"{"number":42,"title":"A\r\nB"}"#));
         let result = child.wait_with_output();
         let written = writer.join();
         match result {
