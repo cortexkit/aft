@@ -3125,7 +3125,7 @@ pub struct AppContext {
     repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
-    output_files: Arc<crate::tool_output::OutputFiles>,
+    output_files: Arc<crate::output_store::OutputFiles>,
     #[cfg(unix)]
     escalation_grants: parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
@@ -3558,7 +3558,7 @@ impl AppContext {
             repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker::default(),
             compression_aggregates,
             bash_background,
-            output_files: crate::tool_output::OutputFiles::shared(),
+            output_files: crate::output_store::OutputFiles::shared(),
             #[cfg(unix)]
             escalation_grants: parking_lot::Mutex::new(
                 crate::sandbox_spawn::EscalationGrantStore::default(),
@@ -6510,11 +6510,11 @@ impl AppContext {
         crate::storage_path::storage_dir(self.config().storage_dir.as_deref())
     }
 
-    pub(crate) fn output_files(&self) -> &crate::tool_output::OutputFiles {
+    pub(crate) fn output_files(&self) -> &crate::output_store::OutputFiles {
         &self.output_files
     }
 
-    pub(crate) fn output_files_arc(&self) -> Arc<crate::tool_output::OutputFiles> {
+    pub(crate) fn output_files_arc(&self) -> Arc<crate::output_store::OutputFiles> {
         Arc::clone(&self.output_files)
     }
 

@@ -168,6 +168,7 @@ pub mod parser;
 pub mod patch;
 pub mod path_identity;
 pub mod pattern_compile;
+pub(crate) mod output_store;
 pub mod persisted_format;
 pub(crate) mod pinned_dir;
 pub mod pinned_executable;

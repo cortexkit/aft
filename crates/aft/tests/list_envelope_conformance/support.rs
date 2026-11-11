@@ -2357,10 +2357,13 @@ pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let source_dir = aft_src_dir();
     let mut paths = collect_rs_files(&source_dir.join("commands"));
+    paths.extend(collect_rs_files(&source_dir.join("search_state")));
     paths.push(source_dir.join("bash_changed_files.rs"));
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));
     paths.push(source_dir.join("tool_output.rs"));
+    paths.push(source_dir.join("output_store.rs"));
+    paths.push(source_dir.join("file_read_exact.rs"));
     paths.push(source_dir.join("subc/bind_log.rs"));
     paths.push(source_dir.join("subc/diagnostics_findings.rs"));
     paths.push(source_dir.join("runtime_drain.rs"));
