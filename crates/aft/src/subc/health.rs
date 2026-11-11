@@ -8759,6 +8759,7 @@ mod tests {
                 ..crate::config::Config::default()
             },
         ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
         let until = crate::semantic_index::unix_millis_now() + 1_399_000;
         crate::synapse_embed::share_lane_pause(
             root.as_path(),
