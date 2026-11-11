@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use crate::data_layer::runtime::DataCheckout;
-use crate::inspect::job::normalize_path;
+use crate::path_identity::normalize_path;
 
 /// Every checkout this process has bound, for the TODO count: it runs on
 /// the inspect pool with only its job's root, and reads the root's

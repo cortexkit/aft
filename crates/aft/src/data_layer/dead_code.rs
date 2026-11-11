@@ -26,7 +26,7 @@ use crate::data_layer::dead_code_snapshot::{
     CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, GoInitializerGroup,
     DISPATCHED_CALLEE_SEPARATOR,
 };
-use crate::inspect::job::canonicalize_normalized;
+use crate::path_identity::canonicalize_normalized;
 
 /// The kinds of reference an outbound call can come from.
 pub(crate) const OUTBOUND_KINDS: [&str; 5] = [

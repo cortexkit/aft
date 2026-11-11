@@ -6,6 +6,21 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default)]
+pub struct AnalyzeOptions {
+    pub entry_points: Vec<PathBuf>,
+    pub public_api_files: Vec<PathBuf>,
+    pub executable_root_exports: BTreeMap<PathBuf, BTreeSet<String>>,
+    /// Files already proven stale by the inspect freshness layer. These paths
+    /// bypass the path metadata fast path so same-size/same-mtime edits are
+    /// still re-read and content-hashed before facts are reused.
+    pub force_reparse_files: Vec<PathBuf>,
+    /// When true, imports/re-exports only make targets live after execution is
+    /// reachable from entry/public files. Used by dead_code; unused_exports keeps
+    /// the default import-usage semantics.
+    pub entry_reachability: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct CallgraphSnapshot {
     pub generated_at: Option<SystemTime>,
     pub files: Vec<PathBuf>,

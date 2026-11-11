@@ -30,6 +30,8 @@ use std::time::SystemTime;
 /// checks.
 pub(crate) const HEAD_BYTES: usize = 8 * 1024;
 
+pub(crate) mod generated;
+
 /// Bytes read from the start of a JSON document for the long-line test.
 pub(crate) const JSON_HEAD_BYTES: usize = 64 * 1024;
 
