@@ -100,11 +100,10 @@ impl RequestSecrets {
             .cloned()
             .collect()
     }
-    #[cfg(unix)]
     pub(crate) fn activity(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.active.clone()
     }
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn with_clock(mut self, clock: Option<Arc<dyn ApprovalClock>>) -> Self {
         if let Some(clock) = clock {
             self.clock = clock;
