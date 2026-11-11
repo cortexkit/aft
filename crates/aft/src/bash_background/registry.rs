@@ -18510,7 +18510,7 @@ mod tests {
             let saved = read_task(&paths.json).unwrap().completion_preview.unwrap();
             assert_eq!(
                 saved.output_preview.as_bytes(),
-                b"Error: no such table: widgets\nSchema: widget(id)"
+                b"Error: no such table: widgets\n\nSchema: widget(id)"
             );
         }
     }
