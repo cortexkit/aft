@@ -139,6 +139,28 @@ def setup_windows_tool_paths() -> dict[str, Union[Path, str]]:
     return values
 
 
+def prune_run_archives(root: Path, run_dir: Path) -> None:
+    # Cancelled runs may never finalize. Bound archive retention without ever
+    # traversing Cargo's shared target directory.
+    before = shutil.disk_usage(root).free
+    low_disk = before < 40 * 1024**3
+    now = time.time()
+    archives = sorted(
+        (entry for entry in (root / "runs").iterdir()
+         if entry != run_dir and not entry.is_symlink() and entry.is_dir()),
+        key=lambda entry: (entry.stat().st_mtime, entry.name),
+    )
+    if low_disk:
+        print(f"CI archive disk free before pruning: {before / 1024**3:.1f} GiB", flush=True)
+    for old in archives:
+        if low_disk or now - old.stat().st_mtime > 86400:
+            print(f"Removing CI run archive {old}", flush=True)
+            shutil.rmtree(old)
+    if low_disk:
+        after = shutil.disk_usage(root).free
+        print(f"CI archive disk free after pruning: {after / 1024**3:.1f} GiB", flush=True)
+
+
 def setup(root: Path, run_dir: Path) -> None:
     target = root / "target"
     target.mkdir(parents=True, exist_ok=True)
@@ -158,11 +180,7 @@ def setup(root: Path, run_dir: Path) -> None:
             text = value.as_posix() if isinstance(value, Path) else value
             print(f"{key}={text}", file=env)
             print(f"{key}={text}")
-    # Cancelled runs may never reach finalization. Keep a week's grace for queued
-    # consumers, pruning only archives, never Cargo's shared build directory.
-    for old in (root / "runs").iterdir():
-        if old != run_dir and time.time() - old.stat().st_mtime > 7 * 86400:
-            shutil.rmtree(old)
+    prune_run_archives(root, run_dir)
 
 
 def main() -> None:

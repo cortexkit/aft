@@ -10,6 +10,10 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::SystemTime;
 
+#[cfg(unix)]
+#[path = "image_cache.rs"]
+mod image_cache;
+
 /// Nextest remaps archive binaries into its extraction directory. Prefer its
 /// runtime executable path to Cargo's path captured when the tests were built.
 pub fn source_binary() -> PathBuf {
@@ -20,7 +24,7 @@ pub fn source_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")))
 }
 
-/// Deploy the real image once per test run on the fixture temp filesystem.
+/// Reuse an immutable executable image for the source binary on the fixture temp filesystem.
 /// This keeps normal pin creation on the same filesystem rather than copying
 /// a large debug image from the build server's target mount for every child.
 #[cfg(unix)]
@@ -151,15 +155,7 @@ fn deploy_with_warmup(
     use std::process::{Command, Stdio};
 
     let source = source.canonicalize()?;
-    let run = std::env::var("NEXTEST_RUN_ID")
-        .ok()
-        .map(|run| {
-            let mut hash = Sha256::new();
-            hash.update(run);
-            format!("nextest-{:x}", hash.finalize())
-        })
-        .unwrap_or_else(|| format!("cargo-{}", std::process::id()));
-    let cache = temporary_root.join(format!("aft-real-module-images-{run}"));
+    let cache = temporary_root.join("aft-real-module-images");
     fs::create_dir_all(&cache)?;
     // The helper is included by several fixture modules. A file lock makes
     // them share one publication even though their Rust statics are separate.
@@ -185,6 +181,7 @@ fn deploy_with_warmup(
             ));
         }
         unchanged(&input, &source, &identity)?;
+        image_cache::refresh(&directory)?;
         return Ok(image);
     }
     let pending = tempfile::Builder::new()
@@ -228,6 +225,8 @@ fn deploy_with_warmup(
         fs::remove_dir_all(&directory)?;
         return Err(error);
     }
+    image_cache::refresh(&directory)?;
+    image_cache::prune(&cache, &directory, SystemTime::now())?;
     Ok(image)
 }
 
@@ -260,6 +259,84 @@ mod tests {
             fs::metadata(&first).unwrap().permissions().mode() & 0o111,
             0
         );
+    }
+
+    #[test]
+    fn fixture_image_cross_process_child() {
+        let Some(root) = std::env::var_os("AFT_FIXTURE_CACHE_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let image = deploy(&root.join("source-aft"), &root).unwrap();
+        fs::write(
+            std::env::var_os("AFT_FIXTURE_CACHE_TEST_REPORT").unwrap(),
+            image.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fixture_image_directory_is_shared_by_two_processes() {
+        let root = tempfile::tempdir().unwrap();
+        source_image(root.path(), b"shared image");
+        let child_test = format!(
+            "{}::fixture_image_cross_process_child",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut children = Vec::new();
+        for run in 0..2 {
+            let report = root.path().join(format!("report-{run}"));
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", &child_test])
+                .env("AFT_FIXTURE_CACHE_TEST_ROOT", root.path())
+                .env("AFT_FIXTURE_CACHE_TEST_REPORT", &report)
+                .env_remove("NEXTEST_RUN_ID");
+            if run == 1 {
+                command.env("NEXTEST_RUN_ID", "another-test-run");
+            }
+            children.push((command.spawn().unwrap(), report));
+        }
+        let paths: Vec<_> = children
+            .into_iter()
+            .map(|(mut child, report)| {
+                assert!(child.wait().unwrap().success());
+                PathBuf::from(String::from_utf8(fs::read(report).unwrap()).unwrap())
+            })
+            .collect();
+        assert_eq!(paths[0], paths[1]);
+        assert_eq!(
+            paths[0].parent().unwrap().parent().unwrap(),
+            root.path().join("aft-real-module-images")
+        );
+    }
+
+    #[test]
+    fn fixture_image_use_refreshes_retention_before_next_publication() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = source_image(root.path(), b"first image");
+        let old = deploy(&source, root.path()).unwrap();
+        let directory = old.parent().unwrap();
+        let stale_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        let stale = filetime::FileTime::from_system_time(stale_time);
+        filetime::set_file_mtime(directory, stale).unwrap();
+        assert_eq!(deploy(&source, root.path()).unwrap(), old);
+        assert!(fs::metadata(directory).unwrap().modified().unwrap() > stale_time);
+        let abandoned = directory.parent().unwrap().join("f".repeat(64));
+        fs::create_dir(&abandoned).unwrap();
+        filetime::set_file_mtime(&abandoned, stale).unwrap();
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"second image").unwrap();
+        fs::rename(replacement, &source).unwrap();
+        let new = deploy(&source, root.path()).unwrap();
+        assert!(new.exists());
+        assert!(
+            old.exists(),
+            "a recently used image must survive publication"
+        );
+        assert!(!abandoned.exists());
     }
 
     #[test]

@@ -1207,6 +1207,7 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
             root = Path(tmp) / "aft-ci"
             env_file = Path(tmp) / "env"
             with unittest.mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file), "GITHUB_PATH": str(Path(tmp) / "path")}), \
+                 unittest.mock.patch.object(self.state.shutil, "disk_usage", return_value=unittest.mock.Mock(free=80 * 1024**3)), \
                  unittest.mock.patch.object(self.state, "setup_windows_tool_paths", return_value={}):
                 first = self.state.run_directory(root, "100", "1")
                 self.state.setup(root, first)
@@ -1236,6 +1237,59 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
             self.assertEqual(first, self.state.run_directory(root, "100", "2"))
             with self.assertRaises(ValueError):
                 self.state.run_directory(root, "../target", "1")
+
+    def test_archive_pruning_keeps_fresh_boundary_and_current_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "aft-ci"
+            now = 1_700_000_000
+            folders = {}
+            for name, age in (("stale", 86401), ("fresh", 86399), ("boundary", 86400), ("current", 90000)):
+                folder = root / "runs" / name
+                folder.mkdir(parents=True)
+                (folder / "archive").write_bytes(b"keep unless stale")
+                os.utime(folder, (now - age, now - age))
+                folders[name] = folder
+            target = root / "target"
+            target.mkdir()
+            (target / "warm-dependency").write_bytes(b"keep")
+            os.utime(target, (1, 1))
+            with unittest.mock.patch.object(self.state.time, "time", return_value=now), \
+                 unittest.mock.patch.object(self.state.shutil, "disk_usage", return_value=unittest.mock.Mock(free=40 * 1024**3)):
+                self.state.prune_run_archives(root, folders["current"])
+            self.assertFalse(folders["stale"].exists())
+            for name in ("fresh", "boundary", "current"):
+                self.assertTrue(folders[name].exists(), name)
+            self.assertEqual((target / "warm-dependency").read_bytes(), b"keep")
+
+    def test_setup_low_disk_removes_all_other_runs_oldest_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "aft-ci"
+            current = self.state.run_directory(root, "103", "1")
+            folders = []
+            for name, modified in (("102", 300), ("100", 100), ("101", 200)):
+                folder = root / "runs" / name
+                folder.mkdir(parents=True)
+                os.utime(folder, (modified, modified))
+                folders.append(folder)
+            target = root / "target"
+            target.mkdir()
+            (target / "warm-dependency").write_bytes(b"keep")
+            disk_usage = unittest.mock.Mock(side_effect=[unittest.mock.Mock(free=39 * 1024**3),
+                                                        unittest.mock.Mock(free=45 * 1024**3)])
+            with unittest.mock.patch.dict(os.environ, {"GITHUB_ENV": str(Path(tmp) / "env")}), \
+                 unittest.mock.patch.object(self.state, "setup_windows_tool_paths", return_value={}), \
+                 unittest.mock.patch.object(self.state.shutil, "disk_usage", disk_usage), \
+                 unittest.mock.patch.object(self.state.shutil, "rmtree", wraps=self.state.shutil.rmtree) as remove, \
+                 unittest.mock.patch("builtins.print") as output:
+                self.state.setup(root, current)
+            self.assertEqual([call.args[0].name for call in remove.call_args_list], ["100", "101", "102"])
+            self.assertEqual(disk_usage.call_args_list, [unittest.mock.call(root), unittest.mock.call(root)])
+            messages = [call.args[0] for call in output.call_args_list]
+            self.assertIn("CI archive disk free before pruning: 39.0 GiB", messages)
+            self.assertIn("CI archive disk free after pruning: 45.0 GiB", messages)
+            self.assertTrue(current.exists())
+            self.assertTrue(all(not folder.exists() for folder in folders))
+            self.assertEqual((target / "warm-dependency").read_bytes(), b"keep")
 
     def test_cleanup_kills_native_test_descendants_but_not_runner_or_unrelated_processes(self) -> None:
         table = {
