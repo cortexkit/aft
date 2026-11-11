@@ -278,33 +278,25 @@ async fn pinned_executable_real_server_survives_binary_replacement_and_cleans_de
         }
     };
     let pinned_metadata = pinned_image.metadata().unwrap();
-    // Linux pins the server's own inode. macOS pins a separate file with the
-    // same bytes, so the running server keeps a single name: the privacy
-    // controls name a program by whichever link the kernel reports.
-    #[cfg(not(target_os = "macos"))]
-    assert_eq!(
+    // The pin is a separate file with the same bytes, so the running server
+    // keeps a single name: macOS privacy controls name a program by whichever
+    // link the kernel reports, and on Linux each link changes the inode's
+    // change time and link count.
+    assert!(pinned_image.starts_with(&storage));
+    assert_ne!(
         (pinned_metadata.dev(), pinned_metadata.ino()),
         (original.dev(), original.ino()),
-        "the initial shim must reference the server's original inode"
+        "the pin is a hard link"
     );
-    #[cfg(target_os = "macos")]
-    {
-        assert!(pinned_image.starts_with(&storage));
-        assert_ne!(
-            pinned_metadata.ino(),
-            original.ino(),
-            "the pin is a hard link"
-        );
-        assert_eq!(
-            std::fs::metadata(&deploy).unwrap().nlink(),
-            1,
-            "the server's image gained a second name"
-        );
-        assert_eq!(
-            std::fs::read(&pinned_image).unwrap(),
-            std::fs::read(&deploy).unwrap()
-        );
-    }
+    assert_eq!(
+        std::fs::metadata(&deploy).unwrap().nlink(),
+        1,
+        "the server's image gained a second name"
+    );
+    assert_eq!(
+        std::fs::read(&pinned_image).unwrap(),
+        std::fs::read(&deploy).unwrap()
+    );
 
     std::fs::rename(&marker, &deploy).unwrap();
     let decoy = Command::new(&deploy).output().unwrap();

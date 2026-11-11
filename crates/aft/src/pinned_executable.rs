@@ -383,45 +383,27 @@ fn owner(name: &str) -> Option<(u32, u64)> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn link_image(source: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let source =
-            std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        let destination =
-            std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        // SAFETY: both absolute path strings are valid and NUL-terminated.
-        // Follow procfs's exe link to the held executable, not the symlink inode.
-        let result = unsafe {
-            libc::linkat(
-                libc::AT_FDCWD,
-                source.as_ptr(),
-                libc::AT_FDCWD,
-                destination.as_ptr(),
-                libc::AT_SYMLINK_FOLLOW,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    // Never give the running daemon's executable a second name on macOS. The
-    // privacy controls name the program that asks for protected files (a
-    // removable volume, Documents, ...) by the path the kernel reports for the
-    // responsible process's executable, and with several hard links that can
-    // be any of them. Every task image then looked like a different "aft", so
-    // an Allow never stuck and the prompt blocked the volume until someone
-    // answered. Returning an error makes `materialize` clone or copy the held
-    // image into a separate file, leaving the daemon at its one placed path.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (source, destination);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the daemon's executable is never hard-linked on macOS",
-        ))
-    }
+    // Never give the running daemon's executable a second name. Returning an
+    // error makes `materialize` clone or copy the held image into a separate
+    // file, leaving the daemon at its one placed path. Task images link that
+    // pin, never the deployed file.
+    //
+    // macOS: the privacy controls name the program that asks for protected
+    // files (a removable volume, Documents, ...) by the path the kernel
+    // reports for the responsible process's executable, and with several hard
+    // links that can be any of them. Every task image then looked like a
+    // different "aft", so an Allow never stuck and the prompt blocked the
+    // volume until someone answered.
+    //
+    // Linux: each link and unlink changes the inode's change time and link
+    // count. With a linked pin, every shell task changed the deployed file's
+    // metadata, so a tool that compares that metadata (an integrity check, a
+    // backup tool) saw a change after every command, with the same bytes.
+    let _ = (source, destination);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the daemon's executable is never hard-linked",
+    ))
 }
 
 #[cfg(unix)]
@@ -449,8 +431,9 @@ fn materialize(
             if clone_held_image(source, destination).is_ok() {
                 return Ok(());
             }
-            // Storage may be on another volume. Stream the already-open image
-            // unchanged so embedded code signatures on macOS remain valid.
+            // The pin is never a link (`link_image`), and storage may be on
+            // another volume. Stream the already-open image unchanged so
+            // embedded code signatures on macOS remain valid.
             let mut output = crate::private_storage::executable_options()
                 .write(true)
                 .create_new(true)
@@ -1071,10 +1054,11 @@ mod tests {
     }
 
     /// The daemon's own executable keeps exactly one name: its pin is a separate
-    /// file, so macOS cannot report the daemon by a pin or task-image path.
-    #[cfg(target_os = "macos")]
+    /// file, so macOS cannot report the daemon by a pin or task-image path, and
+    /// on Linux task links never change the deployed file's inode metadata.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn pinned_executable_macos_pin_is_a_separate_file_from_the_running_image() {
+    fn pinned_executable_pin_is_a_separate_file_from_the_running_image() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let storage = tempfile::tempdir().unwrap();
         let executable = storage.path().join("deploy");
@@ -1096,6 +1080,41 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
+    }
+
+    /// Linking the running image, even once, changes its inode change time and
+    /// link count. Keep the storage on the test binary's own mount so that a
+    /// hard link would succeed if `prepare` or `task_image` made one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_executable_prepare_and_task_image_leave_the_running_image_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let image = linux_image_path();
+        let beside = std::env::current_exe().unwrap();
+        let beside = beside.parent().unwrap();
+        let storage = tempfile::tempdir_in(beside).unwrap();
+        let task = tempfile::tempdir_in(beside).unwrap();
+        let before = std::fs::metadata(&image).unwrap();
+        let pin = prepare(storage.path()).unwrap();
+        pin.task_image(task.path()).unwrap();
+        let pinned = std::fs::metadata(&pin.executable).unwrap();
+        let after = std::fs::metadata(&image).unwrap();
+        assert_ne!(
+            (before.dev(), before.ino()),
+            (pinned.dev(), pinned.ino()),
+            "the pin is a hard link to the running image"
+        );
+        assert_eq!(
+            before.nlink(),
+            after.nlink(),
+            "the running image gained a name"
+        );
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec()),
+            "the running image's inode change time moved"
+        );
+        pin.cleanup_at_exit();
     }
 
     #[cfg(unix)]
