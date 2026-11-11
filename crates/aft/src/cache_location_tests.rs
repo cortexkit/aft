@@ -146,7 +146,7 @@ fn unenrolled_cache_config(temp: &Path) -> Config {
 #[cfg(unix)]
 #[test]
 fn cache_location_crosstalk_ancestor_probe_does_not_register_a_root() {
-    use crate::bash_background::persistence::TRUSTED_TEST_SYMLINKS;
+    use crate::pinned_dir::TRUSTED_TEST_SYMLINKS;
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let real = base.join("real");
@@ -243,7 +243,7 @@ fn cache_location_resolved_cache_root_is_a_plain_path() {
     );
     assert_eq!(
         root,
-        crate::bash_background::persistence::canonical_root_path(&temp.path().join("cache-volume"))
+        crate::pinned_dir::canonical_root_path(&temp.path().join("cache-volume"))
             .unwrap()
             .join("aft")
     );
@@ -267,10 +267,7 @@ fn symlinked_storage_config(temp: &Path) -> Config {
 fn cache_location_symlinked_storage_survives_retry() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = symlinked_storage_config(temp.path());
-    crate::bash_background::persistence::resolve_configured_root(
-        config.storage_dir.as_ref().unwrap(),
-    )
-    .unwrap();
+    crate::pinned_dir::resolve_configured_root(config.storage_dir.as_ref().unwrap()).unwrap();
     AFTER_CACHE_ROOT_RENAME.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(|| panic!("simulated publication crash")));
     });
@@ -298,10 +295,7 @@ fn cache_location_symlinked_storage_survives_retry() {
 fn cache_location_symlinked_storage_doctor_cleanup_works() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = symlinked_storage_config(temp.path());
-    crate::bash_background::persistence::resolve_configured_root(
-        config.storage_dir.as_ref().unwrap(),
-    )
-    .unwrap();
+    crate::pinned_dir::resolve_configured_root(config.storage_dir.as_ref().unwrap()).unwrap();
     let _ = prepare_cache_root(&mut config);
     let storage = config.storage_dir.as_ref().unwrap().clone();
     let root = cache_root(&config);
@@ -427,7 +421,7 @@ fn cache_location_enrollment_recovers_after_registration_disk_full() {
 fn cache_location_enrollment_recovers_after_registration_interruption() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = unenrolled_cache_config(temp.path());
-    crate::bash_background::persistence::BEFORE_REPAIR_RENAME.with(|hook| {
+    crate::pinned_dir::BEFORE_REPAIR_RENAME.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(|| panic!("simulated publication crash")));
     });
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -493,7 +487,7 @@ fn cache_location_enrollment_recovers_after_rename_before_history_promotion() {
 fn cache_location_cleanup_drops_pending_with_missing_staging_without_adopting_foreign_root() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = unenrolled_cache_config(temp.path());
-    crate::bash_background::persistence::BEFORE_REPAIR_RENAME.with(|hook| {
+    crate::pinned_dir::BEFORE_REPAIR_RENAME.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(|| panic!("simulated publication crash")));
     });
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -521,10 +515,10 @@ fn cache_location_cleanup_drops_pending_with_missing_staging_without_adopting_fo
 /// NotFound on every later doctor run.
 #[test]
 fn cache_location_cleanup_drops_pending_when_a_foreign_root_reuses_the_staging_inode() {
-    use crate::bash_background::persistence::REPAIR_IDENTITIES;
+    use crate::pinned_dir::REPAIR_IDENTITIES;
     let temp = tempfile::tempdir().unwrap();
     let mut config = unenrolled_cache_config(temp.path());
-    crate::bash_background::persistence::BEFORE_REPAIR_RENAME.with(|hook| {
+    crate::pinned_dir::BEFORE_REPAIR_RENAME.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(|| panic!("simulated publication crash")));
     });
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -632,7 +626,7 @@ fn cache_location_enrollment_publication_does_not_replace_a_foreign_folder() {
         let mut config = unenrolled_cache_config(temp.path());
         let root = cache_root(&config);
         let foreign = root.clone();
-        crate::bash_background::persistence::BEFORE_REPAIR_RENAME.with(|hook| {
+        crate::pinned_dir::BEFORE_REPAIR_RENAME.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 fs::create_dir(&foreign).unwrap();
                 if populated {
@@ -656,7 +650,7 @@ fn cache_location_enrollment_publication_refuses_a_symlink() {
     let outside = temp.path().join("outside");
     let precious = canary(&outside, "index/foreign");
     let destination = root.clone();
-    crate::bash_background::persistence::BEFORE_REPAIR_RENAME.with(|hook| {
+    crate::pinned_dir::BEFORE_REPAIR_RENAME.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
             std::os::unix::fs::symlink(outside, destination).unwrap();
         }));
@@ -824,7 +818,7 @@ fn cache_location_durable_scan_refuses_excessive_depth() {
 
 #[test]
 fn old_cache_cleanup_keeps_durable_names_when_a_candidate_is_their_bind_alias() {
-    use crate::bash_background::persistence::REPAIR_IDENTITIES;
+    use crate::pinned_dir::REPAIR_IDENTITIES;
     let (_temp, storage, artifacts, config) = fixture();
     let durable = canary(&storage, "backups/precious");
     let candidate = storage.join("index");
@@ -911,7 +905,7 @@ fn cache_location_concurrent_coordination_create_keeps_cache_available() {
         storage_dir: Some(storage.clone()),
         ..Default::default()
     };
-    let warning = crate::bash_background::persistence::with_openat_file_hook(
+    let warning = crate::pinned_dir::with_openat_file_hook(
         Box::new(move |dirfd, name, flags| {
             if name != std::ffi::OsStr::new(IN_USE) {
                 return None;
@@ -975,7 +969,7 @@ fn cache_location_coordination_create_exhaustion_is_typed_busy() {
     let root = PinnedDir::repair_open_path(temp.path()).unwrap();
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&attempts);
-    let error = crate::bash_background::persistence::with_openat_file_hook(
+    let error = crate::pinned_dir::with_openat_file_hook(
         Box::new(move |_, name, flags| {
             assert_eq!(name, std::ffi::OsStr::new(IN_USE));
             observed.lock().unwrap().push(flags);
@@ -990,11 +984,11 @@ fn cache_location_coordination_create_exhaustion_is_typed_busy() {
     assert!(error
         .get_ref()
         .unwrap()
-        .is::<crate::bash_background::persistence::CoordinationCreateContended>());
+        .is::<crate::pinned_dir::CoordinationCreateContended>());
     let contended = error
         .get_ref()
         .unwrap()
-        .downcast_ref::<crate::bash_background::persistence::CoordinationCreateContended>()
+        .downcast_ref::<crate::pinned_dir::CoordinationCreateContended>()
         .unwrap();
     assert_eq!(contended.path(), root.path().join(IN_USE));
     assert_eq!(
@@ -1026,7 +1020,7 @@ fn cache_location_coordination_reopen_refuses_a_sibling_symlink() {
     let destination = outside.clone();
     let link = storage.join(IN_USE);
     let mut first = true;
-    let error = crate::bash_background::persistence::with_openat_file_hook(
+    let error = crate::pinned_dir::with_openat_file_hook(
         Box::new(move |_, _, _| {
             if !first {
                 return None;
@@ -1470,7 +1464,7 @@ fn cache_cleanup_allows_a_daemon_using_a_different_storage_root() {
 
 #[test]
 fn cache_location_recursive_removal_rejects_mount_and_durable_bind_alias() {
-    use crate::bash_background::persistence::REPAIR_IDENTITIES;
+    use crate::pinned_dir::REPAIR_IDENTITIES;
     for mounted in [true, false] {
         let (temp, storage, artifacts, config) = fixture();
         let candidate = artifacts.join("index");
@@ -1513,7 +1507,7 @@ fn cache_location_recursive_removal_rejects_mount_and_durable_bind_alias() {
 #[cfg(unix)]
 #[test]
 fn cache_location_repair_refuses_symlinks_without_following_targets() {
-    use crate::bash_background::persistence::REPAIR_SYMLINK_ELOOP;
+    use crate::pinned_dir::REPAIR_SYMLINK_ELOOP;
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -2034,8 +2028,7 @@ fn old_cache_cleanup_resolves_system_symlink_ancestors_before_preflight() {
     let alias = temp.path().join("system-alias");
     std::os::unix::fs::symlink(&real, &alias).unwrap();
     // Model macOS /var -> /private/var without requiring a root-owned fixture.
-    crate::bash_background::persistence::TRUSTED_TEST_SYMLINKS
-        .with(|links| links.borrow_mut().insert(alias.clone()));
+    crate::pinned_dir::TRUSTED_TEST_SYMLINKS.with(|links| links.borrow_mut().insert(alias.clone()));
     let storage = alias.join("storage");
     let old = canary(&storage, "index/old");
     let durable = canary(&storage, "logs/keep");
@@ -2051,8 +2044,7 @@ fn old_cache_cleanup_resolves_system_symlink_ancestors_before_preflight() {
         assert_eq!(inventory[0].bytes, 7);
         true
     });
-    crate::bash_background::persistence::TRUSTED_TEST_SYMLINKS
-        .with(|links| links.borrow_mut().remove(&alias));
+    crate::pinned_dir::TRUSTED_TEST_SYMLINKS.with(|links| links.borrow_mut().remove(&alias));
     assert!(report.error.is_none(), "{report:?}");
     assert!(!old.exists());
     assert!(durable.is_file());
@@ -2061,9 +2053,7 @@ fn old_cache_cleanup_resolves_system_symlink_ancestors_before_preflight() {
 
 #[test]
 fn old_cache_cleanup_refuses_nested_mounts_and_reports_partial_removal() {
-    use crate::bash_background::persistence::{
-        with_repair_failure_after_for_test, REPAIR_IDENTITIES,
-    };
+    use crate::pinned_dir::{with_repair_failure_after_for_test, REPAIR_IDENTITIES};
     for kind in [0, 1, 2] {
         let (temp, storage, artifacts, config) = fixture();
         let first = canary(&storage, "index/000-first");
@@ -2681,7 +2671,7 @@ fn cache_location_partial_subtree_failure_reports_progress() {
     let first = canary(&artifacts, "index/000-first");
     let last = canary(&artifacts, "index/zzz-last");
     drop(config);
-    let report = crate::bash_background::persistence::with_repair_failure_after_for_test(1, || {
+    let report = crate::pinned_dir::with_repair_failure_after_for_test(1, || {
         remove_inactive_cache_roots(&storage, &[])
     });
     assert!(

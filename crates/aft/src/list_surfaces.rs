@@ -827,7 +827,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal marker liveness and cleanup, not result lists; incomplete or oversized marker reads protect the cache rather than authorize deletion",
     },
     ExclusionEntry {
-        file: "bash_background/persistence.rs",
+        file: "pinned_dir.rs",
         enclosing_item: "RepairBudget, DirectoryEntries, unix_entries, unix_names, repair_names, directory_identities, collect_directory_identities, repair_measure, repair_remove_contents, windows_repair_names, repair_descendant, repair_validate_descendants",
         location_or_primitive: "repair traversal depth, entry and deadline bounds",
         reason: "internal cache repair and retention walks, not result lists; an incomplete identity census or inventory refuses deletion and interrupted removal reports partial progress",

@@ -167,6 +167,7 @@ pub mod patch;
 pub mod path_identity;
 pub mod pattern_compile;
 pub mod persisted_format;
+pub(crate) mod pinned_dir;
 pub mod pinned_executable;
 mod platform_tls;
 #[cfg(unix)]
