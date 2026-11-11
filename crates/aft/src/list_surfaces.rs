@@ -599,6 +599,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "test-only handoff of the held storage sweep worker's join handle out of its gate, not a list",
     },
     ExclusionEntry {
+        file: "commands/url_resolution.rs",
+        enclosing_item: "drop",
+        location_or_primitive: "with_secret_fetch_for_test::Restore::drop self.0.take(), self.1.take()",
+        reason: "Option::take restores the previous test fetch vault and options when the scoped helper exits; neither call cuts a list",
+    },
+    ExclusionEntry {
         file: "commands/configure.rs",
         enclosing_item: "view_working_tree_refresh_path",
         location_or_primitive: "max_examined .take()",
