@@ -30,6 +30,9 @@ use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Install the callbacks before admitting database retries. Binary startup and
+/// configure do this automatically; library hosts using the retry API without a
+/// configure request must register the callbacks explicitly.
 pub fn register_runtime_hooks() {
     crate::runtime_drain::configure::register(crate::runtime_drain::configure::Hooks {
         drain: drain_deferred_configure_maintenance,

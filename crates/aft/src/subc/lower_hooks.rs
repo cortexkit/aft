@@ -1,6 +1,7 @@
 //! Install the optional daemon services declared by lower layers before serving routes.
 
 pub(crate) fn register() {
+    crate::commands::configure::register_runtime_hooks();
     crate::bash_background::frames::register(crate::bash_background::frames::Hooks {
         enabled: super::rich_ui::display::enabled,
         current_task: super::rich_ui::display::current_task,
@@ -18,6 +19,8 @@ mod tests {
     #[test]
     fn edge_registers_every_lower_layer_hook() {
         super::register();
+        assert!(crate::runtime_drain::configure::registered());
+        assert!(crate::runtime_drain::configure::database_runtime().is_some());
         assert!(crate::bash_background::frames::registered());
         assert!(crate::edit::file_reporter_registered());
         assert!(crate::db::call_ledger::held_result_projector_registered());
