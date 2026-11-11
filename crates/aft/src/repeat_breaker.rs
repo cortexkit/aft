@@ -14,7 +14,7 @@ impl RepeatCall {
         Self(RepeatObservation {
             tool: normalized.to_string(),
             semantic_key: semantic_key(normalized, input),
-            mutating: crate::subc::tool_call_is_mutating(tool, input),
+            mutating: crate::host_tool_names::tool_call_is_mutating(tool, input),
         })
     }
 }

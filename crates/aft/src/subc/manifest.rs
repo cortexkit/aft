@@ -1,11 +1,14 @@
 //! Manifest, lane classification, and control-surface helpers exposed over subc.
 
 use super::{
-    json, Bindings, Concurrency, ConsumerRole, ExecutionMode, Flags, IdentityBinding,
-    IdentityScope, Lane, LazyLock, ManagementOperation, ManagementOperationKind, ModuleManifest,
-    Priority, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier, Value,
+    json, Bindings, Concurrency, ConsumerRole, Flags, IdentityBinding, IdentityScope, Lane,
+    LazyLock, ManagementOperation, ManagementOperationKind, ModuleManifest, Priority, ProviderRole,
+    StorageBinding, StorageKind, StorageScope, Tool, TrustTier, Value,
     MODULE_CONTROL_OP_HEALTH_CHECK, PROTOCOL_VERSION,
 };
+
+#[cfg(test)]
+use subc_protocol::manifest::ExecutionMode;
 
 pub(super) const FLOW_OPERATIONS: &[&str] = &[super::diagnostics_findings::OPERATION];
 
@@ -305,26 +308,7 @@ pub(super) fn filter_manifest_tools(
     manifest
 }
 
-/// Classify externally observable effects, not AFT's internal cache/index writes.
-/// The catalog conservatively classifies tools; individual calls can narrow that
-/// classification when their operation is explicitly read-only.
-fn tool_execution_mode(name: &str) -> ExecutionMode {
-    match crate::tool_gate::canonical_tool_name(name).unwrap_or(name) {
-        "bash" | "powershell" | "write" | "edit" | "apply_patch" | "ast_grep_replace"
-        | "aft_delete" | "aft_move" | "aft_import" | "aft_safety" | "bash_kill" | "bash_write" => {
-            ExecutionMode::Mutating
-        }
-        _ => ExecutionMode::Pure,
-    }
-}
-
-pub(crate) fn tool_call_is_mutating(name: &str, args: &Value) -> bool {
-    match crate::tool_gate::canonical_tool_name(name) {
-        Some("aft_safety") if matches!(args["op"].as_str(), Some("history" | "list")) => false,
-        Some("ast_grep_replace") if args["dryRun"].as_bool() == Some(true) => false,
-        _ => tool_execution_mode(name) == ExecutionMode::Mutating,
-    }
-}
+pub(crate) use crate::host_tool_names::{tool_call_is_mutating, tool_execution_mode};
 
 /// Builds the manifest for a host where PowerShell is or is not runnable.
 ///
