@@ -791,7 +791,7 @@ fn enqueue_inner(
     frame: PushFrame,
     expedite: bool,
 ) -> bool {
-    let (task_id, owner) = match &frame {
+    let (_task_id, owner) = match &frame {
         PushFrame::BashCompleted(frame) => (&frame.task_id, &frame.launching_identity),
         PushFrame::BashLongRunning(frame) => (&frame.task_id, &frame.launching_identity),
         PushFrame::BashPatternMatch(frame) => (&frame.task_id, &frame.launching_identity),
@@ -802,8 +802,8 @@ fn enqueue_inner(
     }
     let path = CONNECTION.get().map(|path| path.read().unwrap().clone());
     #[cfg(test)]
-    let path =
-        path.or_else(|| test_endpoint::contains(&format!("aft:bash:{task_id}")).then(PathBuf::new));
+    let path = path
+        .or_else(|| test_endpoint::contains(&format!("aft:bash:{_task_id}")).then(PathBuf::new));
     let Some(path) = path else {
         return false;
     };
