@@ -417,7 +417,8 @@ async fn yield_reason_until_accepted(
         assert_eq!(
             reply,
             json!({"answer": "not_yieldable", "reason": "not_waiting"}),
-            "only a call still reaching its wait may refuse"
+            "only a call still reaching its wait may refuse: key={key}, queued={:?}",
+            inbox.frames.iter().map(body).collect::<Vec<_>>()
         );
         assert!(Instant::now() < until, "the call never became yieldable");
         corr += 1;
