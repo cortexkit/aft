@@ -56,6 +56,9 @@ fn tokens(node: tree_sitter::Node<'_>, bytes: &[u8], deadline: Instant) -> Optio
                 result.push(Token::Group(tokens(child, bytes, deadline)?))
             }
             "token_binding_pattern" => result.extend(tokens(child, bytes, deadline)?),
+            _ if child.named_child_count() > 0 && child.kind() != "scoped_identifier" => {
+                result.push(Token::Group(tokens(child, bytes, deadline)?));
+            }
             _ => result.push(Token::Text(text.into())),
         }
     }
@@ -307,6 +310,13 @@ impl SourceInputs {
         let mut index = 0;
         while index < tokens.len() {
             expired(deadline)?;
+            if tokens[index].text("macro_rules") {
+                if let Some(definition) = definition {
+                    // A generated macro has its own bindings and expansion
+                    // sites; substituting the outer bindings would be a guess.
+                    self.definitions[definition].parameters = None;
+                }
+            }
             if let [Token::Text(name), bang, Token::Group(args), ..] = &tokens[index..] {
                 if bang.text("!") {
                     let name = name.rsplit("::").next()?;
@@ -341,7 +351,10 @@ impl SourceInputs {
                                         }
                                         included.push(target);
                                     }
-                                    None => return Self::refuse(path, false, unresolved),
+                                    None => {
+                                        expired(deadline)?;
+                                        return Self::refuse(path, false, unresolved);
+                                    }
                                 }
                             }
                         }
@@ -416,6 +429,7 @@ impl SourceInputs {
                 let Some(args) = arguments(&invocation.args, deadline)
                     .filter(|args| args.len() == parameters.len())
                 else {
+                    expired(deadline)?;
                     return Self::refuse(&definition.path, false, unresolved);
                 };
                 let mut bindings = BTreeMap::new();
@@ -438,7 +452,10 @@ impl SourceInputs {
                             }
                             included.push(target);
                         }
-                        None => return Self::refuse(&definition.path, false, unresolved),
+                        None => {
+                            expired(deadline)?;
+                            return Self::refuse(&definition.path, false, unresolved);
+                        }
                     }
                 }
             }

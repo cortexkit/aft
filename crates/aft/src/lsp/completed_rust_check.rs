@@ -2627,6 +2627,7 @@ mod tests {
             "fixture!(concat!(\"a\", \".txt\"))",
             "forward!(fixture!(\"a.txt\"))",
             "macro_rules! forward { () => { fixture!(\"a.txt\") }; }",
+            "macro_rules! forward { ($($name:literal),*) => { $(fixture!($name);)* }; } forward!(\"a.txt\");",
             "forward!(fixture)",
             "use fixture as alias; alias!(\"a.txt\")",
         ] {
@@ -2693,8 +2694,10 @@ mod tests {
         for definition in [
             r#"macro_rules! fixture { ($($fixture:literal),*) => { include_str!(concat!("data/", $($fixture),*)) }; }"#,
             r#"macro_rules! fixture { ($fixture:literal) => { include_str!(concat!("data/", $fixture)) }; () => { "empty" }; }"#,
+            r#"macro_rules! fixture { ($fixture:literal) => { macro_rules! generated { () => { include_str!(concat!("data/", $fixture)) }; } generated!() }; }"#,
         ] {
             let (_temp, cache) = fixture();
+            write(&cache.root, "member/src/data/a.txt", "input");
             write(
                 &cache.root,
                 "member/src/lib.rs",
