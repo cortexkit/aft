@@ -327,9 +327,10 @@ impl Runner {
 /// When a failed build is tried again.
 #[derive(Default)]
 struct BuildRetry {
-    /// No build starts before this; a waiting thread starts one then.
+    /// No build starts before this; a shared deadline starts one then.
     at: Option<Instant>,
     in_a_row: u32,
+    timer: Option<crate::shared_timer::Timer>,
 }
 
 /// A checkout and the state of its background work, shared by the work
@@ -337,6 +338,7 @@ struct BuildRetry {
 struct Work {
     checkout: Arc<Checkout>,
     runner: Runner,
+    stopped: AtomicBool,
     /// A build is queued or running.
     building: Arc<AtomicBool>,
     /// A fold of the checkout's segments is queued or running.
@@ -400,9 +402,12 @@ impl Work {
     /// Starts a build unless one is queued or running, or a failed one is
     /// waiting to be tried again. A build that fails is tried again after a
     /// wait that doubles each time, until one succeeds or the checkout is
-    /// dropped; the wait is a sleeping thread, never an executor worker.
+    /// dropped; the wait uses the shared timer, never an executor worker.
     /// Returns whether this call queued a build, so its cause is logged once.
     fn start_build(self: &Arc<Self>) -> bool {
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
         {
             let retry = self
                 .retry
@@ -417,10 +422,13 @@ impl Work {
         }
         let flag = ClearOnDrop(Arc::clone(&self.building));
         let Some(reservation) = self.checkout.reserve_build() else {
-            return;
+            return false;
         };
         let work = Arc::clone(self);
         self.runner.run(BUILD_REQUEST, Pool::Build, move || {
+            if work.stopped.load(Ordering::Acquire) {
+                return;
+            }
             #[cfg(test)]
             while build_holds_for_test()
                 .lock()
@@ -467,15 +475,16 @@ impl Work {
     }
 
     fn retry_build_later(self: &Arc<Self>, error: &DataError) {
-        let wait = {
+        let (wait, at) = {
             let mut retry = self
                 .retry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             retry.in_a_row += 1;
             let wait = backoff(BUILD_RETRY, BUILD_RETRY_MAX, retry.in_a_row);
-            retry.at = Some(Instant::now() + wait);
-            wait
+            let at = Instant::now() + wait;
+            retry.at = Some(at);
+            (wait, at)
         };
         crate::slog_warn!(
             "data layer build failed for {} (trying again in {} s): {error}",
@@ -483,14 +492,20 @@ impl Work {
             wait.as_secs()
         );
         let weak = Arc::downgrade(self);
-        let _ = std::thread::Builder::new()
-            .name("aft-data-build-retry".to_string())
-            .spawn(move || {
-                std::thread::sleep(wait);
-                if let Some(work) = weak.upgrade() {
-                    work.start_build();
-                }
-            });
+        let timer = crate::shared_timer::Timer::at(at, move || {
+            if let Some(work) = weak.upgrade() {
+                work.start_build();
+            }
+            None
+        })
+        .ok();
+        let mut retry = self
+            .retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.stopped.load(Ordering::Acquire) {
+            retry.timer = timer;
+        }
     }
 
     /// Resolves the call graph again until no recorded change is pending,
@@ -499,6 +514,9 @@ impl Work {
     /// ending, by the check after it lets go of the flag. A refresh that
     /// finds the stored call graph damaged starts a build, which replaces it.
     fn start_refresh(self: &Arc<Self>, publish: Publish) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         if !self.checkout.planes().callgraph {
             // Without a call graph there is nothing to resolve: the changes
             // laid over the text index are folded in by a text-only build,
@@ -530,6 +548,9 @@ impl Work {
         // runs beside the root's reads and edits, one at a time per root
         // (the `refreshing` flag), in the refresh pool.
         self.runner.run(REFRESH_REQUEST, Pool::Refresh, move || {
+            if work.stopped.load(Ordering::Acquire) {
+                return;
+            }
             let mut flag = Some(flag);
             loop {
                 let result = work.checkout.refresh_callgraph();
@@ -856,6 +877,9 @@ impl Work {
     /// them. A failed round is tried again after a wait that doubles each
     /// time, as a failed build is.
     fn start_fill(self: &Arc<Self>) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         if !self.meaning.enabled() || self.meaning.reads_only() {
             return;
         }
@@ -874,7 +898,7 @@ impl Work {
         let flag = ClearOnDrop(Arc::clone(&self.filling));
         let work = Arc::clone(self);
         self.runner.run(FILL_REQUEST, Pool::Fill, move || {
-            if crate::executor::current_job_cancelled() {
+            if work.stopped.load(Ordering::Acquire) || crate::executor::current_job_cancelled() {
                 // Runs again when the root is bound and a search asks.
                 return;
             }
@@ -904,15 +928,16 @@ impl Work {
     }
 
     fn retry_fill_later(self: &Arc<Self>, error: &str) {
-        let wait = {
+        let (wait, at) = {
             let mut retry = self
                 .fill_retry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             retry.in_a_row += 1;
             let wait = backoff(BUILD_RETRY, BUILD_RETRY_MAX, retry.in_a_row);
-            retry.at = Some(Instant::now() + wait);
-            wait
+            let at = Instant::now() + wait;
+            retry.at = Some(at);
+            (wait, at)
         };
         crate::slog_warn!(
             "data layer meaning fill failed for {} (trying again in {} s): {error}",
@@ -920,14 +945,20 @@ impl Work {
             wait.as_secs()
         );
         let weak = Arc::downgrade(self);
-        let _ = std::thread::Builder::new()
-            .name("aft-data-fill-retry".to_string())
-            .spawn(move || {
-                std::thread::sleep(wait);
-                if let Some(work) = weak.upgrade() {
-                    work.start_fill();
-                }
-            });
+        let timer = crate::shared_timer::Timer::at(at, move || {
+            if let Some(work) = weak.upgrade() {
+                work.start_fill();
+            }
+            None
+        })
+        .ok();
+        let mut retry = self
+            .fill_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.stopped.load(Ordering::Acquire) {
+            retry.timer = timer;
+        }
     }
 
     /// Tells the status listener, if any, that the checkout's status may
@@ -967,11 +998,24 @@ pub(crate) struct DataCheckout {
 }
 
 impl Drop for DataCheckout {
-    // An evicted checkout must not leave its quiet-timer thread asleep for
-    // up to `QUIET`: its refresh would find nothing to refresh anyway.
+    // An evicted checkout must not dispatch delayed work even if an in-flight
+    // pool job still holds Work alive.
     fn drop(&mut self) {
+        self.work.stopped.store(true, Ordering::Release);
         self.quiet.stop();
         self.work.settle.stop();
+        self.work
+            .retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .timer
+            .take();
+        self.work
+            .fill_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .timer
+            .take();
     }
 }
 
@@ -1079,6 +1123,7 @@ impl DataCheckout {
             }
         };
         let work = Arc::new_cyclic(|weak: &Weak<Work>| Work {
+            stopped: AtomicBool::new(false),
             runner: Runner {
                 root: checkout.root().to_path_buf(),
                 executor: parking_lot::Mutex::new(executor),
@@ -1223,9 +1268,8 @@ impl DataCheckout {
 }
 
 /// Calls `fire` once a checkout has gone `quiet` without a recorded change
-/// (for the call graph, [`QUIET`], to refresh it). One timer thread runs per
-/// checkout at most, and only while a change is waiting: each change moves
-/// the deadline on, and the thread sleeps until the latest one.
+/// (for the call graph, [`QUIET`], to refresh it). Pending checkouts share the
+/// process timer; each change moves the deadline checked at its next wake.
 struct QuietTimer {
     quiet: Duration,
     /// When the last change was recorded, in milliseconds since `epoch`.
@@ -1233,10 +1277,9 @@ struct QuietTimer {
     armed: AtomicBool,
     epoch: Instant,
     fire: Box<dyn Fn() + Send + Sync>,
-    /// Set when the checkout is dropped: the waiting thread ends at once
-    /// instead of sleeping out its deadline.
+    /// Also fences dispatch against checkout shutdown.
     stopped: std::sync::Mutex<bool>,
-    wake: std::sync::Condvar,
+    timer: std::sync::Mutex<Option<crate::shared_timer::Timer>>,
     #[cfg(feature = "test-timing-hooks")]
     test_gate: bool,
 }
@@ -1250,33 +1293,22 @@ impl QuietTimer {
             epoch: Instant::now(),
             fire: Box::new(fire),
             stopped: std::sync::Mutex::new(false),
-            wake: std::sync::Condvar::new(),
+            timer: std::sync::Mutex::new(None),
             #[cfg(feature = "test-timing-hooks")]
             test_gate: false,
         }
     }
 
-    /// Ends the waiting thread, if any, without firing; later changes start
-    /// none.
+    /// Removes the pending callback without firing; later changes arm none.
     fn stop(&self) {
         *self
             .stopped
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        self.wake.notify_all();
-    }
-
-    /// Sleeps up to `duration`, or until [`Self::stop`]; true once stopped.
-    fn sleep(&self, duration: Duration) -> bool {
-        let stopped = self
-            .stopped
+        self.timer
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (stopped, _) = self
-            .wake
-            .wait_timeout_while(stopped, duration, |stopped| !*stopped)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *stopped
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     fn now_ms(&self) -> u64 {
@@ -1293,7 +1325,7 @@ impl QuietTimer {
     /// Changes continue moving its deadline while the integration test writes
     /// and removes a burst; the deadline is checked again after release.
     #[cfg(feature = "test-timing-hooks")]
-    fn hold_for_test(&self) -> Option<PathBuf> {
+    fn gate_for_test(&self) -> Option<PathBuf> {
         if !self.test_gate {
             return None;
         }
@@ -1302,16 +1334,10 @@ impl QuietTimer {
             return None;
         }
         std::fs::write(gate.with_extension("waiting"), b"waiting").expect("signal quiet gate");
-        while gate.exists() && !gate.with_extension("release").exists() {
-            if self.sleep(Duration::from_millis(10)) {
-                return None;
-            }
-        }
         Some(gate)
     }
 
-    /// Notes a recorded change, and starts the timer thread unless one is
-    /// waiting already.
+    /// Notes a recorded change, and arms a deadline unless one is pending.
     fn changed(self: &Arc<Self>) {
         self.note_change();
         self.arm();
@@ -1331,54 +1357,79 @@ impl QuietTimer {
 
     /// Wait from the last recorded change, not from the end of its refresh.
     fn arm(self: &Arc<Self>) {
-        if self.sleep(Duration::ZERO) || self.armed.swap(true, Ordering::AcqRel) {
+        let stopped = self
+            .stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *stopped || self.armed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let timer = Arc::clone(self);
+        let timer = Arc::downgrade(self);
         let quiet_ms = u64::try_from(self.quiet.as_millis()).unwrap_or(u64::MAX);
-        let spawned = std::thread::Builder::new()
-            .name("aft-data-quiet".to_string())
-            .spawn(move || {
-                #[cfg(feature = "test-timing-hooks")]
-                let gate = timer.hold_for_test();
-                if timer.sleep(Duration::ZERO) {
-                    return;
+        #[cfg(feature = "test-timing-hooks")]
+        let mut gate = None;
+        #[cfg(feature = "test-timing-hooks")]
+        let mut gate_checked = false;
+        let scheduled = crate::shared_timer::Timer::at(Instant::now(), move || {
+            let timer = timer.upgrade()?;
+            let stopped = timer
+                .stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *stopped {
+                return None;
+            }
+            #[cfg(feature = "test-timing-hooks")]
+            {
+                if !gate_checked {
+                    gate = timer.gate_for_test();
+                    gate_checked = true;
                 }
-                loop {
-                    let due = timer
-                        .last_change_ms
-                        .load(Ordering::Acquire)
-                        .saturating_add(quiet_ms);
-                    let now = timer.now_ms();
-                    if now < due {
-                        if timer.sleep(Duration::from_millis(due - now)) {
-                            break;
-                        }
-                        continue;
-                    }
-                    timer.armed.store(false, Ordering::Release);
-                    // A change recorded between the deadline check and letting
-                    // go of the flag found the timer armed and started none; if
-                    // there was one, this thread keeps waiting for it.
-                    if timer
-                        .last_change_ms
-                        .load(Ordering::Acquire)
-                        .saturating_add(quiet_ms)
-                        > timer.now_ms()
-                        && !timer.armed.swap(true, Ordering::AcqRel)
-                    {
-                        continue;
-                    }
-                    (timer.fire)();
-                    #[cfg(feature = "test-timing-hooks")]
-                    if let Some(gate) = &gate {
-                        std::fs::write(gate.with_extension("settled"), b"settled")
-                            .expect("signal quiet fire");
-                    }
-                    break;
+                if gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.exists() && !gate.with_extension("release").exists())
+                {
+                    return Some(Instant::now() + Duration::from_millis(10));
                 }
-            });
-        if spawned.is_err() {
+            }
+            let due = timer
+                .last_change_ms
+                .load(Ordering::Acquire)
+                .saturating_add(quiet_ms);
+            let now = timer.now_ms();
+            if now < due {
+                return Some(Instant::now() + Duration::from_millis(due - now));
+            }
+            timer.armed.store(false, Ordering::Release);
+            // A change recorded between the deadline check and letting
+            // go of the flag found the timer armed and started none; if
+            // there was one, keep the deadline armed for it.
+            if timer
+                .last_change_ms
+                .load(Ordering::Acquire)
+                .saturating_add(quiet_ms)
+                > timer.now_ms()
+                && !timer.armed.swap(true, Ordering::AcqRel)
+            {
+                return Some(Instant::now());
+            }
+            // The callback only admits/enqueues work; refreshes, builds and
+            // fills still execute in their existing data pools.
+            drop(stopped);
+            (timer.fire)();
+            #[cfg(feature = "test-timing-hooks")]
+            if let Some(gate) = &gate {
+                std::fs::write(gate.with_extension("settled"), b"settled")
+                    .expect("signal quiet fire");
+            }
+            None
+        });
+        if let Ok(timer) = scheduled {
+            *self
+                .timer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(timer);
+        } else {
             self.armed.store(false, Ordering::Release);
         }
     }
@@ -1790,6 +1841,114 @@ mod tests {
         while !ready() {
             assert!(Instant::now() < deadline, "background work did not finish");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binding_many_roots_shares_waiting_threads_and_eviction_removes_deadlines() {
+        use crate::shared_timer::Timer;
+        const ROOTS: usize = 12;
+        let mut fixtures = Vec::new();
+        let mut managers = Vec::new();
+        let mut works = Vec::new();
+        for _ in 0..ROOTS {
+            let fixture = PublicationFixture::new(QUIET, QUIET);
+            fixture.handle.quiet.changed();
+            fixture.handle.work.settle.changed();
+            // Keep real retry registrations pending while all roots are bound.
+            fixture.handle.work.retry.lock().unwrap().in_a_row = 10;
+            fixture.handle.work.fill_retry.lock().unwrap().in_a_row = 10;
+            fixture.handle.work.retry_build_later(&DataError::Cancelled);
+            fixture
+                .handle
+                .work
+                .retry_fill_later("retry registration test");
+            let manager = Arc::new(crate::inspect::InspectManager::new());
+            manager.note_dead_code_request(Instant::now());
+            works.push(Arc::clone(&fixture.handle.work));
+            managers.push(manager);
+            fixtures.push(fixture);
+        }
+        // Initial checks run immediately, then register the actual idle deadline.
+        wait_until(|| {
+            managers.iter().all(|manager| {
+                manager
+                    .dead_code_timer_registration_for_test()
+                    .and_then(Timer::deadline_for_test)
+                    .is_some_and(|at| at > Instant::now() + Duration::from_secs(60))
+            })
+        });
+        let mut registrations = Vec::new();
+        for (fixture, manager) in fixtures.iter().zip(&managers) {
+            for timer in [&fixture.handle.quiet, &fixture.handle.work.settle] {
+                registrations.push(
+                    timer
+                        .timer
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .registration_for_test(),
+                );
+            }
+            for retry in [&fixture.handle.work.retry, &fixture.handle.work.fill_retry] {
+                registrations.push(
+                    retry
+                        .lock()
+                        .unwrap()
+                        .timer
+                        .as_ref()
+                        .unwrap()
+                        .registration_for_test(),
+                );
+            }
+            registrations.push(manager.dead_code_timer_registration_for_test().unwrap());
+        }
+        wait_until(|| {
+            registrations
+                .iter()
+                .all(|id| Timer::registered_for_test(*id))
+        });
+        let names = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .map(|entry| {
+                std::fs::read_to_string(entry.unwrap().path().join("comm")).unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let count = |name: &str| names.iter().filter(|comm| comm.trim_end() == name).count();
+        // Linux comm truncates thread names to fifteen bytes.
+        assert_eq!(
+            count("aft-shared-time"),
+            1,
+            "one deadline service for every root"
+        );
+        assert_eq!(
+            count("aft-dead-code-r"),
+            2,
+            "release workers grew with roots"
+        );
+        assert_eq!(count("aft-data-quiet"), 0);
+        assert_eq!(count("aft-data-fill-r"), 0);
+        assert_eq!(count("aft-data-build-"), 0);
+
+        let quiet = Arc::downgrade(&fixtures[0].handle.quiet);
+        let manager = Arc::downgrade(&managers[0]);
+        drop(fixtures);
+        drop(managers);
+        wait_until(|| quiet.upgrade().is_none() && manager.upgrade().is_none());
+        assert!(
+            registrations
+                .iter()
+                .all(|id| !Timer::registered_for_test(*id)),
+            "an evicted root left a timer registered"
+        );
+        // Even a pool job retaining Work cannot rearm an evicted checkout.
+        for work in &works {
+            work.retry_build_later(&DataError::Cancelled);
+            work.retry_fill_later("evicted root");
+            assert!(work.retry.lock().unwrap().timer.is_none());
+            assert!(work.fill_retry.lock().unwrap().timer.is_none());
         }
     }
 
@@ -2301,22 +2460,34 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_quiet_timer_ends_its_thread_without_firing() {
+    fn a_stopped_quiet_timer_cancels_its_deadline_without_firing() {
         let fired = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&fired);
         let timer = Arc::new(QuietTimer::new(Duration::from_secs(120), move || {
             count.fetch_add(1, Ordering::SeqCst);
         }));
         timer.changed();
-        // The waiting thread holds the timer.
-        assert_eq!(Arc::strong_count(&timer), 2);
+        let registration = timer
+            .timer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .registration_for_test();
         timer.stop();
         let deadline = Instant::now() + Duration::from_secs(10);
         while Arc::strong_count(&timer) > 1 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(Arc::strong_count(&timer), 1, "the thread is still waiting");
-        // Changes after the stop start no thread.
+        assert_eq!(
+            Arc::strong_count(&timer),
+            1,
+            "the callback retained its owner"
+        );
+        assert!(!crate::shared_timer::Timer::registered_for_test(
+            registration
+        ));
+        // Changes after the stop register no deadline.
         timer.changed();
         assert_eq!(Arc::strong_count(&timer), 1);
         assert_eq!(fired.load(Ordering::SeqCst), 0);

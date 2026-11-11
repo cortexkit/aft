@@ -3,7 +3,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -459,9 +459,64 @@ impl DirectoryWatcher {
 
 struct FsEventsStream {
     stream: usize,
-    run_loop: usize,
-    join: Option<JoinHandle<()>>,
+    queue: usize,
     sender: NativeEventSender,
+}
+
+/// All streams deliver on one serial queue. Only native event translation runs
+/// here; topology probes, exclusion replanning and per-root backpressure remain
+/// on their existing workers. The queue lives for the process, not for a root.
+fn delivery_queue() -> notify::Result<usize> {
+    static QUEUE: OnceLock<usize> = OnceLock::new();
+    let queue = *QUEUE.get_or_init(|| unsafe {
+        dispatch_queue_create(c"aft-fsevents-delivery".as_ptr(), ptr::null()) as usize
+    });
+    if queue == 0 {
+        Err(notify::Error::generic(
+            "failed to create FSEvents delivery queue",
+        ))
+    } else {
+        Ok(queue)
+    }
+}
+
+struct StreamAction {
+    stream: usize,
+    start: bool,
+    started: bool,
+}
+
+extern "C" fn act_on_stream(context: *mut libc::c_void) {
+    unsafe {
+        let action = &mut *context.cast::<StreamAction>();
+        let stream = action.stream as fs::FSEventStreamRef;
+        if action.start {
+            action.started = fs::FSEventStreamStart(stream) != 0;
+        } else {
+            fs::FSEventStreamStop(stream);
+            fs::FSEventStreamInvalidate(stream);
+            fs::FSEventStreamRelease(stream);
+        }
+    }
+}
+
+fn stream_action(queue: usize, stream: usize, start: bool) -> bool {
+    let mut action = StreamAction {
+        stream,
+        start,
+        started: false,
+    };
+    // Synchronous execution on the delivery queue fences callbacks: after a
+    // stop returns no callback can still be using the released stream context.
+    // Stream owners are backend/config workers, never native callbacks.
+    unsafe {
+        dispatch_sync_f(
+            queue as *mut _,
+            (&mut action as *mut StreamAction).cast(),
+            act_on_stream,
+        );
+    }
+    action.started
 }
 
 impl FsEventsStream {
@@ -579,49 +634,28 @@ impl FsEventsStream {
             ));
         }
 
-        let stream_address = stream as usize;
-        let (run_loop_tx, run_loop_rx) = mpsc::sync_channel(1);
-        let join = match thread::Builder::new()
-            .name("aft-fsevents-runloop".to_string())
-            .spawn(move || {
-                let stream = stream_address as fs::FSEventStreamRef;
-                unsafe {
-                    let run_loop = cf::CFRunLoopGetCurrent();
-                    fs::FSEventStreamScheduleWithRunLoop(
-                        stream,
-                        run_loop,
-                        cf::kCFRunLoopDefaultMode,
-                    );
-                    if fs::FSEventStreamStart(stream) == 0 {
-                        let _ = run_loop_tx.send(0);
-                    } else {
-                        let _ = run_loop_tx.send(run_loop as usize);
-                        cf::CFRunLoopRun();
-                    }
-                    fs::FSEventStreamStop(stream);
-                    fs::FSEventStreamInvalidate(stream);
-                    fs::FSEventStreamRelease(stream);
-                }
-            }) {
-            Ok(join) => join,
+        let queue = match delivery_queue() {
+            Ok(queue) => queue,
             Err(error) => {
                 unsafe {
                     fs::FSEventStreamInvalidate(stream);
                     fs::FSEventStreamRelease(stream);
                 }
-                return Err(notify::Error::io(error));
+                return Err(error);
             }
         };
-        let run_loop = run_loop_rx.recv().map_err(notify::Error::from)?;
-        if run_loop == 0 {
-            let _ = join.join();
+        unsafe {
+            FSEventStreamSetDispatchQueue(stream, queue as *mut _);
+        }
+        let stream_address = stream as usize;
+        if !stream_action(queue, stream_address, true) {
+            stream_action(queue, stream_address, false);
             return Err(notify::Error::generic("FSEventStreamStart failed"));
         }
 
         Ok(Self {
             stream: stream_address,
-            run_loop,
-            join: Some(join),
+            queue,
             sender,
         })
     }
@@ -633,16 +667,7 @@ impl FsEventsStream {
 
 impl Drop for FsEventsStream {
     fn drop(&mut self) {
-        let run_loop = self.run_loop as cf::CFRunLoopRef;
-        unsafe {
-            while CFRunLoopIsWaiting(run_loop) == 0 {
-                thread::yield_now();
-            }
-            cf::CFRunLoopStop(run_loop);
-        }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        stream_action(self.queue, self.stream, false);
     }
 }
 
@@ -884,7 +909,16 @@ fn create_cf_path_array(paths: &[PathBuf]) -> notify::Result<cf::CFMutableArrayR
 }
 
 extern "C" {
-    fn CFRunLoopIsWaiting(run_loop: cf::CFRunLoopRef) -> cf::Boolean;
+    fn FSEventStreamSetDispatchQueue(stream: fs::FSEventStreamRef, queue: *mut libc::c_void);
+    fn dispatch_queue_create(
+        label: *const libc::c_char,
+        attr: *const libc::c_void,
+    ) -> *mut libc::c_void;
+    fn dispatch_sync_f(
+        queue: *mut libc::c_void,
+        context: *mut libc::c_void,
+        work: extern "C" fn(*mut libc::c_void),
+    );
 }
 
 #[cfg(test)]
@@ -1005,6 +1039,51 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn streams_share_delivery_queue_and_drop_independently() {
+        let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let mut streams = Vec::new();
+        let mut receivers = Vec::new();
+        let mut paths = Vec::new();
+        for root in &roots {
+            let root = std::fs::canonicalize(root.path()).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let stream = FsEventsStream::start(
+                &root,
+                &[],
+                tx,
+                fs::kFSEventStreamEventIdSinceNow,
+                Arc::new(AtomicU64::new(0)),
+            )
+            .unwrap();
+            assert_eq!(stream.queue, delivery_queue().unwrap());
+            paths.push(root.join("before-drop.rs"));
+            streams.push(stream);
+            receivers.push(rx);
+        }
+        for (path, rx) in paths.iter().zip(&receivers) {
+            std::fs::write(path, b"pub fn before() {}\n").unwrap();
+            wait_for_raw_path(rx, path);
+        }
+        drop(streams.remove(0));
+        // Invalidation and release on the shared queue release the stream's
+        // callback context, so no sender or stream registration survives eviction.
+        while receivers[0].try_recv().is_ok() {}
+        assert!(matches!(
+            receivers[0].try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        let survivor = paths[1].with_file_name("after-drop.rs");
+        std::fs::write(&survivor, b"pub fn after() {}\n").unwrap();
+        wait_for_raw_path(&receivers[1], &survivor);
+        drop(streams);
+        while receivers[1].try_recv().is_ok() {}
+        assert!(matches!(
+            receivers[1].try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     fn symlink_replacement_fixture(
