@@ -1,6 +1,6 @@
 //! Best-effort attribution of agent shell roots over the supervised connection.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,7 +26,7 @@ enum Event {
 
 #[derive(Default)]
 struct State {
-    live: BTreeMap<u32, AgentCommandRoot>,
+    live: BTreeSet<AgentCommandRoot>,
     adopted: BTreeSet<AgentCommandRoot>,
     events: VecDeque<(u64, Event)>,
     sequence: u64,
@@ -40,6 +40,7 @@ struct State {
 struct Declarations {
     state: Mutex<State>,
     changed: Notify,
+    persisting: tokio::sync::Mutex<()>,
 }
 
 impl State {
@@ -68,7 +69,7 @@ impl Declarations {
 
     fn started(&self, root: AgentCommandRoot) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.live.insert(root.pid, root);
+        state.live.insert(root);
         state.adopted.remove(&root);
         state.push(Event::Started(root));
         drop(state);
@@ -77,7 +78,7 @@ impl Declarations {
 
     fn restored(&self, root: AgentCommandRoot) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.live.insert(root.pid, root) == Some(root) {
+        if !state.live.insert(root) {
             return;
         }
         state.adopted.insert(root);
@@ -88,10 +89,9 @@ impl Declarations {
 
     fn finished(&self, root: AgentCommandRoot, cpu_ms: Option<u64>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.live.get(&root.pid) != Some(&root) {
+        if !state.live.remove(&root) {
             return;
         }
-        state.live.remove(&root.pid);
         state.adopted.remove(&root);
         state.push(Event::Finished(AgentCommandFinished {
             pid: root.pid,
@@ -117,7 +117,7 @@ impl Declarations {
             }
         }
         if known {
-            batch.known = Some(state.live.values().copied().collect());
+            batch.known = Some(state.live.iter().copied().collect());
         }
         batch
     }
@@ -232,11 +232,14 @@ impl Declarations {
     }
 
     async fn persist(&self) {
+        // A replaced connection can still be finishing an atomic write. Serialize
+        // snapshots and writes so it cannot overwrite the new connection's roots.
+        let _order = self.persisting.lock().await;
         let (path, roots) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 state.storage.clone(),
-                state.live.values().copied().collect::<Vec<_>>(),
+                state.live.iter().copied().collect::<Vec<_>>(),
             )
         };
         if let Some(path) = path {
@@ -321,21 +324,11 @@ pub(crate) fn finished(root: Option<AgentCommandRoot>, cpu_ms: Option<u64>) {
     }
 }
 
-pub(crate) fn reaped(pid: u32, cpu_ms: Option<u64>) {
-    let root = declarations()
-        .state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .live
-        .get(&pid)
-        .copied();
-    finished(root, cpu_ms);
-}
-
 #[cfg(unix)]
 pub(crate) fn wait4(
     pid: u32,
     flags: libc::c_int,
+    root: Option<AgentCommandRoot>,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     use std::os::unix::process::ExitStatusExt;
     loop {
@@ -352,7 +345,7 @@ pub(crate) fn wait4(
                     .saturating_add(time.tv_usec as u64)
             };
             let cpu_ms = micros(usage.ru_utime).saturating_add(micros(usage.ru_stime)) / 1_000;
-            reaped(pid, Some(cpu_ms));
+            finished(root, Some(cpu_ms));
             return Ok(Some(std::process::ExitStatus::from_raw(status)));
         }
         if result == 0 {
@@ -384,12 +377,15 @@ pub(crate) fn windows_cpu_ms(handle: std::os::windows::io::RawHandle) -> Option<
 
 #[cfg(windows)]
 #[derive(Debug)]
-pub(crate) struct WindowsChild(std::process::Child);
+pub(crate) struct WindowsChild {
+    child: std::process::Child,
+    root: Option<AgentCommandRoot>,
+}
 
 #[cfg(windows)]
 impl From<std::process::Child> for WindowsChild {
     fn from(child: std::process::Child) -> Self {
-        Self(child)
+        Self { child, root: None }
     }
 }
 
@@ -397,72 +393,77 @@ impl From<std::process::Child> for WindowsChild {
 impl std::ops::Deref for WindowsChild {
     type Target = std::process::Child;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.child
     }
 }
 
 #[cfg(windows)]
 impl std::ops::DerefMut for WindowsChild {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.child
     }
 }
 
 #[cfg(windows)]
 impl WindowsChild {
+    pub(crate) fn declare_agent(&mut self) {
+        self.root = started(self.child.id());
+    }
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let status = self.0.try_wait()?;
+        let status = self.child.try_wait()?;
         if status.is_some() {
             self.finished();
         }
         Ok(status)
     }
     pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let status = self.0.wait()?;
+        let status = self.child.wait()?;
         self.finished();
         Ok(status)
     }
     fn finished(&self) {
         use std::os::windows::io::AsRawHandle;
-        reaped(self.0.id(), windows_cpu_ms(self.0.as_raw_handle()));
+        finished(self.root, windows_cpu_ms(self.child.as_raw_handle()));
     }
 }
 
 pub(crate) fn wait_pty(
     child: &mut dyn portable_pty::Child,
+    root: Option<AgentCommandRoot>,
 ) -> std::io::Result<portable_pty::ExitStatus> {
     #[cfg(unix)]
     if let Some(pid) = child.process_id() {
-        return wait4(pid, 0)?
+        return wait4(pid, 0, root)?
             .map(Into::into)
             .ok_or_else(|| std::io::Error::other("wait4 returned no status"));
     }
     let status = child.wait()?;
-    if let Some(pid) = child.process_id() {
+    if root.is_some() {
         #[cfg(windows)]
         let cpu = child.as_raw_handle().and_then(windows_cpu_ms);
         #[cfg(not(windows))]
         let cpu = None;
-        reaped(pid, cpu);
+        finished(root, cpu);
     }
     Ok(status)
 }
 
 pub(crate) fn try_wait_pty(
     child: &mut dyn portable_pty::Child,
+    root: Option<AgentCommandRoot>,
 ) -> std::io::Result<Option<portable_pty::ExitStatus>> {
     #[cfg(unix)]
     if let Some(pid) = child.process_id() {
-        return wait4(pid, libc::WNOHANG).map(|status| status.map(Into::into));
+        return wait4(pid, libc::WNOHANG, root).map(|status| status.map(Into::into));
     }
     let status = child.try_wait()?;
     if status.is_some() {
-        if let Some(pid) = child.process_id() {
+        if root.is_some() {
             #[cfg(windows)]
             let cpu = child.as_raw_handle().and_then(windows_cpu_ms);
             #[cfg(not(windows))]
             let cpu = None;
-            reaped(pid, cpu);
+            finished(root, cpu);
         }
     }
     Ok(status)
@@ -501,6 +502,35 @@ mod tests {
             pid,
             start_time_ms: 1_700_000_000_000 + u64::from(pid),
         }
+    }
+
+    #[test]
+    fn agent_commands_reused_pid_finishes_only_the_original_kernel_identity() {
+        let hub = Declarations::default();
+        let old = root(42);
+        let new = AgentCommandRoot {
+            start_time_ms: old.start_time_ms + 1,
+            ..old
+        };
+        hub.started(old);
+        hub.started(new);
+        hub.finished(old, Some(250));
+        let batch = hub.batch(true);
+        assert_eq!(batch.known, Some(vec![new]));
+        assert_eq!(
+            batch.finished,
+            [AgentCommandFinished {
+                pid: old.pid,
+                start_time_ms: old.start_time_ms,
+                cpu_ms: Some(250)
+            }]
+        );
+        hub.finished(old, Some(250));
+        assert_eq!(
+            hub.batch(true).finished.len(),
+            1,
+            "cached waits must not finish twice or settle the reused PID"
+        );
     }
 
     #[tokio::test]

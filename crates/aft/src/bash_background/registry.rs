@@ -5738,7 +5738,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
-        crate::agent_commands::started(child_pid);
+        child.declare_agent();
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
             let _ = child.wait();
@@ -6571,7 +6571,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
-        crate::agent_commands::started(child_pid);
+        child.declare_agent();
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 let _ = child.kill();

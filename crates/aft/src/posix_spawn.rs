@@ -28,6 +28,9 @@ pub(crate) struct Child {
     handle: Handle,
     pub(crate) stdin: Option<File>,
     reaped: Option<ExitStatus>,
+    // The kernel may reuse the PID as soon as wait4 returns; keep the identity
+    // that was declared, rather than looking up a possibly newer child at reap.
+    agent_root: Option<subc_client_rs::AgentCommandRoot>,
 }
 impl From<std::process::Child> for Child {
     fn from(mut child: std::process::Child) -> Self {
@@ -39,10 +42,14 @@ impl From<std::process::Child> for Child {
             handle: Handle::Std(child),
             stdin,
             reaped: None,
+            agent_root: None,
         }
     }
 }
 impl Child {
+    pub(crate) fn declare_agent(&mut self) {
+        self.agent_root = crate::agent_commands::started(self.id());
+    }
     #[cfg(test)]
     pub(crate) fn kill(&mut self) -> io::Result<()> {
         if self.reaped.is_some() {
@@ -84,7 +91,7 @@ impl Child {
     }
     fn wait_inner(&mut self, flags: libc::c_int) -> io::Result<Option<ExitStatus>> {
         if self.reaped.is_none() {
-            self.reaped = crate::agent_commands::wait4(self.id(), flags)?;
+            self.reaped = crate::agent_commands::wait4(self.id(), flags, self.agent_root)?;
             if let Handle::Native { status, .. } = &mut self.handle {
                 *status = self.reaped;
             }
@@ -562,6 +569,7 @@ fn spawn_native(
             handle: Handle::Native { pid, status: None },
             stdin: parent_stdin,
             reaped: None,
+            agent_root: None,
         })
     }
 }

@@ -28,13 +28,18 @@ const PTY_SETUP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 struct SpawnedPtyChild {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    root: Option<subc_client_rs::AgentCommandRoot>,
 }
 
 impl SpawnedPtyChild {
-    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        root: Option<subc_client_rs::AgentCommandRoot>,
+    ) -> Self {
         Self {
             child: Some(child),
             master: None,
+            root,
         }
     }
 }
@@ -62,7 +67,7 @@ impl Drop for SpawnedPtyChild {
             }
         }
         let _ = child.kill();
-        if let Err(error) = reap_killed_child(child.as_mut(), PTY_SETUP_REAP_TIMEOUT) {
+        if let Err(error) = reap_killed_child(child.as_mut(), PTY_SETUP_REAP_TIMEOUT, self.root) {
             crate::slog_warn!("PTY setup cleanup: {error}");
         }
     }
@@ -74,11 +79,12 @@ impl Drop for SpawnedPtyChild {
 fn reap_killed_child(
     child: &mut (dyn portable_pty::Child + Send + Sync),
     timeout: std::time::Duration,
+    root: Option<subc_client_rs::AgentCommandRoot>,
 ) -> Result<(), String> {
     let pid = child.process_id();
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match crate::agent_commands::try_wait_pty(child) {
+        match crate::agent_commands::try_wait_pty(child, root) {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -417,11 +423,10 @@ fn try_spawn_pty(
     let mut child = SpawnedPtyChild {
         child: Some(child),
         master: Some(pair.master),
+        root: None,
     };
     let child_pid = child.child.as_ref().unwrap().process_id();
-    if let Some(pid) = child_pid {
-        crate::agent_commands::started(pid);
-    }
+    child.root = child_pid.and_then(crate::agent_commands::started);
     #[cfg(unix)]
     if spawn_plan
         .prepared_task()
@@ -558,6 +563,7 @@ fn try_spawn_pty(
         Arc::clone(&was_killed),
         Arc::clone(&exit_observed),
         Arc::clone(&coordinator),
+        child.root,
     )
     .map_err(|error| format!("failed to start PTY waiter: {error}"))?;
 
@@ -744,12 +750,13 @@ pub(crate) fn spawn_waiter(
     was_killed: Arc<AtomicBool>,
     exit_observed: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
+    root: Option<subc_client_rs::AgentCommandRoot>,
 ) -> io::Result<()> {
-    let mut owned_child = SpawnedPtyChild::new(child);
+    let mut owned_child = SpawnedPtyChild::new(child, root);
     super::worker_thread::spawn(super::worker_thread::Worker::PtyWaiter, move || {
         let mut child = owned_child.child.take().unwrap();
         let marker = loop {
-            match crate::agent_commands::wait_pty(child.as_mut()) {
+            match crate::agent_commands::wait_pty(child.as_mut(), root) {
                 Ok(status) => {
                     if was_killed.load(Ordering::SeqCst) {
                         break ExitMarker::Killed;
@@ -882,6 +889,7 @@ mod tests {
             was_killed,
             Arc::clone(&exit_observed),
             Arc::clone(&coordinator),
+            None,
         )
         .unwrap();
         coordinator.signal_one_done();
@@ -995,7 +1003,7 @@ mod tests {
     fn setup_cleanup_reap_gives_up_with_named_error_after_its_bound() {
         let mut child = NeverExitsChild;
         let started = Instant::now();
-        let error = reap_killed_child(&mut child, Duration::from_millis(100))
+        let error = reap_killed_child(&mut child, Duration::from_millis(100), None)
             .expect_err("a child that never exits must not count as reaped");
         assert!(
             started.elapsed() < Duration::from_secs(5),
