@@ -10,10 +10,7 @@ use secret_rules::location::{
     evaluate_request_with_connect, HeaderField, LabelOutcome, Location, RequestView,
 };
 use secret_rules::material::{check_admissible, encode_for_location};
-use secret_rules::target::{
-    authority_matches_connect, normalize_request_target, ConnectAuthority, RequestTarget,
-    RuleTarget,
-};
+use secret_rules::target::{authority_matches_connect, normalize_request_target, ConnectAuthority};
 use zeroize::Zeroizing;
 
 use super::{full, refusal, Body, State};
@@ -36,9 +33,9 @@ pub(super) async fn forward(
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let fallback = state
         .config
-        .grants
+        .scanned_labels
         .first()
-        .map(|g| g.rule.label.as_str())
+        .map(String::as_str)
         .unwrap_or("");
     let result = if let Some(lease) = &lease {
         prepare_and_send(request, &authority, &state, lease.clone(), &mut audit).await
@@ -120,28 +117,8 @@ async fn prepare_and_send(
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let client_upgrade = ws.then(|| hyper::upgrade::on(&mut request));
     let (mut parts, mut incoming) = request.into_parts();
-    let rules: Vec<_> = state.config.grants.iter().map(|g| g.rule.clone()).collect();
-    let target_view = RequestTarget {
-        host: authority.host.clone(),
-        port: authority.port,
-        scheme: "https",
-        target: &target,
-    };
-    let matches: Vec<_> = rules
-        .iter()
-        .map(|r| {
-            target_view
-                .matches(&RuleTarget {
-                    host: &r.host,
-                    port: r.port,
-                    path_prefix: &r.path_prefix,
-                })
-                .is_ok()
-        })
-        .collect();
-    // A runtime-built header label is not a launch grant. Refuse it before
-    // contacting the vault; other destinations and non-header text are literal.
-    if matches.iter().any(|matched| *matched) {
+    // Runtime-built labels cannot widen the labels scanned at launch.
+    {
         for value in parts.headers.values() {
             for (offset, byte) in value.as_bytes().iter().enumerate() {
                 if *byte != b'{' {
@@ -150,19 +127,29 @@ async fn prepare_and_send(
                 if let Some(placeholder) =
                     secret_rules::placeholder::parse_at(value.as_bytes(), offset)
                 {
-                    if !rules.iter().any(|rule| rule.label == placeholder.label) {
+                    if !state
+                        .config
+                        .scanned_labels
+                        .iter()
+                        .any(|label| label == placeholder.label)
+                    {
                         return Err(placeholder.label.to_owned());
                     }
                 }
             }
         }
     }
-    let has_json = rules
-        .iter()
-        .zip(&matches)
-        .any(|(r, m)| *m && matches!(r.location, Location::Json(_)));
-    // Only JSON substitution needs a buffered body. Other uploads remain
-    // streaming; they are never searched for placeholders outside their rule.
+    // A JSON deposit is not known until the addressed release. Buffer bounded
+    // JSON requests so their placeholders can be discovered before asking.
+    let has_json = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
+        });
     let mut body = body_buffer(has_json);
     if has_json {
         while let Some(frame) = incoming.frame().await {
@@ -185,6 +172,56 @@ async fn prepare_and_send(
             }
         }
     }
+    let path = target.split(['?', '#']).next().unwrap_or("/");
+    let path = normalize_request_target(path).map_err(|_| fail())?;
+    let addressed = crate::secret::ApiKeyTarget {
+        scheme: "https".into(),
+        host: authority.host.clone(),
+        port: Some(443),
+        path: String::from_utf8(path.wire).map_err(|_| fail())?,
+    };
+    let mut rules = Vec::new();
+    let mut materials = Vec::new();
+    for label in &state.config.scanned_labels {
+        if !super::audit::mentions(target.as_bytes(), label)
+            && !parts
+                .headers
+                .values()
+                .any(|value| super::audit::mentions(value.as_bytes(), label))
+            && !super::audit::mentions(&body, label)
+        {
+            continue;
+        }
+        audit.mention(label);
+        if !state.is_https_port(authority.port) {
+            continue;
+        }
+        let answer = match state.approvals.use_for_request(label, &addressed).await {
+            Ok(answer) => answer,
+            Err(()) => return Ok(not_approved(label, &authority.host)),
+        };
+        match answer {
+            crate::secret::UseAnswer::NotFound => continue,
+            crate::secret::UseAnswer::Released(released) => {
+                let (location, material) = released.into_parts();
+                let location = secret_rules::location::parse_vault_location(&location)
+                    .map_err(|_| label.clone())?;
+                check_admissible(material.expose(), label, &location).map_err(|_| label.clone())?;
+                state
+                    .install(label, material.expose())
+                    .map_err(|_| label.clone())?;
+                rules.push(secret_rules::location::LabelRule {
+                    label: label.clone(),
+                    host: addressed.host.clone(),
+                    port: authority.port,
+                    path_prefix: addressed.path.clone(),
+                    location,
+                });
+                materials.push(Some(material));
+            }
+            _ => return Err(label.clone()),
+        }
+    }
     let headers = parts
         .headers
         .iter()
@@ -203,53 +240,19 @@ async fn prepare_and_send(
     }
     if has_json {
         let json: serde_json::Value = serde_json::from_slice(&body).map_err(|_| fail())?;
-        for (rule, matched) in rules.iter().zip(&matches) {
+        for rule in &rules {
             if let Location::Json(pointer) = &rule.location {
-                if *matched && json.pointer(pointer).is_some_and(|v| !v.is_string()) {
+                if json.pointer(pointer).is_some_and(|v| !v.is_string()) {
                     return Err(rule.label.clone());
                 }
             }
         }
     }
-    for (grant, matched) in state.config.grants.iter().zip(&matches) {
-        if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
-            return Err(grant.rule.label.clone());
-        }
-    }
-    // Authenticate the upstream first. Material is the vault's revocation
-    // check, so obtain it only after asynchronous connection work ends.
+    // No HTTP request reaches the upstream until every required approval ends.
     let upstream = connect_upstream(authority, state, ws).await?;
     let http2 = matches!(&upstream, Upstream::Http2(_));
     let response = {
         let _gate = state.material_gate.lock();
-        let mut materials = Vec::new();
-        for ((rule, matched), grant) in rules.iter().zip(&matches).zip(&state.config.grants) {
-            if !matched {
-                materials.push(None);
-                continue;
-            }
-            if state.stopped.load(Ordering::Acquire)
-                || !state.generation_valid()
-                || crate::secret::vault::now_ms() >= grant.expires_at_ms
-            {
-                return Err(rule.label.clone());
-            }
-            let material = state
-                .config
-                .vault
-                .material(
-                    &state.config.authorization_scope,
-                    &rule.label,
-                    &rule.grant_id,
-                )
-                .map_err(|_| rule.label.clone())?;
-            check_admissible(material.expose(), &rule.label, &rule.location)
-                .map_err(|_| rule.label.clone())?;
-            state
-                .install(&rule.label, material.expose())
-                .map_err(|_| rule.label.clone())?;
-            materials.push(Some(material));
-        }
         let mut query_edits = Vec::new();
         let mut body_edits = Vec::new();
         let mut header_edits = Vec::new();
@@ -352,19 +355,9 @@ async fn prepare_and_send(
         if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
             return Err(fail());
         }
-        for (grant, matched) in state.config.grants.iter().zip(&matches) {
-            if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
-                return Err(grant.rule.label.clone());
-            }
-        }
-        audit.decide(&plan.labels)?;
+        audit.decide(&rules, &plan.labels)?;
         if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
             return Err(fail());
-        }
-        for (grant, matched) in state.config.grants.iter().zip(&matches) {
-            if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
-                return Err(grant.rule.label.clone());
-            }
         }
         let response = upstream.send(outbound);
         drop(materials);
@@ -374,6 +367,14 @@ async fn prepare_and_send(
     super::response::forward(response, state.clone(), client_upgrade, lease)
         .await
         .map_err(|_| fail())
+}
+
+fn not_approved(label: &str, host: &str) -> Response<Body> {
+    let mut response = Response::new(full(Bytes::from(format!(
+        "secret {label} was not approved for {host}; the request was not sent"
+    ))));
+    *response.status_mut() = hyper::StatusCode::FORBIDDEN;
+    response
 }
 
 pub(super) fn body_buffer(_has_json: bool) -> Zeroizing<Vec<u8>> {

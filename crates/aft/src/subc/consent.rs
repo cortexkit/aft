@@ -268,6 +268,7 @@ static TEST_TRANSPORT: LazyLock<StdMutex<Option<Arc<dyn ConsentTransport>>>> =
 
 /// Install the production transport for this process's daemon connection.
 pub(super) fn install_subc_transport(connection_file: &Path) {
+    crate::secret::transport::install_connection_file(connection_file);
     let transport: Arc<dyn ConsentTransport> = Arc::new(SharedSubcConsent(Arc::new(
         SubcConsentTransport::new(connection_file.to_path_buf()),
     )));

@@ -187,6 +187,13 @@ pub struct ReleasedApiKey {
 }
 
 impl ReleasedApiKey {
+    pub fn new(location: String, bytes: crate::secret::vault::Material) -> Self {
+        Self { location, bytes }
+    }
+
+    pub fn into_parts(self) -> (String, crate::secret::vault::Material) {
+        (self.location, self.bytes)
+    }
     /// The key bytes for the one request that may carry them.
     pub fn material(&self) -> &[u8] {
         self.bytes.expose()

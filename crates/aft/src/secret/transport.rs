@@ -1,6 +1,7 @@
 //! Bounded `secret.use` calls over the daemon's attested consumer routes.
 
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -12,12 +13,44 @@ use zeroize::Zeroizing;
 use super::vault::SecretUseTransport;
 
 const UNAVAILABLE: &str = "secret.use transport unavailable";
+static CONNECTION_FILE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+pub(crate) fn install_connection_file(path: &std::path::Path) {
+    *CONNECTION_FILE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_owned());
+}
+
+pub(crate) fn for_current_command() -> Option<SubcSecretUseTransport> {
+    let path = CONNECTION_FILE.read().ok()?.clone()?;
+    let (_, session) = crate::subc::current_secret_consent_context()?;
+    SubcSecretUseTransport::new(
+        path,
+        BindIdentity::new("aft-secret-use", session),
+        Duration::from_secs(15),
+    )
+}
 
 /// A transport for a future request-addressed vault client. Construct it at call
 /// time: a standalone process has no module identity and must not open as direct.
-/// No connection or vault availability is cached across calls.
+/// One command owns one consumer connection; failed connections are discarded so
+/// a later request can reconnect after the daemon returns.
 #[derive(Clone)]
 pub struct SubcSecretUseTransport {
+    connection_file: PathBuf,
+    identity: BindIdentity,
+    timeout: Duration,
+    worker: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<Work>>>,
+}
+
+struct Work {
+    params: Value,
+    principal: ConsumerIdentity,
+    deadline: tokio::time::Instant,
+    reply: std::sync::mpsc::Sender<Result<Value, String>>,
+}
+
+struct ConnectionConfig {
     connection_file: PathBuf,
     identity: BindIdentity,
     timeout: Duration,
@@ -36,10 +69,16 @@ impl SubcSecretUseTransport {
             connection_file,
             identity,
             timeout,
+            worker: Arc::default(),
         })
     }
 
-    async fn send(&self, params: Value, principal: ConsumerIdentity) -> Result<Value, String> {
+    async fn send(
+        config: &ConnectionConfig,
+        consumer: &subc_client_rs::SubcConsumer,
+        params: Value,
+        principal: ConsumerIdentity,
+    ) -> Result<Value, String> {
         let target = &params["target"];
         if target["scheme"] != "https"
             || target
@@ -54,83 +93,117 @@ impl SubcSecretUseTransport {
         let scope = ScopeSelector::new(stamp.owner, stamp.scope_ref, Some(stamp.scope_epoch));
         let body = serde_json::to_vec(&json!({"method": "secret.use", "params": params}))
             .map_err(|_| UNAVAILABLE.to_owned())?;
-        let consumer = crate::fleet_status::connect_subc_consumer(
-            &self.connection_file,
-            ConsumerOptions::default(),
-        )
-        .await
-        .map_err(|_| UNAVAILABLE.to_owned())?;
-        // Each call owns its consumer, so closing a route cannot interrupt a
-        // concurrent use of an SDK-cached handle. Dropping the call's runtime on
-        // timeout also drops the connection and all of its routes.
-        let result = async {
-            let route = consumer
-                .open_route_scoped(
-                    RouteTarget::ManagementSurface {
-                        module_id: "claustrum".into(),
-                    },
-                    self.identity.clone(),
-                    scope,
-                    CallOptions {
-                        consumer_identity: Some(principal),
-                        timeout: self.timeout,
-                        route_retry_deadline: self.timeout,
-                        ..CallOptions::default()
-                    },
-                )
-                .await
-                .map_err(|_| UNAVAILABLE.to_owned())?;
-            let reply = consumer
-                .request(
-                    &route,
-                    body,
-                    CallOptions {
-                        timeout: self.timeout,
-                        ..CallOptions::default()
-                    },
-                )
-                .await;
-            let result = match reply {
-                Ok(bytes) => {
-                    let bytes = Zeroizing::new(bytes);
-                    serde_json::from_slice(&bytes).map_err(|_| UNAVAILABLE.to_owned())
-                }
-                // Preserve the distinction between a module Error frame and a
-                // result refusal. Do not include SDK errors or reply bytes in
-                // transport diagnostics: either could carry released material.
-                Err(CallError::Module(error)) => Ok(json!({
-                    "code": error.code,
-                    "message": error.message,
-                })),
-                Err(_) => Err(UNAVAILABLE.to_owned()),
-            };
-            let _ = consumer
-                .close_handle(&route, subc_client_rs::CloseRouteOptions::default())
-                .await;
-            result
+        let route = consumer
+            .open_route_scoped(
+                RouteTarget::ManagementSurface {
+                    module_id: "claustrum".into(),
+                },
+                config.identity.clone(),
+                scope,
+                CallOptions {
+                    consumer_identity: Some(principal),
+                    timeout: config.timeout,
+                    route_retry_deadline: config.timeout,
+                    ..CallOptions::default()
+                },
+            )
+            .await
+            .map_err(|_| UNAVAILABLE.to_owned())?;
+        let reply = consumer
+            .request(
+                &route,
+                body,
+                CallOptions {
+                    timeout: config.timeout,
+                    ..CallOptions::default()
+                },
+            )
+            .await;
+        match reply {
+            Ok(bytes) => {
+                let bytes = Zeroizing::new(bytes);
+                serde_json::from_slice(&bytes).map_err(|_| UNAVAILABLE.to_owned())
+            }
+            // Preserve the distinction between a module Error frame and a
+            // result refusal. Do not include SDK errors or reply bytes in
+            // transport diagnostics: either could carry released material.
+            Err(CallError::Module(error)) => Ok(json!({
+                "code": error.code,
+                "message": error.message,
+            })),
+            Err(_) => Err(UNAVAILABLE.to_owned()),
         }
-        .await;
-        let _ = consumer.close().await;
-        result
     }
 
     fn dispatch(&self, params: Value, principal: ConsumerIdentity) -> Result<Value, String> {
-        let this = self.clone();
-        // The seam is synchronous and is also used outside Tokio. A dedicated
-        // runtime avoids entering a nested runtime on the caller's executor thread.
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| UNAVAILABLE.to_owned())?;
-            runtime.block_on(async {
-                tokio::time::timeout(this.timeout, this.send(params, principal))
-                    .await
-                    .map_err(|_| UNAVAILABLE.to_owned())?
+        let sender = self.worker.get_or_init(|| {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let config = ConnectionConfig {
+                connection_file: self.connection_file.clone(),
+                identity: self.identity.clone(),
+                timeout: self.timeout,
+            };
+            std::thread::spawn(move || {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    runtime.block_on(Self::serve(config, receiver));
+                }
+            });
+            sender
+        });
+        let (reply, answer) = std::sync::mpsc::channel();
+        sender
+            .send(Work {
+                params,
+                principal,
+                deadline: tokio::time::Instant::now() + self.timeout,
+                reply,
             })
-        })
-        .join()
-        .map_err(|_| UNAVAILABLE.to_owned())?
+            .map_err(|_| UNAVAILABLE.to_owned())?;
+        answer
+            .recv_timeout(self.timeout)
+            .map_err(|_| UNAVAILABLE.to_owned())?
+    }
+
+    async fn serve(
+        config: ConnectionConfig,
+        mut receiver: tokio::sync::mpsc::UnboundedReceiver<Work>,
+    ) {
+        let mut consumer = None;
+        while let Some(work) = receiver.recv().await {
+            let result = tokio::time::timeout_at(work.deadline, async {
+                if consumer.is_none() {
+                    consumer = Some(
+                        crate::fleet_status::connect_subc_consumer(
+                            &config.connection_file,
+                            ConsumerOptions::default(),
+                        )
+                        .await
+                        .map_err(|_| UNAVAILABLE.to_owned())?,
+                    );
+                }
+                Self::send(
+                    &config,
+                    consumer.as_ref().expect("connected consumer"),
+                    work.params,
+                    work.principal,
+                )
+                .await
+            })
+            .await
+            .unwrap_or_else(|_| Err(UNAVAILABLE.to_owned()));
+            if result.is_err() {
+                if let Some(failed) = consumer.take() {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), failed.close()).await;
+                }
+            }
+            let _ = work.reply.send(result);
+        }
+        if let Some(consumer) = consumer {
+            let _ = tokio::time::timeout(Duration::from_secs(1), consumer.close()).await;
+        }
     }
 }
 

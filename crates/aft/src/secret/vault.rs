@@ -1,30 +1,14 @@
-//! The vault seam: the one way AFT asks for a label's rule and key material.
-//!
-//! AFT never reads a key itself. The vault maps a label to a rule in a
-//! `secret.use` reply ([`crate::secret::wire`]), hands over the bytes for one
-//! request or fetch hop, and collects one audit record per decided label.
-//!
-//! `material` exists because a grant is a permission, not a promise of the same
-//! bytes: the vault releases material per request, and AFT must not cache it.
-//! Key bytes live in a zeroizing buffer whose `Debug` prints a length, so no log
-//! line or panic message carries a key.
-//!
-//! The live vault is not deployed and AFT holds no `secret.use` grant yet, so
-//! production wires [`UnavailableVault`], which resolves nothing and releases
-//! nothing. [`SubcSecretVault`] is the real client, built and tested
-//! against the contract's golden examples; it becomes the production stand-in's
-//! replacement once the daemon can carry the call. The fake for tests compiles
-//! only under `cfg(test)` or the `secret-test-fake` feature, which no release
-//! profile enables (`scripts/check-secret-test-fake.sh` checks that in CI).
+//! Request-addressed vault access. Every outgoing use names its real target;
+//! material is zeroized after that request and is never cached between uses.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use secret_rules::audit::AuditRecordV1;
-use secret_rules::location::LabelRule;
 
 use super::wire::{
-    self, ApprovalRequest, SecretUseAnswer, SecretUseReply, SecretUseRequest, VaultError,
+    self, ApiKeyTarget, ApprovalRequest, ReleasedApiKey, SecretUseAnswer, SecretUseReply,
+    SecretUseRequest,
 };
 
 /// Key bytes for one request or fetch hop.
@@ -83,45 +67,17 @@ pub fn zeroize(bytes: &mut [u8]) {
     std::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
-/// What the vault says about one label.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Resolution {
-    /// A rule to follow and the grant that allows material for it.
-    Granted {
-        /// Where and how the placeholder may be replaced.
-        rule: LabelRule,
-        /// Opaque grant identifier passed back to `material`.
-        grant_id: String,
-        /// When the grant lapses, in milliseconds since the epoch.
-        expires_at_ms: u64,
-    },
+/// What the vault says about one concrete outgoing request.
+#[derive(Debug)]
+pub enum UseAnswer {
+    /// Key and location for this request only.
+    Released(ReleasedApiKey),
     /// The vault is waiting for the user's answer.
     ApprovalRequired(ApprovalRequest),
-    /// The vault refused the label.
-    Denied {
-        /// The vault's reason, plain text with no key material.
-        reason: String,
-    },
-    /// No vault answers. Production answers this until the vault ships and AFT
-    /// holds a grant, which keeps the seam fail-closed.
+    /// Uniform refusal: forwarding the literal placeholder reveals no key.
+    NotFound,
+    /// Transport, grammar, setup, and store failures never permit substitution.
     Unavailable,
-}
-
-/// Why `material` handed out no bytes.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum MaterialError {
-    /// The grant lapsed: its expiry passed, it was revoked, or its scope ended.
-    GrantLapsed,
-    /// The vault could not be reached, or answered transiently.
-    Unavailable {
-        /// Plain-text detail with no key material.
-        detail: String,
-    },
-    /// The vault refused to release material for the grant.
-    Refused {
-        /// The vault's reason, plain text with no key material.
-        reason: String,
-    },
 }
 
 /// Why `audit` did not take a record.
@@ -140,23 +96,19 @@ pub enum AuditError {
     },
 }
 
-/// The three calls AFT makes on the vault.
+/// Request-addressed release and local audit reporting.
 ///
 /// Both scopes are [`crate::secret::SecretScope`] values the daemon stamped,
 /// never tool arguments or session ids.
 pub trait SecretVault: Send + Sync {
-    /// Ask which rule a label follows, without asking for the key bytes.
-    fn resolve(&self, scope: &crate::secret::SecretScope, label: &str) -> Resolution;
-
-    /// Fetch the bytes for one request or fetch hop whose target matched the
-    /// rule that `grant_id` belongs to. Called once per matching request; the
-    /// same grant may release different bytes after a rotation.
-    fn material(
+    /// Ask once for every outgoing request, including repeated requests after
+    /// approval. The vault audits uses and may rotate material between calls.
+    fn use_secret(
         &self,
         scope: &crate::secret::SecretScope,
         label: &str,
-        grant_id: &str,
-    ) -> Result<Material, MaterialError>;
+        target: &ApiKeyTarget,
+    ) -> UseAnswer;
 
     /// Hand one record to the vault's audit sink.
     fn audit(&self, record: &AuditRecordV1) -> Result<(), AuditError>;
@@ -170,30 +122,18 @@ pub trait SecretVault: Send + Sync {
     }
 }
 
-/// The vault production uses while the live vault is undeployed and AFT holds
-/// no `secret.use` grant.
-///
-/// Every resolution is `Unavailable` and `material` refuses, so nothing is ever
-/// substituted without a real grant, whatever the configuration says. No config
-/// file, environment variable or project setting selects another production
-/// vault, so this cannot be switched on by mistake.
+/// Standalone processes have no attested AFT identity and cannot ask the vault.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnavailableVault;
 
 impl SecretVault for UnavailableVault {
-    fn resolve(&self, _scope: &crate::secret::SecretScope, _label: &str) -> Resolution {
-        Resolution::Unavailable
-    }
-
-    fn material(
+    fn use_secret(
         &self,
         _scope: &crate::secret::SecretScope,
         _label: &str,
-        _grant_id: &str,
-    ) -> Result<Material, MaterialError> {
-        Err(MaterialError::Unavailable {
-            detail: "no vault is connected".into(),
-        })
+        _target: &ApiKeyTarget,
+    ) -> UseAnswer {
+        UseAnswer::Unavailable
     }
 
     fn audit(&self, _record: &AuditRecordV1) -> Result<(), AuditError> {
@@ -238,9 +178,7 @@ pub trait SecretUseTransport: Send + Sync {
 /// The real client: `secret.use` over the daemon's transport (§15).
 ///
 /// AFT is one of only two senders the vault admits, and it receives only API
-/// keys. `resolve` reads the reply's rule without keeping any bytes the vault
-/// may have released; a released key at resolution time is zeroized
-/// immediately, exactly as the contract's material rule requires.
+/// keys. Each reply belongs to the real target supplied with that call.
 pub struct SubcSecretVault {
     transport: std::sync::Arc<dyn SecretUseTransport>,
 }
@@ -274,66 +212,21 @@ impl SubcSecretVault {
 }
 
 impl SecretVault for SubcSecretVault {
-    fn resolve(&self, scope: &crate::secret::SecretScope, label: &str) -> Resolution {
-        // A resolution asks about every path, so it names the root path: the
-        // contract matches the target against the record's sealed scope, and a
-        // released key here is dropped, never kept.
-        let target = scope.root_target();
-        match self.call(scope, label, target) {
-            Ok(SecretUseAnswer::Reply(SecretUseReply::ReleasedApiKey(key))) => {
-                let rule = scope.rule_for(label, &key.location);
-                // The released bytes are not what this call asked for; drop them
-                // so they are zeroized here rather than retained.
-                drop(key);
-                Resolution::Granted {
-                    rule,
-                    grant_id: String::new(),
-                    expires_at_ms: 0,
-                }
-            }
-            Ok(SecretUseAnswer::Reply(SecretUseReply::ReleasedLogin(_))) => Resolution::Denied {
-                reason: "the vault released a login to a sender that only takes API keys".into(),
-            },
-            Ok(SecretUseAnswer::Reply(SecretUseReply::ApprovalRequired(request))) => {
-                Resolution::ApprovalRequired(request)
-            }
-            Ok(SecretUseAnswer::Refused(error)) => resolution_for_error(&error),
-            Ok(SecretUseAnswer::Rejected(error)) => {
-                if error.code == "invalid_params" {
-                    Resolution::Denied {
-                        reason: format!("the vault refused the request: {}", error.code),
-                    }
-                } else {
-                    Resolution::Unavailable
-                }
-            }
-            Err(_) => Resolution::Unavailable,
-        }
-    }
-
-    fn material(
+    fn use_secret(
         &self,
         scope: &crate::secret::SecretScope,
         label: &str,
-        _grant_id: &str,
-    ) -> Result<Material, MaterialError> {
-        let target = scope.root_target();
-        match self.call(scope, label, target) {
+        target: &ApiKeyTarget,
+    ) -> UseAnswer {
+        match self.call(scope, label, wire::Target::ApiKey(target.clone())) {
             Ok(SecretUseAnswer::Reply(SecretUseReply::ReleasedApiKey(key))) => {
-                Ok(Material::new(key.material().to_vec()))
+                UseAnswer::Released(key)
             }
-            Ok(SecretUseAnswer::Reply(SecretUseReply::ReleasedLogin(_))) => {
-                Err(MaterialError::Refused {
-                    reason: "the vault released a login, not an API key".into(),
-                })
+            Ok(SecretUseAnswer::Reply(SecretUseReply::ApprovalRequired(request))) => {
+                UseAnswer::ApprovalRequired(request)
             }
-            Ok(SecretUseAnswer::Reply(SecretUseReply::ApprovalRequired(_))) => {
-                Err(MaterialError::GrantLapsed)
-            }
-            Ok(SecretUseAnswer::Refused(error)) => Err(error_for_material(&error)),
-            Ok(SecretUseAnswer::Rejected(_)) | Err(_) => Err(MaterialError::Unavailable {
-                detail: "the vault did not answer".into(),
-            }),
+            Ok(SecretUseAnswer::Refused(error)) if error.code == "not_found" => UseAnswer::NotFound,
+            _ => UseAnswer::Unavailable,
         }
     }
 
@@ -342,26 +235,6 @@ impl SecretVault for SubcSecretVault {
         // counter is the honest record until one lands.
         UNRECORDED_AUDIT_RECORDS.fetch_add(1, Ordering::Relaxed);
         Ok(())
-    }
-}
-
-/// Map a result error onto a resolution (the outcome table).
-fn resolution_for_error(error: &VaultError) -> Resolution {
-    match error.code.as_str() {
-        "not_found" | "invalid_params" => Resolution::Denied {
-            reason: "the vault does not know this secret or target".into(),
-        },
-        _ => Resolution::Unavailable,
-    }
-}
-
-/// Map a result error onto a material refusal.
-fn error_for_material(error: &VaultError) -> MaterialError {
-    match error.code.as_str() {
-        "not_found" => MaterialError::GrantLapsed,
-        code => MaterialError::Refused {
-            reason: format!("the vault refused to release the secret: {code}"),
-        },
     }
 }
 

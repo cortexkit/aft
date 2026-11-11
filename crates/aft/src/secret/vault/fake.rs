@@ -12,20 +12,29 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use secret_rules::audit::AuditRecordV1;
 use secret_rules::location::LabelRule;
 
-use super::{AuditError, Material, MaterialError, Resolution, SecretVault};
+use super::{AuditError, Material, SecretVault, UseAnswer};
 use crate::secret::wire::ApprovalRequest;
 use crate::secret::SecretScope;
+use crate::secret::{ApiKeyTarget, ReleasedApiKey};
 
 /// Everything a test makes the fake say, plus the record of what it was asked.
 #[derive(Default)]
 pub struct FakeVaultScript {
     /// The answer `resolve` gives, per label. A label with no entry answers
     /// `Unavailable`, which is also what an unconfigured vault says.
-    pub resolutions: HashMap<String, Resolution>,
+    pub answers: HashMap<String, FakeReply>,
     /// Bytes `material` hands out, per label, taking one entry per call so a
     /// test can rotate a key under one grant. A label runs out of bytes and
     /// then repeats the last one.
     pub material: HashMap<String, Vec<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum FakeReply {
+    Rule(LabelRule),
+    ApprovalRequired(ApprovalRequest),
+    NotFound,
+    Unavailable,
 }
 
 struct FakeVaultState {
@@ -94,11 +103,8 @@ impl FakeVault {
     }
 
     /// Make `resolve` answer `label` with `resolution`.
-    pub fn set_resolution(&self, label: &str, resolution: Resolution) {
-        self.lock()
-            .script
-            .resolutions
-            .insert(label.to_string(), resolution);
+    pub fn set_answer(&self, label: &str, answer: FakeReply) {
+        self.lock().script.answers.insert(label.to_string(), answer);
     }
 
     /// The bytes `material` hands out for `label`, in call order.
@@ -115,7 +121,7 @@ impl FakeVault {
     }
 
     /// How many times `resolve` was called.
-    pub fn resolve_calls(&self) -> u64 {
+    pub fn use_calls(&self) -> u64 {
         self.resolve_count.load(Ordering::SeqCst)
     }
 
@@ -145,18 +151,14 @@ impl FakeVault {
     }
 
     /// The next bytes for `label`, honouring rotation.
-    fn next_material(&self, label: &str) -> Result<Material, MaterialError> {
+    fn next_material(&self, label: &str) -> Option<Material> {
         let mut state = self.lock();
         state.materials.push(label.to_string());
         let Some(count) = state.script.material.get(label).map(Vec::len) else {
-            return Err(MaterialError::Refused {
-                reason: "the fake vault has no material for this label".into(),
-            });
+            return None;
         };
         if count == 0 {
-            return Err(MaterialError::Refused {
-                reason: "the fake vault's material list is empty".into(),
-            });
+            return None;
         }
         let index = {
             // Rotation advances per label, so a second request under the same
@@ -167,31 +169,54 @@ impl FakeVault {
             index
         };
         let bytes = state.script.material[label][index].clone();
-        Ok(Material::new(bytes))
+        Some(Material::new(bytes))
     }
 }
 
 impl SecretVault for FakeVault {
-    fn resolve(&self, _scope: &SecretScope, label: &str) -> Resolution {
+    fn use_secret(&self, _scope: &SecretScope, label: &str, target: &ApiKeyTarget) -> UseAnswer {
         self.resolve_count.fetch_add(1, Ordering::SeqCst);
-        let mut state = self.lock();
-        state.resolves.push(label.to_string());
-        state
-            .script
-            .resolutions
-            .get(label)
-            .cloned()
-            .unwrap_or(Resolution::Unavailable)
-    }
-
-    fn material(
-        &self,
-        _scope: &SecretScope,
-        label: &str,
-        _grant_id: &str,
-    ) -> Result<Material, MaterialError> {
-        self.material_count.fetch_add(1, Ordering::SeqCst);
-        self.next_material(label)
+        let answer = {
+            let mut state = self.lock();
+            state.resolves.push(label.to_string());
+            state
+                .script
+                .answers
+                .get(label)
+                .cloned()
+                .unwrap_or(FakeReply::Unavailable)
+        };
+        match answer {
+            FakeReply::Rule(rule) => {
+                let request = secret_rules::target::RequestTarget {
+                    host: target.host.clone(),
+                    port: target.port.unwrap_or(443),
+                    scheme: &target.scheme,
+                    target: &target.path,
+                };
+                if request
+                    .matches(&secret_rules::target::RuleTarget {
+                        host: &rule.host,
+                        port: rule.port,
+                        path_prefix: &rule.path_prefix,
+                    })
+                    .is_err()
+                {
+                    return UseAnswer::NotFound;
+                }
+                self.material_count.fetch_add(1, Ordering::SeqCst);
+                match self.next_material(label) {
+                    Some(material) => UseAnswer::Released(ReleasedApiKey::new(
+                        location_text(&rule.location),
+                        material,
+                    )),
+                    None => UseAnswer::Unavailable,
+                }
+            }
+            FakeReply::ApprovalRequired(pending) => UseAnswer::ApprovalRequired(pending),
+            FakeReply::NotFound => UseAnswer::NotFound,
+            FakeReply::Unavailable => UseAnswer::Unavailable,
+        }
     }
 
     fn audit(&self, record: &AuditRecordV1) -> Result<(), AuditError> {
@@ -208,12 +233,18 @@ impl SecretVault for FakeVault {
     }
 }
 
-/// A granted resolution for tests.
-pub fn granted(rule: LabelRule, grant_id: &str) -> Resolution {
-    Resolution::Granted {
-        rule,
-        grant_id: grant_id.to_string(),
-        expires_at_ms: 0,
+/// A matching record for an addressed test call.
+pub fn granted(rule: LabelRule) -> FakeReply {
+    FakeReply::Rule(rule)
+}
+
+pub(crate) fn location_text(location: &secret_rules::location::Location) -> String {
+    use secret_rules::location::Location;
+    match location {
+        Location::Bearer => "authorization_bearer".into(),
+        Location::Header(name) => format!("header:{name}"),
+        Location::Query(name) => format!("query:{name}"),
+        Location::Json(pointer) => format!("json_pointer:{pointer}"),
     }
 }
 

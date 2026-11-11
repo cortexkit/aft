@@ -19,7 +19,7 @@ use crate::sandbox_spawn::SpawnPlan;
 use crate::sandbox_spawn::{RequestedSandboxTier, SandboxRequirement, SandboxTaskKind};
 use crate::secret::{SecretVault, UnavailableVault};
 #[cfg(unix)]
-use crate::secret_proxy::{GrantedLabel, ProxyConfig, SecretProxy};
+use crate::secret_proxy::{ProxyConfig, SecretProxy};
 
 pub(crate) const REMOTE_REFUSED: &str =
     "Secret placeholders stay local; remote commands cannot use them.";
@@ -62,7 +62,10 @@ pub(crate) fn vault() -> Arc<dyn SecretVault> {
     if let Some(vault) = TEST_VAULT.with(|slot| slot.borrow().clone()) {
         return vault;
     }
-    Arc::new(UnavailableVault)
+    match crate::secret::transport::for_current_command() {
+        Some(transport) => Arc::new(crate::secret::SubcSecretVault::new(Arc::new(transport))),
+        None => Arc::new(UnavailableVault),
+    }
 }
 
 pub(crate) fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Response {
@@ -155,6 +158,9 @@ pub(crate) struct Runtime {
 
 #[cfg(unix)]
 impl Runtime {
+    pub(crate) fn approval_status(&self) -> Vec<String> {
+        self.proxy.approval_status()
+    }
     #[cfg(test)]
     pub(crate) fn address(&self) -> std::net::SocketAddr {
         self.proxy.address()
@@ -244,40 +250,15 @@ pub(crate) fn authorize(
         )
     })?;
     let vault = vault();
-    let mut grants = Vec::new();
-    for label in labels {
-        match crate::subc::resolve_current_secret_label(vault.as_ref(), label) {
-            crate::subc::LaunchDecision::Proceed {
-                mut rule,
-                grant_id,
-                expires_at_ms,
-            } => {
-                rule.grant_id = grant_id;
-                grants.push(GrantedLabel {
-                    rule,
-                    expires_at_ms,
-                });
-            }
-            crate::subc::LaunchDecision::Refuse(outcome) => {
-                return Err(outcome_response(id, labels, outcome))
-            }
-            crate::subc::LaunchDecision::Pending(pending) => {
-                return Err(refusal(
-                    id,
-                    labels,
-                    crate::secret::SECRET_ACCESS_PENDING,
-                    pending.message,
-                ))
-            }
-        }
-    }
     let task = preflight.task.as_ref().expect("preflight owns layout");
     let proxy = start_proxy(ProxyConfig {
         vault,
         authorization_scope: scopes.authorization.clone(),
         lifetime_scope: scopes.lifetime.clone(),
         scanned_labels: labels.to_vec(),
-        grants,
+        consent_context: crate::subc::current_secret_consent_context(),
+        #[cfg(test)]
+        test_https_port: None,
         origin: task.paths.task_id.clone(),
     })
     .map_err(|_| refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE))?;

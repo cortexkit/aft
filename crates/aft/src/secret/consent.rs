@@ -47,9 +47,11 @@ impl std::fmt::Debug for SecretConsentRequest {
 /// What happened to a filed secret consent.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ConsentOutcome {
-    /// Cingulate answered. Whatever it said, the caller must resolve again;
-    /// the answer alone grants nothing.
+    /// Cingulate allowed this request. Retry the vault once; only its release
+    /// authorizes substitution.
     Answered,
+    Declined,
+    Expired,
     /// Still pending when the call's hold ended: the call ends
     /// `access_pending` and the retried call asks again.
     Pending,
@@ -65,6 +67,8 @@ impl std::fmt::Debug for ConsentOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConsentOutcome::Answered => f.write_str("Answered"),
+            ConsentOutcome::Declined => f.write_str("Declined"),
+            ConsentOutcome::Expired => f.write_str("Expired"),
             ConsentOutcome::Pending => f.write_str("Pending"),
             ConsentOutcome::Unavailable { detail } => f
                 .debug_struct("Unavailable")
@@ -83,6 +87,11 @@ impl std::fmt::Debug for ConsentOutcome {
 pub trait SecretConsentTransport: Send + Sync {
     /// File `request` and wait for the answer, or for the hold to end.
     fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome;
+
+    /// File once and hold a proxy request for the full approval window.
+    fn hold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+        self.file(request)
+    }
 
     /// Settle a pending ask the call left behind.
     fn withhold(&self, request: &SecretConsentRequest) -> ConsentOutcome;
@@ -121,6 +130,12 @@ pub fn file_consent(request: &SecretConsentRequest) -> ConsentOutcome {
             detail: "no secret consent transport is connected".into(),
         },
     }
+}
+
+pub(crate) fn hold_consent(request: &SecretConsentRequest) -> ConsentOutcome {
+    transport().map_or(ConsentOutcome::Declined, |transport| {
+        transport.hold(request)
+    })
 }
 
 /// Settle a pending secret ask.

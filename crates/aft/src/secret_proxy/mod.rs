@@ -75,9 +75,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::Mutex;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
-use secret_rules::location::{validate_header_name, LabelRule, Location};
+use secret_rules::location::Location;
 use secret_rules::scrub::{MatcherSet, Scrubber};
-use secret_rules::target::{canonical_host, ConnectAuthority};
+use secret_rules::target::ConnectAuthority;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use zeroize::Zeroizing;
@@ -90,19 +90,14 @@ pub(crate) type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io
 /// Constant agent-visible wording; labels and hosts are appended as data.
 pub const PROXY_REFUSAL: &str = "Secret proxy refused the request";
 
-/// A launch-time resolution, not a request-time material cache.
-#[derive(Clone, Debug)]
-pub struct GrantedLabel {
-    pub rule: LabelRule,
-    pub expires_at_ms: u64,
-}
-
 pub struct ProxyConfig {
     pub vault: Arc<dyn SecretVault>,
     pub authorization_scope: SecretScope,
     pub lifetime_scope: SecretScope,
     pub scanned_labels: Vec<String>,
-    pub grants: Vec<GrantedLabel>,
+    pub consent_context: Option<(std::path::PathBuf, String)>,
+    #[cfg(test)]
+    pub test_https_port: Option<u16>,
     pub origin: String,
 }
 
@@ -175,6 +170,7 @@ pub(crate) mod test_hardening {
 }
 
 pub(crate) struct State {
+    approvals: crate::secret::requests::RequestSecrets,
     config: ProxyConfig,
     session: AtomicI32,
     session_birth: std::sync::atomic::AtomicU64,
@@ -199,6 +195,13 @@ pub(crate) struct State {
 }
 
 impl State {
+    fn is_https_port(&self, port: u16) -> bool {
+        #[cfg(test)]
+        if self.config.test_https_port == Some(port) {
+            return true;
+        }
+        port == 443
+    }
     fn idle_timeout(&self) -> Duration {
         #[cfg(test)]
         {
@@ -347,17 +350,11 @@ impl SecretProxy {
             return Err(ProxyError::UnsupportedPlatform);
         }
         let scanned: BTreeSet<_> = config.scanned_labels.iter().collect();
-        let resolved: BTreeSet<_> = config.grants.iter().map(|g| &g.rule.label).collect();
         if scanned.is_empty()
-            || scanned != resolved
-            || resolved.len() != config.grants.len()
-            || config.grants.iter().any(|g| {
-                let r = &g.rule;
-                !secret_rules::placeholder::is_label(&r.label)
-                    || canonical_host(&r.host).is_err()
-                    || secret_rules::target::normalize_path_prefix(&r.path_prefix).map_or(true, |p| p != r.path_prefix)
-                    || matches!(&r.location, Location::Header(name) if validate_header_name(name).is_err())
-            })
+            || scanned.len() != config.scanned_labels.len()
+            || scanned
+                .iter()
+                .any(|label| !secret_rules::placeholder::is_label(label))
         {
             return Err(ProxyError::InvalidRules);
         }
@@ -384,6 +381,11 @@ impl SecretProxy {
             Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random[..]));
         let expected_auth = basic_credentials(&token)?;
         let state = Arc::new(State {
+            approvals: crate::secret::requests::RequestSecrets::new(
+                config.vault.clone(),
+                config.authorization_scope.clone(),
+                config.consent_context.clone(),
+            ),
             config,
             session: AtomicI32::new(0),
             session_birth: std::sync::atomic::AtomicU64::new(0),
@@ -439,6 +441,10 @@ impl SecretProxy {
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub(crate) fn approval_status(&self) -> Vec<String> {
+        self.state.approvals.status()
     }
 
     /// Exec-time only: never persist the returned credential with a task request.
@@ -572,11 +578,7 @@ async fn connect(
     }) {
         return Ok(refused());
     }
-    let intercepted = state
-        .config
-        .grants
-        .iter()
-        .any(|g| canonical_host(&g.rule.host).ok().as_ref() == Some(&authority.host));
+    let intercepted = state.is_https_port(authority.port);
     let tls = if intercepted {
         match state.tls_for(&authority.host) {
             Ok(tls) => Some(tls),

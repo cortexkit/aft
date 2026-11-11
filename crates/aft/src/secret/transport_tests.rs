@@ -14,6 +14,7 @@ fn transport(daemon: &FakeClaustrum) -> SubcSecretUseTransport {
         connection_file: daemon.path.clone(),
         identity: BindIdentity::new("aft-secret-use", "secret-call"),
         timeout: Duration::from_secs(2),
+        worker: Arc::default(),
     }
 }
 
@@ -49,7 +50,8 @@ fn secret_use_route_preserves_the_stamp_and_releases_only_after_phone_approval()
     assert!(!format!("{key:?}").contains("c2stZXhhbXBsZQ"));
     let state = daemon.state.lock().unwrap();
     assert_eq!(state.calls, 3);
-    assert_eq!(state.opens.len(), 3);
+    assert_eq!(state.connections, 1);
+    assert_eq!(state.opens.len(), 1);
     for open in &state.opens {
         assert_eq!(
             open["consumer_identity"],

@@ -245,7 +245,8 @@ pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;
 pub(crate) use secret_consent::{
-    current_call_scopes, current_secret_audit_scope, resolve_current_secret_label, LaunchDecision,
+    current_call_scopes, current_secret_audit_scope, current_secret_consent_context,
+    use_current_secret_label, LaunchDecision,
 };
 mod standalone;
 #[doc(hidden)]

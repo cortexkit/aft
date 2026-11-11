@@ -71,7 +71,7 @@ pub fn location_kind_token(location: &Location) -> String {
     }
 }
 
-/// A label's rule, as resolved by the vault (V1).
+/// The location and concrete target authorized for one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelRule {
     pub label: String,
@@ -79,9 +79,6 @@ pub struct LabelRule {
     pub port: u16,
     pub path_prefix: String,
     pub location: Location,
-    /// Opaque grant identifier; the vault compares it, the crate never parses
-    /// it.
-    pub grant_id: String,
 }
 
 /// Why a request is refused (P2, P4, and the target rules it depends on).

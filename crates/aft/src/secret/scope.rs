@@ -9,10 +9,9 @@
 use std::sync::Arc;
 
 use secret_rules::audit::ScopeRef;
-use secret_rules::location::{LabelRule, Location};
 use subc_protocol::scope::ScopeStamp;
 
-use super::wire::{ApiKeyTarget, Coverage, Target};
+use super::wire::Coverage;
 
 /// The `(owner, kind, ref)` identity of one stamped scope, plus the stamp the
 /// vault is given.
@@ -70,48 +69,6 @@ impl SecretScope {
             kind: self.kind.clone(),
             reference: self.reference.clone(),
         }
-    }
-
-    /// The target a resolution call names.
-    ///
-    /// The vault matches a target against the record's sealed scope and returns
-    /// `not_found` on a mismatch, so a resolution has to name the rule's own
-    /// host. Until a grant exists, that host is unknown: the root path on the
-    /// default port is the least specific target the contract allows, and a
-    /// resolution therefore only ever establishes that the label exists and
-    /// whether it is approved.
-    pub fn root_target(&self) -> Target {
-        Target::ApiKey(ApiKeyTarget {
-            scheme: "https".into(),
-            host: String::new(),
-            port: None,
-            path: "/".into(),
-        })
-    }
-
-    /// The rule a released key's `location` describes, for `label`.
-    ///
-    /// The vault's release says where to put the key but not the host or path
-    /// prefix it was sealed for; those arrive with the grant. A rule built here
-    /// therefore records the location only, which is what the reply proves.
-    pub fn rule_for(&self, label: &str, location: &str) -> LabelRule {
-        secret_rules::location::parse_vault_location(location)
-            .map(|location| LabelRule {
-                label: label.to_string(),
-                host: String::new(),
-                port: 443,
-                path_prefix: "/".into(),
-                location,
-                grant_id: String::new(),
-            })
-            .unwrap_or(LabelRule {
-                label: label.to_string(),
-                host: String::new(),
-                port: 443,
-                path_prefix: "/".into(),
-                location: Location::Bearer,
-                grant_id: String::new(),
-            })
     }
 
     /// The coverage a call asks the vault for. A head or worker call asks for

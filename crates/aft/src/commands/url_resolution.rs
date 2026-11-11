@@ -160,7 +160,6 @@ fn resolve_secret_fetch(
     });
 
     let mut authorization = None;
-    let mut rules = Vec::with_capacity(labels.len());
     if let Some(first) = labels.first() {
         let scopes = match crate::subc::current_call_scopes() {
             Ok((scopes, _)) => scopes,
@@ -174,33 +173,6 @@ fn resolve_secret_fetch(
                 ));
             }
         };
-        for label in labels {
-            match crate::subc::resolve_current_secret_label(vault.as_ref(), label) {
-                crate::subc::LaunchDecision::Proceed {
-                    mut rule, grant_id, ..
-                } => {
-                    rule.grant_id = grant_id;
-                    rules.push(rule);
-                }
-                crate::subc::LaunchDecision::Refuse(outcome) => {
-                    return Err(secret_outcome_refusal(
-                        &req.id,
-                        vault.as_ref(),
-                        labels,
-                        outcome,
-                    ));
-                }
-                crate::subc::LaunchDecision::Pending(pending) => {
-                    return Err(secret_fetch_refusal(
-                        &req.id,
-                        vault.as_ref(),
-                        labels,
-                        crate::secret::SECRET_ACCESS_PENDING,
-                        pending.message,
-                    ));
-                }
-            }
-        }
         authorization = Some(scopes.authorization);
     }
 
@@ -213,7 +185,6 @@ fn resolve_secret_fetch(
         vault: vault.as_ref(),
         authorization,
         labels: labels.to_vec(),
-        rules,
         call_id: req.id.clone(),
     };
     let document = crate::url_fetch::fetch_url_with_secrets(file, &document_dir, options, &secrets)

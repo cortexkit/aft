@@ -37,6 +37,7 @@ fn invalid() -> Value {
 pub(crate) struct State {
     pub opens: Vec<Value>,
     pub calls: usize,
+    pub connections: usize,
     pub hold_open: bool,
     pub hold_reply: bool,
     pub disconnect: bool,
@@ -335,6 +336,7 @@ impl FakeClaustrum {
                             let key = key.clone();
                             tasks.spawn(async move {
                                 if subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "0.39.0", Duration::from_secs(2)).await.is_err() { return; }
+                                state.lock().unwrap().connections += 1;
                                 let mut principal = String::new();
                                 while let Ok(Some(request)) = subc_transport::read_frame(&mut stream).await {
                                     if request.header.ty == FrameType::Ping {

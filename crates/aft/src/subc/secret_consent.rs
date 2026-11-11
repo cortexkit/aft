@@ -30,7 +30,7 @@ use crate::secret::eligibility::{alfonso_of_kind, COMMAND_SCOPE_KINDS};
 use crate::secret::withhold_consent;
 use crate::secret::{
     file_consent, CallScopes, ConsentOutcome, EligibilityForm, Ineligibility, LabelOutcome,
-    Resolution, SecretConsentRequest, SecretScope,
+    SecretConsentRequest, SecretScope,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,16 +72,29 @@ fn decode_secret_elicitation(result: &serde_json::Value) -> Option<&str> {
         .filter(|id| id.starts_with("el_") && id.len() > 3)
 }
 
-fn decode_secret_record(record: &serde_json::Value) -> ConsentOutcome {
+fn decode_secret_record(record: &serde_json::Value, request_id: &str) -> ConsentOutcome {
     if record.get("kind").and_then(serde_json::Value::as_str) != Some("secret_use") {
         return consent_unavailable("Cingulate did not return a secret-use card");
     }
     match record.get("state").and_then(serde_json::Value::as_str) {
         Some("pending") => ConsentOutcome::Pending,
-        // The answer is only a cue to retry the vault, never a grant or denial
-        // to apply locally. In particular, a decline also retries secret.use.
-        Some("answered") => ConsentOutcome::Answered,
-        Some("expired") => consent_unavailable("the secret-use card ended without an answer"),
+        Some("answered") => {
+            let answer = &record["secret_use_answer"];
+            let decision = if let Some(items) = answer["items"].as_array() {
+                items
+                    .iter()
+                    .find(|item| item["request_id"].as_str() == Some(request_id))
+                    .and_then(|item| item["decision"].as_str())
+            } else {
+                answer["decision"].as_str()
+            };
+            if decision == Some("allow") {
+                ConsentOutcome::Answered
+            } else {
+                ConsentOutcome::Declined
+            }
+        }
+        Some("expired" | "withdrawn") => ConsentOutcome::Expired,
         _ => consent_unavailable("Cingulate returned an unknown secret-use card state"),
     }
 }
@@ -114,7 +127,7 @@ impl SubcSecretConsent {
             })?
     }
 
-    async fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+    async fn file(&self, request: &SecretConsentRequest, hold: Duration) -> ConsentOutcome {
         // Cingulate deduplicates the exact ordered items for this filer. Refile
         // unchanged to recover the same card across retries or a lost reply,
         // without refreshing its deadline or introducing a local idempotency key.
@@ -133,7 +146,6 @@ impl SubcSecretConsent {
         let Some(id) = decode_secret_elicitation(&filed) else {
             return consent_unavailable("Cingulate did not return a secret-use card id");
         };
-        let hold = super::consent::hold_budget(None);
         match self
             .call(
                 request,
@@ -143,13 +155,13 @@ impl SubcSecretConsent {
             )
             .await
         {
-            Ok(record) => decode_secret_record(&record),
+            Ok(record) => decode_secret_record(&record, &request.request_id),
             Err(_) => consent_unavailable("Cingulate could not settle the secret-use card"),
         }
     }
 
-    fn dispatch(&self, request: &SecretConsentRequest) -> ConsentOutcome {
-        let future = self.file(request);
+    fn dispatch(&self, request: &SecretConsentRequest, hold: Duration) -> ConsentOutcome {
+        let future = self.file(request, hold);
         match tokio::runtime::Handle::try_current() {
             Ok(current)
                 if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
@@ -164,7 +176,11 @@ impl SubcSecretConsent {
 
 impl crate::secret::SecretConsentTransport for SubcSecretConsent {
     fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
-        self.dispatch(request)
+        self.dispatch(request, super::consent::hold_budget(None))
+    }
+
+    fn hold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+        self.dispatch(request, Duration::from_secs(600))
     }
 
     fn withhold(&self, _request: &SecretConsentRequest) -> ConsentOutcome {
@@ -327,7 +343,9 @@ pub(super) fn file_secret_consent(
     };
     match file_consent(&request) {
         // No usable card or answer: nothing is held, nothing starts.
-        ConsentOutcome::Unavailable { .. } => Err(crate::secret::SECRET_ACCESS_UNAVAILABLE),
+        ConsentOutcome::Unavailable { .. } | ConsentOutcome::Declined | ConsentOutcome::Expired => {
+            Err(crate::secret::SECRET_ACCESS_UNAVAILABLE)
+        }
         ConsentOutcome::Answered => Ok(SecretConsentFiling::Answered),
         ConsentOutcome::Pending => Ok(SecretConsentFiling::Pending(PendingSecretConsent {
             request,
@@ -346,37 +364,21 @@ pub(super) fn withdraw_secret_consent(pending: &PendingSecretConsent) {
     let _ = withhold_consent(&pending.request);
 }
 
-/// What one launch decided for one label, before anything starts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of the fetch's addressed vault call, before sending upstream.
+#[derive(Debug)]
 pub(crate) enum LaunchDecision {
-    /// The label may be used: the rule to follow and the grant to ask for
-    /// material with.
-    Proceed {
-        /// The label's rule, as the vault resolved it.
-        rule: secret_rules::location::LabelRule,
-        /// The grant the material call names.
-        grant_id: String,
-        expires_at_ms: u64,
-    },
-    /// The launch is held until the user answers the filed ask.
+    Proceed(crate::secret::UseAnswer),
     Pending(PendingSecretConsent),
-    /// The launch ends with this outcome, whose code names the reason.
     Refuse(LabelOutcome),
 }
 
-/// Resolve one scanned label for the launch on `identity`: the one entry a
-/// bash or fetch launch calls for each label it found in the command text.
-///
-/// The order is the outcome table's: an ineligible scope refuses with
-/// `secret_refused` before the vault is asked anything, then resolution decides
-/// between proceeding, holding the call for consent, and refusing. A label the
-/// vault needs an answer for files one consent ask under the call's
-/// authorization scope. An answer retries the vault immediately; a pending
-/// card holds the launch until the caller retries. Neither answer grants here.
-pub(crate) fn resolve_label_for_launch(
+/// Fetch tools already know the target. Check eligibility before asking once,
+/// then use the existing held-call consent path if approval is required.
+pub(crate) fn use_label_for_fetch(
     identity: &RouteIdentity,
     vault: &dyn crate::secret::SecretVault,
     label: &str,
+    target: &crate::secret::ApiKeyTarget,
 ) -> LaunchDecision {
     let (scopes, _) = match call_scopes(identity) {
         Ok(scopes) => scopes,
@@ -384,8 +386,6 @@ pub(crate) fn resolve_label_for_launch(
             return LaunchDecision::Refuse(crate::secret::refuse_ineligible(label, reason))
         }
     };
-    // Some vault adapters transiently receive material even at resolution.
-    // Harden here as well as at proxy startup so fetch and bash share the guard.
     #[cfg(unix)]
     if vault.can_release_material() && crate::secret_proxy::protect_secret_process().is_err() {
         return LaunchDecision::Refuse(LabelOutcome::Refuse {
@@ -393,41 +393,23 @@ pub(crate) fn resolve_label_for_launch(
             message: crate::bash_background::secrets::PROXY_UNAVAILABLE.to_owned(),
         });
     }
-    let resolution = vault.resolve(&scopes.authorization, label);
-    let outcome = crate::secret::outcome_for(label, &resolution);
-    match outcome {
-        LabelOutcome::Proceed => match resolution {
-            Resolution::Granted {
-                rule,
-                grant_id,
-                expires_at_ms,
-            } => LaunchDecision::Proceed {
-                rule,
-                grant_id,
-                expires_at_ms,
-            },
-            // A Proceed outcome must correspond to the captured grant.
-            other => LaunchDecision::Refuse(crate::secret::outcome_for(label, &other)),
-        },
-        LabelOutcome::FileConsent {
-            request_id,
-            statement_b64url,
-        } => match file_secret_consent(identity, &scopes, label, &request_id, &statement_b64url) {
+    let answer = vault.use_secret(&scopes.authorization, label, target);
+    if let crate::secret::UseAnswer::ApprovalRequired(pending) = answer {
+        return match file_secret_consent(
+            identity,
+            &scopes,
+            label,
+            &pending.request_id,
+            &pending.statement_b64url,
+        ) {
             Ok(SecretConsentFiling::Pending(pending)) => LaunchDecision::Pending(pending),
             Ok(SecretConsentFiling::Answered) => {
-                match vault.resolve(&scopes.authorization, label) {
-                    Resolution::Granted {
-                        rule,
-                        grant_id,
-                        expires_at_ms,
-                    } => LaunchDecision::Proceed {
-                        rule,
-                        grant_id,
-                        expires_at_ms,
-                    },
-                    other => LaunchDecision::Refuse(crate::secret::outcome_for_second_resolve(
-                        label, &other,
-                    )),
+                let answer = vault.use_secret(&scopes.authorization, label, target);
+                let outcome = crate::secret::outcome_for_second_use(label, &answer);
+                if outcome.proceeds() {
+                    LaunchDecision::Proceed(answer)
+                } else {
+                    LaunchDecision::Refuse(outcome)
                 }
             }
             Err(code) => LaunchDecision::Refuse(crate::secret::refuse(
@@ -435,8 +417,13 @@ pub(crate) fn resolve_label_for_launch(
                 label,
                 "the consent ask could not be filed",
             )),
-        },
-        refusal => LaunchDecision::Refuse(refusal),
+        };
+    }
+    let outcome = crate::secret::outcome_for(label, &answer);
+    if outcome.proceeds() {
+        LaunchDecision::Proceed(answer)
+    } else {
+        LaunchDecision::Refuse(outcome)
     }
 }
 
@@ -459,18 +446,23 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Resolve only with the identity installed by dispatch, never tool arguments.
-pub(crate) fn resolve_current_secret_label(
+/// Use only the dispatcher-installed identity, never tool arguments.
+pub(crate) fn use_current_secret_label(
     vault: &dyn crate::secret::SecretVault,
     label: &str,
+    target: &crate::secret::ApiKeyTarget,
 ) -> LaunchDecision {
     CURRENT_IDENTITY.with(|slot| match slot.borrow().as_ref() {
-        Some(identity) => resolve_label_for_launch(identity, vault, label),
+        Some(identity) => use_label_for_fetch(identity, vault, label, target),
         None => LaunchDecision::Refuse(crate::secret::refuse_ineligible(
             label,
             Ineligibility::NoScope,
         )),
     })
+}
+
+pub(crate) fn current_secret_consent_context() -> Option<(std::path::PathBuf, String)> {
+    current_identity().map(|identity| (identity.project_root.clone(), identity.session.clone()))
 }
 
 pub(super) fn current_identity() -> Option<RouteIdentity> {

@@ -818,15 +818,13 @@ pub(crate) fn create_secret_fetch_dir(storage_dir: &Path) -> Result<PathBuf, Url
 
 /// What a placeholder fetch may do with its secrets.
 pub struct SecretFetch<'a> {
-    /// The vault `material` and `audit` go to.
+    /// The vault each addressed request and audit record go to.
     pub vault: &'a dyn crate::secret::SecretVault,
     /// The call's authorization scope; `None` only when the URL holds no
     /// well-formed placeholder, in which case nothing is resolved or audited.
     pub authorization: Option<crate::secret::SecretScope>,
-    /// Every label found in the URL, in order. Each has a rule in `rules`.
+    /// Every label found in the URL, in order.
     pub labels: Vec<String>,
-    /// The rule the vault granted for each label, carrying its grant id.
-    pub rules: Vec<LabelRule>,
     /// The fetch call's id: audit records name it, plus the hop index.
     pub call_id: String,
 }
@@ -1430,30 +1428,56 @@ fn secret_hop(
         secret_fetch_refused(reason, logical)
     };
 
-    let rules: Vec<LabelRule> = secrets
-        .rules
-        .iter()
-        .filter(|rule| matches!(rule.location, Location::Query(_)))
-        .cloned()
-        .collect();
-    let request = RequestTarget {
+    let mut rules = Vec::new();
+    let mut materials = Vec::new();
+    let present = secret_labels_in_url(logical).unwrap_or_default();
+    let normalized = normalize_request_target(path).map_err(|_| refused(held, "malformed_path"))?;
+    let addressed = crate::secret::ApiKeyTarget {
+        scheme: "https".into(),
         host: authority.host.clone(),
-        port: authority.port,
-        scheme: "https",
-        target: &target,
+        port: Some(443),
+        path: String::from_utf8(normalized.wire).map_err(|_| refused(held, "malformed_path"))?,
     };
-    let matched: Vec<bool> = rules
-        .iter()
-        .map(|rule| {
-            request
-                .matches(&RuleTarget {
-                    host: &rule.host,
-                    port: rule.port,
-                    path_prefix: &rule.path_prefix,
-                })
-                .is_ok()
-        })
-        .collect();
+    for label in &secrets.labels {
+        if authority.port != 443 || !present.contains(label) {
+            continue;
+        }
+        let answer = match crate::subc::use_current_secret_label(secrets.vault, label, &addressed) {
+            crate::subc::LaunchDecision::Proceed(answer) => answer,
+            crate::subc::LaunchDecision::Pending(pending) => {
+                return Err(UrlFetchError::secret(
+                    crate::secret::SECRET_ACCESS_PENDING,
+                    pending.message,
+                ))
+            }
+            crate::subc::LaunchDecision::Refuse(crate::secret::LabelOutcome::Refuse {
+                code,
+                message,
+            }) => return Err(UrlFetchError::secret(code, message)),
+            _ => return Err(refused(held, "missing_material")),
+        };
+        if let crate::secret::UseAnswer::Released(released) = answer {
+            let (location, material) = released.into_parts();
+            let location = secret_rules::location::parse_vault_location(&location)
+                .map_err(|_| refused(held, "missing_material"))?;
+            if !matches!(location, Location::Query(_)) {
+                continue;
+            }
+            if check_admissible(material.expose(), label, &location).is_err() {
+                return Err(refused(held, "material_not_admissible"));
+            }
+            held.hold(label, material.expose())
+                .map_err(|_| refused(held, "replacement_discloses_key"))?;
+            rules.push(LabelRule {
+                label: label.clone(),
+                host: addressed.host.clone(),
+                port: 443,
+                path_prefix: addressed.path.clone(),
+                location,
+            });
+            materials.push(Some(material));
+        }
+    }
     // Plan with a stand-in key first: the rules decide where a key would go,
     // and refuse an ambiguous request, before the vault releases anything.
     let planning: Vec<(String, Vec<u8>)> = rules
@@ -1464,45 +1488,6 @@ fn secret_hop(
     let plan = evaluate_request_with_connect(&view, &authority, &rules, &planning);
     if let Some(refusal) = plan.refusal {
         return Err(refused(&*held, refusal.reason()));
-    }
-
-    // Material is asked only for a rule this hop actually substitutes. A
-    // rule whose host and path match while its placeholder is absent, not the
-    // whole value, or in another parameter needs no key, and asking anyway
-    // would spend a single-use grant on a request that sends none.
-    let mut materials = Vec::with_capacity(rules.len());
-    for ((rule, matched), planned) in rules.iter().zip(&matched).zip(&plan.labels) {
-        if !matched || !planned.is_substituted() {
-            materials.push(None);
-            continue;
-        }
-        let Some(scope) = secrets.authorization.as_ref() else {
-            return Err(refused(&*held, "missing_material"));
-        };
-        let material = match secrets.vault.material(scope, &rule.label, &rule.grant_id) {
-            Ok(material) => material,
-            Err(error) => {
-                let _ = emit_hop_audit(secrets, held, hop, Some(&authority), |_| {
-                    (Decision::Refused, AuditReason::Refused)
-                });
-                return Err(
-                    match crate::secret::outcome_for_material(&rule.label, &error) {
-                        crate::secret::LabelOutcome::Refuse { code, message } => {
-                            UrlFetchError::secret(code, message)
-                        }
-                        _ => secret_fetch_refused("missing_material", logical),
-                    },
-                );
-            }
-        };
-        if check_admissible(material.expose(), &rule.label, &rule.location).is_err() {
-            return Err(refused(&*held, "material_not_admissible"));
-        }
-        // The matcher is installed before any byte of this hop is sent.
-        if held.hold(&rule.label, material.expose()).is_err() {
-            return Err(refused(&*held, "replacement_discloses_key"));
-        }
-        materials.push(Some(material));
     }
 
     let query_start = path.len() + 1;
@@ -1600,14 +1585,9 @@ fn emit_hop_audit(
                 .as_ref()
                 .map(crate::secret::SecretScope::to_scope_ref),
         );
-        let rule = secrets.rules.iter().find(|rule| &rule.label == label);
-        if let (Some(authority), Some(rule)) = (authority, rule) {
-            record = record.with_rule(
-                &authority.host,
-                authority.port,
-                &rule.path_prefix,
-                location_kind_token(&rule.location),
-            );
+        if let Some(authority) = authority {
+            record.host = Some(authority.host.clone());
+            record.port = Some(authority.port);
         }
         if record.to_json_line_with_keys(&keys).is_err() || secrets.vault.audit(&record).is_err() {
             failed = true;
