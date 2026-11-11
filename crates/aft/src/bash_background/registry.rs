@@ -1340,7 +1340,7 @@ pub(crate) struct DuplicateRunningTask {
 #[path = "task_access.rs"]
 mod task_access;
 pub use scratch_retention::{RetainedScratchHealth, SCRATCH_RETENTION};
-pub(crate) use task_access::{is_task_environment, safe_task_entry};
+pub(crate) use task_access::safe_task_entry;
 
 /// What woke the watchdog pass in which a task was observed terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3682,7 +3682,8 @@ impl BgTaskRegistry {
                 };
                 Some((mask(&stdout)?, mask(&stderr)?))
             });
-        let mut bodies = crate::subc::rich_ui::display::bash_bodies(metadata, Some(bytes), streams);
+        let mut bodies =
+            crate::bash_background::frames::bash_bodies(metadata, Some(bytes), streams);
         if let Some(refusal) = (!metadata.local_fallback_started)
             .then(|| remote::remote_refusal(metadata))
             .flatten()
@@ -3735,7 +3736,7 @@ impl BgTaskRegistry {
             }
             display
         };
-        crate::subc::rich_ui::display::bash_terminal(
+        crate::bash_background::frames::bash_terminal(
             &display,
             bodies,
             &metadata.task_id,
@@ -3749,7 +3750,7 @@ impl BgTaskRegistry {
     /// `bash_watch` calls for the same task don't, so they can't attach the
     /// task to their own call's display records.
     pub(crate) fn capture_display_reply(&self, response: &serde_json::Value) {
-        if !crate::subc::rich_ui::display::enabled() {
+        if !crate::bash_background::frames::enabled() {
             return;
         }
         let Some(task_id) = response.get("task_id").and_then(serde_json::Value::as_str) else {
@@ -3779,7 +3780,7 @@ impl BgTaskRegistry {
         let Some(display) = metadata.display.as_mut() else {
             return;
         };
-        crate::subc::rich_ui::display::bash_reply(display, bodies, deferred);
+        crate::bash_background::frames::bash_reply(display, bodies, deferred);
         let terminal = {
             let mut db = DeferredDbWrites::new(self, &task);
             let Ok(mut state) = task.lock_state() else {
@@ -4156,7 +4157,7 @@ impl BgTaskRegistry {
             call_key: key.key.clone(),
         };
         let mut fallback_error = Some("recovered result projection unavailable".to_string());
-        if let Some((frame, outcome, tool_result_body)) = crate::subc::recovered_bash_frame(
+        if let Some((frame, outcome, tool_result_body)) = crate::bash_background::frames::recovered_bash_frame(
             snapshot,
             &ledger_key,
             metadata
@@ -5046,7 +5047,7 @@ impl BgTaskRegistry {
     pub(crate) fn retain_retry_gap(
         &self,
         harness: &str,
-        candidate: &crate::subc::watch_delivery::Candidate,
+        candidate: &crate::task_watch_lines::Candidate,
     ) -> Result<(), String> {
         use super::watch_lines::{LineBatch, RetryGap, WatchLine};
         let frame = &candidate.frame;
@@ -23067,6 +23068,7 @@ mod tests {
 
     #[test]
     fn recovered_terminal_reply_matches_live_status_text() {
+        crate::subc::lower_hooks::register();
         use crate::commands::bash_orchestrate::{decide_bash_step, BashStep};
         for (status, exit, reason, expected) in [
             (BgTaskStatus::Failed, None, Some("spawn aborted"), "failed"),
@@ -23119,9 +23121,13 @@ mod tests {
                 carrier: "reserved:carrier".into(),
                 call_key: "terminal".into(),
             };
-            let (frame, _, retained_body) =
-                crate::subc::recovered_bash_frame(snapshot, &key, dir.path(), None)
-                    .expect("terminal recovered frame");
+            let (frame, _, retained_body) = crate::bash_background::frames::recovered_bash_frame(
+                snapshot,
+                &key,
+                dir.path(),
+                None,
+            )
+            .expect("terminal recovered frame");
             let retained = retained_body
                 .as_deref()
                 .expect("recovered native result is retained");
@@ -31899,8 +31905,8 @@ mod a02_tests {
             .find(|pin| pin.starts_with("tp1:bash:"))
             .unwrap()
             .clone();
-        let display = crate::subc::rich_ui::display::TaskDisplay {
-            identity: crate::subc::rich_ui::outbox::Identity {
+        let display = crate::bash_background::frames::TaskDisplay {
+            identity: crate::bash_background::frames::Identity {
                 runner: subc_protocol::Principal::Reserved {
                     module_id: "broca".into(),
                 },
