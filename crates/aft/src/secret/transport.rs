@@ -34,8 +34,9 @@ pub(crate) fn for_current_command() -> Option<SubcSecretUseTransport> {
     )
 }
 
-/// A request-addressed vault transport. Construct it at call
-/// time: a standalone process has no module identity and must not open as direct.
+/// A request-addressed vault transport. Construct it at call time: a standalone
+/// process has no attested AFT module identity. Never open its vault route under
+/// the daemon's unprivileged `direct` principal instead.
 /// One command owns one consumer connection; failed connections are discarded so
 /// a later request can reconnect after the daemon returns.
 #[derive(Clone)]

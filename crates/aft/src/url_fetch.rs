@@ -1601,8 +1601,12 @@ fn emit_hop_audit(
             record.port = Some(authority.port);
         }
         if let Some(rule) = rules.iter().find(|rule| &rule.label == label) {
-            record.path_prefix = Some(rule.path_prefix.clone());
-            record.location_kind = Some(location_kind_token(&rule.location).to_owned());
+            record = record.with_rule(
+                &rule.host,
+                rule.port,
+                &rule.path_prefix,
+                location_kind_token(&rule.location),
+            );
         }
         if record.to_json_line_with_keys(&keys).is_err() || secrets.vault.audit(&record).is_err() {
             failed = true;

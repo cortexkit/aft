@@ -1,4 +1,5 @@
-//! Real proxy requests backed by the attested consumer route and a phone double.
+//! Real proxy requests using routes authenticated as AFT's module identity.
+//! A consent transport double records phone cards and supplies allow or decline.
 
 use super::*;
 use crate::secret::transport::fake::{FakeClaustrum, Record, NONCE};

@@ -139,8 +139,8 @@ async fn prepare_and_send(
             }
         }
     }
-    // A JSON deposit is not known until the addressed release. Buffer bounded
-    // JSON requests so their placeholders can be discovered before asking.
+    // The vault names the substitution location only when it releases a key.
+    // Buffer bounded JSON bodies to discover placeholders before asking it.
     let has_json = parts
         .headers
         .get("content-type")
