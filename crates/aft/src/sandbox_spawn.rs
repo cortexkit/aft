@@ -2253,23 +2253,10 @@ fn build_relaxed_profile(
             }
         }
         stores.read_metadata_allow.extend(metadata);
-        let listing = git_policy_output(root, &["worktree", "list", "--porcelain", "-z"])
-            .map_err(|error| format!("cannot enumerate sibling checkouts: {error}"))?;
-        if listing.status.success() {
-            for field in listing.stdout.split(|byte| *byte == 0) {
-                if let Some(path) = field.strip_prefix(b"worktree ") {
-                    use std::os::unix::ffi::OsStrExt;
-                    let path = PathBuf::from(OsStr::from_bytes(path));
-                    if !roots.contains(&path) {
-                        checkout_denies.push(path);
-                    }
-                }
+        for path in git_worktree_paths(root, git)? {
+            if !roots.contains(&path) {
+                checkout_denies.push(path);
             }
-        } else if !git.read_roots.is_empty() {
-            return Err(format!(
-                "cannot enumerate sibling checkouts: {}",
-                String::from_utf8_lossy(&listing.stderr)
-            ));
         }
     }
     let storage = ctx.storage_dir();
@@ -2450,6 +2437,105 @@ fn macos_account_home() -> Result<PathBuf, String> {
         return Err("account home is not absolute for keychain isolation".into());
     }
     Ok(path)
+}
+
+/// Every checkout `git worktree list` reports for `root`'s repository.
+///
+/// A listing is reused from the policy's answers while the policy's inputs
+/// (configuration, environment, Git executable, `.git` topology) and the
+/// worktree registrations Git reads are provably unchanged, so registering,
+/// removing or repointing a worktree always reaches the next profile.
+#[cfg(unix)]
+fn git_worktree_paths(root: &Path, git: &GitPolicy) -> Result<Vec<PathBuf>, String> {
+    let answers = git.answers.as_ref().filter(|answers| answers.current(root));
+    if let Some(answers) = answers {
+        let known = answers
+            .worktrees
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(known) = known
+            .as_ref()
+            .filter(|known| known.inputs.filesystem_unchanged())
+        {
+            return Ok(known.worktrees.clone());
+        }
+    }
+    // Record the registrations before Git reads them and publish the listing
+    // only if nothing changed while it ran.
+    let registrations =
+        answers.and_then(|answers| git_worktree_registration_inputs(&answers.common_dir));
+    let listing = git_policy_output(root, &["worktree", "list", "--porcelain", "-z"])
+        .map_err(|error| format!("cannot enumerate sibling checkouts: {error}"))?;
+    if !listing.status.success() {
+        if git.read_roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "cannot enumerate sibling checkouts: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        ));
+    }
+    let worktrees = listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|field| field.strip_prefix(b"worktree "))
+        .map(|path| {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(OsStr::from_bytes(path))
+        })
+        .collect::<Vec<_>>();
+    if let (Some(answers), Some(inputs)) = (answers, registrations) {
+        if inputs.filesystem_unchanged() && answers.current(root) {
+            *answers
+                .worktrees
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(KnownWorktreeListing {
+                inputs,
+                worktrees: worktrees.clone(),
+            });
+        }
+    }
+    Ok(worktrees)
+}
+
+/// The filesystem state `git worktree list` reads beyond the policy inputs:
+/// the entry names of `<common>/worktrees`, each entry's `gitdir` file, and,
+/// for a relative `gitdir`, the location it resolves to (Git reports that
+/// through `realpath`). The main worktree's path comes from the common
+/// directory, which the policy cache key and inputs already pin. `None` when
+/// any of it cannot be recorded, which keeps the listing uncached.
+#[cfg(unix)]
+fn git_worktree_registration_inputs(common_dir: &Path) -> Option<GitPolicyInputs> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut inputs = GitPolicyInputs::filesystem_only();
+    let registrations = common_dir.join("worktrees");
+    inputs.watch(&registrations)?;
+    let names = sorted_dir_names(&registrations)?;
+    for name in names.iter().flatten() {
+        let entry = registrations.join(name);
+        let gitdir = entry.join("gitdir");
+        inputs.watch(&gitdir)?;
+        let contents = match std::fs::read(&gitdir) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let mut location = contents.as_slice();
+        // Git trims trailing `isspace` bytes, which include vertical tab.
+        while let [rest @ .., last] = location {
+            if !matches!(last, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+                break;
+            }
+            location = rest;
+        }
+        let location = location.strip_suffix(b"/.git").unwrap_or(location);
+        if !location.is_empty() && !location.starts_with(b"/") {
+            inputs.watch(&entry.join(OsStr::from_bytes(location)))?;
+        }
+    }
+    inputs.listed_dirs.push((registrations, names));
+    Some(inputs)
 }
 
 /// Build the same control-file denies for project and granted write roots,
@@ -3178,6 +3264,96 @@ struct GitPolicy {
     linked: Option<(PathBuf, PathBuf)>,
     configured_paths: Vec<(String, PathBuf)>,
     metadata_allow: Vec<PathBuf>,
+    /// Git answers the profile builders would otherwise re-query on every
+    /// spawn. Present only when the policy's Git inputs were provable.
+    answers: Option<Arc<GitPolicyAnswers>>,
+}
+
+/// Policy settings whose absence the profile builders re-check on each spawn.
+#[cfg(unix)]
+const REPOSITORY_HOOK_KEYS: [&str; 2] = ["core.hooksPath", "mason.originalHooksPath"];
+
+/// Every path setting a Git policy reads, whose `:(optional)` targets the
+/// cached inputs track.
+#[cfg(unix)]
+const POLICY_PATH_KEYS: [&str; 3] = [
+    "core.hooksPath",
+    "mason.originalHooksPath",
+    "core.excludesFile",
+];
+
+/// Answers Git gave while a policy was resolved, which the sandbox profile
+/// builders reuse instead of starting Git again on every bash spawn.
+///
+/// Sandbox invariant: an answer is reused only while every input Git read to
+/// produce it is provably unchanged. Each consumer re-checks `inputs` (file
+/// identities, environment and Git executable; no subprocess) right before
+/// use, so a configuration edit made after the policy was resolved reaches the
+/// profile exactly as a fresh Git read would. Anything that cannot be proved
+/// falls back to asking Git.
+#[cfg(unix)]
+struct GitPolicyAnswers {
+    /// The input snapshot taken before any of these answers were read.
+    inputs: GitPolicyInputs,
+    common_dir: PathBuf,
+    /// Effective values of `REPOSITORY_HOOK_KEYS`, as the late consumer read
+    /// would return them.
+    hook_values: Option<Vec<(&'static str, Option<String>)>>,
+    /// `git worktree list` paths, filled by the first profile that needs them.
+    worktrees: Mutex<Option<KnownWorktreeListing>>,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for GitPolicyAnswers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitPolicyAnswers")
+            .field("common_dir", &self.common_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Makes the profile builders ignore stored answers and ask Git, as they
+    /// did before answers existed. Only the manual spawn benchmark sets it.
+    static GIT_POLICY_IGNORE_ANSWERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(unix)]
+impl GitPolicyAnswers {
+    fn current(&self, project_root: &Path) -> bool {
+        #[cfg(test)]
+        if GIT_POLICY_IGNORE_ANSWERS.with(|value| value.get()) {
+            return false;
+        }
+        self.inputs.unchanged(project_root)
+    }
+
+    /// The stored values of `keys`, if every one of them is still provably
+    /// what Git would return.
+    fn hook_values(&self, project_root: &Path, keys: &[&str]) -> Option<Vec<Option<String>>> {
+        let known = self.hook_values.as_ref()?;
+        let values = keys
+            .iter()
+            .map(|key| {
+                known
+                    .iter()
+                    .find(|(known_key, _)| known_key == key)
+                    .map(|(_, value)| value.clone())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.current(project_root).then_some(values)
+    }
+}
+
+#[cfg(unix)]
+struct KnownWorktreeListing {
+    /// The worktree registrations Git read: the `worktrees` directory's entry
+    /// names and each entry's `gitdir` file. Configuration, environment and the
+    /// Git executable are covered by the owning answers' inputs.
+    inputs: GitPolicyInputs,
+    worktrees: Vec<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -3466,10 +3642,56 @@ struct GitPolicyInputs {
     executable: PathBuf,
     files: BTreeMap<PathBuf, Option<GitInputIdentity>>,
     resolved_paths: Vec<(PathBuf, PathBuf)>,
+    /// Directories whose entry names Git enumerates, with the sorted names
+    /// (`None` when the directory was absent).
+    listed_dirs: Vec<(PathBuf, Option<Vec<OsString>>)>,
+    /// Raw values of `POLICY_PATH_KEYS` in every configuration source Git
+    /// listed while these inputs were recorded. Not compared on reuse: the
+    /// watched source files already cover them.
+    policy_path_values: Vec<Vec<u8>>,
+    /// Each `:(optional)` target among `policy_path_values`, with whether it
+    /// existed. `git config --path` drops an optional value whose target is
+    /// missing, so the effective setting changes when such a target appears
+    /// or disappears although no configuration changed. `None` when a value
+    /// uses a form whose expansion cannot be proved unchanged; the policy is
+    /// then cached as before, but its answers are withheld.
+    optional_targets: Option<Vec<(PathBuf, bool)>>,
+}
+
+/// Sorted entry names of `dir`: `Some(None)` when it is absent, `None` when it
+/// cannot be read.
+#[cfg(unix)]
+fn sorted_dir_names(dir: &Path) -> Option<Option<Vec<OsString>>> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut names = entries
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .ok()?;
+            names.sort_unstable();
+            Some(Some(names))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
 }
 
 #[cfg(unix)]
 impl GitPolicyInputs {
+    /// Inputs that record only filesystem state, for answers whose
+    /// environment and executable another snapshot already covers.
+    fn filesystem_only() -> Self {
+        Self {
+            environment: Vec::new(),
+            executable: PathBuf::new(),
+            files: BTreeMap::new(),
+            resolved_paths: Vec::new(),
+            listed_dirs: Vec::new(),
+            policy_path_values: Vec::new(),
+            optional_targets: Some(Vec::new()),
+        }
+    }
+
     fn watch(&mut self, path: &Path) -> Option<()> {
         // Include parent identities: a config symlink or any ancestor can be
         // retargeted without changing the inode of the previously read target.
@@ -3557,13 +3779,23 @@ impl GitPolicyInputs {
     fn unchanged(&self, project_root: &Path) -> bool {
         self.environment == git_policy_environment(project_root)
             && git_policy_executable().as_ref() == Some(&self.executable)
-            && self.files.iter().all(|(path, identity)| {
-                git_input_identity(path).is_ok_and(|current| current == *identity)
-            })
-            && self.resolved_paths.iter().all(|(path, expected)| {
-                canonicalize_policy_path(path.clone(), "cached Git policy")
-                    .is_ok_and(|current| current == *expected)
-            })
+            && self.filesystem_unchanged()
+    }
+
+    fn filesystem_unchanged(&self) -> bool {
+        self.files.iter().all(|(path, identity)| {
+            git_input_identity(path).is_ok_and(|current| current == *identity)
+        }) && self.resolved_paths.iter().all(|(path, expected)| {
+            canonicalize_policy_path(path.clone(), "cached Git policy")
+                .is_ok_and(|current| current == *expected)
+        }) && self
+            .listed_dirs
+            .iter()
+            .all(|(dir, names)| sorted_dir_names(dir).is_some_and(|current| current == *names))
+            && self
+                .optional_targets
+                .as_ref()
+                .is_none_or(|targets| optional_targets_unchanged(targets))
     }
 }
 
@@ -3695,8 +3927,7 @@ fn git_policy_inputs(
     let mut inputs = GitPolicyInputs {
         environment,
         executable: git_policy_executable()?,
-        files: BTreeMap::new(),
-        resolved_paths: Vec::new(),
+        ..GitPolicyInputs::filesystem_only()
     };
     // Git's compiled-in system-config location can change if its executable is
     // replaced, or another git appears earlier on PATH.
@@ -3749,6 +3980,10 @@ fn git_policy_inputs(
         inputs.watch(&config)?;
     }
     let discovered = git_policy_config_inputs(project_root, &mut inputs)?;
+    // Sampled before the policy's `--path` reads and compared again before the
+    // policy is cached, so a target that appears while Git runs is never
+    // recorded as current.
+    inputs.optional_targets = git_optional_path_targets(project_root, &inputs);
     // Includes are discovered after Git reads them. Repeat discovery with every
     // first-pass file already watched so an edit cannot hide a new dependency.
     let mut verified = inputs.clone();
@@ -3756,6 +3991,7 @@ fn git_policy_inputs(
     if discovered != rediscovered
         || inputs.files != verified.files
         || inputs.resolved_paths != verified.resolved_paths
+        || inputs.policy_path_values != verified.policy_path_values
         || !inputs.unchanged(project_root)
     {
         return None;
@@ -3786,6 +4022,7 @@ fn git_policy_config_inputs(
     }
 
     let mut discovered = HashSet::new();
+    inputs.policy_path_values.clear();
     let mut fields = output.stdout.split(|byte| *byte == 0);
     loop {
         let Some(origin) = fields.next() else {
@@ -3801,6 +4038,12 @@ fn git_policy_config_inputs(
             None => (record, &b""[..]),
         };
         let origin_file = git_config_origin_path(project_root, origin);
+        if POLICY_PATH_KEYS
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name.as_bytes()))
+        {
+            inputs.policy_path_values.push(value.to_vec());
+        }
         if let Some(path) = &origin_file {
             inputs.watch(path)?;
             discovered.insert(path.clone());
@@ -4082,6 +4325,7 @@ fn resolve_git_policy_uncached(
                     linked: None,
                     configured_paths: Vec::new(),
                     metadata_allow: Vec::new(),
+                    answers: None,
                 },
                 None,
             ));
@@ -4198,28 +4442,76 @@ fn resolve_git_policy_uncached(
     let (hooks_input, hooks) = resolve_hooks_path(project_root, &common_dir)?;
     let mut metadata_allow = Vec::new();
     let mut configured_paths = Vec::new();
-    let keys = if worker {
-        &[
-            "core.hooksPath",
-            "mason.originalHooksPath",
-            "core.excludesFile",
-        ][..]
+    // Workers record these settings in the policy itself. Other roles only
+    // store the hook settings as reusable answers, and only when the inputs
+    // can prove them current later; otherwise the consumer reads them itself.
+    let queried: &[&'static str] = if worker {
+        &POLICY_PATH_KEYS
+    } else if inputs.is_some() {
+        &REPOSITORY_HOOK_KEYS
     } else {
         &[]
     };
-    for (key, input, path) in
-        configured_git_paths_with_inputs(project_root, keys, &mut metadata_allow, &mut inputs)?
+    let values = if queried.is_empty()
+        || !project_root.join(".git").exists()
+        || !crate::developer_tools::git_usable()
     {
-        if let Some(inputs) = &mut inputs {
-            inputs.resolved_paths.push((input, path.clone()));
+        None
+    } else if worker {
+        Some(configured_git_path_values(project_root, queried)?)
+    } else {
+        // A failed read only withholds the answer: the consumer then queries
+        // Git itself and reports its own error.
+        configured_git_path_values(project_root, queried).ok()
+    };
+    if worker {
+        if let Some(values) = &values {
+            for (key, input, path) in configured_git_paths_from_values(
+                project_root,
+                queried,
+                values.clone(),
+                &mut metadata_allow,
+                &mut inputs,
+            )? {
+                if let Some(inputs) = &mut inputs {
+                    inputs.resolved_paths.push((input, path.clone()));
+                }
+                configured_paths.push((key, path));
+            }
         }
-        configured_paths.push((key, path));
     }
     // Re-resolve canonical paths on hits so creation of, or changes to, symlinks
     // in hooks/excludes paths cannot leave a deny pointing at the old target.
     if let Some(inputs) = &mut inputs {
         inputs.resolved_paths.push((hooks_input, hooks.clone()));
     }
+    // The answers stay valid only while the inputs, recorded before these
+    // reads, are unchanged; that includes every optional target's existence.
+    let hook_values = values
+        .filter(|_| {
+            inputs
+                .as_ref()
+                .is_some_and(|inputs| inputs.optional_targets.is_some())
+        })
+        .map(|values| {
+            queried
+                .iter()
+                .copied()
+                .zip(values)
+                .filter(|(key, _)| REPOSITORY_HOOK_KEYS.contains(key))
+                .collect()
+        });
+    let answers = inputs
+        .as_ref()
+        .filter(|inputs| git_config_candidates_exact(inputs))
+        .map(|inputs| {
+            Arc::new(GitPolicyAnswers {
+                inputs: inputs.clone(),
+                common_dir: common_dir.clone(),
+                hook_values,
+                worktrees: Mutex::new(None),
+            })
+        });
     let linked = (git_dir != common_dir).then(|| (git_dir.clone(), common_dir.clone()));
     let read_roots = {
         let mut read_roots = vec![git_dir, common_dir];
@@ -4234,9 +4526,94 @@ fn resolve_git_policy_uncached(
             linked,
             configured_paths,
             metadata_allow,
+            answers,
         },
         inputs,
     ))
+}
+
+/// Whether every candidate configuration file Git may read is watched.
+/// `git var` lists candidates one per line, so a candidate path containing a
+/// newline cannot be split back out of its output and stays unwatched; the
+/// answers would then miss a configuration file created at that path.
+#[cfg(unix)]
+fn git_config_candidates_exact(inputs: &GitPolicyInputs) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    !inputs.executable.as_os_str().as_bytes().contains(&b'\n')
+        && inputs
+            .environment
+            .iter()
+            .filter(|(key, _)| {
+                matches!(
+                    key.to_str(),
+                    Some("HOME" | "XDG_CONFIG_HOME" | "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM")
+                )
+            })
+            .all(|(_, value)| !value.as_bytes().contains(&b'\n'))
+}
+
+/// The `:(optional)` targets among the raw hook-setting values Git listed,
+/// each with whether it exists now. `None` when a value uses a form whose
+/// expansion depends on something not watched (`~user`, `%(prefix)/`, other
+/// path magic) or a target's existence cannot be read.
+#[cfg(unix)]
+fn git_optional_path_targets(
+    project_root: &Path,
+    inputs: &GitPolicyInputs,
+) -> Option<Vec<(PathBuf, bool)>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let home = inputs
+        .environment
+        .iter()
+        .find(|(key, _)| key == "HOME")
+        .map(|(_, value)| PathBuf::from(value));
+    let mut targets = Vec::new();
+    for value in &inputs.policy_path_values {
+        let home_relative = |path: &[u8]| path == b"~" || path.starts_with(b"~/");
+        let Some(path) = value.strip_prefix(b":(optional)") else {
+            // `~user` expands through the account database, which no input
+            // watches; unknown path magic may depend on anything.
+            if value.starts_with(b":(") || (value.starts_with(b"~") && !home_relative(value)) {
+                return None;
+            }
+            continue;
+        };
+        let target = if path.starts_with(b"/") {
+            PathBuf::from(OsStr::from_bytes(path))
+        } else if home_relative(path) {
+            let suffix = path[1..].strip_prefix(b"/").unwrap_or(&path[1..]);
+            home.as_ref()?.join(OsStr::from_bytes(suffix))
+        } else if path.starts_with(b"~") || path.starts_with(b"%(") || path.starts_with(b":(") {
+            return None;
+        } else {
+            // Git runs with `-C project_root`, so a relative target is
+            // checked from there.
+            project_root.join(OsStr::from_bytes(path))
+        };
+        let exists = git_optional_target_exists(&target)?;
+        targets.push((target, exists));
+    }
+    Some(targets)
+}
+
+/// Git treats an optional target as missing only when `stat` reports that it
+/// does not exist; any other error makes Git fail instead.
+#[cfg(unix)]
+fn git_optional_target_exists(path: &Path) -> Option<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+#[cfg(unix)]
+fn optional_targets_unchanged(targets: &[(PathBuf, bool)]) -> bool {
+    targets
+        .iter()
+        .all(|(path, exists)| git_optional_target_exists(path) == Some(*exists))
 }
 
 #[cfg(unix)]
@@ -4316,14 +4693,16 @@ fn resolve_hooks_path(
 
 /// Read missing keys again at the deny/grant consumer. A cached absence is not
 /// proof that a key remains unset: optional targets or configuration files can
-/// appear, or settings can change, after the earlier policy resolution.
+/// appear, or settings can change, after the earlier policy resolution. The
+/// values Git returned while the policy was resolved are reused only while
+/// those inputs are provably unchanged; otherwise Git is asked again.
 #[cfg(unix)]
 fn resolve_missing_repository_hooks(
     project_root: &Path,
     git: &GitPolicy,
     metadata_allow: &mut Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
-    let missing = ["core.hooksPath", "mason.originalHooksPath"]
+    let missing = REPOSITORY_HOOK_KEYS
         .into_iter()
         .filter(|key| {
             !git.configured_paths
@@ -4331,8 +4710,21 @@ fn resolve_missing_repository_hooks(
                 .any(|(existing, _)| existing == *key)
         })
         .collect::<Vec<_>>();
-    configured_git_paths_with_inputs(project_root, &missing, metadata_allow, &mut None)
-        .map(|paths| paths.into_iter().map(|(_, _, path)| path).collect())
+    let known = (!missing.is_empty())
+        .then(|| git.answers.as_ref())
+        .flatten()
+        .and_then(|answers| answers.hook_values(project_root, &missing));
+    let paths = match known {
+        Some(values) => configured_git_paths_from_values(
+            project_root,
+            &missing,
+            values,
+            metadata_allow,
+            &mut None,
+        ),
+        None => configured_git_paths_with_inputs(project_root, &missing, metadata_allow, &mut None),
+    };
+    paths.map(|paths| paths.into_iter().map(|(_, _, path)| path).collect())
 }
 
 /// Resolve operator-owned Git path settings before any command-supplied
@@ -4351,6 +4743,18 @@ fn configured_git_paths_with_inputs(
         return Ok(Vec::new());
     }
     let values = configured_git_path_values(project_root, keys)?;
+    configured_git_paths_from_values(project_root, keys, values, metadata_allow, inputs)
+}
+
+/// Turn the values Git returned for `keys` into watched, resolved paths.
+#[cfg(unix)]
+fn configured_git_paths_from_values(
+    project_root: &Path,
+    keys: &[&str],
+    values: Vec<Option<String>>,
+    metadata_allow: &mut Vec<PathBuf>,
+    inputs: &mut Option<GitPolicyInputs>,
+) -> Result<Vec<(String, PathBuf, PathBuf)>, String> {
     let mut paths = Vec::new();
     for (key, value) in keys.iter().zip(values) {
         let Some(value) = value else {
@@ -8171,13 +8575,9 @@ mod git_policy_cache_tests {
                     linked: None,
                     configured_paths: Vec::new(),
                     metadata_allow: Vec::new(),
+                    answers: None,
                 },
-                inputs: GitPolicyInputs {
-                    environment: Vec::new(),
-                    executable: PathBuf::new(),
-                    files: BTreeMap::new(),
-                    resolved_paths: Vec::new(),
-                },
+                inputs: GitPolicyInputs::filesystem_only(),
             }
         }
 
@@ -8226,20 +8626,28 @@ mod git_policy_cache_tests {
     }
 
     #[test]
-    fn git_policy_cache_worker_denies_keep_late_repository_reads() {
+    fn git_policy_cache_denies_reuse_validated_repository_reads() {
         let fixture = Fixture::new();
         let (policy, _) = fixture.resolve();
         let before = fixture.state(|state| state.calls);
         checkout_control_denies(&fixture.root, &policy).unwrap();
-        assert!(
-            fixture.state(|state| state.calls) > before,
-            "missing worker settings require an authoritative late read"
+        assert_eq!(
+            fixture.state(|state| state.calls),
+            before,
+            "an unset worker setting is answered from the validated resolution"
         );
 
+        // An edit after resolution, consumed with the same policy and no new
+        // resolution, must still reach the denies as a fresh Git read would.
         let config = fixture.root.join(".git/config");
         let mut contents = std::fs::read_to_string(&config).unwrap();
         contents.push_str("[mason]\noriginalHooksPath = new-original\n");
         std::fs::write(config, contents).unwrap();
+        let before = fixture.state(|state| state.calls);
+        let denies = checkout_control_denies(&fixture.root, &policy).unwrap();
+        assert!(denies.contains(&fixture.root.join("new-original")));
+        assert!(fixture.state(|state| state.calls) > before);
+
         let (changed, calls) = fixture.resolve();
         assert!(
             calls > 0,
@@ -8250,15 +8658,295 @@ mod git_policy_cache_tests {
         assert!(denies.contains(&fixture.root.join("new-original")));
         assert_eq!(fixture.state(|state| state.calls), before);
 
-        let head = with_worker_jail(false, || resolve_git_policy(&fixture.root)).unwrap();
-        let before = fixture.state(|state| state.calls);
-        let denies = checkout_control_denies(&fixture.root, &head).unwrap();
-        assert!(denies.contains(&fixture.root.join("new-original")));
-        assert_eq!(
-            fixture.state(|state| state.calls) - before,
-            2,
-            "both missing head-policy keys share one extension probe and one local scope read"
+        for _ in 0..2 {
+            let head = with_worker_jail(false, || resolve_git_policy(&fixture.root)).unwrap();
+            let before = fixture.state(|state| state.calls);
+            let denies = checkout_control_denies(&fixture.root, &head).unwrap();
+            assert!(denies.contains(&fixture.root.join("new-original")));
+            assert!(denies.contains(&fixture.root.join("first-hooks")));
+            assert_eq!(
+                fixture.state(|state| state.calls),
+                before,
+                "head-policy hook settings are answered from the validated resolution"
+            );
+        }
+    }
+
+    fn commit(root: &Path) {
+        let commit = git_policy_output(
+            root,
+            &[
+                "-c",
+                "user.name=Cache Test",
+                "-c",
+                "user.email=cache@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "cache fixture",
+            ],
+        )
+        .unwrap();
+        assert!(commit.status.success(), "{commit:?}");
+    }
+
+    fn git_ok(root: &Path, args: &[&str]) {
+        let output = git_policy_output(root, args).unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    /// What `git worktree list` reports right now, read directly from Git.
+    fn fresh_worktrees(root: &Path) -> Vec<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let output = git_policy_output(root, &["worktree", "list", "--porcelain", "-z"]).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|field| field.strip_prefix(b"worktree "))
+            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+            .collect()
+    }
+
+    /// Every Git read a profile builder makes for one control root.
+    fn profile_reads(root: &Path, git: &GitPolicy) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let denies = checkout_control_denies(root, git).unwrap();
+        resolve_missing_repository_hooks(root, git, &mut Vec::new()).unwrap();
+        (denies, git_worktree_paths(root, git).unwrap())
+    }
+
+    #[test]
+    fn git_policy_cache_hit_profile_reads_start_no_git() {
+        let fixture = Fixture::new();
+        commit(&fixture.root);
+        for worker in [true, false] {
+            let resolve = || with_worker_jail(worker, || resolve_git_policy(&fixture.root));
+            let policy = resolve().unwrap();
+            profile_reads(&fixture.root, &policy);
+            let before = fixture.state(|state| (state.calls, state.hits));
+            let policy = resolve().unwrap();
+            let (denies, worktrees) = profile_reads(&fixture.root, &policy);
+            let after = fixture.state(|state| (state.calls, state.hits));
+            assert_eq!(after.1, before.1 + 1, "worker={worker} must be a cache hit");
+            assert_eq!(after.0, before.0, "worker={worker} hit started Git");
+            assert!(denies.contains(&fixture.root.join("first-hooks")));
+            assert_eq!(worktrees, vec![fixture.root.clone()]);
+            assert_eq!(worktrees, fresh_worktrees(&fixture.root));
+        }
+    }
+
+    #[test]
+    fn git_policy_cache_worktree_listing_follows_registrations() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        commit(&fixture.root);
+        let root = fixture.root.clone();
+        // Lists through the cached answers, checks the result against Git (and
+        // `expected`, when given) and returns how many Git helpers the cached
+        // listing started.
+        let listed = |expected: Option<&[PathBuf]>| {
+            let (policy, _) = fixture.resolve();
+            let before = fixture.state(|state| state.calls);
+            let worktrees = git_worktree_paths(&root, &policy).unwrap();
+            let calls = fixture.state(|state| state.calls) - before;
+            if let Some(expected) = expected {
+                assert_eq!(worktrees, expected);
+            }
+            assert_eq!(worktrees, fresh_worktrees(&root));
+            calls
+        };
+        let main = [root.clone()];
+        listed(Some(&main));
+        assert_eq!(listed(Some(&main)), 0);
+
+        let first = root.join("first-linked");
+        git_ok(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                first.to_str().unwrap(),
+                "HEAD",
+            ],
         );
+        let expected = [root.clone(), first.clone()];
+        assert_eq!(
+            listed(Some(&expected)),
+            1,
+            "a new worktree must invalidate the listing"
+        );
+        assert_eq!(listed(Some(&expected)), 0);
+
+        let moved = root.join("moved-linked-worktree");
+        git_ok(
+            &root,
+            &[
+                "worktree",
+                "move",
+                first.to_str().unwrap(),
+                moved.to_str().unwrap(),
+            ],
+        );
+        let expected = [root.clone(), moved.clone()];
+        assert_eq!(
+            listed(Some(&expected)),
+            1,
+            "a rewritten gitdir must invalidate the listing"
+        );
+        assert_eq!(listed(Some(&expected)), 0);
+
+        // Git resolves a relative gitdir through realpath, so retargeting a
+        // symlink on its path can change the listing without touching the file.
+        // Older Git prints the relative text unresolved; either way the cached
+        // listing must match what Git prints now.
+        let registration = std::fs::read_dir(root.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        for target in ["real-a", "real-b"] {
+            std::fs::create_dir(root.join(target)).unwrap();
+        }
+        symlink("real-a", root.join("alias")).unwrap();
+        std::fs::write(registration.join("gitdir"), "../../../alias/.git\n").unwrap();
+        assert_eq!(listed(None), 1);
+        assert_eq!(listed(None), 0);
+        std::fs::remove_file(root.join("alias")).unwrap();
+        symlink("real-b", root.join("alias")).unwrap();
+        assert_eq!(
+            listed(None),
+            1,
+            "a retargeted gitdir symlink must invalidate"
+        );
+        assert_eq!(listed(None), 0);
+
+        std::fs::remove_dir_all(&registration).unwrap();
+        assert_eq!(listed(Some(&main)), 1, "a removed worktree must invalidate");
+        assert_eq!(listed(Some(&main)), 0);
+    }
+
+    #[test]
+    fn git_policy_cache_linked_listing_follows_replaced_git_pointer() {
+        let fixture = Fixture::new();
+        commit(&fixture.root);
+        let linked = fixture.root.join("linked");
+        git_ok(
+            &fixture.root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let (policy, _) = fixture.resolve_at(&linked);
+        // Git helpers run for `linked` are counted in its own test state.
+        let calls = || with_git_policy_test_state(&linked, |state| state.calls).unwrap();
+        git_worktree_paths(&linked, &policy).unwrap();
+        let before = calls();
+        let worktrees = git_worktree_paths(&linked, &policy).unwrap();
+        assert_eq!(calls(), before);
+        assert_eq!(worktrees, fresh_worktrees(&linked));
+
+        // A replaced `.git` pointer file may name another repository; the
+        // stored answers must not be trusted until it is resolved again.
+        let pointer = std::fs::read_to_string(linked.join(".git")).unwrap();
+        std::fs::remove_file(linked.join(".git")).unwrap();
+        // The same repository through a longer spelling: the length change
+        // makes the replacement visible regardless of timestamp granularity.
+        assert!(pointer.contains("/worktrees/"), "{pointer}");
+        std::fs::write(
+            linked.join(".git"),
+            pointer.replacen("/worktrees/", "/./worktrees/", 1),
+        )
+        .unwrap();
+        let before = calls();
+        let missing = resolve_missing_repository_hooks(&linked, &policy, &mut Vec::new()).unwrap();
+        assert!(
+            calls() > before,
+            "hook answers must not survive the pointer"
+        );
+        let before = calls();
+        let worktrees = git_worktree_paths(&linked, &policy).unwrap();
+        assert!(calls() > before, "the listing must not survive the pointer");
+        assert_eq!(worktrees, fresh_worktrees(&linked));
+        let fresh = configured_git_paths_with_inputs(
+            &linked,
+            &REPOSITORY_HOOK_KEYS
+                .into_iter()
+                .filter(|key| !policy.configured_paths.iter().any(|(set, _)| set == key))
+                .collect::<Vec<_>>(),
+            &mut Vec::new(),
+            &mut None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, path)| path)
+        .collect::<Vec<_>>();
+        assert_eq!(missing, fresh);
+    }
+
+    #[test]
+    fn git_policy_cache_hook_answers_follow_global_config_and_optional_targets() {
+        let fixture = Fixture::new();
+        let head = || with_worker_jail(false, || resolve_git_policy(&fixture.root)).unwrap();
+        let missing = |policy: &GitPolicy| {
+            let before = fixture.state(|state| state.calls);
+            let paths =
+                resolve_missing_repository_hooks(&fixture.root, policy, &mut Vec::new()).unwrap();
+            (paths, fixture.state(|state| state.calls) - before)
+        };
+        let fresh = || {
+            configured_git_paths_with_inputs(
+                &fixture.root,
+                &REPOSITORY_HOOK_KEYS,
+                &mut Vec::new(),
+                &mut None,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, path)| path)
+            .collect::<Vec<_>>()
+        };
+        let policy = head();
+        assert_eq!(missing(&policy), (fresh(), 0));
+
+        let target = fixture.root.join("optional-original");
+        std::fs::write(
+            fixture.root.join("global"),
+            format!(
+                "[mason]\noriginalHooksPath = :(optional){}\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        let (paths, calls) = missing(&policy);
+        assert!(
+            calls > 0,
+            "a created global config must invalidate the answers"
+        );
+        assert_eq!(paths, fresh());
+        let policy = head();
+        assert_eq!(missing(&policy), (fresh(), 0));
+
+        std::fs::create_dir(&target).unwrap();
+        let (paths, calls) = missing(&policy);
+        assert!(
+            calls > 0,
+            "a created optional target must invalidate the answers"
+        );
+        assert_eq!(paths, fresh());
+        assert!(paths.contains(&target));
+        let policy = head();
+        assert_eq!(missing(&policy), (fresh(), 0));
     }
 
     #[test]
@@ -8280,11 +8968,6 @@ mod git_policy_cache_tests {
         assert_eq!(fixture.resolve().1, 0);
 
         std::fs::create_dir(&target).unwrap();
-        let (cached, calls) = fixture.resolve();
-        assert_eq!(
-            calls, 0,
-            "optional-target existence is not tracked by the existing cache"
-        );
         let fresh = configured_git_paths_with_inputs(
             &fixture.root,
             &["mason.originalHooksPath"],
@@ -8293,11 +8976,23 @@ mod git_policy_cache_tests {
         )
         .unwrap();
         assert!(fresh.iter().any(|(_, _, path)| path == &target));
-        let denies = checkout_control_denies(&fixture.root, &cached).unwrap();
+        let denies = checkout_control_denies(&fixture.root, &policy).unwrap();
         assert!(
             denies.contains(&target),
-            "a late read must protect a newly present optional target"
+            "a policy resolved before the target appeared must not hide it"
         );
+        let (resolved, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "optional-target existence is a cached input: creating it must invalidate"
+        );
+        assert!(resolved
+            .configured_paths
+            .iter()
+            .any(|(key, path)| key == "mason.originalHooksPath" && path == &target));
+        let denies = checkout_control_denies(&fixture.root, &resolved).unwrap();
+        assert!(denies.contains(&target));
+        assert_eq!(fixture.resolve().1, 0);
     }
 
     #[test]
@@ -8443,6 +9138,103 @@ mod git_policy_cache_tests {
             fixture.state(|state| (state.hits, state.misses, state.uncached)),
             (0, 0, 2)
         );
+    }
+
+    /// Measures worker bash start latency under the default relaxed worker
+    /// profile, alternating spawns that reuse the policy's stored Git answers
+    /// with spawns that ignore them and query Git as the builders did before.
+    /// Needs a separately built aft binary as the sandbox launcher.
+    #[test]
+    #[ignore = "manual Linux measurement; AFT_GIT_POLICY_BENCH_LAUNCHER names the aft binary"]
+    #[cfg(target_os = "linux")]
+    fn relaxed_worker_bash_spawn_latency() {
+        crate::effective_path::initialize_process_path();
+        let launcher = PathBuf::from(std::env::var_os("AFT_GIT_POLICY_BENCH_LAUNCHER").unwrap())
+            .canonicalize()
+            .unwrap();
+        let spawns = std::env::var("AFT_GIT_POLICY_BENCH_SPAWNS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        let fixture = Fixture::new();
+        let storage = tempfile::tempdir().unwrap();
+        let hooks = tempfile::tempdir().unwrap();
+        fixture.hooks(hooks.path().to_str().unwrap());
+        commit(&fixture.root);
+        let linked = tempfile::tempdir().unwrap();
+        let mut worktrees = Vec::new();
+        for index in 0..4 {
+            let root = linked.path().join(format!("worker-{index}"));
+            git_ok(
+                &fixture.root,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    root.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            worktrees.push(root);
+        }
+        let root = worktrees[0].clone();
+        fixture.register_root(&root);
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.clone());
+        config.storage_dir = Some(storage.path().join("store"));
+        config.github.shim = false;
+        config.git.co_author = "off".into();
+        config.bash.linux_scope = false;
+        config.sandbox.profile.worker = SandboxMode::Relaxed;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let _launcher = install_sandbox_launcher_for_test(&root, launcher);
+        let mut samples: [Vec<(f64, usize)>; 2] = [Vec::new(), Vec::new()];
+        // Two warm-up spawns fill the cache in both modes before sampling.
+        for index in 0..spawns * 2 + 2 {
+            let ignore_answers = index % 2 == 0;
+            GIT_POLICY_IGNORE_ANSWERS.with(|value| value.set(ignore_answers));
+            let before = with_git_policy_test_state(&root, |state| state.calls).unwrap();
+            let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "spawn-latency", "command": "bash", "session_id": "spawn-latency",
+                "params": {"command": "true", "compressed": false}
+            }))
+            .unwrap();
+            let began = Instant::now();
+            // Unlike the strict benchmark, the relaxed Linux profile writes no
+            // marker files into account home directories, so no fixture home
+            // is needed.
+            let response = with_worker_jail(true, || crate::commands::bash::handle(&request, &ctx));
+            let elapsed = began.elapsed().as_secs_f64() * 1000.0;
+            let calls = with_git_policy_test_state(&root, |state| state.calls).unwrap() - before;
+            assert!(response.success, "{response:?}");
+            let id = response.data["task_id"].as_str().unwrap().to_string();
+            while !ctx.bash_background().is_task_terminal(&id) {
+                ctx.bash_background()
+                    .status(&id, "spawn-latency", None, None, 1024)
+                    .unwrap();
+                assert!(began.elapsed() < Duration::from_secs(15));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if index >= 2 {
+                samples[usize::from(!ignore_answers)].push((elapsed, calls));
+            }
+        }
+        GIT_POLICY_IGNORE_ANSWERS.with(|value| value.set(false));
+        for (label, samples) in [("base", &samples[0]), ("answers", &samples[1])] {
+            let mut times = samples.iter().map(|(ms, _)| *ms).collect::<Vec<_>>();
+            times.sort_by(f64::total_cmp);
+            let percentile = |p: usize| times[(times.len() * p / 100).min(times.len() - 1)];
+            let helpers = samples.iter().map(|(_, calls)| *calls).sum::<usize>();
+            eprintln!(
+                "relaxed_spawn mode={label} spawns={} p50_ms={:.3} p90_ms={:.3} git_helpers_per_spawn={:.2}",
+                times.len(),
+                percentile(50),
+                percentile(90),
+                helpers as f64 / times.len() as f64
+            );
+        }
+        assert!(samples[1].iter().all(|(_, calls)| *calls == 0));
     }
 
     /// Measures real worker bash starts under the strict sandbox profile. That
@@ -10923,6 +11715,7 @@ mod policy_tests {
             linked: Some((own.clone(), common.clone())),
             configured_paths: Vec::new(),
             metadata_allow: Vec::new(),
+            answers: None,
         };
         let main = GitPolicy {
             read_roots: Vec::new(),
@@ -10930,6 +11723,7 @@ mod policy_tests {
             linked: None,
             configured_paths: Vec::new(),
             metadata_allow: Vec::new(),
+            answers: None,
         };
         let grants = linked_git_grants(&[linked, main]);
         assert_eq!(
@@ -10975,6 +11769,7 @@ mod policy_tests {
             linked: Some((own, common.clone())),
             configured_paths: Vec::new(),
             metadata_allow: Vec::new(),
+            answers: None,
         };
         let grants = worker_jail_grants(&home, &[worktree], &[git], &policy);
         let files = [
