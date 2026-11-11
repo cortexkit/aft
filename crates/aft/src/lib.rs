@@ -201,6 +201,8 @@ pub mod read_policy;
 pub mod reader_floor;
 pub mod repeat_state;
 pub mod response_finalize;
+pub(crate) mod git_revision;
+pub(crate) mod process_group;
 pub(crate) mod revision_read;
 pub mod root_cache;
 pub mod root_identity;

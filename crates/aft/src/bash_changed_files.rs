@@ -290,7 +290,7 @@ fn git_bytes(directory: &Path, args: &[&str], deadline: Instant, limit: usize) -
     {
         return result;
     }
-    crate::revision_read::bounded_git_bytes(directory, args, deadline, limit)
+    crate::git_revision::bounded_git_bytes(directory, args, deadline, limit)
 }
 pub(crate) struct Scope(Option<Arc<Capture>>);
 pub(crate) type SharedCallDeadline = Arc<Mutex<Option<Instant>>>;
@@ -861,7 +861,7 @@ impl GitStart {
             .with(|slot| slot.get())
             .unwrap_or(budget);
         Self::read_with_git(root, budget, |directory, args, deadline| {
-            crate::revision_read::bounded_git_bytes(directory, args, deadline, MAX_REPORT_BYTES)
+            crate::git_revision::bounded_git_bytes(directory, args, deadline, MAX_REPORT_BYTES)
         })
     }
 
