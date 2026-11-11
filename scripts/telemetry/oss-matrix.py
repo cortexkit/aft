@@ -30,12 +30,12 @@ DEFAULT_REPOS = (
     "spark", "kubernetes", "elasticsearch", "llvm", "linux", "_nongit-24k", "chromium",
 )
 PLANES = ("search", "callgraph")
-MEASUREMENT_PROFILE = "index-store-no-inspect-refresh-v2"
+MEASUREMENT_PROFILE = "index-store-no-inspect-refresh-v3"
 CSV_FIELDS: tuple[str, ...] = (
     "repo", "path", "git", "files", "top_languages", "semantic", "search_status",
     "callgraph_status", "index_store_build_ready_ms", "callgraph_build_ready_ms",
     "callgraph_refresh_ms", "waiting_on",
-    "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps", "measurement_profile",
+    "peak_rss_mb", "peak_rss_sampled_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps", "measurement_profile",
 )
 TEXT_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx", ".kt",
@@ -135,8 +135,10 @@ class ProcessSampler:
     # can only ever be at or below the true peak, and a short-lived spike
     # between two polls is invisible to it. VmHWM is exact and monotonic, which
     # makes the difference between the two a direct measure of how much the
-    # poll missed. Linux only, which is the only platform this gate compares on.
+    # poll missed. The gate uses this kernel peak, with the sampled maximum
+    # retained as a diagnostic. Linux is the only platform this gate compares on.
     peak_rss_hwm_kb: int = 0
+    hwm_available: bool = False
     cpu_seconds: float | None = None
     disk_write_bytes: int | None = None
     gaps: list[str] = field(default_factory=list)
@@ -169,6 +171,7 @@ class ProcessSampler:
             self._sample_once()
 
     def _sample_once(self) -> None:
+        self.hwm_available = False
         if self.proc.poll() is not None:
             self._add_gap("CPU measurement gap: process exited before a sample")
             return
@@ -202,7 +205,10 @@ class ProcessSampler:
                 for line in Path(f"/proc/{self.proc.pid}/status").read_text(encoding="utf-8").splitlines():
                     if line.startswith("VmHWM:"):
                         self.peak_rss_hwm_kb = max(self.peak_rss_hwm_kb, int(line.split()[1]))
+                        self.hwm_available = True
                         break
+                if not self.hwm_available:
+                    self._add_gap("peak RSS high-water mark missing from /proc/<pid>/status")
             except (OSError, ValueError, IndexError):
                 if "peak RSS high-water mark unavailable: /proc/<pid>/status" not in self.gaps:
                     self.gaps.append("peak RSS high-water mark unavailable: /proc/<pid>/status")
@@ -753,6 +759,15 @@ def close_after_final_sample(sampler: ProcessSampler | None, client: NdjsonClien
     return client.close() if client is not None else None
 
 
+def peak_memory_metrics(sampler: ProcessSampler) -> dict[str, str]:
+    # Only the kernel peak captures a spike that falls between resource polls.
+    # Require a successful final read while AFT is alive, before closing stdin;
+    # a missing HWM must not become a zero or fall back to the sampled maximum.
+    hwm = f"{sampler.peak_rss_hwm_kb / 1024:.1f}" if sampler.hwm_available and sampler.peak_rss_hwm_kb > 0 else "n/a"
+    return {"peak_rss_mb": hwm, "peak_rss_hwm_mb": hwm,
+            "peak_rss_sampled_mb": f"{sampler.peak_rss_kb / 1024:.1f}"}
+
+
 PROBE_NAME = "aft_cost_gate_probe.rs"
 PROBE_CALLER = "aft_cost_gate_caller"
 
@@ -902,8 +917,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
                 write_phase_trace(storage / "phase-memory.csv", phases.samples)
         if sampler is not None:
             gaps.extend(sampler.gaps)
-            row["peak_rss_mb"] = f"{sampler.peak_rss_kb / 1024:.1f}"
-            row["peak_rss_hwm_mb"] = f"{sampler.peak_rss_hwm_kb / 1024:.1f}" if sampler.peak_rss_hwm_kb else "n/a"
+            row.update(peak_memory_metrics(sampler))
             row["cpu_s"] = f"{sampler.cpu_seconds:.2f}" if sampler.cpu_seconds is not None else "n/a"
             row["cpu_precision"] = sampler.cpu_precision
             row["disk_write_bytes"] = str(sampler.disk_write_bytes) if sampler.disk_write_bytes is not None else "n/a"
@@ -961,10 +975,10 @@ def write_markdown(path: Path, rows: list[dict[str, str]], scratch: Path) -> Non
         gaps = [(row["repo"], row["gaps"]) for row in rows if row["gaps"] != "none"]
         handle.write("\n## Peak memory by build phase\n\n")
         handle.write("High-water growth charged to the phase that took it, largest first. `callgraph_stage/search_stage`, with `+tier2:<category>` where an inspect category overlapped, so a phase that only exists while two builds run at once is named as one.\n\n")
-        handle.write("| Repo | Polled peak RSS MB | Kernel high-water MB | High-water growth by phase |\n| --- | ---: | ---: | --- |\n")
+        handle.write("| Repo | Gated kernel peak RSS MB | Diagnostic sampled peak MB | High-water growth by phase |\n| --- | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
-                f"| {row['repo']} | {row['peak_rss_mb']} | {row.get('peak_rss_hwm_mb', 'n/a')} | {row.get('hwm_by_phase', 'n/a')} |\n"
+                f"| {row['repo']} | {row['peak_rss_mb']} | {row.get('peak_rss_sampled_mb', 'n/a')} | {row.get('hwm_by_phase', 'n/a')} |\n"
             )
         handle.write("\n## Gaps\n\n")
         handle.write(f"- Scratch root: `{scratch}`.\n")
@@ -1148,6 +1162,9 @@ def phase_self_test() -> int:
 
 
 def store_self_test() -> int:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
     ready: dict[str, float] = {}
     status = {"success": True, "data_store": {}, "search_index": {"status": "ready"},
               "callgraph_store": {"status": "building"}}
@@ -1185,7 +1202,28 @@ def store_self_test() -> int:
         assert "new call edge" in str(error), error
     else:
         raise AssertionError("a successful edit serving a stale graph was accepted")
-    print("oss-matrix store self-test passed: 6 checks (readiness, missing/unavailable store, refresh, stale graph)")
+    proc = SimpleNamespace(pid=4321, poll=lambda: None)
+    sampler = ProcessSampler(proc=proc)  # type: ignore[arg-type]
+    paths: list[str] = []
+
+    def proc_text(path: Path, **_kwargs: Any) -> str:
+        paths.append(str(path))
+        return "VmHWM: 307200 kB\n" if path.name == "status" else "write_bytes: 10\n"
+
+    with patch.object(sys, "platform", "linux"), patch.object(Path, "read_text", proc_text), \
+            patch("subprocess.run", return_value=SimpleNamespace(stdout="90000 00:00:01")), \
+            patch.dict(globals(), {"parse_proc_stat_cpu_seconds": lambda _stat: 1.0}):
+        sampler._sample_once()
+    assert "/proc/4321/status" in paths and all(path.startswith("/proc/4321/") for path in paths), paths
+    assert peak_memory_metrics(sampler) == {
+        "peak_rss_mb": "300.0", "peak_rss_hwm_mb": "300.0", "peak_rss_sampled_mb": "87.9",
+    }, peak_memory_metrics(sampler)
+    with patch.object(sys, "platform", "linux"), patch.object(Path, "read_text", lambda *_a, **_k: ""), \
+            patch("subprocess.run", return_value=SimpleNamespace(stdout="90000 00:00:01")), \
+            patch.dict(globals(), {"parse_proc_stat_cpu_seconds": lambda _stat: 1.0}):
+        sampler._sample_once()
+    assert peak_memory_metrics(sampler)["peak_rss_mb"] == "n/a", peak_memory_metrics(sampler)
+    print("oss-matrix store self-test passed: 9 checks (readiness, refresh, stale graph, same-process kernel peak, missing HWM)")
     return 0
 
 

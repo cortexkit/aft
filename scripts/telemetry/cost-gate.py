@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
-MEASUREMENT_PROFILE = "index-store-no-inspect-refresh-v2"
+MEASUREMENT_PROFILE = "index-store-no-inspect-refresh-v3"
 SYNTHETIC_FILE_COUNT = 24_000
 SYNTHETIC_VERSION = "synthetic-v2"
 REPO_ORDER = ("redox", "typescript-eslint", "jupyterlab", "hugo", "synthetic-24k")
@@ -855,6 +855,9 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
     hwm = [run.row.get("peak_rss_hwm_mb", "n/a") or "n/a" for run in runs if run.ready]
     if any(value != "n/a" for value in hwm):
         parts.append(f"peak_rss_hwm_mb(ungated)={'/'.join(hwm)}")
+    sampled = [run.row.get("peak_rss_sampled_mb", "n/a") or "n/a" for run in runs if run.ready]
+    if any(value != "n/a" for value in sampled):
+        parts.append(f"peak_rss_sampled_mb(ungated)={'/'.join(sampled)}")
     # The resolution share stays visible as a description of where build time
     # went, but it is not a budget: it cannot tell a slower resolution stage
     # from faster stages around it.
@@ -1031,11 +1034,12 @@ def self_test() -> int:
         assert "peak_rss_mb=119/118" in line, line
         assert "cpu_seconds[precision=unknown]=13/12" in line, line
         assert observation_line("fixture", []) == "OBSERVED fixture: no ready run"
-        # The high-water mark is recorded beside the sampled peak, and must stay
-        # out of the gate: it has no baseline and must not acquire one.
+        # Historical diagnostic column names must not become extra budgets.
+        # The current profile supplies the kernel HWM through peak_rss_mb.
         assert "peak_rss_hwm_mb(ungated)=171/170" in line, line
         blessed = repo_metrics_from_runs("fixture", baseline_from_file, runs)
         assert "peak_rss_hwm_mb" not in blessed, sorted(blessed)
+        assert "peak_rss_mb" not in row_metrics({"peak_rss_mb": "n/a", "peak_rss_sampled_mb": "450"})
         assert not RETIRED_METRICS.intersection(blessed), sorted(blessed)
         assert (blessed["index_store_build_ready_ms"]["tolerance_pct"],
                 blessed["index_store_build_ready_ms"]["absolute_floor"]) == (25, 130)

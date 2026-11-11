@@ -75,7 +75,7 @@ measure and print, but it will not gate, because it cannot.
 
 ## What is measured
 
-The current profile is `index-store-no-inspect-refresh-v2`, introduced for the
+The current profile is `index-store-no-inspect-refresh-v3`, introduced for the
 repository-wide index store in AFT 0.64. The older store's trigram build,
 SQLite callgraph resolution, and ready-to-first-query lifecycle events no
 longer exist on the production path. Their measurements are retired, not
@@ -96,10 +96,22 @@ into the new baseline.
   edge's absence must be verified before a duration is accepted. The probe is
   removed after AFT exits; pinned source files are never edited. Each corpus
   therefore contains its pinned files plus this same small probe during capture.
+- `peak_rss_mb` now uses the Linux kernel's `VmHWM` for the same AFT process
+  sampled by `ps` and `/proc/<pid>/stat`. A final read before AFT shuts down is
+  required; a missing kernel peak is missing data, never zero or a fallback to
+  the polled value. `peak_rss_sampled_mb` retains the two-second sampled maximum
+  as a diagnostic. The 20% tolerance and 128 MB floor are unchanged.
+- This fixes sampling aliasing exposed by the first new-store capture
+  (workflow run 43083077307). Jupyterlab's graph-build peak moved from about
+  6.0 seconds to 5.5 seconds between passes. Two-second polling caught the first
+  spike but missed the second: 292.4/227.1 MB looked 29% apart. The kernel
+  recorded 292.4/289.8 MB, only 0.9% apart, while both passes built the full
+  graph and verified the refresh. The failed capture is not blessed or
+  relabelled; this profile requires a fresh capture.
 - Semantic and inspect remain disabled. Every pass has fresh storage. CPU,
-  sampled RSS, kernel high-water diagnostics, waiting-on budgets, pinned corpus
-  revisions, two-pass per-metric minimum selection and the comparator's limit
-  formula are unchanged. Memory phase labels now describe externally observed
+  waiting-on budgets, pinned corpus revisions, two-pass per-metric minimum
+  selection and the comparator's limit formula are unchanged. Memory phase
+  labels now describe externally observed
   building/ready/refresh phases rather than obsolete internal stages.
 - Readiness retains the 25% tolerance and 3,000 ms floor. Refresh inherits the
   former resolution budget's 20% tolerance and 500 ms floor. Resource and
