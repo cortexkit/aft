@@ -17,8 +17,8 @@ use crate::context::AppContext;
 use crate::inspect::job::{InspectCategory, JobKey};
 use crate::protocol::{RawRequest, Response};
 
-use crate::data_layer::parent_session::query::{attach_gaps, Gaps};
-use crate::data_layer::parent_session::{display_relative, read, ParentSession};
+use crate::parent_search::query::{attach_gaps, Gaps};
+use crate::parent_search::{display_relative, read, ParentSession};
 
 /// Adds `child` into `merged`: numbers are summed, arrays concatenated (with
 /// paths made parent-relative), and nested objects merged the same way.

@@ -20,6 +20,7 @@
 //! closed past the unbind grace period no longer counts.
 
 pub(crate) mod engine;
+pub(crate) mod external;
 pub(crate) mod query;
 #[cfg(test)]
 mod tests;

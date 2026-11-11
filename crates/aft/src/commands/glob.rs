@@ -149,7 +149,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         None
     } else {
-        crate::data_layer::parent_session::glob_fan_out(ctx, &search_roots, pattern)
+        crate::parent_search::glob_fan_out(ctx, &search_roots, pattern)
     };
     let (
         mut files,
@@ -398,7 +398,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
-    crate::data_layer::parent_session::attach_search_gaps(&mut body, parent_gaps);
+    crate::parent_search::attach_search_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
     let rendered_count =

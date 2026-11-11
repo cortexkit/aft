@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::context::AppContext;
 use crate::data_layer::checkout::DataError;
-use crate::data_layer::parent_session::Plane;
+use crate::parent_search::Plane;
 use crate::data_layer::runtime::DataCheckout;
 use crate::protocol::{RawRequest, Response};
 
@@ -191,11 +191,11 @@ fn settled<T: std::fmt::Debug>(ask: impl Fn() -> T, done: impl Fn(&T) -> bool) -
 
 /// The parent session `ctx` is bound to, once its worker's first round
 /// has loaded the children.
-fn parent_session(ctx: &AppContext) -> Arc<crate::data_layer::parent_session::ParentSession> {
+fn parent_session(ctx: &AppContext) -> Arc<crate::parent_search::ParentSession> {
     let deadline = Instant::now() + DEADLINE;
     let session = loop {
         crate::runtime_drain::drain_deferred_configure_maintenance(ctx);
-        if let Some(session) = crate::data_layer::parent_session::session_for(ctx) {
+        if let Some(session) = crate::parent_search::session_for(ctx) {
             break session;
         }
         assert!(Instant::now() < deadline, "no parent session started");
@@ -410,7 +410,7 @@ fn parent_loading_child_bounded_walk_keeps_matches_and_reports_a_gap() {
 /// every child remain named gaps.
 #[test]
 fn a_parent_folder_answers_from_its_childrens_checkouts() {
-    crate::data_layer::parent_session::set_default_refresh_interval(Duration::from_millis(100));
+    crate::parent_search::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
@@ -805,7 +805,7 @@ fn audit1432_parent_search_collects_ceiling_skips_from_both_children() {
 fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     use crate::config::{SemanticBackend, SemanticBackendConfig};
     use crate::data_layer::meaning::MeaningState;
-    crate::data_layer::parent_session::set_default_refresh_interval(Duration::from_millis(100));
+    crate::parent_search::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");

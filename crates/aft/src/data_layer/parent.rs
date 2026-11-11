@@ -1,7 +1,7 @@
 //! Parent folders on the data layer.
 //!
 //! A session bound to a folder of repositories that is not a repository
-//! itself builds nothing of its own (see [`crate::data_layer::parent_session`]).
+//! itself builds nothing of its own (see [`crate::parent_search`]).
 //! Each child repository that session found gets a checkout of its own,
 //! bound the first time a query reaches it, and grep, glob and the
 //! call-graph commands answer from the children's views. So does
@@ -28,7 +28,7 @@ use std::time::Duration;
 use crate::config::SemanticBackendConfig;
 use crate::context::AppContext;
 use crate::data_layer::checkout::{CheckoutView, PlaneStatus, Planes};
-use crate::data_layer::parent_session::Plane;
+use crate::parent_search::Plane;
 use crate::data_layer::runtime::{DataCheckout, Fresh};
 use crate::executor::RootMaintenanceExecutor;
 use crate::semantic_index::SemanticIndexFingerprint;
