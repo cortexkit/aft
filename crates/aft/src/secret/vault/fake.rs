@@ -20,7 +20,7 @@ use crate::secret::{ApiKeyTarget, ReleasedApiKey};
 /// Everything a test makes the fake say, plus the record of what it was asked.
 #[derive(Default)]
 pub struct FakeVaultScript {
-    /// The answer to an addressed use, per label. Missing entries are unavailable.
+    /// The reply to a secret-use request for this label. Missing entries are unavailable.
     pub answers: HashMap<String, FakeReply>,
     /// Released bytes per label, advancing once per matching request to exercise
     /// key rotation. After the list runs out, repeat its last value.
@@ -37,9 +37,9 @@ pub enum FakeReply {
 
 struct FakeVaultState {
     script: FakeVaultScript,
-    /// One label per addressed use, in call order.
+    /// One label per secret-use request, in call order.
     resolves: Vec<String>,
-    /// One label per matching release, in call order.
+    /// One label per request matching a stored host/path rule, in call order.
     materials: Vec<String>,
     /// Material calls already served per label, so rotation advances.
     served: HashMap<String, usize>,
@@ -118,12 +118,12 @@ impl FakeVault {
         self.lock().materials.clone()
     }
 
-    /// How many addressed uses were asked for.
+    /// How many secret-use requests were made.
     pub fn use_calls(&self) -> u64 {
         self.resolve_count.load(Ordering::SeqCst)
     }
 
-    /// How many matching requests reached material release.
+    /// How many requests matched a stored host/path rule and asked for material.
     pub fn material_calls(&self) -> u64 {
         self.material_count.load(Ordering::SeqCst)
     }
