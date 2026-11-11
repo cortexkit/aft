@@ -5,6 +5,27 @@
 
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
+pub(crate) type FileReporter = fn(&str, Option<&str>, Option<&str>, Option<&str>, &'static str);
+static FILE_REPORTER: std::sync::OnceLock<FileReporter> = std::sync::OnceLock::new();
+pub(crate) fn register_file_reporter(reporter: FileReporter) {
+    let _ = FILE_REPORTER.set(reporter);
+}
+#[cfg(test)]
+pub(crate) fn file_reporter_registered() -> bool {
+    FILE_REPORTER.get().is_some()
+}
+pub(crate) fn report_file(
+    file: &str,
+    old_path: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
+    change: &'static str,
+) {
+    if let Some(reporter) = FILE_REPORTER.get() {
+        reporter(file, old_path, before, after, change);
+    }
+}
+
 use std::path::Path;
 
 use crate::config::Config;
@@ -1447,7 +1468,7 @@ pub fn no_change_response(id: &str) -> crate::protocol::Response {
 
 /// Supply the unified patch consumed by host diff views, independently of diff counts.
 pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
-    crate::subc::rich_ui::display::file(file, None, Some(before), Some(after), "modified");
+    crate::edit::report_file(file, None, Some(before), Some(after), "modified");
     result["metadata"] = serde_json::json!({ "diff": build_unified_diff(file, before, after) });
 }
 
@@ -1554,7 +1575,7 @@ pub(crate) fn attach_edit_diff(
     before: &str,
     after: &str,
 ) {
-    crate::subc::rich_ui::display::file(file, None, Some(before), Some(after), "modified");
+    crate::edit::report_file(file, None, Some(before), Some(after), "modified");
     if wants_diff(params) {
         let (patch, info) = response_diff(params, file, before, after);
         result["metadata"] = serde_json::json!({ "diff": patch });

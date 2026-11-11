@@ -259,7 +259,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if !rolled_back {
-        crate::subc::rich_ui::display::file(
+        crate::edit::report_file(
             &path.to_string_lossy(),
             None,
             if existed { original } else { Some("") },

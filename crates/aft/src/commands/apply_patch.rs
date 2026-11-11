@@ -1317,7 +1317,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     }
 
     for result in &applied {
-        crate::subc::rich_ui::display::file(
+        crate::edit::report_file(
             &result.display_path.to_string_lossy(),
             result
                 .move_path
