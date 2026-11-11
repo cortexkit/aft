@@ -204,7 +204,9 @@ pub(crate) fn start(
     describe_supported: bool,
 ) -> Arc<Service> {
     let root = key(root);
-    if let Err(error) = crate::db::open(&root.join("aft.db")) {
+    if let Err(error) =
+        crate::db::open(&root.join("aft.db")).inspect(|connection| connection.close_in_background())
+    {
         log::warn!("speech authority initialization unavailable: {error}");
     }
     let mut services = SERVICES

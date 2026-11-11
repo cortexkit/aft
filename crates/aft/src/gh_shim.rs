@@ -5784,6 +5784,7 @@ fn invalidate_successful_github_read_mutation_at(
     let Ok(conn) = crate::db::open(&storage_root.join("aft.db")) else {
         return;
     };
+    conn.close_in_background();
     // A successful mutation can change content shared by several identities, so
     // evict every identity's cache row for the exact resource.
     let _ = invalidate_github_read_cache_resource(

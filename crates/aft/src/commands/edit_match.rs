@@ -1322,11 +1322,22 @@ mod tests {
             .pragma_query_value(None, "page_size", |row| row.get(0))
             .unwrap();
         assert!(N * PAYLOAD / page_size > 1000);
+        let request_checkpoints =
+            crate::db::lifecycle::inline_checkpoints_on_this_thread() - before;
+        let sqlite = crate::db::lifecycle::connection_snapshot();
+        assert!(sqlite.wal_high_water_frames >= 1000);
+        assert_eq!(request_checkpoints, 0);
         println!(
-            "wal_edit_probe n={N} payload_bytes={PAYLOAD} payload_pages={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} request_checkpoints={}",
+            "wal_edit_probe n={N} payload_bytes={PAYLOAD} payload_pages={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} request_checkpoints={} wal_high_water_frames={} lag_events={}",
             N * PAYLOAD / page_size, durations[N / 2], durations[N * 95 / 100],
-            durations[N - 1], crate::db::lifecycle::inline_checkpoints_on_this_thread() - before,
+            durations[N - 1], request_checkpoints, sqlite.wal_high_water_frames, sqlite.wal_checkpoint_lag_events,
         );
+        drop(ctx);
+        drop(pool);
+        assert!(crate::db::deferred_checkpoint::test_hooks::wait_closed(
+            &storage.path().join("aft.db"),
+            std::time::Duration::from_secs(10),
+        ));
     }
 
     /// A failed edit should name the miss, not paste the whole `match` text

@@ -566,6 +566,7 @@ fn standing_snapshot_metadata(
     let Ok(conn) = crate::db::open(&db_path) else {
         return ExternalBorrowMetadata::default();
     };
+    conn.close_in_background();
     let Ok(needs_strict_verify) =
         crate::db::standing_roots::needs_strict_verify_for_resolved_target(
             &conn,

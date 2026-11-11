@@ -3709,6 +3709,7 @@ impl App {
 
         let created = !path.exists();
         let conn = Arc::new(Mutex::new(crate::db::open_with_mode(path, mode)?));
+        crate::db::deferred_checkpoint::register(&conn);
         *slot = Some((key, Arc::clone(&conn)));
         drop(slot);
         if created {
@@ -3754,6 +3755,7 @@ impl App {
     }
 
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
+        crate::db::deferred_checkpoint::register(&conn);
         *self.db.lock() = Some((PathBuf::new(), conn));
     }
 

@@ -1,33 +1,40 @@
-//! WAL checkpoints that a commit asked for but must not wait on.
+//! Checkpoint through the owning connection, never a second SQLite handle.
 //!
-//! SQLite runs a PASSIVE checkpoint inside whichever commit pushes the WAL
-//! past its autocheckpoint threshold (see `tracked_wal_hook`). The checkpoint
-//! copies the WAL's pages into the database file and syncs both files, which
-//! under heavy disk write load can take seconds, all while the committing
-//! thread holds its connection's mutex. A commit made while a caller waits,
-//! such as the undo-history mirror of an edit, hands its checkpoint here
-//! instead (see `defer_wal_checkpoints`). One worker thread runs each one on
-//! a short-lived connection of its own, so it holds neither the committing
-//! connection nor its mutex, and a PASSIVE checkpoint never blocks the
-//! database's readers or writers.
+//! Commit hooks only queue work. Resident stores register a weak reference to
+//! their connection mutex; the worker retries if a request currently owns it.
+//! Short-lived stores hand over their connection at close instead. A stalled
+//! reader or worker is reported as checkpoint lag, never repaired by doing
+//! checkpoint I/O on the committing thread.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use rusqlite::OpenFlags;
+use super::lifecycle::TrackedConnection;
 
-use super::file_identity::{self, FileIdentity};
-use super::lifecycle::{SqliteStore, TrackedConnection, WalCheckpointMode};
-use crate::write_ledger::Domain as WriteDomain;
-
-struct Request {
+pub(crate) struct Request {
     path: PathBuf,
-    identity: FileIdentity,
+    queued: AtomicBool,
+    work: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointRequest")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+enum Job {
+    Checkpoint(Arc<Request>),
+    Close(Box<dyn FnOnce() + Send>),
 }
 
 struct Queue {
-    pending: Mutex<VecDeque<Request>>,
+    pending: Mutex<VecDeque<(Instant, Job)>>,
     ready: Condvar,
 }
 
@@ -49,100 +56,101 @@ fn queue() -> &'static Queue {
     queue
 }
 
-/// Ask the worker to checkpoint the database at `path`, but only while the
-/// file there is still `identity`, the file the asking connection uses. A
-/// request for a database that already has one waiting is dropped: the
-/// waiting checkpoint will copy every frame committed before it runs.
-pub(crate) fn request(path: &Path, identity: FileIdentity) {
+fn enqueue(job: Job, delay: Duration) {
     let queue = queue();
-    let mut pending = queue
+    queue
         .pending
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if pending.iter().any(|waiting| waiting.path == path) {
-        return;
-    }
-    pending.push_back(Request {
-        path: path.to_path_buf(),
-        identity,
-    });
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back((Instant::now() + delay, job));
     queue.ready.notify_one();
+}
+
+impl Request {
+    pub(crate) fn schedule(self: &Arc<Self>) {
+        self.schedule_after(Duration::ZERO);
+    }
+
+    fn schedule_after(self: &Arc<Self>, delay: Duration) {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            enqueue(Job::Checkpoint(Arc::clone(self)), delay);
+        }
+    }
+}
+
+/// Attach once, after putting the connection behind its resident owning lock.
+/// The callback retains only a weak reference, so queued work cannot keep an
+/// evicted store (or its connection) alive.
+pub(crate) fn register(pool: &Arc<Mutex<TrackedConnection>>) {
+    let weak = Arc::downgrade(pool);
+    let conn = pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    conn.set_checkpoint_owner(Box::new(move || {
+        let Some(pool) = weak.upgrade() else {
+            return true;
+        };
+        let conn = match pool.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        conn.checkpoint_in_background()
+    }));
+}
+
+pub(crate) fn owner(path: &Path, work: Box<dyn Fn() -> bool + Send + Sync>) -> Arc<Request> {
+    Arc::new(Request {
+        path: path.to_path_buf(),
+        queued: AtomicBool::new(false),
+        work,
+    })
+}
+
+pub(crate) fn close(work: impl FnOnce() + Send + 'static) {
+    enqueue(Job::Close(Box::new(work)), Duration::ZERO);
 }
 
 fn run(queue: &'static Queue) {
     loop {
-        let request = {
+        let job = {
             let mut pending = queue
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
-                if let Some(request) = pending.pop_front() {
-                    break request;
+                let now = Instant::now();
+                if let Some(index) = pending.iter().position(|(at, _)| *at <= now) {
+                    break pending.remove(index).unwrap().1;
                 }
-                pending = queue
-                    .ready
-                    .wait(pending)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending = if let Some(next) = pending.iter().map(|(at, _)| *at).min() {
+                    queue
+                        .ready
+                        .wait_timeout(pending, next.saturating_duration_since(now))
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0
+                } else {
+                    queue
+                        .ready
+                        .wait(pending)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                };
             }
         };
-        checkpoint(&request);
-        #[cfg(test)]
-        test_hooks::note_finished(&request.path);
-    }
-}
-
-fn checkpoint(request: &Request) {
-    let connection = {
-        // Opening and the checks before it are serialized with AFT's own
-        // database removals and replacements.
-        let _guard = file_identity::filesystem_guard();
-        // A different file at the same path (the database was deleted and
-        // recreated) would share SQLite's per-path WAL-index with the file
-        // the asking connection still has open; opening it would truncate
-        // the index under that connection.
-        if file_identity::identity_of(&request.path) != Some(request.identity) {
-            return;
-        }
-        // Never be the only connection: there is no live WAL to checkpoint,
-        // and closing the last connection runs SQLite's own checkpoint.
-        if file_identity::open_connections(&request.path) == 0 {
-            return;
-        }
-        // No SQLITE_OPEN_CREATE: a database removed since the request is
-        // left removed.
-        match TrackedConnection::open_path_with_flags(
-            &request.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            SqliteStore::AftDb,
-        ) {
-            Ok(connection) => connection,
-            Err(error) => {
-                crate::slog_warn!(
-                    "deferred WAL checkpoint of {} skipped: {error}",
-                    request.path.display()
-                );
-                return;
+        match job {
+            Job::Close(work) => work(),
+            Job::Checkpoint(request) => {
+                #[cfg(test)]
+                test_hooks::wait_at_gate();
+                request.queued.store(false, Ordering::Release);
+                if !(request.work)() {
+                    request.schedule_after(Duration::from_millis(100));
+                } else {
+                    #[cfg(test)]
+                    test_hooks::note_finished(&request.path);
+                }
             }
         }
-    };
-    #[cfg(test)]
-    test_hooks::wait_at_gate();
-    // The same sync policy the database's writers use, so the checkpoint
-    // syncs exactly what an inline one would.
-    if let Err(error) = connection.pragma_update(None, "synchronous", "NORMAL") {
-        crate::slog_warn!(
-            "deferred WAL checkpoint of {} skipped: {error}",
-            request.path.display()
-        );
-        return;
-    }
-    if let Err(error) = connection.checkpoint_wal_as(WalCheckpointMode::Passive, WriteDomain::AftDb)
-    {
-        crate::slog_warn!(
-            "deferred WAL checkpoint of {} failed: {error}",
-            request.path.display()
-        );
     }
 }
 
@@ -165,7 +173,7 @@ pub(crate) mod test_hooks {
         STATE.get_or_init(Default::default)
     }
 
-    pub(super) fn note_finished(path: &Path) {
+    pub(crate) fn note_finished(path: &Path) {
         let (lock, changed) = state();
         let mut state = lock.lock().unwrap();
         *state.finished.entry(path.to_path_buf()).or_default() += 1;
@@ -183,7 +191,7 @@ pub(crate) mod test_hooks {
         state.waiting_at_gate -= 1;
     }
 
-    /// Hold every deferred checkpoint after it opens its connection until
+    /// Hold every deferred checkpoint before it takes the owning lock until
     /// [`open_gate`]. One test at a time may close the gate.
     pub(crate) fn close_gate() {
         let (lock, _) = state();
@@ -220,6 +228,20 @@ pub(crate) mod test_hooks {
             .get(path)
             .copied()
             .unwrap_or(0)
+    }
+
+    pub(crate) fn wait_closed(path: &Path, timeout: Duration) -> bool {
+        let (lock, changed) = state();
+        let deadline = Instant::now() + timeout;
+        let mut state = lock.lock().unwrap();
+        while crate::db::file_identity::open_connections(path) > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            state = changed.wait_timeout(state, deadline - now).unwrap().0;
+        }
+        true
     }
 
     /// Wait until more than `seen` deferred checkpoints of `path` finished.
