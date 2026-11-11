@@ -955,6 +955,7 @@ mod tests {
                 Arc::new(AtomicBool::new(killed)),
                 Arc::clone(&exit_observed),
                 Arc::clone(&coordinator),
+                None,
             )
             .unwrap();
             coordinator.signal_one_done();
