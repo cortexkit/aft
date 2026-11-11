@@ -10961,6 +10961,7 @@ mod ledger_terminal_tests {
 
     #[tokio::test]
     async fn runner_restart_yield_waits_for_call_ledger_admission() {
+        crate::subc::lower_hooks::register();
         use crate::subc::*;
         let (dir, root) = test_support::test_root("yield-during-admission");
         let ctx = test_support::test_ctx();

@@ -618,6 +618,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runner_restart_watch_reattaches_after_aft_restart_without_resetting_its_timer() {
+        crate::subc::lower_hooks::register();
         use crate::db::call_ledger as ledger;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");

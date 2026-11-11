@@ -2174,6 +2174,7 @@ mod tests {
 
     #[test]
     fn runner_restart_held_shell_recovers_exact_terminal_bytes_or_explicit_unknown() {
+        crate::subc::lower_hooks::register();
         let conn = database();
         let scope = scope("core");
         let held = serde_json::to_vec(&json!({"content":[{"type":"text","text":""}],"held":{"reason":"running","yielded":true}})).unwrap();
