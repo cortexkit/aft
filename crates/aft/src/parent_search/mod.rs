@@ -28,7 +28,7 @@ pub use crate::data_layer::parent_session::{Discovery, RequestedPlanes};
 mod tests;
 mod worker;
 
-pub(crate) use query::{attach_gaps, attach_search_gaps};
+pub(crate) use query::attach_search_gaps;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
