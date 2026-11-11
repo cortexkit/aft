@@ -138,6 +138,16 @@ fn samples() -> Value {
         .clone()
 }
 
+#[test]
+fn manifest_sync_health_remembers_newest_notice_even_when_latest_is_older() {
+    let mut health = Health::default();
+    health.observe_version(Some(29));
+    health.observe_version(Some(30));
+    health.observe_version(Some(29));
+    health.observe_version(None);
+    assert_eq!(health.newest_version_seen, Some(30));
+}
+
 #[cfg(unix)]
 #[path = "manifest_sync_vault_fake.rs"]
 mod vault;

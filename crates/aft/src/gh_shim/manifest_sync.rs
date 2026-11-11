@@ -17,6 +17,14 @@ struct Health {
     last_refusal_code: Option<&'static str>,
 }
 
+impl Health {
+    fn observe_version(&mut self, version: Option<u64>) {
+        if let Some(version) = version {
+            self.newest_version_seen = Some(self.newest_version_seen.unwrap_or(0).max(version));
+        }
+    }
+}
+
 static HEALTH: Mutex<Health> = Mutex::new(Health {
     active_version: None,
     newest_version_seen: None,
@@ -328,7 +336,7 @@ async fn latest(session: &ManagementSession) -> Result<Latest, Failure> {
     let mut health = HEALTH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    health.newest_version_seen = Some(health.newest_version_seen.unwrap_or(0).max(latest.version));
+    health.observe_version(Some(latest.version));
     Ok(latest)
 }
 
@@ -428,6 +436,10 @@ where
                 {
                     return Err(Failure::new("transport_unavailable", true));
                 }
+                HEALTH
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .observe_version(notice.version);
                 backoff = Backoff::default();
                 let hash_differs = notice.version == cursor.read_version
                     && notice.manifest_sha256 != cursor.read_sha256;
