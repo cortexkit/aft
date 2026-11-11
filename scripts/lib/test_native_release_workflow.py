@@ -117,6 +117,27 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
         run = next(step for step in e2e["steps"] if step.get("name") == "Run shipped E2E suite")
         self.assertIn("Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR", run["run"])
 
+    def test_windows_arm64_release_validates_managed_clang_and_actual_coff_target_before_building(self):
+        steps = self.workflow("release.yml")["jobs"]["build-win32-arm64"]["steps"]
+        probe = next(i for i, step in enumerate(steps)
+                     if step.get("name") == "Verify administrator-installed LLVM ARM64 support")
+        build = next(i for i, step in enumerate(steps) if step.get("name") == "Build")
+        self.assertLess(probe, build)
+        self.assertNotIn("if", steps[probe])
+        self.assertNotIn("continue-on-error", steps[probe])
+        self.assertEqual(steps[probe]["shell"], "pwsh")
+        run = steps[probe]["run"]
+        self.assertIn("Get-Command clang -CommandType Application", run)
+        self.assertIn('throw "clang is missing from the runner service PATH', run)
+        self.assertIn("& $clang.Source --version", run)
+        self.assertIn("--target=aarch64-pc-windows-msvc -c $source -o $object", run)
+        self.assertIn("$LASTEXITCODE -ne 0", run)
+        self.assertIn("$env:AFT_CI_JOB_DIR", run)
+        self.assertIn("$bytes[0] -ne 0x64 -or $bytes[1] -ne 0xaa", run)
+        self.assertIn("finally {", run)
+        self.assertIn("Remove-Item -LiteralPath $source, $object", run)
+        self.assertNotRegex(run, r"(?i)\b(winget|choco|scoop|Install-Package|Invoke-WebRequest)\b")
+
     def workflow(self, name):
         return parser.parse_workflow(str(ROOT / ".github/workflows" / name))
 

@@ -119,3 +119,20 @@ runs:
           echo "::error::Rust $actual differs from release producer $AFT_CI_RUST_VERSION; provision the matching read-only toolchain."
           exit 1
         fi
+    - name: Verify administrator-installed Windows jq
+      if: runner.os == 'Windows' && runner.environment == 'self-hosted' && inputs.phase == 'setup'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq is missing from the runner service PATH; ask the administrator to install read-only jq on narli for the GitHub audit tests."
+          exit 1
+        fi
+        if ! version="$(jq --version)"; then
+          echo "::error::The administrator-installed jq cannot report its version; repair jq on the runner service PATH."
+          exit 1
+        fi
+        case "$version" in
+          jq-*) printf 'Managed jq: %s (%s)\n' "$version" "$(command -v jq)" ;;
+          *) echo "::error::Unexpected jq version response: $version"; exit 1 ;;
+        esac

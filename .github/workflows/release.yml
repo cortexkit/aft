@@ -574,6 +574,32 @@ jobs:
             throw "MSVC v143 ARM64 compiler/linker/libraries are missing; ask the administrator to provision Microsoft.VisualStudio.Component.VC.Tools.ARM64 on narli"
           }
 
+      - name: Verify administrator-installed LLVM ARM64 support
+        shell: pwsh
+        run: |
+          $clang = Get-Command clang -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $clang) {
+            throw "clang is missing from the runner service PATH; ask the administrator to install read-only LLVM with aarch64-pc-windows-msvc support on narli"
+          }
+          & $clang.Source --version
+          if ($LASTEXITCODE -ne 0) { throw "The administrator-installed clang cannot report its version: $($clang.Source)" }
+          $source = Join-Path $env:AFT_CI_JOB_DIR "llvm-arm64-probe.c"
+          $object = Join-Path $env:AFT_CI_JOB_DIR "llvm-arm64-probe.obj"
+          try {
+            Set-Content -LiteralPath $source -Value 'int aft_ci_arm64_probe(void) { return 0; }' -Encoding ascii
+            & $clang.Source --target=aarch64-pc-windows-msvc -c $source -o $object
+            if ($LASTEXITCODE -ne 0) {
+              throw "clang cannot compile for aarch64-pc-windows-msvc; ask the administrator to provision the Windows ARM64 LLVM backend on narli"
+            }
+            $bytes = [System.IO.File]::ReadAllBytes($object)
+            if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x64 -or $bytes[1] -ne 0xaa) {
+              throw "clang did not produce a Windows ARM64 COFF object; check the administrator-installed LLVM target support"
+            }
+            Write-Host "Verified Windows ARM64 LLVM code generation: $($clang.Source)"
+          } finally {
+            Remove-Item -LiteralPath $source, $object -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Build
         run: cargo build --release --target aarch64-pc-windows-msvc
         env:
