@@ -374,9 +374,15 @@ describe("archive tool deadlines", () => {
     () => {
       const root = createStagingFixture();
       const pidFile = join(root, "tar.pid");
-      writeFileSync(join(root, "tar"), '#!/bin/sh\necho $$ > "$AFT_HANG_PID"\nexec sleep 60\n', {
-        mode: 0o755,
-      });
+      writeFileSync(
+        join(root, "tar"),
+        '#!/bin/sh\n[ -n "$AFT_HANG_WARM" ] && exit 0\necho $$ > "$AFT_HANG_PID"\nexec sleep 60\n',
+        { mode: 0o755 },
+      );
+      // macOS checks a newly written executable on its first run, which can take
+      // longer than the inner test's deadline on a loaded machine. Run it once
+      // so the timed run below starts the fake tar promptly.
+      execFileSync(join(root, "tar"), [], { env: { ...process.env, AFT_HANG_WARM: "1" } });
       try {
         // A separate runner is essential: Bun cannot time out a synchronous fixture.
         const result = spawnSync(
