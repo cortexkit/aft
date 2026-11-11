@@ -1378,7 +1378,7 @@ impl SearchMatcher {
 pub(crate) struct GrepBlocks {
     reader: Option<crate::bounded_io::Reader>,
     pending: Vec<u8>,
-    scratch: Vec<u8>,
+    chunk_bytes: usize,
     end: usize,
     eof: bool,
     yielded: bool,
@@ -1411,7 +1411,7 @@ impl GrepBlocks {
         Ok(Self {
             reader: stream.then_some(reader),
             pending,
-            scratch: Vec::new(),
+            chunk_bytes: 64 << 10,
             end: 0,
             eof: !stream || binary || short,
             yielded: binary,
@@ -1436,23 +1436,17 @@ impl GrepBlocks {
                 self.yielded = true;
                 return Ok(Some((self.line_base, &self.pending[..])));
             }
-            let size = if self.scratch.capacity() == 0 {
-                64 << 10
-            } else {
-                Self::BLOCK_BYTES
-            };
-            self.scratch = self
+            let size = self.chunk_bytes;
+            self.chunk_bytes = Self::BLOCK_BYTES;
+            let before = self.pending.len();
+            self.pending = self
                 .reader
                 .as_mut()
                 .unwrap()
-                .chunk(std::mem::take(&mut self.scratch), size)?;
-            if self.scratch.len() < size {
+                .append(std::mem::take(&mut self.pending), size)?;
+            if self.pending.len() - before < size {
                 self.eof = true;
             }
-            self.pending
-                .try_reserve_exact(self.scratch.len())
-                .map_err(std::io::Error::other)?;
-            self.pending.extend_from_slice(&self.scratch);
             if let Some(end) = memchr::memrchr(b'\n', &self.pending) {
                 self.end = end + 1;
                 self.yielded = true;
@@ -1463,7 +1457,6 @@ impl GrepBlocks {
                 // file with reader.rest, reserving its remaining byte count
                 // once instead of repeatedly growing the carry. Ordinary
                 // lines still stream.
-                self.scratch = Vec::new();
                 self.pending = self
                     .reader
                     .as_mut()
@@ -3158,7 +3151,6 @@ mod grep_block_tests {
         for stream in [false, true] {
             let mut blocks = GrepBlocks::open(&path, None, false, stream).unwrap();
             assert_eq!(blocks.pending.capacity(), 0);
-            assert_eq!(blocks.scratch.capacity(), 0);
             assert!(blocks.next().unwrap().is_none());
         }
         assert_eq!(
@@ -3248,7 +3240,6 @@ mod grep_block_tests {
         let mut blocks = GrepBlocks::open(&path, None, false, true).unwrap();
         assert_eq!(blocks.next().unwrap().unwrap(), (0, content.as_slice()));
         assert!(blocks.reader.is_none());
-        assert_eq!(blocks.scratch.capacity(), 0);
         assert!(blocks.next().unwrap().is_none());
     }
 }

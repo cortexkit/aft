@@ -1893,6 +1893,41 @@ pub(crate) fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
 }
 
 impl Reader {
+    /// Append at most `size` bytes directly to the supplied buffer, avoiding
+    /// a zero-filled scratch buffer and a second copy.
+    pub(crate) fn append(&mut self, mut bytes: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
+        if Instant::now() >= deadline(self.at) {
+            return Err(failure(
+                &self.path,
+                "read_deadline_exceeded",
+                "scan deadline elapsed during file read",
+            ));
+        }
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("file read already failed"))?;
+        let read = move || {
+            bytes.try_reserve_exact(size).map_err(io::Error::other)?;
+            let before = bytes.len();
+            Read::by_ref(&mut file)
+                .take(size as u64)
+                .read_to_end(&mut bytes)?;
+            crate::io_accounting::WORK.content_read_bytes.fetch_add(
+                (bytes.len() - before) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok((file, bytes))
+        };
+        let (file, bytes) = if self.direct {
+            read()?
+        } else {
+            run(&self.path, self.at, move |_| read())?
+        };
+        self.file = Some(file);
+        Ok(bytes)
+    }
+
     pub(crate) fn rest(&mut self, mut bytes: Vec<u8>) -> io::Result<Vec<u8>> {
         if Instant::now() >= deadline(self.at) {
             return Err(failure(
@@ -2072,6 +2107,39 @@ pub(crate) fn stall_running_helper_if_requested(path: &Path) {
 pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::OpenOptionsExt;
+
+    #[test]
+    fn reader_append_is_bounded_and_preserves_cursor_for_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("append.txt");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let mut input = reader(&path, None).unwrap();
+        let bytes = input.append(b"prefix:".to_vec(), 0).unwrap();
+        assert_eq!(bytes, b"prefix:");
+        let bytes = input.append(bytes, 3).unwrap();
+        assert_eq!(bytes, b"prefix:abc");
+        let bytes = input.append(bytes, 2).unwrap();
+        assert_eq!(bytes, b"prefix:abcde");
+        let bytes = input.rest(bytes).unwrap();
+        assert_eq!(bytes, b"prefix:abcdefgh");
+        assert!(input.append(Vec::new(), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reader_append_rejects_expired_deadline_without_advancing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deadline.txt");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let mut input = reader(&path, None).unwrap();
+        input.at = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(
+            input.append(Vec::new(), 3).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        input.at = None;
+        assert_eq!(input.append(Vec::new(), 3).unwrap(), b"abc");
+    }
+
     static MACOS_DIRECTORIES: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     pub(crate) struct MacosProbe(PathBuf);
