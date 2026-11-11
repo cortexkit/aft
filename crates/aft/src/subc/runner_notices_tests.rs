@@ -12,6 +12,318 @@ fn owner(principal: &str, harness: &str) -> crate::bash_background::TaskIdentity
     }
 }
 
+struct Completion {
+    _root: tempfile::TempDir,
+    storage: tempfile::TempDir,
+    registry: crate::bash_background::BgTaskRegistry,
+    route: RouteIdentity,
+    task: String,
+    finished: u64,
+}
+
+impl Completion {
+    fn new(task: &str, offers: usize) -> Self {
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
+        let (root_dir, root) = super::super::test_support::test_root("runner-notices");
+        let storage = tempfile::tempdir().unwrap();
+        let mut route = super::super::test_support::route_identity_with_harness(
+            &root,
+            task,
+            BindTrust::FirstParty,
+            "broca",
+        );
+        if let AuthenticatedPrincipal::RouteBind {
+            principal_id,
+            harness,
+            ..
+        } = &mut Arc::get_mut(&mut route.0).unwrap().spawn_principal
+        {
+            *principal_id = Some("reserved:broca".into());
+            *harness = "broca".into();
+        }
+        let _scope = crate::bash_background::task_identity_scope(Some(route.task_identity()));
+        let paths = create_task_layout(storage.path(), task, task).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task.into(),
+            task.into(),
+            "echo durable".into(),
+            root.as_path().into(),
+            Some(root.as_path().into()),
+            None,
+            true,
+            false,
+        );
+        metadata.mark_terminal(
+            crate::bash_background::BgTaskStatus::Completed,
+            Some(0),
+            None,
+        );
+        metadata.launching_raw_harness = Some("broca".into());
+        metadata.runner_completion_offers = offers;
+        let finished = metadata.finished_at.unwrap();
+        write_task_at(&paths, &metadata).unwrap();
+        let registry = crate::bash_background::BgTaskRegistry::default();
+        registry.replay_session(storage.path(), task).unwrap();
+        Self {
+            _root: root_dir,
+            storage,
+            registry,
+            route,
+            task: task.into(),
+            finished,
+        }
+    }
+
+    fn frame(&self) -> PushFrame {
+        let _scope = crate::bash_background::task_identity_scope(Some(self.route.task_identity()));
+        self.registry
+            .pending_completions_for_session(&self.task)
+            .pop()
+            .unwrap()
+            .into_push_frame()
+    }
+
+    fn delivered(&self) -> bool {
+        use crate::bash_background::persistence::{read_task_at, resolve_task};
+        let paths = resolve_task(self.storage.path(), &self.task, &self.task).unwrap();
+        read_task_at(&paths).unwrap().completion_delivered
+    }
+
+    fn offer(&self, scheduler: &Scheduler, now: Arc<AtomicU64>) {
+        assert!(offer(
+            scheduler,
+            self.registry.clone(),
+            self.frame(),
+            PathBuf::new(),
+            false,
+            move || now.load(Ordering::Relaxed)
+        ));
+    }
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        self.registry.detach();
+    }
+}
+
+fn step(scheduler: &Scheduler, now: std::time::Instant) -> Next {
+    let (id, mut work) = Scheduler::take(&mut scheduler.entries.lock().unwrap(), now).unwrap();
+    let next = work();
+    let result = match &next {
+        Next::Done => Next::Done,
+        Next::Retry(delay) => Next::Retry(*delay),
+    };
+    scheduler.finish(&id, work, next, now);
+    result
+}
+
+fn wait_for(scheduler: &Scheduler, task: &str, finished: bool) {
+    let id = format!("aft:bash:{task}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut entries = scheduler.entries.lock().unwrap();
+    loop {
+        if if finished {
+            !entries.contains_key(&id)
+        } else {
+            entries
+                .get(&id)
+                .is_some_and(|entry| entry.retrying && entry.work.is_some())
+        } {
+            return;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !left.is_zero(),
+            "notice did not reach scheduled state: {task}"
+        );
+        entries = scheduler.wake.wait_timeout(entries, left).unwrap().0;
+    }
+}
+
+#[test]
+fn runner_notices_completion_survives_long_outage_and_acks_only_acceptance() {
+    let task = Completion::new("bash-00000000000b0001", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.retry(30);
+    let scheduler = Scheduler::default();
+    let clock = Arc::new(AtomicU64::new(task.finished));
+    task.offer(&scheduler, clock.clone());
+    let start = std::time::Instant::now();
+    let mut due = start;
+    for attempt in 0..30 {
+        clock.store(
+            task.finished + due.duration_since(start).as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        let Next::Retry(delay) = step(&scheduler, due) else {
+            panic!("retired attempt {attempt}")
+        };
+        assert!(delay <= Duration::from_secs(60));
+        if attempt >= 8 {
+            assert_eq!(delay, Duration::from_secs(60));
+        }
+        assert!(!task.delivered(), "retry must not ack attempt {attempt}");
+        assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
+        due += delay;
+    }
+    assert!(due.duration_since(start) > Duration::from_secs(20 * 60));
+    assert!(matches!(step(&scheduler, due), Next::Done));
+    assert!(task.delivered());
+    assert_eq!(capture.receiver.try_iter().count(), 31);
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn runner_notices_completion_expires_from_finish_even_with_exhausted_old_budget() {
+    let task = Completion::new("bash-00000000000b0002", 100);
+    let capture = test_endpoint::capture(&task.task, false);
+    let scheduler = Scheduler::default();
+    let before = EXPIRED.load(Ordering::Relaxed);
+    task.offer(
+        &scheduler,
+        Arc::new(AtomicU64::new(task.finished + MAX_AGE_MS)),
+    );
+    assert!(matches!(
+        step(&scheduler, std::time::Instant::now()),
+        Next::Done
+    ));
+    assert!(task.delivered());
+    assert!(EXPIRED.load(Ordering::Relaxed) > before);
+    assert!(
+        capture.receiver.try_recv().is_err(),
+        "expired task must not be sent"
+    );
+}
+
+#[test]
+fn runner_notices_restart_offers_pending_completion_with_high_persisted_count() {
+    let task = Completion::new("bash-00000000000b0003", 100);
+    task.registry.detach();
+    let restarted = crate::bash_background::BgTaskRegistry::default();
+    restarted
+        .replay_session(task.storage.path(), &task.task)
+        .unwrap();
+    let _scope = crate::bash_background::task_identity_scope(Some(task.route.task_identity()));
+    let frame = restarted
+        .pending_completions_for_session(&task.task)
+        .pop()
+        .unwrap()
+        .into_push_frame();
+    let capture = test_endpoint::capture(&task.task, false);
+    let scheduler = Scheduler::default();
+    let now = task.finished;
+    assert!(offer(
+        &scheduler,
+        restarted.clone(),
+        frame,
+        PathBuf::new(),
+        false,
+        move || now
+    ));
+    assert!(matches!(
+        step(&scheduler, std::time::Instant::now()),
+        Next::Done
+    ));
+    assert_eq!(capture.receiver.try_iter().count(), 1);
+    assert!(task.delivered());
+    assert_eq!(
+        restarted
+            .notice_metadata(&task.task)
+            .unwrap()
+            .runner_completion_offers,
+        101
+    );
+    restarted.detach();
+}
+
+#[test]
+fn runner_notices_route_bind_expedites_retry_without_parallel_send() {
+    let task = Completion::new("bash-00000000000b0004", 100);
+    let capture = test_endpoint::capture(&task.task, false);
+    capture.retry(1);
+    assert!(enqueue(task.registry.clone(), task.frame()));
+    let scheduler = scheduler().unwrap();
+    wait_for(scheduler, &task.task, false);
+    let first = capture.receiver.try_recv().unwrap();
+    let id = format!("aft:bash:{}", task.task);
+    assert!(
+        scheduler.entries.lock().unwrap()[&id].due
+            > std::time::Instant::now() + Duration::from_secs(50)
+    );
+    let (entered, release) = capture.block_next();
+    route_bound(task.registry.clone(), &task.route);
+    entered.recv_timeout(Duration::from_millis(500)).unwrap();
+    for _ in 0..20 {
+        route_bound(task.registry.clone(), &task.route);
+    }
+    assert!(capture.receiver.try_recv().is_ok());
+    assert!(capture.receiver.try_recv().is_err());
+    release.send(()).unwrap();
+    wait_for(scheduler, &task.task, true);
+    assert!(task.delivered());
+    assert_eq!(capture.max_active(), 1);
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+    assert_eq!(first.request["params"]["send_id"], id);
+    assert!(capture.receiver.try_recv().is_err());
+}
+
+#[test]
+fn runner_notices_waiting_retries_do_not_occupy_workers() {
+    let scheduler = scheduler().unwrap();
+    let mut waiting = Vec::new();
+    for n in 0..20 {
+        let task = Completion::new(&format!("bash-{:016x}", 0xc0000 + n), 100);
+        let capture = test_endpoint::capture(&task.task, false);
+        capture.retry(u64::MAX);
+        assert!(enqueue(task.registry.clone(), task.frame()));
+        wait_for(scheduler, &task.task, false);
+        waiting.push((task, capture));
+    }
+    let task = Completion::new("bash-00000000000b0005", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    assert!(enqueue(task.registry.clone(), task.frame()));
+    capture
+        .receiver
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap();
+    wait_for(scheduler, &task.task, true);
+    assert!(task.delivered());
+    assert!(health().0 >= 20);
+    for (task, _) in waiting {
+        assert!(!task.delivered());
+        scheduler
+            .entries
+            .lock()
+            .unwrap()
+            .remove(&format!("aft:bash:{}", task.task));
+    }
+}
+
+#[test]
+fn runner_notices_bounded_queue_defers_without_ack() {
+    let scheduler = Scheduler::default();
+    for n in 0..QUEUE_CAPACITY {
+        assert!(scheduler.offer(n.to_string(), false, Box::new(|| Next::Done), false));
+    }
+    let task = Completion::new("bash-00000000000b0006", 0);
+    let capture = test_endpoint::capture(&task.task, false);
+    assert!(!offer(
+        &scheduler,
+        task.registry.clone(),
+        task.frame(),
+        PathBuf::new(),
+        false,
+        move || 0
+    ));
+    assert!(!task.delivered());
+    assert!(capture.receiver.try_recv().is_err());
+    assert_eq!(scheduler.entries.lock().unwrap().len(), QUEUE_CAPACITY);
+}
+
 #[test]
 fn runner_alias_switch_preserves_task_ownership_and_persisted_keys() {
     let principal = |raw: &str| AuthenticatedPrincipal::RouteBind {
@@ -92,7 +404,7 @@ impl FakeRunner {
             self.stored.insert(request.send_id.clone(), bytes);
         }
         if self.lose_first_response && self.calls.len() == 1 {
-            return Outcome::Retry;
+            return Outcome::Retry("response_lost");
         }
         let response = reply_body(&SendReply::new("pending").with_submission_id("send-7")).unwrap();
         read_reply::<SendReply>(&response).unwrap();
@@ -107,17 +419,28 @@ fn runner_notices_retry_unknown_outcome_with_same_id_and_dedupe() {
         lose_first_response: true,
         ..Default::default()
     };
-    let mut delays = Vec::new();
-    assert!(deliver(
+    let mut retry_logged = false;
+    assert!(matches!(deliver(
         &request.send_id,
         0,
-        |_| Some(runner.call(&envelope(&request))),
-        |delay| delays.push(delay)
+        true,
+        runner.call(&envelope(&request)),
+        &mut retry_logged,
+    ), Next::Retry(delay) if delay == Duration::from_millis(250)));
+    assert!(matches!(
+        deliver(
+            &request.send_id,
+            1,
+            true,
+            runner.call(&envelope(&request)),
+            &mut retry_logged
+        ),
+        Next::Done
     ));
     assert_eq!(runner.calls.len(), 2);
     assert_eq!(runner.notices, 1);
     assert_eq!(runner.calls[0], runner.calls[1]);
-    assert_eq!(delays, [Duration::from_millis(250)]);
+    assert!(retry_logged);
 }
 
 #[test]
@@ -135,35 +458,32 @@ fn runner_notices_final_refusals_stop_without_retry() {
             refuse: Some(code),
             ..Default::default()
         };
-        assert!(deliver(
-            &request.send_id,
-            0,
-            |_| Some(runner.call(&envelope(&request))),
-            |_| panic!("final refusal retried")
+        assert!(matches!(
+            deliver(
+                &request.send_id,
+                0,
+                true,
+                runner.call(&envelope(&request)),
+                &mut false,
+            ),
+            Next::Done
         ));
         assert_eq!(runner.calls.len(), 1, "{code}");
     }
 }
 
 #[test]
-fn runner_notices_retry_budget_survives_persisted_offer_count() {
-    let mut calls = 0;
-    assert!(deliver(
-        "aft:bash:bash-7",
-        MAX_ATTEMPTS - 1,
-        |_| {
-            calls += 1;
-            Some(Outcome::Retry)
-        },
-        |_| panic!("no attempts remain")
-    ));
-    assert_eq!(calls, 1);
-    assert!(deliver(
-        "aft:bash:bash-7",
-        MAX_ATTEMPTS,
-        |_| panic!("restart reset budget"),
-        |_| {}
-    ));
+fn runner_notices_transients_keep_short_retry_budget() {
+    for attempt in 0..MAX_ATTEMPTS {
+        let next = deliver(
+            "aft:warning:7",
+            attempt,
+            false,
+            Outcome::Retry("offline"),
+            &mut false,
+        );
+        assert_eq!(matches!(next, Next::Done), attempt + 1 == MAX_ATTEMPTS);
+    }
 }
 
 #[test]

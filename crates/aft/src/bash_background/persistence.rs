@@ -1934,8 +1934,8 @@ pub struct PersistedTask {
     /// and clears this. Persisted so the notice survives an AFT restart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancelled_call_unannounced: bool,
-    /// Successful completion offers to an acknowledging runner, including the
-    /// first offer. Persisted so reconnect budgets survive daemon restarts.
+    /// Runner completion send attempts, including the first offer. Persisted
+    /// so retry backoff survives daemon restarts; it is not a delivery limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) runner_completion_offers: usize,
     /// Freeze the exact runner send before its first attempt. A restart must

@@ -7976,6 +7976,9 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             lifecycle_probe,
         );
+        if let Some(route) = routes.get(&route_id) {
+            runner_notices::route_bound(ctx.bash_background().clone(), route);
+        }
     }
     let replayed = push::replay_buffered_push_frames(
         tx,

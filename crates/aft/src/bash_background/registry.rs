@@ -1613,7 +1613,7 @@ impl BashDrainReplyCache {
         published.completion_finished_at = metadata.finished_at;
         published.completion_delivered = metadata.completion_delivered;
         // An off-thread write may publish an earlier offer while a later one
-        // is already reserved in memory. Never reopen that replay budget.
+        // is already reserved in memory. Keep the send-attempt count monotonic.
         published.runner_completion_offers = published
             .runner_completion_offers
             .max(metadata.runner_completion_offers);
