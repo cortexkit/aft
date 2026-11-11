@@ -15468,15 +15468,15 @@ public class Greeter {
 
     #[test]
     fn slow_backend_converges_without_being_marked_down() {
-        // A 3 s floor leaves a singleton 2.5 s of scheduling margin on loaded
+        // A 1.5 s floor leaves a singleton 1.25 s of scheduling margin on loaded
         // CI runners. Scale the per-item delay with it: a 64-item batch still
-        // takes 32 s against its initial 12 s deadline, while 4 items fit in
-        // the 3 s floor. The per-item latency EMA (exponential moving average)
+        // takes 16 s against its initial 6 s deadline, while 4 items fit in
+        // the 1.5 s floor. The per-item latency EMA (exponential moving average)
         // must raise the deadline to recover to 64.
         // Keep the shared config's short deadlines for the never-answer test.
-        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(500));
+        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(250));
         let mut config = programmable_http_config(&server);
-        config.timeout_ms = 3_000;
+        config.timeout_ms = 1_500;
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
 
         for _ in 0..2 {
