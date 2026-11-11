@@ -2071,7 +2071,7 @@ impl PersistedTask {
             "task_terminal",
             format_args!(
                 "task={} status={:?} exit={exit_code:?} duration_ms={:?}",
-                self.task_id, status, self.duration_ms
+                self.task_id, self.status, self.duration_ms
             ),
         );
         self.child_pid = None;
