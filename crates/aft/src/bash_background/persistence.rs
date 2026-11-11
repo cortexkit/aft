@@ -127,7 +127,7 @@ fn wait_on_session_create_gate_for_test(session_dir: &Path) {
     }
 }
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub use crate::persisted_format::BASH_TASK_SCHEMA_VERSION as SCHEMA_VERSION;
 pub(crate) const CONTROL_DIR: &str = "control";
 const IO_DIR: &str = "io";
 pub(crate) const METADATA_FILE: &str = "metadata.json";

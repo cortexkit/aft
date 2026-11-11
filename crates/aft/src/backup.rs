@@ -334,25 +334,8 @@ fn run_restore_before_lock_hook_for_tests(session: &str, attempt: usize) {
 #[cfg(not(test))]
 fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 
-/// Current on-disk backup metadata schema version.
-///
-/// Bump this when the `meta.json` shape changes. Readers check the field and
-/// refuse or migrate older versions instead of misinterpreting them.
-///
-/// Version 5 adds the `directory` and `hardlink` entry kinds and the
-/// per-entry fields `link_to`, `hardlink_detached`, `post_state`,
-/// `external_change_before` and `external_change_checkpoint`. The new kinds
-/// never carry a `content_path`, so a version-4 reader, which reads an
-/// unknown kind as content and then requires its content file, fails closed
-/// on them; the new fields are optional, and readers treat them as unset when
-/// absent, so version-4 stacks load unchanged.
-// Version 6 marks disk metadata that can contain imported guards. Older disk
-// readers enforcing this version gate reject it; the SQLite mirror needs
-// separate downgrade protection before imported history can be exposed.
-pub const SCHEMA_VERSION: u32 = 6;
-/// Ordinary local history must remain readable by the current main daemon.
-/// Only a stack containing imported guards needs the newer reader format.
-pub(crate) const ORDINARY_SCHEMA_VERSION: u32 = 5;
+pub use crate::persisted_format::BACKUP_SCHEMA_VERSION as SCHEMA_VERSION;
+pub(crate) use crate::persisted_format::ORDINARY_BACKUP_SCHEMA_VERSION as ORDINARY_SCHEMA_VERSION;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
