@@ -53,6 +53,8 @@ pub enum ConsentOutcome {
     /// Cingulate allowed this request. Retry the vault once; only its release
     /// authorizes substitution.
     Answered,
+    /// Allowed for one use. Keep the duration for the next request's notice.
+    AnsweredOnce,
     Declined,
     Expired,
     /// Still pending when the call's hold ended: the call ends
@@ -70,6 +72,7 @@ impl std::fmt::Debug for ConsentOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConsentOutcome::Answered => f.write_str("Answered"),
+            ConsentOutcome::AnsweredOnce => f.write_str("AnsweredOnce"),
             ConsentOutcome::Declined => f.write_str("Declined"),
             ConsentOutcome::Expired => f.write_str("Expired"),
             ConsentOutcome::Pending => f.write_str("Pending"),

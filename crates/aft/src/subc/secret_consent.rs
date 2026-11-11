@@ -101,7 +101,11 @@ fn decode_secret_record(record: &serde_json::Value, request_id: &str) -> Consent
                 answer["decision"].as_str()
             };
             if decision == Some("allow") {
-                ConsentOutcome::Answered
+                if answer["duration"].as_str() == Some("once") {
+                    ConsentOutcome::AnsweredOnce
+                } else {
+                    ConsentOutcome::Answered
+                }
             } else {
                 ConsentOutcome::Declined
             }
@@ -206,7 +210,10 @@ impl SubcSecretConsent {
         };
         if matches!(
             outcome,
-            ConsentOutcome::Answered | ConsentOutcome::Declined | ConsentOutcome::Expired
+            ConsentOutcome::Answered
+                | ConsentOutcome::AnsweredOnce
+                | ConsentOutcome::Declined
+                | ConsentOutcome::Expired
         ) {
             card.answered = Some(outcome.clone());
         }
@@ -399,7 +406,9 @@ pub(super) fn file_secret_consent(
         ConsentOutcome::Unavailable { .. } | ConsentOutcome::Declined | ConsentOutcome::Expired => {
             Err(crate::secret::SECRET_ACCESS_UNAVAILABLE)
         }
-        ConsentOutcome::Answered => Ok(SecretConsentFiling::Answered),
+        ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce => {
+            Ok(SecretConsentFiling::Answered)
+        }
         ConsentOutcome::Pending => Ok(SecretConsentFiling::Pending(PendingSecretConsent {
             request,
             label: label.to_string(),

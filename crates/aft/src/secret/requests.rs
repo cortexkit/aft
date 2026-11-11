@@ -183,6 +183,9 @@ impl RequestSecrets {
         }
         let answer = self.ask(label, target).await;
         let UseAnswer::ApprovalRequired(pending) = answer else {
+            if matches!(answer, UseAnswer::Released(_)) {
+                history.used_after_card = false;
+            }
             return Ok(answer);
         };
         if history
@@ -219,14 +222,16 @@ impl RequestSecrets {
         std::thread::spawn(move || {
             let _ = send.send(super::consent::hold_consent(&request));
         });
-        if receive.await.ok() != Some(super::ConsentOutcome::Answered) {
-            return Err(());
-        }
+        let once = match receive.await.ok() {
+            Some(super::ConsentOutcome::AnsweredOnce) => true,
+            Some(super::ConsentOutcome::Answered) => false,
+            _ => return Err(()),
+        };
         let answer = self.ask(label, target).await;
         match answer {
             UseAnswer::ApprovalRequired(_) => Err(()),
             UseAnswer::Released(_) => {
-                history.used_after_card = true;
+                history.used_after_card = once;
                 Ok(answer)
             }
             _ => Ok(answer),

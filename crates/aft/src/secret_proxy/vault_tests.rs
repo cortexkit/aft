@@ -81,7 +81,10 @@ impl Phone {
     fn decide(&self, daemon: &FakeClaustrum, count: usize, answer: ConsentOutcome) {
         let mut state = self.state.lock().unwrap();
         let request = &state.requests[count - 1];
-        if answer == ConsentOutcome::Answered {
+        if matches!(
+            answer,
+            ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce
+        ) {
             daemon
                 .state
                 .lock()
@@ -369,14 +372,22 @@ async fn live_vault_concurrent_requests_share_one_card_and_once_queues_cards_ser
         let first = phone.phone.card(1).await;
         assert!(server.seen.lock().is_empty());
         assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
-        phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+        phone.phone.decide(
+            &daemon,
+            1,
+            if once {
+                ConsentOutcome::AnsweredOnce
+            } else {
+                ConsentOutcome::Answered
+            },
+        );
         if once {
             let second = phone.phone.card(2).await;
             assert_ne!(first.request_id, second.request_id);
             assert!(!worker.is_finished());
             assert!(proxy.approval_status().iter().any(|line| line
                 == "secret test: the approval covered one request; another card was sent"));
-            phone.phone.decide(&daemon, 2, ConsentOutcome::Answered);
+            phone.phone.decide(&daemon, 2, ConsentOutcome::AnsweredOnce);
         }
         let (reply, _client) = worker.join().unwrap();
         assert!(
@@ -530,4 +541,38 @@ async fn live_vault_fetch_uses_the_concrete_target_and_holds_for_the_phone() {
         daemon.state.lock().unwrap().params[0]["target"],
         json!({"scheme":"https", "host":"localhost", "port":443, "path":"/approved/doc.md"})
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_new_card_after_longer_approval_does_not_claim_it_was_once() {
+    let daemon = FakeClaustrum::start();
+    {
+        let mut state = daemon.state.lock().unwrap();
+        state.record = Some(record("authorization_bearer"));
+        state.once = true;
+    }
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let first = request_in_thread(client, false);
+    phone.phone.card(1).await;
+    phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+    let (reply, client) = first.join().unwrap();
+    assert_eq!(reply["status"], 200);
+    // The fixture expires coverage after one request despite the longer phone
+    // answer, standing in for a revoked grant before another request arrives.
+    let second = request_in_thread(client, false);
+    phone.phone.card(2).await;
+    assert_eq!(proxy.approval_status(), vec!["secret test: waiting for approval on the phone for localhost (requests wait up to 10 minutes)"]);
+    phone.phone.decide(&daemon, 2, ConsentOutcome::Declined);
+    let (reply, _client) = second.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    assert_eq!(server.seen.lock().len(), 1);
 }

@@ -680,6 +680,12 @@ fn secret_filer_vectors_are_pinned_and_decode_the_published_card_states() {
             "{name}"
         );
     }
+    let mut once = filer_reply("allowed").unwrap();
+    once["secret_use_answer"]["duration"] = json!("once");
+    assert_eq!(
+        decode_secret_record(&once, "01HF7YAT000000000000000001"),
+        ConsentOutcome::AnsweredOnce
+    );
     assert_eq!(
         decode_secret_record(
             &filer_reply("pending").unwrap(),
