@@ -703,7 +703,7 @@ fn ruff_version_command(
     Ok(command)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn ruff_version_command_available(version_command: Command, deadline: Instant) -> RuffAvailability {
     ruff_version_outcome_available(capture_probe_command(
         version_command,
