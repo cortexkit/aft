@@ -66,7 +66,7 @@ fn write_jq_fixture(directory: &std::path::Path) {
         std::fs::write(directory.join("output.bin"), b"A\r\r\nB\r\n").unwrap();
         std::fs::write(
             directory.join("jq.cmd"),
-            "@echo off\r\necho script=[%~f0] first=[%~1] cmd_extensions=[%CMDEXTVERSION%]>>\"%~dp0invocations.log\"\r\nif \"%~1\"==\"--binary\" exit /b 2\r\nmore >nul\r\ntype \"%~dp0\\output.bin\"\r\n",
+            "@echo off\r\necho script=[%~f0] first=[%~1] cmd_extensions=[%CMDEXTVERSION%]>>\"%~dp0invocations.log\"\r\nif \"%~1\"==\"--binary\" exit /b 2\r\nmore >nul\r\necho after_more=[%ERRORLEVEL%]>>\"%~dp0invocations.log\"\r\ntype \"%~dp0\\output.bin\"\r\necho after_type=[%ERRORLEVEL%]>>\"%~dp0invocations.log\"\r\n",
         )
         .unwrap();
     }
