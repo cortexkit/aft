@@ -25,12 +25,22 @@ impl ReplayKey {
     }
 }
 
-/// Deduplicate offers while any recipient route remains open. Enqueue is not
-/// an ack: after every recipient closes, the registry may offer the task again.
-#[derive(Debug, Default)]
+#[path = "completion_settlement.rs"]
+mod completion_settlement;
+
+type UnackedCompletions =
+    Arc<std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, HashSet<String>>>>>;
+
+/// Plugin and acknowledging runner offers remain eligible until acknowledged.
+/// Offers to other runners are no longer eligible after acceptance; all durable
+/// delivery writes run off-thread.
+#[derive(Default)]
 pub(super) struct CompletionDelivery {
     state: std::sync::Mutex<CompletionOffers>,
-    unacked: std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, HashSet<String>>>>,
+    registries: std::sync::Mutex<HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>>,
+    unacked: UnackedCompletions,
+    #[cfg(test)]
+    settlement_gate: std::sync::Mutex<Option<completion_settlement::TestGate>>,
     buffered: AtomicU64,
     dropped: AtomicU64,
 }
@@ -38,8 +48,42 @@ pub(super) struct CompletionDelivery {
 #[derive(Debug, Default)]
 struct CompletionOffers {
     admitted: HashSet<(ProjectRootId, String)>,
+    settled: HashSet<(ProjectRootId, String)>,
     recipients: HashMap<(ProjectRootId, String), HashSet<RouteChannel>>,
     retry_copies: HashMap<(ProjectRootId, String), usize>,
+}
+
+impl std::fmt::Debug for CompletionDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletionDelivery")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+fn caller_acknowledges_completions(principal: Option<&str>) -> bool {
+    // RouteIdentity's authenticated principal (also carried in ReplayKey) is
+    // stable across reconnects. Harness names are shared by plugins and runners.
+    acknowledging_runner(principal)
+        || !principal.is_some_and(|principal| principal.starts_with("reserved:"))
+}
+
+fn acknowledging_runner(principal: Option<&str>) -> bool {
+    matches!(
+        principal,
+        Some("reserved:thalamus-harness" | "reserved:thalamus-pi")
+    )
+}
+
+// Count the initial successful offer as well as rebind offers. Plugin delivery
+// is not subject to this runner-specific replay budget.
+const RUNNER_COMPLETION_MAX_OFFERS: usize = 3;
+const RUNNER_COMPLETION_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+enum CompletionSend {
+    Send,
+    Hold,
+    Settled,
 }
 
 impl CompletionDelivery {
@@ -56,7 +100,10 @@ impl CompletionDelivery {
         let key = (root.clone(), task.into());
         // A failed copy must not re-offer to another route while a successful
         // recipient is still open. Its durable record still awaits an ack.
-        if !state.recipients.contains_key(&key) && !state.retry_copies.contains_key(&key) {
+        if !state.settled.contains(&key)
+            && !state.recipients.contains_key(&key)
+            && !state.retry_copies.contains_key(&key)
+        {
             state.admitted.remove(&key);
         }
     }
@@ -87,14 +134,138 @@ impl CompletionDelivery {
     }
 
     fn offered(&self, key: &ReplayKey, task: &str, channel: RouteChannel) {
-        let mut state = self.state.lock().unwrap();
-        let task_key = (key.root.clone(), task.into());
-        state.admitted.insert(task_key.clone());
-        state
-            .recipients
-            .entry(task_key)
-            .or_default()
-            .insert(channel);
+        if !caller_acknowledges_completions(key.principal.as_deref()) {
+            self.settle(key, task);
+            return;
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            let task_key = (key.root.clone(), task.into());
+            state.admitted.insert(task_key.clone());
+            if !state
+                .recipients
+                .entry(task_key)
+                .or_default()
+                .insert(channel)
+            {
+                return;
+            }
+        }
+        if acknowledging_runner(key.principal.as_deref()) {
+            if let Some(offers) = self
+                .registry(&key.root)
+                .and_then(|registry| registry.reserve_runner_completion_offer(task))
+            {
+                self.queue_write(key, task, Some(offers));
+            }
+        }
+    }
+
+    fn registry(&self, root: &ProjectRootId) -> Option<crate::bash_background::BgTaskRegistry> {
+        self.registries.lock().unwrap().get(root).cloned()
+    }
+
+    fn is_settled(&self, root: &ProjectRootId, task: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .settled
+            .contains(&(root.clone(), task.into()))
+    }
+
+    fn settle(&self, key: &ReplayKey, task: &str) -> bool {
+        {
+            let mut state = self.state.lock().unwrap();
+            let task_key = (key.root.clone(), task.into());
+            // Retain admission even if persistence fails: reconnects in this
+            // process must not repeat a completion already written to a runner.
+            state.admitted.insert(task_key.clone());
+            if !state.settled.insert(task_key) {
+                return false;
+            }
+        }
+        self.queue_write(key, task, None)
+    }
+
+    fn queue_write(&self, key: &ReplayKey, task: &str, offers: Option<usize>) -> bool {
+        // Synced task-file and SQLite writes must not block binds or live pushes.
+        // A crash before the queued mark lands may repeat the completion once
+        // after restart; that is preferable to blocking every route's bind.
+        let queued = self
+            .registry(&key.root)
+            .ok_or_else(|| "registry is not attached".to_string())
+            .and_then(|registry| {
+                completion_settlement::enqueue(completion_settlement::Settlement {
+                    registry,
+                    key: key.clone(),
+                    task: task.into(),
+                    unacked: Arc::clone(&self.unacked),
+                    offers,
+                    #[cfg(test)]
+                    gate: self.settlement_gate.lock().unwrap().take(),
+                })
+            });
+        match queued {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("subc completion push: task={task} could not queue durable runner completion delivery key={key:?}: {error}; suppressing further offers in this process");
+                self.state
+                    .lock()
+                    .unwrap()
+                    .settled
+                    .insert((key.root.clone(), task.into()));
+                false
+            }
+        }
+    }
+
+    fn prepare(&self, key: &ReplayKey, frame: &PushFrame) -> CompletionSend {
+        let Some(task) = completed_task_id(frame) else {
+            return CompletionSend::Send;
+        };
+        if self.is_settled(&key.root, task) {
+            return CompletionSend::Settled;
+        }
+        let Some(registry) = self.registry(&key.root) else {
+            return CompletionSend::Send;
+        };
+        if acknowledging_runner(key.principal.as_deref()) {
+            let Some(state) = registry.runner_completion_state(task) else {
+                return CompletionSend::Hold;
+            };
+            if state.completion_delivered {
+                return CompletionSend::Settled;
+            }
+            let expired = state.completion_finished_at.is_none_or(|finished| {
+                crate::bash_background::persistence::unix_millis().saturating_sub(finished)
+                    >= RUNNER_COMPLETION_MAX_AGE_MS
+            });
+            if expired || state.runner_completion_offers >= RUNNER_COMPLETION_MAX_OFFERS {
+                log::info!("subc completion push: task={task} outcome=retired key={key:?} reason={} offers={}", if expired { "runner_completion_expired" } else { "runner_completion_offer_limit" }, state.runner_completion_offers);
+                self.settle(key, task);
+                return CompletionSend::Settled;
+            }
+            return CompletionSend::Send;
+        }
+        if caller_acknowledges_completions(key.principal.as_deref()) {
+            return CompletionSend::Send;
+        }
+        let cutoff = match registry.runner_completion_delivery_cutover() {
+            Ok(cutoff) => cutoff,
+            Err(error) => {
+                log::warn!("subc completion push: task={task} waiting for runner completion cutover: {error}");
+                return CompletionSend::Hold;
+            }
+        };
+        if registry
+            .completion_finished_at(task)
+            .is_some_and(|finished| finished < cutoff)
+        {
+            self.settle(key, task);
+            CompletionSend::Settled
+        } else {
+            CompletionSend::Send
+        }
     }
 
     pub(super) fn route_closed(&self, channel: RouteChannel) {
@@ -110,7 +281,7 @@ impl CompletionDelivery {
         });
         for (root, task) in released {
             let key = (root.clone(), task.clone());
-            if state.retry_copies.contains_key(&key) {
+            if state.settled.contains(&key) || state.retry_copies.contains_key(&key) {
                 continue;
             }
             state.admitted.remove(&key);
@@ -188,9 +359,18 @@ pub(super) fn purge_completion_root(
         }
     }
     let mut state = metrics.completion_delivery.state.lock().unwrap();
-    state.admitted.retain(|(key, _)| key != root);
+    let settled = state.settled.clone();
+    state
+        .admitted
+        .retain(|key| &key.0 != root || settled.contains(key));
     state.recipients.retain(|(key, _), _| key != root);
     state.retry_copies.retain(|(key, _), _| key != root);
+    metrics
+        .completion_delivery
+        .registries
+        .lock()
+        .unwrap()
+        .remove(root);
     metrics
         .completion_delivery
         .unacked
@@ -213,6 +393,12 @@ pub(super) fn recover_registry_completions(
 ) {
     metrics
         .completion_delivery
+        .registries
+        .lock()
+        .unwrap()
+        .insert(root.clone(), registry.clone());
+    metrics
+        .completion_delivery
         .unacked
         .lock()
         .unwrap()
@@ -222,14 +408,49 @@ pub(super) fn recover_registry_completions(
         .filter(|route| &route.root == root && route.trust.allows_bash_observation())
         .map(RouteIdentity::task_identity)
         .collect();
+    let mut retired_backlog = 0usize;
     for identity in identities {
         let _scope = crate::bash_background::task_identity_scope(Some(identity.clone()));
+        let key = ReplayKey {
+            root: root.clone(),
+            principal: identity.principal.clone(),
+            harness: identity.harness.clone(),
+            session: identity.session.clone(),
+        };
         for completion in registry.pending_completions_for_session(&identity.session) {
             // Legacy records have no recorded launching identity. Keep their
             // existing memory replay behavior, but do not guess which caller
             // should receive a recovered task after restart.
             if completion.launching_identity.as_ref() != Some(&identity) {
                 continue;
+            }
+            // A queued mark may hold the task state lock while syncing storage.
+            // Do not inspect that task's metadata again from the route runtime.
+            if metrics
+                .completion_delivery
+                .is_settled(root, &completion.task_id)
+            {
+                continue;
+            }
+            // Earlier versions pushed runner completions without recording
+            // delivery. Their pre-cutover backlog has unknown delivery state;
+            // retire it rather than announce potentially days-old commands again.
+            if !caller_acknowledges_completions(identity.principal.as_deref()) {
+                let Ok(cutoff) = registry.runner_completion_delivery_cutover() else {
+                    continue;
+                };
+                if registry
+                    .completion_finished_at(&completion.task_id)
+                    .is_some_and(|finished| finished < cutoff)
+                {
+                    if metrics
+                        .completion_delivery
+                        .settle(&key, &completion.task_id)
+                    {
+                        retired_backlog += 1;
+                    }
+                    continue;
+                }
             }
             if !metrics.completion_delivery.admit(root, &completion.task_id) {
                 continue;
@@ -279,6 +500,10 @@ pub(super) fn recover_registry_completions(
             );
         }
     }
+    log::info!(
+        "subc completion recovery: root={} queued_runner_backlog_retirements={retired_backlog}",
+        root.as_path().display()
+    );
 }
 
 #[derive(Debug, Default)]
@@ -995,6 +1220,14 @@ pub(super) fn replay_buffered_push_frames(
                 completion_dropped(metrics, key, &frame, "untrusted_replay_route");
                 continue;
             }
+            match metrics.completion_delivery.prepare(key, &frame) {
+                CompletionSend::Settled => continue,
+                CompletionSend::Hold => {
+                    queue.push_front(frame);
+                    break;
+                }
+                CompletionSend::Send => {}
+            }
             match try_send_push_frame(writer_tx, metrics, channel, &frame) {
                 PushSendOutcome::Sent => {
                     sent += 1;
@@ -1051,6 +1284,17 @@ fn drain_retry_buffer_for_channel(
         };
 
         while let Some((key, frame)) = queue.pop_front() {
+            match metrics.completion_delivery.prepare(&key, &frame) {
+                CompletionSend::Settled => {
+                    metrics.completion_delivery.retry_finished(&key, &frame);
+                    continue;
+                }
+                CompletionSend::Hold => {
+                    queue.push_front((key, frame));
+                    break;
+                }
+                CompletionSend::Send => {}
+            }
             match try_send_push_frame(writer_tx, metrics, channel, &frame) {
                 PushSendOutcome::Sent => {
                     sent += 1;
@@ -1388,6 +1632,15 @@ fn fan_out_reliable_push_frame(
         };
         let key = ReplayKey::from_identity(identity);
 
+        match metrics.completion_delivery.prepare(&key, frame) {
+            CompletionSend::Settled => continue,
+            CompletionSend::Hold => {
+                buffer_push_frame(metrics, push_buffer, key, frame.clone());
+                break;
+            }
+            CompletionSend::Send => {}
+        }
+
         if retry_buffer
             .get(&channel)
             .is_some_and(|queue| !queue.is_empty())
@@ -1455,6 +1708,10 @@ fn process_reliable_push_frame(
     let durable_bg_session = durable_bg_session_key(&root, &frame);
     if let Some(task_id) = completed_task_id(&frame) {
         completed_tasks.remember(task_id);
+        if !metrics.completion_delivery.admit(&root, task_id) {
+            log::info!("subc completion push: task={task_id} outcome=deduplicated root={} reason=already_queued_or_live_recipient", root.as_path().display());
+            return durable_bg_session;
+        }
         // A root with no open routes need not run maintenance until a caller
         // reconnects. Count its pending task as soon as the completion arrives.
         if let Some(session) = frame_session(&frame) {
@@ -1468,10 +1725,6 @@ fn process_reliable_push_frame(
                 .entry(session.into())
                 .or_default()
                 .insert(task_id.into());
-        }
-        if !metrics.completion_delivery.admit(&root, task_id) {
-            log::info!("subc completion push: task={task_id} outcome=deduplicated root={} reason=already_queued_or_live_recipient", root.as_path().display());
-            return durable_bg_session;
         }
     }
     let _ = fan_out_reliable_push_frame(
@@ -2031,7 +2284,12 @@ mod tests {
         assert!(writer_rx.try_recv().is_err());
 
         // The owner disconnects while the other consumer stays bound. Retain the
-        // notice by its launch identity, not the last route using the session id.
+        // next command's notice by its launch identity, not the last route using
+        // the session id. The earlier completion was already delivered.
+        let mut completion = completion_frame_with_session("detached-task", "moved-session");
+        if let PushFrame::BashCompleted(frame) = &mut completion {
+            frame.launching_identity = Some(owner.task_identity());
+        }
         let detached_routes = HashMap::from([(other_channel, other.clone())]);
         let detached_channels = HashMap::from([(root.clone(), HashSet::from([other_channel]))]);
         fan_out_reliable_push_frame(
@@ -2074,6 +2332,10 @@ mod tests {
         );
         let replay = writer_rx.try_recv().unwrap();
         assert_eq!((replay.header.channel, replay.header.epoch), (3, 9));
+        assert_eq!(
+            push_frame_task_id(&replay).as_deref(),
+            Some("detached-task")
+        );
         assert!(writer_rx.try_recv().is_err());
         assert!(buffered.is_empty());
 

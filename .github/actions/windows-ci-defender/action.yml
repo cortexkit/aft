@@ -4,6 +4,7 @@ runs:
   using: composite
   steps:
     - name: Exclude CI build and test paths from Defender
+      if: runner.environment == 'github-hosted'
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'

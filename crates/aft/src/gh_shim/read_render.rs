@@ -2,7 +2,7 @@
 
 use super::*;
 // Stdio carries only JSON and filter output for local jq; it is never used to
-// start gh. The jq child below receives an empty credential environment.
+// start gh. The jq child below receives no operator credentials.
 use std::process::Stdio;
 
 fn failed(text: impl Into<String>) -> ReadError {
@@ -1097,11 +1097,24 @@ fn select_fields(value: &Value, fields: &str) -> Value {
     Value::Object(selected)
 }
 
+fn jq_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command.env_clear();
+    #[cfg(windows)]
+    for key in ["SystemRoot", "WINDIR"] {
+        // Windows needs these directories to launch batch wrappers. Do not
+        // inherit PATH or credentials just to make a local data filter run.
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+}
+
 // Probe first so older Windows jq builds can use text-mode normalization.
 #[cfg(windows)]
 fn jq_supports_binary(executable: &Path) -> bool {
-    Command::new(executable)
-        .env_clear()
+    jq_command(executable)
         .args(["--binary", "--version"])
         .output()
         .is_ok_and(|result| result.status.success())
@@ -1120,18 +1133,43 @@ fn normalize_jq_newlines(bytes: &[u8]) -> Vec<u8> {
     normalized
 }
 
+/// The error text for a failed jq run. jq's own stderr is the message when it
+/// wrote one; a jq that exits without explaining itself (a crashed or killed
+/// process, or a wrapper script that fails before jq starts) gets how it ended
+/// instead, so the caller never sees an empty error line.
+fn jq_failure_message(status: &std::process::ExitStatus, stderr: &[u8]) -> String {
+    if !stderr.iter().all(u8::is_ascii_whitespace) {
+        return String::from_utf8_lossy(stderr).into_owned();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let (None, Some(signal)) = (status.code(), status.signal()) {
+            return format!("--jq failed: jq terminated by signal {signal}; stderr was empty");
+        }
+        let code = status.code().unwrap_or_else(|| status.into_raw());
+        format!("--jq failed: jq exited with code {code}; stderr was empty")
+    }
+    #[cfg(windows)]
+    {
+        // Windows exit codes are unsigned 32-bit values, often NTSTATUS codes
+        // that are only recognisable in hex (0xc0000135: a missing DLL).
+        let code = status.code().unwrap_or_default() as u32;
+        format!("--jq failed: jq exited with code {code} (0x{code:08x}); stderr was empty")
+    }
+}
+
 fn write_json(value: &Value, jq: Option<&str>, output: &mut impl Write) -> Result<(), ReadError> {
     let bytes = serde_json::to_vec(value).map_err(|error| failed(error.to_string()))?;
     if let Some(filter) = jq {
-        // Run only the local data filter, with argv rather than a shell. gh's
-        // credentials and network are not involved in rendering a JSON value.
+        // Invoke only the resolved local data filter with separate arguments.
+        // gh's credentials and network are not involved in rendering a JSON value.
         let executable = which::which("jq")
             .map_err(|error| failed(format!("--jq needs the local jq executable: {error}")))?;
         // On Windows, use jq's --binary mode when available; otherwise normalize its output.
         #[cfg(windows)]
         let binary_mode = jq_supports_binary(&executable);
-        let mut command = Command::new(executable);
-        command.env_clear();
+        let mut command = jq_command(&executable);
         #[cfg(windows)]
         if binary_mode {
             command.arg("--binary");
@@ -1155,7 +1193,7 @@ fn write_json(value: &Value, jq: Option<&str>, output: &mut impl Write) -> Resul
             .join()
             .map_err(|_| failed("jq input writer panicked"))?;
         if !result.status.success() {
-            return Err(failed(String::from_utf8_lossy(&result.stderr).into_owned()));
+            return Err(failed(jq_failure_message(&result.status, &result.stderr)));
         }
         written.map_err(|error| failed(error.to_string()))?;
         #[cfg(windows)]
@@ -1610,6 +1648,86 @@ impl<W: Write> Write for LogFormatter<'_, W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.output.flush()
+    }
+}
+
+#[cfg(test)]
+mod jq_failure_message_tests {
+    use super::jq_failure_message;
+
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_jq_exit_and_signal_name_how_jq_ended() {
+        // A wait status of 2 << 8 is a normal exit with code 2; a bare 13 is
+        // termination by SIGPIPE.
+        let exited = std::process::ExitStatus::from_raw(2 << 8);
+        assert_eq!(
+            jq_failure_message(&exited, b""),
+            "--jq failed: jq exited with code 2; stderr was empty"
+        );
+        let signalled = std::process::ExitStatus::from_raw(13);
+        assert_eq!(
+            jq_failure_message(&signalled, b" \n"),
+            "--jq failed: jq terminated by signal 13; stderr was empty"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn silent_jq_exit_names_the_code_in_decimal_and_hex() {
+        let exited = std::process::ExitStatus::from_raw(2);
+        assert_eq!(
+            jq_failure_message(&exited, b""),
+            "--jq failed: jq exited with code 2 (0x00000002); stderr was empty"
+        );
+        let missing_dll = std::process::ExitStatus::from_raw(0xc000_0135);
+        assert_eq!(
+            jq_failure_message(&missing_dll, b""),
+            "--jq failed: jq exited with code 3221225781 (0xc0000135); stderr was empty"
+        );
+    }
+
+    #[test]
+    fn jq_stderr_stays_the_message_when_jq_wrote_one() {
+        #[cfg(unix)]
+        let status = std::process::ExitStatus::from_raw(5 << 8);
+        #[cfg(windows)]
+        let status = std::process::ExitStatus::from_raw(5);
+        assert_eq!(
+            jq_failure_message(&status, b"jq: error: syntax error\n"),
+            "jq: error: syntax error\n"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod jq_environment_tests {
+    use super::*;
+
+    #[test]
+    fn jq_child_explicit_environment_contains_only_windows_directories() {
+        let _lock = crate::test_env::process_env_lock();
+        let command = jq_command(Path::new("jq.cmd"));
+        let actual: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+            .collect();
+        let expected = BTreeMap::from([
+            (
+                OsString::from("SystemRoot"),
+                Some(std::env::var_os("SystemRoot").expect("Windows SystemRoot")),
+            ),
+            (
+                OsString::from("WINDIR"),
+                Some(std::env::var_os("WINDIR").expect("Windows WINDIR")),
+            ),
+        ]);
+        assert_eq!(actual, expected);
     }
 }
 

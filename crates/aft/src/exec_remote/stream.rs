@@ -50,14 +50,20 @@ impl ResumePoint {
 }
 
 /// Raw byte sink; task files can implement this without decoding output text.
-/// Persist acceptance before returning. Output checkpoints must commit byte
-/// lengths and sequence together so restart can discard an uncheckpointed tail
-/// and replay it from ResumePoint. Terminal proof must be durable before success.
+/// Persist submission identity and acceptance before returning. Output checkpoints
+/// must commit byte lengths and sequence together so restart can discard an
+/// uncheckpointed tail and replay it from ResumePoint. Terminal proof must be
+/// durable before success.
 pub trait OutputSink {
     /// Save the effective return request before receiving files, and before a
     /// safe cap-refusal resubmit. False withholds a retry already used earlier.
     fn return_request(&mut self, _request: &RunRequest, _retry: bool) -> io::Result<bool> {
         Ok(true)
+    }
+    /// Save the runner's pre-acceptance job id for cancellation and recovery.
+    /// It does not prove input capture or advance an output cursor.
+    fn submission_job(&mut self, _job_id: Uuid) -> io::Result<()> {
+        Ok(())
     }
     /// Display-only pre-acceptance status, with no durable cursor or timer effect.
     fn admission_progress(&mut self, _progress: &types::Progress) {}
@@ -110,6 +116,7 @@ pub trait OutputSink {
 
 #[derive(Default)]
 pub struct StreamConsumer {
+    submission_job_id: Option<Uuid>,
     run_cursor: Option<u64>,
     point: Option<ResumePoint>,
     accepted: bool,
@@ -205,6 +212,12 @@ impl StreamConsumer {
     pub fn resume_point(&self) -> Option<ResumePoint> {
         self.point.clone()
     }
+    pub(super) fn known_job_id(&self) -> Option<Uuid> {
+        self.point
+            .as_ref()
+            .map(|point| point.job_id)
+            .or(self.submission_job_id)
+    }
     /// Decode a caller StreamData payload, keeping the raw sequence for future
     /// StreamRecord variants. Unknown records are never terminal; they advance
     /// the same contiguous resume cursor as output records.
@@ -252,6 +265,11 @@ impl StreamConsumer {
     ) -> Result<(), super::Error> {
         if let StreamRecord::Progress(progress) = record {
             if !self.accepted && self.point.is_none() && self.terminal.is_none() {
+                if let Some(job_id) = progress.job_id() {
+                    self.check_job(job_id)?;
+                    sink.submission_job(job_id)?;
+                    self.submission_job_id = Some(job_id);
+                }
                 sink.admission_progress(&progress);
             }
             return Ok(());
@@ -378,7 +396,7 @@ impl StreamConsumer {
     }
 
     fn check_job(&self, job_id: Uuid) -> Result<(), Error> {
-        if self.point.as_ref().is_some_and(|p| p.job_id != job_id) {
+        if self.known_job_id().is_some_and(|known| known != job_id) {
             Err(Error::Protocol("record belongs to another job".into()))
         } else {
             Ok(())

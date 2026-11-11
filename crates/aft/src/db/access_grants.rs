@@ -525,13 +525,16 @@ pub fn launch_params(
     Ok(params)
 }
 
+/// A validated launch capability and the source of its authority.
+pub type SourcedGrant = (AccessGrant, Option<super::access_grant_rows::GrantSource>);
+
 /// Validation is completed before entering this transaction. The scope-wide
 /// marker and the grants commit together, including for an empty launch list.
 pub fn materialize(
     conn: &Connection,
     key: &PolicyKey,
     raw: &serde_json::Value,
-    grants: &[AccessGrant],
+    grants: &[SourcedGrant],
 ) -> rusqlite::Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let scope = ScopeKey::from_policy(key);
@@ -547,15 +550,15 @@ pub fn materialize(
 fn materialize_on(
     tx: &rusqlite::Transaction<'_>,
     scope: &ScopeKey,
-    grants: &[AccessGrant],
+    grants: &[SourcedGrant],
 ) -> rusqlite::Result<()> {
     let first = tx.execute(
         "INSERT OR IGNORE INTO access_materialized(owner,scope_ref,epoch) VALUES (?1,?2,?3)",
         params![scope.owner, scope.scope_ref, scope.epoch.to_string()],
     )? == 1;
     if first {
-        for grant in grants {
-            insert(tx, scope, grant)?;
+        for (grant, source) in grants {
+            insert_with_source(tx, scope, grant, None, *source)?;
         }
     }
     Ok(())
@@ -630,7 +633,7 @@ pub fn unrestored_launch(conn: &Connection, key: &PolicyKey) -> rusqlite::Result
 pub fn restore_launch(
     conn: &Connection,
     key: &PolicyKey,
-    validate: impl FnOnce(&Connection, &serde_json::Value) -> rusqlite::Result<Vec<AccessGrant>>,
+    validate: impl FnOnce(&Connection, &serde_json::Value) -> rusqlite::Result<Vec<SourcedGrant>>,
 ) -> rusqlite::Result<LaunchRestore> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let scope = ScopeKey::from_policy(key);
@@ -701,6 +704,12 @@ mod tests {
             preset: "worker".into(),
         }
     }
+    fn launch_grant(grant: &AccessGrant) -> SourcedGrant {
+        (
+            grant.clone(),
+            Some(super::super::access_grant_rows::GrantSource::Unknown),
+        )
+    }
     #[test]
     fn grants_materialization_revoke_restart_reclaim_refetch() {
         let dir = tempfile::tempdir().unwrap();
@@ -720,7 +729,7 @@ mod tests {
         {
             let conn = crate::db::open(&path).unwrap();
             register_scope(&conn, &key, Some(&scope("head", 1)), &Config::default()).unwrap();
-            materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
+            materialize(&conn, &bind, &raw, &[launch_grant(&grant)]).unwrap();
             assert_eq!(list(&conn, &key).unwrap(), vec![grant.clone()]);
             assert_eq!(revoke(&conn, &key, &grant.path).unwrap(), 1);
         }
@@ -729,10 +738,10 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let conn = crate::db::open(&path).unwrap();
         assert_eq!(launch_params(&conn, &bind).unwrap(), Some(raw.clone()));
-        materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
+        materialize(&conn, &bind, &raw, &[launch_grant(&grant)]).unwrap();
         let mut rebound = bind.clone();
         rebound.session = "rebound".into();
-        materialize(&conn, &rebound, &raw, &[grant.clone()]).unwrap();
+        materialize(&conn, &rebound, &raw, &[launch_grant(&grant)]).unwrap();
         assert!(list(&conn, &key).unwrap().is_empty());
         let mut access = crate::access_policy::AccessPolicy::from_config(
             &Config::default(),
@@ -760,11 +769,11 @@ mod tests {
         };
         let raw = serde_json::json!([{"path":grant.path,"mode":"read"}]);
         conn.execute_batch("CREATE TRIGGER fail_install BEFORE INSERT ON access_grants BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
-        assert!(materialize(&conn, &bind, &raw, &[grant.clone()]).is_err());
+        assert!(materialize(&conn, &bind, &raw, &[launch_grant(&grant)]).is_err());
         assert!(launch_params(&conn, &bind).unwrap().is_none());
         assert!(list(&conn, &scope).unwrap().is_empty());
         conn.execute_batch("DROP TRIGGER fail_install;").unwrap();
-        materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
+        materialize(&conn, &bind, &raw, &[launch_grant(&grant)]).unwrap();
         assert_eq!(list(&conn, &scope).unwrap(), vec![grant]);
     }
 
@@ -790,7 +799,7 @@ mod tests {
             register_scope(&conn, key, None, &Config::default()).unwrap();
         }
         let raw = serde_json::json!([{"path":grant.path,"mode":"write"}]);
-        materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
+        materialize(&conn, &bind, &raw, &[launch_grant(&grant)]).unwrap();
         conn.execute_batch(
             "CREATE TABLE installs(n INTEGER); INSERT INTO installs VALUES(0);
             CREATE TRIGGER count_install BEFORE INSERT ON access_grants WHEN NEW.epoch='2'
@@ -817,7 +826,7 @@ mod tests {
                         restore_launch(&conn, revived, |_, params| {
                             assert_eq!(params, raw, "only stored launch inputs may be validated");
                             validations.fetch_add(1, Ordering::SeqCst);
-                            Ok(vec![grant.clone()])
+                            Ok(vec![launch_grant(&grant)])
                         })
                         .unwrap()
                     })
@@ -874,10 +883,16 @@ mod tests {
             operation: AccessOperation::Read,
         };
         let raw = serde_json::json!([{"path":grant.path,"mode":"read"}]);
-        materialize(&conn, &policy(&first, dir.path()), &raw, &[grant.clone()]).unwrap();
+        materialize(
+            &conn,
+            &policy(&first, dir.path()),
+            &raw,
+            &[launch_grant(&grant)],
+        )
+        .unwrap();
         let revived = policy(&second, dir.path());
         conn.execute_batch("CREATE TRIGGER fail_install BEFORE INSERT ON access_grants BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
-        assert!(restore_launch(&conn, &revived, |_, _| Ok(vec![grant.clone()])).is_err());
+        assert!(restore_launch(&conn, &revived, |_, _| Ok(vec![launch_grant(&grant)])).is_err());
         for table in [
             "access_launch_params",
             "access_materialized",
@@ -894,7 +909,7 @@ mod tests {
         }
         conn.execute_batch("DROP TRIGGER fail_install;").unwrap();
         assert_eq!(
-            restore_launch(&conn, &revived, |_, _| Ok(vec![grant.clone()])).unwrap(),
+            restore_launch(&conn, &revived, |_, _| Ok(vec![launch_grant(&grant)])).unwrap(),
             LaunchRestore::Materialized
         );
         assert_eq!(list(&conn, &second).unwrap(), vec![grant]);
@@ -967,7 +982,7 @@ mod tests {
             operation: AccessOperation::Read,
         };
         let raw = serde_json::json!([{"path":grant.path,"mode":"read"}]);
-        materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
+        materialize(&conn, &bind, &raw, &[launch_grant(&grant)]).unwrap();
         assert_eq!(launch_params(&conn, &revived).unwrap(), Some(raw.clone()));
         let copied: String = conn
             .query_row(

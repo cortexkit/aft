@@ -668,7 +668,8 @@ jobs:
   # bash_background SIGTERM handling, and Apple Silicon compilation. Linux
   # cannot exercise these paths.
   #
-  # Build library, binary, and non-watcher integration archives in parallel,
+  # Build library, binary, and non-watcher integration archives sequentially on
+  # the single dedicated runner, reusing Cargo outputs outside the checkout,
   # then split them into hash partitions: five for the lib/bin tests and three
   # for the integration tests. The library harness is the dominant link, so it
   # does not share an archive build with other tests. With five lib shards, the
@@ -678,27 +679,44 @@ jobs:
   unit-macos-nextest-archive:
     name: Cargo test archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 30
     env:
-      SCCACHE_GHA_ENABLED: "true"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-macos
           cache-bin: false
@@ -710,14 +728,18 @@ jobs:
       - name: Build nextest archive (macOS integration suite)
         run: python3 scripts/ci-macos-integration-archive.py archive --archive-file "$MACOS_NEXTEST_ARCHIVE"
         env:
-          MACOS_NEXTEST_ARCHIVE: ${{ runner.temp }}/macos-nextest.tar.zst
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          MACOS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-nextest.tar.zst
 
       - name: Capture integration source inventory
-        run: python3 scripts/ci-macos-integration-archive.py list --output "$RUNNER_TEMP/macos-integration-inventory.json"
+        run: python3 scripts/ci-macos-integration-archive.py list --output "$AFT_CI_ARCHIVE_DIR/macos-integration-inventory.json"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Capture doctest inventory
-        run: cargo test --workspace --doc -- --list > "$RUNNER_TEMP/macos-doctest-inventory.txt" 2>&1
+        run: cargo test --workspace --doc -- --list > "$AFT_CI_ARCHIVE_DIR/macos-doctest-inventory.txt" 2>&1
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           CARGO_TERM_COLOR: never
 
       - name: Report nextest archive size
@@ -725,30 +747,34 @@ jobs:
           bytes=$(stat -f %z "$MACOS_NEXTEST_ARCHIVE")
           printf 'macOS nextest archive: %.2f MiB (%s bytes)\n' "$(awk "BEGIN { print $bytes / 1048576 }")" "$bytes"
         env:
-          MACOS_NEXTEST_ARCHIVE: ${{ runner.temp }}/macos-nextest.tar.zst
+          MACOS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-nextest.tar.zst
 
       - uses: ./.github/actions/upload-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-nextest-archive
           path: |
-            ${{ runner.temp }}/macos-nextest.tar.zst
-            ${{ runner.temp }}/macos-integration-inventory.json
-            ${{ runner.temp }}/macos-doctest-inventory.txt
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-nextest.tar.zst
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-integration-inventory.json
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-doctest-inventory.txt
           compression-level: 0
           if-no-files-found: error
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   unit-macos-libtest-archive:
     name: Cargo libtest archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    # The library test compiler peaks near 13 GB, above this free runner's
-    # 7 GB, so the build swaps and takes 30-45 minutes; the time limit leaves
-    # room for that instead of cancelling a slow but healthy build.
-    runs-on: macos-26
+    # The library test compiler peaks near 13 GB. One runner serializes builds
+    # on the 16 GB machine; a cold build still gets ample time to finish.
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 90
     env:
-      SCCACHE_GHA_ENABLED: "true"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       # Non-incremental Cargo builds default to 16 codegen units. Split the
       # large library harness more finely without changing dependency profiles,
@@ -756,18 +782,37 @@ jobs:
       LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=256
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-macos
           cache-bin: false
@@ -780,16 +825,20 @@ jobs:
         shell: bash
         run: |
           started=$SECONDS
-          trap 'printf "### macOS libtest archive\n\nRunner: macos-26 (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          report_timing() {
+            printf "### macOS libtest archive\n\nRunner: rented-mac (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap report_timing EXIT
           # Native time reports resident-memory and paging counters for the build.
           /usr/bin/time -l cargo nextest archive --features test-hooks --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
-          MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          MACOS_LIBTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
 
       # Keep the build's timing report even when a later step fails; it is the
       # evidence for diagnosing slow archive builds.
       - name: Save libtest build timings
-        if: ${{ always() && hashFiles('target/cargo-timings/*.html') != '' }}
+        if: ${{ runner.environment == 'github-hosted' && (always() && hashFiles('target/cargo-timings/*.html') != '') }}
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-libtest-timings
@@ -797,51 +846,79 @@ jobs:
           if-no-files-found: error
 
       - name: Run the serial backtrace probe with local debug objects
-        run: cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          cargo test -p agent-file-tools --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG" --target-dir "$AFT_CI_TARGET_DIR"
 
       - name: Capture lib source inventory
-        run: cargo nextest list --workspace --lib --features test-hooks --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/macos-libtest-inventory.json"
+        run: cargo nextest list --workspace --lib --features test-hooks --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$AFT_CI_ARCHIVE_DIR/macos-libtest-inventory.json"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Report macOS libtest archive size
         run: |
           bytes=$(stat -f %z "$MACOS_LIBTEST_ARCHIVE")
           printf 'macOS libtest archive: %.2f MiB (%s bytes)\n' "$(awk "BEGIN { print $bytes / 1048576 }")" "$bytes"
         env:
-          MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
+          MACOS_LIBTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
 
       - uses: ./.github/actions/upload-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-libtest-archive
           path: |
-            ${{ runner.temp }}/macos-libtest-nextest.tar.zst
-            ${{ runner.temp }}/macos-libtest-inventory.json
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-inventory.json
           compression-level: 0
           if-no-files-found: error
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   unit-macos-bin-archive:
     name: Cargo bin-test archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 25
     env:
-      SCCACHE_GHA_ENABLED: "true"
       SCCACHE_IDLE_TIMEOUT: "0"
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-macos
           cache-bin: false
@@ -853,26 +930,36 @@ jobs:
         # the unrelated library harnesses and integration suite.
         run: cargo nextest archive --features test-hooks --workspace --bins --test sandbox_launch_probe -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
         env:
-          MACOS_BIN_ARCHIVE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          MACOS_BIN_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-nextest.tar.zst
 
       - name: Capture bin source inventory
-        run: cargo nextest list --workspace --bins --features test-hooks --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-bin-inventory.json"
+        run: cargo nextest list --workspace --bins --features test-hooks --profile gate -T json --cargo-quiet > "$AFT_CI_ARCHIVE_DIR/macos-bin-inventory.json"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Report macOS bin archive size
         run: |
           bytes=$(stat -f %z "$MACOS_BIN_ARCHIVE")
           printf 'macOS bin archive: %.2f MiB (%s bytes)\n' "$(awk "BEGIN { print $bytes / 1048576 }")" "$bytes"
         env:
-          MACOS_BIN_ARCHIVE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
+          MACOS_BIN_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-nextest.tar.zst
 
       - uses: ./.github/actions/upload-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-bin-archive
           path: |
-            ${{ runner.temp }}/macos-bin-nextest.tar.zst
-            ${{ runner.temp }}/macos-bin-inventory.json
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-nextest.tar.zst
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-inventory.json
           compression-level: 0
           if-no-files-found: error
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   unit-macos-inventory-proof:
     name: Prove Rust test inventory (macOS)
@@ -882,51 +969,77 @@ jobs:
       - unit-macos-libtest-archive
       - unit-macos-bin-archive
       - unit-macos-watcher
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
 
       - uses: ./.github/actions/setup-nextest
 
       - uses: ./.github/actions/download-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-nextest-archive
-          path: ${{ runner.temp }}
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}
           verify-zstd: macos-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-libtest-archive
-          path: ${{ runner.temp }}
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}
           verify-zstd: macos-libtest-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-bin-archive
-          path: ${{ runner.temp }}
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}
           verify-zstd: macos-bin-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-watcher-inventory
-          path: ${{ runner.temp }}
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}
 
       - name: Prove split Rust test inventory and hash partitions are exact
         run: python3 scripts/rust-test-inventory-proof.py
         env:
-          AFT_NEXTEST_ARCHIVE_LIB_FILE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
-          AFT_NEXTEST_ARCHIVE_BIN_FILE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
-          AFT_NEXTEST_ARCHIVE_INTEGRATION_FILE: ${{ runner.temp }}/macos-nextest.tar.zst
-          AFT_NEXTEST_SOURCE_INVENTORY_LIB_FILE: ${{ runner.temp }}/macos-libtest-inventory.json
-          AFT_NEXTEST_SOURCE_INVENTORY_BIN_FILE: ${{ runner.temp }}/macos-bin-inventory.json
-          AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE: ${{ runner.temp }}/macos-integration-inventory.json
-          AFT_WATCHER_TEST_INVENTORY_FILE: ${{ runner.temp }}/macos-watcher-inventory.txt
-          AFT_DOCTEST_INVENTORY_FILE: ${{ runner.temp }}/macos-doctest-inventory.txt
+          AFT_NEXTEST_ARCHIVE_LIB_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_BIN_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_INTEGRATION_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-nextest.tar.zst
+          AFT_NEXTEST_SOURCE_INVENTORY_LIB_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-inventory.json
+          AFT_NEXTEST_SOURCE_INVENTORY_BIN_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-inventory.json
+          AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-integration-inventory.json
+          AFT_WATCHER_TEST_INVENTORY_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-watcher-inventory.txt
+          AFT_DOCTEST_INVENTORY_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-doctest-inventory.txt
           # Must equal the unit-macos-libtest-shard matrix size.
           AFT_UNIT_PARTITION_COUNT: "5"
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   unit-macos:
     name: Unit tests (macOS)
@@ -974,40 +1087,100 @@ jobs:
     name: Cargo integration shard 1/3 (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-macos-nextest-archive
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: ./.github/actions/integration-shard
         with:
           platform: macos
           shard: "1"
 
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+
   unit-macos-nextest-2:
     name: Cargo integration shard 2/3 (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-macos-nextest-archive
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: ./.github/actions/integration-shard
         with:
           platform: macos
           shard: "2"
 
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+
   unit-macos-nextest-3:
     name: Cargo integration shard 3/3 (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-macos-nextest-archive
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: ./.github/actions/integration-shard
         with:
           platform: macos
           shard: "3"
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   unit-macos-libtest-shard:
     name: Cargo libtest shard ${{ matrix.shard }}/5 (macOS)
@@ -1015,11 +1188,9 @@ jobs:
     needs:
       - unit-macos-libtest-archive
       - unit-macos-bin-archive
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
@@ -1028,16 +1199,35 @@ jobs:
         shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-macos
           cache-bin: false
@@ -1047,21 +1237,27 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - uses: ./.github/actions/download-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-libtest-archive
-          path: ${{ runner.temp }}
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}
           verify-zstd: macos-libtest-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: macos-bin-archive
-          path: ${{ runner.temp }}
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}
           verify-zstd: macos-bin-nextest.tar.zst
 
       - name: Rust libtest shard (nextest archive)
         run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
           started=$SECONDS
-          trap 'printf "### macOS libtest shard %s\n\nRunner: macos-26 (%s)\n\nTest duration: %ss\n" "$AFT_NEXTEST_PARTITION" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          report_timing() {
+            printf "### macOS libtest shard %s\n\nRunner: rented-mac (%s)\n\nTest duration: %ss\n" "$AFT_NEXTEST_PARTITION" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap report_timing EXIT
           ./scripts/rust-test-gate.sh
         shell: bash
         env:
@@ -1069,42 +1265,71 @@ jobs:
           AFT_TEST_DIAG: "1"
           AFT_UNIT_TEST_RUNNER: nextest
           AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}
-          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
-          AFT_NEXTEST_ARCHIVE_BIN_FILE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_BIN_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-bin-nextest.tar.zst
           AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/5
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           NEXTEST_TEST_THREADS: "num-cpus"
 
+      - name: Show macOS libtest shard log
+        if: ${{ failure() && runner.environment != 'github-hosted' }}
+        uses: ./.github/actions/show-gate-log
+        with:
+          path: ${{ runner.temp }}/macos-libtest-shard-${{ matrix.shard }}.log
+
       - name: Upload macOS libtest shard output
-        if: always()
+        if: ${{ runner.environment == 'github-hosted' && (always()) }}
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-libtest-shard-${{ matrix.shard }}-log
           path: ${{ runner.temp }}/macos-libtest-shard-${{ matrix.shard }}.log
           if-no-files-found: warn
 
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+
   unit-macos-watcher:
     name: Cargo watcher tests (macOS)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: macos-26
+    runs-on: [self-hosted, rented-mac]
     timeout-minutes: 20
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-macos
           cache-bin: false
@@ -1114,14 +1339,17 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Capture watcher inventory for the split proof
-        run: cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$RUNNER_TEMP/macos-watcher-inventory.txt" 2>&1
+        run: cargo test --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$AFT_CI_ARCHIVE_DIR/macos-watcher-inventory.txt" 2>&1
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           CARGO_TERM_COLOR: never
 
       - name: Rust watcher gate (macOS)
         # Keep FSEvents tests serial because they share fixtures and exercise
         # the platform watcher backend that the other shards exclude.
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_GATE_LOG: ${{ runner.temp }}/macos-watcher.log
@@ -1129,8 +1357,14 @@ jobs:
           AFT_GATE_PHASES: watcher
           AFT_GATE_SKIP_RELEASE_STORM: "1"
 
+      - name: Show macOS watcher log
+        if: ${{ failure() && runner.environment != 'github-hosted' }}
+        uses: ./.github/actions/show-gate-log
+        with:
+          path: ${{ runner.temp }}/macos-watcher.log
+
       - name: Upload macOS watcher output
-        if: always()
+        if: ${{ runner.environment == 'github-hosted' && (always()) }}
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-watcher-log
@@ -1138,43 +1372,65 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload macOS watcher inventory
-        if: always()
+        if: ${{ runner.environment == 'github-hosted' && (always()) }}
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-watcher-inventory
-          path: ${{ runner.temp }}/macos-watcher-inventory.txt
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-watcher-inventory.txt
           if-no-files-found: warn
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   unit-macos-conformance:
     name: Cargo conformance + Bun tests (macOS)
     if: ${{ github.event_name != 'pull_request' }}
-    # This runner builds its own binary and consumes no archive artifacts.
+    # This lane builds its own binary and consumes no test archives.
     # The summary still requires both conformance and every archive/shard lane.
-    runs-on: macos-26
-    # 45 minutes: a cold-cache cargo build alone has taken 15 minutes here, and
-    # three merge-queue runs hit 30 while their tests were still passing.
+    runs-on: [self-hosted, rented-mac]
+    # Leave room for a cold Cargo build followed by conformance and Bun tests.
     timeout-minutes: 45
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
 
       - name: Refuse dependency paths outside the repository
         run: |
           python3 scripts/check-path-deps.py
           python3 scripts/check-path-deps.py --self-test
 
-      - uses: dtolnay/rust-toolchain@stable
-
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: runner.environment == 'github-hosted'
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-macos
           cache-bin: false
@@ -1182,14 +1438,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: ./.github/actions/setup-nextest
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
@@ -1208,9 +1456,13 @@ jobs:
 
       - name: Cargo build (debug — needed by plugin tests)
         run: cargo build -p agent-file-tools
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Rust conformance gate (macOS)
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          ./scripts/rust-test-gate.sh
         env:
           AFT_TEST_DIAG: "1"
           AFT_GATE_PHASES: conformance
@@ -1219,10 +1471,11 @@ jobs:
       - name: Bash reply timeout contract (test-timing-hooks)
         shell: bash
         run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
           set -euo pipefail
           cargo --version
           test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
-          if ! listing="$(cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
+          if ! listing="$(cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --list 2>&1)"; then
             printf '%s\n' "$listing" >&2
             exit 1
           fi
@@ -1231,7 +1484,15 @@ jobs:
             printf 'expected test missing from integration inventory: %s\n' "$test_name" >&2
             exit 1
           fi
-          cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
+          cargo test --features test-hooks --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" --target-dir "$AFT_CI_TARGET_DIR" -- --exact
+
+      - name: Install GitHub CLI for pinned helper downloads
+        shell: bash
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            brew install gh
+          fi
+          gh --version
 
       - name: Fetch pinned subc-core
         id: subc_core
@@ -1242,13 +1503,26 @@ jobs:
           echo "path=$path" >> "$GITHUB_OUTPUT"
 
       - name: Bun test (all packages)
-        run: bun run test:unit
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          # Several plugin tests spawn the debug binary at the repository's
+          # target/debug/aft. This lane builds into a target folder outside the
+          # checkout, so link that path to the binary it built.
+          mkdir -p target/debug
+          ln -sfn "$AFT_BINARY_PATH" target/debug/aft
+          bun run test:unit
         env:
           AFT_TEST_NATIVE_FIXTURE_TIMING: "1"
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
-          AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
+          AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
           SUBC_CORE_WIRE_VERSION: "2"
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   # ---------------------------------------------------------------------------
   # Rust unit and integration tests on Windows
@@ -1266,24 +1540,42 @@ jobs:
   # behavior. Integration tests send filesystem paths in NDJSON requests through
   # serde_json, which escapes Windows backslashes as JSON string content.
   # ---------------------------------------------------------------------------
+
   unit-windows-nextest-archive:
     name: Cargo test archive (Windows)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
+          components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
 
       # Both the archive builder and the libtest job use the established
       # unit-windows-cargo cache key. Keeping that key stable preserves the
       # existing hot MSVC dependency cache while the jobs run independently.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-windows-cargo
           cache-on-failure: true
@@ -1295,31 +1587,31 @@ jobs:
         run: cargo nextest archive --features test-hooks --workspace -E "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
         shell: pwsh
         env:
-          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
-
-      - uses: actions/setup-python@v6
-        with:
-          # Python's tarfile can stream the zstd archive metadata from 3.14 on.
-          python-version: "3.14"
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
 
       # Run the exact archive-built harness while its local PDB still exists.
       # A package-scoped cargo test changes workspace feature unification and
       # recompiles it; direct execution preserves both symbols and build reuse.
       - name: Run the serial TLS probe from the archive build
-        run: python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe tls
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe tls
         env:
-          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
+          WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
 
       - name: Run the serial backtrace probe with local PDB
-        run: python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe backtrace
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          python scripts/ci-windows-probes.py --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE" --probe backtrace
         env:
-          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
+          WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
 
       - name: Prove split Rust test inventory and hash partitions are exact
         run: python scripts/rust-test-inventory-proof.py
         shell: pwsh
         env:
-          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
           # Must equal the unit-windows-libtest-shard matrix size.
           AFT_UNIT_PARTITION_COUNT: "6"
 
@@ -1329,16 +1621,23 @@ jobs:
           "Windows nextest archive: {0:N2} MiB ({1:N0} bytes)" -f ($bytes / 1MB), $bytes
         shell: pwsh
         env:
-          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
+          WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
 
       # The archive is already zstd-compressed. Disabling the artifact action's
       # second compression avoids spending CPU to recompress incompressible data.
       - uses: ./.github/actions/upload-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: windows-nextest-archive
-          path: ${{ runner.temp }}/windows-nextest.tar.zst
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
           compression-level: 0
           if-no-files-found: error
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   unit-windows-libtest:
     name: Cargo libtest + watcher (Windows)
@@ -1372,7 +1671,7 @@ jobs:
     name: Cargo libtest shard ${{ matrix.shard }}/6 (Windows)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-windows-nextest-archive
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -1381,14 +1680,31 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
+          components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-windows-cargo
           cache-on-failure: true
@@ -1397,9 +1713,10 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - uses: ./.github/actions/download-artifact-retry
+        if: runner.environment == 'github-hosted'
         with:
           name: windows-nextest-archive
-          path: ${{ runner.temp }}
+          path: ${{ env.AFT_CI_ARCHIVE_DIR }}
           verify-zstd: windows-nextest.tar.zst
 
       - name: Rust libtest shard (nextest archive)
@@ -1407,41 +1724,72 @@ jobs:
         # On Windows a process a test leaks inherits the write end of every
         # pipe above it, so `tee` never saw end-of-file and the step hung past
         # a fully passing nextest summary until the job timeout.
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_GATE_LOG: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
           AFT_TEST_DIAG: "1"
           AFT_UNIT_TEST_RUNNER: nextest
           AFT_GATE_PHASES: lib-shard
-          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/6
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           NEXTEST_TEST_THREADS: "4"
 
+      - name: Show Windows libtest shard log
+        if: ${{ failure() && runner.environment != 'github-hosted' }}
+        uses: ./.github/actions/show-gate-log
+        with:
+          path: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
+
       - name: Upload Windows libtest shard output
-        if: always()
+        if: ${{ runner.environment == 'github-hosted' && (always()) }}
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: windows-libtest-shard-${{ matrix.shard }}-log
           path: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
           if-no-files-found: warn
 
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+
   unit-windows-watcher:
     name: Cargo watcher + conformance (Windows)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
+          components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: unit-windows-cargo
           cache-on-failure: true
@@ -1454,7 +1802,9 @@ jobs:
         # Keep watcher tests serial because they share fixtures. The conformance
         # phase checks the provider contract and four bash-promotion/elicitation
         # cases compiled only with test-timing-hooks.
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
+          ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_GATE_LOG: ${{ runner.temp }}/windows-watcher-conformance.log
@@ -1462,52 +1812,124 @@ jobs:
           AFT_GATE_PHASES: watcher,conformance
           AFT_GATE_SKIP_RELEASE_STORM: "1"
 
+      - name: Show Windows watcher + conformance log
+        if: ${{ failure() && runner.environment != 'github-hosted' }}
+        uses: ./.github/actions/show-gate-log
+        with:
+          path: ${{ runner.temp }}/windows-watcher-conformance.log
+
       - name: Upload Windows watcher + conformance output
-        if: always()
+        if: ${{ runner.environment == 'github-hosted' && (always()) }}
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: windows-watcher-conformance-log
           path: ${{ runner.temp }}/windows-watcher-conformance.log
           if-no-files-found: warn
 
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+
   unit-windows-cargo:
     name: Cargo integration shard 1/3 (Windows)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-windows-nextest-archive
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: ./.github/actions/integration-shard
         with:
           platform: windows
           shard: "1"
 
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+
   unit-windows-cargo-2:
     name: Cargo integration shard 2/3 (Windows)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-windows-nextest-archive
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: ./.github/actions/integration-shard
         with:
           platform: windows
           shard: "2"
 
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+
   unit-windows-cargo-3:
     name: Cargo integration shard 3/3 (Windows)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-windows-nextest-archive
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - uses: ./.github/actions/integration-shard
         with:
           platform: windows
           shard: "3"
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+
   # ---------------------------------------------------------------------------
   # Cross-target warning gate (Windows, compile-only, DENIES warnings).
   # Split from unit-windows-cargo: with unique RUSTFLAGS it shares no
@@ -1515,21 +1937,39 @@ jobs:
   # duration to the Windows critical path. Catches unix-cfg dead-code
   # warnings the mac/Linux clippy gates structurally cannot see.
   # ---------------------------------------------------------------------------
+
   unit-windows-check:
     name: Cargo check deny-warnings (Windows)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - uses: ./.github/actions/windows-ci-defender
 
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
         with:
+          components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1545,13 +1985,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         shell: pwsh
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           RUSTFLAGS: "-D warnings"
 
       - name: Check feature-enabled provider conformance (deny warnings)
         run: cargo check -p agent-file-tools --features test-hooks --features test-timing-hooks --test rest
         shell: pwsh
         env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           RUSTFLAGS: "-D warnings"
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
 
   # ---------------------------------------------------------------------------
   # Bash permission flow on Windows
@@ -1578,31 +2026,42 @@ jobs:
   # Non-blocking for this suite (continue-on-error), but a required check on
   # main, so a failure still stops a train from landing.
   # ---------------------------------------------------------------------------
+
   unit-windows-bash:
     name: Bash permission e2e (Windows)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: windows-2022
+    runs-on: [self-hosted, narli]
     timeout-minutes: 20
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
-
-      - uses: ./.github/actions/windows-ci-defender
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
         with:
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-
+          no-cache: true
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
+          package-manager-cache: false
+
+      - uses: ./.github/actions/windows-ci-defender
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.environment == 'github-hosted'
+        with:
+          components: rustfmt, clippy, rust-analyzer
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: runner.environment == 'github-hosted'
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
@@ -1618,10 +2077,21 @@ jobs:
       - name: Cargo build (debug — bash.test.ts spawns the real aft binary)
         run: cargo build -p agent-file-tools
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Bun test (bash permission flow — full bridge + plugin + Rust)
-        run: bun test src/__tests__/e2e/bash.test.ts
+        run: |
+          Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
+          bun test src/__tests__/e2e/bash.test.ts
         working-directory: packages/opencode-plugin
         shell: pwsh
         env:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+          AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft.exe
+
+      - name: Clean native test processes
+        if: always()
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup

@@ -427,6 +427,7 @@ impl Work {
             }
             let result = work.checkout.build();
             drop(flag);
+            work.checkout.notify_readiness_change();
             if !matches!(result, Err(DataError::Cancelled)) {
                 work.notify_status_change();
             }
@@ -904,6 +905,7 @@ impl Work {
     /// Tells the status listener, if any, that the checkout's status may
     /// have changed.
     fn notify_status_change(&self) {
+        self.checkout.notify_readiness_change();
         let listener = self
             .status_listener
             .lock()
@@ -1105,6 +1107,15 @@ impl DataCheckout {
     #[must_use]
     pub(crate) fn checkout(&self) -> &Checkout {
         &self.work.checkout
+    }
+
+    /// Only a queued or running first text build warrants waiting. An old
+    /// publication, a failure, or a checkout with no build scheduled does not.
+    pub(crate) fn first_text_building(&self) -> bool {
+        self.work.building.load(Ordering::Acquire)
+            && self.work.checkout.planes().text
+            && self.work.checkout.view().is_none()
+            && self.work.checkout.last_failure().is_none()
     }
 
     /// Runs the checkout's background work on `executor` from now on: the

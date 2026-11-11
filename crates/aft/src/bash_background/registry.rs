@@ -805,6 +805,9 @@ pub struct BgCompletion {
     pub tokens_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    /// The build server's memory-kill cause and measurements, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_oom_kill: Option<remote::RemoteOomKill>,
     /// Output capture was incomplete, without changing the command's outcome.
     #[serde(default, skip_serializing_if = "is_false")]
     pub output_incomplete: bool,
@@ -837,6 +840,7 @@ impl BgCompletion {
         frame.launching_identity = self.launching_identity;
         frame.changed_files = self.changed_files;
         frame.status_reason = self.status_reason;
+        frame.remote_oom_kill = self.remote_oom_kill;
         frame.output_incomplete = self.output_incomplete;
         frame.live_descendants = self.live_descendants;
         frame.live_descendants_omitted = self.live_descendants_omitted;
@@ -941,6 +945,9 @@ pub struct BgTaskSnapshot {
     /// An explicit remote demand was refused before the command started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_refusal: Option<RemoteRefusal>,
+    /// The build server's memory-kill cause and measurements, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_oom_kill: Option<remote::RemoteOomKill>,
     /// Whether the runner confirmed input capture, retained through disk recovery.
     #[serde(skip)]
     pub(crate) remote_inputs_captured: Option<bool>,
@@ -973,7 +980,7 @@ pub struct BgTaskSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
     /// The build server's job ID for a remote (`runon`) task, once the
-    /// runner has accepted it.
+    /// runner has supplied it in progress or acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_job_id: Option<String>,
     /// Where a live remote task is: capturing inputs, queued (and for how long),
@@ -1486,6 +1493,7 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor:
         Mutex<Option<Arc<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    runner_completion_delivery_cutover: std::sync::OnceLock<u64>,
     speech_db_path: RwLock<Option<PathBuf>>,
     /// Ids of tasks whose aft.db row write found no handle attached. A
     /// configured root opens aft.db after its bind is acknowledged and
@@ -1556,6 +1564,9 @@ pub(crate) struct BashDrainReplyCache(Arc<Mutex<BashDrainReplyState>>);
 
 #[derive(Clone, Default)]
 pub(crate) struct BashDrainReplyState {
+    pub(crate) completion_finished_at: Option<u64>,
+    pub(crate) completion_delivered: bool,
+    pub(crate) runner_completion_offers: usize,
     pub(crate) execution_note: Option<String>,
     pub(crate) deadline: Option<(HardKillDeadline, u64)>,
     pub(crate) inputs_captured: Option<bool>,
@@ -1594,6 +1605,13 @@ impl BashDrainReplyCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         published.execution_note = note;
+        published.completion_finished_at = metadata.finished_at;
+        published.completion_delivered = metadata.completion_delivered;
+        // An off-thread write may publish an earlier offer while a later one
+        // is already reserved in memory. Never reopen that replay budget.
+        published.runner_completion_offers = published
+            .runner_completion_offers
+            .max(metadata.runner_completion_offers);
         published.deadline = deadline;
         published.inputs_captured = inputs_captured;
         published.remote = metadata.remote.as_ref().map(remote::RemoteProgress::of);
@@ -2129,6 +2147,7 @@ impl BgTaskRegistry {
                 project_replay_scan_budget_for_test: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
+                runner_completion_delivery_cutover: std::sync::OnceLock::new(),
                 speech_db_path: RwLock::new(None),
                 db_writes_awaiting_pool: Mutex::new(HashSet::new()),
                 db_detached_logged: AtomicBool::new(false),
@@ -2533,6 +2552,24 @@ impl BgTaskRegistry {
             .write()
             .unwrap_or_else(|error| error.into_inner()) = path;
         if let Ok(connection) = conn.lock() {
+            if self
+                .inner
+                .runner_completion_delivery_cutover
+                .get()
+                .is_none()
+            {
+                match crate::db::state::runner_completion_delivery_cutover(
+                    &connection,
+                    unix_millis(),
+                ) {
+                    Ok(cutover) => {
+                        let _ = self.inner.runner_completion_delivery_cutover.set(cutover);
+                    }
+                    Err(error) => {
+                        log::warn!("could not record runner completion delivery cutover: {error}")
+                    }
+                }
+            }
             crate::db::bash_watches::refresh_watch_gap_health(&connection);
         }
         if let Ok(mut slot) = self.inner.db_pool.write() {
@@ -9487,6 +9524,11 @@ impl BgTaskRegistry {
         );
         snapshot.output_preview = cache.output_preview;
         snapshot.output_truncated = cache.output_truncated;
+        if snapshot.remote_oom_kill.is_some() {
+            if let Some(note) = rendered_execution_note(&metadata) {
+                snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
+            }
+        }
         Some((snapshot, resolved.paths))
     }
 
@@ -11593,17 +11635,14 @@ impl BgTaskRegistry {
         }
         let requested_task_ids = task_ids.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut completion_sessions = HashMap::new();
-        if let Ok(mut completions) = self.inner.completions.lock() {
-            completions.retain(|completion| {
+        if let Ok(completions) = self.inner.completions.lock() {
+            for completion in completions.iter() {
                 let session_matches = completion_matches_session(completion, session_id);
                 if session_matches && requested_task_ids.contains(completion.task_id.as_str()) {
                     completion_sessions
                         .insert(completion.task_id.clone(), completion.session_id.clone());
-                    false
-                } else {
-                    true
                 }
-            });
+            }
         }
 
         let mut delivered = Vec::new();
@@ -11647,6 +11686,7 @@ impl BgTaskRegistry {
                 self.clear_task_watch_state(task_id);
                 // Retain the process-local erased marker so later status calls still
                 // distinguish this task from an ID that never existed.
+                let _ = self.remove_pending_completion(task_id);
                 delivered.push(task_id.clone());
                 continue;
             }
@@ -11675,10 +11715,11 @@ impl BgTaskRegistry {
                 if terminal {
                     self.clear_task_watch_state(task_id);
                     if task.set_completion_delivered(true, self).is_ok() {
-                        // A renderer may have inserted its pre-ack snapshot
-                        // while this ack was waiting for the task state lock.
-                        // Queue writers hold that lock through insertion, so
-                        // this second removal closes that race.
+                        // Remove only after the delivered mark persists, so a
+                        // failed mark leaves the completion pending for plugins
+                        // too. Queue writers hold the task state lock through
+                        // insertion, so this also removes any pending completion
+                        // inserted while the ack waited for that lock.
                         let _ = self.remove_pending_completion(task_id);
                         delivered.push(task_id.clone());
                     }
@@ -11699,6 +11740,7 @@ impl BgTaskRegistry {
                 if terminal {
                     self.mark_persisted_completion_delivered(session_id, task_id);
                 }
+                let _ = self.remove_pending_completion(task_id);
                 delivered.push(task_id.clone());
             }
         }
@@ -11772,6 +11814,51 @@ impl BgTaskRegistry {
         if let Ok(mut registry) = self.inner.watch_registry.lock() {
             registry.reconcile_watch_ids(task_id, &remaining, has_pending_match);
         }
+    }
+
+    pub(crate) fn runner_completion_delivery_cutover(&self) -> Result<u64, String> {
+        self.inner
+            .runner_completion_delivery_cutover
+            .get()
+            .copied()
+            .ok_or_else(|| "runner completion delivery cutover is not initialized".into())
+    }
+
+    pub(crate) fn completion_finished_at(&self, task_id: &str) -> Option<u64> {
+        self.runner_completion_state(task_id)?
+            .completion_finished_at
+    }
+
+    pub(crate) fn runner_completion_state(&self, task_id: &str) -> Option<BashDrainReplyState> {
+        Some(self.task(task_id)?.drain_reply.snapshot())
+    }
+
+    /// Reserve in memory only; the completion writer persists the returned count.
+    pub(crate) fn reserve_runner_completion_offer(&self, task_id: &str) -> Option<usize> {
+        let task = self.task(task_id)?;
+        let mut published = task.drain_reply.0.lock().ok()?;
+        published.runner_completion_offers = published.runner_completion_offers.saturating_add(1);
+        Some(published.runner_completion_offers)
+    }
+
+    pub(crate) fn persist_runner_completion_offer(
+        &self,
+        session: &str,
+        task_id: &str,
+        offers: usize,
+    ) -> std::io::Result<()> {
+        let task = self
+            .task_for_session(task_id, session)
+            .ok_or_else(|| std::io::Error::other("completion task is not owned by this session"))?;
+        self.retry_terminal_persist(&task)?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            metadata.runner_completion_offers = metadata.runner_completion_offers.max(offers);
+        })?;
+        Ok(())
     }
 
     pub fn pending_completions_for_session(&self, session_id: &str) -> Vec<BgCompletion> {
@@ -11875,6 +11962,7 @@ impl BgTaskRegistry {
             compressed_tokens: None,
             tokens_skipped: false,
             status_reason: snapshot.info.status_reason,
+            remote_oom_kill: snapshot.remote_oom_kill,
             output_incomplete: snapshot.output_incomplete,
             live_descendants: snapshot.live_descendants,
             live_descendants_omitted: snapshot.live_descendants_omitted,
@@ -14723,6 +14811,7 @@ impl BgTaskRegistry {
             compressed_tokens: token_counts.compressed_tokens,
             tokens_skipped: token_counts.tokens_skipped,
             status_reason: metadata.status_reason.clone(),
+            remote_oom_kill: remote::remote_oom_kill(metadata),
             output_incomplete: metadata.output_incomplete,
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
@@ -17241,6 +17330,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
         .filter(|r| r.explicit_runon)
         .map(|r| r.accepted);
     let remote_job_id = remote_job_id(&metadata);
+    let remote_oom_kill = remote::remote_oom_kill(&metadata);
     BgTaskSnapshot {
         changed_files: None,
         info: BgTaskInfo {
@@ -17269,6 +17359,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
         sandbox_native: metadata.sandbox_native,
         sandbox_unavailable: false,
         remote_refusal,
+        remote_oom_kill,
         remote_inputs_captured,
         phase: None,
         live_descendants: metadata.live_descendants.clone(),
@@ -17462,6 +17553,7 @@ impl BgTask {
                     .and_then(|mut file| file.read_all())
                     .is_ok_and(|bytes| bytes == b"sandbox_unavailable"),
             remote_refusal: remote::remote_refusal(metadata),
+            remote_oom_kill: remote::remote_oom_kill(metadata),
             remote_inputs_captured: metadata
                 .remote
                 .as_ref()
@@ -18279,12 +18371,23 @@ fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
         .as_ref()
         .and_then(|remote| remote.output_incomplete.as_ref())
         .map(remote::RemoteOutputIncomplete::warning_line);
-    let note = match (warning, metadata.execution_note.as_deref()) {
+    let mut note = match (warning, metadata.execution_note.as_deref()) {
         (Some(warning), Some(note)) if !note.is_empty() => Some(format!("{warning}\n{note}")),
         (Some(warning), _) => Some(warning),
         (None, Some(note)) => Some(note.to_owned()),
         (None, None) => None,
     };
+    // Disk recovery can render the task's terminal result before the finalizer has
+    // saved its execution note. Keep the same memory advice on that path.
+    if let Some(oom) = remote::remote_oom_kill(metadata) {
+        let message = oom.message();
+        if !note.as_ref().is_some_and(|note| note.contains(&message)) {
+            note = Some(match note {
+                Some(note) => format!("{note}\n{message}"),
+                None => message,
+            });
+        }
+    }
     let note = if metadata.status == BgTaskStatus::Killed
         && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
     {
@@ -18800,6 +18903,7 @@ mod tests {
                 compressed_tokens: None,
                 tokens_skipped: false,
                 status_reason: None,
+                remote_oom_kill: None,
                 output_incomplete: false,
                 live_descendants: Some(Vec::new()),
                 live_descendants_omitted: 0,

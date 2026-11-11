@@ -53,10 +53,7 @@ fn windows_posix_atomic_short_name_is_regenerated() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("windows_replace.rs");
     std::fs::write(&path, b"original").unwrap();
-    assert!(
-        !short_name(&path).is_empty(),
-        "the test volume must generate short names"
-    );
+    let had_short_name = !short_name(&path).is_empty();
     let old = information(&File::open(&path).unwrap()).unwrap();
 
     let outcome = atomic_write_source(&path, b"edited").unwrap();
@@ -70,11 +67,16 @@ fn windows_posix_atomic_short_name_is_regenerated() {
         (new.nFileIndexHigh, new.nFileIndexLow)
     );
     let regenerated = short_name(&path);
-    assert!(!regenerated.is_empty());
-    assert_eq!(
-        std::fs::read(path.with_file_name(regenerated)).unwrap(),
-        b"edited"
-    );
+    // Some volumes do not generate short-name (8.3) aliases. Replacement must
+    // still be atomic there; where aliases exist, the new one must read the edit.
+    assert!(!had_short_name || !regenerated.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+    if !regenerated.is_empty() {
+        assert_eq!(
+            std::fs::read(path.with_file_name(regenerated)).unwrap(),
+            b"edited"
+        );
+    }
 }
 
 #[test]
@@ -469,8 +471,10 @@ fn windows_posix_metadata_matches_replace_file() {
     }
     let mut snapshots = Vec::new();
     for guarded in [false, true] {
-        let attributes = FILE_ATTRIBUTE_ARCHIVE;
         let (dir, path) = fixture();
+        let attributes = information(&File::open(&path).unwrap())
+            .unwrap()
+            .dwFileAttributes;
         let temp = dir.path().join("new.txt");
         let original = OpenOptions::new()
             .write(true)
@@ -484,7 +488,9 @@ fn windows_posix_metadata_matches_replace_file() {
             132000000020000000,
         );
         drop(original);
-        // Compare ordinary-file metadata with the historical replacement policy.
+        // Keep the folder's inherited attributes on both files. Forcing only the
+        // original to ARCHIVE drops NOT_CONTENT_INDEXED in some temp folders and
+        // tests an eligibility refusal instead of replacement metadata parity.
         assert_ne!(
             unsafe { SetFileAttributesW(wide(&path).as_ptr(), attributes,) },
             0
@@ -499,11 +505,27 @@ fn windows_posix_metadata_matches_replace_file() {
             133000000020000000,
         );
         drop(file);
+        assert_ne!(
+            unsafe { SetFileAttributesW(wide(&temp).as_ptr(), attributes,) },
+            0
+        );
         let dacl_copy = dir.path().join("acl.txt");
         std::fs::write(&dacl_copy, b"").unwrap();
         super::super::windows_dacl::copy_protected(&path, &dacl_copy).unwrap();
         if guarded {
-            assert!(replace(&path, &temp).unwrap());
+            let original_attributes = information(&File::open(&path).unwrap())
+                .unwrap()
+                .dwFileAttributes;
+            let replacement_attributes = information(&File::open(&temp).unwrap())
+                .unwrap()
+                .dwFileAttributes;
+            assert!(
+                replace(&path, &temp).unwrap(),
+                "method={:?}, reason={}, original attributes={original_attributes:#x}, replacement attributes={replacement_attributes:#x}, fixture={}",
+                LAST_METHOD.get(),
+                LAST_REASON.with(|reason| reason.borrow().clone()),
+                dir.path().display(),
+            );
             assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
         } else {
             use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
@@ -525,7 +547,7 @@ fn windows_posix_metadata_matches_replace_file() {
         }
         let info = information(&File::open(&path).unwrap()).unwrap();
         assert_eq!(stamp(&info).1, 132000000000000000);
-        if guarded && attributes == FILE_ATTRIBUTE_ARCHIVE {
+        if guarded {
             assert!(super::super::windows_dacl::matches(&path, &dacl_copy).unwrap());
         }
         assert_eq!(std::fs::read(&path).unwrap(), b"edited");

@@ -6,11 +6,49 @@ use serde_json::{json, Value};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
+#[cfg(test)]
+mod backup_bookkeeping_tests;
 mod cpu_time;
+#[cfg(test)]
+mod outline_wait_probe;
 pub(crate) mod progress;
 pub(crate) use cpu_time::ThreadCpuSample;
 
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
+
+/// Commands that never create mutation backups or undo post-state records.
+/// Cache/index maintenance by a reader does not make it a file mutation.
+/// Keep unknown commands on the bookkeeping path, including every edit,
+/// safety operation and shell command. The standalone tool-call envelope
+/// has the same property as its named tool; its arguments cannot change it.
+pub fn is_read_only_request(request: &RawRequest) -> bool {
+    let command = if request.command == "tool_call" {
+        let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        name
+    } else {
+        &request.command
+    };
+    matches!(
+        command.strip_prefix("aft_").unwrap_or(command),
+        "outline"
+            | "zoom"
+            | "read"
+            | "grep"
+            | "glob"
+            | "search"
+            | "semantic_search"
+            | "callgraph"
+            | "callers"
+            | "call_tree"
+            | "impact"
+            | "trace_to"
+            | "trace_to_symbol"
+            | "trace_data"
+    )
+}
+
 /// Finalizes a formatted tool result. It receives the agent-visible text so the finalizer can
 /// append trailing lines (the AFT status bar) that every transport then delivers unchanged.
 pub type FinalizeFn<'a> = dyn Fn(&mut Response, &mut String) + 'a;
@@ -58,6 +96,7 @@ pub struct PhaseTrace {
     intentional_wait: bool,
     arg_shape: Option<String>,
     edit_phases: Option<String>,
+    deferred_search_waits: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +232,7 @@ impl PhaseTrace {
             intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
+            deferred_search_waits: None,
         }
     }
 
@@ -242,6 +282,27 @@ impl PhaseTrace {
         // CPU consumed by unrelated tasks while a deferred response was pending.
         self.cpu.execute_suspended = true;
         self.mark_execute_done();
+        if let Some(fields) = self.deferred_search_waits.take() {
+            if let Some(fields) = fields
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let shape = self.arg_shape.get_or_insert_with(String::new);
+                shape.push(' ');
+                shape.push_str(&fields);
+            }
+        }
+    }
+
+    /// The cold-search worker records named waits on its own thread; the
+    /// terminal response harvests them for the usual slow-call fields.
+    pub(crate) fn deferred_search_wait_fields(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<String>>> {
+        let fields = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.deferred_search_waits = Some(std::sync::Arc::clone(&fields));
+        fields
     }
 
     /// Record the argument shape the slow-call line reports for this call.
@@ -842,11 +903,21 @@ pub fn run_tool_call(
             // summary, so they are collected only when that line can exist.
             let search_waits = (reports_search_plan && phase_trace.is_some())
                 .then(crate::commands::semantic_search::waits::begin);
-            let skipped_before = app_ctx.backup().lock().latest_skipped_order(
-                ctx.session_id
-                    .as_deref()
-                    .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
-            );
+            // Read-only outline can wait on bookkeeping outside its handler.
+            // Keep these clocks on the diagnostic path, not in response text.
+            let outline_started =
+                (prepared.request.command == "outline" && phase_trace.is_some()).then(Instant::now);
+            let backup_bookkeeping = !is_read_only_request(&prepared.request);
+            let skipped_before = backup_bookkeeping
+                .then(|| {
+                    app_ctx.backup().lock().latest_skipped_order(
+                        ctx.session_id
+                            .as_deref()
+                            .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
+                    )
+                })
+                .flatten();
+            let outline_backup_before = outline_started.map(|at| at.elapsed());
             let (watcher_pending, callgraph_pending) =
                 crate::response_finalize::query_pending(app_ctx, &prepared.request.command);
             // URL fetch times ride on the slow-call line of the commands that
@@ -855,11 +926,14 @@ pub fn run_tool_call(
             let url_fetch_times = (phase_trace.is_some()
                 && fetches_urls(&prepared.request.command))
             .then(crate::url_fetch::timing::begin);
+            let outline_handler_started = outline_started.map(|_| Instant::now());
             let mut response = if prepared.request.command == "inspect" {
                 crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
             } else {
                 dispatch(prepared.request, app_ctx)
             };
+            let outline_handler = outline_handler_started.map(|at| at.elapsed());
+            let outline_after_started = outline_started.map(|_| Instant::now());
             let search_waits = search_waits.and_then(|scope| scope.finish());
             response = crate::bounded_io::finish_response(response);
             crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
@@ -867,7 +941,10 @@ pub fn run_tool_call(
                 &mut response,
                 callgraph_pending.as_ref(),
             );
-            if response.success && response.data.get("backup_skipped_reason").is_none() {
+            if backup_bookkeeping
+                && response.success
+                && response.data.get("backup_skipped_reason").is_none()
+            {
                 let session = ctx
                     .session_id
                     .as_deref()
@@ -885,6 +962,7 @@ pub fn run_tool_call(
                     }
                 }
             }
+            let outline_after = outline_after_started.map(|at| at.elapsed());
             let url_fetch_times = url_fetch_times.and_then(|scope| scope.finish());
             if let Some(trace) = phase_trace.as_mut() {
                 trace.mark_execute_done();
@@ -904,6 +982,14 @@ pub fn run_tool_call(
                     if let Some(times) = url_fetch_times {
                         shape.push(' ');
                         shape.push_str(&times.render());
+                    }
+                    if let Some(before) = outline_backup_before {
+                        shape.push_str(&format!(
+                            " outline_backup_before_ms={:.3} outline_handler_ms={:.3} outline_after_ms={:.3}",
+                            before.as_secs_f64() * 1000.0,
+                            outline_handler.unwrap_or_default().as_secs_f64() * 1000.0,
+                            outline_after.unwrap_or_default().as_secs_f64() * 1000.0,
+                        ));
                     }
                     trace.note_arg_shape(shape);
                 }
@@ -1793,6 +1879,23 @@ mod tests {
     }
 
     #[test]
+    fn first_text_index_wait_fields_cross_the_continuation_boundary() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.note_arg_shape("query:string".into());
+        let fields = trace.deferred_search_wait_fields();
+        std::thread::spawn(move || {
+            *fields.lock().unwrap() = Some("wait_readiness_ms=42".into());
+        })
+        .join()
+        .unwrap();
+        trace.mark_execute_done_after_await();
+        assert_eq!(
+            trace.arg_shape.as_deref(),
+            Some("query:string wait_readiness_ms=42")
+        );
+    }
+
+    #[test]
     fn phase_trace_reports_execution_and_writer_egress_subphases() {
         let t0 = Instant::now();
         let trace = PhaseTrace {
@@ -1812,6 +1915,7 @@ mod tests {
             intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
+            deferred_search_waits: None,
         };
 
         let phases = trace

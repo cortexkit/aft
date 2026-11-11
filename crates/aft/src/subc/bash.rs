@@ -1166,7 +1166,51 @@ pub(super) async fn answer_yielded_bash_call(
     route: RouteChannel,
     corr: u64,
     target: drain::BashDetachTarget,
+    restart: bool,
 ) -> Result<(), SubcError> {
+    if restart {
+        let frame = super::call_yield::restart_held_frame(
+            target.ver,
+            route,
+            corr,
+            target.flags,
+            Some(json!({"task_id": target.task_id})),
+        )?;
+        let registry = target.registry.clone();
+        let task = target.task_id.clone();
+        let body = frame.body.clone();
+        let structured = !matches!(identity.trust, BindTrust::Untrusted);
+        let persisted = tokio::task::spawn_blocking(move || {
+            registry.hold_running_call(&task, &body, structured)
+        })
+        .await;
+        let frame = match persisted {
+            Ok(Ok(_)) => frame,
+            error => {
+                log::warn!("runner restart hold failed: {error:?}");
+                let unknown = crate::db::call_ledger::unknown_held_result();
+                Frame::build_with_version(
+                    target.ver,
+                    unknown.ty,
+                    target.flags,
+                    route.channel,
+                    route.epoch,
+                    corr,
+                    unknown.body,
+                )
+                .map_err(SubcError::FrameBuild)?
+            }
+        };
+        // Keep the task foreground to avoid a session notice that would
+        // duplicate the result delivered through the call ledger.
+        release_wait_registration(
+            &target.registry,
+            &target.session_id,
+            &target.task_id,
+            target.wait_mode,
+        );
+        return send_reliable_writer_frame(tx, metrics, frame, "yielded bash hold").await;
+    }
     let frame = background_handoff_frame(
         &target,
         identity,
@@ -6499,6 +6543,7 @@ mod grant_path_tests {
                         epoch: 1
                     },
                     1,
+                    false,
                 ),
                 Err(super::super::super::call_yield::NotYieldable::Scope)
             ));
@@ -6540,16 +6585,24 @@ mod grant_path_tests {
                         let target = call
                             .metrics
                             .held_bash_calls
-                            .claim_for_yield(route, 1)
+                            .claim_for_yield(route, 1, false)
                             .unwrap();
                         let identity = super::super::super::test_support::route_identity(
                             &root,
                             "deadline-session",
                         );
                         let (tx, mut rx) = mpsc::channel(8);
-                        answer_yielded_bash_call(&tx, &identity, &call.metrics, route, 1, target)
-                            .await
-                            .unwrap();
+                        answer_yielded_bash_call(
+                            &tx,
+                            &identity,
+                            &call.metrics,
+                            route,
+                            1,
+                            target,
+                            false,
+                        )
+                        .await
+                        .unwrap();
                         let body: Value =
                             serde_json::from_slice(&rx.recv().await.unwrap().frame.body).unwrap();
                         assert_eq!(body["structuredContent"]["task_id"], call.task_id);
@@ -8102,52 +8155,31 @@ mod grant_path_tests {
         )
     }
 
-    /// A kill recorded after the runner received `exec.run` but before it
-    /// accepted the job has no job id to cancel. The worker cancels the call
-    /// itself: a call-key Cancel on the same channel, epoch and correlation as
-    /// the `exec.run`, kept alive by a status round trip so the worker's
-    /// runtime shutting down cannot drop it. Without terminal proof the task
-    /// ends as fate unknown, never as having run.
+    /// Killing during placement must retain the observation until a job id
+    /// arrives. Request-level Cancel only detaches, so only exec.cancel can stop
+    /// the job and the runner's terminal can confirm that it never ran.
     #[cfg(unix)]
     #[tokio::test]
-    async fn background_runon_kill_before_admission_cancels_submission() {
-        use crate::exec_remote::wire_tests::Script;
-        let (daemon, _dir, root, executor, ctx) =
-            capture_fixture(Script::GatedAdmission { refuse: false }).await;
+    async fn background_runon_remote_cancel_placement_waits_for_id_and_terminal() {
+        use crate::exec_remote::wire_tests::{id, Script};
+        let (daemon, _dir, root, executor, ctx) = capture_fixture_with_claims(
+            Script::PlacementWait { job_id: false },
+            &[
+                "exec-remote/v1",
+                crate::exec_remote::types::PROGRESS_CAPABILITY,
+            ],
+        )
+        .await;
         let (reply, _) = background_admission_reply(&daemon, &executor, &root).await;
         let task_id = reply.response_for_test().data["task_id"]
             .as_str()
             .unwrap()
             .to_owned();
-        let killed_id = task_id.clone();
-        let kill_ctx = ctx.clone();
-        let killed = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                crate::commands::bash_kill::handle(
-                    &RawRequest {
-                        id: "kill-admission".into(),
-                        command: "bash_kill".into(),
-                        lsp_hints: None,
-                        session_id: Some("deadline-session".into()),
-                        params: json!({"task_id":killed_id}),
-                    },
-                    &kill_ctx,
-                )
-            }),
-        )
-        .await
-        .expect("queued cancellation must not wait for admission")
-        .unwrap();
-        assert!(killed.success, "{killed:?}");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if daemon
-                    .log
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|(header, _)| header.ty == FrameType::Cancel)
+                if admission_status(&ctx, &task_id).data["remote_phase_note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("waiting for a free build host"))
                 {
                     break;
                 }
@@ -8155,37 +8187,79 @@ mod grant_path_tests {
             }
         })
         .await
-        .expect("the real client must send a call-key Cancel before receiving a job id");
+        .expect("placement progress must be visible before killing");
+        let killed_id = task_id.clone();
+        let kill_ctx = ctx.clone();
+        let killed = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_millis(250))),
+                    || {
+                        crate::commands::bash_kill::handle(
+                            &RawRequest {
+                                id: "kill-placement".into(),
+                                command: "bash_kill".into(),
+                                lsp_hints: None,
+                                session_id: Some("deadline-session".into()),
+                                params: json!({"task_id":killed_id}),
+                            },
+                            &kill_ctx,
+                        )
+                    },
+                )
+            }),
+        )
+        .await
+        .expect("kill must return pending inside the caller budget")
+        .unwrap();
+        assert!(!killed.success, "{killed:?}");
+        let pending = killed.data["message"].as_str().unwrap();
+        assert!(
+            pending.contains("remote cancellation pending"),
+            "{killed:?}"
+        );
+        assert!(pending.contains(&task_id), "{killed:?}");
+        assert!(pending.contains("the job may still run"), "{killed:?}");
+        assert_eq!(admission_status(&ctx, &task_id).data["status"], "starting");
+        assert!(
+            daemon.log.lock().unwrap().iter().all(|(header, body)| {
+                header.ty != FrameType::Cancel && body["method"] != "exec.cancel"
+            }),
+            "without an id the observation must remain open, not detach"
+        );
+        daemon.acceptance_gate.notify_one();
+        daemon.wait_for_requests("exec.cancel", 1).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = admission_status(&ctx, &task_id);
+                if status.data["status"] == "killed" {
+                    assert_eq!(status.data["remote_job_id"], id().to_string());
+                    assert!(
+                        status
+                            .data
+                            .to_string()
+                            .contains("command never started on ck-motor"),
+                        "{status:?}"
+                    );
+                    assert!(
+                        !status.data.to_string().contains("outcome unknown"),
+                        "{status:?}"
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the runner must confirm cancellation after acceptance");
         let log = daemon.log.lock().unwrap();
-        let run = log
-            .iter()
-            .find(|(_, body)| body["method"] == "exec.run")
-            .unwrap()
-            .0;
         let cancel = log
             .iter()
-            .find(|(header, _)| header.ty == FrameType::Cancel)
-            .unwrap()
-            .0;
-        assert_eq!(
-            (cancel.channel, cancel.epoch, cancel.corr),
-            (run.channel, run.epoch, run.corr)
-        );
-        drop(log);
-        daemon.acceptance_gate.notify_one();
-        let status = admission_status(&ctx, &task_id);
-        assert_eq!(
-            status.data["status"], "fate_unknown",
-            "unsubscribe is not terminal proof: {status:?}"
-        );
-        assert!(!status.data.to_string().contains("admitted"), "{status:?}");
-        assert!(
-            status
-                .data
-                .to_string()
-                .contains(crate::bash_background::registry::remote::PRE_ACCEPTANCE_CANCELLED),
-            "{status:?}"
-        );
+            .find(|(_, body)| body["method"] == "exec.cancel")
+            .unwrap();
+        assert_eq!(cancel.1["params"]["job_id"], id().to_string());
+        assert!(log.iter().any(|(_, body)| body["method"] == "exec.attach"));
     }
 
     /// A codemode agent run's shell call as AFT admits it: the run route,

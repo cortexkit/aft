@@ -1,0 +1,8 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["crates/aft/tests/integration/tool_call_parity_test.rs", "crates/aft/src/commands/semantic_search/mod.rs"],
+  "slices": ["search-query-time-parse"],
+  "note": "Ranking-fenced semantic_search and parser code cache the existing code-reference predicate's query-independent names by content digest and grammar. Retained facts are bounded to 2 MiB/512 entries/128 KiB per file; oversized sets keep the original predicate. No content-record format, routing, score, candidate, range, snippet or reply change. Full parity replayed 6700 distinct queries from all 6897 recorded lines: 6692 whole replies equal and eight differ only in the exact watcher_pending gap and warning (four before-only/four after-only), proven by strict normalization of only that notice. All 108 complete quality rows are equal between arms; the two score documents differ only in binary_sha256. Both reproduce nine inherited reference pattern-count differences; no waiver is added. Under eight concurrent searchers and a deterministic sample of 16 real queries selected from 246 that exercised the predicate, ABBA parses/search fell 225.06 to 40.51, wall p50/p95 1598.9/16511.4 to 1378.3/10938.5 ms, caller CPU 518.9/6020.9 to 495.2/3476.1 ms. The unchanged rerank workload has zero parses and is a control, not optimization evidence. See the search-query-time-parse investigation for raw reports, cache hit rate, bounds and limitations."
+}

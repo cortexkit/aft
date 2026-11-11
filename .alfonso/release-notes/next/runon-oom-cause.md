@@ -1,0 +1,1 @@
+- Build-server memory kills now say whether to rerun with more memory or retry as is, including peak working memory when reported.

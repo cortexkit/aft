@@ -228,6 +228,31 @@ describe("startLiveConfigReload", () => {
 });
 
 describe("watchAftConfigFiles", () => {
+  test("an edit made while a new watch is still starting is noticed without an event", async () => {
+    const dir = tempDir();
+    const file = join(dir, "aft.jsonc");
+    writeFileSync(file, "{}");
+    let changes = 0;
+    // The watch is armed but reports nothing, like an event stream that
+    // starts only after the edit below has happened.
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 20,
+      watchImpl: ((path: string, options: { persistent: boolean }) =>
+        watch(path, options, () => {})) as unknown as typeof watch,
+      onChange: () => {
+        changes += 1;
+      },
+    });
+    try {
+      writeFileSync(file, '{ "restrict_to_project_root": true }');
+      await waitUntil(() => changes >= 1, "edit during watch start reloaded");
+      expect(changes).toBe(1);
+    } finally {
+      stop();
+    }
+  });
+
   test("a symlink target edit reloads without an event in the link folder", async () => {
     const dir = tempDir();
     const configDir = join(dir, "cortexkit");

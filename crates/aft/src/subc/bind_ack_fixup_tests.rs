@@ -136,6 +136,7 @@ async fn retracted_bind(tool: bool, trigger: &str, expected_code: &str) {
             &storage,
             QuiescedLsp::ReapInBackground,
             None,
+            None,
             Some(hooks),
         ))
     });

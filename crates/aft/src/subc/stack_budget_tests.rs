@@ -62,6 +62,7 @@ async fn module_loop_control_request_fits_with_stack_headroom() {
                     QuiescedLsp::ReapInBackground,
                     None,
                     None,
+                    None,
                 )
             }))
         })

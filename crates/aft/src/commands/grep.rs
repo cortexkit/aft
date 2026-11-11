@@ -475,7 +475,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
-    crate::data_layer::parent_session::attach_gaps(&mut body, parent_gaps);
+    crate::data_layer::parent_session::attach_search_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
     if let Some(mut envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {

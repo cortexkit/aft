@@ -561,6 +561,8 @@ pub(super) struct DispatchPathMetrics {
     unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
+    /// Zero while running; otherwise milliseconds since `origin` plus one.
+    frame_loop_runtime_parked_ms_plus_one: AtomicU64,
     /// When the frame loop next promised to wake (its drain-tick timer), as
     /// milliseconds since `origin` plus one; `0` means no loop is running.
     frame_loop_wake_deadline_ms_plus_one: AtomicU64,
@@ -637,6 +639,7 @@ impl DispatchPathMetrics {
             unanswered_tools: StdMutex::new(HashMap::new()),
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
+            frame_loop_runtime_parked_ms_plus_one: AtomicU64::new(0),
             frame_loop_wake_deadline_ms_plus_one: AtomicU64::new(0),
             frame_loop_phase: AtomicUsize::new(0),
             frame_loop_frame_header: AtomicU64::new(0),
@@ -915,6 +918,33 @@ impl DispatchPathMetrics {
 
     fn now_ms(&self) -> u64 {
         duration_millis_u64(self.origin.elapsed())
+    }
+
+    /// Install on the current-thread runtime that owns the frame loop. The
+    /// hooks publish only atomics, including while the OS holds the event wait.
+    pub(super) fn frame_loop_runtime(self: &Arc<Self>) -> std::io::Result<tokio::runtime::Runtime> {
+        let parked = Arc::clone(self);
+        let unparked = Arc::clone(self);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_park(move || {
+                parked
+                    .frame_loop_runtime_parked_ms_plus_one
+                    .store(parked.now_ms().saturating_add(1), Ordering::Release);
+            })
+            .on_thread_unpark(move || {
+                unparked
+                    .frame_loop_runtime_parked_ms_plus_one
+                    .store(0, Ordering::Release);
+            })
+            .build()
+    }
+
+    pub(super) fn frame_loop_runtime_parked_for(&self) -> Option<Duration> {
+        let since = self
+            .frame_loop_runtime_parked_ms_plus_one
+            .load(Ordering::Acquire);
+        (since != 0).then(|| Duration::from_millis(self.now_ms().saturating_sub(since - 1)))
     }
 
     pub(super) fn mark_frame_loop_tick(&self) {

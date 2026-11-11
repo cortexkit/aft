@@ -2153,6 +2153,7 @@ async fn exec_remote_module_loop_captures_its_authenticated_daemon_endpoint() {
         QuiescedLsp::ReapInBackground,
         None,
         None,
+        None,
     );
     let (result, _) = tokio::join!(module_task, peer_task);
     result.unwrap();

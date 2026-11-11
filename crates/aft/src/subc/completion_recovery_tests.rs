@@ -9,10 +9,20 @@ const TASK: &str = "bash-0000000000000001";
 const SESSION: &str = "moved-session";
 
 fn persisted_completion(storage: &Path, root: &ProjectRootId, owner: &RouteIdentity) {
+    persisted_completion_at(storage, root, owner, TASK, None);
+}
+
+fn persisted_completion_at(
+    storage: &Path,
+    root: &ProjectRootId,
+    owner: &RouteIdentity,
+    task_id: &str,
+    finished_at: Option<u64>,
+) {
     let _scope = crate::bash_background::task_identity_scope(Some(owner.task_identity()));
-    let task = create_task_layout(storage, SESSION, TASK).unwrap();
+    let task = create_task_layout(storage, SESSION, task_id).unwrap();
     let mut metadata = PersistedTask::starting(
-        TASK.into(),
+        task_id.into(),
         SESSION.into(),
         "echo durable".into(),
         root.as_path().into(),
@@ -22,17 +32,22 @@ fn persisted_completion(storage: &Path, root: &ProjectRootId, owner: &RouteIdent
         false,
     );
     metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    if let Some(finished_at) = finished_at {
+        metadata.started_at = finished_at.saturating_sub(1);
+        metadata.finished_at = Some(finished_at);
+        metadata.duration_ms = Some(1);
+    }
     assert!(!metadata.completion_delivered);
     write_task_at(&task, &metadata).unwrap();
 }
 
 #[test]
-fn opencode2_completion_churn_recovers_from_registry_once_per_connection() {
+fn plugin_completion_churn_recovers_from_registry_once_per_connection() {
     let (_dir, root) = test_root("opencode2-completion-churn");
     let storage = tempfile::tempdir().unwrap();
-    let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
-    let core = tests::caller_route(&root, "reserved:prefrontal-core", "opencode2");
-    let wrong_harness = tests::caller_route(&root, "reserved:thalamus-harness", "opencode");
+    let owner = tests::caller_route(&root, "direct", "opencode");
+    let core = tests::caller_route(&root, "reserved:prefrontal-core", "opencode");
+    let wrong_harness = tests::caller_route(&root, "direct", "pi");
     persisted_completion(storage.path(), &root, &owner);
     let registry = BgTaskRegistry::default();
     registry.replay_session(storage.path(), SESSION).unwrap();
@@ -55,7 +70,7 @@ fn opencode2_completion_churn_recovers_from_registry_once_per_connection() {
     let mut retry = RetryBuffer::new();
     let mut completed = CompletedTaskIds::default();
     // The launching route closed; a core catalog route is still open on the
-    // same session, and a second runner uses a different harness.
+    // same session, and a second plugin uses a different harness.
     process_reliable_push_frame(
         &writer,
         &metrics,
@@ -124,10 +139,10 @@ fn opencode2_completion_churn_recovers_from_registry_once_per_connection() {
 }
 
 #[test]
-fn opencode2_completion_survives_restart_and_late_configure_recovery_until_ack() {
+fn plugin_completion_survives_restart_and_late_configure_recovery_until_ack() {
     let (_dir, root) = test_root("opencode2-completion-restart");
     let storage = tempfile::tempdir().unwrap();
-    let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
+    let owner = tests::caller_route(&root, "direct", "opencode");
     let core = tests::caller_route(&root, "reserved:prefrontal-core", "opencode2");
     persisted_completion(storage.path(), &root, &owner);
     {
@@ -256,10 +271,10 @@ fn opencode2_completion_survives_restart_and_late_configure_recovery_until_ack()
 }
 
 #[test]
-fn opencode2_bind_before_configure_tail_recovers_unacked_completion() {
+fn plugin_bind_before_configure_tail_recovers_unacked_completion() {
     let (_dir, root) = test_root("opencode2-late-completion-recovery");
     let storage = tempfile::tempdir().unwrap();
-    let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
+    let owner = tests::caller_route(&root, "direct", "opencode");
     persisted_completion(storage.path(), &root, &owner);
     let registry = BgTaskRegistry::default();
     let metrics = DispatchPathMetrics::new();
@@ -326,7 +341,7 @@ fn opencode2_bind_before_configure_tail_recovers_unacked_completion() {
 #[test]
 fn completion_buffer_and_drop_health_counts_transport_outcomes() {
     let (_dir, root) = test_root("completion-push-counters");
-    let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
+    let owner = tests::caller_route(&root, "direct", "opencode");
     let key = ReplayKey::from_identity(&owner);
     let frame = completion_frame_with_session(TASK, SESSION);
     let metrics = DispatchPathMetrics::new();
@@ -370,7 +385,7 @@ fn completion_buffer_and_drop_health_counts_transport_outcomes() {
 fn unacked_completion_reoffers_only_after_every_recipient_route_closes() {
     let (_dir, root) = test_root("completion-offered-route-lifetime");
     let storage = tempfile::tempdir().unwrap();
-    let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
+    let owner = tests::caller_route(&root, "direct", "opencode");
     persisted_completion(storage.path(), &root, &owner);
     let registry = BgTaskRegistry::default();
     registry.replay_session(storage.path(), SESSION).unwrap();
@@ -469,7 +484,7 @@ fn unacked_completion_reoffers_only_after_every_recipient_route_closes() {
 fn closing_recipient_does_not_duplicate_an_outstanding_retry_copy() {
     let (_dir, root) = test_root("completion-closing-recipient-retry");
     let storage = tempfile::tempdir().unwrap();
-    let owner = tests::caller_route(&root, "reserved:thalamus-harness", "opencode2");
+    let owner = tests::caller_route(&root, "direct", "opencode");
     persisted_completion(storage.path(), &root, &owner);
     let registry = BgTaskRegistry::default();
     registry.replay_session(storage.path(), SESSION).unwrap();
@@ -542,4 +557,708 @@ fn closing_recipient_does_not_duplicate_an_outstanding_retry_copy() {
     );
     assert!(output.try_recv().is_err());
     registry.detach();
+}
+
+struct RunnerRecovery {
+    storage: tempfile::TempDir,
+    cutoff: u64,
+    root: ProjectRootId,
+    owner: RouteIdentity,
+    registry: BgTaskRegistry,
+    metrics: DispatchPathMetrics,
+    writer: WriterSender,
+    output: mpsc::Receiver<WriterFrame>,
+    routes: HashMap<RouteChannel, RouteIdentity>,
+    channels: HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    buffered: HashMap<ReplayKey, VecDeque<PushFrame>>,
+    retry: RetryBuffer,
+}
+
+impl RunnerRecovery {
+    fn new(root: &ProjectRootId, principal: &str, harness: &str, capacity: usize) -> Self {
+        Self::with_cutoff(
+            root,
+            principal,
+            harness,
+            capacity,
+            crate::bash_background::persistence::unix_millis(),
+        )
+    }
+
+    fn with_cutoff(
+        root: &ProjectRootId,
+        principal: &str,
+        harness: &str,
+        capacity: usize,
+        cutoff: u64,
+    ) -> Self {
+        let storage = tempfile::tempdir().unwrap();
+        let owner = tests::caller_route(root, principal, harness);
+        let registry = BgTaskRegistry::default();
+        let db = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        crate::db::state::set_host_state(
+            &db,
+            crate::db::state::RUNNER_COMPLETION_DELIVERY_CUTOVER,
+            &cutoff.to_string(),
+            cutoff as i64,
+        )
+        .unwrap();
+        registry.set_db_pool(Arc::new(std::sync::Mutex::new(db)));
+        let (writer, output) = mpsc::channel(capacity);
+        let mut recovery = Self {
+            storage,
+            cutoff,
+            root: root.clone(),
+            owner,
+            registry,
+            metrics: DispatchPathMetrics::new(),
+            writer,
+            output,
+            routes: HashMap::new(),
+            channels: HashMap::new(),
+            buffered: HashMap::new(),
+            retry: RetryBuffer::new(),
+        };
+        recovery.recover();
+        recovery
+    }
+
+    fn add_completion(&mut self, task: &str, finished_at: u64) -> PushFrame {
+        persisted_completion_at(
+            self.storage.path(),
+            &self.root,
+            &self.owner,
+            task,
+            Some(finished_at),
+        );
+        self.registry
+            .replay_session(self.storage.path(), SESSION)
+            .unwrap();
+        let _scope = crate::bash_background::task_identity_scope(Some(self.owner.task_identity()));
+        self.registry
+            .pending_completions_for_session(SESSION)
+            .into_iter()
+            .find(|completion| completion.task_id == task)
+            .unwrap()
+            .into_push_frame()
+    }
+
+    fn recover(&mut self) {
+        recover_registry_completions(
+            &self.writer,
+            &self.metrics,
+            &self.registry,
+            &self.routes,
+            &self.channels,
+            &mut self.buffered,
+            &self.root,
+            None,
+        );
+    }
+
+    fn bind(&mut self, channel: RouteChannel) {
+        insert_route_channel(
+            &mut self.routes,
+            &mut self.channels,
+            channel,
+            self.owner.clone(),
+        );
+        self.recover();
+    }
+
+    fn close(&mut self, channel: RouteChannel) {
+        remove_route_channel(&mut self.routes, &mut self.channels, channel);
+        self.metrics.completion_delivery.route_closed(channel);
+    }
+
+    fn live(&mut self, frame: PushFrame) {
+        process_reliable_push_frame(
+            &self.writer,
+            &self.metrics,
+            &self.routes,
+            &self.channels,
+            &HashMap::new(),
+            &mut self.retry,
+            &mut self.buffered,
+            &mut CompletedTaskIds::default(),
+            self.root.clone(),
+            frame,
+            None,
+        );
+    }
+
+    fn assert_frame(&mut self, channel: RouteChannel, task: &str) {
+        let frame = self
+            .output
+            .try_recv()
+            .expect("completion frame was not queued");
+        assert_eq!(route_key(frame.header.channel, frame.header.epoch), channel);
+        assert_eq!(push_frame_task_id(&frame).as_deref(), Some(task));
+        assert!(
+            self.output.try_recv().is_err(),
+            "duplicate completion frame"
+        );
+    }
+
+    fn assert_delivered(&self, task: &str) {
+        completion_settlement::wait_for_settlements();
+        let paths =
+            crate::bash_background::persistence::resolve_task(self.storage.path(), SESSION, task)
+                .unwrap();
+        assert!(read_task_at(&paths).unwrap().completion_delivered);
+        assert!(!self
+            .registry
+            .pending_completion_ids()
+            .values()
+            .any(|tasks| tasks.contains(task)));
+        assert_eq!(
+            self.metrics.completion_delivery.health()["unacked_total"],
+            0
+        );
+    }
+
+    fn restart_registry(&mut self) {
+        completion_settlement::wait_for_settlements();
+        self.registry.detach();
+        self.metrics = DispatchPathMetrics::new();
+        self.registry = BgTaskRegistry::default();
+        let db = crate::db::open(&self.storage.path().join("aft.db")).unwrap();
+        self.registry
+            .set_db_pool(Arc::new(std::sync::Mutex::new(db)));
+        self.registry
+            .replay_session(self.storage.path(), SESSION)
+            .unwrap();
+    }
+
+    fn assert_pending(&self) {
+        completion_settlement::wait_for_settlements();
+        let paths =
+            crate::bash_background::persistence::resolve_task(self.storage.path(), SESSION, TASK)
+                .unwrap();
+        assert!(!read_task_at(&paths).unwrap().completion_delivered);
+        assert!(self.registry.pending_completion_ids()[SESSION].contains(TASK));
+    }
+
+    fn assert_offers(&self, expected: usize) {
+        completion_settlement::wait_for_settlements();
+        let paths =
+            crate::bash_background::persistence::resolve_task(self.storage.path(), SESSION, TASK)
+                .unwrap();
+        assert_eq!(
+            read_task_at(&paths).unwrap().runner_completion_offers,
+            expected,
+            "durable offer count"
+        );
+        assert_eq!(
+            self.registry
+                .runner_completion_state(TASK)
+                .unwrap()
+                .runner_completion_offers,
+            expected,
+            "published offer count"
+        );
+    }
+
+    fn reconnect_three_times(&mut self, first: RouteChannel) {
+        let mut previous = first;
+        for epoch in 2..=4 {
+            self.close(previous);
+            let next = route_key(1, epoch);
+            self.bind(next);
+            assert!(
+                self.output.try_recv().is_err(),
+                "reconnect repeated a delivered completion"
+            );
+            previous = next;
+        }
+    }
+}
+
+impl Drop for RunnerRecovery {
+    fn drop(&mut self) {
+        self.registry.detach();
+    }
+}
+
+#[test]
+fn runner_live_completion_is_delivered_once_across_three_reconnects() {
+    let (_dir, root) = test_root("runner-live-completion-once");
+    for (principal, harness) in [
+        ("reserved:broca", "runner"),
+        ("reserved:other-runner", "opencode2"),
+    ] {
+        let mut recovery = RunnerRecovery::new(&root, principal, harness, 8);
+        let first = route_key(1, 1);
+        recovery.bind(first);
+        let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
+        recovery.live(frame.clone());
+        recovery.assert_frame(first, TASK);
+        recovery.assert_delivered(TASK);
+        recovery.reconnect_three_times(first);
+        recovery.live(frame);
+        assert!(
+            recovery.output.try_recv().is_err(),
+            "late live emission repeated delivery"
+        );
+        assert_eq!(
+            recovery.metrics.completion_delivery.health()["unacked_total"],
+            0
+        );
+    }
+}
+
+#[test]
+fn runner_completion_without_route_is_sent_once_and_stays_delivered_after_restart() {
+    let (_dir, root) = test_root("runner-deferred-completion-once");
+    let mut recovery = RunnerRecovery::new(&root, "reserved:broca", "runner", 8);
+    let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
+    recovery.live(frame);
+    assert!(recovery.output.try_recv().is_err());
+    assert_eq!(
+        recovery.metrics.completion_delivery.health()["unacked_total"],
+        1
+    );
+    let first = route_key(1, 1);
+    recovery.bind(first);
+    recovery.assert_frame(first, TASK);
+    recovery.assert_delivered(TASK);
+    recovery.reconnect_three_times(first);
+
+    recovery.registry.detach();
+    recovery.metrics = DispatchPathMetrics::new();
+    recovery.registry = BgTaskRegistry::default();
+    let db = crate::db::open(&recovery.storage.path().join("aft.db")).unwrap();
+    recovery
+        .registry
+        .set_db_pool(Arc::new(std::sync::Mutex::new(db)));
+    assert_eq!(
+        recovery
+            .registry
+            .runner_completion_delivery_cutover()
+            .unwrap(),
+        recovery.cutoff
+    );
+    recovery
+        .registry
+        .replay_session(recovery.storage.path(), SESSION)
+        .unwrap();
+    recovery.close(route_key(1, 4));
+    recovery.bind(route_key(1, 5));
+    assert!(
+        recovery.output.try_recv().is_err(),
+        "restart repeated a delivered completion"
+    );
+    recovery.assert_delivered(TASK);
+}
+
+#[test]
+fn runner_backlog_before_cutover_is_retired_without_a_frame() {
+    let (_dir, root) = test_root("runner-completion-backlog-cutover");
+    let mut recovery = RunnerRecovery::new(&root, "reserved:broca", "runner", 8);
+    const NEW_TASK: &str = "bash-0000000000000002";
+    persisted_completion_at(
+        recovery.storage.path(),
+        &root,
+        &recovery.owner,
+        TASK,
+        Some(recovery.cutoff - 1),
+    );
+    let fresh = recovery.add_completion(NEW_TASK, recovery.cutoff + 1);
+    let old = {
+        let _scope =
+            crate::bash_background::task_identity_scope(Some(recovery.owner.task_identity()));
+        recovery
+            .registry
+            .pending_completions_for_session(SESSION)
+            .into_iter()
+            .find(|completion| completion.task_id == TASK)
+            .unwrap()
+            .into_push_frame()
+    };
+    // Live emissions can be queued in memory while their durable completions
+    // are also pending. Recovery must suppress the old copy in both places.
+    recovery.live(old.clone());
+    recovery.live(fresh);
+    let first = route_key(1, 1);
+    recovery.bind(first);
+    recovery.assert_frame(first, NEW_TASK);
+    recovery.assert_delivered(TASK);
+    recovery.assert_delivered(NEW_TASK);
+    recovery.live(old);
+    assert!(recovery.output.try_recv().is_err());
+    recovery.reconnect_three_times(first);
+}
+
+#[test]
+fn runner_retry_completion_is_delivered_only_when_writer_accepts_it() {
+    let (_dir, root) = test_root("runner-retry-completion-once");
+    let mut recovery = RunnerRecovery::new(&root, "reserved:broca", "runner", 1);
+    let first = route_key(1, 1);
+    recovery.bind(first);
+    let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
+    assert!(matches!(
+        try_send_push_frame(
+            &recovery.writer,
+            &recovery.metrics,
+            first,
+            &completion_frame("writer-filler")
+        ),
+        PushSendOutcome::Sent
+    ));
+    recovery.live(frame);
+    assert_eq!(recovery.retry[&first].len(), 1);
+    let paths =
+        crate::bash_background::persistence::resolve_task(recovery.storage.path(), SESSION, TASK)
+            .unwrap();
+    assert!(
+        !read_task_at(&paths).unwrap().completion_delivered,
+        "backpressure is not delivery"
+    );
+    recovery.assert_frame(first, "writer-filler");
+    assert_eq!(
+        drain_retry_buffers_for_bound_routes(
+            &recovery.writer,
+            &recovery.metrics,
+            &recovery.routes,
+            &mut recovery.retry
+        ),
+        1
+    );
+    recovery.assert_frame(first, TASK);
+    recovery.assert_delivered(TASK);
+    recovery.reconnect_three_times(first);
+}
+
+#[test]
+fn runner_failed_durable_delivery_stays_admitted_and_unacked() {
+    let (_dir, root) = test_root("runner-completion-persist-failure");
+    let mut recovery = RunnerRecovery::new(&root, "reserved:broca", "runner", 8);
+    let first = route_key(1, 1);
+    recovery.bind(first);
+    let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
+    let json = {
+        let _scope =
+            crate::bash_background::task_identity_scope(Some(recovery.owner.task_identity()));
+        recovery.registry.task_json_path(TASK, SESSION).unwrap()
+    };
+    let original = std::fs::read(&json).unwrap();
+    std::fs::remove_file(&json).unwrap();
+    std::fs::create_dir(&json).unwrap();
+    recovery.live(frame.clone());
+    recovery.assert_frame(first, TASK);
+    completion_settlement::wait_for_settlements();
+    assert!(recovery.registry.pending_completion_ids()[SESSION].contains(TASK));
+    assert_eq!(
+        recovery.metrics.completion_delivery.health()["unacked_total"],
+        1
+    );
+    recovery.reconnect_three_times(first);
+    recovery.live(frame);
+    assert!(recovery.output.try_recv().is_err());
+    assert_eq!(
+        recovery.metrics.completion_delivery.health()["unacked_total"],
+        1
+    );
+    std::fs::remove_dir(&json).unwrap();
+    std::fs::write(&json, original).unwrap();
+    let paths =
+        crate::bash_background::persistence::resolve_task(recovery.storage.path(), SESSION, TASK)
+            .unwrap();
+    assert!(!read_task_at(&paths).unwrap().completion_delivered);
+}
+
+#[test]
+fn runner_cutover_is_recorded_once_on_the_owning_database() {
+    let storage = tempfile::tempdir().unwrap();
+    let db = Arc::new(std::sync::Mutex::new(
+        crate::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    let registry = BgTaskRegistry::default();
+    registry.set_db_pool(db.clone());
+    let cutoff = registry.runner_completion_delivery_cutover().unwrap();
+    assert!(cutoff > 0);
+    assert_eq!(
+        crate::db::state::get_host_state(
+            &db.lock().unwrap(),
+            crate::db::state::RUNNER_COMPLETION_DELIVERY_CUTOVER
+        )
+        .unwrap(),
+        Some(cutoff.to_string())
+    );
+    assert_eq!(
+        crate::db::state::runner_completion_delivery_cutover(&db.lock().unwrap(), cutoff + 1000)
+            .unwrap(),
+        cutoff,
+        "cutover must not move on a later open"
+    );
+    registry.detach();
+}
+
+#[test]
+fn runner_recovery_returns_before_durable_settlement_and_does_not_repeat() {
+    let (_dir, root) = test_root("runner-completion-queued-settlement");
+    for backlog in [false, true] {
+        let mut recovery = RunnerRecovery::new(&root, "reserved:broca", "runner", 8);
+        let finished = if backlog {
+            recovery.cutoff - 1
+        } else {
+            recovery.cutoff + 1
+        };
+        let frame = recovery.add_completion(TASK, finished);
+        recovery.live(frame);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        *recovery
+            .metrics
+            .completion_delivery
+            .settlement_gate
+            .lock()
+            .unwrap() = Some(completion_settlement::TestGate {
+            entered,
+            release: resume,
+        });
+        let first = route_key(1, 1);
+        let (returned, bound) = std::sync::mpsc::channel();
+        let binding = std::thread::spawn(move || {
+            recovery.bind(first);
+            assert!(returned.send(recovery).is_ok());
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut recovery = bound
+            .recv_timeout(Duration::from_secs(1))
+            .expect("route recovery waited for durable completion settlement");
+        binding.join().unwrap();
+        if backlog {
+            assert!(
+                recovery.output.try_recv().is_err(),
+                "backlog must not be sent"
+            );
+        } else {
+            recovery.assert_frame(first, TASK);
+        }
+        let paths = crate::bash_background::persistence::resolve_task(
+            recovery.storage.path(),
+            SESSION,
+            TASK,
+        )
+        .unwrap();
+        assert!(
+            !read_task_at(&paths).unwrap().completion_delivered,
+            "durable mark ran while the worker was held"
+        );
+        assert_eq!(
+            recovery.metrics.completion_delivery.health()["unacked_total"],
+            1
+        );
+        recovery.reconnect_three_times(first);
+        release.send(()).unwrap();
+        recovery.assert_delivered(TASK);
+    }
+}
+
+#[test]
+fn runner_cached_cutover_does_not_wait_for_the_database_connection() {
+    let storage = tempfile::tempdir().unwrap();
+    let db = Arc::new(std::sync::Mutex::new(
+        crate::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    let registry = BgTaskRegistry::default();
+    registry.set_db_pool(db.clone());
+    let cutoff = registry.runner_completion_delivery_cutover().unwrap();
+    let locked = db.lock().unwrap();
+    let (returned, result) = std::sync::mpsc::channel();
+    let reading = registry.clone();
+    let reader = std::thread::spawn(move || {
+        returned
+            .send(reading.runner_completion_delivery_cutover())
+            .unwrap();
+    });
+    let cached = result.recv_timeout(Duration::from_secs(1));
+    drop(locked);
+    reader.join().unwrap();
+    assert_eq!(
+        cached
+            .expect("cutover read waited for the database connection")
+            .unwrap(),
+        cutoff
+    );
+    registry.detach();
+}
+
+#[test]
+fn direct_plugin_callers_acknowledge_completions() {
+    let (_dir, root) = test_root("plugin-completion-ack-policy");
+    for harness in ["opencode", "pi"] {
+        let route = tests::caller_route(&root, "direct", harness);
+        assert!(caller_acknowledges_completions(
+            route.task_identity().principal.as_deref()
+        ));
+    }
+}
+
+#[test]
+fn thalamus_runner_callers_acknowledge_completions() {
+    let (_dir, root) = test_root("thalamus-completion-ack-policy");
+    for (principal, harness) in [
+        ("reserved:thalamus-harness", "opencode2"),
+        ("reserved:thalamus-harness", "pi"),
+        ("reserved:thalamus-pi", "pi"),
+    ] {
+        let route = tests::caller_route(&root, principal, harness);
+        assert!(caller_acknowledges_completions(
+            route.task_identity().principal.as_deref()
+        ));
+    }
+}
+
+#[test]
+fn thalamus_runner_unacked_completion_reoffers_are_bounded_across_restart() {
+    let (_dir, root) = test_root("runner-completion-ack-budget");
+    for principal in ["reserved:thalamus-harness", "reserved:thalamus-pi"] {
+        let mut recovery = RunnerRecovery::new(&root, principal, "opencode2", 8);
+        let first = route_key(1, 1);
+        recovery.bind(first);
+        let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
+        recovery.live(frame.clone());
+        recovery.assert_frame(first, TASK);
+        recovery.assert_pending();
+        recovery.assert_offers(1);
+        // Maintenance and duplicate live emissions on an open route are not
+        // new offers. Only closing that recipient makes the task replayable.
+        recovery.recover();
+        recovery.live(frame);
+        assert!(recovery.output.try_recv().is_err());
+        recovery.close(first);
+        recovery.restart_registry();
+        recovery.assert_offers(1);
+        for epoch in 2..=3 {
+            let next = route_key(1, epoch);
+            recovery.bind(next);
+            recovery.assert_frame(next, TASK);
+            recovery.assert_pending();
+            recovery.assert_offers(epoch as usize);
+            recovery.close(next);
+            recovery.restart_registry();
+            recovery.assert_offers(epoch as usize);
+        }
+        for epoch in 4..=6 {
+            let next = route_key(1, epoch);
+            recovery.bind(next);
+            assert!(
+                recovery.output.try_recv().is_err(),
+                "offer budget was reset"
+            );
+            recovery.assert_delivered(TASK);
+            recovery.close(next);
+        }
+    }
+}
+
+#[test]
+fn thalamus_runner_acked_completion_never_reoffers_after_rebind_or_restart() {
+    let (_dir, root) = test_root("runner-completion-explicit-ack");
+    for principal in ["reserved:thalamus-harness", "reserved:thalamus-pi"] {
+        let mut recovery = RunnerRecovery::new(&root, principal, "opencode2", 8);
+        let first = route_key(1, 1);
+        recovery.bind(first);
+        let frame = recovery.add_completion(TASK, recovery.cutoff + 1);
+        recovery.live(frame);
+        recovery.assert_frame(first, TASK);
+        recovery.assert_pending();
+        {
+            let _scope =
+                crate::bash_background::task_identity_scope(Some(recovery.owner.task_identity()));
+            assert_eq!(
+                recovery
+                    .registry
+                    .ack_completions_for_session(Some(SESSION), &[TASK.into()]),
+                vec![TASK]
+            );
+        }
+        recovery.recover();
+        recovery.assert_delivered(TASK);
+        recovery.reconnect_three_times(first);
+        recovery.close(route_key(1, 4));
+        recovery.restart_registry();
+        recovery.bind(route_key(1, 5));
+        assert!(recovery.output.try_recv().is_err());
+    }
+}
+
+#[test]
+fn thalamus_runner_expired_completion_is_retired_in_live_and_recovery_paths() {
+    let (_dir, root) = test_root("runner-completion-ack-expiry");
+    for live in [false, true] {
+        let day_ms = 24 * 60 * 60 * 1000;
+        let now = crate::bash_background::persistence::unix_millis();
+        // The task timestamp is after the recovery cutoff, so cutoff-based
+        // backlog retirement cannot accidentally satisfy the expiry assertion.
+        let mut recovery = RunnerRecovery::with_cutoff(
+            &root,
+            "reserved:thalamus-harness",
+            "opencode2",
+            8,
+            now - 2 * day_ms,
+        );
+        if live {
+            recovery.bind(route_key(1, 1));
+        }
+        let frame = recovery.add_completion(TASK, now - day_ms - 1);
+        if live {
+            recovery.live(frame);
+        } else {
+            recovery.bind(route_key(1, 1));
+        }
+        assert!(
+            recovery.output.try_recv().is_err(),
+            "expired completion was offered"
+        );
+        recovery.assert_delivered(TASK);
+        recovery.reconnect_three_times(route_key(1, 1));
+    }
+}
+
+#[test]
+fn thalamus_runner_offer_persistence_does_not_block_rebind() {
+    let (_dir, root) = test_root("runner-completion-ack-off-thread");
+    let mut recovery = RunnerRecovery::new(&root, "reserved:thalamus-harness", "opencode2", 8);
+    recovery.add_completion(TASK, recovery.cutoff + 1);
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    *recovery
+        .metrics
+        .completion_delivery
+        .settlement_gate
+        .lock()
+        .unwrap() = Some(completion_settlement::TestGate {
+        entered,
+        release: resume,
+    });
+    recovery.bind(route_key(1, 1));
+    recovery.assert_frame(route_key(1, 1), TASK);
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The route reads published delivery metadata, not the task state that
+    // the durable writer can hold while syncing task storage.
+    let _no_state_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+    recovery.close(route_key(1, 1));
+    recovery.bind(route_key(1, 2));
+    recovery.assert_frame(route_key(1, 2), TASK);
+    drop(_no_state_locks);
+    release.send(()).unwrap();
+    recovery.assert_pending();
+}
+
+#[test]
+fn broca_runner_caller_does_not_acknowledge_completions() {
+    let (_dir, root) = test_root("broca-completion-ack-policy");
+    let route = tests::caller_route(&root, "reserved:broca", "runner");
+    assert!(!caller_acknowledges_completions(
+        route.task_identity().principal.as_deref()
+    ));
+}
+
+#[test]
+fn legacy_and_unverified_callers_keep_explicit_ack_policy() {
+    assert!(caller_acknowledges_completions(None));
+    assert!(caller_acknowledges_completions(Some("unverified")));
 }

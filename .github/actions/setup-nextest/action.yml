@@ -12,11 +12,24 @@ runs:
   using: composite
   steps:
     - name: Cache cargo-nextest
+      if: runner.environment == 'github-hosted'
       id: nextest-cache
       uses: actions/cache@v4
       with:
         path: ~/.cargo/bin/cargo-nextest*
         key: cargo-nextest-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Expose native cargo-nextest install on PATH
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        bin_dir="$HOME/.cargo/bin"
+        mkdir -p "$bin_dir"
+        if command -v cygpath >/dev/null 2>&1; then
+          bin_dir="$(cygpath -m "$bin_dir")"
+        fi
+        printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
+        printf 'Native cargo-nextest PATH: %s\n' "$bin_dir"
 
     - name: Download and install cargo-nextest
       if: steps.nextest-cache.outputs.cache-hit != 'true'
@@ -52,6 +65,13 @@ runs:
         if [[ "$NEXTEST_VERSION" != "0.9.138" ]]; then
           echo "No pinned cargo-nextest checksum is available for $NEXTEST_VERSION" >&2
           exit 1
+        fi
+
+        # Dedicated runners retain the verified install between jobs without a
+        # round trip to GitHub's cache service. Hosted runners keep their cache.
+        if [[ "$RUNNER_ENVIRONMENT" == self-hosted ]] && \
+           cargo-nextest --version 2>/dev/null | grep -q "^cargo-nextest ${NEXTEST_VERSION} "; then
+          exit 0
         fi
 
         mkdir -p "$HOME/.cargo/bin"

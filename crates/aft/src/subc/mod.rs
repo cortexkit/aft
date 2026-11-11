@@ -208,7 +208,7 @@ mod bash;
 mod bind_candidates;
 mod bind_log;
 mod call_policy;
-mod call_yield;
+pub(crate) mod call_yield;
 mod carrier_read_only;
 #[cfg(test)]
 mod tool_result_tests;
@@ -1640,10 +1640,13 @@ enum ManagementAdmission {
     FlowOnly,
     /// Cingulate's route: the `permissions/v1` operations and nothing else.
     PermissionsOnly,
-    /// Tool-provider metadata without a project root; grants no management authority.
+    /// Tool-provider metadata and custodian feeds without a project root;
+    /// grants no management authority or project-tool access.
     ProjectFree {
         workdir: Option<String>,
         legacy_root: Option<PathBuf>,
+        model_only: bool,
+        held_updates: bool,
     },
 }
 
@@ -4527,9 +4530,9 @@ fn run_subc_mode_on_runtime_thread(
     crate::db::call_ledger::mark_provider_process();
     let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    let runtime = dispatch_path_metrics
+        .frame_loop_runtime()
         .map_err(SubcError::Runtime)?;
 
     let executor_for_loop = Arc::clone(&executor);
@@ -4566,6 +4569,7 @@ fn run_subc_mode_on_runtime_thread(
                 &storage_dir,
                 // The exit phase below takes and shuts down every root's servers.
                 QuiescedLsp::LeaveForExitSweep,
+                Some(dispatch_path_metrics),
                 #[cfg(test)]
                 None,
                 #[cfg(test)]
@@ -5173,6 +5177,7 @@ async fn run_module_loop<R, W>(
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
     connection_end_lsp: QuiescedLsp,
+    runtime_metrics: Option<Arc<DispatchPathMetrics>>,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
     #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
 ) -> Result<ModuleLoopExit, SubcError>
@@ -5238,7 +5243,8 @@ where
         },
     };
 
-    let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    let dispatch_path_metrics =
+        runtime_metrics.unwrap_or_else(|| Arc::new(DispatchPathMetrics::new()));
     dispatch_path_metrics.watch_delivery.install(&executor);
     if let Some(probe) = lifecycle_probe.clone() {
         *dispatch_path_metrics
@@ -6018,8 +6024,8 @@ where
                         // before any store, provider, or general tool dispatch.
                         // Tool routes retain their separate call-mode contract.
                         if let Some(identity) = management_routes.get(&route) {
-                            if let ManagementAdmission::ProjectFree { workdir, legacy_root } = &identity.admission {
-                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics, workdir.as_deref(), legacy_root.as_deref()).await {
+                            if let ManagementAdmission::ProjectFree { .. } = &identity.admission {
+                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics, identity, &shared_app, storage_dir).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -6076,6 +6082,7 @@ where
                         // access (the head agent's, or a worker run's own worker's):
                         // every step below sees the owner-derived identity.
                         let codemode_routes;
+                        ledger_edge.note_received(&decoded, &routes);
                         let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok(), |identity| {
                             let Some(ctx) = executor.actor_context(&identity.root) else {
                                 return Some(Err(remote_policy::policy_unavailable()));
@@ -6735,6 +6742,9 @@ where
                 );
                 if let Some(keys) = completion.unacked_bg_keys {
                     bg_unacked_keys_by_root.insert(root_id.clone(), keys);
+                    if let Some(ctx) = executor.actor_context(&root_id) {
+                        tokio::task::spawn_blocking(move || call_yield::recover_watches(ctx));
+                    }
                 }
                 if let Some(ctx) = executor.actor_context(&root_id) {
                     push::recover_registry_completions(
@@ -8541,6 +8551,15 @@ async fn handle_control_request(
                     ManagementAdmission::ProjectFree {
                         workdir: scope.as_ref().and_then(|stamp| stamp.workdir.clone()),
                         legacy_root: legacy_root.clone(),
+                        model_only: wire::ToolResponsePolicy::model_only_for_bind(
+                            principal_id(&principal).as_deref(),
+                            call_mode
+                                .as_ref()
+                                .unwrap_or(&subc_protocol::call_mode::CallMode::Classic),
+                        ),
+                        held_updates: cortexkit_role_tool_provider::consumer_reads_held_update_v1(
+                            consumer_capabilities.as_deref(),
+                        ),
                     }
                 } else if scope
                     .as_ref()
@@ -9076,18 +9095,25 @@ async fn handle_control_request(
     }
 }
 
-/// Metadata is static on a project-free route. A tool's views are keyed by its
-/// tool version, not by a project, so display servers that open routes without a
-/// project folder can still fetch them. Task handles, including those used to
-/// read a bash task's status, belong to a project's registry and cannot be
-/// resolved here.
+/// Metadata and the custodian's late-result feed need no project. Task handles,
+/// including those used to read bash status, still require a project registry.
 async fn handle_project_free_request(
     tx: &WriterSender,
     frame: &Frame,
-    metrics: &DispatchPathMetrics,
-    workdir: Option<&str>,
-    legacy_root: Option<&Path>,
+    metrics: &Arc<DispatchPathMetrics>,
+    identity: &ManagementIdentity,
+    shared_app: &Arc<App>,
+    storage_dir: &Path,
 ) -> Result<(), SubcError> {
+    let ManagementAdmission::ProjectFree {
+        workdir,
+        legacy_root,
+        model_only,
+        held_updates,
+    } = &identity.admission
+    else {
+        unreachable!()
+    };
     let mut body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
     let operation = body
         .get("op")
@@ -9100,6 +9126,21 @@ async fn handle_project_free_request(
     } else {
         body.get("arguments").cloned().unwrap_or_else(|| json!({}))
     };
+    if let Some(op @ ("late_results" | "late_results.ack")) = operation.as_deref() {
+        tool_provider::project_free_custody(
+            tx,
+            frame,
+            metrics,
+            shared_app.clone(),
+            storage_dir.join("aft.db"),
+            op,
+            arguments,
+            principal_label(&identity.principal),
+            *model_only,
+            *held_updates,
+        );
+        return Ok(());
+    }
     let result = match operation.as_deref() {
         Some("role.describe") => Ok(tool_provider::describe()),
         Some("tool.views") => tool_views::answer(arguments),
@@ -9118,8 +9159,8 @@ async fn handle_project_free_request(
         }
         _ => Err(project_folder_refusal(
             PROJECT_REQUIRED_CODE,
-            workdir,
-            legacy_root,
+            workdir.as_deref(),
+            legacy_root.as_deref(),
             route_key(frame.header.channel, frame.header.epoch),
             frame.header.corr,
         )),
@@ -11543,13 +11584,10 @@ async fn handle_tool_call_with_capabilities(
             }
         }
     }
-    // A head's keyed watch on a route that opted in to `tool.yield` can be
-    // ended early; the watch thread holds the signal until it ends.
-    let watch_yield = (bare_name == "bash_watch"
-        && ledger_key.is_some()
-        && !role.is_worker()
-        && call_yield::route_refusal(&identity).is_none())
-    .then(|| metrics.watch_yields.register(route_id, frame.header.corr));
+    // A keyed watch retains its signal through a runner restart. Only heads
+    // use the separate person-message handoff.
+    let watch_yield = (bare_name == "bash_watch" && ledger_key.is_some() && identity.call_yield)
+        .then(|| metrics.watch_yields.register(route_id, frame.header.corr));
     // Decided before the arguments move into the job: slow-call logging needs
     // to know whether a person is waiting on this call.
     let caller = if manifest::is_native_plumbing_call(&bare_name, &arguments) {
@@ -11998,6 +12036,14 @@ async fn handle_tool_call_with_capabilities(
     let uses_deferred_response_seam = bare_name == "inspect"
         || bare_name == "bash_watch"
         || bare_name == "delete"
+        || (bare_name == "search"
+            && arguments
+                .get("pattern")
+                .and_then(Value::as_str)
+                .is_none_or(|pattern| pattern.trim().is_empty())
+            && executor.actor_context(&identity.root).is_some_and(|ctx| {
+                crate::commands::semantic_search::first_text_index_wait_needed(&ctx)
+            }))
         || crate::commands::lsp_navigation::is_lsp_navigation_command(&bare_name);
     if uses_deferred_response_seam {
         let Some(deferred_ctx) = executor.actor_context(&identity.root) else {
@@ -12137,6 +12183,18 @@ async fn handle_tool_call_with_capabilities(
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
                                 Some(reply_budget.deadline),
+                            )
+                        } else if bare_name_for_run == "search" {
+                            phase_trace.note_arg_shape(crate::run_tool_call::tool_call_arg_shape(
+                                &prepared.request,
+                            ));
+                            let wait_fields = phase_trace.deferred_search_wait_fields();
+                            crate::commands::semantic_search::handle_first_index_search_deferred(
+                                &prepared.request,
+                                Arc::clone(&deferred_ctx),
+                                matches!(bind_trust, BindTrust::Untrusted),
+                                reply_budget.deadline,
+                                Some(wait_fields),
                             )
                         } else if bare_name_for_run == "delete" {
                             crate::commands::delete_file::handle_delete_deferred_with_restriction(
@@ -15254,6 +15312,7 @@ pub(crate) mod test_support {
             compressed_tokens: None,
             tokens_skipped: false,
             status_reason: None,
+            remote_oom_kill: None,
             output_incomplete: false,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
@@ -15547,6 +15606,7 @@ mod tests {
                 None,
                 &fixture_path.join("storage"),
                 QuiescedLsp::ReapInBackground,
+                None,
                 Some(actor),
                 None,
             ))
@@ -15722,6 +15782,7 @@ mod tests {
                 None,
                 &fixture_path.join("storage"),
                 QuiescedLsp::ReapInBackground,
+                None,
                 Some(actor),
                 None,
             ))
@@ -23231,6 +23292,7 @@ mod pong_priority_tests {
                 None,
                 &storage_path,
                 QuiescedLsp::ReapInBackground,
+                None,
                 None,
                 Some(hooks),
             ))

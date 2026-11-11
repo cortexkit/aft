@@ -102,6 +102,7 @@ impl WireRestore {
                 QuiescedLsp::ReapInBackground,
                 None,
                 None,
+                None,
             ))
         });
         let mut fixture = Self {

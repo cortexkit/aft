@@ -10,7 +10,10 @@
 //! One row is one saved folder (or file) grant of one holder: the head agent
 //! whose scope saved it, or a worker scope, which is listed under the head
 //! that owns it. Grants last until revoked or until the holder's scope ends,
-//! so no row carries `expires_at_ms`. `scope` takes one of AFT's four tokens:
+//! so no row carries `expires_at_ms`. A worker's rows carry
+//! `ends_with_holder: true`, so the page can say the grant ends with that
+//! worker instead of "until revoked"; a head's scope outlives its revivals,
+//! so its rows leave the member out. `scope` takes one of AFT's four tokens:
 //! `read` and `read_write` for a folder, `file_read` and `file_read_write`
 //! for a single file. `scope_label` is the sentence the page shows as given.
 use crate::access_policy::{AccessOperation, GrantKind};
@@ -200,6 +203,7 @@ pub(super) fn row_json(row: &GrantRow, homes: &[PathBuf]) -> Value {
             holder.insert("scope_ref".into(), json!(scope_ref));
         }
     }
+    let ends_with_holder = matches!(row.holder, GrantHolder::Worker { .. });
     let mut value = json!({
         "id": row.grant_id,
         "holder": holder,
@@ -218,6 +222,9 @@ pub(super) fn row_json(row: &GrantRow, homes: &[PathBuf]) -> Value {
     );
     if row.source.is_none() {
         object.insert(TIME_BOUND_FIELD.into(), json!("at_or_before"));
+    }
+    if ends_with_holder {
+        object.insert("ends_with_holder".into(), json!(true));
     }
     if let Some(agent_id) = row.holder.agent_id() {
         object.insert("agent_id".into(), json!(agent_id));

@@ -1137,6 +1137,8 @@ pub(crate) fn parse_resolved_source(
 }
 
 fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
+    #[cfg(feature = "test-hooks")]
+    SEARCH_PARSE_COUNT.with(|count| count.set(count.get() + 1));
     #[cfg(test)]
     work_counters::CACHED_PARSER_PARSES.with(|count| count.set(count.get() + 1));
     REUSABLE_PARSERS.with(|parsers| {
@@ -1163,6 +1165,17 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
                 message: format!("tree-sitter parse returned None for {}", path.display()),
             })
     })
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static SEARCH_PARSE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Actual tree-sitter parses on this thread, for search workload measurements.
+#[cfg(feature = "test-hooks")]
+pub fn search_parse_count_for_test() -> u64 {
+    SEARCH_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
 /// Cached parse result: mtime at parse time + the tree.

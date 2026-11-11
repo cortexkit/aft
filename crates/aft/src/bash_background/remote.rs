@@ -13,6 +13,52 @@ use std::ffi::OsStr;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+/// Memory-kill facts reported by the build server, not the local memory cap.
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteOomKill {
+    pub cause: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_stated_mib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_peak_working_mib: Option<u64>,
+}
+
+impl RemoteOomKill {
+    pub(super) fn message(&self) -> String {
+        let peak = self
+            .memory_peak_working_mib
+            .map(|mib| format!(" (peak {mib} MiB)"))
+            .unwrap_or_default();
+        match self.cause.as_str() {
+            OOM_KILL_CAUSE_JOB_LIMIT => {
+                let limit = self.memory_stated_mib.map_or_else(String::new, |mib| {
+                    if mib % 1024 == 0 {
+                        format!(" of {} GiB", mib / 1024)
+                    } else {
+                        format!(" of {mib} MiB")
+                    }
+                });
+                format!("killed: it went over its memory limit{limit}{peak}; rerun with a larger limit")
+            }
+            OOM_KILL_CAUSE_HOST_PRESSURE | OOM_KILL_CAUSE_HOST_OOM => format!(
+                "killed: the build server ran out of memory, not this job's limit{peak}; rerun as is"
+            ),
+            _ => format!(
+                "killed for memory{peak}; the build server reported an unrecognized OOM cause"
+            ),
+        }
+    }
+}
+
+pub(super) fn remote_oom_kill(metadata: &super::PersistedTask) -> Option<RemoteOomKill> {
+    let terminal = metadata.remote.as_ref()?.terminal.as_ref()?;
+    Some(RemoteOomKill {
+        cause: terminal.oom_kill()?.cause().to_owned(),
+        memory_stated_mib: terminal.memory_stated_mib(),
+        memory_peak_working_mib: terminal.memory_peak_working_mib(),
+    })
+}
+
 fn rendered_refusal_reason(reason: &str, detail: Option<&str>) -> String {
     let Some(detail) = detail else {
         return reason.to_owned();
@@ -393,18 +439,11 @@ async fn draining_retry_sleep(_root: &Path, _now: u64, delay: u64) {
     tokio::time::sleep(Duration::from_millis(delay)).await;
 }
 
-/// Shown for a remote task cancelled after it was submitted but before the
-/// build server accepted it: with no job id, nothing can confirm whether the
-/// command ran.
+/// Without a job id, AFT cannot send job cancellation or confirm from the runner
+/// that the job has finished, even after the local observation ends.
 #[cfg(unix)]
-pub(crate) const PRE_ACCEPTANCE_CANCELLED: &str =
-    "cancelled before the build server accepted the job; whether it ran is unknown";
-
-/// Prefix shown, followed by `: <error>`, when cancelling such a task
-/// failed.
-#[cfg(unix)]
-pub(crate) const PRE_ACCEPTANCE_CANCEL_FAILED: &str =
-    "could not cancel before the build server accepted the job; whether it ran is unknown";
+pub(crate) const PRE_ACCEPTANCE_CANCEL_UNCONFIRMED: &str =
+    "remote cancellation unconfirmed; no job id was received, so the job may still run";
 
 /// The remote runner AFT dispatches to; named in every remote reply header.
 #[cfg(unix)]
@@ -435,10 +474,19 @@ fn remote_execution_note(remote: &RemoteTask) -> String {
     if remote.requested_network {
         details.push("network".to_string());
     }
-    let mut note = if details.is_empty() {
-        format!("ran remotely on {RUNNER_ID}")
+    let execution = if remote
+        .terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.ran == Some(Ran::None))
+    {
+        format!("command never started on {RUNNER_ID}")
     } else {
-        format!("ran remotely on {RUNNER_ID} ({})", details.join(", "))
+        format!("ran remotely on {RUNNER_ID}")
+    };
+    let mut note = if details.is_empty() {
+        execution
+    } else {
+        format!("{execution} ({})", details.join(", "))
     };
     if remote.requested_network && remote.accepted && !remote.granted_network {
         note.push_str("\nOFFLINE: the runner did not grant the requested network access");
@@ -1712,6 +1760,9 @@ pub(super) fn terminal_metadata_from_proof(metadata: &mut PersistedTask) -> Opti
         return None;
     }
     let (status, code, reason) = terminal_outcome(verdict, None);
+    let reason = remote_oom_kill(metadata)
+        .map(|oom| oom.message())
+        .or(reason);
     metadata.mark_terminal(status, code, reason);
     Some(())
 }
@@ -1812,6 +1863,22 @@ impl OutputSink for TaskSink {
             receiver.set_cap(cap);
         }
         Ok(true)
+    }
+
+    fn submission_job(&mut self, job_id: Uuid) -> io::Result<()> {
+        let unchanged = self
+            .task
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("task lock poisoned"))?
+            .metadata
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.job_id == Some(job_id));
+        if !unchanged {
+            self.commit(|remote| remote.job_id = Some(job_id))?;
+        }
+        Ok(())
     }
 
     fn admission_progress(&mut self, progress: &exec::types::Progress) {
@@ -3174,7 +3241,14 @@ impl BgTaskRegistry {
                 let result = tests::capture_remote_launch_logs(&task, run);
                 #[cfg(not(test))]
                 let result = run();
-                if let Err(error) = result {
+                if let Err(mut error) = result {
+                    if task.state.lock().is_ok_and(|state| {
+                        state.metadata.remote.as_ref().is_some_and(|remote| {
+                            remote.cancel_requested && remote.job_id.is_none()
+                        })
+                    }) {
+                        error = format!("{PRE_ACCEPTANCE_CANCEL_UNCONFIRMED}: {error}");
+                    }
                     if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
                         task.remote_launch_ready.store(true, Ordering::Release);
                         release_worker_owed_cancel_claim(&task.task_id);
@@ -3260,9 +3334,9 @@ impl BgTaskRegistry {
         );
         let mut retry_request = None;
         let resume_submission = initial.is_none()
-            // An accepted job without a terminal was detached by an AFT restart.
+            // A known job without a terminal was detached by an AFT restart.
             // Recover its existing job ID, even if the submission also has a key.
-            && !(remote.accepted && remote.job_id.is_some() && remote.terminal.is_none())
+            && !(remote.job_id.is_some() && remote.terminal.is_none())
             && remote.resubmit_for_recovery()
             && (remote.terminal.as_ref().is_some_and(|record| {
                 exec::grade(record) == Verdict::OutcomeUnknown
@@ -3545,9 +3619,10 @@ impl BgTaskRegistry {
                 }
             };
             if !request.return_paths.is_empty() {
-                let maximum = client.return_max_bytes().await.map_err(|e| e.to_string())?;
+                // Build outputs may not exist locally yet. Reserve the selected
+                // runner's allowance independently of the current local files.
                 request.return_max_bytes =
-                    Some(exec::requested_return_max_bytes(&request, maximum));
+                    Some(client.return_max_bytes().await.map_err(|e| e.to_string())?);
             }
             fallback = Some(local);
             if remote.explicit_runon {
@@ -3578,7 +3653,12 @@ impl BgTaskRegistry {
                 .is_some_and(|remote| remote.cancel_requested)
             {
                 if !self.finish_owner_pause_cancel(&task, Ok(())) {
-                    self.remote_terminal(&task, Verdict::Cancelled, None);
+                    self.remote_terminal_with_note(
+                        &task,
+                        Verdict::Cancelled,
+                        None,
+                        Some("cancelled before remote dispatch to ck-motor; command never started"),
+                    );
                 }
                 return Ok(());
             }
@@ -3612,6 +3692,7 @@ impl BgTaskRegistry {
             }
         };
         let mut cancelled = false;
+        let mut pending_cancel_deadline = None;
         let mut keyed_recovery_error = None;
         loop {
             // Poll intent even when every stream read is immediately ready.
@@ -3625,7 +3706,13 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|r| r.cancel_requested);
             if cancel && !cancelled {
-                if let Some(point) = stream.resume_point() {
+                // A job id can be known before acceptance without proving that
+                // inputs were captured. Use it for cancellation without changing
+                // acceptance or advancing the output cursor.
+                let point = stream
+                    .resume_point()
+                    .or_else(|| task.state.lock().ok()?.metadata.remote.as_ref()?.point());
+                if let Some(point) = point {
                     // Stands in for the daemon stopping before it sent the
                     // cancellation to the runner.
                     #[cfg(test)]
@@ -3656,18 +3743,17 @@ impl BgTaskRegistry {
                     };
                     cancelled = true;
                 } else {
-                    // Before the runner accepts the submission, there is no job
-                    // ID for exec.cancel or attach. Cancel the active call instead.
-                    // The SDK closes its receiver, so this cannot prove the job stopped.
-                    let result = client
-                        .cancel_submission(&stream)
-                        .await
-                        .map_err(|error| format!("{PRE_ACCEPTANCE_CANCEL_FAILED}: {error}"));
-                    if self.finish_owner_pause_cancel(&task, result.clone()) {
-                        return Ok(());
+                    // Request-level Cancel only detaches. Keep reading until an
+                    // id arrives, then send exec.cancel before following again.
+                    // Progress must not extend the runner's queue/run allowance.
+                    let deadline =
+                        pending_cancel_deadline.get_or_insert(recovery.job_end + recovery.grace);
+                    if tokio::time::Instant::now() >= *deadline {
+                        return Err(
+                            "runner confirmation time limit passed while waiting for a job id"
+                                .into(),
+                        );
                     }
-                    result?;
-                    return Err(PRE_ACCEPTANCE_CANCELLED.into());
                 }
             }
             sink.sent_at = stream.sent_at();
@@ -3902,7 +3988,15 @@ impl BgTaskRegistry {
                     // Prefer the accepted job over resubmitting the command with
                     // its key. The shorter key-recovery limit must not abandon a
                     // job that can still be queued or running on the executor.
-                    if current.resubmit_for_recovery() && !current.accepted {
+                    // An unknown terminal's id alone is not acceptance: replay
+                    // the durable key to establish whether submission happened.
+                    if current.resubmit_for_recovery()
+                        && (current.job_id.is_none()
+                            || (!current.accepted
+                                && current.terminal.as_ref().is_some_and(|record| {
+                                    matches!(record.outcome, Outcome::OutcomeUnknown)
+                                })))
+                    {
                         keyed_recovery_error.get_or_insert_with(|| error.to_string());
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
@@ -4673,6 +4767,16 @@ impl BgTaskRegistry {
     }
 
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
+        self.remote_terminal_with_note(task, verdict, error, None);
+    }
+
+    fn remote_terminal_with_note(
+        &self,
+        task: &Arc<BgTask>,
+        verdict: Verdict,
+        error: Option<String>,
+        execution_note: Option<&str>,
+    ) {
         // Known terminal outcomes keep their status. Unknown outcomes reach
         // this point only after recovery was unavailable or exhausted.
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
@@ -4686,12 +4790,17 @@ impl BgTaskRegistry {
             if state.metadata.is_terminal() {
                 return;
             }
-            let remote_note = state
-                .metadata
-                .remote
-                .as_ref()
-                .map(remote_execution_note)
-                .unwrap_or_else(|| format!("ran remotely on {RUNNER_ID}"));
+            reason = remote_oom_kill(&state.metadata)
+                .map(|oom| oom.message())
+                .or(reason);
+            let remote_note = execution_note.map(str::to_owned).unwrap_or_else(|| {
+                state
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .map(remote_execution_note)
+                    .unwrap_or_else(|| format!("ran remotely on {RUNNER_ID}"))
+            });
             if unknown {
                 if let Some(remote) = state.metadata.remote.as_ref() {
                     let job_id = remote
@@ -4868,9 +4977,26 @@ impl BgTaskRegistry {
             .wait_timeout_while(state, bound, |s| !s.metadata.is_terminal())
             .map_err(|_| "task lock poisoned")?;
         if !state.metadata.is_terminal() {
-            return Err(
-                "remote cancellation requested; terminal pending; inspect bash_status (never rerun)".into(),
-            );
+            if state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.job_id.is_none())
+            {
+                return Err(format!(
+                    "remote cancellation pending for task {}; no job id was received, so the job may still run; AFT will cancel it when its job id arrives; inspect bash_status (never rerun)",
+                    task.task_id,
+                ));
+            }
+            let job_id = state
+                .metadata
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.job_id)
+                .unwrap();
+            return Err(format!(
+                "remote cancellation pending for job {job_id}; the job may still run until the build server confirms it stopped; inspect bash_status (never rerun)"
+            ));
         }
         drop(state);
         Ok(self.snapshot_with_terminal_cache(task, 8 * 1024))

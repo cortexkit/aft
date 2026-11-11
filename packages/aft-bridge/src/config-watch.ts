@@ -359,13 +359,18 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
 
   const watchImpl = options.watchImpl ?? watch;
   let rejectedRetries = 0;
+  // A new watch can start reporting some time after it is armed (on macOS the
+  // event stream starts asynchronously, slower on a loaded machine), and an
+  // edit made in that window sends no event at all. So the revalidation tick
+  // after any watch is armed checks the files once more.
+  let recheckAfterArming = false;
   const check = (): void => {
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = null;
     timer = null;
     firstPendingAt = null;
     if (stopped) return;
-    revalidate();
+    if (revalidate()) recheckAfterArming = true;
     const seen = new Map<string, string | null>();
     for (const path of options.paths) {
       const text = readTextOrNull(path);
@@ -499,13 +504,16 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
     }
     return moved;
   }
-  revalidate();
+  recheckAfterArming = revalidate();
   if (options.checkAtStart) check();
   // Some platforms stop reporting on a deleted or replaced directory without
   // an error; a periodic check re-arms such a watch. Moving a watch (for
   // example once `.cortexkit/` is created) may reveal a file, so it checks.
   const revalidateTimer = setInterval(() => {
-    if (!stopped && revalidate()) schedule();
+    if (stopped) return;
+    const moved = revalidate();
+    if (moved || recheckAfterArming) schedule();
+    recheckAfterArming = moved;
   }, CONFIG_WATCH_REVALIDATE_MS);
   revalidateTimer.unref?.();
 

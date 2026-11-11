@@ -553,9 +553,8 @@ fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
             let entry = |schema: Value, description: Option<String>| {
                 let mut entry = catalog_entry(&name, semantics, schema, description);
                 // A head's waiting `bash` call can be handed back with
-                // `tool.yield`; a delegated worker's keeps holding (see
-                // `call_yield::route_refusal`), so the worker preset is untagged.
-                if preset == CatalogPreset::Head && name == "bash" {
+                // `tool.yield`. Workers use held replies when their runner restarts.
+                if name == "bash" || (preset == CatalogPreset::Worker && name == "bash_watch") {
                     entry
                         .capabilities
                         .push(super::call_yield::CALL_YIELD_TOOL_TAG.into());
@@ -1633,6 +1632,9 @@ pub(super) fn admit_call_mode(
     name: &str,
     mode: &cortexkit_role_tool_provider::CallMode,
 ) -> Result<(), ErrorBody> {
+    if native_completion_ack(name) {
+        return Ok(());
+    }
     use cortexkit_role_tool_provider::{catalog::serves_call_mode, CallMode};
     let tool = served_tools(CatalogPreset::Head)
         .iter()
@@ -1692,7 +1694,11 @@ pub(super) fn admit_for_session(
     hashline_route: bool,
 ) -> Result<CallerRole, ErrorBody> {
     check_call(call)?;
-    let role = resolve_caller_role(call.preset.as_deref(), scoped_route, false)?;
+    let role = resolve_caller_role(
+        call.preset.as_deref(),
+        scoped_route && !native_completion_ack(&call.name),
+        false,
+    )?;
     admit_as(
         call,
         disabled,
@@ -1861,7 +1867,13 @@ pub(super) fn shell_capability_refusal(name: &str, trusted: bool) -> Option<Erro
     (!trusted
         && matches!(
             name,
-            "bash" | "powershell" | "bash_status" | "bash_kill" | "bash_write" | "bash_watch"
+            "bash"
+                | "powershell"
+                | "bash_status"
+                | "bash_kill"
+                | "bash_write"
+                | "bash_watch"
+                | "bash_ack_completions"
         ))
     .then(|| {
         ErrorBody::new(
@@ -1913,6 +1925,7 @@ pub(super) fn note_native_outcome(
 /// pass through the same edge and are committed before reaching the socket.
 pub(super) struct LedgerEdge {
     calls: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerCall>>,
+    received: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), ReceivedCall>>,
     waiting: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerWait>>,
     authorizing: std::sync::Mutex<std::collections::HashSet<super::ReverseCorrKey>>,
     ready: tokio::sync::mpsc::UnboundedSender<super::DecodedFrame>,
@@ -1950,6 +1963,11 @@ fn copy_terminal_body(body: &[u8]) -> Vec<u8> {
     });
     body.to_vec()
 }
+struct ReceivedCall {
+    key: crate::db::call_ledger::Key,
+    live: tokio::sync::watch::Sender<bool>,
+}
+
 struct LedgerWait {
     admission: super::AdmissionWait,
     cancel: super::PersistentCancelSignal,
@@ -2017,7 +2035,11 @@ enum Custody {
         /// finding no record of its own is then a refusal, not `unknown_call`.
         owner_as_carrier: bool,
     },
-    LateResults(cortexkit_role_tool_provider::late_results::LateResultsRequest),
+    Late(LateCustody),
+}
+
+enum LateCustody {
+    Read(cortexkit_role_tool_provider::late_results::LateResultsRequest),
     Ack(cortexkit_role_tool_provider::late_results::AckRequest),
 }
 
@@ -2044,9 +2066,8 @@ fn custody_request(
     body: &Value,
     identity: &super::RouteIdentity,
 ) -> Result<Custody, ErrorBody> {
-    use cortexkit_role_tool_provider::{
-        late_results::{AckRequest, LateResultsRequest},
-        withdraw::{parse_withdraw_request, resolve_carrier, CarrierResolution},
+    use cortexkit_role_tool_provider::withdraw::{
+        parse_withdraw_request, resolve_carrier, CarrierResolution,
     };
     let arguments = || body.get("arguments").cloned().unwrap_or_else(|| json!({}));
     match op {
@@ -2075,13 +2096,132 @@ fn custody_request(
                 owner_as_carrier,
             })
         }
-        "late_results" => serde_json::from_value::<LateResultsRequest>(arguments())
-            .map(Custody::LateResults)
-            .map_err(|error| errors::invalid_request("arguments", error.to_string())),
-        _ => serde_json::from_value::<AckRequest>(arguments())
-            .map(Custody::Ack)
-            .map_err(|error| errors::invalid_request("arguments", error.to_string())),
+        _ => late_custody_request(op, arguments()).map(Custody::Late),
     }
+}
+
+fn late_custody_request(op: &str, arguments: Value) -> Result<LateCustody, ErrorBody> {
+    use cortexkit_role_tool_provider::late_results::{AckRequest, LateResultsRequest};
+    match op {
+        "late_results" => {
+            serde_json::from_value::<LateResultsRequest>(arguments).map(LateCustody::Read)
+        }
+        _ => serde_json::from_value::<AckRequest>(arguments).map(LateCustody::Ack),
+    }
+    .map_err(|error| errors::invalid_request("arguments", error.to_string()))
+}
+
+fn run_late_custody(
+    conn: &rusqlite::Connection,
+    request: LateCustody,
+    custodian: &str,
+    held_updates: bool,
+) -> Result<Vec<u8>, ErrorBody> {
+    use crate::db::call_ledger as ledger;
+    let unavailable = |error: rusqlite::Error| {
+        ErrorBody::new("database_unavailable", error.to_string())
+            .with_detail(json!({"retryable":false}))
+    };
+    match request {
+        LateCustody::Read(request) => ledger::late_results_for_consumer(
+            conn,
+            custodian,
+            ledger::provider_incarnation(),
+            request.since.as_ref(),
+            request.limit,
+            ledger::now_ms(),
+            ROLE_REPLY_BODY_LIMIT,
+            held_updates,
+        )
+        .map_err(unavailable)?,
+        LateCustody::Ack(request) => ledger::ack_through(
+            conn,
+            custodian,
+            ledger::provider_incarnation(),
+            &request.through,
+        )
+        .map_err(unavailable)?
+        .map(|_| b"{}".to_vec()),
+    }
+}
+
+/// A project-free feed uses the same ledger and rules about which callers
+/// receive structured result data as a project route. Database work stays off
+/// the frame loop.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn project_free_custody(
+    writer: &super::WriterSender,
+    frame: &subc_protocol::Frame,
+    metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+    app: std::sync::Arc<crate::context::App>,
+    database: std::path::PathBuf,
+    op: &str,
+    arguments: Value,
+    custodian: String,
+    model_only: bool,
+    held_updates: bool,
+) {
+    let request = frame.clone();
+    let writer = writer.clone();
+    let metrics = metrics.clone();
+    let decoded = late_custody_request(op, arguments);
+    let op = op.to_owned();
+    tokio::spawn(async move {
+        let result = match decoded {
+            Err(error) => Err(error),
+            Ok(decoded) => tokio::task::spawn_blocking(move || {
+                let unavailable = |message: String| {
+                    ErrorBody::new("database_unavailable", message)
+                        .with_detail(json!({"retryable":false}))
+                };
+                let db = app
+                    .open_db(&database)
+                    .map_err(|error| unavailable(error.to_string()))?;
+                let conn = db
+                    .lock()
+                    .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
+                run_late_custody(&conn, decoded, &custodian, held_updates)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(ErrorBody::new(
+                    "executor_failure",
+                    format!("{op} did not complete"),
+                ))
+            }),
+        };
+        let result = result.and_then(|body| {
+            let mut policy = super::wire::ToolResponsePolicy::for_retention();
+            policy.model_only = model_only;
+            policy.project_custody_body(body).map_err(|_| {
+                ErrorBody::new("internal_error", "retained tool reply could not be decoded")
+            })
+        });
+        match result {
+            Err(error) => {
+                let _ = super::send_provider_error(&writer, &metrics, &request, error).await;
+            }
+            Ok(body) => {
+                if let Ok(frame) = subc_protocol::Frame::build_with_version(
+                    request.header.ver,
+                    subc_protocol::FrameType::Response,
+                    request.header.flags,
+                    request.header.channel,
+                    request.header.epoch,
+                    request.header.corr,
+                    body,
+                ) {
+                    let _ = super::send_reliable_writer_frame(
+                        &writer,
+                        &metrics,
+                        frame,
+                        "custody reply",
+                    )
+                    .await;
+                }
+            }
+        }
+    });
 }
 
 /// What a custody executor job produced: the reply body, and whether a held
@@ -2198,7 +2338,6 @@ fn run_custody(
     let db = ctx
         .db()
         .ok_or_else(|| unavailable("call ledger is unavailable".into()))?;
-    let incarnation = ledger::provider_incarnation();
     let now = crate::db::call_ledger::now_ms();
     match request {
         Custody::Withdraw {
@@ -2255,38 +2394,15 @@ fn run_custody(
                 }
             }
         }
-        Custody::LateResults(request) => {
+        Custody::Late(request) => {
             let conn = db
                 .lock()
                 .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
-            ledger::late_results_for_consumer(
-                &conn,
-                custodian,
-                incarnation,
-                request.since.as_ref(),
-                request.limit,
-                now,
-                ROLE_REPLY_BODY_LIMIT,
-                held_updates,
-            )
-            .map_err(|error| unavailable(error.to_string()))?
-            .map(|body| CustodyReply {
+            run_late_custody(&conn, request, custodian, held_updates).map(|body| CustodyReply {
                 body,
                 withdrawn_key: None,
                 kill_elsewhere: None,
             })
-        }
-        Custody::Ack(request) => {
-            let conn = db
-                .lock()
-                .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
-            ledger::ack_through(&conn, custodian, incarnation, &request.through)
-                .map_err(|error| unavailable(error.to_string()))?
-                .map(|_| CustodyReply {
-                    body: b"{}".to_vec(),
-                    withdrawn_key: None,
-                    kill_elsewhere: None,
-                })
         }
     }
 }
@@ -2360,6 +2476,7 @@ impl LedgerEdge {
         (
             std::sync::Arc::new(Self {
                 calls: Default::default(),
+                received: Default::default(),
                 waiting: Default::default(),
                 recent_sweeps: Default::default(),
                 authorizing: Default::default(),
@@ -2416,6 +2533,49 @@ impl LedgerEdge {
             carrier,
             call_key: call_key.into(),
         }
+    }
+
+    /// Track received keys before waiting for stored access rules or database work.
+    /// The observers neither send replies nor count as held requests.
+    pub(super) fn note_received(
+        &self,
+        decoded: &super::DecodedFrame,
+        routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
+    ) {
+        let route = super::route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let Some(identity) = routes
+            .get(&route)
+            .filter(|identity| identity.role == RouteRole::ToolProviderV1)
+        else {
+            return;
+        };
+        let Ok(body) = decoded.body() else {
+            return;
+        };
+        if body
+            .get("op")
+            .is_some_and(|op| op.as_str() != Some("tool.call"))
+            || body
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(recognized_operation)
+        {
+            return;
+        }
+        let Some(call_key) = body.get("call_key").and_then(Value::as_str) else {
+            return;
+        };
+        if cortexkit_role_tool_provider::call::validate_call_key(call_key).is_err() {
+            return;
+        }
+        self.received
+            .lock()
+            .unwrap()
+            .entry((route, decoded.frame.header.corr))
+            .or_insert_with(|| ReceivedCall {
+                key: Self::key(identity, call_key),
+                live: tokio::sync::watch::channel(false).0,
+            });
     }
 
     /// Returns the frame unchanged for keyless, legacy and refused calls.
@@ -2578,6 +2738,7 @@ impl LedgerEdge {
         let cancel = PersistentCancelSignal::new();
         let terminal_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let admission = AdmissionWait::from_decoded(&decoded, &call.name);
+        self.note_received(&decoded, routes);
         self.waiting.lock().unwrap().insert(
             (route, decoded.frame.header.corr),
             LedgerWait {
@@ -2679,6 +2840,14 @@ impl LedgerEdge {
                                     detached: false,
                                 },
                             );
+                            if let Some(received) = edge
+                                .received
+                                .lock()
+                                .unwrap()
+                                .get(&(route, decoded.frame.header.corr))
+                            {
+                                let _ = received.live.send_replace(true);
+                            }
                         }
                         admitted
                     };
@@ -3023,11 +3192,9 @@ impl LedgerEdge {
     }
 
     /// Answers a `tool.yield` on a v1 route (see `call_yield` for the
-    /// contract it follows). The decision reads only in-memory call state, so
-    /// neither the answer nor an accepted call's final frame waits for the
-    /// executor or the database: the final frame of a handed-back `bash` call
-    /// is sent right here, before the answer, and a `bash_watch` thread checks
-    /// its signal at least once a second.
+    /// contract it follows). Person-message handoffs need only in-memory state.
+    /// Restart holds are persisted off the frame loop before the final frame
+    /// and acceptance are sent, so losing the runner cannot lose the result.
     fn call_yield(
         self: &std::sync::Arc<Self>,
         decoded: super::DecodedFrame,
@@ -3035,6 +3202,71 @@ impl LedgerEdge {
         identity: &super::RouteIdentity,
         writer: &super::WriterSender,
         metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+    ) {
+        let pending = super::call_yield::parse_request(body)
+            .ok()
+            .and_then(|yielded| {
+                self.admission_for_yield(
+                    super::route_key(decoded.frame.header.channel, decoded.frame.header.epoch),
+                    &Self::key(identity, &yielded.call_key),
+                )
+            });
+        let Some(mut pending) = pending else {
+            self.call_yield_ready(decoded, body, identity, writer, metrics, false);
+            return;
+        };
+        let edge = self.clone();
+        let body = body.clone();
+        let identity = identity.clone();
+        let writer = writer.clone();
+        let metrics = metrics.clone();
+        let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        tokio::spawn(async move {
+            // Admission is asynchronous, so an immediately following yield can
+            // arrive before the live call exists. Leave most of the five-second
+            // reply budget for persisting and delivering the held reply.
+            let live = *pending.borrow();
+            if !live {
+                let _ = tokio::time::timeout_at(admission_deadline, pending.changed()).await;
+            }
+            edge.call_yield_ready(decoded, &body, &identity, &writer, &metrics, true);
+        });
+    }
+
+    fn admission_for_yield(
+        &self,
+        route: super::RouteChannel,
+        key: &crate::db::call_ledger::Key,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        if self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|((call_route, _), call)| *call_route == route && call.key == *key)
+        {
+            return None;
+        }
+        // The watch retains transitions even when admission finishes before
+        // the new waiter is first polled. Do not hold calls and received together.
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|((call_route, _), wait)| {
+                (*call_route == route && wait.key == *key && !*wait.live.borrow())
+                    .then(|| wait.live.subscribe())
+            })
+    }
+
+    fn call_yield_ready(
+        self: &std::sync::Arc<Self>,
+        decoded: super::DecodedFrame,
+        body: &Value,
+        identity: &super::RouteIdentity,
+        writer: &super::WriterSender,
+        metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+        received_during_admission: bool,
     ) {
         use super::call_yield::{NotYieldable, YieldAnswer, YieldableTool};
         let request = decoded.frame;
@@ -3053,7 +3285,9 @@ impl LedgerEdge {
         // Calls are recorded under the route's attested carrier, so this key
         // finds only the caller's own calls.
         let key = Self::key(identity, &yielded.call_key);
+        let restart = yielded.reason == super::call_yield::RUNNER_RESTART;
         let mut handed_back = None;
+        let mut held_watch = None;
         let answer = {
             let mut calls = self.calls.lock().unwrap();
             match calls.iter_mut().find(|((call_route, _), call)| {
@@ -3062,22 +3296,40 @@ impl LedgerEdge {
                     && !call.detached
                     && call.withdrawn.is_none()
             }) {
+                None if received_during_admission => {
+                    YieldAnswer::NotYieldable(NotYieldable::NotWaiting)
+                }
                 None => YieldAnswer::UnknownCall,
                 // The contract never accepts a yield twice.
                 Some((_, call)) if call.yielded => YieldAnswer::UnknownCall,
                 Some((&(_, corr), call)) => {
-                    let decision = if let Some(refusal) = super::call_yield::route_refusal(identity)
+                    let refusal = if identity.call_yield
+                        && !restart
+                        && yielded.reason != super::call_yield::PERSON_MESSAGE
                     {
+                        Some(NotYieldable::Reason)
+                    } else if restart {
+                        super::call_yield::restart_route_refusal(identity)
+                    } else {
+                        super::call_yield::route_refusal(identity)
+                    };
+                    let decision = if let Some(refusal) = refusal {
                         Err(refusal)
-                    } else if yielded.reason != super::call_yield::PERSON_MESSAGE {
+                    } else if !restart && yielded.reason != super::call_yield::PERSON_MESSAGE {
                         Err(NotYieldable::Reason)
                     } else {
                         match call.yieldable {
                             None => Err(NotYieldable::Tool),
                             Some(YieldableTool::Bash) => metrics
                                 .held_bash_calls
-                                .claim_for_yield(route, corr)
+                                .claim_for_yield(route, corr, restart)
                                 .map(|target| handed_back = Some((corr, target))),
+                            Some(YieldableTool::BashWatch) if restart => metrics
+                                .watch_yields
+                                .waiting(route, corr)
+                                .filter(|signal| super::call_yield::watch_can_hold(signal))
+                                .map(|signal| held_watch = Some((corr, signal)))
+                                .ok_or(NotYieldable::NotWaiting),
                             Some(YieldableTool::BashWatch) => {
                                 if metrics.watch_yields.request(route, corr) {
                                     Ok(())
@@ -3106,9 +3358,37 @@ impl LedgerEdge {
         );
         let identity = identity.clone();
         tokio::spawn(async move {
+            let mut answer = answer;
+            if let Some((corr, signal)) = held_watch {
+                match super::call_yield::hold_watch(
+                    signal,
+                    key,
+                    &identity,
+                    route,
+                    corr,
+                    request.header.ver,
+                    request.header.flags,
+                )
+                .await
+                {
+                    Ok(frame) => {
+                        let _ = super::send_reliable_writer_frame(
+                            &writer,
+                            &metrics,
+                            frame,
+                            "yielded watch hold",
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        log::warn!("runner restart watch hold failed: {error}");
+                        answer = YieldAnswer::NotYieldable(NotYieldable::NotWaiting);
+                    }
+                }
+            }
             if let Some((corr, target)) = handed_back {
                 if let Err(error) = super::bash::answer_yielded_bash_call(
-                    &writer, &identity, &metrics, route, corr, target,
+                    &writer, &identity, &metrics, route, corr, target, restart,
                 )
                 .await
                 {
@@ -3195,6 +3475,10 @@ impl LedgerEdge {
         executor: &std::sync::Arc<crate::executor::Executor>,
         route: Option<super::RouteChannel>,
     ) {
+        self.received
+            .lock()
+            .unwrap()
+            .retain(|(channel, _), _| route.is_some_and(|route| *channel != route));
         let calls: Vec<_> = self
             .calls
             .lock()
@@ -3226,6 +3510,12 @@ impl LedgerEdge {
         &self,
         routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
     ) -> std::collections::HashSet<super::RouteChannel> {
+        // Policy waits own their own cancellation. Forget only their key
+        // observations when a route retires, without taking over any replies.
+        self.received
+            .lock()
+            .unwrap()
+            .retain(|(route, _), _| routes.contains_key(route));
         self.calls
             .lock()
             .unwrap()
@@ -3300,6 +3590,7 @@ impl LedgerEdge {
     }
 
     pub(super) fn close(&self) {
+        self.received.lock().unwrap().clear();
         for signal in self.waiting.lock().unwrap().values() {
             signal.cancel.cancel();
         }
@@ -3338,6 +3629,10 @@ impl LedgerEdge {
     }
 
     pub(super) fn finish_waiting(&self, request: &subc_protocol::Frame) -> bool {
+        self.received.lock().unwrap().remove(&(
+            super::route_key(request.header.channel, request.header.epoch),
+            request.header.corr,
+        ));
         self.waiting
             .lock()
             .unwrap()
@@ -3514,6 +3809,12 @@ impl LedgerEdge {
                     outgoing.header.ty,
                     FrameType::Response | FrameType::Error | FrameType::StreamEnd
                 );
+                if terminal {
+                    edge.received
+                        .lock()
+                        .unwrap()
+                        .remove(&(route, outgoing.header.corr));
+                }
                 let permission_hold = outgoing.header.ty == FrameType::Response
                     && serde_json::from_slice::<Value>(&outgoing.body).is_ok_and(|body| {
                         body.get("held").is_some() && body.get("isError").is_none()
@@ -3538,7 +3839,9 @@ impl LedgerEdge {
                         .is_ok_and(|body| body["held"]["reason"] == "running");
                     {
                         let mut calls = edge.calls.lock().unwrap();
-                        if running {
+                        let yielded = serde_json::from_slice::<Value>(&outgoing.body)
+                            .is_ok_and(|body| body["held"]["yielded"] == true);
+                        if running && !yielded {
                             calls.remove(&(route, outgoing.header.corr));
                         } else if let Some(call) = calls.get_mut(&(route, outgoing.header.corr)) {
                             call.detached = true;
@@ -3860,6 +4163,12 @@ fn legacy_file_path_digests(name: &str) -> &'static [String] {
     DIGESTS.get(name).map_or(&[], Vec::as_slice)
 }
 
+fn native_completion_ack(name: &str) -> bool {
+    // Transport bookkeeping reuses the native handler, never the model catalog
+    // or its schemas. Keep this exception narrower than the plumbing allowlist.
+    name == "bash_ack_completions" && super::is_subc_native_plumbing_tool(name)
+}
+
 /// [`admit`] for a call whose role is already resolved.
 fn admit_as(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
@@ -3878,6 +4187,9 @@ fn admit_as(
         trusted,
         role,
     )?;
+    if native_completion_ack(&call.name) {
+        return Ok(());
+    }
     admit_arguments_for(call, role, true, hashline_route)
 }
 
@@ -3891,10 +4203,11 @@ pub(super) fn admit_role_name(
     trusted: bool,
     role: CallerRole,
 ) -> Result<(), ErrorBody> {
-    if !METADATA
-        .iter()
-        .chain(PRESET_ONLY_METADATA)
-        .any(|(tool, _, _)| *tool == name)
+    if !native_completion_ack(name)
+        && !METADATA
+            .iter()
+            .chain(PRESET_ONLY_METADATA)
+            .any(|(tool, _, _)| *tool == name)
     {
         return Err(errors::unknown_tool(name));
     }
@@ -8490,6 +8803,131 @@ pub(in crate::subc) mod route_tests {
         }
     }
 
+    #[tokio::test]
+    async fn runner_completion_ack_tool_call_owns_tasks_and_stays_out_of_catalog() {
+        use crate::bash_background::persistence::{
+            create_task_layout, read_task_at, write_task_at, PersistedTask,
+        };
+        use crate::bash_background::{BgTaskStatus, TaskIdentity};
+
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for principal in ["reserved:thalamus-harness", "reserved:thalamus-pi"] {
+            let (dir, root) = test_support::test_root("runner-native-completion-ack");
+            let ctx = test_support::test_ctx();
+            let mut identity = test_support::route_identity_with_harness(
+                &root,
+                "ack-session",
+                BindTrust::FirstParty,
+                "opencode2",
+            );
+            let data = Arc::get_mut(&mut identity.0).unwrap();
+            data.role = RouteRole::ToolProviderV1;
+            data.scope = Some(stamp("head"));
+            if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                &mut data.spawn_principal
+            {
+                *principal_id = Some(principal.into());
+            }
+            let storage = dir.path().join("tasks");
+            let mut saved = Vec::new();
+            for (task_id, session, task_principal, harness) in [
+                (
+                    "bash-0000000000000001",
+                    "ack-session",
+                    principal,
+                    "opencode2",
+                ),
+                (
+                    "bash-0000000000000002",
+                    "foreign-session",
+                    principal,
+                    "opencode2",
+                ),
+                (
+                    "bash-0000000000000003",
+                    "ack-session",
+                    "reserved:broca",
+                    "opencode2",
+                ),
+                ("bash-0000000000000004", "ack-session", principal, "pi"),
+            ] {
+                let task = create_task_layout(&storage, session, task_id).unwrap();
+                let mut metadata = PersistedTask::starting(
+                    task_id.into(),
+                    session.into(),
+                    "echo ack".into(),
+                    root.as_path().into(),
+                    Some(root.as_path().into()),
+                    None,
+                    true,
+                    false,
+                );
+                metadata.launching_identity = Some(TaskIdentity {
+                    principal: Some(task_principal.into()),
+                    harness: harness.into(),
+                    session: session.into(),
+                });
+                metadata.harness = Some(harness.into());
+                metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+                write_task_at(&task, &metadata).unwrap();
+                ctx.bash_background()
+                    .replay_session(&storage, session)
+                    .unwrap();
+                saved.push(task);
+            }
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            for preset in ["head", "worker", "reader"] {
+                let reply = exchange_with_actor(
+                    json!({"op":"tool.catalog", "preset":preset}),
+                    identity.clone(),
+                    ctx.clone(),
+                    &metrics,
+                    |_, _| panic!("catalog must not dispatch"),
+                )
+                .await;
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                let tools = body["tools"].as_array().expect("catalog tools");
+                assert!(!tools
+                    .iter()
+                    .any(|tool| tool["name"] == "bash_ack_completions"));
+            }
+            let reply = exchange_with_actor(
+                json!({"op":"tool.call", "name":"bash_ack_completions", "arguments":{
+                    "session_id":"foreign-session",
+                    "task_ids":["bash-0000000000000001", "bash-0000000000000002", "bash-0000000000000003", "bash-0000000000000004", "bash-0000000000000099"]
+                }}),
+                identity.clone(), ctx.clone(), &metrics,
+                |request, ctx| {
+                    assert_eq!(request.command, "bash_ack_completions");
+                    assert_eq!(request.session(), "ack-session");
+                    let response = crate::commands::bash_drain_completions::handle_ack(&request, ctx);
+                    assert_eq!(response.data["acked_task_ids"], json!(["bash-0000000000000001"]));
+                    assert_eq!(response.data["ignored_task_ids"], json!(["bash-0000000000000002", "bash-0000000000000003", "bash-0000000000000004", "bash-0000000000000099"]));
+                    response
+                },
+            ).await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{body}");
+            assert_eq!(body["isError"], false, "{body}");
+            for (index, task) in saved.iter().enumerate() {
+                assert_eq!(read_task_at(task).unwrap().completion_delivered, index == 0);
+            }
+            assert!(admit(
+                &serde_json::from_value(
+                    json!({"name":"bash_ack_completions", "arguments":{"task_ids":[]}})
+                )
+                .unwrap(),
+                false,
+                &[],
+                true,
+                "ack-session",
+                false
+            )
+            .is_err());
+            ctx.bash_background().detach();
+        }
+    }
+
     /// A context for `root` with hashline edit mode on and its aft.db in
     /// `storage`. A second context made the same way stands for AFT after a
     /// restart: it shares nothing with the first but the database file.
@@ -10499,6 +10937,241 @@ mod ledger_terminal_tests {
         Key {
             carrier: "first-party".into(),
             call_key: "repeat".into(),
+        }
+    }
+
+    fn yield_admission_request(corr: u64, body: Value) -> crate::subc::DecodedFrame {
+        crate::subc::DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            launch_restore: None,
+            codemode_policies: None,
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                42,
+                1,
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+            phase_trace: crate::run_tool_call::PhaseTrace::new(Instant::now()),
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_restart_yield_waits_for_call_ledger_admission() {
+        use crate::subc::*;
+        let (dir, root) = test_support::test_root("yield-during-admission");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked = executor.submit_async(
+            root.clone(),
+            crate::executor::Lane::CallLedger,
+            "block-yield-admission".into(),
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                crate::protocol::Response::success("block-yield-admission", json!({}))
+            }),
+        );
+        started_rx.await.unwrap();
+        let mut identity = test_support::route_identity_with_harness(
+            &root,
+            "session",
+            BindTrust::FirstParty,
+            "runner",
+        );
+        let data = std::sync::Arc::get_mut(&mut identity.0).unwrap();
+        data.role = RouteRole::ToolProviderV1;
+        data.call_yield = true;
+        data.held_reply = true;
+        data.tool_result_body = true;
+        let route = route_key(42, 1);
+        let key = LedgerEdge::key(&identity, "admission-watch");
+        let routes = std::collections::HashMap::from([(route, identity)]);
+        let (edge, mut ready) = LedgerEdge::new();
+        let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
+        let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
+        let signal = metrics.watch_yields.register(route, 7);
+        crate::subc::call_yield::watch_waiting(
+            &signal,
+            crate::subc::call_yield::WatchWait::new(
+                ctx.clone(),
+                crate::protocol::RawRequest {
+                    id: "7".into(),
+                    command: "bash_watch".into(),
+                    session_id: Some("session".into()),
+                    params: json!({"task_id":"pending-watch", "timeout_ms":10000}),
+                    lsp_hints: None,
+                },
+                crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+                10000,
+            ),
+        );
+        let watch = yield_admission_request(
+            7,
+            json!({"name":"bash_watch", "preset":"worker", "call_key":key.call_key, "arguments":{"taskId":"pending-watch", "timeoutMs":10000}}),
+        );
+        edge.note_received(&watch, &routes);
+        assert!(edge.calls.lock().unwrap().is_empty());
+        assert!(ready.try_recv().is_err());
+        let sent = Instant::now();
+        assert!(edge.defer(
+            yield_admission_request(8, json!({"name":"tool.yield", "arguments":{"call_key":key.call_key, "reason":"runner_restart"}})),
+            &routes, &executor, &writer, &metrics,
+        ).is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err(),
+            "a received call must not answer unknown_call while its admission is blocked"
+        );
+        assert!(edge
+            .defer(watch, &routes, &executor, &writer, &metrics)
+            .is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err(),
+            "the same yield must stay pending across policy and ledger admission waits"
+        );
+        release_tx.send(()).unwrap();
+        blocked.await.unwrap();
+        let admitted = tokio::time::timeout(Duration::from_secs(5), ready.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.frame.header.corr, 7);
+        let mut held = false;
+        let mut accepted = false;
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            match frame.header.corr {
+                7 => {
+                    assert_eq!(body["held"], json!({"reason":"running", "yielded":true}));
+                    held = true;
+                }
+                8 => {
+                    assert_eq!(body, json!({"answer":"accepted"}));
+                    accepted = true;
+                }
+                other => panic!("unexpected response corr={other}: {body}"),
+            }
+        }
+        assert!(held && accepted);
+        assert!(sent.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            crate::db::call_ledger::get(&ctx.db().unwrap().lock().unwrap(), &key)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::call_ledger::State::DispatchStarted
+        );
+        assert!(crate::subc::call_yield::watch_finished(
+            &signal,
+            &crate::protocol::Response::success(
+                "7",
+                json!({"task_id":"pending-watch", "output":"watch completed", "status":"completed"})
+            )
+        ));
+        assert_eq!(
+            crate::db::call_ledger::get(&ctx.db().unwrap().lock().unwrap(), &key)
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::db::call_ledger::State::Settled
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_restart_yield_bounds_admission_wait_and_handles_completion_before_reply() {
+        use crate::subc::*;
+        let (_dir, root) = test_support::test_root("yield-admission-bounds");
+        for completed in [false, true] {
+            let mut identity = test_support::route_identity(&root, "session");
+            let data = std::sync::Arc::get_mut(&mut identity.0).unwrap();
+            data.role = RouteRole::ToolProviderV1;
+            data.call_yield = true;
+            let key = LedgerEdge::key(&identity, "pending-watch");
+            let (edge, _) = LedgerEdge::new();
+            let request = yield_admission_request(
+                7,
+                json!({"name":"bash_watch", "call_key":key.call_key, "arguments":{"taskId":"pending-watch"}}),
+            );
+            edge.note_received(
+                &request,
+                &std::collections::HashMap::from([(route_key(42, 1), identity.clone())]),
+            );
+            assert!(edge.held_since().is_empty());
+            assert!(edge.drain_for_module_drain().unwrap().is_empty());
+            let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
+            let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
+            let body = json!({"name":"tool.yield", "arguments":{"call_key":key.call_key, "reason":"runner_restart"}});
+            let sent = Instant::now();
+            edge.call_yield(
+                yield_admission_request(8, body.clone()),
+                &body,
+                &identity,
+                &writer,
+                &metrics,
+            );
+            if completed {
+                // Admission and completion can both happen before the waiter
+                // first polls. Its subscription must retain that notification.
+                let pending = edge
+                    .received
+                    .lock()
+                    .unwrap()
+                    .remove(&(route_key(42, 1), 7))
+                    .unwrap();
+                pending.live.send_replace(true);
+            }
+            let frame = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&frame.body).unwrap(),
+                json!({"answer":"not_yieldable", "reason":"not_waiting"}),
+                "completed={completed}"
+            );
+            assert!(sent.elapsed() < Duration::from_secs(3));
+            if !completed {
+                let pending = edge.admission_for_yield(route_key(42, 1), &key).unwrap();
+                assert!(edge.unrouted_shells(&Default::default()).is_empty());
+                assert!(edge.received.lock().unwrap().is_empty());
+                assert!(
+                    pending.has_changed().is_err(),
+                    "retired routes must drop their observation senders"
+                );
+            }
+            let unknown = json!({"name":"tool.yield", "arguments":{"call_key":"never-received", "reason":"runner_restart"}});
+            edge.call_yield(
+                yield_admission_request(9, unknown.clone()),
+                &unknown,
+                &identity,
+                &writer,
+                &metrics,
+            );
+            let frame = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&frame.body).unwrap(),
+                json!({"answer":"unknown_call"})
+            );
         }
     }
 

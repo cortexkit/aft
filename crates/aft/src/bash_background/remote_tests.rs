@@ -5,6 +5,147 @@ use crate::exec_remote::wire_tests::{daemon, id, Script};
 #[path = "bookkeeping_probe.rs"]
 mod bookkeeping_probe;
 
+fn assert_remote_oom_terminal(cause: Option<&str>, expected: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut record = TerminalRecord::new(id(), Outcome::Signal { signal: 9 }, 1, 0, 0)
+        .with_ran(Ran::Remote)
+        .with_workspace_changes(Vec::new())
+        .with_memory_stated_mib(8192)
+        .with_memory_peak_working_mib(7798);
+    if let Some(cause) = cause {
+        record = record.with_oom_kill(OomKill::new(cause));
+    }
+    let verdict = exec::grade(&record);
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.terminal(&record, &verdict).unwrap();
+
+    // A crash after the terminal record is saved must give the same advice as live completion.
+    let readonly = self::registry();
+    let (disk, _) = readonly
+        .terminal_status_from_disk(&task_id, "session", Some(dir.path()), dir.path())
+        .unwrap();
+    assert_eq!(disk.info.status_reason.as_deref(), Some(expected));
+    if cause.is_some() {
+        assert!(disk.output_preview.contains(expected), "{disk:?}");
+    }
+    registry.remote_terminal(&task, verdict, None);
+    let done = registry.observed_status(&task_id, "session", 8192).unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Failed);
+    assert_eq!(done.exit_code, Some(137));
+    assert_eq!(done.info.status_reason.as_deref(), Some(expected));
+    assert!(done.output_preview.contains(expected), "{done:?}");
+    assert_eq!(
+        read_task(&paths.json).unwrap().status_reason.as_deref(),
+        Some(expected)
+    );
+    let completion = registry
+        .drain_completions()
+        .into_iter()
+        .find(|completion| completion.task_id == task_id)
+        .expect("remote completion notice");
+    assert_eq!(completion.status_reason.as_deref(), Some(expected));
+    assert!(
+        completion.output_preview.contains(expected),
+        "{completion:?}"
+    );
+    let foreground =
+        crate::commands::bash_orchestrate::foreground_result_response("oom", done.clone());
+    assert!(foreground.data["output"]
+        .as_str()
+        .unwrap()
+        .contains(expected));
+    for value in [
+        serde_json::to_value(&disk).unwrap(),
+        serde_json::to_value(&done).unwrap(),
+        serde_json::to_value(&completion).unwrap(),
+        serde_json::to_value(completion.into_push_frame()).unwrap(),
+        foreground.data,
+    ] {
+        if let Some(cause) = cause {
+            assert_eq!(
+                value["remote_oom_kill"],
+                serde_json::json!({
+                    "cause": cause,
+                    "memory_stated_mib": 8192,
+                    "memory_peak_working_mib": 7798,
+                })
+            );
+        } else {
+            assert!(value.get("remote_oom_kill").is_none(), "{value}");
+            assert!(!value.to_string().contains("memory"));
+        }
+    }
+}
+
+#[test]
+fn exec_remote_bash_oom_job_limit() {
+    assert_remote_oom_terminal(
+        Some("job_limit"),
+        "killed: it went over its memory limit of 8 GiB (peak 7798 MiB); rerun with a larger limit",
+    );
+}
+
+#[test]
+fn exec_remote_bash_oom_host_pressure() {
+    assert_remote_oom_terminal(Some("host_pressure"), "killed: the build server ran out of memory, not this job's limit (peak 7798 MiB); rerun as is");
+}
+
+#[test]
+fn exec_remote_bash_oom_host_oom() {
+    assert_remote_oom_terminal(Some("host_oom"), "killed: the build server ran out of memory, not this job's limit (peak 7798 MiB); rerun as is");
+}
+
+#[test]
+fn exec_remote_bash_oom_absent_keeps_signal_text() {
+    assert_remote_oom_terminal(None, "remote signal 9");
+}
+
+#[test]
+fn exec_remote_bash_oom_optional_measurements_and_unknown_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "true");
+    let task = registry.task(&task_id).unwrap();
+    for (cause, stated, expected) in [
+        (
+            "job_limit",
+            None,
+            "killed: it went over its memory limit; rerun with a larger limit",
+        ),
+        (
+            "job_limit",
+            Some(1536),
+            "killed: it went over its memory limit of 1536 MiB; rerun with a larger limit",
+        ),
+        (
+            "host_oom",
+            None,
+            "killed: the build server ran out of memory, not this job's limit; rerun as is",
+        ),
+        (
+            "future_cause",
+            None,
+            "killed for memory; the build server reported an unrecognized OOM cause",
+        ),
+    ] {
+        let mut record = TerminalRecord::new(id(), Outcome::Signal { signal: 9 }, 1, 0, 0)
+            .with_oom_kill(OomKill::new(cause));
+        if let Some(stated) = stated {
+            record = record.with_memory_stated_mib(stated);
+        }
+        let mut metadata = task.state.lock().unwrap().metadata.clone();
+        metadata.remote.as_mut().unwrap().terminal = Some(record);
+        let oom = remote_oom_kill(&metadata).unwrap();
+        assert_eq!(oom.message(), expected);
+        let structured = serde_json::to_value(&oom).unwrap();
+        assert_eq!(structured["cause"], cause);
+        assert!(structured.get("memory_peak_working_mib").is_none());
+    }
+}
+
 #[test]
 fn remote_admission_progress_lines_are_exact_and_detail_is_plain_text() {
     use exec::types::{Progress, ProgressPhase};
@@ -3376,11 +3517,236 @@ async fn exec_remote_bash_kill_sends_cancel_and_reports_terminal() {
         .any(|(_, b)| b["method"] == "exec.cancel"));
 }
 
+#[tokio::test]
+async fn remote_cancel_before_dispatch_reports_never_started() {
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let daemon = daemon(Script::GatedRoute, "exec-remote/v1").await;
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    wait_for("route setup must hold the job before dispatch", || {
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, body)| body["op"] == "route.open")
+            .then_some(())
+    })
+    .await;
+    let killing = registry.clone();
+    let killed_id = task_id.clone();
+    let operation =
+        tokio::task::spawn_blocking(move || killing.kill(&killed_id, "session").unwrap());
+    wait_for("kill intent must precede remote dispatch", || {
+        registry
+            .task(&task_id)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .cancel_requested
+            .then_some(())
+    })
+    .await;
+    daemon.acceptance_gate.notify_one();
+    let done = operation.await.unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert_eq!(done.remote_job_id, None);
+    assert!(
+        done.output_preview
+            .starts_with("cancelled before remote dispatch to ck-motor; command never started"),
+        "{done:?}"
+    );
+    assert!(!done.output_preview.contains("ran remotely"), "{done:?}");
+    assert!(exec_runs(&daemon).is_empty());
+    assert!(
+        cancel_requests(&daemon).is_empty(),
+        "nothing was submitted to cancel"
+    );
+}
+
 fn cancel_terminal(outcome: Outcome, killed: Option<Killed>, ran: Ran) -> TerminalRecord {
     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
     terminal.killed = killed;
     terminal.ran = Some(ran);
     terminal
+}
+
+#[tokio::test]
+async fn remote_cancel_placement_without_job_id_expires_with_truthful_warning() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::PlacementWait { job_id: false },
+        &["exec-remote/v1", exec::types::PROGRESS_CAPABILITY],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_reattach_budget(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    wait_for("placement progress before cancellation", || {
+        registry
+            .task(&task_id)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .remote_admission_note
+            .clone()
+    })
+    .await;
+    let (pending, _) = timed_kill(&registry, &task_id, Some(Duration::from_millis(250))).await;
+    let pending = pending.unwrap_err();
+    assert!(pending.contains("remote cancellation pending"), "{pending}");
+    assert!(pending.contains(&task_id), "{pending}");
+    assert!(pending.contains("the job may still run"), "{pending}");
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(done.info.task_id, task_id);
+    assert_eq!(done.remote_job_id, None);
+    assert!(
+        done.output_preview
+            .contains("no job id was received, so the job may still run"),
+        "{done:?}"
+    );
+    assert!(
+        done.output_preview
+            .contains("runner confirmation time limit passed"),
+        "{done:?}"
+    );
+    assert!(cancel_requests(&daemon).is_empty());
+}
+
+#[tokio::test]
+async fn remote_cancel_placement_progress_id_cancels_before_acceptance() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::PlacementWait { job_id: true },
+        &["exec-remote/v1", exec::types::PROGRESS_CAPABILITY],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    wait_for(
+        "progress must supply the job id before cancellation",
+        || {
+            registry
+                .status(&task_id, "session", None, None, 0)
+                .unwrap()
+                .remote_job_id
+        },
+    )
+    .await;
+    let task = registry.task(&task_id).unwrap();
+    let saved = read_task(&task.paths.json).unwrap();
+    let remote = saved.remote.unwrap();
+    assert_eq!(remote.job_id, Some(id()));
+    assert!(!remote.accepted);
+    assert_eq!(remote.last_seq, None);
+    let killing = registry.clone();
+    let killed_id = task_id.clone();
+    let done = tokio::task::spawn_blocking(move || killing.kill(&killed_id, "session").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    let expected_job_id = id().to_string();
+    assert_eq!(
+        done.remote_job_id.as_deref(),
+        Some(expected_job_id.as_str())
+    );
+    assert!(
+        done.output_preview
+            .contains("command never started on ck-motor"),
+        "{done:?}"
+    );
+    assert!(!done.output_preview.contains("ran remotely"), "{done:?}");
+    let requests = cancel_requests(&daemon);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["params"]["job_id"], id().to_string());
+    let saved = read_task(&task.paths.json).unwrap();
+    let remote = saved.remote.unwrap();
+    assert!(!remote.accepted, "the fake server never released Accepted");
+    assert_eq!(remote.terminal.unwrap().ran, Some(Ran::None));
+}
+
+#[tokio::test]
+async fn remote_cancel_restart_with_progress_id_cancels_before_acceptance() {
+    let daemon = daemon(Script::PlacementWait { job_id: true }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let mut saved = read_task(&paths.json).unwrap();
+    let remote = saved.remote.as_mut().unwrap();
+    remote.accepted = false;
+    remote.queue_position = None;
+    remote.cancel_requested = true;
+    write_task(&paths.json, &saved).unwrap();
+    original.dual_write_task(&paths, &saved);
+    drop(original);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert!(
+        done.output_preview
+            .contains("command never started on ck-motor"),
+        "{done:?}"
+    );
+    let requests = cancel_requests(&daemon);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["params"]["job_id"], id().to_string());
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.run"));
+}
+
+#[tokio::test]
+async fn remote_cancel_restart_without_job_id_does_not_claim_cancellation() {
+    let daemon = daemon(Script::PlacementWait { job_id: false }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let mut saved = read_task(&paths.json).unwrap();
+    let remote = saved.remote.as_mut().unwrap();
+    remote.accepted = false;
+    remote.job_id = None;
+    remote.queue_position = None;
+    remote.cancel_requested = true;
+    saved.execution_note = None;
+    write_task(&paths.json, &saved).unwrap();
+    original.dual_write_task(&paths, &saved);
+    drop(original);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(done.info.task_id, task_id);
+    assert!(
+        done.output_preview
+            .contains("no job id was received, so the job may still run"),
+        "{done:?}"
+    );
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.run"));
 }
 
 fn cancel_unknown_terminal() -> TerminalRecord {
@@ -3423,6 +3789,13 @@ async fn assert_cancel_terminal(
     if expected == BgTaskStatus::Killed {
         assert_eq!(done.info.status_reason.as_deref(), Some("remote cancel"));
         assert!(!done.output_preview.contains("may still be running"));
+        if record().ran == Some(Ran::None) {
+            assert!(
+                done.output_preview
+                    .contains("command never started on ck-motor"),
+                "{done:?}"
+            );
+        }
     } else {
         assert!(done
             .info
@@ -3542,7 +3915,7 @@ async fn exec_remote_cancel_execution_ended_false_keeps_unknown_warning() {
 }
 
 const TERMINAL_PENDING: &str =
-    "remote cancellation requested; terminal pending; inspect bash_status (never rerun)";
+    "remote cancellation pending for job 0192a64a-1234-7000-8000-000000000001; the job may still run until the build server confirms it stopped; inspect bash_status (never rerun)";
 
 /// Start a remote task on a runner that confirms a cancel but sends the
 /// terminal only once the test releases `completion_gate`, and wait until the
@@ -14505,7 +14878,7 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
 }
 
 #[tokio::test]
-async fn bash_kill_scope_withdraws_submission_before_acceptance() {
+async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
     let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
@@ -14528,43 +14901,50 @@ async fn bash_kill_scope_withdraws_submission_before_acceptance() {
     });
     daemon.wait_for_requests("exec.run", 1).await;
     let pausing = registry.clone();
-    let reply = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            crate::commands::bash_kill_scope::handle_bash_kill_scope(
-                serde_json::json!({"scope":scope}),
-                Some(&scope.owner),
-                &[pausing],
-            )
-        }),
-    )
-    .await
-    .expect("withdrawal must not wait for acceptance")
-    .unwrap();
-    assert!(reply.success, "{reply:?}");
-    let mut expected = case["reply"]["data"].clone();
-    expected["killed"][0]["task_id"] = serde_json::json!(task);
-    assert_eq!(reply.data, expected);
-    wait_for("call-key Cancel must reach the runner", || {
-        daemon
-            .log
+    let operation = tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":scope}),
+            Some(&scope.owner),
+            &[pausing],
+        )
+    });
+    wait_for("owner pause intent must precede acceptance", || {
+        registry
+            .task(&task)
+            .unwrap()
+            .state
             .lock()
             .unwrap()
-            .iter()
-            .any(|(header, _)| header.ty == subc_protocol::FrameType::Cancel)
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .cancel_requested
             .then_some(())
     })
     .await;
-    assert!(
-        !daemon
-            .log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(_, body)| body["method"] == "exec.cancel"),
-        "no job ID was known for exec.cancel"
-    );
+    // Detaching a caller does not cancel the job. Retain the observation until
+    // Accepted supplies an id, then send a real exec.cancel for the owner pause.
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(header, _)| header.ty == subc_protocol::FrameType::Cancel));
+    assert!(exec_cancels(&daemon).is_empty());
     daemon.acceptance_gate.notify_one();
+    let reply = tokio::time::timeout(Duration::from_secs(2), operation)
+        .await
+        .expect("a real cancellation must settle after acceptance")
+        .unwrap();
+    assert!(reply.success, "{reply:?}");
+    let mut expected = case["reply"]["data"].clone();
+    expected["killed"][0]["task_id"] = serde_json::json!(task);
+    expected["killed"][0]["remote"]["job_id"] = serde_json::json!(id());
+    assert_eq!(reply.data, expected);
+    let cancels = exec_cancels(&daemon);
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0]["job_id"], id().to_string());
 }
 
 async fn submission_daemon(
@@ -16233,8 +16613,47 @@ fn expired_gap_unverified_line_is_the_approved_text() {
 }
 
 #[tokio::test]
-async fn runon_return_v3_keeps_default_cap_for_small_or_missing_local_files() {
-    for existing in [false, true] {
+async fn runon_return_over_cap_report_names_the_requested_cap() {
+    for (large, expected_bytes, expected_limit) in [
+        (false, 10_485_760, "10 MiB"),
+        (true, 134_217_728, "128 MiB"),
+    ] {
+        let mut claims = RETURN_CLAIMS.to_vec();
+        if large {
+            claims.push(exec::types::RETURN_LARGE_CAPABILITY);
+        }
+        let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+            Script::ReturnVector("failed-over-cap"),
+            &claims,
+            1,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let (reply, _) = orchestrated_reply(
+            &ctx,
+            &daemon,
+            return_call(&["dist/hello.txt", "dist/large.bin"]),
+        )
+        .await;
+        assert!(reply.success, "{reply:?}");
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["return_max_bytes"], expected_bytes);
+        let output = reply.data["output"].as_str().unwrap();
+        let report = format!(
+            "dist/large.bin: not returned (it would take the total past the {expected_limit} limit)"
+        );
+        assert!(output.contains(&report), "{output}");
+        let task_id = reply.data["task_id"].as_str().unwrap();
+        let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
+        assert!(remote::remote_report(&saved).unwrap().contains(&report));
+    }
+}
+
+#[tokio::test]
+async fn runon_return_v3_uses_advertised_cap_for_new_and_existing_outputs() {
+    for local_bytes in [None, Some(5), Some(5 * 1024 * 1024), Some(6 * 1024 * 1024)] {
         let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
             Script::ReturnVector("two-files-one-empty"),
             &[
@@ -16248,9 +16667,12 @@ async fn runon_return_v3_keeps_default_cap_for_small_or_missing_local_files() {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let ctx = restarted_context(dir.path());
-        if existing {
+        if let Some(bytes) = local_bytes {
             fs::create_dir(dir.path().join("dist")).unwrap();
-            fs::write(dir.path().join("dist/hello.txt"), b"hello").unwrap();
+            fs::File::create(dir.path().join("dist/hello.txt"))
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
         }
         let (reply, _) = orchestrated_reply(
             &ctx,
@@ -16261,15 +16683,15 @@ async fn runon_return_v3_keeps_default_cap_for_small_or_missing_local_files() {
         assert!(reply.success, "{reply:?}");
         let runs = exec_runs(&daemon);
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["return_max_bytes"], 10_485_760);
+        assert_eq!(runs[0]["return_max_bytes"], 134_217_728);
         let task_id = reply.data["task_id"].as_str().unwrap();
         let task = ctx.bash_background().task(task_id).unwrap();
         let saved = read_task(&task.paths.json).unwrap();
         let remote = saved.remote.unwrap();
-        assert_eq!(remote.return_max_bytes, 10_485_760);
+        assert_eq!(remote.return_max_bytes, 134_217_728);
         let restored =
             restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
-        assert_eq!(restored.return_max_bytes, Some(10_485_760));
+        assert_eq!(restored.return_max_bytes, Some(134_217_728));
     }
 }
 

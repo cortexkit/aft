@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -49,6 +50,94 @@ def inline_python(job, name):
 
 
 class NativeReleaseWorkflowTests(unittest.TestCase):
+    def test_self_hosted_release_builds_prepare_node_and_system_python_before_invoking_them(self):
+        jobs = self.workflow("release.yml")["jobs"]
+        native = {name: job for name, job in jobs.items() if "self-hosted" in job.get("runs-on", [])}
+        self.assertEqual(set(native), {"build-darwin-arm64", "build-darwin-x64",
+                                       "build-win32-arm64", "build-win32-x64", "e2e-win32-x64"})
+        for name, job in native.items():
+            with self.subTest(job=name):
+                steps = job["steps"]
+                for action, tool, version in (("actions/setup-node@v5", "node", "24"),
+                                              ("actions/setup-python@v6", "python3", "3.14")):
+                    pattern = r"\bpython(?:3)?\s" if tool == "python3" else r"\bnode\s"
+                    uses = [i for i, step in enumerate(steps) if re.search(pattern, step.get("run", ""))]
+                    if not uses:
+                        self.assertEqual(tool, "python3")
+                        continue
+                    setup = next(i for i, step in enumerate(steps) if step.get("uses") == action)
+                    self.assertLess(setup, uses[0])
+                    key = "node-version" if tool == "node" else "python-version"
+                    self.assertEqual(steps[setup]["with"][key], version)
+                    if tool == "python3":
+                        self.assertEqual(steps[setup]["if"], "runner.environment == 'github-hosted'")
+                native = next(i for i, step in enumerate(steps) if step.get("uses") == "./.github/actions/native-ci-state")
+                first_use = next(i for i, step in enumerate(steps) if re.search(r"\bnode\s", step.get("run", "")))
+                self.assertLess(native, first_use)
+                if name.startswith("build-darwin-"):
+                    self.assertEqual(steps[native]["with"]["phase"], "python")
+
+    def test_windows_release_jobs_reuse_narli_without_mutating_rust_or_the_artifact_contract(self):
+        jobs = self.workflow("release.yml")["jobs"]
+        for job_id, target, name in (("build-win32-arm64", "aarch64-pc-windows-msvc", "Build Windows ARM64"),
+                                      ("build-win32-x64", "x86_64-pc-windows-msvc", "Build Windows x64"),
+                                      ("e2e-win32-x64", "x86_64-pc-windows-msvc", "Shipped E2E (Windows x64)")):
+            with self.subTest(job=job_id):
+                job = jobs[job_id]
+                self.assertEqual(job["name"], name)
+                self.assertEqual(job["runs-on"], ["self-hosted", "narli"])
+                steps = job["steps"]
+                self.assertEqual(steps[1]["uses"], "actions/setup-python@v6")
+                self.assertEqual(steps[2]["uses"], "./.github/actions/native-ci-state")
+                self.assertEqual(steps[2]["with"]["rust-target"], target)
+                for step in steps:
+                    action = step.get("uses", "")
+                    if action.startswith(("dtolnay/rust-toolchain@", "mozilla-actions/sccache-action@", "Swatinem/rust-cache@")):
+                        self.assertEqual(step["if"], "runner.environment == 'github-hosted'")
+                    if action == "oven-sh/setup-bun@v2":
+                        self.assertEqual(step["with"]["no-cache"], "true")
+                    if step.get("run", "").startswith("cargo build"):
+                        self.assertEqual(step["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}")
+                self.assertNotIn("RUSTC_WRAPPER", job.get("env", {}))
+                self.assertNotIn("SCCACHE_GHA_ENABLED", job.get("env", {}))
+                self.assertEqual(steps[-1], {"uses": "./.github/actions/native-ci-state", "if": "always()",
+                                             "with": {"phase": "cleanup"}})
+                if job_id.startswith("build-"):
+                    stage = next(i for i, step in enumerate(steps)
+                                 if step.get("name") == "Stage the built binary for the existing artifact contract")
+                    self.assertIn(f'$env:AFT_CI_TARGET_DIR/{target}/release/aft.exe', steps[stage]["run"])
+                    self.assertIn("Get-FileHash $source", steps[stage]["run"])
+                    upload = next(i for i, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4")
+                    self.assertLess(stage, upload)
+        arm = commands(jobs["build-win32-arm64"])
+        self.assertIn("Hostx64/arm64/cl.exe", arm)
+        self.assertIn("lib/arm64/vcruntime.lib", arm)
+        e2e = jobs["e2e-win32-x64"]
+        self.assertEqual(e2e["steps"][2]["with"]["rust-version"], "${{ needs.build-win32-x64.outputs.rust_version }}")
+        run = next(step for step in e2e["steps"] if step.get("name") == "Run shipped E2E suite")
+        self.assertIn("Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR", run["run"])
+
+    def test_windows_arm64_release_validates_managed_clang_and_actual_coff_target_before_building(self):
+        steps = self.workflow("release.yml")["jobs"]["build-win32-arm64"]["steps"]
+        probe = next(i for i, step in enumerate(steps)
+                     if step.get("name") == "Verify administrator-installed LLVM ARM64 support")
+        build = next(i for i, step in enumerate(steps) if step.get("name") == "Build")
+        self.assertLess(probe, build)
+        self.assertNotIn("if", steps[probe])
+        self.assertNotIn("continue-on-error", steps[probe])
+        self.assertEqual(steps[probe]["shell"], "pwsh")
+        run = steps[probe]["run"]
+        self.assertIn("Get-Command clang -CommandType Application", run)
+        self.assertIn('throw "clang is missing from the runner service PATH', run)
+        self.assertIn("& $clang.Source --version", run)
+        self.assertIn("--target=aarch64-pc-windows-msvc -c $source -o $object", run)
+        self.assertIn("$LASTEXITCODE -ne 0", run)
+        self.assertIn("$env:AFT_CI_JOB_DIR", run)
+        self.assertIn("$bytes[0] -ne 0x64 -or $bytes[1] -ne 0xaa", run)
+        self.assertIn("finally {", run)
+        self.assertIn("Remove-Item -LiteralPath $source, $object", run)
+        self.assertNotRegex(run, r"(?i)\b(winget|choco|scoop|Install-Package|Invoke-WebRequest)\b")
+
     def workflow(self, name):
         return parser.parse_workflow(str(ROOT / ".github/workflows" / name))
 
@@ -70,10 +159,40 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(job["env"]["CARGO_PROFILE_DIR"], "${{ inputs.cargo_profile == 'stage' && 'debug' || 'release' }}")
         self.assertEqual(job["env"]["CARGO_PROFILE_DEV_DEBUG"], "line-tables-only")
         self.assertIn('cargo build --profile "$CARGO_PROFILE"', commands(job))
-        for command in ('codesign -f -s -', 'codesign --verify --strict', '"target/$CARGO_PROFILE_DIR/aft" --version'):
+        for command in ('codesign -f -s -', 'codesign --verify --strict', '"$AFT_CI_TARGET_DIR/$CARGO_PROFILE_DIR/aft" --version'):
             self.assertIn(command, commands(job))
-        run = next(step for step in job["steps"] if step.get("run") == "bash tests/macos-e2e/run.sh")
-        self.assertEqual(run["env"]["AFT_BINARY_PATH"], "${{ github.workspace }}/target/${{ env.CARGO_PROFILE_DIR }}/aft")
+        run = next(step for step in job["steps"] if "bash tests/macos-e2e/run.sh" in step.get("run", "").splitlines())
+        self.assertEqual(run["env"]["AFT_BINARY_PATH"], "${{ env.AFT_CI_TARGET_DIR }}/${{ env.CARGO_PROFILE_DIR }}/aft")
+
+    def test_macos_e2e_reuses_coreutils_without_write_access_to_homebrew(self):
+        source = (ROOT / "tests/macos-e2e/run.sh").read_text()
+        start = source.index('echo "── Installing GNU coreutils')
+        end = source.index("# ---- Install OpenCode", start)
+        for executable in ("timeout", "gtimeout"):
+            with self.subTest(executable=executable), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                tools = root / "bin"
+                tools.mkdir()
+                for name in ("bash", "mkdir", "ln"):
+                    installed = shutil.which(name)
+                    assert installed is not None
+                    (tools / name).symlink_to(installed)
+                executables = {
+                    tools / executable: '#!/bin/sh\nprintf "fixture timeout\\n"\n',
+                    tools / "brew": '#!/bin/sh\necho "brew must not run, even for prefix queries" >&2\nexit 99\n',
+                }
+                for path, content in executables.items():
+                    path.write_text(content)
+                    path.chmod(0o755)
+                result = subprocess.run(
+                    [str(tools / "bash"), "-e", "-c", source[start:end] + "\ntimeout --version\n"],
+                    capture_output=True, text=True,
+                    env={**os.environ, "PATH": str(tools), "RUNNER_TEMP": str(root / "runner-temp")},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("fixture timeout", result.stdout)
+                expected = tools / "timeout" if executable == "timeout" else root / "runner-temp/aft-e2e-tools/timeout"
+                self.assertIn(str(expected), result.stdout)
 
     def test_every_publish_job_requires_shipped_e2e_on_release_sha(self):
         jobs = self.workflow("release.yml")["jobs"]

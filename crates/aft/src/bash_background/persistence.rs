@@ -1920,6 +1920,10 @@ pub struct PersistedTask {
     /// and clears this. Persisted so the notice survives an AFT restart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancelled_call_unannounced: bool,
+    /// Successful completion offers to an acknowledging runner, including the
+    /// first offer. Persisted so reconnect budgets survive daemon restarts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) runner_completion_offers: usize,
     /// The saved folder grants this command's sandbox allowed, so revoking
     /// one can stop it. Persisted so a restarted AFT still knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2018,6 +2022,7 @@ impl PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
+            runner_completion_offers: 0,
             folder_grants: super::registry::folder_grants::for_spawn(),
         };
         crate::gh_shim_ticket::capture_spawn(&metadata);
@@ -2190,6 +2195,7 @@ impl From<BashTaskRow> for PersistedTask {
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
             cancelled_call_unannounced: false,
+            runner_completion_offers: 0,
             folder_grants: None,
         }
     }
@@ -3190,9 +3196,15 @@ where
     update(&mut metadata);
     metadata.schema_version = SCHEMA_VERSION;
     if original_terminal {
+        // Terminal execution facts are immutable; delivery bookkeeping can
+        // still advance as a consumer receives or acknowledges the result.
         let completion_delivered = metadata.completion_delivered;
+        let runner_completion_offers = metadata
+            .runner_completion_offers
+            .max(original.runner_completion_offers);
         metadata = original;
         metadata.completion_delivered = completion_delivered;
+        metadata.runner_completion_offers = runner_completion_offers;
         metadata.schema_version = SCHEMA_VERSION;
     }
     write_task_at(task, &metadata)?;

@@ -210,6 +210,29 @@ jobs:
     with:
       cargo_profile: stage
 
+  # Archives stay on their producing machine until every consumer succeeds;
+  # failed-job retries still need the successful producers from the same run.
+  # Cargo's target directory is deliberately not part of this cleanup.
+  native-ci-cleanup:
+    name: Clean native CI state (${{ matrix.machine }})
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    needs: [unit, e2e]
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: [rented-mac, narli]
+    runs-on: [self-hosted, "${{ matrix.machine }}"]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          python-version: "3.14"
+      - uses: ./.github/actions/native-ci-state
+        with:
+          phase: ${{ needs.unit.result == 'success' && needs.e2e.result == 'success' && 'finalize' || 'cleanup' }}
+
   search-quality-binary:
     name: Search quality binary (Linux x64)
     if: ${{ github.event_name != 'pull_request' }}

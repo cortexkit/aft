@@ -1,6 +1,9 @@
 mod cli;
 mod standalone_input;
 
+#[cfg(test)]
+mod backup_bookkeeping_dispatch_tests;
+
 /// Every heap allocation of the binary passes through the tracer, which
 /// names the operation behind a large allocation or a burst of many.
 #[global_allocator]
@@ -1484,6 +1487,7 @@ fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
     dispatch_config_probe_for_test(ctx);
     let (watcher_pending, callgraph_pending) =
         aft::response_finalize::query_pending(ctx, &req.command);
+    let backup_bookkeeping = !aft::run_tool_call::is_read_only_request(&req);
     let mut response = dispatch_command(req, ctx);
     aft::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
     aft::response_finalize::attach_callgraph_pending_gaps(
@@ -1492,7 +1496,9 @@ fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
     );
     // Every mutation this request made is on disk now; record what it left so
     // a later undo can tell AFT's own result from a change made outside AFT.
-    ctx.backup().lock().record_post_mutation_states();
+    if backup_bookkeeping {
+        ctx.backup().lock().record_post_mutation_states();
+    }
     response
 }
 

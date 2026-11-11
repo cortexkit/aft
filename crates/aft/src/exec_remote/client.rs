@@ -347,21 +347,6 @@ impl ExecRemoteClient {
         self.attach(point).await
     }
 
-    /// Attempt call-key cancellation even before Accepted assigns a job ID.
-    /// Unsubscribe closes the local receiver and sends Cancel best-effort;
-    /// a subsequent status round trip keeps the transport alive to send it
-    /// before the task's runtime shuts down. Neither sending Cancel nor receiving
-    /// the status reply proves termination.
-    /// Without a job ID, terminal recovery still has to report unknown.
-    #[cfg(unix)]
-    pub(crate) async fn cancel_submission(&self, stream: &RemoteStream) -> Result<(), Error> {
-        stream
-            .subscription
-            .unsubscribe()
-            .map_err(Error::Transport)?;
-        self.status().await.map(|_| ())
-    }
-
     /// Idempotent cancellation by job ID after a caller restart or detach.
     /// The acknowledgement is not a terminal; follow it with `attach`.
     pub async fn cancel_job(&self, job_id: Uuid) -> Result<CancelReply, Error> {
@@ -485,7 +470,7 @@ impl RemoteStream {
             if let Err(error) = self.subscription.closed().await {
                 // Only this typed submit refusal proves no job was created. A
                 // record (including acceptance) rules out resubmitting the call.
-                if !self.received_frame && self.consumer.resume_point().is_none() {
+                if !self.received_frame && self.consumer.known_job_id().is_none() {
                     if let Some((client, request)) = self.return_retry.take() {
                         if let Some(maximum) = refused_return_cap(&error, &request) {
                             let request = request.with_return_max_bytes(maximum);

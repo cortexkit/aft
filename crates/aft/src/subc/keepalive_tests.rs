@@ -83,6 +83,7 @@ impl Harness {
                     QuiescedLsp::ReapInBackground,
                     None,
                     None,
+                    None,
                 ))
         });
         assert_eq!(

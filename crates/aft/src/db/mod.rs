@@ -39,7 +39,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 28;
+pub const CURRENT_SCHEMA_VERSION: u32 = 29;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -70,6 +70,7 @@ const MIGRATION_VERSIONS: &[u32] = &[
     26,
     access_grant_rows::SCHEMA_VERSION,
     access_grant_rows::SOURCE_SCHEMA_VERSION,
+    call_ledger::CARRIER_CUSTODY_SCHEMA_VERSION,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -1057,6 +1058,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         26 => conn.execute_batch(catalog_edit_modes::MIGRATION),
         access_grant_rows::SCHEMA_VERSION => access_grant_rows::migrate(conn),
         access_grant_rows::SOURCE_SCHEMA_VERSION => access_grant_rows::migrate_source(conn),
+        call_ledger::CARRIER_CUSTODY_SCHEMA_VERSION => call_ledger::migrate_carrier_custody(conn),
         _ => Ok(()),
     }
 }

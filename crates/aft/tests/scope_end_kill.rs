@@ -1091,7 +1091,7 @@ async fn nondefinitive_answers_retry_without_killing_and_detached_result_is_once
     let page = loop {
         let page = body(
             &daemon
-                .call(2, json!({"name":"late_results","arguments":{}}))
+                .call(3, json!({"name":"late_results","arguments":{}}))
                 .await,
         );
         if !page["entries"].as_array().unwrap().is_empty() {
@@ -1107,6 +1107,7 @@ async fn nondefinitive_answers_retry_without_killing_and_detached_result_is_once
     assert_eq!(page["entries"].as_array().unwrap().len(), 1);
     assert_eq!(page["entries"][0]["call_key"], "natural");
     assert_eq!(page["entries"][0]["kind"], "result");
+    assert_eq!(page["entries"][0]["custodian"], "reserved:carrier");
     // The module named "carrier" is not in AFT's trusted consumer list,
     // so its wire result omits structured status. Empty command output
     // renders only the task marker; the persisted task record proves the exit.
@@ -1117,22 +1118,24 @@ async fn nondefinitive_answers_retry_without_killing_and_detached_result_is_once
         .1;
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["exit_code"], 0);
-    let carrier = body(
+    let owner = body(
         &daemon
-            .call(3, json!({"name":"late_results","arguments":{}}))
+            .call(2, json!({"name":"late_results","arguments":{}}))
             .await,
     );
-    assert_eq!(carrier["entries"], json!([]));
-    daemon
+    assert_eq!(owner["entries"], json!([]));
+    let ack = daemon
         .call(
-            2,
+            3,
             json!({"name":"late_results.ack","arguments":{"through":page["cursor"]}}),
         )
         .await;
+    assert_eq!(ack.header.ty, FrameType::Response);
+    assert_eq!(body(&ack), json!({}));
     assert_eq!(
         body(
             &daemon
-                .call(2, json!({"name":"late_results","arguments":{}}))
+                .call(3, json!({"name":"late_results","arguments":{}}))
                 .await
         )["entries"],
         json!([])

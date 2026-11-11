@@ -831,6 +831,7 @@ fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
         compressed_tokens: None,
         tokens_skipped: false,
         status_reason: None,
+        remote_oom_kill: None,
         output_incomplete: false,
         live_descendants: Some(Vec::new()),
         live_descendants_omitted: 0,

@@ -241,13 +241,175 @@ fn relative_files(root: &Path, files: Vec<String>) -> Vec<String> {
     files
 }
 
+/// Two ready repositories, then beta's checkout replaced by the existing
+/// refusing-executor fixture so it stays building without a timing race.
+fn with_loading_child(run: impl FnOnce(&AppContext, &Path, &Path)) {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    for name in ["alpha", "beta"] {
+        init_repo(&root.join(name), name);
+    }
+    let parent = {
+        let _git = crate::test_env::hermetic_git_env_guard();
+        configure(&root, &storage, true, false)
+    };
+    let session = parent_session(&parent);
+    session.pause_refresh(true);
+    settled(
+        || grep(&parent, COMMON),
+        |reply| reply["index_status"] == "Ready" && matched_files(reply).len() == 4,
+    );
+    let (refusing, _executor, _unbound, _dir) = refusing_executor();
+    let held_storage = base.join("held-storage");
+    std::fs::create_dir_all(&held_storage).unwrap();
+    let held = DataCheckout::open(&root.join("beta"), &held_storage, Some(refusing)).unwrap();
+    parent
+        .data_children()
+        .insert_for_test(session.root(), &root.join("beta"), held);
+    run(&parent, &root, &storage);
+}
+
+#[test]
+fn parent_loading_child_walks_until_ready_then_returns_to_indexed_grep_and_glob() {
+    with_loading_child(|parent, root, storage| {
+        let expected = [
+            "alpha/src/lib.rs",
+            "alpha/src/util.rs",
+            "beta/src/lib.rs",
+            "beta/src/util.rs",
+        ];
+        let loading = grep(parent, COMMON);
+        assert_eq!(
+            relative_files(root, matched_files(&loading)),
+            expected,
+            "{loading:#}"
+        );
+        assert_eq!(loading["complete"], true, "{loading:#}");
+        assert!(gaps(&loading).is_empty(), "{loading:#}");
+        assert_eq!(loading["index_status"], "Building");
+        assert_eq!(loading["fallback"], "filesystem");
+        assert_eq!(loading["files_read_directly"], 4);
+        assert!(
+            loading["text"]
+                .as_str()
+                .unwrap()
+                .contains("[index: building; searched all 4 files directly]"),
+            "{loading:#}"
+        );
+
+        let loading_glob = glob(parent, "**/*.rs");
+        let files = |reply: &Value| {
+            relative_files(
+                root,
+                reply["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|file| file.as_str().unwrap().replace('\\', "/"))
+                    .collect(),
+            )
+        };
+        assert_eq!(files(&loading_glob), expected, "{loading_glob:#}");
+        assert_eq!(loading_glob["complete"], true, "{loading_glob:#}");
+        assert_eq!(loading_glob["fallback"], "filesystem");
+        assert!(gaps(&loading_glob).is_empty());
+        assert_eq!(
+            files(&glob(parent, "beta/src/*.rs")),
+            ["beta/src/lib.rs", "beta/src/util.rs"]
+        );
+
+        // Restoring a normally scheduled checkout must restore the ready path,
+        // not keep walking beta after its text view is available.
+        let ready = DataCheckout::open(&root.join("beta"), storage, None).unwrap();
+        parent
+            .data_children()
+            .insert_for_test(root, &root.join("beta"), ready);
+        let indexed = settled(
+            || grep(parent, COMMON),
+            |reply| reply["index_status"] == "Ready",
+        );
+        assert_eq!(
+            relative_files(root, matched_files(&indexed)),
+            expected,
+            "{indexed:#}"
+        );
+        assert_eq!(indexed["complete"], true);
+        assert_eq!(indexed["files_read_directly"], 0);
+        assert!(indexed["fallback"].is_null());
+        assert!(gaps(&indexed).is_empty());
+        assert!(!indexed["text"].as_str().unwrap().contains("[index:"));
+        let indexed_glob = glob(parent, "**/*.rs");
+        assert_eq!(files(&indexed_glob), expected, "{indexed_glob:#}");
+        assert_eq!(indexed_glob["complete"], true);
+        assert!(indexed_glob["fallback"].is_null());
+        assert!(gaps(&indexed_glob).is_empty());
+    });
+}
+
+fn assert_gap_leads(reply: &Value, child: &str) {
+    assert_eq!(reply["complete"], false, "{reply:#}");
+    let gaps = child_gaps(reply);
+    assert_eq!(gaps.len(), 1, "{reply:#}");
+    assert_eq!(gaps[0]["path"], child, "{reply:#}");
+    let block = format!(
+        "(Parent folder: not covered by this answer:\n- {child}: {})\n\n",
+        gaps[0]["reason"].as_str().unwrap()
+    );
+    assert!(
+        reply["text"].as_str().unwrap().starts_with(&block),
+        "{reply:#}"
+    );
+}
+
+#[test]
+fn parent_loading_child_failed_walk_is_a_gap_before_zero_matches() {
+    with_loading_child(|parent, root, _| {
+        std::fs::remove_dir_all(root.join("beta")).unwrap();
+        let reply = grep(parent, "TOKEN_NOT_IN_EITHER_REPOSITORY");
+        assert_gap_leads(&reply, "beta");
+        assert_eq!(reply["total_matches"], 0);
+        assert!(!reply["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Found 0 matches"));
+        assert!(!child_gaps(&reply)[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("still loading"));
+        assert_gap_leads(&glob(parent, "**/*.missing"), "beta");
+    });
+}
+
+#[test]
+fn parent_loading_child_bounded_walk_keeps_matches_and_reports_a_gap() {
+    with_loading_child(|parent, _, _| {
+        crate::grep_executor::with_walk_limit(0, || {
+            let reply = grep(parent, COMMON);
+            assert_gap_leads(&reply, "beta");
+            assert_eq!(matched_files(&reply).len(), 2, "{reply:#}");
+            assert_eq!(reply["walk_stopped_by"], "file_limit");
+            assert!(child_gaps(&reply)[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("fallback walk stops at 0 files"));
+            let glob_reply = glob(parent, "**/*.rs");
+            assert_gap_leads(&glob_reply, "beta");
+            assert_eq!(glob_reply["files"].as_array().unwrap().len(), 2);
+            assert_eq!(glob_reply["walk_truncated"], true);
+        });
+    });
+}
+
 /// A folder of 66 repositories: `alpha`, `beta` and `gamma` committed
 /// crates, `building` and `failed` crates whose checkouts never finish a
 /// build, and 61 bare folders, the last two past the 64-repository cap. With
 /// the data layer on, the parent answers grep, glob and the call graph from
-/// each served child's own checkout, built on first use, with named gaps for
-/// a child still building, a child whose build failed, the children past the
-/// cap and the files outside every child.
+/// each served child's own checkout, built on first use. Grep and glob walk
+/// the building child; failed children, children past the cap and files outside
+/// every child remain named gaps.
 #[test]
 fn a_parent_folder_answers_from_its_childrens_checkouts() {
     crate::data_layer::parent_session::set_default_refresh_interval(Duration::from_millis(100));
@@ -289,17 +451,14 @@ fn a_parent_folder_answers_from_its_childrens_checkouts() {
     }
     let failure = "AFT could not scan this checkout: the fixture's build failed".to_string();
 
-    let named = vec![
-        child_gap("building", Plane::<()>::Loading.gap_reason("trigram")),
-        child_gap(
-            "failed",
-            Plane::<()>::Gap(failure.clone()).gap_reason("trigram"),
-        ),
-    ];
+    let named = vec![child_gap(
+        "failed",
+        Plane::<()>::Gap(failure.clone()).gap_reason("trigram"),
+    )];
     // Every other child builds its checkout on first use.
     let data_grep = settled(|| grep(&parent, COMMON), |reply| child_gaps(reply) == named);
     // `init_repo` writes COMMON once in each crate's src/lib.rs and once in
-    // its src/util.rs; `building` and `failed` cannot answer.
+    // its src/util.rs; `building` answers by walking, but `failed` cannot answer.
     assert_eq!(
         relative_files(&root, matched_files(&data_grep)),
         [
@@ -307,6 +466,8 @@ fn a_parent_folder_answers_from_its_childrens_checkouts() {
             "alpha/src/util.rs",
             "beta/src/lib.rs",
             "beta/src/util.rs",
+            "building/src/lib.rs",
+            "building/src/util.rs",
             "gamma/src/lib.rs",
             "gamma/src/util.rs",
         ],
@@ -356,6 +517,8 @@ fn a_parent_folder_answers_from_its_childrens_checkouts() {
             "alpha/src/util.rs",
             "beta/src/lib.rs",
             "beta/src/util.rs",
+            "building/src/lib.rs",
+            "building/src/util.rs",
             "gamma/src/lib.rs",
             "gamma/src/util.rs",
         ],
@@ -522,11 +685,10 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     assert!(executor.register_actor(root_id, Arc::clone(&parent)));
     parent.mark_subc_unbound();
 
-    let loading = vec![
-        child_gap("one", Plane::<()>::Loading.gap_reason("trigram")),
-        child_gap("two", Plane::<()>::Loading.gap_reason("trigram")),
-    ];
-    assert_eq!(child_gaps(&grep(&parent, COMMON)), loading);
+    let loading = grep(&parent, COMMON);
+    assert!(child_gaps(&loading).is_empty(), "{loading:#}");
+    assert_eq!(matched_files(&loading).len(), 4, "{loading:#}");
+    assert_eq!(loading["index_status"], "Building", "{loading:#}");
     std::thread::sleep(Duration::from_millis(500));
     let bound = parent.data_children().bound_for_test();
     assert_eq!(bound.len(), 2);
@@ -534,12 +696,14 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
         bound.iter().all(|checkout| checkout.view().is_none()),
         "a child of an unbound parent root was built"
     );
-    assert_eq!(child_gaps(&grep(&parent, COMMON)), loading);
+    let still_loading = grep(&parent, COMMON);
+    assert!(child_gaps(&still_loading).is_empty(), "{still_loading:#}");
+    assert_eq!(still_loading["index_status"], "Building");
 
     parent.mark_subc_bound();
     let served = settled(
         || grep(&parent, COMMON),
-        |reply| reply.get("gaps").is_none() && matched_files(reply).len() == 4,
+        |reply| reply["index_status"] == "Ready" && matched_files(reply).len() == 4,
     );
     assert_eq!(served["complete"], true, "{served:#}");
 

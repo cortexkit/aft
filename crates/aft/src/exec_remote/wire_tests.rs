@@ -224,6 +224,11 @@ pub(crate) enum Script {
     GatedAdmission {
         refuse: bool,
     },
+    /// Release acceptance separately from placement progress, optionally carrying
+    /// a job id. Only exec.cancel stops the job; attach confirms it never ran.
+    PlacementWait {
+        job_id: bool,
+    },
     /// Delay route opening before the client can submit exec.run.
     GatedRoute,
     /// Drop the connection on the first `exec.run`, before any stream record:
@@ -523,6 +528,30 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(reply(FrameType::StreamEnd, Value::Null));
                             }
                         }
+                        "exec.run" | "exec.attach" if matches!(script, Script::PlacementWait { .. }) => {
+                            if body["method"] == "exec.run" {
+                                assert_eq!(body["params"]["progress"], true);
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Progress(
+                                    match script {
+                                        Script::PlacementWait { job_id: true } => Progress::new(ProgressPhase::PlacementWait, 0, Some("waiting for a host with 8 free vCPUs".into())).unwrap().with_job_id(id()),
+                                        _ => Progress::new(ProgressPhase::PlacementWait, 26 * 60 * 1000, Some("waiting for a host with 8 free vCPUs".into())).unwrap(),
+                                    }
+                                )).unwrap()));
+                                let accepted = reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap());
+                                let writer = writer.clone();
+                                let gate = server_acceptance_gate.clone();
+                                producers.push(tokio::spawn(async move {
+                                    gate.notified().await;
+                                    let _ = subc_transport::write_frame(&mut *writer.lock().await, &accepted).await;
+                                }));
+                            } else {
+                                assert_eq!(body["params"]["job_id"], id().to_string());
+                                let mut terminal = TerminalRecord::new(id(), if cancelled { Outcome::Cancelled } else { Outcome::OutcomeUnknown }, 0, 0, 0);
+                                terminal.ran = Some(Ran::None);
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap()));
+                                replies.push(reply(FrameType::StreamEnd, Value::Null));
+                            }
+                        }
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
@@ -721,7 +750,7 @@ pub(crate) async fn daemon_with_capabilities(
                         _ => panic!("unexpected caller operation {body}"),
                     }
                 },
-                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. }) => {},
+                FrameType::Cancel if matches!(script, Script::DetachSafeStages { .. } | Script::PlacementWait { .. }) => {},
                 FrameType::Cancel => {cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst);},
                 _ => {},
             }
@@ -2091,6 +2120,17 @@ async fn empty_attach_reports_no_frames_and_keeps_accepted_resume_point() {
         "StreamEnd alone must not reset the empty-attach budget"
     );
     assert_eq!(attached.resume_point(), Some(point));
+}
+
+#[tokio::test]
+async fn return_cap_defaults_to_10_mib_without_chunked_returns() {
+    let daemon = daemon(
+        Script::ReturnVector("two-files-one-empty"),
+        client::CAPABILITY,
+    )
+    .await;
+    let client = client(&daemon).await;
+    assert_eq!(client.return_max_bytes().await.unwrap(), 10_485_760);
 }
 
 #[tokio::test]

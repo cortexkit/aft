@@ -68,10 +68,18 @@ pub fn handle_ack(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(error) => return Response::error(&req.id, "pattern_ack_failed", error),
         }
     }
+    let acked_task_ids =
+        background.ack_completions_for_session(Some(req.session()), &params.task_ids);
+    let ignored_task_ids: Vec<_> = params
+        .task_ids
+        .iter()
+        .filter(|task| !acked_task_ids.contains(task))
+        .collect();
     Response::success(
         &req.id,
         json!({
-            "acked_task_ids": background.ack_completions_for_session(Some(req.session()), &params.task_ids),
+            "acked_task_ids": acked_task_ids,
+            "ignored_task_ids": ignored_task_ids,
             "acked_matches": acked_matches,
         }),
     )

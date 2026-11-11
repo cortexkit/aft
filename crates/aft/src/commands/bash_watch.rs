@@ -306,6 +306,7 @@ pub(crate) fn handle_deferred_with_observation_only(
 #[derive(Default)]
 pub(crate) struct YieldSignal {
     requested: AtomicBool,
+    pub(crate) restart: std::sync::Mutex<crate::subc::call_yield::WatchRestart>,
 }
 
 impl YieldSignal {
@@ -367,6 +368,10 @@ pub(crate) fn handle_deferred_yieldable(
             return DispatchOutcome::Immediate(Response::error(&id, "invalid_request", message))
         }
     };
+    let (budget, limit_ms) = yield_signal
+        .as_ref()
+        .and_then(|signal| crate::subc::call_yield::watch_resume_timing(signal))
+        .unwrap_or((budget, limit_ms));
     let session = req.session().to_string();
     let shell_tool = req.host_tool_names().shell().to_string();
     let registry = ctx.bash_background().clone();
@@ -395,6 +400,9 @@ pub(crate) fn handle_deferred_yieldable(
     let thread_id = id.clone();
     let ask_route = crate::access_policy::capture_ask_route();
     let grant_scope = crate::access_policy::current_scope();
+    let restart_wait = yield_signal.as_ref().map(|_| {
+        crate::subc::call_yield::WatchWait::new(Arc::clone(&ctx), req.clone(), budget, limit_ms)
+    });
     if let Err(error) = crate::bash_background::worker_thread::spawn(
         crate::bash_background::worker_thread::Worker::Watch,
         move || {
@@ -413,7 +421,12 @@ pub(crate) fn handle_deferred_yieldable(
                         project_root.as_deref(),
                         harness.as_deref(),
                     ) {
-                        let _ = tx.send(Response::error(&thread_id, "task_recovery_failed", error));
+                        let response = Response::error(&thread_id, "task_recovery_failed", error);
+                        if !yield_signal.as_ref().is_some_and(|signal| {
+                            crate::subc::call_yield::watch_finished(signal, &response)
+                        }) {
+                            let _ = tx.send(response);
+                        }
                         return;
                     }
                 }
@@ -433,12 +446,20 @@ pub(crate) fn handle_deferred_yieldable(
                     yield_signal,
                 };
                 if watch.observed_status(0).is_none() {
-                    let _ = tx.send(Response::error(
+                    let response = Response::error(
                         &thread_id,
                         "task_not_found",
                         format_unknown_polled_task_message(&watch.task_id, &shell_tool),
-                    ));
+                    );
+                    if !watch.yield_signal.as_ref().is_some_and(|signal| {
+                        crate::subc::call_yield::watch_finished(signal, &response)
+                    }) {
+                        let _ = tx.send(response);
+                    }
                     return;
+                }
+                if let (Some(signal), Some(wait)) = (&watch.yield_signal, restart_wait) {
+                    crate::subc::call_yield::watch_waiting(signal, wait);
                 }
                 let Some(waited) = watch.wait(&worker_cancellation) else {
                     // Cancelled: the transport already answered the call.
@@ -449,6 +470,17 @@ pub(crate) fn handle_deferred_yieldable(
                 // the record disappears while the watch is waiting.
                 let snapshot = watch.observed_status(PREVIEW_BYTES);
                 let response = match snapshot {
+                    Some(snapshot)
+                        if snapshot.info.status == BgTaskStatus::FateUnknown
+                            && watch.yield_signal.as_ref().is_some_and(|signal| {
+                                crate::subc::call_yield::watch_is_held(signal)
+                            }) =>
+                    {
+                        crate::subc::call_yield::watch_unknown(
+                            watch.yield_signal.as_ref().unwrap(),
+                        );
+                        return;
+                    }
                     Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
                     None => Response::error(
                         &thread_id,
@@ -456,6 +488,12 @@ pub(crate) fn handle_deferred_yieldable(
                         format_unknown_polled_task_message(&watch.task_id, &shell_tool),
                     ),
                 };
+                if watch.yield_signal.as_ref().is_some_and(|signal| {
+                    crate::subc::call_yield::watch_finished(signal, &response)
+                }) {
+                    let _ = tx.send(response);
+                    return;
+                }
                 let _ = tx.send(response);
             })
         },
@@ -549,7 +587,11 @@ impl WatchJob {
             scan_incomplete: false,
         };
         loop {
-            if cancellation.cancel_already_requested() {
+            let held = self
+                .yield_signal
+                .as_ref()
+                .is_some_and(|signal| crate::subc::call_yield::watch_is_held(signal));
+            if cancellation.cancel_already_requested() && !held {
                 return None;
             }
             // A worker waiting on its task keeps the task's default hard kill
@@ -638,7 +680,14 @@ impl WatchJob {
                 poll_delay(started.elapsed()).min(deadline - now)
             }
             .min(self.budget.deadline - now);
-            if cancellation.wait_for_cancellation(pause) {
+            if held {
+                std::thread::sleep(pause);
+            } else if cancellation.wait_for_cancellation(pause)
+                && !self
+                    .yield_signal
+                    .as_ref()
+                    .is_some_and(|signal| crate::subc::call_yield::watch_is_held(signal))
+            {
                 return None;
             }
         }

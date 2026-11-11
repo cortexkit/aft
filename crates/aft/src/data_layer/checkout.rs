@@ -332,6 +332,9 @@ pub struct Checkout {
     /// let go. A memory figure walked at one value stays right until it
     /// moves (see [`Self::memory_epoch`]).
     memory_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Wakes readers at publication, including the text-only publication
+    /// that precedes the rest of a checkout's first build.
+    readiness: (Mutex<u64>, std::sync::Condvar),
 }
 
 /// A checkout's call graph kept up to date between publications.
@@ -897,6 +900,7 @@ impl Checkout {
             engine,
             recording: Mutex::new(()),
             memory_epoch,
+            readiness: (Mutex::new(0), std::sync::Condvar::new()),
         };
         handle.adopt_newest()?;
         Ok(handle)
@@ -951,7 +955,47 @@ impl Checkout {
             sink.finish(),
         );
         debug_assert!(applied, "the recording lock keeps the publication");
+        self.notify_readiness_change();
         Ok(())
+    }
+
+    pub(crate) fn readiness_generation(&self) -> u64 {
+        *self
+            .readiness
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Capture the generation before checking readiness, then wait with no
+    /// checkout or writer lock held. A publication between the check and this
+    /// wait changes the generation, so its wake cannot be lost.
+    pub(crate) fn wait_for_readiness_change(
+        &self,
+        generation: &mut u64,
+        wait: std::time::Duration,
+    ) {
+        let guard = self
+            .readiness
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = self
+            .readiness
+            .1
+            .wait_timeout_while(guard, wait, |current| *current == *generation)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = *guard;
+    }
+
+    pub(crate) fn notify_readiness_change(&self) {
+        let mut generation = self
+            .readiness
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.wrapping_add(1);
+        self.readiness.1.notify_all();
     }
 
     /// The checkout's root folder.
@@ -1089,6 +1133,8 @@ impl Checkout {
                 }
             }
         }
+        drop(live);
+        self.notify_readiness_change();
     }
 
     /// Whether the checkout needs a build: nothing is published, or what is
@@ -2042,6 +2088,7 @@ impl Checkout {
                 .map(|(path, _)| path)
                 .collect::<Vec<_>>()
         };
+        self.notify_readiness_change();
         // Paths reported before anything was published, after the scan
         // started: the scan may have read them before they changed.
         self.record_paths(&late)?;

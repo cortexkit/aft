@@ -21,6 +21,7 @@
       {
         "agent_id": "agent-alf",
         "card_ref": "acc_2",
+        "ends_with_holder": true,
         "granted_at_ms": 1000000,
         "holder": {
           "agent_id": "agent-alf",
@@ -36,6 +37,7 @@
       },
       {
         "agent_id": "agent-alf",
+        "ends_with_holder": true,
         "granted_at_bound": "at_or_before",
         "granted_at_ms": 1000000,
         "holder": {
@@ -52,6 +54,7 @@
       },
       {
         "agent_id": "agent-alf",
+        "ends_with_holder": true,
         "granted_at_ms": 1000000,
         "holder": {
           "agent_id": "agent-alf",

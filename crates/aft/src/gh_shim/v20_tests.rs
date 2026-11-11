@@ -63,10 +63,11 @@ fn write_jq_fixture(directory: &std::path::Path) {
     #[cfg(windows)]
     {
         // Model text-mode jq output and an older jq that lacks the binary flag.
+        // The child has no PATH; locate the stdin drain through SystemRoot.
         std::fs::write(directory.join("output.bin"), b"A\r\r\nB\r\n").unwrap();
         std::fs::write(
             directory.join("jq.cmd"),
-            "@echo off\r\nif \"%~1\"==\"--binary\" exit /b 2\r\nmore >nul\r\ntype \"%~dp0\\output.bin\"\r\n",
+            "@echo off\r\nif \"%~1\"==\"--binary\" exit /b 2\r\n\"%SystemRoot%\\System32\\more.com\" >nul\r\ntype \"%~dp0\\output.bin\"\r\n",
         )
         .unwrap();
     }
@@ -81,6 +82,7 @@ fn write_jq_fixture(directory: &std::path::Path) {
         .unwrap();
     }
 }
+
 fn reply(value: Value) -> ReadReply {
     ReadReply::Get(GetReply {
         status: 200,
@@ -1866,7 +1868,16 @@ fn audit_jq_child_receives_no_operator_credential_environment() {
         None => std::env::remove_var(key),
     }
     result.unwrap();
-    assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), json!({}));
+    let environment = serde_json::from_slice::<Value>(&output).unwrap();
+    #[cfg(windows)]
+    let expected = json!({
+        "SystemRoot": std::env::var("SystemRoot").expect("Windows SystemRoot"),
+        "WINDIR": std::env::var("WINDIR").expect("Windows WINDIR"),
+    });
+    #[cfg(not(windows))]
+    let expected = json!({});
+    assert_eq!(environment, expected);
+    assert!(environment.get("GH_TOKEN").is_none());
 }
 
 #[test]

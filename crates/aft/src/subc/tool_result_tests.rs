@@ -265,6 +265,7 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
             QuiescedLsp::ReapInBackground,
             None,
             None,
+            None,
         ))
     });
     async fn receive(daemon: &mut tokio::io::DuplexStream, channel: u16, corr: u64) -> Frame {
@@ -480,6 +481,7 @@ async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_
                 None,
                 &module_root.join("storage"),
                 QuiescedLsp::ReapInBackground,
+                None,
                 None,
                 None,
             ))
@@ -826,6 +828,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
             QuiescedLsp::ReapInBackground,
             None,
             None,
+            None,
         ))
     });
     async fn receive(daemon: &mut tokio::io::DuplexStream, channel: u16, corr: u64) -> Frame {
@@ -998,6 +1001,7 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
             None,
             &module_root.join("storage"),
             QuiescedLsp::ReapInBackground,
+            None,
             None,
             None,
         ))

@@ -1,0 +1,138 @@
+name: Native CI state
+description: Keep native build outputs outside checkout and clean leaked test processes
+inputs:
+  phase:
+    description: setup, cleanup, finalize, or python (interpreter validation only)
+    default: setup
+  rust-target:
+    description: Required preinstalled target on the read-only Windows toolchain
+    default: x86_64-pc-windows-msvc
+  rust-version:
+    description: Require this Rust version when consuming a release producer's bytes
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Validate system Python on the native runner
+      if: runner.environment == 'self-hosted'
+      shell: bash
+      run: |
+        set -euo pipefail
+        probe='import os, sys
+        if sys.version_info < (3, 14):
+            raise SystemExit("Python " + sys.version.split()[0] + " is older than required 3.14")
+        print(sys.executable.replace("\\", "/"))
+        print(os.path.normcase(os.path.realpath(sys.base_prefix)).replace("\\", "/"))
+        print(sys.version.replace("\n", " "))'
+        report=""
+        failures=""
+        for candidate in python3.14 python3 python; do
+          if command -v "$candidate" >/dev/null 2>&1; then
+            if report="$("$candidate" -B -c "$probe" 2>&1)"; then
+              break
+            fi
+            failures="${failures}${candidate}: ${report}; "
+            report=""
+          fi
+        done
+        if [[ -z "$report" && "$RUNNER_OS" == Windows ]] && command -v py >/dev/null 2>&1; then
+          if ! report="$(py -3.14 -B -c "$probe" 2>&1)"; then
+            failures="${failures}py -3.14: ${report}; "
+            report=""
+          fi
+        fi
+        if [[ -z "$report" ]]; then
+          echo "::error::System Python 3.14+ is required. Ask the runner administrator to install it with matching python and python3 aliases. Found: ${failures:-no Python command on PATH}"
+          exit 1
+        fi
+        report="${report//$'\r'/}"
+        executable="${report%%$'\n'*}"
+        identity="${report#*$'\n'}"
+        directory="${executable%/*}"
+        export PATH="$directory:$PATH"
+        for alias in python python3; do
+          if ! command -v "$alias" >/dev/null 2>&1; then
+            echo "::error::Missing $alias beside $executable; the administrator must provide python and python3 for the same Python 3.14+ installation."
+            exit 1
+          fi
+          if ! actual="$("$alias" -B -c "$probe" 2>&1)"; then
+            echo "::error::$alias does not run Python 3.14+: $actual. Ask the administrator to repair the system Python aliases."
+            exit 1
+          fi
+          actual="${actual//$'\r'/}"
+          if [[ "${actual#*$'\n'}" != "$identity" ]]; then
+            echo "::error::$alias resolves to a different Python installation or build than $executable. Ask the administrator to repair the system Python aliases."
+            exit 1
+          fi
+          printf 'System %s: %s\n' "$alias" "$actual"
+        done
+        if [[ -d "$directory/Scripts" ]]; then
+          printf '%s\n' "$directory/Scripts" >> "$GITHUB_PATH"
+        fi
+        printf '%s\n' "$directory" >> "$GITHUB_PATH"
+        printf 'AFT_CI_PYTHON=%s\n' "$executable" >> "$GITHUB_ENV"
+    - if: inputs.phase != 'python'
+      shell: bash
+      env:
+        AFT_CI_PHASE: ${{ inputs.phase }}
+      run: |
+        if [[ -n "${AFT_CI_PYTHON:-}" ]]; then
+          python="$AFT_CI_PYTHON"
+        elif command -v python3 >/dev/null 2>&1; then
+          python=python3
+        else
+          python=python
+        fi
+        "$python" scripts/ci-native-state.py "$AFT_CI_PHASE"
+    - name: Verify installed Windows Rust toolchain (read-only)
+      if: runner.os == 'Windows' && runner.environment == 'self-hosted' && inputs.phase == 'setup'
+      shell: bash
+      env:
+        AFT_CI_RUST_TARGET: ${{ inputs.rust-target }}
+        AFT_CI_RUST_VERSION: ${{ inputs.rust-version }}
+      run: |
+        set -euo pipefail
+        if ! rustup show; then
+          echo "::error::The administrator-managed toolchain at $RUSTUP_HOME is unavailable; do not install or update it from CI."
+          exit 1
+        fi
+        targets="$(rustup target list --installed)"
+        printf 'Installed Rust targets:\n%s\n' "$targets"
+        if ! grep -Fxq "$AFT_CI_RUST_TARGET" <<< "$targets"; then
+          echo "::error::Missing target $AFT_CI_RUST_TARGET in $RUSTUP_HOME; ask the runner administrator to install it."
+          exit 1
+        fi
+        components="$(rustup component list --installed)"
+        printf 'Installed Rust components:\n%s\n' "$components"
+        for component in rustfmt clippy rust-analyzer rust-src; do
+          if ! grep -Eq "^${component}(-|$)" <<< "$components"; then
+            echo "::error::Missing component $component in $RUSTUP_HOME; ask the runner administrator to install it."
+            exit 1
+          fi
+        done
+        actual="$(rustc --version)"
+        printf '%s\n' "$actual"
+        cargo --version
+        actual="${actual#rustc }"
+        actual="${actual%% *}"
+        if [[ -n "$AFT_CI_RUST_VERSION" && "$actual" != "$AFT_CI_RUST_VERSION" ]]; then
+          echo "::error::Rust $actual differs from release producer $AFT_CI_RUST_VERSION; provision the matching read-only toolchain."
+          exit 1
+        fi
+    - name: Verify administrator-installed Windows jq
+      if: runner.os == 'Windows' && runner.environment == 'self-hosted' && inputs.phase == 'setup'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq is missing from the runner service PATH; ask the administrator to install read-only jq on narli for the GitHub audit tests."
+          exit 1
+        fi
+        if ! version="$(jq --version)"; then
+          echo "::error::The administrator-installed jq cannot report its version; repair jq on the runner service PATH."
+          exit 1
+        fi
+        case "$version" in
+          jq-*) printf 'Managed jq: %s (%s)\n' "$version" "$(command -v jq)" ;;
+          *) echo "::error::Unexpected jq version response: $version"; exit 1 ;;
+        esac

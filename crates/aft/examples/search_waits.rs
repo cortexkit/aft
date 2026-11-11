@@ -384,6 +384,17 @@ fn wait_ready(ctx: &AppContext, root: &Path, limit: Duration) -> Duration {
     }
 }
 
+fn tree_parse_count() -> u64 {
+    #[cfg(feature = "test-hooks")]
+    {
+        aft::parser::search_parse_count_for_test()
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        0
+    }
+}
+
 /// One search call as the example saw it.
 struct Sample {
     phase: String,
@@ -394,6 +405,7 @@ struct Sample {
     /// The error code of a failed call.
     code: Option<String>,
     waits: SearchWaits,
+    tree_parses: u64,
 }
 
 /// Runs `searchers` threads of back-to-back searches against `ctx` until
@@ -446,6 +458,7 @@ fn run_searches(
                     let req = request(body);
                     let tag = background();
                     let scope = waits::begin_with_wait_cpu();
+                    let parses_before = tree_parse_count();
                     let response =
                         aft::commands::semantic_search::handle_semantic_search(&req, ctx);
                     let waits = scope.finish().expect("outermost scope");
@@ -456,6 +469,7 @@ fn run_searches(
                         success: response.success,
                         code: response.data["code"].as_str().map(str::to_string),
                         waits,
+                        tree_parses: tree_parse_count() - parses_before,
                     });
                 }
             });
@@ -1034,6 +1048,13 @@ fn main() {
                     "wall_ms": ms(sample.waits.wall),
                     "cpu_ms": sample.waits.cpu.map(ms),
                     "waits": slots,
+                    "tree_parses": sample.tree_parses,
+                    "code_references": {
+                        "hits": sample.waits.code_references.hits,
+                        "misses": sample.waits.code_references.misses,
+                        "names": sample.waits.code_references.names,
+                        "bytes": sample.waits.code_references.bytes,
+                    },
                 })
             )
             .unwrap();

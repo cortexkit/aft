@@ -4360,8 +4360,14 @@ fn main() {
             "{mode}: cargo build blocked on analyzer check:\n{stderr}"
         );
         let analyzer_target = base_target.join("rust-analyzer");
+        // Cargo can report OUT_DIR without the Windows verbatim prefix even
+        // when the fixture root was canonicalized. Compare filesystem paths
+        // in the same canonical form, not their different spellings.
+        let check_out_path = fs::canonicalize(check_out.trim()).expect("canonical check OUT_DIR");
+        let analyzer_target_path =
+            fs::canonicalize(&analyzer_target).expect("canonical analyzer target");
         assert!(
-            std::path::Path::new(check_out.trim()).starts_with(&analyzer_target),
+            check_out_path.starts_with(&analyzer_target_path),
             "{mode}: check artifacts at {check_out}, expected {}",
             analyzer_target.display()
         );

@@ -161,12 +161,16 @@ async fn approval_held_update_is_gated_durable_and_followed_by_one_terminal() {
             row.tool_result_source.is_some(),
             "a consent-held terminal must retain its native source for exact keyed replay"
         );
-        let owner = row.scope.unwrap().owner;
+        let scope = row.scope.unwrap();
+        let owner = scope.owner;
+        let custodian = row.custodian.unwrap();
+        assert_eq!(owner, "reserved:prefrontal-core");
+        assert_eq!(custodian, "reserved:basal");
         let feed = |conn: &rusqlite::Connection, incarnation: &str| -> Value {
             serde_json::from_slice(
                 &ledger::late_results(
                     conn,
-                    &owner,
+                    &custodian,
                     incarnation,
                     None,
                     None,
@@ -191,7 +195,7 @@ async fn approval_held_update_is_gated_durable_and_followed_by_one_terminal() {
         assert_eq!(update["held"], json!({"reason":"running"}));
         assert_eq!(update["call_key"], "program-9200");
         assert_eq!(update["owner"], owner);
-        assert_eq!(update["custodian"], owner);
+        assert_eq!(update["custodian"], custodian);
         assert_eq!(update["ref"], run.scope.as_ref().unwrap().scope_ref);
         assert_eq!(
             update["scope_epoch"],
@@ -200,7 +204,7 @@ async fn approval_held_update_is_gated_durable_and_followed_by_one_terminal() {
         let legacy_feed: Value = serde_json::from_slice(
             &ledger::late_results_for_consumer(
                 &db.lock().unwrap(),
-                &owner,
+                &custodian,
                 ledger::provider_incarnation(),
                 None,
                 None,
@@ -232,7 +236,7 @@ async fn approval_held_update_is_gated_durable_and_followed_by_one_terminal() {
         let old_cursor: cortexkit_role_tool_provider::late_results::Cursor =
             serde_json::from_value(original["cursor"].clone()).unwrap();
         assert_eq!(
-            ledger::ack_through(&reopened, &owner, "after-restart", &old_cursor)
+            ledger::ack_through(&reopened, &custodian, "after-restart", &old_cursor)
                 .unwrap()
                 .unwrap_err()
                 .code,
@@ -249,7 +253,7 @@ async fn approval_held_update_is_gated_durable_and_followed_by_one_terminal() {
             provider_incarnation: "after-restart".into(),
             seq: update_seq,
         };
-        ledger::ack_through(&reopened, &owner, "after-restart", &cursor)
+        ledger::ack_through(&reopened, &custodian, "after-restart", &cursor)
             .unwrap()
             .unwrap();
         assert!(!ledger::record_running_update(

@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.18"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.20"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.18"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.20"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -366,6 +366,38 @@ pub(super) struct MemorySink {
     started: Vec<Started>,
 }
 
+#[test]
+fn remote_cancel_progress_job_id_is_not_acceptance_or_an_output_cursor() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    let job_id = Uuid::from_bytes([1; 16]);
+    consumer
+        .consume(
+            StreamRecord::Progress(
+                Progress::new(ProgressPhase::Upload, 0, None)
+                    .unwrap()
+                    .with_job_id(job_id),
+            ),
+            &mut sink,
+        )
+        .unwrap();
+    assert!(consumer.resume_point().is_none());
+    assert_eq!(consumer.known_job_id(), Some(job_id));
+    assert!(sink.seqs.is_empty());
+    assert!(consumer
+        .consume(
+            StreamRecord::Accepted(Accepted::new(Uuid::from_bytes([2; 16]), 1)),
+            &mut sink
+        )
+        .is_err());
+    consumer
+        .consume(StreamRecord::Accepted(Accepted::new(job_id, 1)), &mut sink)
+        .unwrap();
+    let point = consumer.resume_point().unwrap();
+    assert_eq!(point.job_id, job_id);
+    assert_eq!(point.last_seq, None);
+}
+
 impl OutputSink for MemorySink {
     fn started(&mut self, started: &Started) -> std::io::Result<()> {
         self.seqs.push(started.seq);
@@ -656,93 +688,6 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         &preset
     )
     .is_err());
-}
-
-#[test]
-fn requested_return_limit_tracks_only_named_local_files() {
-    for (name, sizes, paths, maximum, expected) in [
-        (
-            "small file",
-            vec![("small.bin", 4096)],
-            vec!["small.bin"],
-            134_217_728,
-            10_485_760,
-        ),
-        (
-            "named files total over 5 MiB",
-            vec![("first.bin", 3_145_728), ("second.bin", 2_097_153)],
-            vec!["first.bin", "second.bin"],
-            134_217_728,
-            134_217_728,
-        ),
-        (
-            "exactly 5 MiB",
-            vec![("boundary.bin", 5_242_880)],
-            vec!["boundary.bin"],
-            134_217_728,
-            10_485_760,
-        ),
-        (
-            "missing file",
-            vec![],
-            vec!["missing.bin"],
-            134_217_728,
-            10_485_760,
-        ),
-        (
-            "small and missing files",
-            vec![("small.bin", 4096)],
-            vec!["small.bin", "missing.bin"],
-            134_217_728,
-            10_485_760,
-        ),
-        (
-            "no return paths",
-            vec![("unlisted.bin", 6_291_456)],
-            vec![],
-            134_217_728,
-            10_485_760,
-        ),
-        (
-            "runner without large returns",
-            vec![("large.bin", 6_291_456)],
-            vec!["large.bin"],
-            10_485_760,
-            10_485_760,
-        ),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let cwd = root.join("subdir");
-        std::fs::create_dir(&cwd).unwrap();
-        for (path, size) in sizes {
-            std::fs::File::create(cwd.join(path))
-                .unwrap()
-                .set_len(size)
-                .unwrap();
-        }
-        let request = build_request(
-            &root,
-            &root,
-            &cwd,
-            "make dist",
-            Default::default(),
-            None,
-            &PresetParams {
-                return_paths: paths.into_iter().map(str::to_owned).collect(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            requested_return_max_bytes(&request, maximum),
-            expected,
-            "{name}"
-        );
-        if request.return_paths.is_empty() {
-            assert_eq!(request.return_max_bytes, None, "{name}");
-        }
-    }
 }
 
 #[test]
