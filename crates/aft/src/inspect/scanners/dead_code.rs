@@ -6256,10 +6256,7 @@ fn read_with<T>(consume: impl FnOnce(bool) -> T) -> T { consume(crate::guard::is
                 "src/main.rs",
                 "mod read; mod db { pub mod file_identity; } fn main() { read::read_exact(); }",
             ),
-            (
-                "src/read.rs",
-                include_str!("../../file_read_exact.rs"),
-            ),
+            ("src/read.rs", include_str!("../../file_read_exact.rs")),
             (
                 "src/db/file_identity.rs",
                 "pub(crate) fn is_live_sqlite_handle() {}",
