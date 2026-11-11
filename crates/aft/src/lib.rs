@@ -188,6 +188,7 @@ pub mod protocol;
 pub(crate) mod provisional_identity_retry;
 pub mod pty_render;
 pub mod query_shape;
+pub mod pending_response;
 pub mod read_policy;
 pub mod reader_floor;
 pub mod repeat_state;
