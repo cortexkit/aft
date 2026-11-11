@@ -22,6 +22,20 @@ function fileKey(path: string): string {
   return `${stat.dev}:${stat.ino}`;
 }
 
+export function scanProcessWithRetry(scan: () => void, alive: () => boolean): void {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      scan();
+      return;
+    } catch (error) {
+      if (!alive()) return;
+      if (attempt === 2) throw error;
+      // procfs visibility can briefly change during exec or process exit.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+}
+
 export function cacheUsageSnapshot(): CacheUsage {
   const files = new Set<string>();
   const record = (path: string) => {
@@ -35,25 +49,35 @@ export function cacheUsageSnapshot(): CacheUsage {
     for (const entry of readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
       const directory = join("/proc", entry);
-      try {
-        if (statSync(directory).uid !== process.geteuid?.()) continue;
-        record(join(directory, "exe"));
-        for (const fd of readdirSync(join(directory, "fd"))) record(join(directory, "fd", fd));
-        for (const line of readFileSync(join(directory, "maps"), "utf8").split("\n")) {
-          const match = /^\S+\s+\S+\s+\S+\s+([a-f\d]+):([a-f\d]+)\s+(\d+)/i.exec(line);
-          if (!match || match[3] === "0") continue;
-          const major = BigInt(`0x${match[1]}`);
-          const minor = BigInt(`0x${match[2]}`);
-          const device =
-            ((major & 0xfffn) << 8n) |
-            (minor & 0xffn) |
-            ((minor & ~0xffn) << 12n) |
-            ((major & ~0xfffn) << 32n);
-          files.add(`${device}:${match[3]}`);
-        }
-      } catch (error) {
-        if (pidAlive(Number(entry))) throw error;
-      }
+      scanProcessWithRetry(
+        () => {
+          if (statSync(directory).uid !== process.geteuid?.()) return;
+          record(join(directory, "exe"));
+          for (const fd of readdirSync(join(directory, "fd"))) record(join(directory, "fd", fd));
+          for (const line of readFileSync(join(directory, "maps"), "utf8").split("\n")) {
+            const match = /^\S+\s+\S+\s+\S+\s+([a-f\d]+):([a-f\d]+)\s+(\d+)/i.exec(line);
+            if (!match || match[3] === "0") continue;
+            const major = BigInt(`0x${match[1]}`);
+            const minor = BigInt(`0x${match[2]}`);
+            const device =
+              ((major & 0xfffn) << 8n) |
+              (minor & 0xffn) |
+              ((minor & ~0xffn) << 12n) |
+              ((major & ~0xfffn) << 32n);
+            files.add(`${device}:${match[3]}`);
+          }
+        },
+        () => {
+          if (!pidAlive(Number(entry))) return false;
+          try {
+            const stat = readFileSync(join(directory, "stat"), "utf8");
+            const state = stat.slice(stat.lastIndexOf(") ") + 2)[0];
+            return state !== "Z" && state !== "X";
+          } catch (error) {
+            return (error as NodeJS.ErrnoException).code !== "ENOENT";
+          }
+        },
+      );
     }
   } else {
     // lsof includes open descriptors and executable mappings, including aliases

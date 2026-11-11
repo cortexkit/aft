@@ -20,6 +20,7 @@ import {
   linkCachedExecutable,
   pruneExecutableCache,
 } from "./test-utils/cached-executable.js";
+import { scanProcessWithRetry } from "./test-utils/image-cache-usage.js";
 
 test("binary executable bytes reuse one immutable content-addressed path", () => {
   const bytes = Buffer.from(`\u0000AFT test executable ${randomUUID()}\n`);
@@ -33,6 +34,31 @@ test("binary executable bytes reuse one immutable content-addressed path", () =>
   expect(after.mtimeMs).toBe(before.mtimeMs);
   expect(after.ino).toBe(before.ino);
   expect(second.split(/[\\/]/).at(-2)).toMatch(/^[a-f0-9]{64}$/);
+});
+
+test("executable cache process probe retries transient exec visibility", () => {
+  let attempts = 0;
+  scanProcessWithRetry(
+    () => {
+      if (++attempts < 3) throw new Error("transient procfs refusal");
+    },
+    () => true,
+  );
+  expect(attempts).toBe(3);
+});
+
+test("executable cache process probe preserves persistent visibility refusal", () => {
+  let attempts = 0;
+  expect(() =>
+    scanProcessWithRetry(
+      () => {
+        attempts++;
+        throw new Error("persistent procfs refusal");
+      },
+      () => true,
+    ),
+  ).toThrow("persistent procfs refusal");
+  expect(attempts).toBe(3);
 });
 
 test("executable cache prunes only stale siblings and refreshes every hit", () => {

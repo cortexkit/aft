@@ -87,6 +87,27 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn scan_process(
+    mut scan: impl FnMut() -> io::Result<()>,
+    alive: impl Fn() -> bool,
+) -> io::Result<()> {
+    for attempt in 0..3 {
+        match scan() {
+            Ok(()) => return Ok(()),
+            Err(_) if !alive() => return Ok(()),
+            Err(error) if attempt == 2 => return Err(error),
+            Err(_) => {
+                // procfs can briefly deny access during exec or process exit.
+                // Persistent refusal still prevents eviction rather than
+                // guessing that the process has no image open.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+    unreachable!()
+}
+
+#[cfg(target_os = "linux")]
 pub fn snapshot() -> io::Result<Usage> {
     use std::os::unix::fs::MetadataExt;
     let mut usage = Usage::default();
@@ -109,7 +130,8 @@ pub fn snapshot() -> io::Result<Usage> {
             for fd in fs::read_dir(process.path().join("fd"))? {
                 usage.record(&fd?.path());
             }
-            for line in fs::read_to_string(process.path().join("maps"))?.lines() {
+            let maps = fs::read(process.path().join("maps"))?;
+            for line in String::from_utf8_lossy(&maps).lines() {
                 let fields: Vec<_> = line.split_whitespace().take(5).collect();
                 if fields.len() != 5 {
                     continue;
@@ -131,11 +153,20 @@ pub fn snapshot() -> io::Result<Usage> {
             }
             Ok(())
         };
-        if let Err(error) = scan() {
-            if pid_alive(pid) {
-                return Err(error);
+        scan_process(&mut scan, || {
+            if !pid_alive(pid) {
+                return false;
             }
-        }
+            let stat = match fs::read_to_string(process.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) => return error.kind() != io::ErrorKind::NotFound,
+            };
+            !matches!(
+                stat.rsplit_once(") ")
+                    .and_then(|(_, rest)| rest.chars().next()),
+                Some('Z' | 'X')
+            )
+        })?;
     }
     Ok(usage)
 }
@@ -220,5 +251,43 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
 impl Usage {
     pub fn hold(&mut self, path: &Path) {
         self.record(path);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_cache_process_probe_retries_exec_transition_refusal() {
+        let mut attempts = 0;
+        scan_process(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                } else {
+                    Ok(())
+                }
+            },
+            || true,
+        )
+        .unwrap();
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn image_cache_process_probe_fails_closed_for_persistent_refusal() {
+        let mut attempts = 0;
+        let error = scan_process(
+            || {
+                attempts += 1;
+                Err(io::ErrorKind::PermissionDenied.into())
+            },
+            || true,
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }
