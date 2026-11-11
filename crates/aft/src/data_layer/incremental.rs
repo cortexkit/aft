@@ -613,6 +613,8 @@ impl LiveCheckout {
         let pool = Arc::clone(&self.pool);
         let mut stats = crate::alloc_trace::install(&pool, || {
             let stats = self.update_in_pool(next, changed)?;
+            #[cfg(feature = "test-hooks")]
+            super::refresh_probe::stage("encode");
             // Every resolution the update made or changed is encoded, so
             // that it can be let go between updates like a stored one.
             let parses = &self.inputs.parses;
@@ -714,7 +716,9 @@ impl LiveCheckout {
             ..UpdateStats::default()
         };
         let old = std::mem::replace(&mut self.inputs, next);
+        #[cfg(feature = "test-hooks")]
         let mut profile_clock = Instant::now();
+        #[cfg(feature = "test-hooks")]
         self.profile_refresh("start", &mut profile_clock);
         let inputs = &self.inputs;
         let membership = changed
@@ -856,6 +860,8 @@ impl LiveCheckout {
         // read is asked again; a file any of whose answers differ is bound,
         // resolved or traced again. This needs no rule about which change can
         // affect which read.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("facts");
         let started = Instant::now();
         let stale = if membership.is_empty() && links.is_empty() && configs.is_empty() {
             StaleAnswers::default()
@@ -866,10 +872,13 @@ impl LiveCheckout {
         stats.answers_checked = stale.checked;
         stats.answers_changed = stale.changed;
         stats.facts_ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "test-hooks")]
         self.profile_refresh("facts", &mut profile_clock);
 
         // Pass 1. A binding depends on the file's own parse, on which paths
         // exist, and on configuration it read.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("binding");
         let started = Instant::now();
         let mut binding_keys = membership.clone();
         binding_keys.extend(changed_packages.iter().cloned());
@@ -989,6 +998,7 @@ impl LiveCheckout {
             self.bound.set(path, bound);
         }
         stats.bind_ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "test-hooks")]
         self.profile_refresh("bind", &mut profile_clock);
 
         // What a recorded answer can depend on that changed.
@@ -1011,6 +1021,8 @@ impl LiveCheckout {
         changed_keys.extend(changed_crates);
 
         // Pass 2.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("replay");
         let started = Instant::now();
         let facts = Rc::new(ViewBindingFacts::typed(Rc::new(CheckoutFacts { inputs })));
         let (index, files) = resolver_index(inputs, &self.bound, &facts);
@@ -1096,7 +1108,10 @@ impl LiveCheckout {
         }
         drop(answers);
         drop(trace_answers);
+        #[cfg(feature = "test-hooks")]
         self.profile_refresh("replay", &mut profile_clock);
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("resolution");
         // Files kept whose binding was redone carry their resolution over.
         for path in &rebind {
             if resolve.contains(path) {
@@ -1137,12 +1152,15 @@ impl LiveCheckout {
             self.resolved.insert(path, file);
         }
         stats.resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "test-hooks")]
         self.profile_refresh("resolve", &mut profile_clock);
 
         // Pass 3, for files whose rows were kept: each trace was replayed
         // with its file's surface answers above. Resolving files again
         // changes no surface a trace reads, since every file whose binding
         // could change was bound again in pass 1.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("dispatch");
         let started = Instant::now();
         let mut recompute = Vec::new();
         // Stale answers were asked before this update removed files; a
@@ -1180,9 +1198,12 @@ impl LiveCheckout {
         }
         drop(index);
         drop(facts);
+        #[cfg(feature = "test-hooks")]
         self.profile_refresh("dispatch", &mut profile_clock);
 
         // Pass 4.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("sites");
         let started = Instant::now();
         let mut site_keys = BTreeSet::new();
         let mut sites = contents.clone();
@@ -1219,6 +1240,7 @@ impl LiveCheckout {
         }
         stats.sites_resolved = paths.len();
         stats.sites_ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "test-hooks")]
         self.profile_refresh("sites", &mut profile_clock);
         stats.touched = rebind
             .into_iter()
@@ -1230,6 +1252,7 @@ impl LiveCheckout {
         Ok(stats)
     }
 
+    #[cfg(feature = "test-hooks")]
     fn profile_refresh(&self, stage: &str, clock: &mut Instant) {
         if std::env::var_os("AFT_REFRESH_PROFILE").is_none() {
             return;

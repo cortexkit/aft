@@ -1533,6 +1533,8 @@ impl Checkout {
             stored: self.stored_records()?,
             ..BuildSink::default()
         };
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("extraction");
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
         let mut collected = sink.finish();
@@ -1650,6 +1652,8 @@ impl Checkout {
         report.resolve_ms = elapsed_ms(started);
         checkpoint()?;
 
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("publication");
         let started = Instant::now();
         #[cfg(test)]
         wait_while_publication_held_for_test(&self.root);
@@ -1865,6 +1869,8 @@ impl Checkout {
         log::debug!("sibling callgraph update: {update:?}");
         let resolve_ms = elapsed_ms(started);
         let started = Instant::now();
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("publication");
         let delta = self.publish_changes_as(true)?;
         let publish_ms = elapsed_ms(started);
         let segment_bytes = self
@@ -2645,6 +2651,8 @@ impl Checkout {
         let mut stats = None;
         if !changed.is_empty() {
             note_source_work(&self.root, |work| work.resolutions += 1);
+            #[cfg(feature = "test-hooks")]
+            super::refresh_probe::stage("extraction");
             // The changed files are extracted here, all at once on the
             // engine's threads, rather than each when its edit was recorded.
             let extracting = changed
@@ -2659,6 +2667,8 @@ impl Checkout {
                     change.content.get();
                 });
             });
+            #[cfg(feature = "test-hooks")]
+            super::refresh_probe::stage("planning");
             let next = next_inputs(state, &engine.live.inputs, changes, &changed);
             let changed_names = changed
                 .iter()
@@ -2677,6 +2687,9 @@ impl Checkout {
             // The caller drops a partly updated engine after either error,
             // so the next refresh starts again from the publication.
             let update = update.map_err(|error| DataError::Resolve(error.to_string()))?;
+            log::debug!("callgraph refresh work: changed={} rebound={} replayed={} resolved={} dispatch_replayed={} dispatch_recomputed={} sites={} touched={}", update.changed_paths, update.rebound, update.replayed, update.resolved, update.dispatch_replayed, update.dispatch_recomputed, update.sites_resolved, update.touched.len());
+            #[cfg(feature = "test-hooks")]
+            super::refresh_probe::stage("slices");
             // Only the files this update touched get new slices; every file
             // touched by an earlier update keeps the slice it got then. Each
             // is laid over the publication encoded, as a publication stores

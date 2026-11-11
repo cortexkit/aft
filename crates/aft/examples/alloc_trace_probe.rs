@@ -13,7 +13,7 @@
 //! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
 //!     replay <pack.jsonl.gz> [publish_every|daemon] [threads]
 //! cargo run --profile ci-storm -p agent-file-tools --example alloc_trace_probe -- \
-//!     transition <base-root> <target-root> [threads]
+//!     transition <base-root> <target-root> [threads] [sibling|refresh|cold]
 //! ```
 //!
 //! `overhead` runs two workloads in one process and prints one JSON line
@@ -61,8 +61,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aft::alloc_trace::TracingAllocator;
@@ -75,25 +75,45 @@ use aft_store::ids::{Digest128, FamilyId};
 struct Switch;
 
 static TRACE: AtomicBool = AtomicBool::new(false);
+static COUNTING: AtomicBool = AtomicBool::new(false);
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
+static STAGE_RSS: AtomicU64 = AtomicU64::new(0);
+
+fn count(bytes: isize) {
+    if COUNTING.load(Ordering::Relaxed) {
+        let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
+}
 
 unsafe impl GlobalAlloc for Switch {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if TRACE.load(Ordering::Relaxed) {
+        let ptr = if TRACE.load(Ordering::Relaxed) {
             unsafe { TracingAllocator.alloc(layout) }
         } else {
             unsafe { System.alloc(layout) }
+        };
+        if !ptr.is_null() {
+            count(layout.size() as isize);
         }
+        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if TRACE.load(Ordering::Relaxed) {
+        let ptr = if TRACE.load(Ordering::Relaxed) {
             unsafe { TracingAllocator.alloc_zeroed(layout) }
         } else {
             unsafe { System.alloc_zeroed(layout) }
+        };
+        if !ptr.is_null() {
+            count(layout.size() as isize);
         }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        count(-(layout.size() as isize));
         if TRACE.load(Ordering::Relaxed) {
             unsafe { TracingAllocator.dealloc(ptr, layout) }
         } else {
@@ -102,11 +122,15 @@ unsafe impl GlobalAlloc for Switch {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if TRACE.load(Ordering::Relaxed) {
+        let next = if TRACE.load(Ordering::Relaxed) {
             unsafe { TracingAllocator.realloc(ptr, layout, new_size) }
         } else {
             unsafe { System.realloc(ptr, layout, new_size) }
+        };
+        if !next.is_null() {
+            count(new_size as isize - layout.size() as isize);
         }
+        next
     }
 }
 
@@ -326,6 +350,7 @@ fn start_resident_sampler() {
     std::thread::spawn(|| loop {
         if let Some(bytes) = resident_bytes() {
             RESIDENT_PEAK.fetch_max(bytes, Ordering::Relaxed);
+            STAGE_RSS.fetch_max(bytes, Ordering::Relaxed);
         }
         std::thread::sleep(Duration::from_millis(250));
     });
@@ -389,6 +414,53 @@ fn start_tracing() {
     aft::alloc_trace::start_logger();
     TRACE.store(true, Ordering::SeqCst);
     start_resident_sampler();
+}
+
+struct Stage {
+    name: &'static str,
+    started: Instant,
+    cpu: (f64, f64, u64),
+    live: isize,
+}
+
+static STAGE: Mutex<Option<Stage>> = Mutex::new(None);
+
+/// Stage peaks count the whole Rust heap, including allocations made by a
+/// previous stage. Counting is opt-in because atomics on every allocation
+/// perturb CPU timings. C-library memory is visible only in the RSS samples.
+fn stage(name: &'static str) {
+    if !COUNTING.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut current = STAGE.lock().unwrap();
+    let live = LIVE.load(Ordering::Relaxed);
+    let peak = PEAK.swap(live, Ordering::Relaxed);
+    let rss = resident_bytes().unwrap_or(0);
+    let rss_peak = STAGE_RSS.swap(rss, Ordering::Relaxed).max(rss);
+    let cpu = usage();
+    if let Some(previous) = current.take() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "refresh_stage": previous.name,
+                "wall_s": previous.started.elapsed().as_secs_f64(),
+                "cpu_s": cpu.0 + cpu.1 - previous.cpu.0 - previous.cpu.1,
+                "live_bytes_at_start": previous.live,
+                "peak_live_bytes": peak,
+                "live_bytes_at_end": live,
+                "resident_peak_bytes": rss_peak,
+                "malloc_at_end": malloc_figures(),
+            })
+        );
+    }
+    if name != "end" {
+        *current = Some(Stage {
+            name,
+            started: Instant::now(),
+            cpu: usage(),
+            live,
+        });
+    }
 }
 
 /// The probe's edit: a function appended to AFT's crate root, which most of
@@ -755,26 +827,97 @@ fn main() {
         Some("restart") => restart(args),
         Some("replay") => replay(args),
         Some("transition") => transition(args),
-        _ => panic!("usage: alloc_trace_probe overhead|burst|refresh|restart|replay|transition ..."),
+        _ => {
+            panic!("usage: alloc_trace_probe overhead|burst|refresh|restart|replay|transition ...")
+        }
     }
 }
 
-/// Measures a new checkout whose revision differs from its published sibling.
-/// The supplied roots stay intact; the store is private to this run.
+/// Measures a revision transition using sibling admission, a refresh of an
+/// already published checkout, or a cold rebuild reusing its stored records.
+/// Roots must be exported source trees, not repositories with private files.
+/// Their contents stay intact; the mutable checkout and store are private.
 fn transition(mut args: impl Iterator<Item = String>) {
     let base = std::fs::canonicalize(args.next().unwrap()).unwrap();
     let target = std::fs::canonicalize(args.next().unwrap()).unwrap();
     let threads = args.next().map_or(8, |threads| threads.parse().unwrap());
+    let strategy = args.next().unwrap_or_else(|| "sibling".to_string());
+    assert!(["sibling", "refresh", "cold"].contains(&strategy.as_str()));
+    let profiling = std::env::var_os("PROBE_STAGES").is_some();
+    COUNTING.store(profiling, Ordering::Relaxed);
+    #[cfg(feature = "test-hooks")]
+    if profiling {
+        aft::data_layer::refresh_probe::set_observer(stage);
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    assert!(!profiling, "PROBE_STAGES requires --features test-hooks");
     start_tracing();
     let scratch = tempfile::tempdir().unwrap();
     let store = scratch.path().join("store");
     let family = FamilyId::from_digest(Digest128::of(b"alloc trace transition"));
     let layer = Arc::new(DataLayer::new(256 << 20, threads));
-    let sibling = Checkout::bind(Arc::clone(&layer), &store, family, &base).unwrap();
-    phase("base_build", || format!("{:?}", sibling.build().unwrap()));
-    let worktree = Checkout::bind(Arc::clone(&layer), &store, family, &target).unwrap();
+    let root = scratch.path().join("checkout");
+    copy_tree(&base, &root);
+    let sibling = Checkout::bind(Arc::clone(&layer), &store, family, &root).unwrap();
+    stage("base_start");
+    phase("base_build", || {
+        let report = sibling.build().unwrap();
+        stage("end");
+        format!("{report:?}")
+    });
+    let next = if strategy == "sibling" {
+        let next = scratch.path().join("sibling");
+        copy_tree(&target, &next);
+        next
+    } else {
+        std::fs::remove_dir_all(&root).unwrap();
+        copy_tree(&target, &root);
+        root
+    };
+    stage("bind");
+    let worktree = Checkout::bind(Arc::clone(&layer), &store, family, &next).unwrap();
     phase("target_build", || {
-        with_cache_counts(&layer, || format!("{:?}", worktree.build().unwrap()))
+        with_cache_counts(&layer, || {
+            let detail = if strategy == "refresh" {
+                let stats = worktree.refresh_callgraph().unwrap().unwrap();
+                let detail = format!(
+                    "changed {}, rebound {}, resolved {}, replayed {}, dispatch replayed {}, recomputed {}, sites {}, touched {}; update {} ms (facts {}, bind {}, resolve {}, dispatch {}, sites {})",
+                    stats.changed_paths, stats.rebound, stats.resolved, stats.replayed,
+                    stats.dispatch_replayed, stats.dispatch_recomputed, stats.sites_resolved,
+                    stats.touched.len(), stats.total_ms, stats.facts_ms, stats.bind_ms,
+                    stats.resolve_ms, stats.dispatch_ms, stats.sites_ms,
+                );
+                stage("publication");
+                worktree.publish_changes().unwrap();
+                detail
+            } else {
+                format!("{:?}", worktree.build().unwrap())
+            };
+            stage("end");
+            detail
+        })
     });
     println!("engine parts {:?}", worktree.engine_memory_parts());
+}
+
+/// Copies an archive's source tree without following links or copying Git's
+/// metadata. The empty marker makes ignore rules behave as in a repository.
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    let mut archive = Command::new("tar")
+        .args(["-c", "--exclude=.git", "-C"])
+        .arg(source)
+        .arg(".")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(destination)
+        .stdin(archive.stdout.take().unwrap())
+        .status()
+        .unwrap();
+    assert!(status.success() && archive.wait().unwrap().success());
+    std::fs::create_dir_all(destination.join(".git")).unwrap();
 }

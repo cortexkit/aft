@@ -27,6 +27,8 @@ pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;
 pub(crate) mod query;
+#[cfg(feature = "test-hooks")]
+pub mod refresh_probe;
 pub mod reuse;
 pub(crate) mod runtime;
 #[cfg(test)]
