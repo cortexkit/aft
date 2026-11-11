@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 pub mod executable_cache;
 pub mod fake_lsp;
+#[path = "../../src/test_gate.rs"]
+pub mod test_gate;
 mod timeout_forensics;
 
 #[path = "../../src/test_env.rs"]

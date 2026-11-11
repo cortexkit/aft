@@ -244,6 +244,8 @@ pub(crate) mod search_hot_path_measurements;
 pub(crate) mod test_allocations;
 #[cfg(test)]
 pub(crate) mod test_env;
+#[cfg(test)]
+pub(crate) mod test_gate;
 #[cfg(all(test, windows))]
 pub(crate) mod test_read_denial;
 #[cfg(test)]
