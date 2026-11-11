@@ -395,7 +395,10 @@ async fn assert_pty_launch_hands_back(principal: &str, harness: &str, kind: &str
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["status"], "running", "{response:?}");
     assert_eq!(response.data["mode"], "pty", "{response:?}");
-    assert!(reply.text_for_test().unwrap().starts_with("PTY task started:"));
+    assert!(reply
+        .text_for_test()
+        .unwrap()
+        .starts_with("PTY task started:"));
     let task_id = response.data["task_id"].as_str().unwrap();
     assert_eq!(fixture.status(task_id), BgTaskStatus::Running);
 
@@ -413,7 +416,10 @@ async fn assert_pty_launch_hands_back(principal: &str, harness: &str, kind: &str
     assert_eq!(write.data["bytes_written"], 18);
     fixture.wait_terminal(task_id).await;
     assert_eq!(fixture.status(task_id), BgTaskStatus::Completed);
-    assert_eq!(std::fs::read_to_string(received).unwrap(), "interactive-input");
+    assert_eq!(
+        std::fs::read_to_string(received).unwrap(),
+        "interactive-input"
+    );
     assert!(replies.try_recv().is_err(), "the call answers exactly once");
 }
 
