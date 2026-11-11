@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "search-query-time-parse",
+    "search-waits-first-index"
+  ],
+  "note": "Combined landing of post-0.64 batch 1, the self-hosted CI move and test fixes. Ranking-fenced changes: (1) search-query-time-parse, described in its own descriptor (cached code-reference facts; 6,700-query parity, all 108 quality rows equal); (2) commands/semantic_search/waits.rs: aft_search waits up to 8 s for a newly bound project's first text index before refusing; it changes readiness timing only, never routing, scores, candidates or reply text once the index is ready. No other ranking-fence file changes. Rows must stay byte-equal to the reference."
+}
