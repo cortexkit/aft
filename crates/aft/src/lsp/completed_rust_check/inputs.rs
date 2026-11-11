@@ -2,9 +2,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::{canonical, expired};
+use serde::{Deserialize, Serialize};
 
 const INCLUDE_PROVISIONAL: &str = "cargo check completed, but {file} includes a file whose path can't be resolved; diagnostics are provisional";
 const ENV_PROVISIONAL: &str = "cargo check completed, but {file} reads an environment variable whose name can't be resolved; diagnostics are provisional";
@@ -26,7 +28,7 @@ impl UnresolvedInput {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Token {
     Literal(String),
     Text(String),
@@ -141,6 +143,7 @@ fn include_path(root: &Path, source: &Path, relative: &str, deadline: Instant) -
     (path.starts_with(root) && path.is_file()).then_some(path)
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Definition {
     name: String,
     path: PathBuf,
@@ -148,6 +151,7 @@ struct Definition {
     includes: Vec<(Vec<Token>, bool)>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Invocation {
     name: String,
     path: PathBuf,
@@ -155,22 +159,56 @@ struct Invocation {
     nested: bool,
 }
 
-#[derive(Default)]
-pub(super) struct SourceInputs {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct FileFacts {
     definitions: Vec<Definition>,
     invocations: Vec<Invocation>,
-    references: Vec<String>,
-    rust_sources: BTreeSet<PathBuf>,
-    parsed: BTreeSet<PathBuf>,
+    references: BTreeSet<String>,
+    direct: Vec<(Vec<Token>, bool)>,
+    env_keys: Vec<String>,
 }
 
-impl SourceInputs {
-    pub(super) fn needs_parse(&self, path: &Path) -> bool {
-        !self.parsed.contains(path)
-            && (path.extension().is_some_and(|extension| extension == "rs")
-                || self.rust_sources.contains(path))
-    }
+#[derive(Clone, Debug)]
+pub(super) struct CachedFacts(Arc<FileFacts>);
 
+impl Serialize for CachedFacts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CachedFacts {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        FileFacts::deserialize(deserializer).map(|facts| Self(Arc::new(facts)))
+    }
+}
+
+impl CachedFacts {
+    pub(super) fn map_paths(
+        &mut self,
+        map: &mut impl FnMut(PathBuf) -> Result<PathBuf, &'static str>,
+    ) -> Result<(), &'static str> {
+        let facts = Arc::make_mut(&mut self.0);
+        for definition in &mut facts.definitions {
+            definition.path = map(definition.path.clone())?;
+        }
+        for invocation in &mut facts.invocations {
+            invocation.path = map(invocation.path.clone())?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SourceInputs {
+    pub(super) facts: BTreeMap<PathBuf, CachedFacts>,
+    rust_sources: BTreeSet<PathBuf>,
+    parsed: BTreeSet<PathBuf>,
+    pending: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    searched_names: BTreeSet<String>,
+}
+
+impl FileFacts {
     fn refuse<T>(
         path: &Path,
         environment: bool,
@@ -185,7 +223,28 @@ impl SourceInputs {
 }
 
 impl SourceInputs {
-    pub(super) fn add(
+    pub(super) fn new(searched_names: BTreeSet<String>) -> Self {
+        Self {
+            searched_names,
+            ..Self::default()
+        }
+    }
+    pub(super) fn needs_parse(&self, path: &Path) -> bool {
+        path.extension().is_some_and(|extension| extension == "rs")
+            || (!self.parsed.contains(path) && self.rust_sources.contains(path))
+    }
+}
+
+#[cfg(test)]
+thread_local! { static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+pub(super) fn take_parses() -> usize {
+    PARSES.with(|count| count.replace(0))
+}
+
+impl FileFacts {
+    fn parse(
         &mut self,
         root: &Path,
         path: &Path,
@@ -194,7 +253,8 @@ impl SourceInputs {
         unresolved: &mut Option<UnresolvedInput>,
     ) -> Option<(Vec<PathBuf>, Vec<String>)> {
         std::str::from_utf8(bytes).ok()?;
-        self.parsed.insert(path.into());
+        #[cfg(test)]
+        PARSES.with(|count| count.set(count.get() + 1));
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -283,7 +343,7 @@ impl SourceInputs {
                 continue;
             }
             if node.kind() == "identifier" {
-                self.references.push(node.utf8_text(bytes).ok()?.into());
+                self.references.insert(node.utf8_text(bytes).ok()?.into());
             }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
@@ -291,6 +351,7 @@ impl SourceInputs {
                 nodes.push(child);
             }
         }
+        self.env_keys = env_keys.clone();
         Some((included, env_keys))
     }
 
@@ -339,6 +400,7 @@ impl SourceInputs {
                                     .includes
                                     .push((args.to_vec(), name == "include"));
                             } else {
+                                self.direct.push((args.to_vec(), name == "include"));
                                 let empty = BTreeMap::new();
                                 let target =
                                     expression(args, path, &empty, deadline).and_then(|relative| {
@@ -346,9 +408,6 @@ impl SourceInputs {
                                     });
                                 match target {
                                     Some(target) => {
-                                        if name == "include" {
-                                            self.rust_sources.insert(target.clone());
-                                        }
                                         included.push(target);
                                     }
                                     None => {
@@ -387,10 +446,146 @@ impl SourceInputs {
                     root, path, group, definition, nested, deadline, included, env_keys, unresolved,
                 )?;
             } else if let Token::Text(name) = &tokens[index] {
-                self.references.push(name.clone());
+                self.references.insert(name.rsplit("::").next()?.into());
             }
             index += 1;
         }
+        Some(())
+    }
+}
+
+impl SourceInputs {
+    pub(super) fn macro_names(&self) -> BTreeSet<String> {
+        self.facts
+            .values()
+            .flat_map(|facts| &facts.0.definitions)
+            .filter(|definition| !definition.includes.is_empty())
+            .map(|definition| definition.name.clone())
+            .collect()
+    }
+
+    pub(super) fn add(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        bytes: Option<Vec<u8>>,
+        cached: Option<CachedFacts>,
+        deadline: Instant,
+        unresolved: &mut Option<UnresolvedInput>,
+    ) -> Option<(Vec<PathBuf>, Vec<String>)> {
+        if !path.extension().is_some_and(|extension| extension == "rs") {
+            self.parsed.insert(path.into());
+        }
+        if let Some(cached) = cached {
+            return self.load(root, path, cached, deadline, unresolved);
+        }
+        if let Some(bytes) = bytes {
+            let text = std::str::from_utf8(&bytes).ok()?;
+            if text.contains("include") || text.contains("env") {
+                let mut facts = FileFacts::default();
+                facts.parse(root, path, &bytes, deadline, unresolved)?;
+                return self.load(
+                    root,
+                    path,
+                    CachedFacts(Arc::new(facts)),
+                    deadline,
+                    unresolved,
+                );
+            }
+            self.pending.insert(path.into(), Some(bytes));
+        }
+        Some((Vec::new(), Vec::new()))
+    }
+
+    fn load(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        facts: CachedFacts,
+        deadline: Instant,
+        unresolved: &mut Option<UnresolvedInput>,
+    ) -> Option<(Vec<PathBuf>, Vec<String>)> {
+        let mut included = Vec::new();
+        for (input, rust) in &facts.0.direct {
+            expired(deadline)?;
+            let target = expression(input, path, &BTreeMap::new(), deadline)
+                .and_then(|relative| include_path(root, path, &relative, deadline));
+            let Some(target) = target else {
+                expired(deadline)?;
+                return FileFacts::refuse(path, false, unresolved);
+            };
+            if *rust {
+                self.rust_sources.insert(target.clone());
+            }
+            included.push(target);
+        }
+        let env_keys = facts.0.env_keys.clone();
+        self.facts.insert(path.into(), facts);
+        Some((included, env_keys))
+    }
+
+    pub(super) fn scan_pending(
+        &mut self,
+        root: &Path,
+        files: &BTreeMap<PathBuf, super::Stamp>,
+        deadline: Instant,
+        unresolved: &mut Option<UnresolvedInput>,
+    ) -> Option<()> {
+        let names = self.macro_names();
+        let added: BTreeSet<_> = names.difference(&self.searched_names).cloned().collect();
+        if !added.is_empty() {
+            for path in files.keys() {
+                expired(deadline)?;
+                if (path.extension().is_some_and(|ext| ext == "rs")
+                    || self.rust_sources.contains(path))
+                    && !self.facts.contains_key(path)
+                {
+                    self.pending.entry(path.clone()).or_insert(None);
+                }
+            }
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for (path, bytes) in pending {
+            expired(deadline)?;
+            let candidates = if bytes.is_some() { &names } else { &added };
+            if candidates.is_empty() {
+                continue;
+            }
+            let bytes = bytes.or_else(|| super::read_bounded(&path, deadline))?;
+            let observed = super::stamp(&std::fs::metadata(&path).ok()?)?;
+            let expected = files.get(&path)?;
+            if (observed.size, observed.modified, observed.changed)
+                != (expected.size, expected.modified, expected.changed)
+            {
+                return None;
+            }
+            let text = std::str::from_utf8(&bytes).ok()?;
+            let mut relevant = false;
+            for name in candidates {
+                expired(deadline)?;
+                // Also match bare names: an import alias or forwarding macro
+                // can hide a call without spelling `name!` in the same file.
+                if text.contains(name) {
+                    relevant = true;
+                    break;
+                }
+            }
+            if relevant {
+                if blake3::hash(&bytes).to_hex().as_str() != expected.hash {
+                    return None;
+                }
+                let mut facts = FileFacts::default();
+                facts.parse(root, &path, &bytes, deadline, unresolved)?;
+                self.load(
+                    root,
+                    &path,
+                    CachedFacts(Arc::new(facts)),
+                    deadline,
+                    unresolved,
+                )?;
+            }
+        }
+        self.searched_names.extend(names);
         Some(())
     }
 
@@ -401,20 +596,20 @@ impl SourceInputs {
         unresolved: &mut Option<UnresolvedInput>,
     ) -> Option<Vec<PathBuf>> {
         let mut included = Vec::new();
-        for definition in &self.definitions {
+        for definition in self.facts.values().flat_map(|facts| &facts.0.definitions) {
             expired(deadline)?;
             if definition.includes.is_empty() {
                 continue;
             }
-            for name in &self.references {
+            for facts in self.facts.values() {
                 expired(deadline)?;
                 // Passing a macro by name (including a `use ... as ...`
                 // alias) can hide calls from this deliberately small resolver.
-                if name.rsplit("::").next() == Some(&definition.name) {
-                    return Self::refuse(&definition.path, false, unresolved);
+                if facts.0.references.contains(&definition.name) {
+                    return FileFacts::refuse(&definition.path, false, unresolved);
                 }
             }
-            for invocation in &self.invocations {
+            for invocation in self.facts.values().flat_map(|facts| &facts.0.invocations) {
                 expired(deadline)?;
                 if invocation.name != definition.name {
                     continue;
@@ -424,19 +619,19 @@ impl SourceInputs {
                     .as_ref()
                     .filter(|_| !invocation.nested)
                 else {
-                    return Self::refuse(&definition.path, false, unresolved);
+                    return FileFacts::refuse(&definition.path, false, unresolved);
                 };
                 let Some(args) = arguments(&invocation.args, deadline)
                     .filter(|args| args.len() == parameters.len())
                 else {
                     expired(deadline)?;
-                    return Self::refuse(&definition.path, false, unresolved);
+                    return FileFacts::refuse(&definition.path, false, unresolved);
                 };
                 let mut bindings = BTreeMap::new();
                 for (parameter, arg) in parameters.iter().zip(args) {
                     expired(deadline)?;
                     let [Token::Literal(value)] = arg else {
-                        return Self::refuse(&definition.path, false, unresolved);
+                        return FileFacts::refuse(&definition.path, false, unresolved);
                     };
                     bindings.insert(parameter.clone(), value.clone());
                 }
@@ -454,7 +649,7 @@ impl SourceInputs {
                         }
                         None => {
                             expired(deadline)?;
-                            return Self::refuse(&definition.path, false, unresolved);
+                            return FileFacts::refuse(&definition.path, false, unresolved);
                         }
                     }
                 }

@@ -2,6 +2,8 @@ mod applicability_cache;
 pub mod child_registry;
 pub mod client;
 pub(crate) mod completed_rust_check;
+#[cfg(feature = "test-hooks")]
+pub use completed_rust_check::FingerprintProbe;
 mod diagnostic_registration;
 pub mod diagnostics;
 pub mod document;

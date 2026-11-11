@@ -1,7 +1,7 @@
 //! A completed compiler check, not an idle server, is the authority behind this
 //! cache. Disk validation is fail-closed and never installs cached rows into the
 //! live diagnostics store: a cold server can publish partial results independently.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -14,11 +14,11 @@ use serde::{Deserialize, Serialize};
 use super::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 
 mod inputs;
-use inputs::{SourceInputs, UnresolvedInput};
+use inputs::{CachedFacts, SourceInputs, UnresolvedInput};
 
 pub(crate) const BUDGET: Duration = Duration::from_secs(2);
 // The first completed check has no trusted hash ledger yet. Later requests
-// reuse content hashes, but still resolve macros against current source files.
+// reuse content hashes and parsed facts, then resolve cross-file macro inputs.
 const INITIAL_CAPTURE_BUDGET: Duration = Duration::from_secs(15);
 // Filesystem timestamps can round a write down to a tick before the wall-clock
 // instant at which it actually happened. Two seconds covers coarse timestamp
@@ -29,9 +29,9 @@ const CHECK_BEGIN_TIMESTAMP_MARGIN: Duration = Duration::from_secs(2);
 // Worktree churn must not turn completed compiler checks into an unbounded disk cache.
 const MAX_RECORDS: usize = 64;
 const RECORD_SCAN_LIMIT: usize = 1024;
-// Schema 2 did not fence filesystem timestamp granularity at check begin, so
-// even matching inputs cannot establish that its saved diagnostics are sound.
-const RECORD_SCHEMA: u32 = 3;
+// Older records have no proof that skipped sources were checked for the set of
+// include-bearing macro names. Rebuild their facts before trusting a check.
+const RECORD_SCHEMA: u32 = 4;
 
 fn canonical(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path)
@@ -150,6 +150,10 @@ pub(crate) struct Fingerprint {
     pub(crate) hashed: usize,
     extra_inputs: Vec<PathBuf>,
     extra_env_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    source_facts: BTreeMap<PathBuf, CachedFacts>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    macro_names: BTreeSet<String>,
     #[serde(skip)]
     environment_overrides: BTreeMap<String, String>,
 }
@@ -250,7 +254,7 @@ fn workspace_packages(root: &Path, deadline: Instant) -> Option<Vec<PathBuf>> {
     Some(packages)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn fingerprint(
     root: &Path,
     runtime: String,
@@ -261,6 +265,46 @@ pub(crate) fn fingerprint(
     began: Option<SystemTime>,
 ) -> Option<Fingerprint> {
     fingerprint_with_reason(root, runtime, previous, deadline, began, &mut None)
+}
+
+/// Test-only access to the production fingerprint for paired release probes.
+#[cfg(feature = "test-hooks")]
+pub struct FingerprintProbe(Fingerprint);
+
+#[cfg(feature = "test-hooks")]
+impl FingerprintProbe {
+    pub fn capture(root: &Path, previous: Option<&Self>) -> Option<Self> {
+        fingerprint(
+            root,
+            "release-probe".into(),
+            previous.map(|previous| &previous.0),
+            Instant::now() + Duration::from_secs(60),
+            None,
+        )
+        .map(Self)
+    }
+
+    pub fn stats(&self) -> (usize, usize, usize, u64, usize) {
+        let (rust_files, rust_bytes) = self
+            .0
+            .files
+            .iter()
+            .filter(|(path, _)| path.extension().is_some_and(|ext| ext == "rs"))
+            .fold((0, 0), |(count, bytes), (_, stamp)| {
+                (count + 1, bytes + stamp.size)
+            });
+        (
+            self.0.examined,
+            self.0.files.len(),
+            rust_files,
+            rust_bytes,
+            self.0.hashed,
+        )
+    }
+
+    pub fn same_digest(&self, other: &Self) -> bool {
+        self.0.digest == other.0.digest
+    }
 }
 
 fn fingerprint_with_reason(
@@ -284,7 +328,8 @@ fn fingerprint_with_reason(
         started: Instant::now(),
     };
     let mut hashed = 0;
-    let mut source_inputs = SourceInputs::default();
+    let mut source_inputs =
+        SourceInputs::new(previous.map_or_else(BTreeSet::new, |p| p.macro_names.clone()));
     let mut pending = workspace_packages(root, deadline)?;
     let mut inputs = vec![root.join("Cargo.toml")];
     let extra_inputs = previous.map_or_else(Vec::new, |p| p.extra_inputs.clone());
@@ -374,9 +419,13 @@ fn fingerprint_with_reason(
     }
     loop {
         if inputs.is_empty() {
+            source_inputs.scan_pending(root, &files, deadline, unresolved)?;
             for path in source_inputs.resolve(root, deadline, unresolved)? {
                 expired(deadline)?;
-                if !files.contains_key(&path) || source_inputs.needs_parse(&path) {
+                if !files.contains_key(&path)
+                    || (!path.extension().is_some_and(|ext| ext == "rs")
+                        && source_inputs.needs_parse(&path))
+                {
                     inputs.push(path);
                 }
             }
@@ -386,7 +435,10 @@ fn fingerprint_with_reason(
         };
         report.last = path.clone();
         expired(deadline)?;
-        if files.contains_key(&path) && !source_inputs.needs_parse(&path) {
+        if files.contains_key(&path)
+            && (path.extension().is_some_and(|ext| ext == "rs")
+                || !source_inputs.needs_parse(&path))
+        {
             continue;
         }
         let metadata = fs::symlink_metadata(&path).ok()?;
@@ -452,17 +504,14 @@ fn fingerprint_with_reason(
             hashed += 1;
         }
         if source_inputs.needs_parse(&path) {
-            // Macro invocations in another source file can change the paths a
-            // definition reads, even when the definition's own bytes did not.
-            let bytes = source_bytes.or_else(|| read_bounded(&path, deadline))?;
-            let observed = stamp(&fs::metadata(&path).ok()?)?;
-            if (observed.size, observed.modified, observed.changed)
-                != (current.size, current.modified, current.changed)
-            {
-                return None;
-            }
+            // Facts are keyed by the same content hash as the file stamp.
+            // Unchanged sources need neither a read nor a tree-sitter parse.
+            let cached = previous
+                .filter(|_| old.is_some_and(|old| old.hash == current.hash))
+                .and_then(|previous| previous.source_facts.get(&path))
+                .cloned();
             let (included, env_keys) =
-                source_inputs.add(root, &path, &bytes, deadline, unresolved)?;
+                source_inputs.add(root, &path, source_bytes, cached, deadline, unresolved)?;
             current.included = included;
             current.env_keys = env_keys;
         }
@@ -502,6 +551,7 @@ fn fingerprint_with_reason(
         hashed
     );
     report.complete = true;
+    let macro_names = source_inputs.macro_names();
     Some(Fingerprint {
         files,
         runtime,
@@ -510,6 +560,8 @@ fn fingerprint_with_reason(
         hashed,
         extra_inputs,
         extra_env_keys,
+        source_facts: source_inputs.facts,
+        macro_names,
         environment_overrides,
     })
 }
@@ -687,6 +739,8 @@ impl Runtime {
             hashed: 0,
             extra_inputs: Vec::new(),
             extra_env_keys: Vec::new(),
+            source_facts: BTreeMap::new(),
+            macro_names: BTreeSet::new(),
             environment_overrides: BTreeMap::new(),
         });
         seed.environment_overrides = self
@@ -930,8 +984,16 @@ fn map_fingerprint_paths(
     fingerprint.extra_inputs = fingerprint
         .extra_inputs
         .into_iter()
-        .map(map)
+        .map(&mut map)
         .collect::<Result<_, _>>()?;
+    let mut source_facts = BTreeMap::new();
+    for (path, mut facts) in fingerprint.source_facts {
+        facts.map_paths(&mut map)?;
+        if source_facts.insert(map(path)?, facts).is_some() {
+            return Err("duplicate source facts path");
+        }
+    }
+    fingerprint.source_facts = source_facts;
     Ok(fingerprint)
 }
 
@@ -2316,8 +2378,20 @@ mod tests {
         write_record(&missed.path, certified).unwrap();
         let disk: serde_json::Value =
             serde_json::from_slice(&fs::read(&missed.path).unwrap()).unwrap();
-        assert_eq!(disk["record"]["schema"], 3);
+        assert_eq!(disk["record"]["schema"], RECORD_SCHEMA);
         assert!(valid(&reload(&missed)).is_some());
+    }
+
+    #[test]
+    fn schema_three_record_without_source_facts_is_a_cache_miss() {
+        let (_temp, cache) = fixture();
+        let mut old = (**cache.saved.as_ref().unwrap()).clone();
+        old.schema = 3;
+        write_record(&cache.path, &old).unwrap();
+        assert!(
+            reload(&cache).saved.is_none(),
+            "older records do not prove which macro names skipped sources were checked against"
+        );
     }
 
     #[test]
@@ -2427,6 +2501,122 @@ mod tests {
             Instant::now() + BUDGET,
             None,
         )
+    }
+
+    #[test]
+    fn warm_fingerprint_reuses_saved_source_facts_without_parsing() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "member/src/data/a.txt", "one");
+        write(&cache.root, "member/src/data/b.txt", "two");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture { ($name:literal) => { include_str!(concat!("data/", $name)) }; }
+            const ENV: Option<&str> = option_env!("AFT_TEST_CACHED_SOURCE_FACTS");
+        "#,
+        );
+        write(
+            &cache.root,
+            "member/src/calls.rs",
+            "const DATA: &str = fixture!(\"a.txt\");",
+        );
+        inputs::take_parses();
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert_eq!(
+            inputs::take_parses(),
+            2,
+            "only the definition and its call need parsing"
+        );
+        write_record(&cache.path, cache.saved.as_ref().unwrap()).unwrap();
+        let reloaded = reload(&cache);
+        let original = &cache.saved.as_ref().unwrap().fingerprint;
+        let restored = &reloaded.saved.as_ref().unwrap().fingerprint;
+        assert_eq!(
+            serde_json::to_value(&original.source_facts).unwrap(),
+            serde_json::to_value(&restored.source_facts).unwrap()
+        );
+        assert_eq!(original.macro_names, restored.macro_names);
+        inputs::take_parses();
+        let warm = fingerprint(
+            &cache.root,
+            "v1".into(),
+            Some(restored),
+            Instant::now() + BUDGET,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            inputs::take_parses(),
+            0,
+            "unchanged warm sources must not be parsed"
+        );
+        assert_eq!(warm.digest, restored.digest);
+        write(
+            &cache.root,
+            "member/src/calls.rs",
+            "const DATA: &str = fixture!(\"b.txt\");",
+        );
+        let changed = fingerprint(
+            &cache.root,
+            "v1".into(),
+            Some(&warm),
+            Instant::now() + BUDGET,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            inputs::take_parses(),
+            1,
+            "only the changed call site needs parsing"
+        );
+        assert!(changed
+            .files
+            .contains_key(&cache.root.join("member/src/data/b.txt")));
+        assert!(!changed
+            .files
+            .contains_key(&cache.root.join("member/src/data/a.txt")));
+    }
+
+    #[test]
+    fn byte_prefilter_skips_irrelevant_sources_and_revisits_new_macro_names() {
+        let (_temp, cache) = fixture();
+        write(
+            &cache.root,
+            "member/src/calls.rs",
+            "const DATA: &str = fixture!(\"a.txt\");",
+        );
+        write(&cache.root, "member/src/data/a.txt", "one");
+        inputs::take_parses();
+        let before = capture_inputs(&cache).unwrap();
+        assert_eq!(
+            inputs::take_parses(),
+            0,
+            "irrelevant bytes must not reach tree-sitter"
+        );
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture { ($name:literal) => { include_str!(concat!("data/", $name)) }; }
+        "#,
+        );
+        let after = fingerprint(
+            &cache.root,
+            "v1".into(),
+            Some(&before),
+            Instant::now() + BUDGET,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            inputs::take_parses(),
+            2,
+            "a new definition must discover unchanged callers"
+        );
+        assert!(after
+            .files
+            .contains_key(&cache.root.join("member/src/data/a.txt")));
     }
 
     fn unresolved_input(cache: &CompletedRustCheck) -> String {
