@@ -1,0 +1,24 @@
+name: Show gate log
+description: >
+  Print a failed gate's log into the job output. Self-hosted runners do not
+  upload gate logs as artifacts, and the runner's temp folder is wiped when the
+  job ends, so without this the failure details are lost.
+inputs:
+  path:
+    description: Gate log written by scripts/rust-test-gate.sh (AFT_GATE_LOG).
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GATE_LOG: ${{ inputs.path }}
+      run: |
+        if [[ ! -f "$GATE_LOG" ]]; then
+          echo "no gate log at $GATE_LOG"
+          exit 0
+        fi
+        echo "--- failure lines in $GATE_LOG ---"
+        grep -nE 'FAIL|panicked at|failures:|test result: FAILED|error(\[|:)|SIGSEGV|SIGABRT|exit code|STATUS_' "$GATE_LOG" | tail -n 120 || true
+        echo "--- last 400 lines of $GATE_LOG ---"
+        tail -n 400 "$GATE_LOG"

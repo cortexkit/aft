@@ -1272,6 +1272,12 @@ jobs:
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           NEXTEST_TEST_THREADS: "num-cpus"
 
+      - name: Show macOS libtest shard log
+        if: ${{ failure() && runner.environment != 'github-hosted' }}
+        uses: ./.github/actions/show-gate-log
+        with:
+          path: ${{ runner.temp }}/macos-libtest-shard-${{ matrix.shard }}.log
+
       - name: Upload macOS libtest shard output
         if: ${{ runner.environment == 'github-hosted' && (always()) }}
         uses: ./.github/actions/upload-artifact-retry
@@ -1350,6 +1356,12 @@ jobs:
           AFT_TEST_DIAG: "1"
           AFT_GATE_PHASES: watcher
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+      - name: Show macOS watcher log
+        if: ${{ failure() && runner.environment != 'github-hosted' }}
+        uses: ./.github/actions/show-gate-log
+        with:
+          path: ${{ runner.temp }}/macos-watcher.log
 
       - name: Upload macOS watcher output
         if: ${{ runner.environment == 'github-hosted' && (always()) }}
@@ -1726,6 +1738,12 @@ jobs:
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           NEXTEST_TEST_THREADS: "4"
 
+      - name: Show Windows libtest shard log
+        if: ${{ failure() && runner.environment != 'github-hosted' }}
+        uses: ./.github/actions/show-gate-log
+        with:
+          path: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
+
       - name: Upload Windows libtest shard output
         if: ${{ runner.environment == 'github-hosted' && (always()) }}
         uses: ./.github/actions/upload-artifact-retry
@@ -1793,6 +1811,12 @@ jobs:
           AFT_TEST_DIAG: "1"
           AFT_GATE_PHASES: watcher,conformance
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+      - name: Show Windows watcher + conformance log
+        if: ${{ failure() && runner.environment != 'github-hosted' }}
+        uses: ./.github/actions/show-gate-log
+        with:
+          path: ${{ runner.temp }}/windows-watcher-conformance.log
 
       - name: Upload Windows watcher + conformance output
         if: ${{ runner.environment == 'github-hosted' && (always()) }}
