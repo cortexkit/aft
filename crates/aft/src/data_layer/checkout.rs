@@ -5356,7 +5356,7 @@ impl TodoCountMemo {
 }
 
 impl Checkout {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn todo_count_memo_stats_for_test(&self) -> (usize, usize) {
         use aft_store::heap::HeapBytes as _;
         let memo = self.todo_counts.lock().unwrap();
