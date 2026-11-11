@@ -4,17 +4,17 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use aft::bash_background::persistence::retention::{
+    prune_retention_sweep, prune_retention_tick, prune_terminal_rows,
+};
 use aft::bash_background::persistence::{
     create_task_layout, session_tasks_dir, write_task_at, PersistedTask,
 };
 use aft::bash_background::BgTaskStatus;
 use aft::db::bash_tasks::{
-    prune_terminal_rows, terminal_rows_eligible_count, upsert_bash_task, BashTaskRow,
-    TERMINAL_ROW_RETENTION_AGE_MS,
+    terminal_rows_eligible_count, upsert_bash_task, BashTaskRow, TERMINAL_ROW_RETENTION_AGE_MS,
 };
-use aft::db::compression_events::{
-    prune_retention_sweep, prune_retention_tick, RetentionSweepOutcome, BASH_TASK_STEADY_STATE_ROWS,
-};
+use aft::db::compression_events::{RetentionSweepOutcome, BASH_TASK_STEADY_STATE_ROWS};
 use aft::db::TrackedConnection as Connection;
 use rusqlite::params;
 
