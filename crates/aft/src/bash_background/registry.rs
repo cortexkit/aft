@@ -2542,7 +2542,7 @@ impl BgTaskRegistry {
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
-        crate::db::deferred_checkpoint::register(&conn);
+        crate::db::deferred_checkpoint::register_shared(&conn);
         let path = conn
             .lock()
             .ok()

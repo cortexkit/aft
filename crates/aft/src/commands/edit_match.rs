@@ -1363,6 +1363,7 @@ mod tests {
         let checkpoint_attempts = checkpoint_after.0 - checkpoint_before.0;
         let checkpoint_mutex_hold = checkpoint_after.1 - checkpoint_before.1;
         assert!(checkpoint_attempts > 0);
+        assert_eq!(checkpoint_mutex_hold, std::time::Duration::ZERO);
         if disk_writer {
             assert!(writer_rounds > 0);
         }

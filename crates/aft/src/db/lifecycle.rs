@@ -882,6 +882,19 @@ impl TrackedConnection {
         Arc::clone(&self.wal_hook.checkpoint_stats)
     }
 
+    pub(crate) fn checkpoint_feedback(&self) -> impl Fn(bool) + Send + Sync + 'static {
+        let weak = Arc::downgrade(&self.wal_hook);
+        move |finished| {
+            if let Some(state) = weak.upgrade() {
+                if finished {
+                    state.lag_reported.store(false, Ordering::Relaxed);
+                } else {
+                    state.note_checkpoint_lag();
+                }
+            }
+        }
+    }
+
     /// Return false while a reader pins the WAL or SQLite cannot checkpoint.
     /// Retrying from the worker also drains a backlog when no new calls arrive.
     pub(crate) fn checkpoint_in_background(&self) -> bool {
@@ -1272,11 +1285,7 @@ mod tests {
         use super::super::deferred_checkpoint::{self, test_hooks};
         use std::time::Duration;
 
-        for store in [
-            SqliteStore::AftDb,
-            SqliteStore::InspectScopeCache,
-            SqliteStore::BreakerFile,
-        ] {
+        for store in [SqliteStore::InspectScopeCache, SqliteStore::BreakerFile] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("tool.sqlite");
             let conn = TrackedConnection::open(&path, store).unwrap();
@@ -1340,6 +1349,76 @@ mod tests {
             drop(pool);
             assert!(test_hooks::wait_closed(&path, Duration::from_secs(10)));
         }
+    }
+
+    #[test]
+    fn shared_checkpoint_never_holds_the_request_connection_mutex() {
+        use super::super::deferred_checkpoint::{self, test_hooks};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = crate::db::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE checkpoint_payloads(payload BLOB)")
+            .unwrap();
+        conn.checkpoint_wal_as(WalCheckpointMode::Truncate, WriteDomain::AftDb)
+            .unwrap();
+        let main_size = std::fs::metadata(&path).unwrap().len();
+        let stats = conn.checkpoint_stats();
+        let pool = Arc::new(Mutex::new(conn));
+        deferred_checkpoint::register_shared(&pool);
+        let finished = test_hooks::finished(&path);
+        let gate = test_hooks::close_gate(&path);
+        let inline = inline_checkpoints_on_this_thread();
+        {
+            let conn = pool.lock().unwrap();
+            for _ in 0..72 {
+                conn.execute(
+                    "INSERT INTO checkpoint_payloads VALUES(zeroblob(524288))",
+                    [],
+                )
+                .unwrap();
+            }
+            assert!(
+                test_hooks::wait_until_held(Duration::from_secs(10)),
+                "the worker could not open its SQLite handle while the request owned the mutex"
+            );
+            assert_eq!(crate::db::file_identity::open_connections(&path), 2);
+            assert!(
+                conn.wal_hook.last_log_frames.load(Ordering::Relaxed) > WAL_LAG_THRESHOLD_PAGES
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), main_size);
+            assert_eq!(inline_checkpoints_on_this_thread(), inline);
+        }
+        assert!(
+            pool.try_lock().is_ok(),
+            "checkpoint work held the shared mutex"
+        );
+        drop(gate);
+        assert!(test_hooks::wait_finished_after(
+            &path,
+            finished,
+            Duration::from_secs(10)
+        ));
+        let (attempts, held) = stats.snapshot();
+        assert!(attempts > 0);
+        assert_eq!(held, Duration::ZERO);
+        {
+            let conn = pool.lock().unwrap();
+            assert!(std::fs::metadata(&path).unwrap().len() > main_size);
+            conn.execute("INSERT INTO checkpoint_payloads VALUES(zeroblob(4096))", [])
+                .unwrap();
+            let bound = 32 + WAL_LAG_THRESHOLD_PAGES as u64 * (conn.page_size + 24);
+            assert!(
+                std::fs::metadata(path.with_extension("db-wal"))
+                    .unwrap()
+                    .len()
+                    <= bound
+            );
+            assert_eq!(inline_checkpoints_on_this_thread(), inline);
+        }
+        drop(pool);
+        assert!(test_hooks::wait_closed(&path, Duration::from_secs(10)));
     }
 
     #[test]

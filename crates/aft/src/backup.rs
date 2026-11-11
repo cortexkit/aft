@@ -1299,7 +1299,7 @@ impl BackupStore {
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
-        crate::db::deferred_checkpoint::register(&conn);
+        crate::db::deferred_checkpoint::register_shared(&conn);
         if let Ok(mut slot) = self.db_pool.write() {
             *slot = Some(conn);
         }
@@ -12480,16 +12480,6 @@ mod edit_latency_tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "edited");
     }
 
-    /// Opens the deferred-checkpoint gate when dropped, so a failing
-    /// assertion cannot leave other tests' checkpoints held.
-    struct GateGuard;
-
-    impl Drop for GateGuard {
-        fn drop(&mut self) {
-            crate::db::deferred_checkpoint::test_hooks::open_gate();
-        }
-    }
-
     /// The aft.db mirror commit of an undo snapshot must not run the WAL
     /// checkpoint SQLite triggers past the autocheckpoint threshold: that
     /// copies the WAL into the database and syncs both files while the edit
@@ -12524,8 +12514,7 @@ mod edit_latency_tests {
 
         let finished_before = test_hooks::finished(&db_file);
         let inline_before = crate::db::lifecycle::inline_checkpoints_on_this_thread();
-        test_hooks::close_gate();
-        let gate = GateGuard;
+        let gate = test_hooks::close_gate(&db_file);
         store
             .snapshot_with_op("deferred", &path, "edit", Some("op-1"))
             .unwrap();
