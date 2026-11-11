@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, SemanticBackendConfig};
 use crate::context::{AppContext, ConfigureMaintenanceJob, SemanticIndexStatus};
@@ -21,10 +21,25 @@ use crate::lsp::registry::{
 };
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
+pub(crate) use crate::runtime_drain::configure::ConfigureMaintenanceState;
+use crate::runtime_drain::configure::{
+    ConfigureMaintenanceContinuation, ConfigureMaintenanceStage,
+};
 use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
 use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn register_runtime_hooks() {
+    crate::runtime_drain::configure::register(crate::runtime_drain::configure::Hooks {
+        drain: drain_deferred_configure_maintenance,
+        drain_yielding: drain_deferred_configure_maintenance_yielding,
+        pending: standalone_configure_maintenance_pending,
+        prefix: drain_standalone_configure_prefix,
+        unit: drain_standalone_configure_unit,
+        database_runtime: configure_database_runtime_with_mode,
+    });
+}
 
 static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -2300,6 +2315,7 @@ fn handle_configure_prepared(
     ctx: &AppContext,
     prepared: Option<&Config>,
 ) -> Response {
+    register_runtime_hooks();
     let response = configure_prepared(req, ctx, prepared);
     if response.success {
         // The rebind's rescan runs in the configure tail, after this reply;
@@ -3911,153 +3927,6 @@ pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
     let cancelled = jobs.len();
     cancel_unbound_configure_jobs(ctx, jobs);
     cancelled
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ConfigureMaintenanceStage {
-    #[default]
-    Admission,
-    DatabaseRuntime,
-    SessionReplay,
-    BashRuntime,
-    ProjectRuntime,
-    Watcher,
-    ProcessFlags,
-    Status,
-}
-
-impl ConfigureMaintenanceStage {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Admission => "admission",
-            Self::DatabaseRuntime => "database_runtime",
-            Self::SessionReplay => "session_replay",
-            Self::BashRuntime => "bash_runtime",
-            Self::ProjectRuntime => "project_runtime",
-            Self::Watcher => "watcher",
-            Self::ProcessFlags => "process_flags",
-            Self::Status => "status",
-        }
-    }
-
-    /// Initial work that runs before the first request after configure: bash
-    /// replay restores the DB tasks and one bounded disk batch, so an immediate
-    /// `bash_drain_completions` sees those results. Disk-only tasks beyond that
-    /// batch arrive through later maintenance and completion delivery rather
-    /// than delaying requests for a full disk scan. The prefix also prepares the
-    /// project runtime (a queued `outline`/`glob` must see the rebuilt gitignore
-    /// matcher), and the watcher start. The watcher only observes changes made
-    /// after it subscribes, so a file written between the configure ack and the
-    /// first request is lost for good if the start waits for a later yield: on a
-    /// small tree the index is ready after one request, an ignore-rule change
-    /// written right after it was never seen, and the ignored file stayed in
-    /// grep results. Everything after these is housekeeping and yields to
-    /// requests.
-    fn is_non_yielding_prefix(self) -> bool {
-        matches!(
-            self,
-            Self::Admission
-                | Self::DatabaseRuntime
-                | Self::SessionReplay
-                | Self::BashRuntime
-                | Self::ProjectRuntime
-                | Self::Watcher
-        )
-    }
-}
-
-#[derive(Debug)]
-struct ConfigureMaintenanceContinuation {
-    job: ConfigureMaintenanceJob,
-    stage: ConfigureMaintenanceStage,
-    replay_retry_at: Option<Instant>,
-    lexical_bind_retry_at: Option<Instant>,
-    callgraph_upgrade_retry_at: Option<Instant>,
-    replay_error_logged: bool,
-}
-
-impl ConfigureMaintenanceContinuation {
-    fn new(job: ConfigureMaintenanceJob) -> Self {
-        Self {
-            job,
-            stage: ConfigureMaintenanceStage::Admission,
-            replay_retry_at: None,
-            lexical_bind_retry_at: None,
-            callgraph_upgrade_retry_at: None,
-            replay_error_logged: false,
-        }
-    }
-
-    fn retry_at(&self) -> Option<Instant> {
-        self.callgraph_upgrade_retry_at
-            .or(self.lexical_bind_retry_at)
-            .or(self.replay_retry_at)
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct ConfigureMaintenanceState {
-    jobs: VecDeque<ConfigureMaintenanceContinuation>,
-    // Freeze retry eligibility across one full drain so a deferred unit cannot
-    // become due again while other units run and monopolize the same drain.
-    replay_retry_cutoff: Option<Instant>,
-}
-
-impl ConfigureMaintenanceState {
-    pub(crate) fn jobs_is_empty(&self) -> bool {
-        self.jobs.is_empty()
-    }
-
-    pub(crate) fn has_ready_job(&self) -> bool {
-        let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
-        self.jobs.iter().any(|continuation| {
-            continuation
-                .retry_at()
-                .is_none_or(|deadline| deadline <= now)
-        })
-    }
-
-    fn select_ready_job(&mut self, ctx: &AppContext) -> bool {
-        let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
-        let Some(index) = self.jobs.iter().position(|continuation| {
-            ctx.subc_unbound_quiesced()
-                || continuation
-                    .retry_at()
-                    .is_none_or(|deadline| deadline <= now)
-        }) else {
-            return false;
-        };
-        self.jobs.rotate_left(index);
-        true
-    }
-
-    fn absorb_enqueued(&mut self, ctx: &AppContext) {
-        self.jobs.extend(
-            ctx.drain_configure_maintenance()
-                .into_iter()
-                .map(ConfigureMaintenanceContinuation::new),
-        );
-    }
-
-    /// True when the next unit to run starts a job or continues one past its
-    /// request-critical prefix, so stopping here leaves no prefix half done.
-    ///
-    /// Why the remaining stops are safe: stopping before a job's Admission
-    /// leaves the root exactly as it is between a bind ack and the tail's
-    /// first submission, which every bind already passes through. Past the
-    /// prefix, the standalone loop already lets requests (configures and edits
-    /// included) run between units. A writer that runs meanwhile either keeps
-    /// the configure generation (an equivalent rebind, an LSP-path update or
-    /// an edit, none of which touch what the remaining stages read) or
-    /// advances it, in which case `drop_superseded_parked_continuations`
-    /// discards the rest and the newer configure's own tail repeats every
-    /// root-scoped stage.
-    fn can_step_aside(&self) -> bool {
-        self.jobs.front().is_none_or(|continuation| {
-            continuation.stage == ConfigureMaintenanceStage::Admission
-                || !continuation.stage.is_non_yielding_prefix()
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

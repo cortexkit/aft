@@ -1,4 +1,5 @@
 use crate as aft;
+pub(crate) mod configure;
 use crate::context::{
     AppContext, SemanticIndexStatus, SemanticRefreshRequest, WatcherDrainApplyPhase,
     WatcherDrainPhase, WatcherDrainSliceState,
@@ -375,7 +376,7 @@ pub fn standalone_root_configured(ctx: &AppContext) {
 }
 
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
-    crate::commands::configure::drain_deferred_configure_maintenance(ctx);
+    (configure::hooks().drain)(ctx);
     crate::data_layer::runtime::root_bound(ctx);
     crate::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
 }
@@ -397,35 +398,35 @@ pub fn follow_configure_with_data_layer(ctx: &AppContext) {
 /// returns `true` when the drain stepped aside for a queued interactive
 /// writer on the same root and left the rest parked for a requeued drain.
 pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) -> bool {
-    crate::commands::configure::drain_deferred_configure_maintenance_yielding(ctx)
+    (configure::hooks().drain_yielding)(ctx)
 }
 
 /// Tracks deferred configure work for the standalone NDJSON loop. The attached-
 /// daemon (`subc`) path schedules this work through its executor instead.
 #[derive(Debug)]
 pub struct StandaloneConfigureMaintenance {
-    inner: crate::commands::configure::ConfigureMaintenanceState,
+    inner: configure::ConfigureMaintenanceState,
 }
 
 impl Default for StandaloneConfigureMaintenance {
     fn default() -> Self {
         Self {
-            inner: crate::commands::configure::ConfigureMaintenanceState::default(),
+            inner: configure::ConfigureMaintenanceState::default(),
         }
     }
 }
 
 impl StandaloneConfigureMaintenance {
     pub fn has_pending(&mut self, ctx: &AppContext) -> bool {
-        crate::commands::configure::standalone_configure_maintenance_pending(ctx, &mut self.inner)
+        (configure::hooks().pending)(ctx, &mut self.inner)
     }
 
     pub fn drain_prefix(&mut self, ctx: &Arc<AppContext>) -> bool {
-        crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner)
+        (configure::hooks().prefix)(ctx, &mut self.inner)
     }
 
     pub fn drain_one(&mut self, ctx: &Arc<AppContext>) -> bool {
-        crate::commands::configure::drain_standalone_configure_unit(ctx, &mut self.inner)
+        (configure::hooks().unit)(ctx, &mut self.inner)
     }
 }
 

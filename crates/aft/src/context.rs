@@ -2221,11 +2221,9 @@ fn session_owned_scratch_location(
 /// operation; accepting it would create or change `<root>/issue:/N` locally.
 fn reject_github_address(req_id: &str, path: &Path) -> Result<(), crate::protocol::Response> {
     match path.to_str() {
-        Some(raw) => crate::github_address::reject_github_resource_path(
-            req_id,
-            "file operation",
-            raw,
-        ),
+        Some(raw) => {
+            crate::github_address::reject_github_resource_path(req_id, "file operation", raw)
+        }
         None => Ok(()),
     }
 }
@@ -3082,7 +3080,7 @@ pub struct AppContext {
     /// interactive writer (usually a route bind) could take the actor. The
     /// next tail drain resumes it before anything newly enqueued.
     parked_configure_tail:
-        parking_lot::Mutex<Option<crate::commands::configure::ConfigureMaintenanceState>>,
+        parking_lot::Mutex<Option<crate::runtime_drain::configure::ConfigureMaintenanceState>>,
     /// The background identity retry armed when aft.db was busy at this
     /// root's bind. See [`crate::provisional_identity_retry`].
     provisional_identity_retry: crate::provisional_identity_retry::RetrySlot,
@@ -3463,9 +3461,7 @@ impl AppContext {
             data_external: parking_lot::Mutex::new(std::collections::HashMap::new()),
             callgraph_executor: parking_lot::Mutex::new(None),
             view_load_health: parking_lot::Mutex::new(ViewLoadHealth::default()),
-            search_exact_memo: Arc::new(
-                crate::search_state::memo::ExactMemoStore::new(),
-            ),
+            search_exact_memo: Arc::new(crate::search_state::memo::ExactMemoStore::new()),
             symbol_cache,
             inspect_manager,
             tier2_refresh_scheduler: parking_lot::Mutex::new(Tier2RefreshScheduler::new()),
@@ -4956,7 +4952,7 @@ impl AppContext {
 
     pub(crate) fn park_configure_tail(
         &self,
-        state: crate::commands::configure::ConfigureMaintenanceState,
+        state: crate::runtime_drain::configure::ConfigureMaintenanceState,
     ) {
         let previous = self.parked_configure_tail.lock().replace(state);
         debug_assert!(
@@ -4967,7 +4963,7 @@ impl AppContext {
 
     pub(crate) fn take_parked_configure_tail(
         &self,
-    ) -> Option<crate::commands::configure::ConfigureMaintenanceState> {
+    ) -> Option<crate::runtime_drain::configure::ConfigureMaintenanceState> {
         self.parked_configure_tail.lock().take()
     }
 
@@ -5702,7 +5698,7 @@ impl AppContext {
             self.finish_database_runtime_error(error.to_string(), false);
             return;
         }
-        crate::commands::configure::configure_database_runtime_with_mode(
+        (crate::runtime_drain::configure::hooks().database_runtime)(
             self,
             &root,
             &storage,
@@ -6974,21 +6970,18 @@ impl AppContext {
     }
 
     /// The search reranker's backend slot.
-    pub(crate) fn rerank_slot(
-        &self,
-    ) -> &crate::search_state::rerank::slot::BackendSlot {
+    pub(crate) fn rerank_slot(&self) -> &crate::search_state::rerank::slot::BackendSlot {
         &self.rerank_slot
     }
 
     /// Start building the reranker backend for `config` in the background when
     /// it differs from the one built or being built. Never blocks on the build.
     fn reconcile_rerank_backend(&self, config: &Config) {
-        self.rerank_slot.reconcile(
-            crate::search_state::rerank::slot::BuildInputs::from_config(
+        self.rerank_slot
+            .reconcile(crate::search_state::rerank::slot::BuildInputs::from_config(
                 config,
                 !self.daemonless_query_mode(),
-            ),
-        );
+            ));
     }
 
     pub(crate) fn daemonless_query_mode(&self) -> bool {
@@ -7311,9 +7304,7 @@ impl AppContext {
         )
     }
 
-    pub(crate) fn search_exact_memo(
-        &self,
-    ) -> Arc<crate::search_state::memo::ExactMemoStore> {
+    pub(crate) fn search_exact_memo(&self) -> Arc<crate::search_state::memo::ExactMemoStore> {
         Arc::clone(&self.search_exact_memo)
     }
 
