@@ -725,6 +725,7 @@ fn replay(mut args: impl Iterator<Item = String>) {
     let mut reused = (0usize, 0.0f64, 0.0f64);
     let mut walls = Vec::new();
     let mut publications = 0usize;
+    let mut cold_builds = 0usize;
     phase("replay", || {
         let mut since = 0usize;
         for (index, edit) in edits.iter().enumerate() {
@@ -735,6 +736,7 @@ fn replay(mut args: impl Iterator<Item = String>) {
             let cpu = cpu_seconds();
             let wall = Instant::now();
             let stats = checkout.refresh_callgraph().unwrap();
+            cold_builds += usize::from(stats.as_ref().is_some_and(|stats| stats.cold_build));
             let wall = wall.elapsed().as_secs_f64();
             let cpu = cpu_seconds() - cpu;
             if stats.is_some() {
@@ -767,7 +769,7 @@ fn replay(mut args: impl Iterator<Item = String>) {
                 .unwrap_or(0.0)
         };
         format!(
-            "{} edits, {publications} publications; refreshes that started an engine: {} \
+            "{} edits, {publications} publications, {cold_builds} cold switches; refreshes that started an engine: {} \
              ({:.1} s wall, {:.1} s CPU); that reused one: {} ({:.1} s wall, {:.1} s CPU); \
              all: {:.1} s wall, {:.1} s CPU, per refresh p50 {:.0} ms, p90 {:.0} ms, max {:.0} ms",
             edits.len(),
@@ -898,6 +900,22 @@ fn transition(mut args: impl Iterator<Item = String>) {
         })
     });
     println!("engine parts {:?}", worktree.engine_memory_parts());
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("PROBE_COMPARE").is_some() {
+        let cold = Checkout::bind(
+            Arc::clone(&layer),
+            &scratch.path().join("cold-store"),
+            family,
+            &next,
+        )
+        .unwrap();
+        cold.build().unwrap();
+        let compared = aft::data_layer::checkout_gate::compare_engines(&worktree, &cold).unwrap();
+        println!(
+            "forced-switch comparison {}",
+            serde_json::to_string(&compared).unwrap()
+        );
+    }
 }
 
 /// Copies an archive's source tree without following links or copying Git's

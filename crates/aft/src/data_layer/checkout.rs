@@ -34,9 +34,10 @@ use aft_store::text::{
 use super::callgraph::{CheckoutInputs, EncodedResolution, FileResolution};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
 use super::graph_store::{Held, SectionsWriter, StoredSlices};
-use super::incremental::{LiveCheckout, UpdateStats};
+use super::incremental::{LiveCheckout, UpdateError, UpdateStats};
 use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
 use super::query::{SliceReader, SliceSource};
+use super::refresh_budget::{RefreshBudget, RefreshLimit};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
@@ -79,6 +80,8 @@ pub(crate) struct SourceWork {
     /// Passes over the files: a scan reads every file whose stat does not
     /// prove its recorded content, and a build's scan parses what it reads.
     pub(crate) scans: usize,
+    /// Whole call-graph cold builds, excluding text-only scans and sibling admission.
+    pub(crate) cold_builds: usize,
     /// Call-graph resolutions: a build's, or a refresh's update.
     pub(crate) resolutions: usize,
     /// The most stored parses, and separately resolutions, a refresh's
@@ -370,6 +373,29 @@ struct GraphEngine {
     /// substantial state. The publication must replace that size estimate;
     /// small publications otherwise keep the ordinary measurement cadence.
     measure_after_publication: bool,
+}
+
+enum EngineUpdate {
+    Applied(
+        Option<UpdateStats>,
+        Option<(OverlaySlices<Arc<StoredSlices>>, Refreshed)>,
+    ),
+    Cold(RefreshLimit),
+}
+
+/// A checkout's single queued or running build. Dropping a queued task also
+/// releases its reservation, so another reader can request the build again.
+pub(crate) struct BuildReservation {
+    live: Arc<RwLock<Live>>,
+}
+
+impl Drop for BuildReservation {
+    fn drop(&mut self) {
+        self.live
+            .write()
+            .expect("no panics while holding it")
+            .building = false;
+    }
 }
 
 impl GraphEngine {
@@ -1451,11 +1477,42 @@ impl Checkout {
     }
 
     fn build_as(&self, measure: bool) -> Result<BuildReport, DataError> {
+        let Some(reservation) = self.reserve_build() else {
+            return Ok(BuildReport {
+                superseded: true,
+                ..BuildReport::default()
+            });
+        };
+        self.build_reserved(measure, reservation)
+    }
+
+    pub(crate) fn reserve_build(&self) -> Option<BuildReservation> {
+        let mut live = self.write_live();
+        if live.building {
+            return None;
+        }
+        live.building = true;
+        Some(BuildReservation {
+            live: Arc::clone(&self.live),
+        })
+    }
+
+    pub(crate) fn is_building(&self) -> bool {
+        self.live
+            .read()
+            .expect("no panics while holding it")
+            .building
+    }
+
+    pub(crate) fn build_reserved(
+        &self,
+        measure: bool,
+        reservation: BuildReservation,
+    ) -> Result<BuildReport, DataError> {
         let _alloc_label =
             crate::alloc_trace::scope(crate::alloc_trace::Label::INDEX_BUILD, Some(&self.root));
-        self.write_live().building = true;
         let result = self.build_inner(measure);
-        self.write_live().building = false;
+        drop(reservation);
         self.note_outcome("build", &result);
         result
     }
@@ -1512,6 +1569,7 @@ impl Checkout {
         checkpoint()?;
         // A change recorded before the scan starts is in what the scan
         // reads; one recorded later may not be.
+        note_source_work(&self.root, |work| work.cold_builds += 1);
         let covered = self
             .live
             .read()
@@ -1865,7 +1923,7 @@ impl Checkout {
         let text_ready_ms = elapsed_ms(build_started);
         checkpoint()?;
         let started = Instant::now();
-        let update = self.refresh_callgraph()?;
+        let update = self.refresh_callgraph_as(true)?;
         log::debug!("sibling callgraph update: {update:?}");
         let resolve_ms = elapsed_ms(started);
         let started = Instant::now();
@@ -2480,12 +2538,16 @@ impl Checkout {
     /// When a stored record or fragment cannot be read, or resolution
     /// fails. The pending paths stay pending then.
     pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
+        self.refresh_callgraph_as(false)
+    }
+
+    fn refresh_callgraph_as(&self, by_build: bool) -> Result<Option<UpdateStats>, DataError> {
         let _alloc_label = crate::alloc_trace::scope(
             crate::alloc_trace::Label::CALLGRAPH_REFRESH,
             Some(&self.root),
         );
         checkpoint()?;
-        let result = self.refresh_inner();
+        let result = self.refresh_inner(by_build);
         self.touch_memory();
         self.note_outcome("refresh", &result);
         result
@@ -2503,9 +2565,12 @@ impl Checkout {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
-    fn refresh_inner(&self) -> Result<Option<UpdateStats>, DataError> {
-        let (published, state, changes, covered) = {
+    fn refresh_inner(&self, by_build: bool) -> Result<Option<UpdateStats>, DataError> {
+        let (published, state, changes, covered, invalidated) = {
             let live = self.live.read().expect("no panics while holding it");
+            if live.building && !by_build {
+                return Ok(None);
+            }
             let Some(published) = live.published.clone() else {
                 return Ok(None);
             };
@@ -2513,7 +2578,24 @@ impl Checkout {
                 .state
                 .clone()
                 .unwrap_or_else(|| Arc::new(published.state.clone()));
-            (published, state, live.changes.clone(), live.sequence)
+            let invalidated = live
+                .refreshed
+                .as_ref()
+                .map_or_else(BTreeSet::new, |refreshed| {
+                    refreshed
+                        .replaced
+                        .keys()
+                        .chain(&refreshed.removed)
+                        .cloned()
+                        .collect()
+                });
+            (
+                published,
+                state,
+                live.changes.clone(),
+                live.sequence,
+                invalidated,
+            )
         };
         // Without a call graph there is nothing to update; the build that
         // makes one covers every change recorded before its scan.
@@ -2529,15 +2611,55 @@ impl Checkout {
             *slot = None;
             slot
         });
+        if self.is_building() && !by_build {
+            return Ok(None);
+        }
+        let parsed = slot.as_ref().map_or_else(
+            || published.graph.parsed_files().count(),
+            |engine| engine.live.inputs.parses.len(),
+        );
+        let mut budget = RefreshBudget::new(parsed, invalidated);
         // A damaged stored record or fragment can stop the update where it
         // expects one (every file the engine lists has a parse and a
         // resolution). Such a stop fails this refresh as damage, and the
         // engine, whose state it may have left half-updated, starts again.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.update_engine(&mut slot, &published, &state, &changes)
+            self.update_engine(&mut slot, &published, &state, &changes, &mut budget)
         }));
         let (stats, served) = match outcome {
-            Ok(Ok(outcome)) => outcome,
+            Ok(Ok(EngineUpdate::Applied(stats, served))) => (stats, served),
+            Ok(Ok(EngineUpdate::Cold(limit))) => {
+                // No incremental engine or its decoded state overlaps the cold
+                // builder. Watcher events keep recording over the publication.
+                *slot = None;
+                let reservation = if by_build { None } else { self.reserve_build() };
+                drop(slot);
+                drop(changes);
+                drop(state);
+                drop(published);
+                if !by_build && reservation.is_none() {
+                    return Ok(None);
+                }
+                crate::slog_info!(
+                    "data layer cold refresh: root={} invalidated={} threshold={} parsed={}",
+                    self.root.display(),
+                    limit.invalidated,
+                    limit.threshold,
+                    limit.parsed
+                );
+                let started = Instant::now();
+                if let Some(reservation) = reservation {
+                    self.build_reserved(false, reservation)?;
+                } else {
+                    // Sibling admission already owns the build reservation.
+                    self.build_inner(false)?;
+                }
+                return Ok(Some(UpdateStats {
+                    cold_build: true,
+                    total_ms: elapsed_ms(started),
+                    ..UpdateStats::default()
+                }));
+            }
             Ok(Err(error)) => {
                 *slot = None;
                 return Err(error);
@@ -2625,13 +2747,20 @@ impl Checkout {
         published: &Arc<Published>,
         state: &Arc<CheckoutState>,
         changes: &BTreeMap<Vec<u8>, Change>,
-    ) -> Result<
-        (
-            Option<UpdateStats>,
-            Option<(OverlaySlices<Arc<StoredSlices>>, Refreshed)>,
-        ),
-        DataError,
-    > {
+        budget: &mut RefreshBudget,
+    ) -> Result<EngineUpdate, DataError> {
+        // This test needs neither extraction nor an engine start. A single
+        // watcher batch can already be larger than incremental admission.
+        if let Err(limit) = budget.check(changes.len()) {
+            return Ok(EngineUpdate::Cold(limit));
+        }
+        let changed_members = changes
+            .keys()
+            .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        if let Err(limit) = budget.include(&changed_members) {
+            return Ok(EngineUpdate::Cold(limit));
+        }
         if slot
             .as_ref()
             .is_some_and(|engine| !Arc::ptr_eq(&engine.published, &published))
@@ -2670,11 +2799,16 @@ impl Checkout {
             #[cfg(feature = "test-hooks")]
             super::refresh_probe::stage("planning");
             let next = next_inputs(state, &engine.live.inputs, changes, &changed);
+            if let Err(limit) = budget.set_parsed(next.parses.len()) {
+                return Ok(EngineUpdate::Cold(limit));
+            }
             let changed_names = changed
                 .iter()
                 .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_string))
                 .collect::<BTreeSet<_>>();
-            let update = engine.live.update(next, &changed_names);
+            let update = engine
+                .live
+                .update_with_budget(next, &changed_names, Some(budget));
             // The engine reads stored parses and resolutions as it goes; a
             // read that failed made it work from an empty one.
             let failures = published.graph.failures();
@@ -2686,7 +2820,13 @@ impl Checkout {
             }
             // The caller drops a partly updated engine after either error,
             // so the next refresh starts again from the publication.
-            let update = update.map_err(|error| DataError::Resolve(error.to_string()))?;
+            let update = match update {
+                Ok(update) => update,
+                Err(UpdateError::Limit(limit)) => return Ok(EngineUpdate::Cold(limit)),
+                Err(UpdateError::Resolve(error)) => {
+                    return Err(DataError::Resolve(error.to_string()))
+                }
+            };
             log::debug!("callgraph refresh work: changed={} rebound={} replayed={} resolved={} dispatch_replayed={} dispatch_recomputed={} sites={} touched={}", update.changed_paths, update.rebound, update.replayed, update.resolved, update.dispatch_replayed, update.dispatch_recomputed, update.sites_resolved, update.touched.len());
             #[cfg(feature = "test-hooks")]
             super::refresh_probe::stage("slices");
@@ -2779,7 +2919,7 @@ impl Checkout {
         let served = stats
             .is_some()
             .then(|| (engine.overlay.clone(), engine.refreshed.clone()));
-        Ok((stats, served))
+        Ok(EngineUpdate::Applied(stats, served))
     }
 
     /// Publishes what changed since the publication in a segment of its
@@ -6251,7 +6391,13 @@ pub fn other() { callee(); }
             )
         };
         assert!(matches!(
-            checkout.update_engine(&mut None, &published, &state, &changes),
+            checkout.update_engine(
+                &mut None,
+                &published,
+                &state,
+                &changes,
+                &mut RefreshBudget::new(published.graph.parsed_files().count(), BTreeSet::new())
+            ),
             Err(DataError::Damaged(_))
         ));
         for attempt in 0..2 {
@@ -7116,14 +7262,11 @@ pub fn other() { callee(); }
         );
     }
 
-    /// A change recorded while a build runs, after its scan, stays laid over
-    /// the build's publication. A refresh that resolved it during the build
-    /// laid its answer over the old publication's call graph, which the
-    /// build's replaces, so the change is pending again until a refresh
-    /// resolves it over the new one. The call graph used to report ready
-    /// then and answer without the change.
+    /// A change after a build's scan stays pending over its publication.
+    /// Refreshes now coalesce with that build instead of resolving against
+    /// the old publication and discarding those results when the build ends.
     #[test]
-    fn a_change_resolved_while_a_build_ran_is_resolved_again_over_its_publication() {
+    fn a_change_recorded_while_a_build_runs_resolves_over_its_publication() {
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         demo(root.path());
@@ -7152,12 +7295,8 @@ pub fn other() { callee(); }
         checkout
             .record_paths(&[b"src/extra.rs".to_vec(), b"src/lib.rs".to_vec()])
             .unwrap();
-        checkout.refresh_callgraph().unwrap();
-        let view = checkout.view().unwrap();
-        assert_eq!(view.status().callgraph, PlaneStatus::Ready);
-        let resolved = callers_of(&view, "src/util.rs", "callee");
-        assert!(resolved.contains("src/extra.rs"), "{resolved}");
-        drop(view);
+        assert!(checkout.refresh_callgraph().unwrap().is_none());
+        assert_eq!(checkout.status().callgraph_pending, 2);
 
         drop(hold);
         building.join().unwrap().unwrap();
@@ -7171,7 +7310,7 @@ pub fn other() { callee(); }
         checkout.refresh_callgraph().unwrap();
         assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
         let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
-        assert_eq!(callers, resolved);
+        assert!(callers.contains("src/extra.rs"), "{callers}");
         let cold_store = tempfile::tempdir().unwrap();
         let cold = Checkout::bind(layer, cold_store.path(), family(), root.path()).unwrap();
         cold.build().unwrap();
@@ -7595,6 +7734,136 @@ pub fn other() { callee(); }
     }
 
     const CHAIN: usize = 8;
+
+    #[test]
+    fn bounded_refresh_accumulates_invalidations_across_two_passes() {
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let mut files = BTreeMap::new();
+        for group in ["a", "b"] {
+            files.insert(
+                format!("{group}.ts"),
+                format!("export function helper_{group}() {{}}\n"),
+            );
+            for i in 0..550 {
+                files.insert(format!("{group}{i}.ts"), format!(
+                    "import {{ helper_{group} }} from './{group}';\nexport function f_{group}{i}() {{ helper_{group}(); }}\n"
+                ));
+            }
+        }
+        let worktree = Worktree::new(&layer, store.path(), files);
+        let root = worktree.dir.path();
+        let checkout = &worktree.checkout;
+        let before = source_work_for_test(root).cold_builds;
+        let edit = |group: &str| {
+            let path = format!("{group}.ts");
+            write(
+                root,
+                &path,
+                &format!("export function renamed_{group}() {{}}\n"),
+            );
+            checkout.record_paths(&[path.into_bytes()]).unwrap();
+            checkout.refresh_callgraph().unwrap().unwrap()
+        };
+        let first = edit("a");
+        assert!(!first.cold_build);
+        assert!((500..1024).contains(&first.touched.len()), "{first:?}");
+        assert_eq!(source_work_for_test(root).cold_builds, before);
+        let second = edit("b");
+        assert!(
+            second.cold_build,
+            "two disjoint sub-threshold passes exceed the union limit"
+        );
+        assert_eq!(source_work_for_test(root).cold_builds, before + 1);
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+        assert!(checkout.refresh_callgraph().unwrap().is_none());
+        assert_eq!(source_work_for_test(root).cold_builds, before + 1);
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root).unwrap();
+        cold.build().unwrap();
+        let compared = super::super::checkout_gate::compare_engines(checkout, &cold).unwrap();
+        assert_eq!(compared.files, 1102);
+    }
+
+    fn record_many_notes(checkout: &Checkout, root: &Path, generation: usize) {
+        let paths = (0..1025)
+            .map(|i| {
+                let path = format!("notes_{generation}_{i}.txt");
+                write(root, &path, "changed while the checkout is being rebased\n");
+                path.into_bytes()
+            })
+            .collect::<Vec<_>>();
+        checkout.record_paths(&paths).unwrap();
+    }
+
+    fn bounded_refresh_catch_up(broad: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Arc::new(Checkout::bind(layer, store.path(), family(), root.path()).unwrap());
+        checkout.build().unwrap();
+        let before = source_work_for_test(root.path()).cold_builds;
+        record_many_notes(&checkout, root.path(), 0);
+        let hold = hold_build_publication_for_test(root.path());
+        let refreshing = {
+            let checkout = Arc::clone(&checkout);
+            std::thread::spawn(move || checkout.refresh_callgraph().unwrap().unwrap())
+        };
+        hold.wait_until_held();
+        if broad {
+            record_many_notes(&checkout, root.path(), 1);
+        } else {
+            write(root.path(), "src/extra.rs", "pub fn late() {}\n");
+            checkout.record_paths(&[b"src/extra.rs".to_vec()]).unwrap();
+        }
+        assert!(checkout.refresh_callgraph().unwrap().is_none());
+        assert!(
+            checkout.build().unwrap().superseded,
+            "a running cold build absorbs another request"
+        );
+        assert_eq!(source_work_for_test(root.path()).cold_builds, before + 1);
+        drop(hold);
+        assert!(refreshing.join().unwrap().cold_build);
+        assert!(checkout.status().callgraph_pending > 0);
+        let caught_up = checkout.refresh_callgraph().unwrap().unwrap();
+        assert_eq!(caught_up.cold_build, broad);
+        assert_eq!(
+            source_work_for_test(root.path()).cold_builds,
+            before + 1 + usize::from(broad)
+        );
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+    }
+
+    #[test]
+    fn bounded_refresh_catches_up_small_events_during_a_cold_build_incrementally() {
+        bounded_refresh_catch_up(false);
+    }
+
+    #[test]
+    fn bounded_refresh_runs_one_more_cold_build_for_a_broad_preserved_batch() {
+        bounded_refresh_catch_up(true);
+    }
+
+    #[test]
+    fn bounded_refresh_coalesces_with_a_queued_cold_build() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        record_many_notes(&checkout, root.path(), 0);
+        let before = source_work_for_test(root.path()).cold_builds;
+        let reservation = checkout.reserve_build().unwrap();
+        assert!(checkout.refresh_callgraph().unwrap().is_none());
+        assert!(checkout.reserve_build().is_none());
+        assert_eq!(source_work_for_test(root.path()).cold_builds, before);
+        checkout.build_reserved(false, reservation).unwrap();
+        assert_eq!(source_work_for_test(root.path()).cold_builds, before + 1);
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+    }
 
     /// Worktrees of one repository keep editing while a main checkout takes
     /// in their changes, as one merging its workers' branches does, and a

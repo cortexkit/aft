@@ -48,11 +48,14 @@ use super::callgraph::{
     CheckoutInputs, FileResolution, MethodCallInputs, Resolutions,
 };
 use super::graph_store::StoredSlices;
+use super::refresh_budget::{RefreshBudget, RefreshLimit};
 use super::subjects::{affected_by, subjects, Subject};
 
 /// What one update did, for measurement.
 #[derive(Clone, Debug, Default)]
 pub struct UpdateStats {
+    /// A broad incremental update was replaced by a stored-record cold build.
+    pub cold_build: bool,
     pub changed_paths: usize,
     /// Recorded checkout reads asked again, and how many got a different
     /// answer.
@@ -82,6 +85,27 @@ pub struct UpdateStats {
     /// Files whose stored resolution changed: rebound, resolved, traced or
     /// re-sited again, or removed.
     pub touched: BTreeSet<String>,
+}
+
+pub(crate) enum UpdateError {
+    Resolve(ManifestJoinError),
+    Limit(RefreshLimit),
+}
+
+impl From<ManifestJoinError> for UpdateError {
+    fn from(error: ManifestJoinError) -> Self {
+        Self::Resolve(error)
+    }
+}
+
+fn admit<'a>(
+    budget: &mut Option<&mut RefreshBudget>,
+    files: impl IntoIterator<Item = &'a String>,
+) -> Result<(), UpdateError> {
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.include(files).map_err(UpdateError::Limit)?;
+    }
+    Ok(())
 }
 
 /// Which files recorded each input key, for one kind of recording: the
@@ -609,17 +633,34 @@ impl LiveCheckout {
         next: CheckoutInputs,
         changed: &BTreeSet<String>,
     ) -> Result<UpdateStats, ManifestJoinError> {
+        self.update_with_budget(next, changed, None)
+            .map_err(|error| match error {
+                UpdateError::Resolve(error) => error,
+                UpdateError::Limit(_) => {
+                    unreachable!("an unbounded update cannot hit a refresh limit")
+                }
+            })
+    }
+
+    /// A limit aborts before the newly invalidated pass runs. The caller must
+    /// drop this partly updated engine before rebuilding the checkout.
+    pub(crate) fn update_with_budget(
+        &mut self,
+        next: CheckoutInputs,
+        changed: &BTreeSet<String>,
+        budget: Option<&mut RefreshBudget>,
+    ) -> Result<UpdateStats, UpdateError> {
         let started = Instant::now();
         let pool = Arc::clone(&self.pool);
         let mut stats = crate::alloc_trace::install(&pool, || {
-            let stats = self.update_in_pool(next, changed)?;
+            let stats = self.update_in_pool(next, changed, budget)?;
             #[cfg(feature = "test-hooks")]
             super::refresh_probe::stage("encode");
             // Every resolution the update made or changed is encoded, so
             // that it can be let go between updates like a stored one.
             let parses = &self.inputs.parses;
             self.resolved.encode_changed(|path| parses.key(path));
-            Ok::<_, ManifestJoinError>(stats)
+            Ok::<_, UpdateError>(stats)
         })?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(stats)
@@ -710,7 +751,9 @@ impl LiveCheckout {
         &mut self,
         next: CheckoutInputs,
         changed: &BTreeSet<String>,
-    ) -> Result<UpdateStats, ManifestJoinError> {
+        mut budget: Option<&mut RefreshBudget>,
+    ) -> Result<UpdateStats, UpdateError> {
+        admit(&mut budget, changed)?;
         let mut stats = UpdateStats {
             changed_paths: changed.len(),
             ..UpdateStats::default()
@@ -905,6 +948,7 @@ impl LiveCheckout {
         rebind.extend(contents.iter().cloned());
         rebind.extend(stale.binding.iter().cloned());
         rebind.retain(|path| inputs.parses.contains_key(path));
+        admit(&mut budget, rebind.iter().chain(&removed_parses))?;
         let rebind = rebind.into_iter().collect::<Vec<_>>();
         let rebind_refs = rebind.iter().collect::<Vec<_>>();
         let new_bound = bind_all(inputs, &rebind_refs)?;
@@ -1036,6 +1080,7 @@ impl LiveCheckout {
                 resolve.insert(path.clone());
             }
         }
+        admit(&mut budget, &resolve)?;
         // Resolving a Rust file reads the module tree, which the resolver
         // builds by binding every module-declaring file; bind those in
         // parallel first (see `BindCache::bind_module_declaring`).
@@ -1108,6 +1153,7 @@ impl LiveCheckout {
         }
         drop(answers);
         drop(trace_answers);
+        admit(&mut budget, &resolve)?;
         #[cfg(feature = "test-hooks")]
         self.profile_refresh("replay", &mut profile_clock);
         #[cfg(feature = "test-hooks")]
@@ -1174,6 +1220,7 @@ impl LiveCheckout {
             }
         }
         recompute.extend(traces_changed);
+        admit(&mut budget, &recompute)?;
         for path in &recompute {
             let (_, parse) = &inputs.parses[path.as_str()];
             let dispatch = dispatch_targets(path, parse, &index, &facts)?;
@@ -1194,7 +1241,7 @@ impl LiveCheckout {
         // A file bound on first use inside passes 2 and 3 cannot return its
         // error there.
         if let Some(error) = files.take_error() {
-            return Err(error);
+            return Err(error.into());
         }
         drop(index);
         drop(facts);
@@ -1225,6 +1272,7 @@ impl LiveCheckout {
         }
         sites.extend(self.reverse.sites_of(&site_keys));
         sites.retain(|path| inputs.parses.contains_key(path));
+        admit(&mut budget, &sites)?;
         let paths = sites.iter().collect::<Vec<_>>();
         for (path, kept, dependencies) in
             self.calls.resolve_sites(inputs, &self.resolved, &paths)?

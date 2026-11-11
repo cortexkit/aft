@@ -416,6 +416,9 @@ impl Work {
             return false;
         }
         let flag = ClearOnDrop(Arc::clone(&self.building));
+        let Some(reservation) = self.checkout.reserve_build() else {
+            return;
+        };
         let work = Arc::clone(self);
         self.runner.run(BUILD_REQUEST, Pool::Build, move || {
             #[cfg(test)]
@@ -426,7 +429,7 @@ impl Work {
             {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let result = work.checkout.build();
+            let result = work.checkout.build_reserved(false, reservation);
             drop(flag);
             work.checkout.notify_readiness_change();
             if !matches!(result, Err(DataError::Cancelled)) {
@@ -515,6 +518,9 @@ impl Work {
             let mut requested = self.publish_requested.lock();
             *requested = (*requested).max(publish);
         }
+        if self.checkout.is_building() {
+            return;
+        }
         if self.refreshing.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -527,6 +533,9 @@ impl Work {
             let mut flag = Some(flag);
             loop {
                 let result = work.checkout.refresh_callgraph();
+                if work.checkout.is_building() {
+                    return;
+                }
                 if !matches!(result, Ok(None) | Err(DataError::Cancelled)) {
                     work.notify_status_change();
                 }
