@@ -8,8 +8,10 @@ use std::sync::atomic::Ordering;
 
 use crate::context::AppContext;
 #[cfg(test)]
+pub(crate) use crate::output_store::cleanup_expired;
+pub(crate) use crate::output_store::OutputScope;
+#[cfg(test)]
 use crate::output_store::SAVED_FILE_LIMIT;
-pub(crate) use crate::output_store::{cleanup_expired, OutputScope};
 use crate::protocol::Response;
 
 pub const TEXT_LIMIT: usize = 50 * 1024;
