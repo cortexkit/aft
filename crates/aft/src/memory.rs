@@ -238,7 +238,7 @@ impl RootMemorySnapshot {
         self
     }
 
-    fn rollup(&self) -> RootMemoryRollup {
+    pub(crate) fn rollup(&self) -> RootMemoryRollup {
         let mut estimates = vec![
             &self.semantic,
             &self.trigram,
