@@ -18,19 +18,18 @@ use regex::bytes::Regex;
 use regex_syntax::hir::{Hir, HirKind};
 
 use crate::cache_freshness;
-use crate::commands::semantic_search::request_files::{
-    Fetched, FileStat, RequestFile, RequestFiles,
-};
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 use crate::root_identity::key::{artifact_cache_key_for_build, canonicalize_or_normalize};
+use crate::search_state::request_files::{Fetched, FileStat, RequestFile, RequestFiles};
 
-pub use crate::commands::semantic_search::{exact_lane, memo};
+pub use crate::commands::semantic_search::exact_lane;
+pub use crate::search_state::memo;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactPassMatch {
     pub path: PathBuf,
-    pub symbol_range: Option<crate::commands::semantic_search::comparator::SymbolOffsetRange>,
-    pub evidence: crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor,
+    pub symbol_range: Option<crate::search_state::candidate::SymbolOffsetRange>,
+    pub evidence: crate::search_state::evidence_descriptor::EvidenceDescriptor,
     pub content_digest: String,
 }
 
@@ -788,7 +787,7 @@ impl SearchIndexSnapshot {
         let mut files_hashed = 0usize;
         let mut matches = Vec::new();
         let search_root_canon = canonicalize_for_search_membership(search_root);
-        let request_files = crate::commands::semantic_search::request_files::current();
+        let request_files = crate::search_state::request_files::current();
 
         for file_id in candidate_file_ids {
             let Some(file_entry) = self.files.get(file_id as usize) else {
@@ -2361,7 +2360,7 @@ impl SearchIndexSnapshot {
         let missing_on_disk = AtomicUsize::new(0);
         // Rayon tasks run on other threads, where the request's file set is
         // not current: take it here and hand it to them.
-        let request_files = crate::commands::semantic_search::request_files::current();
+        let request_files = crate::search_state::request_files::current();
         let request_files = request_files.as_deref();
         let files: Vec<GrepFileMatches> = examined_slice
             .par_iter()
@@ -2377,7 +2376,7 @@ impl SearchIndexSnapshot {
                         return None;
                     }
                     let deadline = started.checked_add(limits.budget);
-                    let fetched = crate::commands::semantic_search::request_files::read_through(
+                    let fetched = crate::search_state::request_files::read_through(
                         request_files,
                         &file.path,
                         |path| Ok((read_indexed_file_bytes(path, deadline)?, None)),
@@ -3081,7 +3080,7 @@ pub(crate) fn read_request_corpus_file(
     }
     let Some(files) = files else {
         #[cfg(test)]
-        crate::commands::semantic_search::request_files::record_disk_read(path);
+        crate::search_state::request_files::record_disk_read(path);
         return match read_search_corpus_file(path, max_file_size) {
             SearchCorpusEligibility::Eligible(file) => RequestCorpusFile::Eligible {
                 generated: file.generated,

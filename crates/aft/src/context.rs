@@ -2949,7 +2949,7 @@ pub struct AppContext {
     /// Checkout view load failures of this project (see [`ViewLoadHealth`]).
     /// Read by the health snapshot; written by every query that loads a view.
     view_load_health: parking_lot::Mutex<ViewLoadHealth>,
-    search_exact_memo: Arc<crate::commands::semantic_search::memo::ExactMemoStore>,
+    search_exact_memo: Arc<crate::search_state::memo::ExactMemoStore>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
     tier2_refresh_scheduler: parking_lot::Mutex<Tier2RefreshScheduler>,
@@ -3464,7 +3464,7 @@ impl AppContext {
             callgraph_executor: parking_lot::Mutex::new(None),
             view_load_health: parking_lot::Mutex::new(ViewLoadHealth::default()),
             search_exact_memo: Arc::new(
-                crate::commands::semantic_search::memo::ExactMemoStore::new(),
+                crate::search_state::memo::ExactMemoStore::new(),
             ),
             symbol_cache,
             inspect_manager,
@@ -7313,7 +7313,7 @@ impl AppContext {
 
     pub(crate) fn search_exact_memo(
         &self,
-    ) -> Arc<crate::commands::semantic_search::memo::ExactMemoStore> {
+    ) -> Arc<crate::search_state::memo::ExactMemoStore> {
         Arc::clone(&self.search_exact_memo)
     }
 

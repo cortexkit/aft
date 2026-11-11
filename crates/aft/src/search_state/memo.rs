@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex, RwLock};
 
-use crate::commands::semantic_search::comparator::{CandidateResult, SymbolOffsetRange};
-use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
-use crate::commands::semantic_search::generation_token::GenerationToken;
+use super::candidate::{CandidateResult, SymbolOffsetRange};
+use super::evidence_descriptor::EvidenceDescriptor;
+use super::generation_token::GenerationToken;
 use crate::native_stat::{now_ns, NativeStat};
 use crate::search_index::ExactEvidenceScope;
 

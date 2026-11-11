@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 static PROCESS_NONCE: OnceLock<[u8; 16]> = OnceLock::new();
 
-/// Process-wide 128-bit CSPRNG process nonce.
+/// Process-wide 128-bit nonce from a cryptographically secure random generator.
 fn get_process_nonce() -> [u8; 16] {
     *PROCESS_NONCE.get_or_init(|| {
         let mut nonce = [0u8; 16];

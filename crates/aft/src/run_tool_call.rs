@@ -8,11 +8,10 @@ use crate::protocol::{RawRequest, Response};
 
 #[cfg(test)]
 mod backup_bookkeeping_tests;
-mod cpu_time;
 #[cfg(test)]
 mod outline_wait_probe;
+pub(crate) use crate::clock::ThreadCpuSample;
 pub(crate) use crate::tool_progress as progress;
-pub(crate) use cpu_time::ThreadCpuSample;
 
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
 

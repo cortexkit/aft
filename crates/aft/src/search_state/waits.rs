@@ -270,7 +270,7 @@ impl SearchWaits {
 
     /// `waits=text_view:0.01/1,embed:3.20/1 search_cpu=12.34ms`: each kind
     /// that ran, as total milliseconds / timer count, then the searching
-    /// thread's CPU time (`?` when unknown). Content-free by construction.
+    /// thread's CPU time (`?` when unknown). Includes no query or source text.
     pub fn render(&self) -> String {
         let mut out = String::from("waits=");
         let mut any = false;
@@ -377,7 +377,7 @@ thread_local! {
 pub struct WaitScope {
     /// `None` when another scope was already open on this thread: the outer
     /// scope keeps collecting and this one reports nothing of its own.
-    started: Option<(Instant, Option<crate::run_tool_call::ThreadCpuSample>)>,
+    started: Option<(Instant, Option<crate::clock::ThreadCpuSample>)>,
 }
 
 /// Start collecting this thread's search waits. If a scope is already open
@@ -415,7 +415,7 @@ fn open(wait_cpu: bool) -> WaitScope {
         true
     });
     WaitScope {
-        started: opened.then(|| (Instant::now(), crate::run_tool_call::ThreadCpuSample::now())),
+        started: opened.then(|| (Instant::now(), crate::clock::ThreadCpuSample::now())),
     }
 }
 
@@ -425,9 +425,9 @@ impl WaitScope {
     pub fn finish(mut self) -> Option<SearchWaits> {
         let (started, cpu_started) = self.started.take()?;
         let wall = started.elapsed();
-        let cpu = crate::run_tool_call::ThreadCpuSample::elapsed(
+        let cpu = crate::clock::ThreadCpuSample::elapsed(
             cpu_started,
-            crate::run_tool_call::ThreadCpuSample::now(),
+            crate::clock::ThreadCpuSample::now(),
         );
         let (slots, wait_cpu_sampled, files, prepared, code_references) =
             COLLECTOR.with(|collector| {
@@ -473,7 +473,7 @@ pub struct WaitTimer {
     started: Option<TimerStart>,
 }
 
-type TimerStart = (Instant, u32, Option<crate::run_tool_call::ThreadCpuSample>);
+type TimerStart = (Instant, u32, Option<crate::clock::ThreadCpuSample>);
 
 /// Start timing a wait of `kind` on this thread.
 pub fn time(kind: SearchWait) -> WaitTimer {
@@ -490,7 +490,7 @@ pub fn time(kind: SearchWait) -> WaitTimer {
         kind,
         started: open.map(|(generation, wait_cpu)| {
             let cpu = if wait_cpu {
-                crate::run_tool_call::ThreadCpuSample::now()
+                crate::clock::ThreadCpuSample::now()
             } else {
                 None
             };
@@ -543,9 +543,9 @@ impl Drop for WaitTimer {
         };
         let elapsed = started.elapsed();
         let cpu = cpu_started.and_then(|cpu_started| {
-            crate::run_tool_call::ThreadCpuSample::elapsed(
+            crate::clock::ThreadCpuSample::elapsed(
                 Some(cpu_started),
-                crate::run_tool_call::ThreadCpuSample::now(),
+                crate::clock::ThreadCpuSample::now(),
             )
         });
         COLLECTOR.with(|collector| {
