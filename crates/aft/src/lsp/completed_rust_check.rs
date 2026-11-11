@@ -56,7 +56,7 @@ impl Drop for WalkReport<'_> {
             self.last.display(),
             self.started.elapsed().as_millis()
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if !self.complete {
             eprintln!(
                 "fingerprint refused at {} after {:?}; examined {}",
