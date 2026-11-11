@@ -4267,7 +4267,7 @@ if len(header) == 4:
 c.close(); s.close()
 PY
 peer=$!
-while ! test -S "$TMPDIR/malformed.sock"; do sleep .02; done
+__AFT_SOCKET_GATE__
 rm -f "$AFT_GH_SHIM_STATE_DIR/read-session-lookup.json"
 if AFT_GH_READ_SOCKET="$TMPDIR/malformed.sock" gh api repos/cortexkit/aft >/dev/null 2>&1; then exit 92; fi
 wait "$peer"
@@ -4277,7 +4277,7 @@ with open(sys.argv[1]) as f: record = json.load(f)
 assert record['outcome'] == 'unavailable' and record['reason'] == 'worker read broker reply malformed', record
 PY
 echo MALFORMED_BROKER_REPLY_REFUSED
-"#.replace("while ! test -S \"$TMPDIR/malformed.sock\"; do sleep .02; done", &test_gate::gate_socket("\"$TMPDIR/malformed.sock\"", "sleep .02"))).await;
+"#.replace("__AFT_SOCKET_GATE__", &test_gate::gate_socket("\"$TMPDIR/malformed.sock\"", "sleep .02"))).await;
     assert!(reply.contains("MALFORMED_BROKER_REPLY_REFUSED"), "{reply}");
     assert!(jail.read_holder.lock().unwrap().calls.is_empty());
     assert!(!jail.worktree.join("native-gh.log").exists());
