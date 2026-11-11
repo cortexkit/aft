@@ -1851,6 +1851,18 @@ fn fixture_descriptor_targets() -> std::collections::BTreeMap<String, usize> {
     targets
 }
 
+/// Descriptors once the SQLite handles a fixture closed are really closed: a
+/// closed store hands its handle to the background checkpoint worker, which
+/// releases it shortly after the fixture returns.
+#[cfg(target_os = "linux")]
+fn settled_fixture_descriptor_targets() -> std::collections::BTreeMap<String, usize> {
+    assert!(
+        crate::db::deferred_checkpoint::test_hooks::drain(Duration::from_secs(10)),
+        "queued SQLite closes did not finish within 10 s"
+    );
+    fixture_descriptor_targets()
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn tool_result_fixtures_release_descriptors() {
@@ -1947,15 +1959,15 @@ fn tool_result_fixtures_release_descriptors() {
     let mut leaks = Vec::new();
     for (name, fixture) in cases {
         fixture(); // Initialize legitimate process-wide caches before measuring.
-        let initial = fixture_descriptor_targets();
+        let initial = settled_fixture_descriptor_targets();
         let before: usize = initial.values().sum();
         for round in 0..rounds {
-            let prior: usize = fixture_descriptor_targets().values().sum();
+            let prior: usize = settled_fixture_descriptor_targets().values().sum();
             fixture();
-            let current: usize = fixture_descriptor_targets().values().sum();
+            let current: usize = settled_fixture_descriptor_targets().values().sum();
             println!("FD_CENSUS {name} round={round} before={prior} after={current}");
         }
-        let final_targets = fixture_descriptor_targets();
+        let final_targets = settled_fixture_descriptor_targets();
         let after: usize = final_targets.values().sum();
         let retained: Vec<_> = final_targets
             .iter()

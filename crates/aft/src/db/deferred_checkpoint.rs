@@ -400,6 +400,18 @@ pub(crate) mod test_hooks {
         true
     }
 
+    /// Wait until every close and checkpoint already due on the worker has run.
+    /// A closed store hands its SQLite handle to the worker, so its descriptors
+    /// stay open briefly after the owner returns; count descriptors only after
+    /// this. A handle the worker never releases still shows up afterwards.
+    pub(crate) fn drain(timeout: Duration) -> bool {
+        let (done, finished) = std::sync::mpsc::channel();
+        super::close(move || {
+            let _ = done.send(());
+        });
+        finished.recv_timeout(timeout).is_ok()
+    }
+
     /// Wait until more than `seen` deferred checkpoints of `path` finished.
     pub(crate) fn wait_finished_after(path: &Path, seen: u64, timeout: Duration) -> bool {
         let (lock, changed) = state();
