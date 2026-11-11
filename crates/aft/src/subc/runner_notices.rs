@@ -167,6 +167,19 @@ fn envelope(request: &SendRequest) -> Vec<u8> {
         .expect("notice request is JSON")
 }
 
+fn target(address: &Address) -> RouteTarget {
+    RouteTarget::ManagementSurface {
+        module_id: address.module.clone(),
+    }
+}
+
+fn role_versions() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        cortexkit_role_llm_runner::ROLE.into(),
+        cortexkit_role_llm_runner::VERSION.into(),
+    )])
+}
+
 #[cfg(test)]
 pub(super) mod test_endpoint {
     use super::*;
@@ -350,17 +363,12 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
     let Ok(consumer) = SubcConsumer::connect(path, ConsumerOptions::default()).await else {
         return Err(Outcome::Retry);
     };
-    let target = RouteTarget::ManagementSurface {
-        module_id: address.module.clone(),
-    };
+    let target = target(address);
     let options = CallOptions {
         timeout: Duration::from_secs(5),
         route_retry_deadline: Duration::from_secs(5),
         consumer_identity: Some(principal),
-        role_versions: Some(std::collections::BTreeMap::from([(
-            "llm-runner".into(),
-            "v1".into(),
-        )])),
+        role_versions: Some(role_versions()),
         ..CallOptions::default()
     };
     let route = match &address.scope {

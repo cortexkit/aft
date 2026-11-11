@@ -624,6 +624,8 @@ fn runner_notice_recovery_retries_same_id_and_stays_delivered_after_restart() {
         .recv_timeout(Duration::from_secs(3))
         .unwrap();
     assert_eq!(first.harness, "opencode2");
+    assert_eq!(first.session, SESSION);
+    assert!(first.scope.is_none());
     assert_eq!(first.request, retry.request);
     assert_eq!(
         first.request["params"]["send_id"],

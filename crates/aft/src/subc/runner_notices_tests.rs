@@ -186,7 +186,11 @@ fn runner_notices_raw_harness_bind_back_and_worker_delivery() {
         assert_eq!(address.identity.harness, raw);
         assert_eq!(address.identity.session, "session-7");
         assert_eq!(address.worker, worker);
-        let versions = std::collections::BTreeMap::from([("llm-runner".into(), "v1".into())]);
+        let versions = role_versions();
+        assert_eq!(
+            serde_json::to_value(target(&address)).unwrap(),
+            json!({"kind":"management_surface", "module_id":address.module})
+        );
         let runner = FakeRunner::default();
         runner.bind(&address, &versions).unwrap();
         assert!(runner
