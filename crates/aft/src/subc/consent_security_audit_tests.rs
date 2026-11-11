@@ -544,7 +544,7 @@ async fn audit_shell_always_does_not_approve_the_next_command() {
 }
 
 #[tokio::test]
-async fn audit_owner_feed_contains_tagged_result_and_excludes_other_principals() {
+async fn audit_carrier_feed_contains_tagged_result_and_excludes_other_principals() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let control = Controlled::install(f.fake.clone());
@@ -563,28 +563,28 @@ async fn audit_owner_feed_contains_tagged_result_and_excludes_other_principals()
     let feed = f
         .checkout_tool(&run, "late_results", json!({}), 9408, read_dispatch)
         .await;
-    assert!(
-        feed["entries"].as_array().unwrap().is_empty(),
-        "the carrier is not the custodian: {feed}"
-    );
+    let entries = feed["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{feed}");
+    assert_eq!(entries[0]["call_key"], "program-9407");
+    assert_eq!(entries[0]["owner"], "reserved:prefrontal-core");
+    assert_eq!(entries[0]["custodian"], "reserved:basal");
+    assert_eq!(entries[0]["ref"], "run:audit-feed");
+    assert_eq!(entries[0]["scope_epoch"], 7);
     let mut owner = identity(&run.project_root, f.head.scope.clone());
     if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
         &mut Arc::get_mut(&mut owner.0).unwrap().spawn_principal
     {
         *principal_id = Some("reserved:prefrontal-core".into());
     }
-    let feed =
+    let owner_feed =
         audit_keyed_reply(&f, &owner, "late_results", json!({}), "unused-provider-key").await;
-    let entries = feed["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1, "{feed}");
-    assert_eq!(entries[0]["call_key"], "program-9407");
-    assert_eq!(entries[0]["owner"], "reserved:prefrontal-core");
-    assert_eq!(entries[0]["custodian"], "reserved:prefrontal-core");
-    assert_eq!(entries[0]["ref"], "run:audit-feed");
-    assert_eq!(entries[0]["scope_epoch"], 7);
+    assert!(
+        owner_feed["entries"].as_array().unwrap().is_empty(),
+        "owner attribution does not grant custody: {owner_feed}"
+    );
     let wrong_ack = audit_keyed_reply(
         &f,
-        &run,
+        &owner,
         "late_results.ack",
         json!({"through":feed["cursor"]}),
         "unused-provider-key",
@@ -595,7 +595,7 @@ async fn audit_owner_feed_contains_tagged_result_and_excludes_other_principals()
         "an unrelated custodian must not acknowledge this cursor: {wrong_ack}"
     );
     let again =
-        audit_keyed_reply(&f, &owner, "late_results", json!({}), "unused-provider-key").await;
+        audit_keyed_reply(&f, &run, "late_results", json!({}), "unused-provider-key").await;
     assert_eq!(again["entries"], feed["entries"]);
 }
 
@@ -1034,7 +1034,7 @@ async fn audit_existing_acknowledged_key_reuse_is_a_new_call() {
     // Acknowledgement ends the old call's lifetime; reusing its key names a new call.
     ledger::ack_through(
         &reopened,
-        &row.scope.unwrap().owner,
+        &row.scope.unwrap().custodian,
         ledger::provider_incarnation(),
         &cursor,
     )

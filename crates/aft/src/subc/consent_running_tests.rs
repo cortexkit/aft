@@ -173,9 +173,12 @@ async fn program_running_hold_survives_drain_and_finishes_once_for_head_and_work
         assert_ne!(result["isError"], true);
         let conn = db.lock().unwrap();
         let row = ledger::get(&conn, &key).unwrap().unwrap();
+        let scope = row.scope.unwrap();
+        assert_eq!(scope.owner, "reserved:prefrontal-core");
+        assert_eq!(scope.custodian, "reserved:basal");
         let page = ledger::late_results(
             &conn,
-            &row.scope.unwrap().owner,
+            &scope.custodian,
             ledger::provider_incarnation(),
             None,
             None,

@@ -231,7 +231,10 @@ fn grant_sources_schema28_preserves_rows_and_refuses_schema27_reader() {
     let mut conn = Connection::open_in_memory().unwrap();
     crate::db::run_migrations_supported(&mut conn, 27).unwrap();
     conn.execute("INSERT INTO access_grants(owner,scope_ref,epoch,path,kind,mode,grant_id,granted_at_ms,card_ref) VALUES ('o','s','1','/a','subtree','read','preserved',123,'acc_old')", []).unwrap();
-    assert_eq!(crate::db::run_migrations(&mut conn).unwrap(), 28);
+    assert_eq!(
+        crate::db::run_migrations_supported(&mut conn, 28).unwrap(),
+        28
+    );
     let row = || {
         conn.query_row(
             "SELECT grant_id,granted_at_ms,card_ref,source FROM access_grants",
@@ -256,7 +259,7 @@ fn grant_sources_schema28_preserves_rows_and_refuses_schema27_reader() {
         })
     ));
     assert_eq!(
-        crate::db::run_migrations(&mut conn).unwrap(),
+        crate::db::run_migrations_supported(&mut conn, 28).unwrap(),
         28,
         "a supported retry remains readable"
     );
@@ -278,7 +281,7 @@ fn grant_sources_schema28_preserves_rows_and_refuses_schema27_reader() {
     conn.execute("UPDATE schema_version SET version=27", [])
         .unwrap();
     assert_eq!(
-        crate::db::run_migrations(&mut conn).unwrap(),
+        crate::db::run_migrations_supported(&mut conn, 28).unwrap(),
         28,
         "migration tolerates an additive-column rollback"
     );
@@ -290,13 +293,28 @@ fn grant_sources_schema28_preserves_rows_and_refuses_schema27_reader() {
 #[test]
 fn grant_sources_reader_floor_refusal_then_retry() {
     use crate::persisted_format::{self, PersistedStore};
+    let supported = crate::db::CURRENT_SCHEMA_VERSION;
     let dir = tempfile::tempdir().unwrap();
     let floor = crate::reader_floor::floor_path(dir.path());
-    std::fs::write(&floor, r#"{"floor_schema":1,"stores":{"aft.db":29}}"#).unwrap();
+    std::fs::write(
+        &floor,
+        format!(
+            r#"{{"floor_schema":1,"stores":{{"aft.db":{}}}}}"#,
+            supported + 1
+        ),
+    )
+    .unwrap();
     assert_eq!(crate::reader_floor::prepare(dir.path()).len(), 1);
     let path = dir.path().join("aft.db");
-    assert!(persisted_format::gate(PersistedStore::AftDb, &path, &path, Some(28)).is_err());
-    std::fs::write(&floor, r#"{"floor_schema":1,"stores":{"aft.db":28}}"#).unwrap();
+    assert!(
+        persisted_format::gate(PersistedStore::AftDb, &path, &path, Some(supported.into()))
+            .is_err()
+    );
+    std::fs::write(
+        &floor,
+        format!(r#"{{"floor_schema":1,"stores":{{"aft.db":{supported}}}}}"#),
+    )
+    .unwrap();
     filetime::set_file_mtime(
         &floor,
         filetime::FileTime::from_system_time(
@@ -305,12 +323,14 @@ fn grant_sources_reader_floor_refusal_then_retry() {
     )
     .unwrap();
     crate::reader_floor::refresh_refused(dir.path()).unwrap();
-    assert!(persisted_format::gate(PersistedStore::AftDb, &path, &path, Some(28)).is_ok());
+    assert!(
+        persisted_format::gate(PersistedStore::AftDb, &path, &path, Some(supported.into())).is_ok()
+    );
     let conn = crate::db::open(&path).unwrap();
     assert_eq!(
         conn.query_row("SELECT version FROM schema_version", [], |row| row
             .get::<_, u32>(0))
             .unwrap(),
-        28
+        supported
     );
 }

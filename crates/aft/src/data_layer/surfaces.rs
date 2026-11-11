@@ -322,7 +322,8 @@ pub(crate) fn bind_for_test(ctx: &AppContext) {
             ctx.set_canonical_cache_root(std::fs::canonicalize(&root).unwrap_or(root));
         }
     }
-    ctx.data_checkout().expect("the index store binds the root");
+    ctx.data_checkout()
+        .unwrap_or_else(|| panic!("the index store binds the root: {:?}", report(ctx)));
 }
 
 /// Whether this root's text index serves: `Some(true)` ready, `Some(false)`

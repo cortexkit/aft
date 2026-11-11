@@ -14,7 +14,11 @@ fn request(command: &str, params: serde_json::Value) -> RawRequest {
 
 fn fixture() -> (tempfile::TempDir, Arc<AppContext>) {
     // Undo must exercise a real snapshot, not the system-temp backup exemption.
-    let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch");
+    let scratch = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("cargo provides the runtime manifest directory"),
+    )
+    .join("../../target/scratch");
     std::fs::create_dir_all(&scratch).unwrap();
     let root = tempfile::Builder::new()
         .prefix("backup-bookkeeping-")

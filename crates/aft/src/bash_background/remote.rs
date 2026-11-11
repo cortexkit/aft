@@ -3988,7 +3988,15 @@ impl BgTaskRegistry {
                     // Prefer the accepted job over resubmitting the command with
                     // its key. The shorter key-recovery limit must not abandon a
                     // job that can still be queued or running on the executor.
-                    if current.resubmit_for_recovery() && current.job_id.is_none() {
+                    // An unknown terminal's id alone is not acceptance: replay
+                    // the durable key to establish whether submission happened.
+                    if current.resubmit_for_recovery()
+                        && (current.job_id.is_none()
+                            || (!current.accepted
+                                && current.terminal.as_ref().is_some_and(|record| {
+                                    matches!(record.outcome, Outcome::OutcomeUnknown)
+                                })))
+                    {
                         keyed_recovery_error.get_or_insert_with(|| error.to_string());
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
