@@ -2,11 +2,34 @@
 
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
-use crate::parser::LangId;
+use crate::parser::{grammar_for, LangId};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
+
+#[derive(Default)]
+pub(crate) struct FactParsers {
+    parsers: HashMap<LangId, tree_sitter::Parser>,
+}
+
+impl FactParsers {
+    pub(crate) fn parse_source(&mut self, lang: LangId, source: &str) -> Option<tree_sitter::Tree> {
+        let parser = match self.parsers.entry(lang) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let grammar = grammar_for(lang);
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&grammar).is_err() {
+                    return None;
+                }
+                entry.insert(parser)
+            }
+        };
+
+        parser.parse(source, None)
+    }
+}
 
 pub(crate) const RUST_MACRO_REF_SHAPE_CALL: &str = "call";
 pub(crate) const RUST_MACRO_REF_SHAPE_METHOD: &str = "method";
@@ -1805,7 +1828,7 @@ pub(crate) fn rust_collect_api_macro_text(
         return;
     }
     let padded = format!("{}{}", "\n".repeat(row), interior);
-    let mut analyzer = DeadCodeFileAnalyzer::default();
+    let mut analyzer = FactParsers::default();
     if let Some(tree) = analyzer.parse_source(LangId::Rust, &padded) {
         if !tree.root_node().has_error() {
             rust_collect_api_facts(&padded, tree.root_node(), file, scope, facts);

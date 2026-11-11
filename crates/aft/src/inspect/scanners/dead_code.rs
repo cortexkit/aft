@@ -26,7 +26,7 @@ use crate::inspect::{
     InspectJob, InspectResult, InspectScanSuccess,
 };
 use crate::parser::dead_code_facts::*;
-use crate::parser::{detect_language, grammar_for, LangId};
+use crate::parser::{detect_language, LangId};
 
 use super::source_text::{
     graph_source_permit, read_graph_source_text, SourceText, GRAPH_TOO_LARGE,
@@ -137,7 +137,7 @@ struct RustImportedSymbolSpec {
 
 #[derive(Default)]
 struct DeadCodeFileAnalyzer {
-    parsers: HashMap<LangId, tree_sitter::Parser>,
+    parsers: FactParsers,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,19 +215,7 @@ impl DeadCodeFileAnalyzer {
     }
 
     fn parse_source(&mut self, lang: LangId, source: &str) -> Option<tree_sitter::Tree> {
-        let parser = match self.parsers.entry(lang) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let grammar = grammar_for(lang);
-                let mut parser = tree_sitter::Parser::new();
-                if parser.set_language(&grammar).is_err() {
-                    return None;
-                }
-                entry.insert(parser)
-            }
-        };
-
-        parser.parse(source, None)
+        self.parsers.parse_source(lang, source)
     }
 }
 
