@@ -1555,6 +1555,109 @@ fn lsp_warnings_probe_each_biome_folder_once_per_pass() {
     );
 }
 
+#[cfg(test)]
+#[test]
+fn configure_warnings_canonicalize_biome_directories_not_each_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(
+        root.join("biome.json"),
+        r#"{"files":{"includes":["src/**/*.json"]}}"#,
+    )
+    .unwrap();
+    const DIRECTORIES: usize = 7;
+    const FILES_PER_DIRECTORY: usize = 100;
+    for directory in 0..DIRECTORIES {
+        let folder = root.join(format!("src/nested{directory}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        for file in 0..FILES_PER_DIRECTORY {
+            std::fs::write(folder.join(format!("file{file}.json")), "{}").unwrap();
+        }
+    }
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut calls = Vec::new();
+    ConfigureWarningWork {
+        root: root.clone(),
+        config: Arc::new(Config {
+            project_root: Some(root),
+            ..Default::default()
+        }),
+        generation_flag: Arc::new(AtomicU64::new(1)),
+        generation: 1,
+        tx,
+        session_id: None,
+    }
+    .run(|boundary| {
+        crate::inspect::job::CANONICALIZE_CALLS.with(|counter| match boundary {
+            WarningBoundary::ResolvingLsp => *counter.borrow_mut() = Some(Vec::new()),
+            WarningBoundary::Publication => calls = counter.borrow_mut().take().unwrap(),
+            _ => {}
+        });
+    });
+    assert!(rx.try_recv().is_ok(), "the warning pass must publish");
+    assert!(
+        calls.len() <= DIRECTORIES + 1,
+        "{} files should resolve at most {} directories, not {} paths: {:?}",
+        DIRECTORIES * FILES_PER_DIRECTORY,
+        DIRECTORIES + 1,
+        calls.len(),
+        &calls[..calls.len().min(12)]
+    );
+    assert!(
+        calls.len() >= DIRECTORIES,
+        "each source directory was visited"
+    );
+}
+
+/// Run directly on macOS with AFT_CONFIGURE_WARNING_MEASURE_ROOT pointing at
+/// a checkout. CPU time covers the complete warning pass, not test setup.
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+#[ignore = "manual configure-warning CPU measurement"]
+fn configure_warnings_cpu_measurement() {
+    fn cpu_seconds() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // getrusage initializes the supplied structure on success.
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+            0
+        );
+        let usage = unsafe { usage.assume_init() };
+        let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0;
+        seconds(usage.ru_utime) + seconds(usage.ru_stime)
+    }
+    let root = crate::inspect::job::canonicalize_normalized(Path::new(
+        &std::env::var_os("AFT_CONFIGURE_WARNING_MEASURE_ROOT").expect("measurement checkout"),
+    ));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let work = ConfigureWarningWork {
+        root: root.clone(),
+        config: Arc::new(Config {
+            project_root: Some(root),
+            ..Default::default()
+        }),
+        generation_flag: Arc::new(AtomicU64::new(1)),
+        generation: 1,
+        tx,
+        session_id: None,
+    };
+    let cpu = cpu_seconds();
+    let wall = Instant::now();
+    work.run(|_| {});
+    let cpu = cpu_seconds() - cpu;
+    let wall = wall.elapsed().as_secs_f64();
+    let warnings = rx
+        .try_recv()
+        .expect("the warning pass publishes")
+        .1
+        .warnings;
+    eprintln!(
+        "configure-warnings CPU={cpu:.6}s wall={wall:.6}s warnings={}",
+        warnings.len()
+    );
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WarningBoundary {
     Discovery,

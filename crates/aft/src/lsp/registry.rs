@@ -1103,7 +1103,15 @@ fn biome_config_excludes(
     mode: RootPathMode,
     memo: Option<&mut BiomeSelectionMemo>,
 ) -> bool {
-    biome_file_selection_in(server, path, mode, memo).excludes(path, mode)
+    if server.kind == ServerKind::Biome {
+        if let Some(memo) = memo {
+            let resolved = memo.resolve_file(path, mode);
+            return memo
+                .selection(server, &resolved, RootPathMode::WalkEntry)
+                .excludes(&resolved, RootPathMode::WalkEntry);
+        }
+    }
+    biome_file_selection(server, path, mode).excludes(path, mode)
 }
 
 #[derive(Clone)]
@@ -1195,6 +1203,8 @@ fn biome_selection_for_config(config_path: Option<PathBuf>) -> BiomeFileSelectio
 /// the pass it was created for.
 #[derive(Default)]
 pub(crate) struct BiomeSelectionMemo {
+    /// Directory identities and regular filenames observed during this pass.
+    directories: HashMap<PathBuf, Option<BiomeDirectory>>,
     /// Workspace root by (root-marker set, resolved starting directory).
     roots: HashMap<(u64, PathBuf), Option<PathBuf>>,
     /// The configuration found by searching upward from each directory.
@@ -1203,7 +1213,49 @@ pub(crate) struct BiomeSelectionMemo {
     selections: HashMap<PathBuf, BiomeFileSelection>,
 }
 
+struct BiomeDirectory {
+    resolved: PathBuf,
+    files: HashSet<std::ffi::OsString>,
+}
+
 impl BiomeSelectionMemo {
+    /// Resolve a directory once, then join its recorded regular files. Resolving
+    /// every file separately makes realpath dominate large configure passes on
+    /// macOS. Symlinks and unrecorded names still take the full resolution path;
+    /// exact filename matching also preserves Windows case and short-name aliases.
+    fn resolve_file(&mut self, path: &Path, mode: RootPathMode) -> PathBuf {
+        if matches!(mode, RootPathMode::WalkEntry) {
+            return path.to_path_buf();
+        }
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return mode.resolve(path);
+        };
+        let directory = self
+            .directories
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| {
+                let entries = std::fs::read_dir(parent).ok()?;
+                let mut files = HashSet::new();
+                for entry in entries {
+                    let entry = entry.ok()?;
+                    if entry.file_type().ok()?.is_file() {
+                        files.insert(entry.file_name());
+                    }
+                }
+                Some(BiomeDirectory {
+                    // Never mix Windows verbatim paths with the normalized config roots.
+                    resolved: crate::inspect::job::canonicalize_normalized(parent),
+                    files,
+                })
+            });
+        if let Some(directory) = directory {
+            if directory.files.contains(name) {
+                return directory.resolved.join(name);
+            }
+        }
+        mode.resolve(path)
+    }
+
     fn selection(
         &mut self,
         server: &ServerDef,
@@ -2175,6 +2227,68 @@ mod tests {
                 file.display()
             );
         }
+    }
+
+    #[test]
+    fn biome_pass_memo_preserves_resolved_applicability() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::create_dir(root.join(".git")).unwrap();
+        write_file(
+            &root.join("biome.json"),
+            r#"{"files":{"includes":["src/**/*.json", "!src/excluded/**"]}}"#,
+        );
+        for name in [
+            "src/one.json",
+            "src/nested/two.json",
+            "src/excluded/no.json",
+            "other/no.json",
+        ] {
+            write_file(&root.join(name), "{}");
+        }
+        let mut files = vec![
+            ("src/one.json", true),
+            ("src/nested/two.json", true),
+            ("src/excluded/no.json", false),
+            ("other/no.json", false),
+            ("src/nested/../one.json", true),
+            ("src/missing.json", true),
+        ];
+        #[cfg(unix)]
+        {
+            // Lexically excluded aliases must still use the target's config-relative name.
+            std::os::unix::fs::symlink(root.join("src/nested"), root.join("linked")).unwrap();
+            std::os::unix::fs::symlink(root.join("src/one.json"), root.join("alias.json")).unwrap();
+            std::os::unix::fs::symlink(root.join("other/no.json"), root.join("src/link.json"))
+                .unwrap();
+            files.extend([
+                ("linked/two.json", true),
+                ("alias.json", true),
+                ("src/link.json", false),
+            ]);
+        }
+        #[cfg(windows)]
+        files.push(("SRC/ONE.JSON", true));
+        let config = Config::default();
+        let mut memo = super::BiomeSelectionMemo::default();
+        for (name, included) in files.iter().chain(&files) {
+            let file = root.join(name);
+            let kinds =
+                |servers: Vec<ServerDef>| servers.into_iter().map(|s| s.kind).collect::<Vec<_>>();
+            let before = kinds(servers_for_file(&file, &config));
+            let after = kinds(super::servers_for_file_in_pass(&file, &config, &mut memo));
+            assert_eq!(after, before, "{name}");
+            assert_eq!(after.contains(&ServerKind::Biome), *included, "{name}");
+            assert_eq!(
+                memo.resolve_file(&file, super::RootPathMode::Resolve),
+                crate::inspect::job::canonicalize_normalized(&file),
+                "{name} retains normalized path identity"
+            );
+        }
+        assert_eq!(
+            memo.resolve_file(&root.join("src"), super::RootPathMode::Resolve),
+            crate::inspect::job::canonicalize_normalized(&root.join("src"))
+        );
     }
 
     /// A pass over many files in one folder resolves that folder's workspace
