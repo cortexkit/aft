@@ -30,12 +30,11 @@ DEFAULT_REPOS = (
     "spark", "kubernetes", "elasticsearch", "llvm", "linux", "_nongit-24k", "chromium",
 )
 PLANES = ("search", "callgraph")
-MEASUREMENT_PROFILE = "cold-index-no-inspect-v1"
+MEASUREMENT_PROFILE = "index-store-no-inspect-refresh-v2"
 CSV_FIELDS: tuple[str, ...] = (
     "repo", "path", "git", "files", "top_languages", "semantic", "search_status",
-    "callgraph_status", "search_wall_ms", "search_first_query_ms", "callgraph_wall_ms",
-    "callgraph_first_query_ms", "callgraph_resolution_share_pct", "callgraph_resolution_ms", "search_superseded", "search_failed", "search_suspended",
-    "callgraph_superseded", "callgraph_failed", "callgraph_suspended", "waiting_on",
+    "callgraph_status", "index_store_build_ready_ms", "callgraph_build_ready_ms",
+    "callgraph_refresh_ms", "waiting_on",
     "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps", "measurement_profile",
 )
 TEXT_SUFFIXES = {
@@ -68,10 +67,6 @@ class NdjsonClient:
     def __init__(self, binary: Path, root: Path, storage: Path, *, allow_non_git_callgraph: bool = False):
         env = os.environ.copy()
         env["AFT_STORAGE_DIR"] = str(storage)
-        if allow_non_git_callgraph:
-            # Disable file watching for the synthetic non-git corpus so both
-            # planes use a cold path instead of reusing a warm callgraph.
-            env["AFT_TEST_DISABLE_FILE_WATCHER"] = "1"
         env.setdefault("RUST_LOG", "info")
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -470,6 +465,7 @@ class PhaseSampler:
     interval_s: float = PHASE_SAMPLE_INTERVAL_S
     samples: list[PhaseSample] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
+    observed_stages: list[tuple[float, dict[str, str]]] = field(default_factory=list)
     _started: float = 0.0
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
@@ -489,11 +485,16 @@ class PhaseSampler:
             self._thread.join(timeout=3)
         if not self.samples:
             return
-        timeline = build_timeline(self._log_lines())
+        timeline = (LogTimeline(stages=self.observed_stages) if self.observed_stages
+                    else build_timeline(self._log_lines()))
         if timeline.is_empty():
             self.gaps.append("phase memory trace unlabelled: no index_event records in the AFT log")
             return
         label_samples(self.samples, timeline)
+
+    def mark(self, search: str, callgraph: str) -> None:
+        """Label externally observed phases, not retired store internals."""
+        self.observed_stages.append((time.time(), {"search": search, "callgraph": callgraph}))
 
     def _log_lines(self) -> list[str]:
         lines: list[str] = []
@@ -752,6 +753,63 @@ def close_after_final_sample(sampler: ProcessSampler | None, client: NdjsonClien
     return client.close() if client is not None else None
 
 
+PROBE_NAME = "aft_cost_gate_probe.rs"
+PROBE_CALLER = "aft_cost_gate_caller"
+
+
+def probe_source(target: str) -> str:
+    return ("pub fn aft_cost_gate_before() {}\npub fn aft_cost_gate_after() {}\n"
+            f"pub fn {PROBE_CALLER}() {{ {target}(); }}\n")
+
+
+def observe_store_ready(status: dict[str, Any], ready_ms: dict[str, float], elapsed_ms: float) -> dict[str, str]:
+    if not status.get("success") or not isinstance(status.get("data_store"), dict):
+        raise NdjsonError("status did not expose the current index store")
+    states = {plane: status_value(status, plane) for plane in PLANES}
+    if any(state not in ("building", "ready") for state in states.values()):
+        raise NdjsonError(f"index store unavailable: {states}")
+    for plane, state in states.items():
+        if state == "ready" and plane not in ready_ms:
+            ready_ms[plane] = elapsed_ms
+    return states
+
+
+def checked_tool(client: NdjsonClient, deadline: float, name: str, **arguments: Any) -> dict[str, Any]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BudgetExceeded
+    response = client.request("tool_call", timeout_s=min(60.0, remaining), name=name, arguments=arguments)
+    if not response.get("success"):
+        raise NdjsonError(f"{name} probe failed: {response.get('message', response.get('code', 'unknown error'))}")
+    return response
+
+
+def probe_callers(client: NdjsonClient, deadline: float, target: str) -> bool:
+    response = checked_tool(client, deadline, "callgraph", op="callers", path=PROBE_NAME, symbol=target)
+    return PROBE_CALLER in json.dumps(response)
+
+
+def measure_refresh(client: NdjsonClient, deadline: float) -> float:
+    """Time a real edit through publication and an exact call-graph read.
+
+    A successful tool response alone can still describe the old graph. Require
+    the edge to move between two existing targets before recording a duration.
+    Editing through AFT also exercises its production path for processing
+    the changed file before the next reader answers.
+    """
+    if not probe_callers(client, deadline, "aft_cost_gate_before"):
+        raise NdjsonError("cold call graph did not contain the refresh probe's original edge")
+    started = time.monotonic()
+    checked_tool(client, deadline, "edit", path=PROBE_NAME, edits=[{
+        "oldString": "{ aft_cost_gate_before(); }", "newString": "{ aft_cost_gate_after(); }",
+    }])
+    if not probe_callers(client, deadline, "aft_cost_gate_after"):
+        raise NdjsonError("refresh did not publish the new call edge")
+    if probe_callers(client, deadline, "aft_cost_gate_before"):
+        raise NdjsonError("refresh retained the removed call edge")
+    return (time.monotonic() - started) * 1000.0
+
+
 def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_seconds: float) -> dict[str, str]:
     row = empty_row(root.name, root)
     row["measurement_profile"] = MEASUREMENT_PROFILE
@@ -760,8 +818,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         row.update({"git": "n/a", "files": "n/a", "top_languages": "n/a", "outcome": "missing", "gaps": "repository path absent"})
         return row
     git = repo_is_git(root)
-    file_count, languages, all_paths = repo_shape(root, git)
-    probe_files = select_probe_files(root, all_paths)
+    file_count, languages, _all_paths = repo_shape(root, git)
     row.update({"git": "yes" if git else "no", "files": str(file_count), "top_languages": languages})
     gaps: list[str] = []
     if storage.exists():
@@ -770,12 +827,19 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
     started = time.monotonic()
     deadline = started + budget_seconds
     states = {plane: "loading" for plane in PLANES}
-    queried = {plane: False for plane in PLANES}
+    ready_ms: dict[str, float] = {}
+    probe_path = root / PROBE_NAME
+    if probe_path.exists():
+        raise RuntimeError(f"refusing to overwrite refresh probe: {probe_path}")
+    probe_created = False
     client: NdjsonClient | None = None
     sampler: ProcessSampler | None = None
     phases: PhaseSampler | None = None
     outcome = "failed"
     try:
+        with probe_path.open("x", encoding="utf-8") as handle:
+            probe_created = True
+            handle.write(probe_source("aft_cost_gate_before"))
         client = NdjsonClient(binary, root, storage, allow_non_git_callgraph=not git)
         sampler = ProcessSampler(client.proc)
         sampler.start()
@@ -787,6 +851,8 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
             "indexes": {"trigram": True, "callgraph": True, "semantic": False},
             "inspect": {"enabled": False},
         })
+        phases.mark("building", "building")
+        build_started = time.monotonic()
         configured = client.request(
             "configure",
             timeout_s=max(0.1, min(30.0, deadline - time.monotonic())),
@@ -798,66 +864,24 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         )
         if not configured.get("success"):
             raise NdjsonError(f"configure failed: {configured.get('message', configured.get('code', 'unknown error'))}")
-        literal = existing_literal(probe_files)
-        if literal is None:
-            gaps.append("no source literal found for the search first-query probe")
-        while not all(queried.values()):
+        while len(ready_ms) < len(PLANES):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise BudgetExceeded
-            # Polling on the same two-second cadence as resource sampling keeps the
-            # small-budget control observable and avoids a status busy-loop.
-            time.sleep(min(2.0, remaining))
-            if time.monotonic() >= deadline:
-                raise BudgetExceeded
-            status = client.request("status", timeout_s=min(10.0, deadline - time.monotonic()))
-            if not status.get("success"):
-                raise NdjsonError(f"status failed: {status.get('message', status.get('code', 'unknown error'))}")
-            states = {plane: status_value(status, plane) for plane in PLANES}
-            # Older standalone status payloads omit callgraph state even though
-            # they emit the authoritative index_event grammar. Keep polling
-            # status, but use that event as a compatibility fallback rather than
-            # turning a completed cold build into a decorative budget timeout.
-            if states["callgraph"] == "unknown":
-                logged_state = logged_plane_state(storage, "callgraph")
-                if logged_state:
-                    states["callgraph"] = logged_state
-                    gaps.append("status omitted callgraph state; used index_event compatibility fallback")
-            terminal = terminal_outcome(states)
-            if terminal:
-                outcome = terminal
-                break
-            if states["search"] == "ready" and not queried["search"]:
-                if literal is None:
-                    outcome = "failed"
-                    break
-                time.sleep(0.05)
-                search = client.request(
-                    "tool_call", timeout_s=min(30.0, deadline - time.monotonic()),
-                    name="grep", arguments={"pattern": literal},
-                )
-                if not search.get("success"):
-                    raise NdjsonError(f"grep first query failed: {search.get('message', search.get('code', 'unknown error'))}")
-                queried["search"] = True
-            if states["callgraph"] == "ready" and not queried["callgraph"]:
-                probe = outlined_symbol(client, root, probe_files, min(15.0, deadline - time.monotonic()))
-                if probe is None:
-                    gaps.append("outline returned no callable symbol for the callgraph first-query probe")
-                    outcome = "failed"
-                    break
-                path, symbol = probe
-                time.sleep(0.05)
-                callgraph = client.request(
-                    "tool_call", timeout_s=min(30.0, deadline - time.monotonic()), name="callgraph",
-                    arguments={"op": "callers", "path": path, "symbol": symbol},
-                )
-                if not callgraph.get("success"):
-                    raise NdjsonError(f"callgraph first query failed: {callgraph.get('message', callgraph.get('code', 'unknown error'))}")
-                queried["callgraph"] = True
-        if all(queried.values()):
+            # Status is the new store's public readiness surface. A short sleep
+            # bounds observation error without turning readiness into a busy loop.
+            time.sleep(min(0.05, remaining))
+            status = client.request("status", timeout_s=max(0.1, min(10.0, deadline - time.monotonic())))
+            states = observe_store_ready(status, ready_ms, (time.monotonic() - build_started) * 1000.0)
+            phases.mark(states["search"], states["callgraph"])
+        if len(ready_ms) == len(PLANES):
+            row["index_store_build_ready_ms"] = f"{ready_ms['search']:.3f}"
+            row["callgraph_build_ready_ms"] = f"{ready_ms['callgraph']:.3f}"
+            checked_tool(client, deadline, "grep", pattern="aft_cost_gate_before", path=PROBE_NAME)
+            phases.mark("ready", "refresh")
+            row["callgraph_refresh_ms"] = f"{measure_refresh(client, deadline):.3f}"
+            phases.mark("ready", "ready")
             outcome = "ready"
-        elif outcome == "failed" and "unknown" in states.values():
-            gaps.append("status did not expose a ready state for every requested plane")
     except BudgetExceeded:
         outcome = "budget_exceeded"
     except (NdjsonError, OSError, ValueError) as error:
@@ -867,6 +891,8 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         close_gap = close_after_final_sample(sampler, client)
         if close_gap:
             gaps.append(close_gap)
+        if probe_created:
+            probe_path.unlink(missing_ok=True)
         if phases is not None:
             phases.stop()
             gaps.extend(phases.gaps)
@@ -885,18 +911,6 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
     row.update({
         "search_status": states["search"],
         "callgraph_status": states["callgraph"],
-        "search_wall_ms": metrics.get("index_search_start_to_ready_ms_n_p50_max", "n/a"),
-        "search_first_query_ms": metrics.get("index_search_ready_to_first_query_ms_n_p50_max", "n/a"),
-        "callgraph_wall_ms": metrics.get("index_callgraph_start_to_ready_ms_n_p50_max", "n/a"),
-        "callgraph_first_query_ms": metrics.get("index_callgraph_ready_to_first_query_ms_n_p50_max", "n/a"),
-        "callgraph_resolution_share_pct": metrics.get("index_callgraph_resolution_share_pct_n_p50_max", "n/a"),
-        "callgraph_resolution_ms": metrics.get("index_callgraph_resolution_ms_n_p50_max", "n/a"),
-        "search_superseded": metrics.get("index_search_superseded", "n/a"),
-        "search_failed": metrics.get("index_search_failed", "n/a"),
-        "search_suspended": metrics.get("index_search_suspended", "n/a"),
-        "callgraph_superseded": metrics.get("index_callgraph_superseded", "n/a"),
-        "callgraph_failed": metrics.get("index_callgraph_failed", "n/a"),
-        "callgraph_suspended": metrics.get("index_callgraph_suspended", "n/a"),
         "waiting_on": metrics.get("index_waiting_on", "n/a"),
         "outcome": outcome,
         "log_path": log_paths(storage),
@@ -937,18 +951,12 @@ def read_rows(path: Path) -> list[dict[str, str]]:
 def write_markdown(path: Path, rows: list[dict[str, str]], scratch: Path) -> None:
     with path.open("w", encoding="utf-8") as handle:
         handle.write("# OSS repository-shape cold-build matrix\n\n")
-        handle.write("Every row uses a fresh `AFT_STORAGE_DIR`; semantic indexing is disabled for the entire matrix. Timing values are `n/p50/max` milliseconds as emitted by `index-census.py`.\n\n")
-        handle.write("| Repo | Git? | Files | Top languages | Semantic | Search wall / first query | Callgraph wall / first query / resolution share | Peak RSS MB | CPU s | Outcome | Log |\n")
+        handle.write("Every row uses a fresh `AFT_STORAGE_DIR`; semantic and inspect are disabled. Timings are monotonic milliseconds observed through production status and edit/callgraph responses.\n\n")
+        handle.write("| Repo | Git? | Files | Top languages | Semantic | Index-store ready ms | Callgraph ready / refresh ms | Peak RSS MB | CPU s | Outcome | Log |\n")
         handle.write("| --- | --- | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- |\n")
         for row in rows:
             handle.write(
-                f"| {row['repo']} | {row['git']} | {row['files']} | {row['top_languages']} | {row['semantic']} | {row['search_wall_ms']} / {row['search_first_query_ms']} | {row['callgraph_wall_ms']} / {row['callgraph_first_query_ms']} / {row['callgraph_resolution_share_pct']} | {row['peak_rss_mb']} | {row['cpu_s']} | {row['outcome']} | `{row['log_path']}` |\n"
-            )
-        handle.write("\n## Plane terminal events\n\n")
-        handle.write("| Repo | Search superseded / failed / suspended | Callgraph superseded / failed / suspended | Waiting on |\n| --- | --- | --- | --- |\n")
-        for row in rows:
-            handle.write(
-                f"| {row['repo']} | {row['search_superseded']} / {row['search_failed']} / {row['search_suspended']} | {row['callgraph_superseded']} / {row['callgraph_failed']} / {row['callgraph_suspended']} | {row['waiting_on']} |\n"
+                f"| {row['repo']} | {row['git']} | {row['files']} | {row['top_languages']} | {row['semantic']} | {row['index_store_build_ready_ms']} | {row['callgraph_build_ready_ms']} / {row['callgraph_refresh_ms']} | {row['peak_rss_mb']} | {row['cpu_s']} | {row['outcome']} | `{row['log_path']}` |\n"
             )
         gaps = [(row["repo"], row["gaps"]) for row in rows if row["gaps"] != "none"]
         handle.write("\n## Peak memory by build phase\n\n")
@@ -1139,6 +1147,48 @@ def phase_self_test() -> int:
     return 0
 
 
+def store_self_test() -> int:
+    ready: dict[str, float] = {}
+    status = {"success": True, "data_store": {}, "search_index": {"status": "ready"},
+              "callgraph_store": {"status": "building"}}
+    observe_store_ready(status, ready, 120)
+    assert ready == {"search": 120}, ready
+    status["callgraph_store"]["status"] = "ready"
+    observe_store_ready(status, ready, 240)
+    assert ready == {"search": 120, "callgraph": 240}, ready
+    for invalid in ({"success": True}, {**status, "callgraph_store": {"status": "unavailable"}}):
+        try:
+            observe_store_ready(invalid, {}, 999)
+        except NdjsonError:
+            pass
+        else:
+            raise AssertionError("missing or unavailable store was accepted")
+
+    class FakeClient:
+        def __init__(self, stale: bool = False):
+            self.edited = False
+            self.stale = stale
+
+        def request(self, command: str, **params: Any) -> dict[str, Any]:
+            assert command == "tool_call", command
+            if params["name"] == "edit":
+                self.edited = not self.stale
+                return {"success": True}
+            symbol = params["arguments"]["symbol"]
+            present = symbol == ("aft_cost_gate_after" if self.edited else "aft_cost_gate_before")
+            return {"success": True, "callers": [PROBE_CALLER] if present else []}
+
+    assert measure_refresh(FakeClient(), time.monotonic() + 30) >= 0  # type: ignore[arg-type]
+    try:
+        measure_refresh(FakeClient(stale=True), time.monotonic() + 30)  # type: ignore[arg-type]
+    except NdjsonError as error:
+        assert "new call edge" in str(error), error
+    else:
+        raise AssertionError("a successful edit serving a stale graph was accepted")
+    print("oss-matrix store self-test passed: 6 checks (readiness, missing/unavailable store, refresh, stale graph)")
+    return 0
+
+
 def self_test(args: argparse.Namespace) -> int:
     root = Path.home() / "Work" / "OSS" / "tmignore-rs"
     if not root.is_dir():
@@ -1157,40 +1207,10 @@ def self_test(args: argparse.Namespace) -> int:
         row = rows[0]
         assert row["outcome"] == "ready", row
         assert row["search_status"] == "ready" and row["callgraph_status"] == "ready", row
-        assert compact_p50(row["search_first_query_ms"]) > 0, row
-        assert compact_p50(row["callgraph_first_query_ms"]) > 0, row
-        logs = [Path(path) for path in row["log_path"].split(";") if path]
-        matching_logs = [
-            path for path in logs
-            if "index_event kind=build_ready plane=callgraph" in path.read_text(encoding="utf-8", errors="replace")
-        ]
-        assert matching_logs, row
-        grep = subprocess.run(
-            ["grep", "-H", "index_event kind=build_ready plane=callgraph", *map(str, matching_logs)],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        assert grep.returncode == 0, grep.stderr
-        positive_fields = {
-            key: row[key]
-            for key in (
-                "outcome", "search_status", "callgraph_status", "search_first_query_ms",
-                "callgraph_first_query_ms", "log_path",
-            )
-        }
-        print(f"positive row: {json.dumps(positive_fields, sort_keys=True)}")
-        print(grep.stdout, end="")
-        events = []
-        for path in logs:
-            events.extend(
-                line.rstrip()
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
-                if "index_event" in line
-            )
-        print("first 5 index_event lines:")
-        for line in events[:5]:
-            print(line)
+        for metric in ("index_store_build_ready_ms", "callgraph_build_ready_ms", "callgraph_refresh_ms"):
+            assert float(row[metric]) > 0, row
+        assert not (root / PROBE_NAME).exists(), "refresh probe was not cleaned up"
+        print(f"positive row: {json.dumps(row, sort_keys=True)}")
         negative = argparse.Namespace(**vars(args))
         negative.list_file = str(list_file)
         negative.results_dir = str(temporary / "negative-results")
@@ -1216,6 +1236,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date", help="Output date suffix, YYYY-MM-DD (default: today)")
     parser.add_argument("--self-test", action="store_true", help="Run tmignore-rs positive and short-budget negative controls")
     parser.add_argument("--self-test-phases", action="store_true", help="Check the phase-attribution helpers; needs no corpus, binary, or /proc")
+    parser.add_argument("--self-test-store", action="store_true", help="Check current-store readiness and refresh probes without a binary")
     args = parser.parse_args()
     if args.budget_min <= 0:
         parser.error("--budget-min must be greater than zero")
@@ -1227,6 +1248,8 @@ if __name__ == "__main__":
         arguments = parse_args()
         if arguments.self_test_phases:
             raise SystemExit(phase_self_test())
+        if arguments.self_test_store:
+            raise SystemExit(store_self_test())
         raise SystemExit(self_test(arguments) if arguments.self_test else (run_matrix(arguments) and 0))
     except (AssertionError, RuntimeError, OSError, ValueError) as error:
         print(f"oss-matrix: {error}", file=sys.stderr)

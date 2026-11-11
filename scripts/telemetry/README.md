@@ -75,8 +75,48 @@ measure and print, but it will not gate, because it cannot.
 
 ## What is measured
 
-All compared numbers come from the runner sampler or structured telemetry; no
-human-readable log message is used as a gate input.
+The current profile is `index-store-no-inspect-refresh-v2`, introduced for the
+repository-wide index store in AFT 0.64. The older store's trigram build,
+SQLite callgraph resolution, and ready-to-first-query lifecycle events no
+longer exist on the production path. Their measurements are retired, not
+filled with zero or inferred from unrelated log messages. Historical CSV
+reading remains available for diagnosis, but those columns cannot be blessed
+into the new baseline.
+
+- `index_store_build_ready_ms` measures configure to the text plane becoming
+  ready; `callgraph_build_ready_ms` measures configure to the call graph becoming
+  ready. The harness uses a monotonic clock and polls the structured status
+  surface every 50 ms. Both require `data_store` in status. These are externally
+  observed readiness times, including binding/configuration and up to one poll
+  of observation error, not the removed stores' internal build durations.
+- `callgraph_refresh_ms` measures one real source edit through AFT's edit tool
+  and an exact call-graph read. Before configure, the harness creates an isolated
+  Rust probe containing two targets and one caller. The edit moves the call
+  from the first target to the second. Both the new edge's presence and the old
+  edge's absence must be verified before a duration is accepted. The probe is
+  removed after AFT exits; pinned source files are never edited. Each corpus
+  therefore contains its pinned files plus this same small probe during capture.
+- Semantic and inspect remain disabled. Every pass has fresh storage. CPU,
+  sampled RSS, kernel high-water diagnostics, waiting-on budgets, pinned corpus
+  revisions, two-pass per-metric minimum selection and the comparator's limit
+  formula are unchanged. Memory phase labels now describe externally observed
+  building/ready/refresh phases rather than obsolete internal stages.
+- Readiness retains the 25% tolerance and 3,000 ms floor. Refresh inherits the
+  former resolution budget's 20% tolerance and 500 ms floor. Resource and
+  waiting-on thresholds are preserved verbatim by the baseline writer.
+- Baseline generation requires two ready passes with every core metric and
+  refuses a pair whose maximum exceeds the minimum's tolerance/floor budget.
+  A noisy capture is a failed capture, not permission to widen a threshold.
+
+The pure probe controls run without a corpus or AFT binary:
+
+```bash
+scripts/telemetry/oss-matrix.sh --self-test-store
+```
+
+The following describes the **retired profile**, retained to explain historical
+nightly results and the investigations below. It is not the current capture
+contract. No human-readable log message is a gate input in either profile.
 
 - The measurement profile is `cold-index-no-inspect-v1`: trigram and callgraph
   build together with semantic and inspect disabled. Inspect's opportunistic
