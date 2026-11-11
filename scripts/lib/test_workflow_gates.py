@@ -1239,21 +1239,27 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 self.state.run_directory(root, "../target", "1")
 
     def test_shared_target_is_cleaned_whole_only_above_fifty_gib_on_self_hosted(self) -> None:
-        target = Path("native-target")
         for environment, size, expected in (("github-hosted", 78, False), ("self-hosted", 50, False),
                                              ("self-hosted", 78, True)):
             with self.subTest(environment=environment, size=size), \
+                 tempfile.TemporaryDirectory() as tmp, \
                  unittest.mock.patch.dict(os.environ, {"RUNNER_ENVIRONMENT": environment}), \
                  unittest.mock.patch.object(self.state, "target_bytes", return_value=size * 1024**3) as measure, \
                  unittest.mock.patch.object(self.state.subprocess, "run") as run, \
                  unittest.mock.patch("builtins.print") as output:
+                target = Path(tmp) / "target"
+                fingerprint = target / "debug" / ".fingerprint" / "dep-1"
+                fingerprint.parent.mkdir(parents=True)
+                fingerprint.write_bytes(b"fingerprint")
+                # A read-only file, as cargo and git leave on Windows, must not stop the clean.
+                fingerprint.chmod(0o400)
                 self.state.clean_oversized_target(target)
                 self.assertEqual(measure.call_count, int(environment == "self-hosted"))
+                # The clean runs before the toolchain is on PATH, so it never runs cargo.
+                run.assert_not_called()
+                self.assertEqual(target.exists(), not expected)
                 if expected:
-                    run.assert_called_once_with(["cargo", "clean", "--target-dir", str(target)], check=True)
                     self.assertIn("78.0 GiB", output.call_args.args[0])
-                else:
-                    run.assert_not_called()
 
     def test_setup_checks_shared_target_before_publishing_build_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -187,10 +187,19 @@ def clean_oversized_target(target: Path) -> None:
         return
     size = target_bytes(target)
     if size > 50 * 1024**3:
-        print(f"CI shared target size before cargo clean: {size / 1024**3:.1f} GiB ({size} bytes)", flush=True)
-        # Cargo owns the dependency graph and fingerprints. Cleaning the whole
+        print(f"CI shared target size before cleaning: {size / 1024**3:.1f} GiB ({size} bytes)", flush=True)
+        # Cargo owns the dependency graph and fingerprints. Removing the whole
         # target is safe; deleting apparently old deps individually is not.
-        subprocess.run(["cargo", "clean", "--target-dir", str(target)], check=True)
+        # This runs before the toolchain is on the job's PATH, and `cargo clean`
+        # refuses a target that has no CACHEDIR.TAG, so remove the folder
+        # directly. It is this state root's own `target`, never a caller path.
+        shutil.rmtree(target, onexc=_clear_read_only_and_retry)
+
+
+def _clear_read_only_and_retry(function, path, _error) -> None:
+    # Windows refuses to delete read-only files, which cargo and git leave behind.
+    os.chmod(path, 0o700)
+    function(path)
 
 
 def setup(root: Path, run_dir: Path) -> None:

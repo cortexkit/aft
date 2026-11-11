@@ -404,6 +404,8 @@ pub(crate) mod test_hooks {
     /// A closed store hands its SQLite handle to the worker, so its descriptors
     /// stay open briefly after the owner returns; count descriptors only after
     /// this. A handle the worker never releases still shows up afterwards.
+    /// Only the Linux descriptor census needs it.
+    #[cfg(target_os = "linux")]
     pub(crate) fn drain(timeout: Duration) -> bool {
         let (done, finished) = std::sync::mpsc::channel();
         super::close(move || {
