@@ -2502,3 +2502,5 @@ fn outside_retry_cannot_override_a_floor_and_logs_the_refusal() {
     assert_eq!(refused.data["code"], "denied_floor", "{:?}", refused.data);
     assert_outside_retry_log(&lines, "denied_floor", &target, &token);
 }
+
+use crate::native_route::with_native_route;

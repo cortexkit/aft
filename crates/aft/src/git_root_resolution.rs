@@ -312,7 +312,7 @@ mod tests {
                     );
                     policy.decide(
                         crate::access_policy::AccessOperation::Read,
-                        &crate::access_policy::policy_path(root),
+                        &crate::policy_path::policy_path(root),
                         false,
                     ) == crate::access_policy::AccessDecision::Deny(
                         crate::access_policy::AccessDenial::Floor,

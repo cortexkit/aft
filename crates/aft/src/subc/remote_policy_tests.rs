@@ -2887,7 +2887,7 @@ fn siblings_catalog_refuses_outside_checkout_and_dotdot_escape() {
                 &worker,
                 &ctx,
             ),
-            &not_readable(&crate::access_policy::policy_path(&outside)),
+            &not_readable(&crate::policy_path::policy_path(&outside)),
         );
         assert!(lookup(&ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).is_none());
     }
@@ -2912,7 +2912,7 @@ fn siblings_catalog_refuses_symlink_to_outside_checkout() {
             &worker,
             &ctx,
         ),
-        &not_readable(&crate::access_policy::policy_path(outside.path())),
+        &not_readable(&crate::policy_path::policy_path(outside.path())),
     );
 }
 
@@ -2984,10 +2984,10 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
     for route in [&head, &worker] {
         assert_siblings_refused(
             catalog(request.clone(), route, &ctx),
-            &not_readable(&crate::access_policy::policy_path(outside.path())),
+            &not_readable(&crate::policy_path::policy_path(outside.path())),
         );
     }
-    let granted_path = crate::access_policy::policy_path(outside.path());
+    let granted_path = crate::policy_path::policy_path(outside.path());
     crate::db::access_grants::insert(
         &ctx.db().unwrap().lock().unwrap(),
         &access_grants::policy_scope_key(&head),
@@ -3069,7 +3069,7 @@ impl SiblingGrantFixture {
         )
         .unwrap();
         let head_grant = AccessGrant {
-            path: crate::access_policy::policy_path(&dir.path().join("granted")),
+            path: crate::policy_path::policy_path(&dir.path().join("granted")),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         };
@@ -3125,7 +3125,7 @@ fn assert_siblings_refused(result: Result<Value, subc_protocol::ErrorBody>, mess
 /// grants do not cover or one that is not a checkout root.
 #[test]
 fn siblings_head_preflight_counts_the_plans_own_allow_paths() {
-    use crate::access_policy::policy_path;
+    use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-preflight-head");
     let (ctx, head) = (&fixture.ctx, &fixture.head);
     let commons = fixture.path("granted/commons");
@@ -3233,14 +3233,14 @@ fn siblings_worker_fetch_counts_only_saved_grants() {
         crate::db::access_grants::revoke(
             &ctx.db().unwrap().lock().unwrap(),
             &access_grants::policy_scope_key(&worker),
-            &crate::access_policy::policy_path(&commons),
+            &crate::policy_path::policy_path(&commons),
         )
         .unwrap(),
         1
     );
     assert_siblings_refused(
         catalog(request, &worker, ctx),
-        &not_readable(&crate::access_policy::policy_path(&commons)),
+        &not_readable(&crate::policy_path::policy_path(&commons)),
     );
 }
 
@@ -3342,7 +3342,7 @@ async fn siblings_pass_cores_launch_fetches_then_brocas_fetch_and_submit() {
 /// carries the fetch.
 #[test]
 fn siblings_worker_scope_fetches_still_refuse_ungranted_plans() {
-    use crate::access_policy::policy_path;
+    use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-refused-head");
     let ctx = &fixture.ctx;
     let commons = fixture.path("granted/commons");
@@ -3394,7 +3394,7 @@ fn siblings_worker_scope_fetches_still_refuse_ungranted_plans() {
 /// siblings are refused whichever connection carries the fetch.
 #[test]
 fn siblings_unauthorized_worker_scope_is_refused() {
-    use crate::access_policy::policy_path;
+    use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-unauthorized-head");
     let ctx = &fixture.ctx;
     let commons = fixture.path("granted/commons");
@@ -3441,7 +3441,8 @@ fn siblings_unauthorized_worker_scope_is_refused() {
 /// grants once, so a later plan naming the sibling in allow_paths adds none.
 #[test]
 fn siblings_owner_waiver_covers_only_the_owner_carried_worker_fetch() {
-    use crate::access_policy::{policy_path, ScopeGrantsDenial};
+    use crate::access_policy::{ScopeGrantsDenial};
+    use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-waiver-head");
     let ctx = &fixture.ctx;
     let commons = fixture.path("granted/commons");
@@ -3573,7 +3574,7 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
     stamp.kind = subc_protocol::scope::ScopeKind::Head;
     stamp.scope_ref = "siblings-submit-head".into();
     access_grants::register(&head, &ctx).unwrap();
-    let path = crate::access_policy::policy_path(sibling.path());
+    let path = crate::policy_path::policy_path(sibling.path());
     crate::db::access_grants::insert(
         &ctx.db().unwrap().lock().unwrap(),
         &access_grants::policy_scope_key(&head),

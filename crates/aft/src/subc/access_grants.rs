@@ -1039,7 +1039,7 @@ pub(super) fn restore_launch_before(
         // Building the head policy also probes paths besides saved grants.
         // Isolate the whole unlocked phase so those probes share the deadline.
         let resolved = crate::bounded_io::run(&identity.project_root, None, move |_| {
-            crate::access_policy::with_bounded_policy_paths(resolution_progress.clone(), || -> Result<_, subc_protocol::ErrorBody> {
+            crate::policy_path::with_bounded_policy_paths(resolution_progress.clone(), || -> Result<_, subc_protocol::ErrorBody> {
                 let head = saved_head
                     .clone()
                     .map(|policy| policy.resolve(&storage));

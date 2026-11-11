@@ -25,7 +25,7 @@ pub(crate) fn with_root<R>(
                 root,
                 Arc::new(move |path| {
                     use crate::access_policy::{AccessDecision, AccessOperation};
-                    let identity = crate::access_policy::policy_path(path);
+                    let identity = crate::policy_path::policy_path(path);
                     identity.starts_with(&decision_root)
                         && policy.decide_resolved(AccessOperation::Read, &identity, false)
                             == AccessDecision::Allow

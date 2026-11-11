@@ -24,7 +24,7 @@ fn folder(path: &std::path::Path, operation: AccessOperation) -> AccessGrant {
 /// and a fixed Unix path such as `/work/x` is relative on Windows because it
 /// names no drive.
 fn work(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    crate::access_policy::policy_path(dir.path())
+    crate::policy_path::policy_path(dir.path())
         .join("work")
         .join(name)
 }

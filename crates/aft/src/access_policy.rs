@@ -281,113 +281,6 @@ impl CapturedAskRoute {
     }
 }
 
-/// Legacy stdin transports have no daemon bind identity. Their private process
-/// context and configured harness supply a route; nested subc dispatch keeps
-/// the authenticated route already installed by the daemon boundary.
-pub fn with_native_route(
-    mut request: crate::protocol::RawRequest,
-    ctx: &crate::context::AppContext,
-    run: impl FnOnce(
-        crate::protocol::RawRequest,
-        &crate::context::AppContext,
-    ) -> crate::protocol::Response,
-) -> crate::protocol::Response {
-    let preview = request
-        .params
-        .get("preview")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || ["hashline_preflight", "undo_preview", "checkpoint_paths"]
-            .contains(&request.command.as_str());
-    match current_ask_route() {
-        AskRoute::Plugin { scope, once } => {
-            ctx.mark_standalone_plugin_host();
-            strip_native_approval_metadata(&mut request);
-            return finish_plugin_response(&scope, &once, preview, run(request, ctx));
-        }
-        AskRoute::Lowered => {}
-        _ => return run(request, ctx),
-    }
-    let plugin = matches!(
-        ctx.config().harness,
-        Some(crate::harness::Harness::Opencode | crate::harness::Harness::Pi)
-    );
-    if !plugin {
-        return run(request, ctx);
-    }
-    ctx.mark_standalone_plugin_host();
-    let args = request
-        .params
-        .get("arguments")
-        .or_else(|| request.params.get("args"))
-        .unwrap_or(&request.params);
-    let tool = native_tool_name(&request);
-    let mut scope = ctx
-        .standalone_approval_scope(request.session())
-        .for_tool(tool, args);
-    let ids: Vec<String> = args
-        .get("permissions_granted")
-        .and_then(serde_json::Value::as_array)
-        .map(|ids| {
-            ids.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let once = plugin::claim(&mut scope, &ids);
-    strip_native_approval_metadata(&mut request);
-    let _route = ask_route_guard(Some(AskRoute::Plugin {
-        scope: scope.clone(),
-        once: once.clone(),
-    }));
-    finish_plugin_response(&scope, &once, preview, run(request, ctx))
-}
-
-/// The tool a native request runs: the nested `name` of a `tool_call`,
-/// otherwise the command itself.
-fn native_tool_name(request: &crate::protocol::RawRequest) -> &str {
-    if request.command == "tool_call" {
-        request
-            .params
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-    } else {
-        &request.command
-    }
-}
-
-/// Remove `permissions_granted` before a plugin host's native request runs,
-/// after its outside-access tokens were claimed.
-///
-/// On the native wire `permissions_granted` only ever holds the host's own
-/// approvals: both plugins drop the agent's `permissions_granted` from the
-/// tool arguments before adding the approvals they granted
-/// (`withHostPermissionGrants` and `withOutsidePermissions` in
-/// `packages/opencode-plugin/src/tools/outside-permissions.ts` and
-/// `packages/pi-plugin/src/tools/_shared.ts`, each destructuring the field
-/// away as `_untrusted`). A shell reads its approved command patterns and
-/// escalation grants from that field, so it is kept when the tool that
-/// runs is bash or powershell, called directly or nested in a `tool_call`.
-/// Every other tool has no use for it, so it is removed and a forged value
-/// can never reach a handler.
-fn strip_native_approval_metadata(request: &mut crate::protocol::RawRequest) {
-    if matches!(native_tool_name(request), "bash" | "powershell") {
-        return;
-    }
-    let params = &mut request.params;
-    let arguments = if params.get("arguments").is_some() {
-        params.get_mut("arguments")
-    } else if params.get("args").is_some() {
-        params.get_mut("args")
-    } else {
-        Some(params)
-    };
-    if let Some(args) = arguments.and_then(serde_json::Value::as_object_mut) {
-        args.remove("permissions_granted");
-    }
-}
 
 pub(crate) fn finish_plugin_response(
     scope: &plugin::Scope,
@@ -1508,24 +1401,7 @@ pub(crate) fn expand_home(path: &Path, home: &Path) -> PathBuf {
     }
 }
 
-/// Identity for policy comparisons only. Tool return paths retain their existing
-/// resolution contract, including the unchanged spelling when unrestricted.
-pub(crate) fn policy_path(path: &Path) -> PathBuf {
-    let bounded = BOUNDED_POLICY_PATHS.with(|slot| slot.borrow().clone());
-    if let Some(state) = bounded {
-        if state.error.borrow().is_none() {
-            *state.progress.lock().unwrap_or_else(|e| e.into_inner()) = path.to_path_buf();
-            match crate::bounded_io::run(path, None, |path| Ok(resolve_policy_path(&path))) {
-                Ok(path) => return path,
-                Err(error) => *state.error.borrow_mut() = Some(error),
-            }
-        }
-        // The enclosing resolution must reject this entire policy. Do not run
-        // more filesystem work after its first failure.
-        return crate::path_identity::normalize_path(path);
-    }
-    resolve_policy_path(path)
-}
+use crate::policy_path::policy_path;
 
 pub(crate) struct StoragePaths;
 
@@ -1539,68 +1415,6 @@ impl crate::read_policy::StoragePathPolicy for StoragePaths {
     }
 }
 
-struct BoundedPolicyPaths {
-    progress: std::sync::Arc<std::sync::Mutex<PathBuf>>,
-    error: std::cell::RefCell<Option<std::io::Error>>,
-}
-
-thread_local! {
-    static BOUNDED_POLICY_PATHS: std::cell::RefCell<Option<std::rc::Rc<BoundedPolicyPaths>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Resolve a complete policy with isolated filesystem probes, rejecting all of
-/// its derived authority if any probe fails. The caller supplies the I/O budget.
-pub(crate) fn with_bounded_policy_paths<T>(
-    progress: std::sync::Arc<std::sync::Mutex<PathBuf>>,
-    work: impl FnOnce() -> T,
-) -> std::io::Result<T> {
-    struct Restore(Option<std::rc::Rc<BoundedPolicyPaths>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            BOUNDED_POLICY_PATHS.with(|slot| *slot.borrow_mut() = self.0.take());
-        }
-    }
-    let state = std::rc::Rc::new(BoundedPolicyPaths {
-        progress,
-        error: Default::default(),
-    });
-    let _restore = Restore(BOUNDED_POLICY_PATHS.with(|slot| slot.replace(Some(state.clone()))));
-    let value = work();
-    let error = state.error.borrow_mut().take();
-    match error {
-        Some(error) => Err(error),
-        None => Ok(value),
-    }
-}
-
-fn resolve_policy_path(path: &Path) -> PathBuf {
-    #[cfg(all(test, unix))]
-    crate::bounded_io::stall_running_helper_if_requested(path);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("/"))
-            .join(path)
-    };
-    let mut ancestor = path.clone();
-    let mut tail = Vec::new();
-    loop {
-        if let Ok(mut canonical) = ancestor.canonicalize() {
-            for component in tail.iter().rev() {
-                canonical.push(component);
-            }
-            return crate::path_identity::normalize_path(&canonical);
-        }
-        let Some(name) = ancestor.file_name().map(ToOwned::to_owned) else {
-            return crate::path_identity::normalize_path(&path);
-        };
-        tail.push(name);
-        if !ancestor.pop() {
-            return crate::path_identity::normalize_path(&path);
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -149,7 +149,7 @@ pub(super) fn home_folders() -> Vec<PathBuf> {
     else {
         return Vec::new();
     };
-    let canonical = crate::access_policy::policy_path(&home);
+    let canonical = crate::policy_path::policy_path(&home);
     if canonical == home {
         vec![home]
     } else {

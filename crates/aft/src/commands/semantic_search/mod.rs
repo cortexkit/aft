@@ -775,11 +775,11 @@ fn handle_semantic_search_with_disk_fallback(
         .filter(|path| !path.is_empty());
     let external_root = if let Some(requested_path) = requested_path {
         let requested = project_root.join(crate::git_root_resolution::expand_tilde(requested_path));
-        let storage = crate::access_policy::policy_path(&ctx.storage_dir());
+        let storage = crate::policy_path::policy_path(&ctx.storage_dir());
         let scan_root_is_protected = |root: &Path| {
             // Resolve both sides: storage may be configured through a parent
             // symlink, including /var on macOS, while the candidate is canonical.
-            crate::access_policy::policy_path(root).starts_with(&storage)
+            crate::policy_path::policy_path(root).starts_with(&storage)
                 || ctx
                     .validate_search_path(
                         &req.id,

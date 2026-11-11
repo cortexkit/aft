@@ -10010,7 +10010,7 @@ impl AppContext {
         let normalized = normalize_path(&path_for_resolution);
         let Some(file_name) = normalized.file_name() else {
             let location = self.validate_path(req_id, path)?;
-            let identity = crate::access_policy::policy_path(&location);
+            let identity = crate::policy_path::policy_path(&location);
             return Ok((location, identity));
         };
         let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
@@ -10806,7 +10806,8 @@ impl AppContext {
         preserve_final: bool,
         allow_approval: bool,
     ) -> Result<PathBuf, crate::protocol::Response> {
-        use crate::access_policy::{policy_path, AccessDecision, AccessDenial, AccessOperation};
+        use crate::access_policy::{AccessDecision, AccessDenial, AccessOperation};
+        use crate::policy_path::policy_path;
         if let Some(response) = self.worker_root_search_refusal(req_id, original, search_tool) {
             return Err(response);
         }
@@ -12165,7 +12166,7 @@ mod force_restrict_tests {
             .unwrap()
             .compile_shell(task_temp, Vec::new(), Vec::new())
             .unwrap();
-        let main_identity = crate::access_policy::policy_path(&main);
+        let main_identity = crate::policy_path::policy_path(&main);
         assert!(!shell
             .write_allow_roots()
             .iter()
@@ -12196,7 +12197,8 @@ mod force_restrict_tests {
 
     #[test]
     fn standalone_native_plugin_dispatch_never_uses_lowered() {
-        use crate::access_policy::{current_ask_route, with_native_route, AskRoute};
+        use crate::access_policy::{current_ask_route, AskRoute};
+        use crate::native_route::with_native_route;
         let root = TempDir::new().unwrap();
         let outside = tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap();
         let target = outside.path().join("file.txt");

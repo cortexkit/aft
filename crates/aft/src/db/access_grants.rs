@@ -399,7 +399,7 @@ pub fn insert_with_source(
     if !grant.path.is_absolute() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let canonical = crate::access_policy::policy_path(&grant.path);
+    let canonical = crate::policy_path::policy_path(&grant.path);
     conn.execute("INSERT INTO access_grants(owner,scope_ref,epoch,path,kind,mode,grant_id,granted_at_ms,card_ref,source)
         SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0)
         ON CONFLICT(owner,scope_ref,epoch,path,kind) DO UPDATE SET
@@ -886,7 +886,7 @@ mod tests {
         // temp dir's /var is /private/var), so build the expected grant the
         // same way.
         let grant = AccessGrant {
-            path: crate::access_policy::policy_path(&dir.path().join("outside")),
+            path: crate::policy_path::policy_path(&dir.path().join("outside")),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Write,
         };
@@ -928,7 +928,7 @@ mod tests {
         register_scope(&conn, &scope, None, &Config::default()).unwrap();
         let bind = policy(&scope, dir.path());
         let grant = AccessGrant {
-            path: crate::access_policy::policy_path(&dir.path().join("future")),
+            path: crate::policy_path::policy_path(&dir.path().join("future")),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         };
@@ -955,7 +955,7 @@ mod tests {
         let bind = policy(&first, dir.path());
         let revived = policy(&second, dir.path());
         let grant = AccessGrant {
-            path: crate::access_policy::policy_path(&dir.path().join("outside")),
+            path: crate::policy_path::policy_path(&dir.path().join("outside")),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Write,
         };
@@ -1041,7 +1041,7 @@ mod tests {
         }
         let grant = AccessGrant {
             // Grants use canonical policy identities, including temp-directory aliases.
-            path: crate::access_policy::policy_path(
+            path: crate::policy_path::policy_path(
                 &dir.path().join("nested").join("..").join("outside"),
             ),
             kind: GrantKind::Subtree,
@@ -1142,7 +1142,7 @@ mod tests {
         let bind = policy(&first, dir.path());
         let revived = policy(&second, dir.path());
         let grant = AccessGrant {
-            path: crate::access_policy::policy_path(&dir.path().join("outside")),
+            path: crate::policy_path::policy_path(&dir.path().join("outside")),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         };

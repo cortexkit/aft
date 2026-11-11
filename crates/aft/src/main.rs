@@ -1497,7 +1497,7 @@ fn dispatch_config_probe_for_test(ctx: &AppContext) {
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
-    aft::access_policy::with_native_route(req, ctx, dispatch_on_route)
+    aft::native_route::with_native_route(req, ctx, dispatch_on_route)
 }
 
 fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
@@ -1863,7 +1863,7 @@ fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Re
 
 fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     let mut deferred = None;
-    let response = aft::access_policy::with_native_route(req, ctx, |req, _| {
+    let response = aft::native_route::with_native_route(req, ctx, |req, _| {
         match dispatch_outcome_on_route(req, ctx) {
             DispatchOutcome::Immediate(response) => response,
             DispatchOutcome::Deferred(pending) => {

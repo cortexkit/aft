@@ -64,7 +64,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         // protect: the read tool answers not-found, so the host need not ask.
         || ctx.bash_background().is_session_missing_scratch_path(
             req.session(),
-            &crate::access_policy::policy_path(&path),
+            &crate::policy_path::policy_path(&path),
         );
     Response::success(&req.id, json!({ "owned": owned }))
 }

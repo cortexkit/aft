@@ -925,8 +925,8 @@ fn fixture_with_worker_directory(
     executor: Arc<Executor>,
     worker_directory: &str,
 ) -> Fixture {
-    let head_root = crate::access_policy::policy_path(&dir.path().join("head"));
-    let worker_root = crate::access_policy::policy_path(&dir.path().join(worker_directory));
+    let head_root = crate::policy_path::policy_path(&dir.path().join("head"));
+    let worker_root = crate::policy_path::policy_path(&dir.path().join(worker_directory));
     std::fs::create_dir_all(&head_root).unwrap();
     std::fs::create_dir_all(&worker_root).unwrap();
     std::fs::write(head_root.join("shared.txt"), "head-owned contents\n").unwrap();
@@ -1525,7 +1525,7 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
         let outside = f.dir.path().join(format!("consent-outside-{index}.txt"));
         std::fs::write(&outside, "consent scope grant").unwrap();
         let grant = AccessGrant {
-            path: crate::access_policy::policy_path(&outside),
+            path: crate::policy_path::policy_path(&outside),
             kind: GrantKind::File,
             operation: AccessOperation::Read,
         };
@@ -1963,7 +1963,7 @@ async fn consent_answer_within_the_budget_runs_the_held_call() {
 #[test]
 fn consent_covering_withdraw_log_names_grant_without_raw_path() {
     let grant = AccessGrant {
-        path: crate::access_policy::policy_path(Path::new("/tmp/scope")),
+        path: crate::policy_path::policy_path(Path::new("/tmp/scope")),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     };
@@ -3864,7 +3864,7 @@ async fn consent_scope_head_file_grant_allows_once_without_delegating_directory(
     set_hold_budget_for_test(Some(Duration::from_millis(100)));
     // Cards and stored grants carry canonical policy paths. Temp directories can
     // sit behind a symlink (macOS /var -> /private/var), so compare canonically.
-    let target = crate::access_policy::policy_path(&f.dir.path().join("elsewhere.txt"));
+    let target = crate::policy_path::policy_path(&f.dir.path().join("elsewhere.txt"));
     {
         let db = f.ctx.db().unwrap();
         crate::db::access_grants::insert(
@@ -3905,7 +3905,7 @@ async fn consent_scope_head_file_only_scope_answer_stores_only_the_file() {
     set_hold_budget_for_test(Some(Duration::from_millis(100)));
     // Cards and stored grants carry canonical policy paths. Temp directories can
     // sit behind a symlink (macOS /var -> /private/var), so compare canonically.
-    let target = crate::access_policy::policy_path(&f.dir.path().join("elsewhere.txt"));
+    let target = crate::policy_path::policy_path(&f.dir.path().join("elsewhere.txt"));
     let grant = AccessGrant {
         path: target.clone(),
         kind: GrantKind::File,
@@ -4298,7 +4298,7 @@ fn consent_scope_home_file_stays_file_only() {
         .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from)
         .expect("the test runner supplies a home directory");
-    assert_file_only_read_scope(crate::access_policy::policy_path(&home).join("x"));
+    assert_file_only_read_scope(crate::policy_path::policy_path(&home).join("x"));
 }
 
 #[cfg(unix)]
@@ -4307,7 +4307,7 @@ fn consent_scope_etc_hosts_stays_file_only() {
     // The root-alias scan limiter is process-wide; serialize with every
     // other consent test that can reach it.
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
-    assert_file_only_read_scope(crate::access_policy::policy_path(Path::new("/etc/hosts")));
+    assert_file_only_read_scope(crate::policy_path::policy_path(Path::new("/etc/hosts")));
 }
 
 #[cfg(unix)]
@@ -4339,7 +4339,7 @@ fn assert_file_only_read_scope(path: PathBuf) {
 #[cfg(unix)]
 fn assert_file_only_write_scope(path: PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let nested = crate::access_policy::policy_path(&dir.path().join("nested/src"));
+    let nested = crate::policy_path::policy_path(&dir.path().join("nested/src"));
     std::fs::create_dir_all(&nested).unwrap();
     let control = directory_scope(&AccessGrant {
         path: nested.join("lib.rs"),
@@ -4371,7 +4371,7 @@ fn test_home() -> PathBuf {
         .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from)
         .expect("the test runner supplies a home directory");
-    crate::access_policy::policy_path(&home)
+    crate::policy_path::policy_path(&home)
 }
 
 #[cfg(unix)]
@@ -4401,14 +4401,14 @@ fn consent_scope_write_root_file_stays_file_only() {
 #[test]
 fn consent_scope_write_root_level_folder_stays_file_only() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
-    assert_file_only_write_scope(crate::access_policy::policy_path(Path::new("/usr")).join("x"));
+    assert_file_only_write_scope(crate::policy_path::policy_path(Path::new("/usr")).join("x"));
 }
 
 #[cfg(unix)]
 #[test]
 fn consent_scope_write_system_folder_stays_file_only() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
-    assert_file_only_write_scope(crate::access_policy::policy_path(Path::new("/etc/hosts")));
+    assert_file_only_write_scope(crate::policy_path::policy_path(Path::new("/etc/hosts")));
 }
 
 #[test]
@@ -4419,7 +4419,7 @@ fn consent_scope_nested_file_still_offers_directory() {
     let dir = tempfile::tempdir().unwrap();
     let parent = dir.path().join("nested/src");
     std::fs::create_dir_all(&parent).unwrap();
-    let parent = crate::access_policy::policy_path(&parent);
+    let parent = crate::policy_path::policy_path(&parent);
     let scope = directory_scope(&AccessGrant {
         path: parent.join("lib.rs"),
         kind: GrantKind::File,
@@ -4649,7 +4649,7 @@ fn consent_scope_sibling_card_reuses_memoized_probe() {
 
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let dir = tempfile::tempdir().unwrap();
-    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    let parent = crate::policy_path::policy_path(&dir.path().join("nested"));
     std::fs::create_dir_all(&parent).unwrap();
     let probes = Arc::new(AtomicUsize::new(0));
     let mut previous_count = 0;
@@ -4687,7 +4687,7 @@ fn consent_scope_unknown_alias_answer_is_not_memoized() {
 
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let dir = tempfile::tempdir().unwrap();
-    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    let parent = crate::policy_path::policy_path(&dir.path().join("nested"));
     std::fs::create_dir_all(&parent).unwrap();
     let probes = Arc::new(AtomicUsize::new(0));
     let (_, lines) = crate::logging::capture_log_lines(|| {
@@ -4797,7 +4797,7 @@ fn consent_scope_vanished_directory_is_info_once_even_after_memo_pruning() {
 fn consent_scope_memo_expires_and_unsafe_answers_keep_each_file() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let dir = tempfile::tempdir().unwrap();
-    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    let parent = crate::policy_path::policy_path(&dir.path().join("nested"));
     std::fs::create_dir_all(&parent).unwrap();
     let grant = AccessGrant {
         path: parent.join("first.txt"),
@@ -4836,7 +4836,7 @@ fn consent_scope_waits_for_other_directory_probe_permit() {
     let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
     let dir = tempfile::tempdir().unwrap();
-    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    let parent = crate::policy_path::policy_path(&dir.path().join("nested"));
     std::fs::create_dir_all(&parent).unwrap();
     let permit = DIRECTORY_SCOPE_PROBE_LIMITER.try_acquire().unwrap();
     let release = std::thread::spawn(move || {
@@ -4864,7 +4864,7 @@ async fn consent_scope_timed_out_probe_is_not_memoized() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     assert_eq!(directory_scope_probe_budget(), Duration::from_millis(250));
     let dir = tempfile::tempdir().unwrap();
-    let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
+    let parent = crate::policy_path::policy_path(&dir.path().join("nested"));
     std::fs::create_dir_all(&parent).unwrap();
     let grant = AccessGrant {
         path: parent.join("first.txt"),
@@ -5029,7 +5029,7 @@ fn consent_scope_rejects_canonical_root_alias() {
     std::fs::create_dir_all(&target).unwrap();
     std::os::unix::fs::symlink(&target, root.join("etc")).unwrap();
     std::os::unix::fs::symlink(root.join("missing"), root.join("unavailable")).unwrap();
-    let target = crate::access_policy::policy_path(&target);
+    let target = crate::policy_path::policy_path(&target);
     assert_eq!(directory_is_root_alias(&target, &root), Some(true));
     assert_eq!(
         directory_is_root_alias(&root.join("private/other"), &root),
@@ -5908,7 +5908,7 @@ async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
     let target = directory.join("elsewhere.txt");
     std::fs::write(&target, "unheld contents").unwrap();
     let head_grant = AccessGrant {
-        path: crate::access_policy::policy_path(&directory),
+        path: crate::policy_path::policy_path(&directory),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     };
@@ -5940,7 +5940,7 @@ async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
             &db.lock().unwrap(),
             &access_grants::scope_key(&f.head),
             &AccessGrant {
-                path: crate::access_policy::policy_path(&target),
+                path: crate::policy_path::policy_path(&target),
                 kind: GrantKind::File,
                 operation: AccessOperation::Read,
             },
@@ -7187,7 +7187,7 @@ async fn macos_allowed_read_eperm_returns_named_denial_and_updates_one_card() {
         &f.ctx,
     )
     .unwrap();
-    let folder = crate::access_policy::policy_path(&f.dir.path().join("protected"));
+    let folder = crate::policy_path::policy_path(&f.dir.path().join("protected"));
     std::fs::create_dir(&folder).unwrap();
     let target = folder.join("file.txt");
     std::fs::write(&target, "protected bytes").unwrap();
@@ -7470,7 +7470,7 @@ async fn macos_blocked_or_refused_card_does_not_block_or_replace_tool_denial() {
         &f.ctx,
     )
     .unwrap();
-    let folder = crate::access_policy::policy_path(&f.dir.path().join("protected"));
+    let folder = crate::policy_path::policy_path(&f.dir.path().join("protected"));
     std::fs::create_dir(&folder).unwrap();
     let target = folder.join("file.txt");
     std::fs::write(&target, "protected bytes").unwrap();
@@ -7512,7 +7512,7 @@ async fn consent_pending_messages_pin_worker_and_head_recipients() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     set_hold_budget_for_test(Some(Duration::from_millis(300)));
-    let target = crate::access_policy::policy_path(&f.dir.path().join("elsewhere.txt"));
+    let target = crate::policy_path::policy_path(&f.dir.path().join("elsewhere.txt"));
     let worker = f.read(&f.worker, &target, 71).await;
     assert_eq!(code(&worker), "access_pending", "{worker}");
     assert_eq!(worker["structuredContent"]["message"], format!(
@@ -7534,7 +7534,7 @@ async fn assert_unrepresentable_paths_send_nothing(paths: Vec<PathBuf>) {
     {
         assert!(f
             .head_root
-            .starts_with(crate::access_policy::policy_path(f.dir.path())));
+            .starts_with(crate::policy_path::policy_path(f.dir.path())));
         let db = f.ctx.db().unwrap();
         assert_eq!(
             crate::db::access_grants::mode(&db.lock().unwrap(), &access_grants::scope_key(&f.head))
@@ -7740,7 +7740,7 @@ async fn consent_head_revocation_during_resolution_is_judged_by_the_new_policy()
     let target = directory.join("elsewhere.txt");
     std::fs::write(&target, "unheld contents").unwrap();
     let head_grant = AccessGrant {
-        path: crate::access_policy::policy_path(&directory),
+        path: crate::policy_path::policy_path(&directory),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     };
@@ -7752,7 +7752,7 @@ async fn consent_head_revocation_during_resolution_is_judged_by_the_new_policy()
     )
     .unwrap();
     let grant = AccessGrant {
-        path: crate::access_policy::policy_path(&target),
+        path: crate::policy_path::policy_path(&target),
         kind: GrantKind::File,
         operation: AccessOperation::Read,
     };

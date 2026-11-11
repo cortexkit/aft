@@ -33,7 +33,7 @@ pub fn handle_with_dispatch(
     dispatch: &DispatchFn<'_>,
 ) -> Response {
     super::configure::register_runtime_hooks();
-    crate::access_policy::with_native_route(req.clone(), ctx, |req, ctx| {
+    crate::native_route::with_native_route(req.clone(), ctx, |req, ctx| {
         handle_on_route(&req, ctx, dispatch)
     })
 }

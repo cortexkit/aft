@@ -68,14 +68,14 @@ impl Fixture {
 }
 
 fn has_floor_skip(response: &Response, path: &Path) -> bool {
-    let expected = crate::access_policy::policy_path(path);
+    let expected = crate::policy_path::policy_path(path);
     response.data["skipped_files"]
         .as_array()
         .is_some_and(|files| {
             files.iter().any(|file| {
                 file["reason"] == "denied_floor"
                     && file["file"].as_str().is_some_and(|file| {
-                        crate::access_policy::policy_path(Path::new(file)) == expected
+                        crate::policy_path::policy_path(Path::new(file)) == expected
                     })
             })
         })

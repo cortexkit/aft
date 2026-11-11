@@ -193,7 +193,7 @@ fn folder_revoke_racing_a_spawn_stops_the_command_once_registered() {
     use std::time::Duration;
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let granted = crate::access_policy::policy_path(storage.path()).join("granted");
+    let granted = crate::policy_path::policy_path(storage.path()).join("granted");
     std::fs::create_dir(&granted).unwrap();
     let sandbox_temp = storage.path().join("sandbox-temp");
     std::fs::create_dir(&sandbox_temp).unwrap();

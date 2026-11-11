@@ -79,7 +79,7 @@ mod tests {
             legacy_paths
                 .into_iter()
                 .filter(|path| path.exists())
-                .map(|path| crate::access_policy::policy_path(&path)),
+                .map(|path| crate::policy_path::policy_path(&path)),
         );
         assert_eq!(
             current.private_stores.read_allow,

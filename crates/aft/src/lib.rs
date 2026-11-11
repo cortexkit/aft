@@ -161,6 +161,7 @@ pub mod lsp;
 pub mod lsp_hints;
 mod luau;
 pub mod memory;
+pub mod native_route;
 pub(crate) mod native_stat;
 pub mod ndjson_text;
 #[cfg(test)]
@@ -180,6 +181,7 @@ pub mod persisted_format;
 pub(crate) mod pinned_dir;
 pub mod pinned_executable;
 mod platform_tls;
+pub(crate) mod policy_path;
 #[cfg(unix)]
 pub(crate) mod posix_spawn;
 mod privacy_spawn;

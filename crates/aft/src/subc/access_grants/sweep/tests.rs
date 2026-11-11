@@ -275,7 +275,7 @@ async fn saved_grant_sweep_only_deletes_definite_ends() {
             // Grants are stored in policy form (on Windows the temp folder's
             // spelling differs), and the sweep must start from an empty table
             // each round so it describes exactly one scope.
-            let stored = crate::access_policy::policy_path(&dir.path().join(name));
+            let stored = crate::policy_path::policy_path(&dir.path().join(name));
             assert_eq!(store::revoke(&conn, &key, &stored).unwrap(), 1, "{name}");
         }
         match name {

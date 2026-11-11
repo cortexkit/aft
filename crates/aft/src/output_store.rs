@@ -352,7 +352,7 @@ struct CleanupSession {
 /// output. The cursor resumes on the next bounded pass, including after eviction.
 pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) -> CleanupReport {
     const SCAN_ENTRIES: usize = 256;
-    let root = crate::access_policy::policy_path(&harness.join("tool-results"));
+    let root = crate::policy_path::policy_path(&harness.join("tool-results"));
     static CURSORS: std::sync::OnceLock<Mutex<HashMap<PathBuf, CleanupCursor>>> =
         std::sync::OnceLock::new();
     let mut report = CleanupReport::default();

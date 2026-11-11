@@ -3020,7 +3020,7 @@ fn jail_target_allowed(
     if !target.is_absolute() || target.parent().is_none() {
         return false;
     }
-    let target = crate::access_policy::policy_path(target);
+    let target = crate::policy_path::policy_path(target);
     !home.starts_with(&target)
         && !project_roots.iter().any(|root| root.starts_with(&target))
         && policy.decide_tree_write(&target) != AccessDecision::Deny(AccessDenial::Floor)

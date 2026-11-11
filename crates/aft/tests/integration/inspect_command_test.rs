@@ -307,7 +307,7 @@ fn inspect_as_opencode(
     payload: Value,
     run: impl Fn(&AppContext, Value) -> Value,
 ) -> Value {
-    aft::access_policy::with_native_route(request(payload.clone()), ctx, |_, ctx| {
+    aft::native_route::with_native_route(request(payload.clone()), ctx, |_, ctx| {
         let value = run(ctx, payload.clone());
         aft::protocol::Response {
             id: "inspect".into(),
@@ -5101,7 +5101,7 @@ const CONTENT_PULL_ERROR: &str = "BROKEN marker in synced text";
 /// `edit_match` dispatched as an OpenCode host's request is, so a file
 /// outside the project can be edited.
 fn edit_match_as_opencode(ctx: &AppContext, id: &str, file: &Path, from: &str, to: &str) {
-    let response = aft::access_policy::with_native_route(
+    let response = aft::native_route::with_native_route(
         request(json!({
             "id": id, "command": "edit_match",
             "file": file.display().to_string(), "match": from, "replacement": to,

@@ -784,7 +784,7 @@ fn handle_glob_edit_match_inner(
             .capability_floor(
                 AccessOperation::Write,
                 GrantKind::File,
-                &crate::access_policy::policy_path(path),
+                &crate::policy_path::policy_path(path),
             )
             .is_some()
         {

@@ -725,7 +725,7 @@ fn artifact_read_search_symlinked_storage_matches_main_bytes() {
             .strip_prefix(original.config().storage_dir.as_ref().unwrap())
             .unwrap(),
     );
-    assert_ne!(storage, crate::access_policy::policy_path(&storage));
+    assert_ne!(storage, crate::policy_path::policy_path(&storage));
     assert_eq!(
         ctx.validate_read_path("policy-test", "policy-session", artifact.parent().unwrap())
             .unwrap_err()

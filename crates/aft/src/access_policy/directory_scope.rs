@@ -268,7 +268,7 @@ pub(crate) fn probe_directory_scope_with(
         .map(|path| {
             #[cfg(all(test, unix))]
             crate::bounded_io::stall_helper_if_requested(&path);
-            crate::access_policy::policy_path(&path)
+            crate::policy_path::policy_path(&path)
         })
         .ok_or("home identity unknown")?;
     probe_directory_scope_at_home(parent, &home, root_alias_check)
@@ -287,7 +287,7 @@ pub(crate) fn probe_directory_scope_at_home(
         return Err("directory does not exist");
     }
     let (volume, _) = crate::volume::volume_anchor(parent).ok_or("volume identity unknown")?;
-    let volume = crate::access_policy::policy_path(&volume);
+    let volume = crate::policy_path::policy_path(&volume);
     let root = parent.ancestors().last().unwrap_or(parent);
     if !directory_scope_is_narrow(parent, home, &volume) {
         return Ok(false);
@@ -411,7 +411,7 @@ pub(crate) fn scan_root_alias(directory: &Path, root: &Path) -> Option<bool> {
             let Ok(target) = entry.path().canonicalize() else {
                 continue;
             };
-            if crate::access_policy::policy_path(&target) == directory {
+            if crate::policy_path::policy_path(&target) == directory {
                 return Some(true);
             }
         }
