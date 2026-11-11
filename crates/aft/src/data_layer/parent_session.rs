@@ -27,7 +27,7 @@ mod tests;
 mod worker;
 
 pub use query::route;
-pub(crate) use query::{attach_gaps, attach_search_gaps, glob_fan_out, grep_fan_out};
+pub(crate) use query::{attach_search_gaps, glob_fan_out, grep_fan_out};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
