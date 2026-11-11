@@ -795,7 +795,9 @@ async fn captured_dispatch_reaches_the_real_gate_with_a_precommitted_pinned_nonc
             let slot = reserve(project, session, scope, body)?;
             let path = path.clone();
             Ok(ReservedBotRequest::for_test(move || {
-                let conn = crate::gh_shim_speech::store::Store::new(path).connect().unwrap();
+                let conn = crate::gh_shim_speech::store::Store::new(path)
+                    .connect()
+                    .unwrap();
                 let expect: String = conn
                     .query_row(
                         "SELECT expect_json FROM gh_speech_requests WHERE request_nonce=?1",
