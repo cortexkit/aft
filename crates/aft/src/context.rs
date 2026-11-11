@@ -2221,7 +2221,7 @@ fn session_owned_scratch_location(
 /// operation; accepting it would create or change `<root>/issue:/N` locally.
 fn reject_github_address(req_id: &str, path: &Path) -> Result<(), crate::protocol::Response> {
     match path.to_str() {
-        Some(raw) => crate::commands::github_comments::reject_github_resource_path(
+        Some(raw) => crate::github_address::reject_github_resource_path(
             req_id,
             "file operation",
             raw,
@@ -9823,7 +9823,7 @@ impl AppContext {
         if path.is_absolute()
             || path
                 .to_str()
-                .is_some_and(crate::commands::github_comments::is_github_resource_path)
+                .is_some_and(crate::github_address::is_github_resource_path)
         {
             return path.to_path_buf();
         }
