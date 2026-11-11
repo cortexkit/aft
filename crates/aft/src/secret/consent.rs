@@ -53,7 +53,8 @@ pub enum ConsentOutcome {
     /// Cingulate allowed this request. Retry the vault once; only its release
     /// authorizes substitution.
     Answered,
-    /// Allowed for one use. Keep the duration for the next request's notice.
+    /// One-use approval. Preserve this distinction so a later card can be
+    /// announced as replacing a consumed one-use approval.
     AnsweredOnce,
     Declined,
     Expired,
