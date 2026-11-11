@@ -30,7 +30,7 @@ pub(crate) fn apply_project_ignore_rules<'a>(
     builder: &'a mut ignore::WalkBuilder,
     walk_root: &Path,
 ) -> &'a mut ignore::WalkBuilder {
-    if crate::context::confinement::active() {
+    if crate::data_layer::read_fence::active() {
         // Ignore files can themselves be symlinks to another checkout. A
         // confined walk must not read those files, even to filter its results.
         return builder

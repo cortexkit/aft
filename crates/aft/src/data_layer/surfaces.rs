@@ -29,7 +29,10 @@ use super::checkout::{
     PlaneStatus, INDEX_STORE,
 };
 use super::runtime::{DataCheckout, DataFailure};
-use crate::context::{AppContext, SemanticFillHealth, SemanticHealthComponentSnapshot};
+#[cfg(test)]
+use crate::context::AppContext;
+use crate::data_layer::host::IndexHost;
+use crate::data_layer::status::{SemanticFillHealth, SemanticHealthComponentSnapshot};
 use crate::memory::MemoryEstimate;
 use aft_store::family::NewerFormat;
 
@@ -67,7 +70,7 @@ pub(crate) mod reason {
 }
 
 /// This root's checkout in the data layer, as a status read finds it.
-pub(crate) enum DataCheckoutProbe {
+pub enum DataCheckoutProbe {
     /// Nothing has bound it.
     NotBound,
     /// A bind is in progress (it scans the checkout), or the handle's slot
@@ -82,7 +85,7 @@ pub(crate) enum DataCheckoutProbe {
 
 /// Why a root's checkout is never bound in the data layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Withheld {
+pub enum Withheld {
     /// The root is a filesystem, volume or drive root.
     TooBroad,
     /// The root is the home folder.
@@ -346,7 +349,7 @@ pub(crate) fn bind_for_test(ctx: &AppContext) {
 /// Whether this root's text index serves: `Some(true)` ready, `Some(false)`
 /// still building, `None` when no checkout is bound or its text plane is off.
 /// For callers outside the crate, such as `aft warmup`.
-pub fn text_plane_ready(ctx: &AppContext) -> Option<bool> {
+pub fn text_plane_ready(ctx: &dyn IndexHost) -> Option<bool> {
     match report(ctx)?.text.status {
         READY => Some(true),
         BUILDING => Some(false),
@@ -387,14 +390,17 @@ pub(crate) fn skipped_folder_health_note(root: &Path, count: usize) -> String {
 /// Report only gaps intersecting the request's scope, under its read policy.
 /// The preview is bounded independently of the number of skipped folders.
 pub(crate) fn disclose_index_gaps(
-    ctx: &AppContext,
+    ctx: &impl IndexHost,
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,
 ) {
     if !response.success {
         return;
     }
-    let views = if let Some(session) = super::parent_session::session_for(ctx) {
+    let session = ctx
+        .canonical_cache_root_opt()
+        .and_then(|root| super::parent_session::session_for_root(&root));
+    let views = if let Some(session) = session {
         let children = session.children();
         let children = children
             .iter()
@@ -417,7 +423,7 @@ pub(crate) fn disclose_index_gaps(
     } else {
         return;
     };
-    let fence = crate::context::confinement::capture();
+    let fence = crate::data_layer::read_fence::capture();
     let mut count = 0;
     let mut gaps = Vec::new();
     let mut lines = Vec::new();
@@ -538,15 +544,15 @@ pub(crate) fn disclose_parse_gaps(
     .into();
 }
 
-pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
+pub(crate) fn report(ctx: &dyn IndexHost) -> Option<DataStoreReport> {
     report_inner(ctx, false)
 }
 
-pub(crate) fn report_for_push(ctx: &AppContext) -> Option<DataStoreReport> {
+pub(crate) fn report_for_push(ctx: &dyn IndexHost) -> Option<DataStoreReport> {
     report_inner(ctx, true)
 }
 
-fn report_inner(ctx: &AppContext, cached_only: bool) -> Option<DataStoreReport> {
+fn report_inner(ctx: &dyn IndexHost, cached_only: bool) -> Option<DataStoreReport> {
     Some(match ctx.probe_data_checkout()? {
         DataCheckoutProbe::NotBound => {
             DataStoreReport::both(PlaneReport::because(OFF, reason::NOT_BOUND, None))
@@ -583,7 +589,7 @@ fn report_inner(ctx: &AppContext, cached_only: bool) -> Option<DataStoreReport> 
 /// The family-store file a newer build wrote that `ctx`'s checkout refused
 /// at its last bind, build or refresh, without binding it; `None` when the
 /// data layer is off or nothing was refused.
-pub(crate) fn storage_refusal(ctx: &AppContext) -> Option<NewerFormat> {
+pub(crate) fn storage_refusal(ctx: &dyn IndexHost) -> Option<NewerFormat> {
     match ctx.probe_data_checkout()? {
         DataCheckoutProbe::BindFailed(error) => error.refusal().cloned(),
         DataCheckoutProbe::Bound(checkout) => checkout.last_failure()?.refusal,
@@ -1227,17 +1233,17 @@ impl DataLayerMemory {
 /// The data layer's memory for `ctx`'s root (see [`DataLayerMemory`]);
 /// `None` when the data layer is off. Never binds the checkout and never
 /// waits for a lock.
-pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<DataLayerMemory> {
+pub(crate) fn memory_estimate(ctx: &dyn IndexHost) -> Option<DataLayerMemory> {
     memory_estimate_with(ctx, false)
 }
 
 /// Health reuses dirty figures for up to thirty seconds. Explicit censuses use
 /// [`memory_estimate`] instead, so completed edits are observable immediately.
-pub(crate) fn memory_estimate_for_rollup(ctx: &AppContext) -> Option<DataLayerMemory> {
+pub(crate) fn memory_estimate_for_rollup(ctx: &dyn IndexHost) -> Option<DataLayerMemory> {
     memory_estimate_with(ctx, true)
 }
 
-fn memory_estimate_with(ctx: &AppContext, reuse_dirty: bool) -> Option<DataLayerMemory> {
+fn memory_estimate_with(ctx: &dyn IndexHost, reuse_dirty: bool) -> Option<DataLayerMemory> {
     Some(match ctx.probe_data_checkout()? {
         // Nothing is held for a checkout that is not bound.
         DataCheckoutProbe::NotBound
@@ -1248,7 +1254,7 @@ fn memory_estimate_with(ctx: &AppContext, reuse_dirty: bool) -> Option<DataLayer
             ..DataLayerMemory::unbound()
         },
         DataCheckoutProbe::Bound(checkout) => {
-            let snapshot = ctx.inspect_manager().try_callgraph_projection_snapshot();
+            let snapshot = ctx.temporary_inspect_projection();
             let counted_elsewhere = snapshot
                 .as_ref()
                 .map(|snapshot| Arc::as_ptr(snapshot) as usize);
@@ -1549,7 +1555,7 @@ fn user_commands_operator_projection_returns_without_waiting_and_coalesces_disk_
 /// is normal), `Some(Some(field))` otherwise, in today's shape. `None` when
 /// the data layer is off, so zoom asks today's store. Like every status
 /// read, it never binds the checkout.
-pub(crate) fn zoom_callgraph_field(ctx: &AppContext) -> Option<Option<Value>> {
+pub(crate) fn zoom_callgraph_field(ctx: &dyn IndexHost) -> Option<Option<Value>> {
     let report = report(ctx)?;
     let plane = &report.callgraph;
     // `callgraph_off` tells the agent the call graph is switched off in
@@ -1581,7 +1587,7 @@ pub enum WarmState {
 /// The text and call-graph planes of `ctx`'s root, for `aft warmup`.
 /// Binds the checkout on the first call, which starts its build; a call
 /// graph that answers with edits still waiting counts as ready.
-pub fn warm(ctx: &AppContext) -> (WarmState, WarmState) {
+pub fn warm(ctx: &dyn IndexHost) -> (WarmState, WarmState) {
     let report = match ctx.data_checkout() {
         Some(checkout) => report_of(&checkout),
         None => match report(ctx) {
@@ -1785,7 +1791,7 @@ pub fn fill_root(
 /// index status applies. Asking binds
 /// the checkout and starts its fill. Ready only once every file meaning
 /// search applies to is filled: a partial plane is still pending.
-pub fn warm_meaning(ctx: &AppContext) -> Option<WarmState> {
+pub fn warm_meaning(ctx: &dyn IndexHost) -> Option<WarmState> {
     use crate::commands::data_search::DataSemantic;
     use crate::data_layer::status::SemanticIndexStatus;
     if !ctx.data_layer_serves_meaning() {
