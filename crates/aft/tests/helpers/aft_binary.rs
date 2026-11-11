@@ -25,8 +25,51 @@ pub fn source_binary() -> PathBuf {
 /// a large debug image from the build server's target mount for every child.
 #[cfg(unix)]
 pub fn aft_binary() -> PathBuf {
-    deploy(&source_binary(), &std::env::temp_dir())
+    #[cfg(target_os = "macos")]
+    let warm = warm_fixture_image;
+    #[cfg(not(target_os = "macos"))]
+    let warm = |_: &Path| Ok(());
+    deploy_with_warmup(&source_binary(), &std::env::temp_dir(), |_| {}, warm)
         .unwrap_or_else(|error| panic!("cannot deploy real AFT fixture image: {error}"))
+}
+
+/// Pay macOS's first-exec cost before a command's own timeout starts. Production
+/// warms its startup pin too; the integration launcher override uses this copy.
+#[cfg(target_os = "macos")]
+fn warm_fixture_image(image: &Path) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let mut child = Command::new(image)
+        .env_clear()
+        .args(["gh-shim", "--shim-version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(io::Error::other(format!("fixture warmup exited {status}")))
+            }
+            Ok(None) if start.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => {
+                // SAFETY: the warmup child was placed in its own process group.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                return Err(match result {
+                    Err(error) => error,
+                    _ => io::Error::other("fixture image warmup exceeded 30s"),
+                });
+            }
+        }
+    }
 }
 
 // Windows holds the running .exe open and does not copy or link it into storage.
@@ -84,16 +127,26 @@ fn unchanged(source: &File, path: &Path, expected: &Identity) -> io::Result<()> 
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn deploy(source: &Path, temporary_root: &Path) -> io::Result<PathBuf> {
     deploy_observing_copy(source, temporary_root, |_| {})
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn deploy_observing_copy(
     source: &Path,
     temporary_root: &Path,
     copied: impl FnOnce(&Path),
+) -> io::Result<PathBuf> {
+    deploy_with_warmup(source, temporary_root, copied, |_| Ok(()))
+}
+
+#[cfg(unix)]
+fn deploy_with_warmup(
+    source: &Path,
+    temporary_root: &Path,
+    copied: impl FnOnce(&Path),
+    warm: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<PathBuf> {
     use std::process::{Command, Stdio};
 
@@ -169,6 +222,12 @@ fn deploy_observing_copy(
     // image and an existing nonempty source-identity directory is not replaced.
     fs::rename(pending.path(), &directory)?;
     unchanged(&input, &source, &identity)?;
+    // Warm the final pathname while the publication lock still excludes other
+    // fixtures. Never cache a failed warmup as an image ready for tool traffic.
+    if let Err(error) = warm(&image) {
+        fs::remove_dir_all(&directory)?;
+        return Err(error);
+    }
     Ok(image)
 }
 
@@ -200,6 +259,80 @@ mod tests {
         assert_ne!(
             fs::metadata(&first).unwrap().permissions().mode() & 0o111,
             0
+        );
+    }
+
+    #[test]
+    fn fixture_image_is_warmed_once_at_its_immutable_final_path() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source_image(root.path(), b"real image bytes");
+        let warmed = std::cell::RefCell::new(Vec::new());
+        let first = deploy_with_warmup(
+            &source,
+            root.path(),
+            |_| {},
+            |image| {
+                assert_eq!(fs::read(image).unwrap(), b"real image bytes");
+                assert!(fs::metadata(image).unwrap().permissions().readonly());
+                assert!(!image
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".publishing-"));
+                warmed.borrow_mut().push(image.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let second = deploy_with_warmup(
+            &source,
+            root.path(),
+            |_| panic!("a cached fixture must not be copied again"),
+            |_| panic!("a cached fixture must not be warmed again"),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(*warmed.borrow(), vec![first]);
+    }
+
+    #[test]
+    fn failed_fixture_warmup_is_not_cached() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source_image(root.path(), b"real image bytes");
+        let failed_path = std::cell::RefCell::new(None);
+        let error = deploy_with_warmup(
+            &source,
+            root.path(),
+            |_| {},
+            |image| {
+                failed_path.replace(Some(image.to_path_buf()));
+                Err(io::Error::other("injected warmup failure"))
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected warmup failure"));
+        let image = failed_path.into_inner().unwrap();
+        assert!(!image.parent().unwrap().exists());
+
+        let copied = std::cell::Cell::new(false);
+        let warmed = std::cell::Cell::new(false);
+        let retry = deploy_with_warmup(
+            &source,
+            root.path(),
+            |_| copied.set(true),
+            |_| {
+                warmed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(retry, image);
+        assert!(copied.get(), "the failed image must be republished");
+        assert!(
+            warmed.get(),
+            "the retry must finish warmup before returning"
         );
     }
 
