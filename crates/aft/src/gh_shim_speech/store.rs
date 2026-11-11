@@ -201,7 +201,7 @@ impl Store {
                 serde_json::json!({}),
             ));
         }
-        let schema = crate::db::current_schema_version(&conn).map_err(db_error)?;
+        let schema = rows::schema_version(&conn).map_err(db_error)?;
         if schema < 22 {
             return Err(unavailable(
                 "db::gh_speech::connect",
