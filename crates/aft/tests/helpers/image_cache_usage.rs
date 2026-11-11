@@ -97,7 +97,7 @@ fn scan_process(
             Err(_) if !alive() => return Ok(()),
             Err(error) if attempt == 2 => return Err(error),
             Err(_) => {
-                // procfs can briefly deny access during exec or process exit.
+                // Linux's /proc filesystem can briefly deny access during exec or process exit.
                 // Persistent refusal still prevents eviction rather than
                 // guessing that the process has no image open.
                 std::thread::sleep(std::time::Duration::from_millis(10));

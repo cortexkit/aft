@@ -30,7 +30,7 @@ export function scanProcessWithRetry(scan: () => void, alive: () => boolean): vo
     } catch (error) {
       if (!alive()) return;
       if (attempt === 2) throw error;
-      // procfs visibility can briefly change during exec or process exit.
+      // Visibility in Linux's /proc filesystem can briefly change during exec or process exit.
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
   }
