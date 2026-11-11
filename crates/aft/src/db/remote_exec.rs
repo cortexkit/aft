@@ -60,6 +60,14 @@ pub fn freeze(
             |row| row.get(0),
         )
         .optional()?;
+    let prior = match prior {
+        Some(prior) => Some(prior),
+        None => super::runner_harness_keys::lookup_alias::<String>(
+            &tx,
+            key,
+            super::runner_harness_keys::AliasTable::RemoteExec,
+        )?,
+    };
     let mut policy = policy.clone();
     if let Some(prior) = prior {
         let prior: FrozenParams = serde_json::from_str(&prior).map_err(|e| {
@@ -115,6 +123,23 @@ pub fn lookup(
     key: &PolicyKey,
     now: u64,
 ) -> rusqlite::Result<Option<FrozenParams>> {
+    if key.harness == "runner" && read_params(conn, key)?.is_none() {
+        return super::runner_harness_keys::lookup_alias::<String>(
+            conn,
+            key,
+            super::runner_harness_keys::AliasTable::RemoteExec,
+        )?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose();
+    }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let row = catalog_params(&tx, key, CatalogParams::RemoteExec)?;
     let policy = row
@@ -145,20 +170,14 @@ pub fn lookup(
 /// Saved params that do not parse are an error, so callers can refuse the call
 /// instead of treating an unreadable fence as absent.
 pub fn confined(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<bool> {
-    let v = key.values();
-    let epoch = key.epoch.to_string();
-    let row: Option<String> = conn
-        .query_row(
-            "SELECT params FROM remote_exec_policies
-             WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
-             AND owner=?5 AND scope_ref=?6 AND preset=?7
-             AND (epoch=?8 OR length(epoch)<length(?8)
-                  OR (length(epoch)=length(?8) AND epoch<?8))
-             ORDER BY epoch=?8 DESC, length(epoch) DESC, epoch DESC LIMIT 1",
-            params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let row = match read_params(conn, key)? {
+        Some(row) => Some(row),
+        None => super::runner_harness_keys::lookup_alias::<String>(
+            conn,
+            key,
+            super::runner_harness_keys::AliasTable::RemoteExec,
+        )?,
+    };
     row.map(|json| {
         serde_json::from_str::<FrozenParams>(&json)
             .map(|params| params.confine.is_some())
@@ -172,6 +191,22 @@ pub fn confined(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<bool> {
     })
     .transpose()
     .map(|confined| confined.unwrap_or(false))
+}
+
+fn read_params(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<String>> {
+    let v = key.values();
+    let epoch = key.epoch.to_string();
+    conn.query_row(
+        "SELECT params FROM remote_exec_policies
+             WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
+             AND owner=?5 AND scope_ref=?6 AND preset=?7
+             AND (epoch=?8 OR length(epoch)<length(?8)
+                  OR (length(epoch)=length(?8) AND epoch<?8))
+             ORDER BY epoch=?8 DESC, length(epoch) DESC, epoch DESC LIMIT 1",
+        params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 pub(super) enum CatalogParams {

@@ -4537,6 +4537,7 @@ fn run_subc_mode_on_runtime_thread(
     crate::db::call_ledger::mark_provider_process();
     let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
+    crate::db::runner_harness_keys::start(ctx.app(), ctx.storage_dir().join("aft.db"));
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
     let runtime = dispatch_path_metrics
         .frame_loop_runtime()

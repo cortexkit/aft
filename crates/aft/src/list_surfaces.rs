@@ -762,9 +762,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "db/runner_harness_keys.rs",
-        enclosing_item: "copy_aliases",
+        enclosing_item: "copy_aliases_with_limit, lookup_alias",
         location_or_primitive: "SOURCE_LIMIT and SQL LIMIT",
-        reason: "startup value migration bounds source rows before copying and refuses an oversized batch atomically; no agent list is returned and original rows remain available for rollback",
+        reason: "startup value migration bounds source rows before copying and skips an oversized batch atomically; fallback reads select one authoritative row by identical key and deterministic recency, not an agent result list; originals remain available for rollback",
     },
     ExclusionEntry {
         file: "bash_background/registry.rs",

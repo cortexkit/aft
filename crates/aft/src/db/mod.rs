@@ -30,7 +30,7 @@ pub mod github_read_cache;
 pub mod remote_exec;
 pub mod removal;
 pub mod rich_ui;
-mod runner_harness_keys;
+pub(crate) mod runner_harness_keys;
 pub mod standing_roots;
 pub mod state;
 
@@ -687,7 +687,6 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
         apply_pragmas_with_timeout(&conn, TOOL_RETRY_BUSY_WAIT)?;
         run_migrations(&mut conn)?;
         ensure_additive_indexes(&conn)?;
-        runner_harness_keys::copy_aliases(&conn)?;
         clear_stored_compression_commands(&mut conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         return Ok(conn);
@@ -720,7 +719,6 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
             )?;
             run_migrations(&mut conn)?;
             ensure_additive_indexes(&conn)?;
-            runner_harness_keys::copy_aliases(&conn)?;
             clear_stored_compression_commands(&mut conn)?;
             Ok::<(), OpenError>(())
         })();

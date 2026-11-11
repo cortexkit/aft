@@ -101,7 +101,11 @@ pub fn lookup(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<Option<boo
         )
         .optional()?;
     let Some((rowid, hashline)) = older else {
-        return Ok(None);
+        return super::runner_harness_keys::lookup_alias(
+            conn,
+            key,
+            super::runner_harness_keys::AliasTable::EditModes,
+        );
     };
     conn.execute(
         "INSERT OR IGNORE INTO catalog_edit_modes
