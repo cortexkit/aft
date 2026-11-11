@@ -20,12 +20,10 @@ use crate::secret::{ApiKeyTarget, ReleasedApiKey};
 /// Everything a test makes the fake say, plus the record of what it was asked.
 #[derive(Default)]
 pub struct FakeVaultScript {
-    /// The answer `resolve` gives, per label. A label with no entry answers
-    /// `Unavailable`, which is also what an unconfigured vault says.
+    /// The answer to an addressed use, per label. Missing entries are unavailable.
     pub answers: HashMap<String, FakeReply>,
-    /// Bytes `material` hands out, per label, taking one entry per call so a
-    /// test can rotate a key under one grant. A label runs out of bytes and
-    /// then repeats the last one.
+    /// Released bytes per label, advancing once per matching request to exercise
+    /// key rotation. After the list runs out, repeat its last value.
     pub material: HashMap<String, Vec<Vec<u8>>>,
 }
 
@@ -39,9 +37,9 @@ pub enum FakeReply {
 
 struct FakeVaultState {
     script: FakeVaultScript,
-    /// One line per `resolve`, in call order.
+    /// One label per addressed use, in call order.
     resolves: Vec<String>,
-    /// One line per `material`, in call order.
+    /// One label per matching release, in call order.
     materials: Vec<String>,
     /// Material calls already served per label, so rotation advances.
     served: HashMap<String, usize>,
@@ -102,12 +100,12 @@ impl FakeVault {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Make `resolve` answer `label` with `resolution`.
+    /// Choose the reply for `label`.
     pub fn set_answer(&self, label: &str, answer: FakeReply) {
         self.lock().script.answers.insert(label.to_string(), answer);
     }
 
-    /// The bytes `material` hands out for `label`, in call order.
+    /// The bytes released for `label`, in call order.
     pub fn set_material(&self, label: &str, values: Vec<Vec<u8>>) {
         self.lock()
             .script
@@ -115,17 +113,17 @@ impl FakeVault {
             .insert(label.to_string(), values);
     }
 
-    /// The labels `material` was asked about, in order.
+    /// Labels that reached material release, in order.
     pub fn materials(&self) -> Vec<String> {
         self.lock().materials.clone()
     }
 
-    /// How many times `resolve` was called.
+    /// How many addressed uses were asked for.
     pub fn use_calls(&self) -> u64 {
         self.resolve_count.load(Ordering::SeqCst)
     }
 
-    /// How many times `material` was called.
+    /// How many matching requests reached material release.
     pub fn material_calls(&self) -> u64 {
         self.material_count.load(Ordering::SeqCst)
     }
@@ -161,8 +159,7 @@ impl FakeVault {
             return None;
         }
         let index = {
-            // Rotation advances per label, so a second request under the same
-            // grant can see different bytes.
+            // Repeated requests may receive rotated bytes even with the same rule.
             let served = state.served.entry(label.to_string()).or_insert(0);
             let index = (*served).min(count - 1);
             *served += 1;

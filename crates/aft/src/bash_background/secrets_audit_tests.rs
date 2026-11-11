@@ -657,7 +657,35 @@ fn audit_live_vault_key_never_reaches_task_logs_previews_or_status() {
         "audit_live_vault_key_never_reaches_task_logs_previews_or_status",
         || {
             use crate::secret::transport::fake::{FakeClaustrum, Record, NONCE};
-            use crate::secret::{ApiKeyTarget, SubcSecretVault, UseAnswer};
+            use crate::secret::{
+                ConsentOutcome, SecretConsentRequest, SecretConsentTransport, SubcSecretVault,
+            };
+            struct Phone {
+                cards: std::sync::mpsc::Sender<SecretConsentRequest>,
+                answer: Mutex<std::sync::mpsc::Receiver<ConsentOutcome>>,
+            }
+            impl SecretConsentTransport for Phone {
+                fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+                    self.hold(request)
+                }
+                fn hold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+                    self.cards.send(request.clone()).unwrap();
+                    self.answer
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap_or(ConsentOutcome::Expired)
+                }
+                fn withhold(&self, _: &SecretConsentRequest) -> ConsentOutcome {
+                    ConsentOutcome::Expired
+                }
+            }
+            let (cards, received_card) = std::sync::mpsc::channel();
+            let (answer, answered) = std::sync::mpsc::channel();
+            crate::secret::consent::install_transport(Some(Arc::new(Phone {
+                cards,
+                answer: Mutex::new(answered),
+            })));
             let f = Fixture::new();
             f.echo_key.store(true, Ordering::SeqCst);
             let daemon = FakeClaustrum::start();
@@ -678,25 +706,33 @@ fn audit_live_vault_key_never_reaches_task_logs_previews_or_status() {
                 },
             );
             let vault = Arc::new(SubcSecretVault::new(Arc::new(transport)));
-            let scope = crate::secret::SecretScope::from_stamp(&stamp("worker"));
-            let target = ApiKeyTarget {
-                scheme: "https".into(),
-                host: "localhost".into(),
-                port: Some(443),
-                path: "/api".into(),
-            };
-            let UseAnswer::ApprovalRequired(pending) = vault.use_secret(&scope, "test", &target)
-            else {
-                panic!("prime the phone approval");
-            };
+            let curl = f.curl().replace("--max-time 2", "--max-time 20");
+            let command = format!("{curl}; printf '\\n'; {curl} >&2");
+            let response = f.launch_with_vault(vault, &command, false, json!({}));
+            let id = f.task(&response);
+            let pending = received_card
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the real request files its card");
+            assert_eq!(
+                pending.scope,
+                crate::secret::SecretScope::from_stamp(&stamp("worker"))
+            );
+            assert!(
+                f.seen.lock().unwrap().is_empty(),
+                "approval holds the request before upstream dispatch"
+            );
+            let status_request: RawRequest = serde_json::from_value(json!({"id":"waiting-vault-status", "command":"bash_status", "session_id":"secret-bash", "params":{"task_id":id}})).unwrap();
+            let waiting = crate::commands::bash_status::handle(&status_request, &f.ctx);
+            let waiting_json = serde_json::to_string(&waiting).unwrap();
+            assert!(waiting.success, "{waiting:?}");
+            assert!(waiting_json.contains("secret test: waiting for approval on the phone for localhost (requests wait up to 10 minutes)"));
+            assert!(!waiting_json.contains(std::str::from_utf8(KEY).unwrap()));
             daemon
                 .state
                 .lock()
                 .unwrap()
                 .approve(&pending.statement_b64url);
-            let command = format!("{}; printf '\\n'; {} >&2", f.curl(), f.curl());
-            let response = f.launch_with_vault(vault, &command, false, json!({}));
-            let id = f.task(&response);
+            answer.send(ConsentOutcome::Answered).unwrap();
             f.wait_terminal(&id);
             let snapshot = f
                 .ctx
@@ -739,7 +775,7 @@ fn audit_live_vault_key_never_reaches_task_logs_previews_or_status() {
             assert_eq!(
                 daemon.state.lock().unwrap().calls,
                 3,
-                "priming ask and one release per real request"
+                "one approval ask and one release per real request"
             );
             assert_eq!(daemon.state.lock().unwrap().connections, 1);
         },

@@ -648,7 +648,10 @@ fn secret_bash_real_plan_precedence_and_untrusted_request_scope() {
     let reply = crate::subc::with_secret_identity_for_test(root.path(), stamp("head"), || {
         crate::commands::bash::handle(&req, &ctx)
     });
-    assert_eq!(code(&reply), Some("secrets_unavailable"));
+    assert!(
+        reply.success,
+        "an eligible launch does not ask an unavailable vault: {reply:?}"
+    );
     for key in PROXY_KEYS.iter().chain(REMOVE_KEYS.iter()) {
         let mut conflict = req.clone();
         conflict.params["params"]["env"] = json!({*key: "conflict"});
