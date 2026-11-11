@@ -1610,9 +1610,10 @@ fn configure_warnings_canonicalize_biome_directories_not_each_file() {
     );
 }
 
-/// Run directly on macOS with AFT_CONFIGURE_WARNING_MEASURE_ROOT pointing at
-/// a checkout. CPU time covers the complete warning pass, not test setup.
-#[cfg(all(test, target_os = "macos"))]
+/// Run directly on Unix with AFT_CONFIGURE_WARNING_MEASURE_ROOT pointing at
+/// a checkout. CPU time covers the complete warning pass, including path-call
+/// tracing, but not test setup.
+#[cfg(all(test, unix))]
 #[test]
 #[ignore = "manual configure-warning CPU measurement"]
 fn configure_warnings_cpu_measurement() {
@@ -1642,18 +1643,21 @@ fn configure_warnings_cpu_measurement() {
         tx,
         session_id: None,
     };
+    crate::inspect::job::CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
     let cpu = cpu_seconds();
     let wall = Instant::now();
     work.run(|_| {});
     let cpu = cpu_seconds() - cpu;
     let wall = wall.elapsed().as_secs_f64();
+    let canonicalizations = crate::inspect::job::CANONICALIZE_CALLS
+        .with(|calls| calls.borrow_mut().take().unwrap().len());
     let warnings = rx
         .try_recv()
         .expect("the warning pass publishes")
         .1
         .warnings;
     eprintln!(
-        "configure-warnings CPU={cpu:.6}s wall={wall:.6}s warnings={}",
+        "configure-warnings CPU={cpu:.6}s wall={wall:.6}s canonicalizations={canonicalizations} warnings={}",
         warnings.len()
     );
 }
