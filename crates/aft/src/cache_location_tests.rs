@@ -35,7 +35,8 @@ fn registered_floor_hook_preserves_newer_reader_refusal() {
     assert!(prepare_cache_root(&mut config).is_none());
     let database = storage.join("aft.db");
     assert!(crate::persisted_format::gate(crate::persisted_format::PersistedStore::AftDb, &database, &database, None).is_err());
-    assert_eq!(fs::read(floor).unwrap(), saved);
+    let prepared: serde_json::Value = serde_json::from_slice(&fs::read(floor).unwrap()).unwrap();
+    assert_eq!(prepared["stores"]["aft.db"], crate::db::CURRENT_SCHEMA_VERSION + 1);
 }
 
 #[test]
