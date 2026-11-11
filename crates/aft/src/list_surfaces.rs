@@ -1340,6 +1340,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "SNIPPET_LINE_MAX_CHARS",
         reason: "incremental implementation of the existing per-line text window, with exactly the same ellipsis and truncation marker; bounds retained characters, not result rows",
     },
+    ExclusionEntry {
+        file: "data_layer/surfaces.rs",
+        enclosing_item: "disclose_index_gaps",
+        location_or_primitive: "INDEX_GAP_PREVIEW",
+        reason: "coverage-gap preview, not a findings page; skipped_folders counts every relevant unreadable folder and skipped_folders_omitted counts names beyond the preview",
+    },
 ];
 
 /// Look up a surface by command, mode, and list id.

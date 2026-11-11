@@ -112,6 +112,9 @@ pub struct PathRecord {
 /// Which content each path of a checkout held at one moment.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CheckoutState {
+    /// Relative folders the walk could not read, with their OS error text.
+    /// A rescan retries them rather than treating their absence as complete.
+    skipped_directories: Arc<std::collections::BTreeMap<Vec<u8>, String>>,
     /// The Git tree and index the state was built from, when the checkout
     /// is in Git. Opaque to the store; compared byte for byte.
     pub git: Vec<u8>,
@@ -170,6 +173,7 @@ impl CheckoutState {
             return Err(StateError::TooLong);
         }
         Ok(Self {
+            skipped_directories: Arc::default(),
             git,
             conversion,
             root: Vec::new(),
@@ -189,10 +193,27 @@ impl CheckoutState {
         self
     }
 
-    /// This state recording the root folder `from` records.
+    /// This state recording the root folder and walk gaps `from` records.
     #[must_use]
     pub fn with_root_of(mut self, from: &Self) -> Self {
         self.root.clone_from(&from.root);
+        self.skipped_directories = Arc::clone(&from.skipped_directories);
+        self
+    }
+
+    /// Folders the scan could not read, in relative path order.
+    #[must_use]
+    pub fn skipped_directories(&self) -> &std::collections::BTreeMap<Vec<u8>, String> {
+        &self.skipped_directories
+    }
+
+    /// Replaces the walk's coverage gaps after a full or partial scan.
+    #[must_use]
+    pub fn with_skipped_directories(
+        mut self,
+        skipped: std::collections::BTreeMap<Vec<u8>, String>,
+    ) -> Self {
+        self.skipped_directories = Arc::new(skipped);
         self
     }
 
@@ -400,6 +421,13 @@ impl CheckoutState {
                 None => out.byte(0),
             }
         }
+        if format >= 4 {
+            out.usize(self.skipped_directories.len());
+            for (path, reason) in self.skipped_directories.iter() {
+                out.blob(path);
+                out.str(reason);
+            }
+        }
         out.finish()
     }
 
@@ -425,8 +453,8 @@ impl CheckoutState {
                 supported: u16::from(STATE_FORMAT),
             });
         }
-        // Format 2 is format 3 without the root folder.
-        if format != STATE_FORMAT && format != 2 {
+        // Format 2 has no root folder; format 3 has no walk gaps.
+        if !matches!(format, 2..=STATE_FORMAT) {
             return Err(RecordError::Invalid("unknown checkout state format"));
         }
         let git = input.blob().map_err(invalid)?.to_vec();
@@ -440,7 +468,7 @@ impl CheckoutState {
                 .try_into()
                 .map_err(|_| RecordError::Invalid("conversion digest length"))?,
         );
-        let root = if format == STATE_FORMAT {
+        let root = if format >= 3 {
             let root = input.blob().map_err(invalid)?.to_vec();
             if std::str::from_utf8(&root).is_err() {
                 return Err(RecordError::Invalid("root folder is not UTF-8"));
@@ -542,8 +570,18 @@ impl CheckoutState {
             }
             _ => return Err(RecordError::Invalid("fragment section flag")),
         }
+        let mut skipped_directories = std::collections::BTreeMap::new();
+        if format >= 4 {
+            let count = input.count_of(2).map_err(invalid)?;
+            for _ in 0..count {
+                let path = input.blob().map_err(invalid)?.to_vec();
+                let reason = input.str().map_err(invalid)?.to_string();
+                skipped_directories.insert(path, reason);
+            }
+        }
         input.finish().map_err(invalid)?;
         Ok(Self {
+            skipped_directories: Arc::new(skipped_directories),
             git,
             conversion,
             root,
@@ -562,7 +600,7 @@ impl CheckoutState {
 /// flag 2: old readers deliberately treat that flag as unusable and rebuild,
 /// rather than refusing the whole family on rollback. The record envelope
 /// and the rest of the state layout are unchanged.
-const STATE_FORMAT: u8 = 3;
+const STATE_FORMAT: u8 = 4;
 
 /// How much of a state record [`newer_state_format`] reads to find the
 /// payload's format byte: the record header and the payload's string table,
@@ -647,6 +685,7 @@ crate::heap_bytes_of_fields!(PathRecord {
     language,
 });
 crate::heap_bytes_of_fields!(CheckoutState {
+    skipped_directories,
     git,
     conversion,
     root,
@@ -730,6 +769,29 @@ mod tests {
             CheckoutState::decode(&rootless.encode()).unwrap().root(),
             None
         );
+    }
+
+    #[test]
+    fn skipped_folders_survive_encoding_and_rebuilding_and_legacy_states_decode() {
+        let state = CheckoutState::new(Vec::new(), Digest128::of(b""), vec![record("a", "a")])
+            .unwrap()
+            .with_root(Path::new("/work"))
+            .with_skipped_directories(
+                [(
+                    b"locked".to_vec(),
+                    "permission denied (os error 13)".to_string(),
+                )]
+                .into(),
+            );
+        let decoded = CheckoutState::decode(&state.encode()).unwrap();
+        assert_eq!(decoded, state);
+        let rebuilt = CheckoutState::new(Vec::new(), state.conversion, Vec::new())
+            .unwrap()
+            .with_root_of(&state);
+        assert_eq!(rebuilt.skipped_directories(), state.skipped_directories());
+        let legacy = CheckoutState::decode(&state.encode_as(3)).unwrap();
+        assert_eq!(legacy.root(), state.root());
+        assert!(legacy.skipped_directories().is_empty());
     }
 
     #[test]

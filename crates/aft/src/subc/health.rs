@@ -2003,6 +2003,7 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
                 )
             })
         && root["data_store"]["failure"].is_null()
+        && root["data_store"]["skipped_folders"].as_u64().unwrap_or(0) == 0
         && root["suspended_domains"]
             .as_array()
             .is_none_or(Vec::is_empty)
@@ -2094,6 +2095,19 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
     for field in ["project_root", "root_id", "standing_entry"] {
         if let Some(Value::String(path)) = row.get_mut(field) {
             *path = abbreviated_health_path(path);
+        }
+    }
+    if let (Some(root_path), Some(count)) = (
+        row.get("project_root").and_then(Value::as_str),
+        row.get("data_store")
+            .and_then(|store| store["skipped_folders"].as_u64()),
+    ) {
+        if count > 0 {
+            let note = crate::data_layer::surfaces::skipped_folder_health_note(
+                Path::new(root_path),
+                count as usize,
+            );
+            row["data_store"]["skipped_folder_note"] = Value::String(note);
         }
     }
     if let Some(Value::String(refusal)) = row.get_mut("standing_refusal") {
@@ -5010,6 +5024,8 @@ mod tests {
         failure: Option<(&'static str, bool)>,
     ) -> crate::data_layer::surfaces::DataStoreHealth {
         crate::data_layer::surfaces::DataStoreHealth {
+            skipped_folders: 0,
+            skipped_folder_note: None,
             reason,
             error: None,
             pending_edits: 0,
@@ -5023,6 +5039,31 @@ mod tests {
                 },
             ),
         }
+    }
+
+    #[test]
+    fn data_store_unreadable_folders_are_informational_and_keep_budgeted_identity() {
+        let mut store = data_store_health(None, None);
+        store.skipped_folders = 2;
+        let root_path = format!("/work/{}/project", "long/".repeat(100));
+        store.skipped_folder_note = Some(crate::data_layer::surfaces::skipped_folder_health_note(
+            Path::new(&root_path),
+            2,
+        ));
+        assert_eq!(data_store_failure_reason(&store), None);
+        let failed = DataStoreFailedRoots::collect([(root_path.as_str(), &store)]);
+        let state = root_health_rollup_state(0, 0, 1, None);
+        assert_eq!(with_data_store_failures(state.clone(), &failed), state);
+        let mut root = json!({"project_root": root_path, "data_store": store});
+        assert!(abbreviate_health_root(&mut root));
+        assert_eq!(root["data_store"]["skipped_folders"], 2);
+        assert_eq!(
+            root["data_store"]["skipped_folder_note"],
+            format!(
+                "{}: index skipped 2 unreadable folders",
+                abbreviated_health_path(&root_path)
+            )
+        );
     }
 
     #[test]

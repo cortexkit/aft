@@ -660,6 +660,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             response.data["text"] = serde_json::json!(format!("{line}\n\n{output}"));
         }
     }
+    disclose_skipped_folders(req, ctx, &mut response);
     response
 }
 
@@ -667,11 +668,26 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 /// must still run the bounded exact/lexical scan while the indexes warm.
 pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
-    handle_semantic_search_with_disk_fallback(
+    let mut response = handle_semantic_search_with_disk_fallback(
         req,
         ctx,
         config.indexes.trigram || config.indexes.semantic,
-    )
+    );
+    disclose_skipped_folders(req, ctx, &mut response);
+    response
+}
+
+fn disclose_skipped_folders(req: &RawRequest, ctx: &AppContext, response: &mut Response) {
+    let Some(root) = ctx.config().project_root.clone() else {
+        return;
+    };
+    let scope = req
+        .params
+        .get("path")
+        .and_then(Value::as_str)
+        .map_or_else(|| root.clone(), |path| root.join(path));
+    let scope = std::fs::canonicalize(&scope).unwrap_or(scope);
+    crate::data_layer::surfaces::disclose_index_gaps(ctx, &[scope], response);
 }
 
 thread_local! {

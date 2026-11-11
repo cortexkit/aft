@@ -1235,9 +1235,12 @@ impl Checkout {
         )
         .map_err(|error| DataError::Scan(error.to_string()))?;
         let changed = changed_members(&current, &scanned.state);
+        let mut retry = changed.iter().cloned().collect::<BTreeSet<_>>();
+        retry.extend(current.skipped_directories().keys().cloned());
+        retry.extend(scanned.state.skipped_directories().keys().cloned());
         // Recording scans each path again under the same rules, so a change
         // recorded meanwhile is taken from the disk once more, not lost.
-        self.record_paths(&changed)?;
+        self.record_paths(&retry.into_iter().collect::<Vec<_>>())?;
         Ok(changed.len())
     }
 

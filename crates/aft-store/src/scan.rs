@@ -181,9 +181,11 @@ pub fn scan(
     previous: Option<&CheckoutState>,
     sink: &dyn ContentSink,
 ) -> Result<Scan, ScanError> {
-    let (records, mut counters) = walk_records(root, policy, previous, None, sink)?;
+    let (records, skipped, mut counters) = walk_records(root, policy, previous, None, sink)?;
     counters.files = records.len();
-    let state = CheckoutState::new(Vec::new(), Digest128::of(b""), records)?.with_root(root);
+    let state = CheckoutState::new(Vec::new(), Digest128::of(b""), records)?
+        .with_root(root)
+        .with_skipped_directories(skipped);
     Ok(Scan { state, counters })
 }
 
@@ -217,13 +219,18 @@ pub fn scan_paths(
     sink: &dyn ContentSink,
 ) -> Result<PathScan, ScanError> {
     let restrict = Arc::new(Restrict::new(paths));
-    let (walked, mut counters) = walk_records(
+    let (walked, mut skipped, mut counters) = walk_records(
         root,
         policy,
         Some(previous),
         Some(Arc::clone(&restrict)),
         sink,
     )?;
+    for (path, reason) in previous.skipped_directories() {
+        if !restrict.covers(path) {
+            skipped.insert(path.clone(), reason.clone());
+        }
+    }
     let mut records = previous
         .paths()
         .iter()
@@ -255,8 +262,9 @@ pub fn scan_paths(
     drop(walked_by_path);
     records.extend(walked);
     counters.files = records.len();
-    let state =
-        CheckoutState::new(previous.git.clone(), previous.conversion, records)?.with_root(root);
+    let state = CheckoutState::new(previous.git.clone(), previous.conversion, records)?
+        .with_root(root)
+        .with_skipped_directories(skipped);
     Ok(PathScan {
         state,
         changed: changed.into_iter().collect(),
@@ -324,13 +332,23 @@ impl Restrict {
 
 /// Walks `root` under the scan's rules, limited to `restrict` when given,
 /// and records every member it reaches.
+type WalkRecords = (
+    Vec<PathRecord>,
+    std::collections::BTreeMap<Vec<u8>, String>,
+    ScanCounters,
+);
+
 fn walk_records(
     root: &Path,
     policy: &ScanPolicy,
     previous: Option<&CheckoutState>,
     restrict: Option<Arc<Restrict>>,
     sink: &dyn ContentSink,
-) -> Result<(Vec<PathRecord>, ScanCounters), ScanError> {
+) -> Result<WalkRecords, ScanError> {
+    std::fs::read_dir(root).map_err(|source| ScanError::Walk {
+        path: root.to_path_buf(),
+        source,
+    })?;
     let common_dir = git_common_dir(root);
     let mut builder = WalkBuilder::new(root);
     builder
@@ -382,6 +400,7 @@ fn walk_records(
     });
 
     let records = Mutex::new(Vec::new());
+    let skipped = Mutex::new(std::collections::BTreeMap::new());
     let walk_error = Mutex::new(None);
     let counters = Counters::default();
     builder.build_parallel().run(|| {
@@ -389,13 +408,22 @@ fn walk_records(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    // A directory that cannot be listed is a hole in the
-                    // state, so the whole scan fails rather than silently
-                    // dropping its files.
+                    // Permission-denied folders are explicit coverage gaps.
+                    // Other walk errors still fail the scan.
                     if let Some(io) = error.io_error()
                         && io.kind() != io::ErrorKind::NotFound
                     {
                         let path = error_path(&error).unwrap_or_else(|| root.to_path_buf());
+                        if io.kind() == io::ErrorKind::PermissionDenied
+                            && path != root
+                            && let Ok(relative) = relative_bytes(root, &path)
+                        {
+                            skipped
+                                .lock()
+                                .expect("no panics while holding it")
+                                .insert(relative, io.to_string().to_lowercase());
+                            return WalkState::Continue;
+                        }
                         let mut slot = walk_error.lock().expect("no panics while holding it");
                         slot.get_or_insert(ScanError::Walk {
                             path,
@@ -440,7 +468,11 @@ fn walk_records(
         return Err(error);
     }
     let records = records.into_inner().expect("no panics while holding it");
-    Ok((records, counters.finish()))
+    Ok((
+        records,
+        skipped.into_inner().expect("no panics while holding it"),
+        counters.finish(),
+    ))
 }
 
 #[derive(Default)]
@@ -839,6 +871,72 @@ mod tests {
     /// One step of a path-scan test: what it changes on disk, the paths a
     /// watcher would report, and the paths whose record must change.
     type Step<'a> = (Box<dyn Fn() + 'a>, Vec<&'a str>, Vec<&'a str>);
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn walk_skips_unreadable_folders_and_retries_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("hidden.txt"), "needle hidden\n").unwrap();
+        std::fs::write(root.join("open.txt"), "needle open\n").unwrap();
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let restore = Restore(locked.clone());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&locked)
+                .err()
+                .expect("run without DAC override privileges")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let sink = Collect::default();
+        let policy = ScanPolicy::default();
+        let first = scan(root, &policy, None, &sink).unwrap().state;
+        assert_eq!(paths(&first), vec!["open.txt"]);
+        assert_eq!(first.skipped_directories().len(), 1);
+        assert_eq!(
+            first.skipped_directories()[b"locked".as_slice()],
+            "permission denied (os error 13)"
+        );
+        let partial = scan_paths(root, &policy, &first, &[b"open.txt".to_vec()], &sink)
+            .unwrap()
+            .state;
+        assert_eq!(partial.skipped_directories(), first.skipped_directories());
+        let retried = scan_paths(root, &policy, &partial, &[b"locked".to_vec()], &sink)
+            .unwrap()
+            .state;
+        assert_eq!(retried.skipped_directories(), first.skipped_directories());
+        drop(restore);
+        let recovered = scan_paths(root, &policy, &retried, &[b"locked".to_vec()], &sink)
+            .unwrap()
+            .state;
+        assert!(recovered.skipped_directories().is_empty());
+        assert_eq!(paths(&recovered), vec!["locked/hidden.txt", "open.txt"]);
+        assert!(
+            scan(root, &policy, Some(&first), &sink)
+                .unwrap()
+                .state
+                .skipped_directories()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn walk_a_vanished_root_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        assert!(
+            matches!(scan(&missing, &ScanPolicy::default(), None, &Collect::default()), Err(ScanError::Walk { source, .. }) if source.kind() == io::ErrorKind::NotFound)
+        );
+    }
 
     /// The members of `state` with what identifies each, for comparing a
     /// path scan with a full scan.

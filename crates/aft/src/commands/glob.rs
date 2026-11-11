@@ -439,7 +439,11 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    Response::success(&req.id, body)
+    let mut response = Response::success(&req.id, body);
+    if source == "index" {
+        crate::data_layer::surfaces::disclose_index_gaps(ctx, &search_roots, &mut response);
+    }
+    response
 }
 
 fn named_ignored_root(

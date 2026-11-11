@@ -150,6 +150,8 @@ impl PlaneReport {
 /// surface.
 #[derive(Clone, Debug)]
 pub(crate) struct DataStoreReport {
+    pub(crate) skipped_folders: usize,
+    pub(crate) skipped_folder_note: Option<String>,
     pub(crate) text: PlaneReport,
     pub(crate) callgraph: PlaneReport,
     /// Paths of the checkout as last published; `None` before anything is.
@@ -182,6 +184,8 @@ pub(crate) struct DataStoreReport {
 impl DataStoreReport {
     fn both(plane: PlaneReport) -> Self {
         Self {
+            skipped_folders: 0,
+            skipped_folder_note: None,
             text: plane.clone(),
             callgraph: plane,
             files: None,
@@ -221,6 +225,8 @@ impl DataStoreReport {
             .into_iter()
             .find(|plane| plane.reason.is_some());
         DataStoreHealth {
+            skipped_folders: self.skipped_folders,
+            skipped_folder_note: self.skipped_folder_note.clone(),
             reason: plane_reason.and_then(|plane| plane.reason),
             error: plane_reason.and_then(|plane| plane.error.clone()),
             pending_edits: self.pending_edits,
@@ -238,6 +244,9 @@ impl DataStoreReport {
 /// The `data_store` object of status and of each root's health.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DataStoreHealth {
+    pub skipped_folders: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_folder_note: Option<String>,
     /// Why a plane is off or unavailable; see [`reason`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -337,6 +346,107 @@ pub fn text_plane_ready(ctx: &AppContext) -> Option<bool> {
     }
 }
 
+const INDEX_GAP_NOTE: &str =
+    "(Index skipped {folders}; results may miss files in them:\n{paths}\n)";
+const INDEX_GAP_PREVIEW: usize = 3;
+
+fn folder_count(count: usize) -> String {
+    format!(
+        "{count} unreadable folder{}",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+pub(crate) fn skipped_folder_health_note(root: &Path, count: usize) -> String {
+    format!("{}: index skipped {}", root.display(), folder_count(count))
+}
+
+/// Report only gaps intersecting the request's scope, under its read policy.
+/// The preview is bounded independently of the number of skipped folders.
+pub(crate) fn disclose_index_gaps(
+    ctx: &AppContext,
+    roots: &[PathBuf],
+    response: &mut crate::protocol::Response,
+) {
+    if !response.success {
+        return;
+    }
+    let views = if let Some(session) = super::parent_session::session_for(ctx) {
+        let children = session.children();
+        let children = children
+            .iter()
+            .filter(|child| {
+                roots
+                    .iter()
+                    .any(|scope| child.root.starts_with(scope) || scope.starts_with(&child.root))
+            })
+            .map(|child| child.root.as_path())
+            .collect::<Vec<_>>();
+        super::parent::text_planes(ctx, session.root(), &children)
+            .into_iter()
+            .filter_map(|plane| match plane {
+                super::parent::Plane::Ready(view) => Some((*view).clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else if let Some(DataCheckoutProbe::Bound(checkout)) = ctx.probe_data_checkout() {
+        checkout.view().into_iter().collect::<Vec<_>>()
+    } else {
+        return;
+    };
+    let fence = crate::context::confinement::capture();
+    let mut count = 0;
+    let mut gaps = Vec::new();
+    let mut lines = Vec::new();
+    for view in &views {
+        for (path, reason) in view.current_state().skipped_directories() {
+            let path = view.root().join(String::from_utf8_lossy(path).as_ref());
+            if !roots
+                .iter()
+                .any(|scope| path.starts_with(scope) || scope.starts_with(&path))
+                || !fence.admits_walk_entry(&path)
+            {
+                continue;
+            }
+            count += 1;
+            if gaps.len() < INDEX_GAP_PREVIEW {
+                lines.push(format!("{}: {reason}", path.display()));
+                gaps.push(
+                serde_json::json!({"kind": "unreadable_folder", "path": path, "reason": reason}),
+            );
+            }
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    let omitted = count - gaps.len();
+    if omitted > 0 {
+        lines.push(format!("and {omitted} more"));
+    }
+    let note = INDEX_GAP_NOTE
+        .replace("{folders}", &folder_count(count))
+        .replace("{paths}", &lines.join("\n"));
+    let body = &mut response.data;
+    body["complete"] = Value::Bool(false);
+    body["skipped_folders"] = serde_json::json!(count);
+    body["skipped_folders_omitted"] = serde_json::json!(omitted);
+    let existing = body
+        .as_object_mut()
+        .expect("response body")
+        .entry("gaps")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(existing) = existing.as_array_mut() {
+        existing.extend(gaps);
+    }
+    let text = body["text"].as_str().unwrap_or_default();
+    body["text"] = Value::String(if text.is_empty() {
+        note
+    } else {
+        format!("{note}\n\n{text}")
+    });
+}
+
 pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
     Some(match ctx.probe_data_checkout()? {
         DataCheckoutProbe::NotBound => {
@@ -408,6 +518,15 @@ pub(crate) fn report_of(checkout: &DataCheckout) -> DataStoreReport {
         Some(checkout.checkout().family_dir().to_path_buf()),
     );
     report.meaning = meaning_report(checkout);
+    report.skipped_folders = checkout
+        .view()
+        .map_or(0, |view| view.current_state().skipped_directories().len());
+    if report.skipped_folders > 0 {
+        report.skipped_folder_note = Some(skipped_folder_health_note(
+            checkout.checkout().root(),
+            report.skipped_folders,
+        ));
+    }
     report
 }
 
@@ -714,6 +833,8 @@ fn report_from(
         PlaneReport::of(READY)
     };
     DataStoreReport {
+        skipped_folders: 0,
+        skipped_folder_note: None,
         text,
         callgraph,
         files,
@@ -1345,6 +1466,112 @@ mod tests {
     /// A configured context over a small Rust crate, with its own storage.
     fn context(root: &Path, storage: &Path) -> AppContext {
         context_with(root, storage, |_| {})
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_folders_publish_with_health_and_query_gaps_then_rescan_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = context_with(&root, storage.path(), |config| {
+            config.indexes.semantic = false
+        });
+        write(&root, "open.txt", "needle open\n");
+        write(&root, "locked/hidden.txt", "needle hidden\n");
+        let locked = root.join("locked");
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let restore = Restore(locked.clone());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&locked)
+                .err()
+                .expect("run without DAC override privileges")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        serve_text_index_for_test(&ctx);
+        let health = report(&ctx).unwrap().health();
+        assert_eq!(health.skipped_folders, 1);
+        assert_eq!(
+            health.skipped_folder_note,
+            Some(format!(
+                "{}: index skipped 1 unreadable folder",
+                root.display()
+            ))
+        );
+        assert_eq!(health.reason, None);
+        assert!(health.failure.is_none());
+        let request = |command: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("gap-{command}"), "command": command,
+                "pattern": if command == "glob" { "**/*.txt" } else { "needle" },
+                "query": "needle",
+            }))
+            .unwrap()
+        };
+        let grep = crate::commands::grep::handle_grep(&request("grep"), &ctx);
+        let glob = crate::commands::glob::handle_glob(&request("glob"), &ctx);
+        let search = crate::commands::semantic_search::handle_semantic_search(
+            &request("semantic_search"),
+            &ctx,
+        );
+        let expected = format!("(Index skipped 1 unreadable folder; results may miss files in them:\n{}: permission denied (os error 13)\n)", locked.display());
+        for response in [&grep, &glob, &search] {
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["complete"], false, "{:?}", response.data);
+            assert_eq!(response.data["skipped_folders"], 1);
+            assert_eq!(
+                response.data["gaps"][0],
+                serde_json::json!({"kind":"unreadable_folder", "path": locked, "reason":"permission denied (os error 13)"})
+            );
+            assert_eq!(
+                response.data["text"]
+                    .as_str()
+                    .unwrap()
+                    .split("\n\n")
+                    .next()
+                    .unwrap(),
+                expected
+            );
+            assert!(response.data["text"].as_str().unwrap().contains("open.txt"));
+        }
+        assert_eq!(grep.data["index_status"], "Ready");
+        let mut scoped = crate::protocol::Response::success(
+            "scope",
+            serde_json::json!({"text":"unchanged", "complete":true}),
+        );
+        disclose_index_gaps(&ctx, &[root.join("src")], &mut scoped);
+        assert_eq!(scoped.data["text"], "unchanged");
+        drop(restore);
+        ctx.data_checkout().unwrap().checkout().rescan().unwrap();
+        let recovered = crate::commands::grep::handle_grep(&request("grep"), &ctx);
+        assert!(recovered.success, "{:?}", recovered.data);
+        assert!(
+            recovered.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("hidden.txt"),
+            "{:?}",
+            recovered.data
+        );
+        assert!(recovered.data["skipped_folders"].is_null());
+        assert_eq!(report(&ctx).unwrap().health().skipped_folders, 0);
+    }
+
+    #[test]
+    fn unreadable_folder_notes_use_the_approved_plural_wording() {
+        assert_eq!(
+            skipped_folder_health_note(Path::new("/work"), 2),
+            "/work: index skipped 2 unreadable folders"
+        );
+        assert_eq!(INDEX_GAP_NOTE.replace("{folders}", &folder_count(2)).replace("{paths}", "a: permission denied\nb: operation not permitted"), "(Index skipped 2 unreadable folders; results may miss files in them:\na: permission denied\nb: operation not permitted\n)");
     }
 
     /// As [`context`], with `edit` applied to its configuration.
