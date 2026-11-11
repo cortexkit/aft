@@ -99,10 +99,11 @@ impl RequestSecrets {
             .cloned()
             .collect()
     }
+    #[cfg(unix)]
     pub(crate) fn activity(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.active.clone()
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_clock(mut self, clock: Option<Arc<dyn ApprovalClock>>) -> Self {
         if let Some(clock) = clock {
             self.clock = clock;
@@ -175,6 +176,7 @@ impl RequestSecrets {
 
     /// The caller supplies a fresh verified connection before a releasing retry.
     /// No mutex is held while asking the vault or waiting for a person's answer.
+    #[cfg(all(test, unix))]
     pub(crate) async fn use_in_request<F, Fut>(
         &self,
         label: &str,

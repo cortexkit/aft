@@ -1465,6 +1465,7 @@ fn secret_hop(
     for (label, answer) in eligible.iter().zip(answers) {
         let answer = match answer {
             crate::subc::LaunchDecision::Proceed(answer) => answer,
+            #[cfg(test)]
             crate::subc::LaunchDecision::Pending(pending) => {
                 let _ = refused(held, "missing_material");
                 return Err(UrlFetchError::secret(

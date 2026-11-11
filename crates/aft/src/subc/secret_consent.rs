@@ -27,10 +27,10 @@
 use super::{carrier_read_only, flow_read, tool_provider, RouteIdentity};
 use crate::secret::eligibility::{alfonso_of_kind, COMMAND_SCOPE_KINDS};
 #[cfg(test)]
-use crate::secret::withhold_consent;
+use crate::secret::{file_consent, withhold_consent};
 use crate::secret::{
-    file_consent, CallScopes, ConsentOutcome, EligibilityForm, Ineligibility, LabelOutcome,
-    SecretConsentRequest, SecretScope,
+    CallScopes, ConsentOutcome, EligibilityForm, Ineligibility, LabelOutcome, SecretConsentRequest,
+    SecretScope,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -437,6 +437,7 @@ fn bound_codemode(
 /// A launch outcome that may end the call with `access_pending`, carrying
 /// the ask it needs answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct PendingSecretConsent {
     /// The ask filed under the authorization scope.
     pub(super) request: SecretConsentRequest,
@@ -446,6 +447,7 @@ pub(crate) struct PendingSecretConsent {
     pub(crate) message: &'static str,
 }
 
+#[cfg(test)]
 pub(super) enum SecretConsentFiling {
     Answered,
     Pending(PendingSecretConsent),
@@ -457,6 +459,7 @@ pub(super) enum SecretConsentFiling {
 /// A filing failure or expired card ends the call with `access_unavailable`;
 /// a pending card holds it with `access_pending`. An answer only tells the
 /// launch to ask the vault again before starting any child, job or proxy.
+#[cfg(test)]
 pub(super) fn file_secret_consent(
     identity: &RouteIdentity,
     scopes: &CallScopes,
@@ -502,6 +505,7 @@ pub(super) fn withdraw_secret_consent(pending: &PendingSecretConsent) {
 #[derive(Debug)]
 pub(crate) enum LaunchDecision {
     Proceed(crate::secret::UseAnswer),
+    #[cfg(test)]
     Pending(PendingSecretConsent),
     Refuse(LabelOutcome),
 }
@@ -579,22 +583,6 @@ thread_local! {
     /// `None` while no call is being dispatched on this thread.
     static CURRENT_SCOPES: std::cell::RefCell<Option<Result<(CallScopes, EligibilityForm), Ineligibility>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// Use only the dispatcher-installed identity, never tool arguments.
-#[cfg(test)]
-pub(crate) fn use_current_secret_label(
-    vault: &dyn crate::secret::SecretVault,
-    label: &str,
-    target: &crate::secret::ApiKeyTarget,
-) -> LaunchDecision {
-    CURRENT_IDENTITY.with(|slot| match slot.borrow().as_ref() {
-        Some(identity) => use_label_for_fetch(identity, vault, label, target),
-        None => LaunchDecision::Refuse(crate::secret::refuse_ineligible(
-            label,
-            Ineligibility::NoScope,
-        )),
-    })
 }
 
 pub(crate) fn current_secret_consent_context() -> Option<(std::path::PathBuf, String)> {
@@ -846,7 +834,7 @@ pub(crate) fn use_current_secret_labels(
                                 );
                                 let dummy =
                                     [(label.clone(), b"proxy-planning-value-0000".to_vec())];
-                                // An already-covered request returns its location only with the release, so its location-dependent refusal can occur only afterwards.
+                                // Without a pending card, the vault reveals a deposit location only when releasing its key, so location-dependent refusals can follow that release.
                                 if secret_rules::location::evaluate_request_with_connect(
                                     &view,
                                     &authority,

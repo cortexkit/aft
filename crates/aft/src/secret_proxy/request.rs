@@ -276,8 +276,8 @@ async fn prepare_and_send(
                 let (location, material) = released.into_parts();
                 let location = secret_rules::location::parse_vault_location(&location)
                     .ok_or_else(|| label.clone())?;
-                // The vault returns the location with the released material,
-                // so a location-dependent refusal cannot precede that release.
+                // Without a pending card, the vault reveals a deposit location only
+                // when releasing its key, so location-dependent refusals can follow that release.
                 let rule = secret_rules::location::LabelRule {
                     label: label.clone(),
                     host: addressed.host.clone(),

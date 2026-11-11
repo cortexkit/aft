@@ -99,7 +99,8 @@ pub trait SecretConsentTransport: Send + Sync + 'static {
         None
     }
     /// Await one shared card. Production observes cancellation while awaiting
-    /// the Cingulate consent service and withdraws before releasing its scoped transport.
+    /// the Cingulate consent service and withdraws while the route is still
+    /// bound to the card's authorization scope.
     fn wait(
         self: std::sync::Arc<Self>,
         request: SecretConsentRequest,

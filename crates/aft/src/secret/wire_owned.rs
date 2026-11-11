@@ -121,7 +121,9 @@ impl ResultBody {
                 class: error.class.as_ref().map(|class| class.as_str().into()),
             }));
         }
-        let text = |v: &Option<Text>| v.as_ref().map(Text::as_str).ok_or_else(malformed);
+        fn text(v: &Option<Text>) -> Result<&str, ReplyError> {
+            v.as_ref().map(Text::as_str).ok_or_else(malformed)
+        }
         let reply = match text(&self.status)? {
             "released" => match text(&self.kind)? {
                 "agent_api_key" if count == 4 => {
