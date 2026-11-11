@@ -201,6 +201,7 @@ mod rayon_thread_tests {
 }
 
 fn main() {
+    aft::commands::policy_environment::register();
     // The subc daemon hands a supervised module its launch nonce through an
     // inherited pipe (and, for now, an environment copy). Take it before
     // anything else can run: this is the only moment the process has one
@@ -4708,5 +4709,17 @@ mod config_pin_tests {
         assert_eq!(*seen.lock().unwrap(), vec![false, false]);
         // The next request sees the publication.
         assert!(ctx.config().restrict_to_project_root);
+    }
+}
+
+#[cfg(test)]
+mod policy_environment_startup_tests {
+    #[test]
+    fn both_entry_modes_register_policy_environment_before_config_or_context() {
+        let source = include_str!("main.rs");
+        let main = source.split_once("fn main() {").unwrap().1;
+        let first_statement = main.trim_start().lines().next().unwrap();
+        assert_eq!(first_statement, "aft::commands::policy_environment::register();",
+            "both NDJSON and subc enter through main: register before parsing the mode or resolving config");
     }
 }

@@ -7,6 +7,7 @@ pub mod bash;
 
 /// Install typed rewrite targets before serving bash in a process or embedder.
 pub fn register_shell_handlers() {
+    policy_environment::register();
     crate::bash_rewrite::dispatch::register(crate::bash_rewrite::dispatch::RewriteDispatch {
         read: read::handle_read,
         grep: grep::handle_grep,
@@ -44,6 +45,7 @@ pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
 pub mod extract_function;
+pub mod policy_environment;
 pub(crate) use crate::file_read_exact;
 pub(crate) mod github_comments;
 pub mod glob;

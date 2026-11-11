@@ -1,6 +1,10 @@
 //! Route-local filesystem authority. Resolution belongs to the caller; every
 //! resolved target is decided here before a tool mutates it or a shell launches.
 
+pub(crate) mod directory_scope;
+pub(crate) use directory_scope::directory_scope;
+pub(crate) mod environment;
+
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -758,21 +762,7 @@ impl AccessPolicy {
             }
         }
         let mut read_allow = roots.clone();
-        let mut managed_paths = Vec::new();
-        if config.github.shim {
-            managed_paths.push(crate::pinned_executable::shims_dir(&storage));
-            if let Ok(binary) = crate::agent_child_env::shim_binary(config) {
-                managed_paths.push(binary);
-            }
-        }
-        if config.git.co_author != "off" {
-            managed_paths.push(crate::agent_child_env::managed_git_hooks_dir(storage));
-            if config.git.co_author == "auto" {
-                if let Ok(binary) = crate::agent_child_env::shim_binary(config) {
-                    managed_paths.push(binary);
-                }
-            }
-        }
+        let managed_paths = environment::managed_read_paths(config, storage);
         read_allow.extend(
             managed_paths
                 .into_iter()
@@ -983,7 +973,7 @@ impl AccessPolicy {
         owned_artifact: bool,
         contains: fn(&Path, &Path) -> bool,
     ) -> Option<PolicyFloor> {
-        if crate::bash_background::registry::is_task_environment(path) {
+        if crate::task_temp_reads::is_task_environment(path) {
             return Some(PolicyFloor {
                 path: path.to_path_buf(),
                 rule: FloorRule::TaskEnvironment,
