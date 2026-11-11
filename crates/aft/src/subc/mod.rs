@@ -14637,10 +14637,13 @@ pub(crate) mod test_support {
             .bash_background()
             .spawn(
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
-                if case == "completion" {
-                    "while [ ! -f exit-ready ]; do sleep 0.05; done; echo terminal"
+                &if case == "completion" {
+                    format!(
+                        "{}; echo terminal",
+                        crate::test_gate::gate("exit-ready", "sleep 0.05")
+                    )
                 } else {
-                    "sleep 30"
+                    "sleep 30".to_string()
                 },
                 "polled-bash-session".into(),
                 dir.path().to_path_buf(),

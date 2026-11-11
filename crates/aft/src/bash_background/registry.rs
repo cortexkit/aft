@@ -20386,7 +20386,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let release = dir.path().join("release");
         let original = BgTaskRegistry::default();
-        let task_id = original.spawn_with_shell(SpawnPlan::Unsandboxed, &format!("sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true", release.display()), crate::bash_background::BashShell::Bash, PathBuf::from("/bin/bash"), "session".into(), dir.path().into(), HashMap::new(), crate::bash_background::HardKill::After(Duration::from_secs(30)), None, dir.path().into(), 10, true, false, Some(dir.path().into())).unwrap();
+        let task_id = original
+            .spawn_with_shell(
+                SpawnPlan::Unsandboxed,
+                &format!(
+                    "sh -c '{}; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true",
+                    crate::test_gate::gate(&format!("\"{}\"", release.display()), "sleep 0.01")
+                ),
+                crate::bash_background::BashShell::Bash,
+                PathBuf::from("/bin/bash"),
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                dir.path().into(),
+                10,
+                true,
+                false,
+                Some(dir.path().into()),
+            )
+            .unwrap();
         let paths = original.task(&task_id).unwrap().paths.clone();
         original.detach();
         drop(original);
@@ -26067,7 +26087,7 @@ mod tests {
             // deferred by bash, the sleep is born after the signal, and it
             // outlives the trapped shell as a survivor this TERM-only kill
             // then waits for.
-            "trap 'echo trapped > trapped; while [ ! -e release ]; do sleep 0.01; done; exit 0' TERM\nsleep 30 & sleeper=$!\necho ready > ready\nwait $sleeper\nwhile :; do sleep 30 & wait $!; done\n").unwrap();
+            format!("trap 'echo trapped > trapped; {}; exit 0' TERM\nsleep 30 & sleeper=$!\necho ready > ready\nwait $sleeper\nwhile :; do sleep 30 & wait $!; done\n", crate::test_gate::gate_exists("release", "sleep 0.01"))).unwrap();
         let task_id =
             spawn_unsandboxed_for_kill_test(&registry, dir.path(), "bash child.sh & wait");
         let ready_deadline = Instant::now() + Duration::from_secs(10);
@@ -26325,7 +26345,10 @@ mod tests {
         let task_id = registry
             .spawn_pty(
                 SpawnPlan::Unsandboxed,
-                "/bin/sh -c 'while [ ! -f ready ]; do sleep 0.01; done; printf done'",
+                &format!(
+                    "/bin/sh -c '{}; printf done'",
+                    crate::test_gate::gate("ready", "sleep 0.01")
+                ),
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
@@ -26387,7 +26410,10 @@ mod tests {
         let task_id = registry
             .spawn_pty(
                 SpawnPlan::Unsandboxed,
-                "/bin/sh -c 'while [ ! -f ready ]; do sleep 0.01; done'",
+                &format!(
+                    "/bin/sh -c '{}'",
+                    crate::test_gate::gate("ready", "sleep 0.01")
+                ),
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
@@ -26746,8 +26772,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let finish = dir.path().join("finish");
             let command = format!(
-                "while [ ! -f '{}' ]; do sleep 0.01; done; exit {code}",
-                finish.display()
+                "{}; exit {code}",
+                crate::test_gate::gate(&format!("'{}'", finish.display()), "sleep 0.01")
             );
             let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), &command);
             let task = registry.task_for_test(&task_id).unwrap();
@@ -27002,9 +27028,9 @@ mod tests {
         let quote =
             |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
         let command = format!(
-            "printf 'spawn\\n' >> {}; while [ ! -e {} ]; do sleep 0.05; done",
+            "printf 'spawn\\n' >> {}; {}",
             quote(&spawn_marker),
-            quote(&stop_marker)
+            crate::test_gate::gate_exists(&quote(&stop_marker), "sleep 0.05")
         );
 
         let original = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
@@ -29406,7 +29432,10 @@ mod tests {
         let go = storage.join("go");
         // The line break keeps LATE's line within the watch preview's mask cap;
         // LATE still arrives in the fourth 64 KiB scan chunk.
-        let command = format!("while [ ! -e '{}' ]; do sleep 0.01; done; head -c 196608 /dev/zero; printf '\\nLATE'; sleep 30", go.display());
+        let command = format!(
+            "{}; head -c 196608 /dev/zero; printf '\\nLATE'; sleep 30",
+            crate::test_gate::gate_exists(&format!("'{}'", go.display()), "sleep 0.01")
+        );
         let id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,

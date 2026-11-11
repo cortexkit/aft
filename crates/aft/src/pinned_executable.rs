@@ -797,11 +797,12 @@ mod tests {
                 ),
             ]);
             let command = format!(
-                ": > ready-{mode}; while [ ! -f release ]; do /bin/sleep 0.02; done; \
+                ": > ready-{mode}; {}; \
                  printf '%s\\n' \"$(command -v gh)\" \"$AFT_GH_SHIMS_DIR\" \"$AFT_GH_SHIM_BINARY\" \"$PATH\" > resolved-{mode}; \
                  gh --list pinned_executable_cleanup_preserves_live_owner > output-{mode} 2>&1; \
                  shim_status=$?; \"$AFT_GH_SHIM_BINARY\" --list pinned_executable_cleanup_preserves_live_owner > binary-output-{mode} 2>&1; \
-                 printf '%s:%s' \"$shim_status\" \"$?\" > status-{mode}.tmp; /bin/mv status-{mode}.tmp status-{mode}"
+                 printf '%s:%s' \"$shim_status\" \"$?\" > status-{mode}.tmp; /bin/mv status-{mode}.tmp status-{mode}",
+                crate::test_gate::gate("release", "/bin/sleep 0.02")
             );
             let plan = if mode == "host" {
                 use crate::sandbox_spawn::{

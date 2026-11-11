@@ -220,8 +220,8 @@ fn foreground_command_promoted_at_cap_keeps_running_and_then_holds_a_slot() {
     let holders = fill_background_slots(&ctx);
     let release = project.path().join("release");
     let command = format!(
-        "while [ ! -e '{}' ]; do sleep 0.05; done; echo promoted-done",
-        release.display()
+        "{}; echo promoted-done",
+        crate::test_gate::gate_exists(&format!("'{}'", release.display()), "sleep 0.05")
     );
 
     let foreground_id = task_id(&launch(&ctx, "session-c", &command, false));

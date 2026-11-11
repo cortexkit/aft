@@ -862,7 +862,7 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
             config.sandbox.profile.worker = mode;
         });
         let gate = root.path().join(format!("go-{index}"));
-        let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
+        let command = format!("{}; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", crate::test_gate::gate(&format!("'{}'", gate.display()), "sleep 0.05"), vault.port, vault.port);
         let command = format!(
             "python3 '{}' {} '{}' || exit 71; printf 'memory-and-bundle-ok\\n' >&2; {command}",
             memory_probe.display(),

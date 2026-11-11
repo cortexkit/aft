@@ -283,8 +283,9 @@ fn audit_authorizing_head_end_stops_run_proxy() {
     isolated("audit_authorizing_head_end_stops_run_proxy", || {
         let f = Fixture::new();
         let command = format!(
-            "{}; : > first; while [ ! -f next ]; do sleep 0.05; done; {}; : > second; sleep 30",
+            "{}; : > first; {}; {}; : > second; sleep 30",
             f.curl(),
+            crate::test_gate::gate("next", "sleep 0.05"),
             f.curl()
         );
         let id = f.task(&f.launch(&command, true, json!({})));
@@ -417,7 +418,11 @@ fn audit_arm_failure_cleans_transferred_scratch() {
 fn audit_killing_revokes_before_term_grace() {
     isolated("audit_killing_revokes_before_term_grace", || {
         let f = Fixture::new();
-        let command = format!("trap ':' TERM; : > ready; while [ ! -f during-kill ]; do sleep 0.05; done; {}; : > term-request; while :; do sleep 0.05; done", f.curl());
+        let command = format!(
+            "trap ':' TERM; : > ready; {}; {}; : > term-request; while :; do sleep 0.05; done",
+            crate::test_gate::gate("during-kill", "sleep 0.05"),
+            f.curl()
+        );
         let id = f.task(&f.launch(&command, false, json!({})));
         f.wait_file("ready");
         let address = f
@@ -532,7 +537,11 @@ fn audit_timeout_removes_proxy() {
 
 fn completion_cleanup(timeout: bool) {
     let f = Fixture::new();
-    let command = format!("printf '%s' \"${{SSL_CERT_FILE%/*}}\" > scratch-path; {}; : > first; while [ ! -f finish ]; do sleep 0.05; done", f.curl());
+    let command = format!(
+        "printf '%s' \"${{SSL_CERT_FILE%/*}}\" > scratch-path; {}; : > first; {}",
+        f.curl(),
+        crate::test_gate::gate("finish", "sleep 0.05")
+    );
     let extra = if timeout {
         json!({"timeout":2500})
     } else {
@@ -569,8 +578,9 @@ fn audit_epoch_rebind_revokes_secret_not_ordinary_job() {
         let f = Fixture::new();
         let id = f.task(&f.launch(
             &format!(
-                "{}; : > first; while [ ! -f next ]; do sleep 0.05; done; {}; : > second; sleep 30",
+                "{}; : > first; {}; {}; : > second; sleep 30",
                 f.curl(),
+                crate::test_gate::gate("next", "sleep 0.05"),
                 f.curl()
             ),
             true,

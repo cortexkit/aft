@@ -69,11 +69,17 @@ async fn launch(fixture: &Fixture, background: bool, refuse: bool) -> crate::pro
                     crate::bash_background::spawn(
                         "start-view-launch",
                         &session,
-                        "printf '%s' \"$AFT_GH_SPEECH_START_VIEW\" > seen-view; while [ ! -e release-view ]; do sleep 0.02; done",
+                        &format!(
+                            "printf '%s' \"$AFT_GH_SPEECH_START_VIEW\" > seen-view; {}",
+                            crate::test_gate::gate_exists("release-view", "sleep 0.02")
+                        ),
                         crate::bash_background::BashShell::Bash,
                         crate::bash_background::registry::resolve_posix_shell(),
                         Some(project),
-                        Some(HashMap::from([("AFT_GH_SHIM_STATE_DIR".into(), state.display().to_string())])),
+                        Some(HashMap::from([(
+                            "AFT_GH_SHIM_STATE_DIR".into(),
+                            state.display().to_string(),
+                        )])),
                         crate::bash_background::HardKill::After(Duration::from_secs(30)),
                         &ctx,
                         background,
@@ -90,7 +96,9 @@ async fn launch(fixture: &Fixture, background: bool, refuse: bool) -> crate::pro
                 })
             })
         })
-    }).await.unwrap()
+    })
+    .await
+    .unwrap()
 }
 
 async fn view_seen(fixture: &Fixture) -> PathBuf {

@@ -91,8 +91,8 @@ fn exercise_profile(
     };
     if kind == "promoted" {
         command.push_str(&format!(
-            "; while ! test -f '{}'; do sleep .02; done",
-            release.display()
+            "; {}",
+            crate::test_gate::gate(&format!("'{}'", release.display()), "sleep .02")
         ));
     }
     let mut request =

@@ -93,8 +93,11 @@ impl Fixture {
     /// A command that runs until [`Self::release`] is called with `name`.
     fn blocked_command(&self, name: &str) -> String {
         format!(
-            "while [ ! -f '{}' ]; do sleep 0.05; done; echo released",
-            self.release_path(name).display()
+            "{}; echo released",
+            crate::test_gate::gate(
+                &format!("'{}'", self.release_path(name).display()),
+                "sleep 0.05"
+            )
         )
     }
 

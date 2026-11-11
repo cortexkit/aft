@@ -296,8 +296,8 @@ fn bash_posix_spawn_zero_daemon_forks() {
             let release = dir.path().join(format!("release-{iteration}"));
             let command = if mode == "promoted" {
                 format!(
-                    "while [ ! -f '{}' ]; do sleep 0.01; done; printf spawn-ok",
-                    release.display()
+                    "{}; printf spawn-ok",
+                    crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.01")
                 )
             } else {
                 "printf spawn-ok".into()

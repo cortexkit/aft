@@ -1019,7 +1019,11 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
         let counter = dir.path().join("executions");
         let release = dir.path().join("release");
         let _release_on_failure = ReleaseOnDrop(release.clone());
-        let command = format!("printf x >> '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done; printf entrypoint-proof", counter.display(), release.display());
+        let command = format!(
+            "printf x >> '{}'; {}; printf entrypoint-proof",
+            counter.display(),
+            crate::test_gate::gate(&format!("'{}'", release.display()), "/bin/sleep 0.01")
+        );
         if entry == "deferred-wait" {
             crate::subc::test_support::assert_deferred_wait_entrypoint(&command, &release).await;
             assert_eq!(
@@ -1564,8 +1568,10 @@ async fn assert_new_remote_changed_files(fallback: bool) {
             storage.path().join("remote-output.txt").display()
         )
     };
-    let command =
-        format!("{write}; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done");
+    let command = format!(
+        "{write}; {}",
+        crate::test_gate::gate_exists("\"$CHANGED_FILES_RELEASE\"", "sleep 0.01")
+    );
     let task_id = {
         let _capture = crate::bash_changed_files::scope(Some(capture.clone()));
         ctx.bash_background()
@@ -6962,9 +6968,9 @@ async fn exec_remote_bash_double_restart_starts_local_fallback_once() {
     let release = dir.path().join("release");
     let _release_on_failure = ReleaseOnDrop(release.clone());
     let command = format!(
-        "printf x >> '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done",
+        "printf x >> '{}'; {}",
         counter.display(),
-        release.display()
+        crate::test_gate::gate(&format!("'{}'", release.display()), "/bin/sleep 0.01")
     );
     let (original, task_id, paths) =
         persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);
@@ -7091,8 +7097,8 @@ async fn exec_remote_bash_refusal_queue_wait_is_not_local_run_time() {
     let release = dir.path().join("release");
     let _release_on_failure = ReleaseOnDrop(release.clone());
     let command = format!(
-        "while [ ! -f '{}' ]; do /bin/sleep 0.01; done; printf budget-proof",
-        release.display()
+        "{}; printf budget-proof",
+        crate::test_gate::gate(&format!("'{}'", release.display()), "/bin/sleep 0.01")
     );
     let (original, task_id, paths) =
         persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);

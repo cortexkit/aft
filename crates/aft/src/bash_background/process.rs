@@ -1624,7 +1624,8 @@ mod tests {
         // the descendant.
         let script = format!(
             "sh -c \"trap '' TERM; echo \\$$ > '{pid}'; touch '{ready}'; sleep 30\" & \
-             while [ ! -f '{ready}' ]; do sleep 0.02; done; exit 0",
+             {}; exit 0",
+            crate::test_gate::gate(&format!("'{}'", ready.display()), "sleep 0.02"),
             pid = pidfile.display(),
             ready = ready.display(),
         );

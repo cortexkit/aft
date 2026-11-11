@@ -4732,7 +4732,7 @@ mod grant_path_tests {
             1052,
             Flags::new(false, Priority::Interactive, false),
             PROTOCOL_VERSION,
-            json!({"command": "echo hello; while [ ! -f release ]; do sleep 0.1; done", "wait": true}),
+            json!({"command": format!("echo hello; {}", crate::test_gate::gate("release", "sleep 0.1")), "wait": true}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
                 keepalive: None,
@@ -5247,9 +5247,12 @@ mod grant_path_tests {
         let marker_path = marker.to_string_lossy().replace('\\', "/");
         let release_path = release.to_string_lossy().replace('\\', "/");
         let command = if cfg!(windows) {
-            format!("Set-Content -Path '{marker_path}' -Value started; while (-not (Test-Path '{release_path}')) {{ Start-Sleep -Milliseconds 20 }}; Write-Output 'handoff-finished'")
+            format!("Set-Content -Path '{marker_path}' -Value started; {}; Write-Output 'handoff-finished'", crate::test_gate::powershell_gate(&release_path, 20))
         } else {
-            format!("printf started > '{marker_path}'; until [ -e '{release_path}' ]; do sleep 0.02; done; printf 'handoff-finished\\n'")
+            format!(
+                "printf started > '{marker_path}'; {}; printf 'handoff-finished\\n'",
+                crate::test_gate::gate_exists(&format!("'{release_path}'"), "sleep 0.02")
+            )
         };
         let session = "detach-log-session";
         let request = RawRequest {
@@ -6478,7 +6481,7 @@ mod grant_path_tests {
             let release = dir.path().join("release");
             let _release = DeferredWaitReleaseGuard(vec![release.clone()]);
             let call = start(&executor, &root, &ctx, local_bash_stub,
-                json!({"command":format!("until [ -e '{}' ]; do sleep 0.02; done", release.display()), "timeout":60000}), true).await;
+                json!({"command":crate::test_gate::gate_exists(&format!("'{}'", release.display()), "sleep 0.02"), "timeout":60000}), true).await;
             answer_from_loop(&call, &root, true).await;
             assert_eq!(
                 settled(&ctx, &call.task_id).await.status,
@@ -8479,8 +8482,8 @@ mod grant_path_tests {
         let (identity, cancel, run, _) = codemode_run_call(&root);
         let release = dir.path().join("release");
         let command = format!(
-            "while [ ! -f '{}' ]; do sleep 0.05; done; echo finished",
-            release.display()
+            "{}; echo finished",
+            crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.05")
         );
         let task_id = codemode_background_launch(
             &executor,
@@ -11234,15 +11237,11 @@ mod grant_path_tests {
             // Each command polls for its release file. Windows runs bash commands
             // through PowerShell, so the loop is written in its syntax there.
             #[cfg(windows)]
-            let command = format!(
-                "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}",
-                releases.0[index].display()
-            );
+            let command =
+                crate::test_gate::powershell_gate(&releases.0[index].display().to_string(), 10);
             #[cfg(not(windows))]
-            let command = format!(
-                "while [ ! -f '{}' ]; do sleep 0.01; done",
-                releases.0[index].display()
-            );
+            let command =
+                crate::test_gate::gate(&format!("'{}'", releases.0[index].display()), "sleep 0.01");
             let connection = PersistentCancelSignal::new();
             let route = PersistentCancelSignal::new();
             submit_deferred_bash(

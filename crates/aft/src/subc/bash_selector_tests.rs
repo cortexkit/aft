@@ -485,9 +485,9 @@ async fn cancelled_wait_names_its_task_once_and_delivers_its_completion_after_re
     let started = dir.path().join("started");
     let release = dir.path().join("release");
     let command = format!(
-        "touch '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; printf cancelled-call-done",
+        "touch '{}'; {}; printf cancelled-call-done",
         started.display(),
-        release.display()
+        crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.05")
     );
 
     let first = cancel_test_context(&root, &storage);

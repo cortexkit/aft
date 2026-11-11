@@ -53,8 +53,8 @@ fn gated_command(root: &Path) -> (String, PathBuf) {
     let release = root.join("release-shell");
     (
         format!(
-            "while [ ! -e '{}' ]; do sleep 0.01; done; printf running-result",
-            release.display()
+            "{}; printf running-result",
+            crate::test_gate::gate_exists(&format!("'{}'", release.display()), "sleep 0.01")
         ),
         release,
     )

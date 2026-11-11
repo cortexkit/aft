@@ -2656,7 +2656,7 @@ mod legacy_root_task_repair_tests {
         let mut command = Command::new("/bin/sh");
         command.args([
             "-c",
-            "printf before; while ! test -f \"$1\"; do sleep 0.02; done; printf after; printf error-after >&2; printf 37 > \"$2\"; exit 37",
+            &format!("printf before; {}; printf after; printf error-after >&2; printf 37 > \"$2\"; exit 37", crate::test_gate::gate("\"$1\"", "sleep 0.02")),
             "legacy-writer",
         ]);
         command.arg(&release).arg(&task.paths.exit);
