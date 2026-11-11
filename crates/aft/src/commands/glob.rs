@@ -166,14 +166,14 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         parent_gaps = answer.gaps;
         (
             answer.files,
-            false,
-            false,
-            "index",
+            answer.walk_truncated,
+            answer.walk_time_limit_reached,
+            if answer.walked { "fallback" } else { "index" },
             answer.entries_visited,
             Duration::ZERO,
             answer.scope_has_files,
             Duration::ZERO,
-            0,
+            answer.skipped_foreign_mounts,
         )
     } else if search_roots.len() == 1 {
         let discovery = match discover_glob_root(
@@ -398,7 +398,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
-    crate::data_layer::parent_session::attach_gaps(&mut body, parent_gaps);
+    crate::data_layer::parent_session::attach_search_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
     let rendered_count =

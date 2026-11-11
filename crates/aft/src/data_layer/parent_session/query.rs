@@ -103,6 +103,15 @@ impl Gaps {
 
 /// Marks `body` incomplete and lists `gaps` in its `gaps` field and text.
 pub(crate) fn attach_gaps(body: &mut Value, gaps: Vec<Value>) {
+    attach_gaps_in_order(body, gaps, false);
+}
+
+/// Search gaps precede the counts: an unsearched child is not a negative result.
+pub(crate) fn attach_search_gaps(body: &mut Value, gaps: Vec<Value>) {
+    attach_gaps_in_order(body, gaps, true);
+}
+
+fn attach_gaps_in_order(body: &mut Value, gaps: Vec<Value>, first: bool) {
     if gaps.is_empty() {
         return;
     }
@@ -130,9 +139,12 @@ pub(crate) fn attach_gaps(body: &mut Value, gaps: Vec<Value>) {
             }
         }
         if let Some(Value::String(text)) = object.get_mut("text") {
-            text.push_str(&format!(
-                "\n\n(Parent folder: not covered by this answer:\n{lines})"
-            ));
+            let note = format!("(Parent folder: not covered by this answer:\n{lines})");
+            if first {
+                *text = format!("{note}\n\n{text}");
+            } else {
+                text.push_str(&format!("\n\n{note}"));
+            }
         }
     }
 }
@@ -159,6 +171,7 @@ fn overlapping(session: &ParentSession, scope: &Path) -> Vec<Arc<Child>> {
 /// the index store, scoped to the part of the search root inside the child.
 enum ChildText {
     Data(crate::data_layer::tools::grep::ViewScope),
+    Loading,
 }
 
 impl ChildText {
@@ -167,6 +180,7 @@ impl ChildText {
         let _ = search_root;
         match self {
             Self::Data(scope) => scope.has_files(),
+            Self::Loading => true,
         }
     }
 
@@ -176,6 +190,7 @@ impl ChildText {
         let _ = search_root;
         match self {
             Self::Data(scope) => scope.has_files_matching(filters),
+            Self::Loading => unreachable!("loading children use the bounded walk"),
         }
     }
 
@@ -189,6 +204,7 @@ impl ChildText {
                 .candidates(pattern)
                 .map(Cow::Owned)
                 .map_err(|error| error.to_string()),
+            Self::Loading => unreachable!("loading children use the bounded walk"),
         }
     }
 
@@ -196,6 +212,7 @@ impl ChildText {
     fn listing(&self) -> Cow<'_, SearchIndexSnapshot> {
         match self {
             Self::Data(scope) => Cow::Owned(scope.listing()),
+            Self::Loading => unreachable!("loading children use the bounded walk"),
         }
     }
 }
@@ -236,6 +253,7 @@ fn child_texts(
                         crate::data_layer::tools::grep::ViewScope::of((*view).clone(), scope)?,
                     ))
                 }
+                Plane::Loading => Ok(ChildText::Loading),
                 plane => Err(plane.gap_reason("trigram")?),
             };
             Some((child, text))
@@ -248,7 +266,8 @@ fn child_texts(
 // ---------------------------------------------------------------------------
 
 /// The parent session's grep: every directory root is answered from the
-/// warm trigram snapshots of the children it overlaps. Explicit files and
+/// warm trigram snapshots of the children it overlaps, walking children whose
+/// indexes are still building. Explicit files and
 /// roots outside the parent folder keep the ordinary executor, which reads
 /// them directly. `None` when `ctx` is not a parent session.
 pub(crate) fn grep_fan_out(
@@ -296,6 +315,44 @@ pub(crate) fn grep_fan_out(
                     continue;
                 }
             };
+            if matches!(text, ChildText::Loading) {
+                let search_root = if search_root.starts_with(&child.root) {
+                    search_root
+                } else {
+                    &child.root
+                };
+                let mut counts = crate::grep_executor::ScopeFileCounts::default();
+                let result = crate::grep_executor::fallback_grep_counted(
+                    &project_root,
+                    search_root,
+                    &child.root,
+                    pattern,
+                    filters,
+                    max_results,
+                    IndexStatus::Building,
+                    params.path_exclusion,
+                    &mut counts,
+                    false,
+                    order,
+                );
+                if let Some(reason) = result.index_read_gaps.first() {
+                    gaps.child(&child, reason.clone());
+                } else if let Some(reason) = crate::commands::grep::walk_coverage_note(&result) {
+                    gaps.child(&child, reason);
+                } else if result.skipped_foreign_mounts > 0 {
+                    gaps.child(&child, format!(
+                        "(Fallback directory walk skipped {} foreign filesystem mount(s); results may be incomplete.)",
+                        result.skipped_foreign_mounts
+                    ));
+                }
+                scope_has_files |= counts.eligible > 0;
+                phases
+                    .walk_counts
+                    .get_or_insert_with(Default::default)
+                    .add(counts);
+                results.push(result);
+                continue;
+            }
             if text.has_files(search_root) {
                 sources.push((child, text));
             }
@@ -385,11 +442,16 @@ pub(crate) struct GlobFanOut {
     pub files: Vec<PathBuf>,
     pub scope_has_files: bool,
     pub entries_visited: usize,
+    pub walked: bool,
+    pub walk_truncated: bool,
+    pub walk_time_limit_reached: bool,
+    pub skipped_foreign_mounts: usize,
     pub gaps: Vec<Value>,
 }
 
 /// The parent session's glob: each root is answered from the warm trigram
-/// snapshots of the children it overlaps. `None` when `ctx` is not a parent
+/// snapshots of the children it overlaps, walking children whose indexes are
+/// still building. `None` when `ctx` is not a parent
 /// session.
 pub(crate) fn glob_fan_out(
     ctx: &AppContext,
@@ -401,6 +463,10 @@ pub(crate) fn glob_fan_out(
         files: Vec::new(),
         scope_has_files: false,
         entries_visited: 0,
+        walked: false,
+        walk_truncated: false,
+        walk_time_limit_reached: false,
+        skipped_foreign_mounts: 0,
         gaps: Vec::new(),
     };
     let mut gaps = Gaps::default();
@@ -423,6 +489,39 @@ pub(crate) fn glob_fan_out(
                     continue;
                 }
             };
+            if matches!(text, ChildText::Loading) {
+                let child_root = if search_root.starts_with(&child.root) {
+                    &search_root
+                } else {
+                    &child.root
+                };
+                let filters = crate::search_index::build_path_filters(&[pattern.to_string()], &[])
+                    .unwrap_or_default();
+                let outcome = crate::grep_executor::bounded_fallback_walk_files_for_target(
+                    &search_root,
+                    child_root,
+                    &filters,
+                    false,
+                );
+                if let Some(reason) = outcome.error {
+                    gaps.child(&child, reason);
+                } else if outcome.walk_truncated {
+                    gaps.child(&child, "(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)".into());
+                } else if outcome.skipped_foreign_mounts > 0 {
+                    gaps.child(&child, format!(
+                        "(Fallback directory walk skipped {} foreign filesystem mount(s); results may be incomplete.)",
+                        outcome.skipped_foreign_mounts
+                    ));
+                }
+                answer.walked = true;
+                answer.walk_truncated |= outcome.walk_truncated;
+                answer.walk_time_limit_reached |= outcome.walk_time_limit_reached;
+                answer.skipped_foreign_mounts += outcome.skipped_foreign_mounts;
+                answer.scope_has_files |= !outcome.files.is_empty();
+                answer.entries_visited += outcome.entries_visited;
+                answer.files.extend(outcome.files);
+                continue;
+            }
             let (files, scope_has_files, visited) =
                 text.listing().glob_profiled(pattern, &search_root, false);
             answer.scope_has_files |= scope_has_files;

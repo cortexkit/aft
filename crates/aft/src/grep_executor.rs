@@ -150,6 +150,8 @@ pub(crate) fn with_fallback_walk_sort_metadata_delay_for_test<R>(
 
 #[derive(Clone, Debug)]
 pub struct FallbackWalkOutcome {
+    /// The first traversal error, retained so an empty walk cannot prove absence.
+    pub error: Option<String>,
     pub files: Vec<PathBuf>,
     pub walk_truncated: bool,
     /// True only when the iterator stopped because its walk deadline expired.
@@ -221,8 +223,9 @@ impl ScopeFileCounts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct FallbackWalkProgress {
+    error: Option<String>,
     /// The limit that stopped the walk early; `None` when it reached every file.
     bound: Option<WalkBound>,
     skipped_foreign_mounts: usize,
@@ -1631,6 +1634,7 @@ pub(crate) fn source_first_fallback_walk_files(
         }
     }
     FallbackWalkOutcome {
+        error: None,
         files,
         walk_truncated,
         walk_time_limit_reached,
@@ -1691,6 +1695,7 @@ fn bounded_fallback_walk_files_with_limits_target(
         search_root,
         Some(deadline),
         FallbackWalkOutcome {
+            error: None,
             files: Vec::new(),
             walk_truncated: false,
             walk_time_limit_reached: false,
@@ -1741,6 +1746,7 @@ fn walk_files_unbounded(
         Some(filter_root),
     ) else {
         return FallbackWalkOutcome {
+            error: Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()),
             files: Vec::new(),
             walk_truncated: false,
             walk_time_limit_reached: false,
@@ -1758,6 +1764,7 @@ fn walk_files_unbounded(
     let mut walk_time_limit_reached = false;
     let mut entries_visited = 0usize;
     let mut walker = builder.build();
+    let mut error = None;
 
     loop {
         // Stop between entries; if `next` blocks, the caller can still take
@@ -1779,8 +1786,13 @@ fn walk_files_unbounded(
             walk_truncated = true;
             break;
         }
-        let Ok(entry) = entry else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(cause) => {
+                error.get_or_insert_with(|| cause.to_string());
+                progress.update(|snapshot| snapshot.error.clone_from(&error));
+                continue;
+            }
         };
         if !entry
             .file_type()
@@ -1811,6 +1823,7 @@ fn walk_files_unbounded(
         sort_walked_paths_by_mtime_desc(&mut files, filter_root);
     }
     FallbackWalkOutcome {
+        error,
         files,
         walk_truncated,
         walk_time_limit_reached,
@@ -1900,13 +1913,18 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         false,
         Some(filter_root),
     ) else {
-        return FallbackWalkProgress::default();
+        return FallbackWalkProgress {
+            error: Some(std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()),
+            ..Default::default()
+        };
     };
     let mut walker = builder.build();
+    let mut error = None;
 
     loop {
         if snapshot.stopped() {
             return FallbackWalkProgress {
+                error,
                 bound: Some(WalkBound::TimeBudget),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
                 counts,
@@ -1920,11 +1938,17 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
             state.1.counts = counts;
             state.1.skipped_foreign_mounts = skipped_foreign_mounts.load(Ordering::Relaxed);
         });
-        let Ok(entry) = entry else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(cause) => {
+                error.get_or_insert_with(|| cause.to_string());
+                snapshot.update(|state| state.1.error.clone_from(&error));
+                continue;
+            }
         };
         if cancellation.is_some_and(|token| token.cancel_requested_before_commit()) {
             return FallbackWalkProgress {
+                error,
                 bound: Some(WalkBound::Cancelled),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
                 counts,
@@ -1932,6 +1956,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         }
         if started.elapsed() >= budget {
             return FallbackWalkProgress {
+                error,
                 bound: Some(WalkBound::TimeBudget),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
                 counts,
@@ -1956,6 +1981,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
             files_seen += 1;
             if files_seen > max_files {
                 return FallbackWalkProgress {
+                    error,
                     bound: Some(WalkBound::FileLimit(max_files)),
                     skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
                     counts,
@@ -1967,6 +1993,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         }
     }
     FallbackWalkProgress {
+        error,
         bound: None,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         counts,
@@ -2032,7 +2059,7 @@ fn fallback_grep(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fallback_grep_counted(
+pub(crate) fn fallback_grep_counted(
     project_root: &Path,
     search_root: &Path,
     filter_root: &Path,
@@ -2348,7 +2375,7 @@ fn fallback_grep_with_limits_counted(
 
     GrepResult {
         index_sources_unavailable: false,
-        index_read_gaps: Vec::new(),
+        index_read_gaps: progress.error.into_iter().collect(),
         total_matches: total_matches.load(Ordering::Relaxed),
         matches,
         files_searched,
