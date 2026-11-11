@@ -5533,12 +5533,23 @@ where
     // Arm the existing promised-wake marker before the first turn too: a lock
     // taken before the first select must be just as recoverable as a later one.
     dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
+    let notice_executor = executor.clone();
     held_task_recovery::start(
         shared_app.clone(),
         executor.clone(),
         push_senders.clone(),
         storage_dir.to_path_buf(),
-        |_| {},
+        move |replayed| {
+            if replayed.is_empty() {
+                return;
+            }
+            // Each recovered task lives in its own project's registry, and an
+            // offer against a registry that doesn't hold the task does nothing,
+            // so every actor can be offered the whole set.
+            for actor in notice_executor.actor_contexts() {
+                runner_notices::offer_replayed(actor.bash_background().clone(), replayed);
+            }
+        },
     );
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
         dispatch_path_metrics.mark_frame_loop_step("LedgerEdge::detach_shells", "", 0);
