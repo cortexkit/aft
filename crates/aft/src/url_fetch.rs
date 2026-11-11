@@ -982,7 +982,12 @@ fn fetch_with_secrets(
     let mut deadline = FetchDeadline::for_current_call();
     let approved = Arc::new(ApprovedHosts::default());
     let progress = Arc::new(ConnectProgress::default());
-    let client = build_client(&options, Arc::clone(&approved), Arc::clone(&progress))?;
+    let client = build_client(
+        &options,
+        Arc::clone(&approved),
+        Arc::clone(&progress),
+        false,
+    )?;
     let mut held = HeldKeys::default();
     let mut hop = 0;
     let response = loop {
@@ -999,7 +1004,11 @@ fn fetch_with_secrets(
         let sent = send_request(
             &client,
             outbound.as_ref().unwrap_or(&current),
-            Some((current.as_str(), &held)),
+            Some(SecretSend {
+                shown: current.as_str(),
+                held: &held,
+                released: outbound.is_some(),
+            }),
             &deadline,
             &progress,
         );
@@ -1464,6 +1473,7 @@ fn secret_hop(
     );
     for (label, answer) in eligible.iter().zip(answers) {
         let answer = match answer {
+            crate::subc::LaunchDecision::InvalidPlan(reason) => return Err(refused(held, reason)),
             crate::subc::LaunchDecision::Proceed(answer) => answer,
             #[cfg(test)]
             crate::subc::LaunchDecision::Pending(pending) => {
@@ -1959,7 +1969,7 @@ fn fetch_with_redirects(
     approved: Arc<ApprovedHosts>,
 ) -> Result<HttpResponse, UrlFetchError> {
     let progress = Arc::new(ConnectProgress::default());
-    let client = build_client(options, Arc::clone(&approved), Arc::clone(&progress))?;
+    let client = build_client(options, Arc::clone(&approved), Arc::clone(&progress), true)?;
     let mut current_url = start_url.clone();
 
     for redirect_count in 0..=MAX_REDIRECTS {
@@ -2020,6 +2030,13 @@ fn send_with_transient_retries(
     send_request(client, target, None, deadline, progress)
 }
 
+#[derive(Clone, Copy)]
+struct SecretSend<'a> {
+    shown: &'a str,
+    held: &'a HeldKeys,
+    released: bool,
+}
+
 /// [`send_with_transient_retries`] for one request. With `secret` set, the
 /// request belongs to a placeholder fetch: every message names the given
 /// placeholder URL instead of `target`, a failure is reported through
@@ -2028,7 +2045,7 @@ fn send_with_transient_retries(
 fn send_request(
     client: &Client,
     target: &Url,
-    secret: Option<(&str, &HeldKeys)>,
+    secret: Option<SecretSend<'_>>,
     deadline: &FetchDeadline,
     progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
@@ -2049,12 +2066,12 @@ fn send_request(
 fn send_request_attempts(
     client: &Client,
     target: &Url,
-    secret: Option<(&str, &HeldKeys)>,
+    secret: Option<SecretSend<'_>>,
     deadline: &FetchDeadline,
     progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
-    let named = secret.map_or(target.as_str(), |(shown, _)| shown);
-    let held = secret.map(|(_, held)| held);
+    let named = secret.map_or(target.as_str(), |secret| secret.shown);
+    let held = secret.map(|secret| secret.held);
     let mut attempt = 0;
     loop {
         let remaining = deadline.remaining();
@@ -2084,7 +2101,7 @@ fn send_request_attempts(
         // only spend the rest of the deadline the same way.
         // One released key authorizes one send attempt, even if the peer received
         // the credential and reset before its response reached this process.
-        let retryable = secret.is_none()
+        let retryable = !secret.is_some_and(|secret| secret.released)
             && is_transient_reqwest_error(&error)
             && phase != Some(FetchPhase::Headers);
         let backoff = TRANSIENT_RETRY_BACKOFFS_MS
@@ -2185,6 +2202,7 @@ fn build_client(
     options: &UrlFetchOptions,
     approved: Arc<ApprovedHosts>,
     progress: Arc<ConnectProgress>,
+    automatic_replays: bool,
 ) -> Result<Client, UrlFetchError> {
     let resolver = GuardedResolver {
         approved,
@@ -2200,6 +2218,11 @@ fn build_client(
             delay: options.connect_delay,
         })
         .dns_resolver(Arc::new(resolver));
+    let builder = if automatic_replays {
+        builder
+    } else {
+        builder.retry(reqwest::retry::never())
+    };
 
     let tls_config = match &options.tls_config {
         Some(config) => config.clone(),

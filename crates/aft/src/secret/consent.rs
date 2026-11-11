@@ -238,6 +238,14 @@ pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcom
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cards.retain(|_, card| {
+            if card.waiters.load(std::sync::atomic::Ordering::Acquire) == 0
+                && matches!(
+                    &*card.outcome.borrow(),
+                    Some(ConsentOutcome::Unavailable { .. })
+                )
+            {
+                return false;
+            }
             card.created.elapsed() < std::time::Duration::from_secs(600)
                 || card.expires > super::vault::now_ms()
                 || card.waiters.load(std::sync::atomic::Ordering::Acquire) > 0

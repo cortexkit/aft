@@ -1249,6 +1249,7 @@ struct HeldCardEndpoint {
     awaits: std::sync::atomic::AtomicUsize,
     allow_after: usize,
     fail_withdraw: bool,
+    fail_await: bool,
 }
 impl super::super::consent::ConsentTransport for HeldCardEndpoint {
     fn call(
@@ -1262,10 +1263,16 @@ impl super::super::consent::ConsentTransport for HeldCardEndpoint {
         );
         let allow = self.allow_after > 0 && attempt + 1 >= self.allow_after;
         let fail_withdraw = self.fail_withdraw;
+        let fail_await = self.fail_await;
         Box::pin(async move {
             match call.method {
                 "consent.request" => Ok(serde_json::json!({"elicitation_id":"el_held"})),
                 "consent.await" => {
+                    if fail_await {
+                        return Err(super::super::consent::ConsentError::Unavailable(
+                            "offline".into(),
+                        ));
+                    }
                     tokio::time::sleep(Duration::from_millis(
                         call.params["timeout_ms"].as_u64().unwrap(),
                     ))
@@ -1391,4 +1398,53 @@ async fn production_secret_card_cancellation_withdraws_once_on_its_original_scop
         assert_eq!(withdraw[0].scope, calls[0].scope);
         assert_eq!(withdraw[0].params["elicitation_id"], "el_held");
     }
+}
+
+#[tokio::test]
+async fn a_failed_secret_card_await_withdraws_before_returning_unavailable_and_cancelled_filing_does_not_start(
+) {
+    let endpoint = Arc::new(HeldCardEndpoint {
+        fail_await: true,
+        ..Default::default()
+    });
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let answer = transport
+        .wait(
+            held_request(crate::secret::vault::now_ms() + 600_000),
+            Default::default(),
+        )
+        .await;
+    assert!(matches!(answer, ConsentOutcome::Unavailable { .. }));
+    let calls = endpoint.calls.lock().unwrap();
+    assert_eq!(
+        calls.iter().map(|call| call.method).collect::<Vec<_>>(),
+        vec!["consent.request", "consent.await", "consent.withdraw"]
+    );
+    assert!(calls.iter().all(|call| call.scope == calls[0].scope));
+    drop(calls);
+    let endpoint = Arc::new(HeldCardEndpoint::default());
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let cancel = crate::secret::consent::Cancellation::default();
+    cancel.cancel();
+    assert_eq!(
+        transport
+            .wait(
+                held_request(crate::secret::vault::now_ms() + 600_000),
+                cancel
+            )
+            .await,
+        ConsentOutcome::Expired
+    );
+    assert!(
+        endpoint.calls.lock().unwrap().is_empty(),
+        "a worker scheduled after its last request disappeared must not file a card"
+    );
 }

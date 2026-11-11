@@ -40,6 +40,7 @@ impl RequestBudget {
 pub(crate) enum UseError {
     NotApproved,
     Unavailable,
+    InvalidPlan(&'static str),
 }
 
 pub(crate) struct RequestSecrets {

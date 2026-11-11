@@ -268,7 +268,7 @@ async fn prepare_and_send(
             Err(crate::secret::requests::UseError::NotApproved) => {
                 return Ok(not_approved(label, &authority.host, state))
             }
-            Err(crate::secret::requests::UseError::Unavailable) => return Err(label.clone()),
+            Err(_) => return Err(label.clone()),
         };
         match answer {
             crate::secret::UseAnswer::NotFound => continue,

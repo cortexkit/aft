@@ -780,6 +780,41 @@ mod url_tests {
             assert!(!result.text().contains(std::str::from_utf8(KEY).unwrap()));
         }
 
+        #[test]
+        fn literal_not_found_fetch_keeps_ordinary_transport_retries_without_a_release() {
+            let fixture = fixture(Default::default());
+            let count = Arc::new(AtomicUsize::new(0));
+            let seen = count.clone();
+            let server = serve(&fixture.tls, move |_| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    None
+                } else {
+                    Some(markdown(b"# Literal\n"))
+                }
+            });
+            let vault = FakeVault::new();
+            vault.set_answer("test", FakeReply::NotFound);
+            let req = request(
+                "outline",
+                &format!("https://api.secret.test/document.md?key={PLACEHOLDER}"),
+                serde_json::json!({}),
+            );
+            let result = run(
+                &fixture,
+                &vault,
+                &[("api.secret.test", server.addr)],
+                &req,
+                true,
+            );
+            assert!(result.response.success, "{}", result.text());
+            assert_eq!(server.heads().len(), 2);
+            assert_eq!(vault.material_calls(), 0);
+            assert!(server
+                .targets()
+                .iter()
+                .all(|target| target.contains("ck-secret:test")));
+        }
+
         fn stamp() -> subc_protocol::scope::ScopeStamp {
             serde_json::from_value(serde_json::json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-fetch","kind":"head","scope_epoch":1,"owner_authorized":true})).unwrap()
         }

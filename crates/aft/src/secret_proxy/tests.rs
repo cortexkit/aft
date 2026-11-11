@@ -788,14 +788,18 @@ async fn proxy_h1_h2_locations_keepalive_authority_and_scanned_set() {
             server.seen.lock().last().unwrap()["headers"]["authorization"],
             format!("Bearer {MARKER}")
         );
+        assert!(
+            !proxy.state.headers_sensitive.load(Ordering::Acquire),
+            "an empty edit list must not report a sensitive-header substitution"
+        );
         assert_eq!(client.request("/approved/two", json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}), "{}")["status"], 200);
         let response = client.command(json!({"op":"request", "authority":"other.invalid", "path":"/approved", "headers":{"authorization":format!("Bearer {MARKER}")}}));
         assert_eq!(response["status"], 403, "{response}");
     }
     assert_eq!(
         vault.calls.load(Ordering::SeqCst),
-        10,
-        "only labels present in each request are asked"
+        12,
+        "every present label is asked, including the two NotFound targets"
     );
     proxy.stop();
     assert!(proxy.state.patterns.lock().is_empty());
@@ -920,8 +924,8 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
     }
     assert_eq!(
         vault.calls.load(Ordering::SeqCst),
-        4,
-        "the vault names the location before its structure can be validated"
+        2,
+        "duplicate JSON structure refuses before asking; the valid JSON request reveals each location with its release"
     );
     assert!(server.seen.lock().is_empty());
     *vault.refused_label.lock() = Some("json".into());

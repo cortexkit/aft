@@ -414,7 +414,7 @@ async fn live_vault_concurrent_requests_share_one_card_and_once_queues_cards_ser
             phone.phone.state.lock().unwrap().requests.len(),
             if once { 2 } else { 1 }
         );
-        assert_eq!(daemon.state.lock().unwrap().calls, if once { 4 } else { 3 });
+        assert_eq!(daemon.state.lock().unwrap().calls, if once { 5 } else { 4 });
         assert_eq!(daemon.state.lock().unwrap().connections, 1);
     }
 }
@@ -891,6 +891,7 @@ async fn a_fetch_and_proxy_request_share_one_once_card_then_raise_exactly_one_su
     assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
     phone.phone.decide(&daemon, 1, ConsentOutcome::AnsweredOnce);
     phone.phone.card(2).await;
+    condition(|| server.seen.lock().len() == 1).await;
     assert_eq!(
         server.seen.lock().len(),
         1,

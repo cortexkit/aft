@@ -248,6 +248,24 @@ impl SubcSecretConsent {
         ) {
             card.answered = Some(outcome.clone());
         }
+        if cancel.is_some() && matches!(outcome, ConsentOutcome::Unavailable { .. }) {
+            // An unsuccessful await still leaves a live card. Settle it before
+            // reporting failure, while its requester scope can still be bound.
+            if self
+                .call(
+                    request,
+                    "consent.withdraw",
+                    serde_json::json!({"elicitation_id": card.elicitation}),
+                    SECRET_CONSENT_TIMEOUT,
+                )
+                .await
+                .is_err()
+            {
+                crate::slog_warn!("secret consent withdrawal failed");
+            } else {
+                card.answered = Some(ConsentOutcome::Expired);
+            }
+        }
         outcome
     }
 
@@ -276,9 +294,14 @@ impl crate::secret::SecretConsentTransport for SubcSecretConsent {
         cancel: crate::secret::consent::Cancellation,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ConsentOutcome> + Send>> {
         Box::pin(async move {
+            let mut request = request;
+            let expires = request
+                .expires_at_ms
+                .unwrap_or(u64::MAX)
+                .min(crate::secret::vault::now_ms().saturating_add(600_000));
+            request.expires_at_ms = Some(expires);
             loop {
                 let now = crate::secret::vault::now_ms();
-                let expires = request.expires_at_ms.unwrap_or(now.saturating_add(600_000));
                 if now >= expires {
                     cancel.cancel();
                 }
@@ -508,6 +531,7 @@ pub(crate) enum LaunchDecision {
     #[cfg(test)]
     Pending(PendingSecretConsent),
     Refuse(LabelOutcome),
+    InvalidPlan(&'static str),
 }
 
 /// Fetch tools already know the target. Check eligibility before asking once,
@@ -812,8 +836,11 @@ pub(crate) fn use_current_secret_labels(
                             expires,
                             |location| {
                                 let location =
-                                    secret_rules::location::parse_vault_location(location)
-                                        .ok_or(crate::secret::requests::UseError::Unavailable)?;
+                                    secret_rules::location::parse_vault_location(location).ok_or(
+                                        crate::secret::requests::UseError::InvalidPlan(
+                                            "missing_material",
+                                        ),
+                                    )?;
                                 if !matches!(location, secret_rules::location::Location::Query(_)) {
                                     return Ok(());
                                 }
@@ -835,16 +862,18 @@ pub(crate) fn use_current_secret_labels(
                                 let dummy =
                                     [(label.clone(), b"proxy-planning-value-0000".to_vec())];
                                 // Without a pending card, the vault reveals a deposit location only when releasing its key, so location-dependent refusals can follow that release.
-                                if secret_rules::location::evaluate_request_with_connect(
-                                    &view,
-                                    &authority,
-                                    &[rule],
-                                    &dummy,
-                                )
-                                .refusal
-                                .is_some()
+                                if let Some(refusal) =
+                                    secret_rules::location::evaluate_request_with_connect(
+                                        &view,
+                                        &authority,
+                                        &[rule],
+                                        &dummy,
+                                    )
+                                    .refusal
                                 {
-                                    Err(crate::secret::requests::UseError::Unavailable)
+                                    Err(crate::secret::requests::UseError::InvalidPlan(
+                                        refusal.reason(),
+                                    ))
                                 } else {
                                     Ok(())
                                 }
@@ -869,6 +898,14 @@ pub(crate) fn use_current_secret_labels(
             };
             match answer {
                 Ok(answer) => answers[index] = Some(answer),
+                Err(crate::secret::requests::UseError::InvalidPlan(reason)) => {
+                    return Some(
+                        labels
+                            .iter()
+                            .map(|_| LaunchDecision::InvalidPlan(reason))
+                            .collect(),
+                    )
+                }
                 Err(_) => return None,
             }
         }
