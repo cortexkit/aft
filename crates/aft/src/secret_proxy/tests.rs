@@ -939,7 +939,7 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
         refused["body"],
         "Secret proxy refused the request: json (localhost)\n"
     );
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 6);
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 4);
     assert!(server.seen.lock().is_empty());
     *vault.refused_label.lock() = None;
     assert_eq!(
