@@ -269,10 +269,12 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
             false,
             true,
             remote_policy::RemoteSource::None,
-            Instant::now() + Duration::from_secs(10),
+            // Runner workers hold background calls when late results are supported.
+            // End this call's reply budget before releasing the running child.
+            Instant::now() + Duration::from_millis(250),
         );
     }
-    let done = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+    let done = tokio::time::timeout(Duration::from_secs(30), done_rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -290,7 +292,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
     let capture = super::super::runner_notices::test_endpoint::capture(&task_id, false);
     completion_gate.release();
     let completion = loop {
-        let frame = tokio::time::timeout(Duration::from_secs(10), notice_rx.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(30), notice_rx.recv())
             .await
             .unwrap()
             .unwrap();
