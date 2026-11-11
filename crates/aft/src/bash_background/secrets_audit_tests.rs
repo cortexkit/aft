@@ -37,6 +37,7 @@ struct Fixture {
     server: Option<std::thread::JoinHandle<()>>,
     _launcher: Box<dyn std::any::Any>,
     tasks: Mutex<Vec<String>>,
+    echo_key: Arc<AtomicBool>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -90,6 +91,8 @@ impl Fixture {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (seen_server, stopping) = (seen.clone(), stop.clone());
+        let echo_key = Arc::new(AtomicBool::new(false));
+        let echo_response = echo_key.clone();
         let server = std::thread::spawn(move || {
             while !stopping.load(Ordering::SeqCst) {
                 let socket = match listener.accept() {
@@ -120,9 +123,13 @@ impl Fixture {
                             .lock()
                             .unwrap()
                             .push(String::from_utf8(bytes).unwrap());
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                        );
+                        let body: &[u8] = if echo_response.load(Ordering::SeqCst) {
+                            KEY
+                        } else {
+                            b"ok"
+                        };
+                        let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+                        let _ = stream.write_all(body);
                         let _ = stream.flush();
                         break;
                     }
@@ -140,6 +147,7 @@ impl Fixture {
             server: Some(server),
             _launcher: Box::new(launcher),
             tasks: Mutex::new(Vec::new()),
+            echo_key,
         }
     }
     fn curl(&self) -> String {
@@ -152,6 +160,15 @@ impl Fixture {
         serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"audit-run","kind":"ephemeral","scope_epoch":1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap()
     }
     fn launch(&self, command: &str, bound: bool, extra: serde_json::Value) -> Response {
+        self.launch_with_vault(self.vault.clone(), command, bound, extra)
+    }
+    fn launch_with_vault(
+        &self,
+        vault: Arc<dyn SecretVault>,
+        command: &str,
+        bound: bool,
+        extra: serde_json::Value,
+    ) -> Response {
         let mut req = request(command);
         req.params["params"]
             .as_object_mut()
@@ -163,7 +180,7 @@ impl Fixture {
                 crate::commands::bash::handle(&req, &self.ctx)
             })
         };
-        with_vault(self.vault.clone(), || {
+        with_vault(vault, || {
             if bound {
                 crate::subc::with_secret_bound_identity_for_test(
                     self.root.path(),
@@ -632,4 +649,99 @@ fn audit_hardened_daemon_preserves_child_fd_aliases() {
             b"data"
         );
     });
+}
+
+#[test]
+fn audit_live_vault_key_never_reaches_task_logs_previews_or_status() {
+    isolated(
+        "audit_live_vault_key_never_reaches_task_logs_previews_or_status",
+        || {
+            use crate::secret::transport::fake::{FakeClaustrum, Record, NONCE};
+            use crate::secret::{ApiKeyTarget, SubcSecretVault, UseAnswer};
+            let f = Fixture::new();
+            f.echo_key.store(true, Ordering::SeqCst);
+            let daemon = FakeClaustrum::start();
+            daemon.state.lock().unwrap().record = Some(Record {
+                name: "test".into(),
+                host: "localhost".into(),
+                path: "/api".into(),
+                location: "authorization_bearer".into(),
+                key: KEY.to_vec(),
+            });
+            let transport = crate::secret::transport::SubcSecretUseTransport::for_test(
+                daemon.path.clone(),
+                subc_protocol::BindIdentity::new("live-secret-bash", "secret-bash"),
+                Duration::from_secs(2),
+                subc_client_rs::ConsumerIdentity {
+                    module_id: "aft".into(),
+                    launch_nonce: NONCE.into(),
+                },
+            );
+            let vault = Arc::new(SubcSecretVault::new(Arc::new(transport)));
+            let scope = crate::secret::SecretScope::from_stamp(&stamp("worker"));
+            let target = ApiKeyTarget {
+                scheme: "https".into(),
+                host: "localhost".into(),
+                port: Some(443),
+                path: "/api".into(),
+            };
+            let UseAnswer::ApprovalRequired(pending) = vault.use_secret(&scope, "test", &target)
+            else {
+                panic!("prime the phone approval");
+            };
+            daemon
+                .state
+                .lock()
+                .unwrap()
+                .approve(&pending.statement_b64url);
+            let command = format!("{}; printf '\\n'; {} >&2", f.curl(), f.curl());
+            let response = f.launch_with_vault(vault, &command, false, json!({}));
+            let id = f.task(&response);
+            f.wait_terminal(&id);
+            let snapshot = f
+                .ctx
+                .bash_background()
+                .status(
+                    &id,
+                    "secret-bash",
+                    Some(f.root.path()),
+                    Some(f._storage.path()),
+                    8192,
+                )
+                .unwrap();
+            assert_eq!(snapshot.exit_code, Some(0), "{}", f.diagnostics());
+            let key = std::str::from_utf8(KEY).unwrap();
+            let status_request: RawRequest = serde_json::from_value(json!({"id":"live-vault-status", "command":"bash_status", "session_id":"secret-bash", "params":{"task_id":id}})).unwrap();
+            let status_reply = crate::commands::bash_status::handle(&status_request, &f.ctx);
+            assert!(status_reply.success, "{status_reply:?}");
+            for text in [
+                serde_json::to_string(&response).unwrap(),
+                snapshot.output_preview.clone(),
+                serde_json::to_string(&snapshot).unwrap(),
+                f.diagnostics(),
+                serde_json::to_string(&status_reply).unwrap(),
+            ] {
+                assert!(
+                    !text.contains(key),
+                    "released material escaped into task observability"
+                );
+            }
+            assert!(snapshot.output_preview.contains("{{ck-secret:test}}"));
+            assert_eq!(f.seen.lock().unwrap().len(), 2);
+            assert!(
+                f.seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.contains(key)),
+                "the vault key actually reached the approved upstream"
+            );
+            assert_eq!(
+                daemon.state.lock().unwrap().calls,
+                3,
+                "priming ask and one release per real request"
+            );
+            assert_eq!(daemon.state.lock().unwrap().connections, 1);
+        },
+    );
 }

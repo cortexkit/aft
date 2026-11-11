@@ -787,7 +787,11 @@ async fn proxy_h1_h2_locations_keepalive_authority_and_scanned_set() {
         let response = client.command(json!({"op":"request", "authority":"other.invalid", "path":"/approved", "headers":{"authorization":format!("Bearer {MARKER}")}}));
         assert_eq!(response["status"], 403, "{response}");
     }
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 16);
+    assert_eq!(
+        vault.calls.load(Ordering::SeqCst),
+        10,
+        "only labels present in each request are asked"
+    );
     proxy.stop();
     assert!(proxy.state.patterns.lock().is_empty());
 }
@@ -877,9 +881,10 @@ async fn proxy_literal_responses_only_gain_matchers_after_material() {
     );
     assert!(!after.to_string().contains(std::str::from_utf8(K1).unwrap()));
     assert_eq!(
-        server.seen.lock().last().unwrap()["headers"]["authorization"],
-        "Bearer {{ck-secret:from-file}}"
+        after["status"], 403,
+        "an unscanned header label is refused before dispatch"
     );
+    assert_eq!(server.seen.lock().len(), 2);
     assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -903,12 +908,16 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
     proxy.arm_command(client.process.id()).unwrap();
     client.connect(false);
     for body in [
-        r#"{"key":4}"#,
+        r#"{"key":4,"other":"{{ck-secret:json}}"}"#,
         r#"{"key":"{{ck-secret:json}}","key":"{{ck-secret:json}}"}"#,
     ] {
         assert_eq!(client.request("/approved", json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}), body)["status"], 403);
     }
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        vault.calls.load(Ordering::SeqCst),
+        4,
+        "the vault names the location before its structure can be validated"
+    );
     assert!(server.seen.lock().is_empty());
     *vault.refused_label.lock() = Some("json".into());
     let refused = client.request(
@@ -921,7 +930,7 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
         refused["body"],
         "Secret proxy refused the request: json (localhost)\n"
     );
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 6);
     assert!(server.seen.lock().is_empty());
     *vault.refused_label.lock() = None;
     assert_eq!(
@@ -1024,18 +1033,16 @@ async fn proxy_websocket_scrubs_fragments_and_refuses_extensions_and_rsv() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_non_rule_connect_is_tunnelled_without_interception() {
+async fn proxy_non_https443_connect_is_tunnelled_without_interception() {
     let server = Server::new("echo-request").await;
     let vault = Vault::new();
-    let proxy = SecretProxy::start_with_tls(
-        config(
-            vault.clone(),
-            server.address.port(),
-            &[("test", Location::Bearer)],
-        ),
-        server.client_tls.clone(),
-    )
-    .unwrap();
+    let mut cfg = config(
+        vault.clone(),
+        server.address.port(),
+        &[("test", Location::Bearer)],
+    );
+    cfg.test_https_port = None;
+    let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
     let mut client = Client::spawn(&proxy, &server);
     proxy.arm_command(client.process.id()).unwrap();
     assert_eq!(
@@ -1310,7 +1317,7 @@ async fn proxy_unavailable_release_refuses_and_tunnel_closes_on_stop() {
         )["status"],
         403
     );
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
     assert!(server.seen.lock().is_empty());
     assert_eq!(
         client.command(json!({"op":"connect","authority":server.address.to_string()}))["ok"],

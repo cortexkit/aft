@@ -43,7 +43,8 @@ pub(crate) struct RequestSecrets {
     scope: SecretScope,
     context: Option<(std::path::PathBuf, String)>,
     slots: Mutex<HashMap<String, Arc<Slot>>>,
-    status: Mutex<BTreeMap<String, Vec<String>>>,
+    status: Mutex<BTreeMap<String, (u64, Vec<String>)>>,
+    sequence: AtomicU64,
     clock: Arc<dyn ApprovalClock>,
     active: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -60,6 +61,7 @@ impl RequestSecrets {
             context,
             slots: Mutex::default(),
             status: Mutex::default(),
+            sequence: AtomicU64::new(1),
             clock: Arc::new(WallClock),
             active: Arc::default(),
         }
@@ -101,7 +103,7 @@ impl RequestSecrets {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .flatten()
+            .flat_map(|(_, lines)| lines)
             .cloned()
             .collect()
     }
@@ -131,14 +133,21 @@ impl RequestSecrets {
         }
         self.active.fetch_add(1, Ordering::AcqRel);
         let _active = Active(self.active.clone());
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let result = tokio::select! {
-            result = self.use_serial(label, target) => result,
+            result = self.use_serial(label, target, sequence) => result,
             () = self.clock.deadline() => Err(()),
         };
-        self.status
+        let mut status = self
+            .status
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(label);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if status
+            .get(label)
+            .is_some_and(|(owner, _)| *owner == sequence)
+        {
+            status.remove(label);
+        }
         result
     }
 
@@ -156,7 +165,12 @@ impl RequestSecrets {
         receive.await.unwrap_or(UseAnswer::Unavailable)
     }
 
-    async fn use_serial(&self, label: &str, target: &ApiKeyTarget) -> Result<UseAnswer, ()> {
+    async fn use_serial(
+        &self,
+        label: &str,
+        target: &ApiKeyTarget,
+        sequence: u64,
+    ) -> Result<UseAnswer, ()> {
         let slot = self.slot(label);
         let mut history = slot.history.lock().await;
         if history
@@ -197,7 +211,7 @@ impl RequestSecrets {
         self.status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(label.into(), lines);
+            .insert(label.into(), (sequence, lines));
         history.filed = Some((pending.request_id.clone(), pending.expires_at_ms));
         slot.expires.store(pending.expires_at_ms, Ordering::Release);
         let (send, receive) = tokio::sync::oneshot::channel();

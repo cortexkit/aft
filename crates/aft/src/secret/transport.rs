@@ -45,6 +45,8 @@ pub struct SubcSecretUseTransport {
     identity: BindIdentity,
     timeout: Duration,
     worker: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<Work>>>,
+    #[cfg(test)]
+    test_principal: Option<ConsumerIdentity>,
 }
 
 struct Work {
@@ -74,7 +76,25 @@ impl SubcSecretUseTransport {
             identity,
             timeout,
             worker: Arc::default(),
+            #[cfg(test)]
+            test_principal: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        connection_file: PathBuf,
+        identity: BindIdentity,
+        timeout: Duration,
+        principal: ConsumerIdentity,
+    ) -> Self {
+        Self {
+            connection_file,
+            identity,
+            timeout,
+            worker: Arc::default(),
+            test_principal: Some(principal),
+        }
     }
 
     async fn send(
@@ -217,6 +237,10 @@ fn aft_identity() -> Option<ConsumerIdentity> {
 
 impl SecretUseTransport for SubcSecretUseTransport {
     fn secret_use(&self, params: Value) -> Result<Value, String> {
+        #[cfg(test)]
+        if let Some(principal) = &self.test_principal {
+            return self.dispatch(params, principal.clone());
+        }
         let principal = aft_identity().ok_or_else(|| UNAVAILABLE.to_owned())?;
         self.dispatch(params, principal)
     }

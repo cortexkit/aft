@@ -166,12 +166,15 @@ fn live_config(daemon: &FakeClaustrum, port: u16, clock: Arc<Clock>) -> ProxyCon
         "live-vault-{}",
         SEQUENCE.fetch_add(1, Ordering::SeqCst)
     ));
-    let transport = crate::secret::transport::SubcSecretUseTransport::new(
+    let transport = crate::secret::transport::SubcSecretUseTransport::for_test(
         daemon.path.clone(),
         subc_protocol::BindIdentity::new("test", "session"),
         Duration::from_secs(2),
-    )
-    .unwrap();
+        subc_client_rs::ConsumerIdentity {
+            module_id: "aft".into(),
+            launch_nonce: NONCE.into(),
+        },
+    );
     ProxyConfig {
         vault: Arc::new(SubcSecretVault::new(Arc::new(transport))),
         authorization_scope: auth,
@@ -204,7 +207,6 @@ fn request_in_thread(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_release_injects_only_the_deposit_location_and_every_use_is_audited() {
-    let _nonce = crate::launch_nonce::install_for_tests(Some(NONCE.into()));
     let daemon = FakeClaustrum::start();
     daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
     let phone = PhoneGuard::install();
@@ -256,7 +258,6 @@ async fn live_vault_release_injects_only_the_deposit_location_and_every_use_is_a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_decline_and_expiry_answer_403_without_sending_or_retrying() {
-    let _nonce = crate::launch_nonce::install_for_tests(Some(NONCE.into()));
     for decision in [ConsentOutcome::Declined, ConsentOutcome::Expired] {
         let daemon = FakeClaustrum::start();
         daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
@@ -304,7 +305,6 @@ async fn live_vault_decline_and_expiry_answer_403_without_sending_or_retrying() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_injected_ten_minute_deadline_answers_403_locally() {
-    let _nonce = crate::launch_nonce::install_for_tests(Some(NONCE.into()));
     let daemon = FakeClaustrum::start();
     daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
     let phone = PhoneGuard::install();
@@ -315,11 +315,20 @@ async fn live_vault_injected_ten_minute_deadline_answers_403_locally() {
         server.client_tls.clone(),
     )
     .unwrap();
+    proxy
+        .state
+        .test_idle_timeout_ms
+        .store(100, Ordering::Release);
     let mut client = Client::spawn(&proxy, &server);
     proxy.arm_command(client.process.id()).unwrap();
     client.connect(false);
     let worker = request_in_thread(client, false);
     phone.phone.card(1).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !worker.is_finished(),
+        "a held approval outlives the socket idle timeout"
+    );
     clock.advance(599_999);
     assert!(
         !worker.is_finished(),
@@ -339,7 +348,6 @@ async fn live_vault_injected_ten_minute_deadline_answers_403_locally() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_concurrent_requests_share_one_card_and_once_queues_cards_serially() {
-    let _nonce = crate::launch_nonce::install_for_tests(Some(NONCE.into()));
     for once in [false, true] {
         let daemon = FakeClaustrum::start();
         {
@@ -388,7 +396,6 @@ async fn live_vault_concurrent_requests_share_one_card_and_once_queues_cards_ser
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_wrong_host_is_literal_and_never_files_a_card() {
-    let _nonce = crate::launch_nonce::install_for_tests(Some(NONCE.into()));
     let daemon = FakeClaustrum::start();
     let mut other = record("authorization_bearer");
     other.host = "other.test".into();
@@ -421,7 +428,6 @@ async fn live_vault_wrong_host_is_literal_and_never_files_a_card() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_redirect_to_another_host_asks_again_and_sends_no_key() {
-    let _nonce = crate::launch_nonce::install_for_tests(Some(NONCE.into()));
     let daemon = FakeClaustrum::start();
     daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
     let phone = PhoneGuard::install();
@@ -463,7 +469,6 @@ async fn live_vault_redirect_to_another_host_asks_again_and_sends_no_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_fetch_uses_the_concrete_target_and_holds_for_the_phone() {
-    let _nonce = crate::launch_nonce::install_for_tests(Some(NONCE.into()));
     let daemon = FakeClaustrum::start();
     daemon.state.lock().unwrap().record = Some(record("query:key"));
     let phone = PhoneGuard::install();

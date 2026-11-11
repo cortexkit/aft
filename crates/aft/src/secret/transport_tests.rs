@@ -15,6 +15,7 @@ fn transport(daemon: &FakeClaustrum) -> SubcSecretUseTransport {
         identity: BindIdentity::new("aft-secret-use", "secret-call"),
         timeout: Duration::from_secs(2),
         worker: Arc::default(),
+        test_principal: None,
     }
 }
 
@@ -119,16 +120,20 @@ fn secret_use_route_maps_all_sender_refusals_without_releasing_material() {
 #[test]
 fn secret_use_fake_grant_lookup_is_independent_of_requested_coverage_and_covers_linked_workers() {
     let daemon = FakeClaustrum::start();
-    let transport = transport(&daemon);
+    let head_transport = transport(&daemon);
     let mut head = golden(0);
     head["coverage"] = json!("agent_and_workers");
-    let pending = call(&transport, head);
+    let pending = call(&head_transport, head);
     daemon
         .state
         .lock()
         .unwrap()
         .approve(pending["result"]["statement_b64url"].as_str().unwrap());
-    assert_eq!(call(&transport, golden(1)), json!({"result":golden(3)}));
+    assert_eq!(
+        call(&head_transport, golden(1)),
+        json!({"result":golden(3)})
+    );
+    let transport = transport(&daemon);
     let mut worker = golden(0);
     worker["stamp"] = golden(2)["stamp"].clone();
     assert_eq!(

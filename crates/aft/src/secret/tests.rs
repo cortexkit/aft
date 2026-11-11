@@ -177,6 +177,7 @@ fn the_fake_counts_addressed_uses_and_rotates_material() {
     assert_eq!(second.material(), b"second-key-material");
     assert_eq!(vault.use_calls(), 2);
     assert_eq!(vault.material_calls(), 2);
+    assert_eq!(vault.materials(), vec!["repo", "repo"]);
     let mut other = target();
     other.host = "other.example.com".into();
     assert!(matches!(
