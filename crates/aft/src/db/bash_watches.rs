@@ -369,14 +369,14 @@ pub(crate) fn acknowledge_delivery(
 ) -> rusqlite::Result<()> {
     let epoch = gap
         .map(|gap| gap.eviction_epoch.as_str())
-        .unwrap_or(crate::subc::watch_delivery::eviction_epoch());
+        .unwrap_or(crate::task_watch_lines::eviction_epoch());
     let through = gap.map(|gap| gap.evicted_through).unwrap_or_default();
     conn.execute("INSERT INTO bash_watch_delivery_acks(harness, session_id, task_id, watch_id, version, acknowledged_at, eviction_epoch, evicted_through) VALUES(?1,?2,?3,?4,?5,unixepoch(),?6,?7) ON CONFLICT(harness, session_id, task_id, watch_id) DO UPDATE SET version=MAX(version,excluded.version), acknowledged_at=excluded.acknowledged_at, eviction_epoch=CASE WHEN excluded.eviction_epoch != '' THEN excluded.eviction_epoch ELSE eviction_epoch END, evicted_through=CASE WHEN eviction_epoch = excluded.eviction_epoch THEN MAX(evicted_through,excluded.evicted_through) WHEN excluded.eviction_epoch != '' THEN excluded.evicted_through ELSE evicted_through END", params![harness, session, task, watch, version as i64, epoch, through as i64])?;
     // Only prune old acknowledgements from an earlier daemon: its process-local
     // retry copies no longer exist, even if the current daemon is long-lived.
     conn.execute(
         "DELETE FROM bash_watch_delivery_acks WHERE acknowledged_at < unixepoch() - 2592000 AND eviction_epoch != ?1",
-        [crate::subc::watch_delivery::eviction_epoch()],
+        [crate::task_watch_lines::eviction_epoch()],
     )?;
     Ok(())
 }
