@@ -66,7 +66,7 @@ fn write_jq_fixture(directory: &std::path::Path) {
         std::fs::write(directory.join("output.bin"), b"A\r\r\nB\r\n").unwrap();
         std::fs::write(
             directory.join("jq.cmd"),
-            "@echo off\r\nif \"%~1\"==\"--binary\" exit /b 2\r\nmore >nul\r\ntype \"%~dp0\\output.bin\"\r\n",
+            "@echo off\r\necho script=[%~f0] first=[%~1] cmd_extensions=[%CMDEXTVERSION%]>>\"%~dp0invocations.log\"\r\nif \"%~1\"==\"--binary\" exit /b 2\r\nmore >nul\r\ntype \"%~dp0\\output.bin\"\r\n",
         )
         .unwrap();
     }
@@ -80,6 +80,94 @@ fn write_jq_fixture(directory: &std::path::Path) {
         )
         .unwrap();
     }
+}
+
+#[cfg(windows)]
+fn diagnose_jq_fixture(directory: &std::path::Path) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn probe(label: &str, command: &mut Command) {
+        eprintln!("jq probe {label}: command={command:?}");
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!(
+                    "jq probe {label}: spawn={error:?}, os={:?}",
+                    error.raw_os_error()
+                );
+                return;
+            }
+        };
+        let mut input = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            input.write_all(br#"{"number":42,"title":"A\r\nB"}"#)
+        });
+        let result = child.wait_with_output();
+        let written = writer.join();
+        match result {
+            Ok(result) => eprintln!(
+                "jq probe {label}: status={}, code={:?}, code_hex={:?}, stdout={:?}, stderr={:?}, writer={written:?}",
+                result.status,
+                result.status.code(),
+                result.status.code().map(|code| format!("{:#010x}", code as u32)),
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr),
+            ),
+            Err(error) => eprintln!("jq probe {label}: wait={error:?}, writer={written:?}"),
+        }
+    }
+
+    eprintln!("jq probe fixture={}", directory.display());
+    eprintln!("jq probe cwd={:?}", std::env::current_dir());
+    for key in ["PATH", "PATHEXT", "ComSpec", "SystemRoot", "WINDIR"] {
+        eprintln!("jq probe {key}={:?}", std::env::var_os(key));
+    }
+    // Read before the diagnostic launches so these markers identify only the
+    // binary-mode probe and render attempted by the failing production call.
+    eprintln!(
+        "jq probe production fixture invocations={:?}",
+        std::fs::read_to_string(directory.join("invocations.log"))
+    );
+    let executable = which::which("jq");
+    eprintln!("jq probe resolved={executable:?}");
+    if let Ok(executable) = executable {
+        probe(
+            "binary flag / cleared env",
+            Command::new(&executable)
+                .env_clear()
+                .args(["--binary", "--version"]),
+        );
+        probe(
+            "render / cleared env",
+            Command::new(&executable)
+                .env_clear()
+                .args(["-r", "--", ".title"]),
+        );
+        let mut restored = Command::new(&executable);
+        restored.env_clear().args(["-r", "--", ".title"]);
+        for key in ["SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                restored.env(key, value);
+            }
+        }
+        probe("render / Windows directories restored", &mut restored);
+        probe(
+            "render / inherited env",
+            Command::new(&executable).args(["-r", "--", ".title"]),
+        );
+    }
+    probe(
+        "explicit fixture / cleared env",
+        Command::new(directory.join("jq.cmd"))
+            .env_clear()
+            .args(["-r", "--", ".title"]),
+    );
 }
 fn reply(value: Value) -> ReadReply {
     ReadReply::Get(GetReply {
@@ -981,12 +1069,16 @@ fn v20_native_json_aliases_and_jq_render_from_constrained_gets() {
         ".title",
     ]);
     let mut output = Vec::new();
-    render::run(
+    let result = render::run(
         &plan,
         &mut |_| Ok(reply(json!({"number":42,"title":"A\r\nB"}))),
         &mut output,
-    )
-    .unwrap();
+    );
+    #[cfg(windows)]
+    if result.is_err() {
+        diagnose_jq_fixture(jq_dir.path());
+    }
+    result.unwrap();
     assert_eq!(output, b"A\r\nB\n");
 }
 
