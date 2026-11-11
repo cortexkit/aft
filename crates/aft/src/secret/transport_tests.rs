@@ -197,8 +197,17 @@ fn secret_use_standalone_cannot_construct_a_module_transport_and_keeps_unavailab
     let stamp: ScopeStamp = serde_json::from_value(golden(0)["stamp"].clone()).unwrap();
     let vault = crate::bash_background::secrets::vault();
     assert!(matches!(
-        vault.resolve(&crate::secret::SecretScope::from_stamp(&stamp), "key"),
-        crate::secret::Resolution::Unavailable
+        vault.use_secret(
+            &crate::secret::SecretScope::from_stamp(&stamp),
+            "key",
+            &crate::secret::ApiKeyTarget {
+                scheme: "https".into(),
+                host: "x.test".into(),
+                port: Some(443),
+                path: "/repos/a".into()
+            }
+        ),
+        crate::secret::UseAnswer::Unavailable
     ));
 }
 

@@ -232,7 +232,6 @@ fn a_redirect_hop_to_another_host_scheme_or_port_is_not_authorized() {
         port: 443,
         path_prefix: "/v1".to_string(),
         location: Location::Query("key".to_string()),
-        grant_id: "g".to_string(),
     };
     let rules = [rule];
     let same = request("api.example.com", 443, "https", "/v1/next");

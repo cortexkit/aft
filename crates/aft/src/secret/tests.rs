@@ -25,7 +25,6 @@ fn rule(label: &str) -> secret_rules::location::LabelRule {
         port: 443,
         path_prefix: "/v1".into(),
         location: Location::Bearer,
-        grant_id: "grant-1".into(),
     }
 }
 
@@ -34,21 +33,27 @@ fn rule(label: &str) -> secret_rules::location::LabelRule {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn production_resolve_is_unavailable_for_every_label_and_scope() {
-    let vault = UnavailableVault;
-    let scope = production_scope();
+fn standalone_use_is_unavailable_for_every_label_and_scope() {
     for label in ["prod", "test", "repo"] {
-        assert_eq!(vault.resolve(&scope, label), Resolution::Unavailable);
+        assert!(matches!(
+            UnavailableVault.use_secret(&production_scope(), label, &target()),
+            UseAnswer::Unavailable
+        ));
     }
-    assert!(matches!(
-        vault.material(&scope, "prod", "grant-1"),
-        Err(MaterialError::Unavailable { .. })
-    ));
+}
+
+fn target() -> ApiKeyTarget {
+    ApiKeyTarget {
+        scheme: "https".into(),
+        host: "api.example.com".into(),
+        port: Some(443),
+        path: "/v1".into(),
+    }
 }
 
 #[test]
 fn an_unavailable_resolution_ends_the_launch_with_secrets_unavailable() {
-    let outcome = outcome_for("prod", &Resolution::Unavailable);
+    let outcome = outcome_for("prod", &UseAnswer::Unavailable);
     assert_eq!(outcome.code(), Some(SECRETS_UNAVAILABLE));
     assert!(!outcome.proceeds());
     // The message names the label it refused and never a key.
@@ -63,15 +68,17 @@ fn an_unavailable_resolution_ends_the_launch_with_secrets_unavailable() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_granted_resolution_proceeds() {
-    let outcome = outcome_for("repo", &granted(rule("repo"), "grant-1"));
-    assert_eq!(outcome, LabelOutcome::Proceed);
-    assert_eq!(outcome.code(), None);
+fn a_released_request_proceeds() {
+    let answer = UseAnswer::Released(ReleasedApiKey::new(
+        "authorization_bearer".into(),
+        Material::new(b"test-secret".to_vec()),
+    ));
+    assert_eq!(outcome_for("repo", &answer), LabelOutcome::Proceed);
 }
 
 #[test]
 fn an_approval_required_resolution_files_a_consent_and_holds_the_call() {
-    let outcome = outcome_for("repo", &Resolution::ApprovalRequired(approval("req-1")));
+    let outcome = outcome_for("repo", &UseAnswer::ApprovalRequired(approval("req-1")));
     let LabelOutcome::FileConsent {
         request_id,
         statement_b64url,
@@ -87,46 +94,22 @@ fn an_approval_required_resolution_files_a_consent_and_holds_the_call() {
 }
 
 #[test]
-fn a_denied_resolution_refuses_naming_the_label() {
-    let outcome = outcome_for(
-        "repo",
-        &Resolution::Denied {
-            reason: "this device may not use repo".into(),
-        },
-    );
-    assert_eq!(outcome.code(), Some(SECRET_REFUSED));
-    let LabelOutcome::Refuse { message, .. } = &outcome else {
-        panic!("a denial refuses the launch");
-    };
-    assert!(message.contains("repo"), "{message}");
-    assert!(
-        message.contains("this device may not use repo"),
-        "{message}"
+fn uniform_not_found_keeps_the_literal_request() {
+    assert_eq!(
+        outcome_for("repo", &UseAnswer::NotFound),
+        LabelOutcome::Proceed
     );
 }
 
 #[test]
-fn a_second_resolve_is_the_only_thing_that_can_grant() {
-    // Cingulate's answer alone never grants: a resolve that still asks again
-    // substitutes nothing, while a grant after the answer proceeds and a
-    // denial refuses.
+fn a_phone_answer_never_grants_material_without_a_vault_release() {
     assert_eq!(
-        outcome_for_second_resolve("repo", &Resolution::ApprovalRequired(approval("req-1"))).code(),
+        outcome_for_second_use("repo", &UseAnswer::ApprovalRequired(approval("req-1"))).code(),
         Some(SECRETS_UNAVAILABLE)
     );
-    assert!(outcome_for_second_resolve("repo", &granted(rule("repo"), "grant-1")).proceeds());
+    assert!(outcome_for_second_use("repo", &UseAnswer::NotFound).proceeds());
     assert_eq!(
-        outcome_for_second_resolve(
-            "repo",
-            &Resolution::Denied {
-                reason: "no".into()
-            }
-        )
-        .code(),
-        Some(SECRET_REFUSED)
-    );
-    assert_eq!(
-        outcome_for_second_resolve("repo", &Resolution::Unavailable).code(),
+        outcome_for_second_use("repo", &UseAnswer::Unavailable).code(),
         Some(SECRETS_UNAVAILABLE)
     );
 }
@@ -157,11 +140,14 @@ fn the_first_failing_label_decides_a_multi_label_launch() {
 }
 
 #[test]
-fn a_material_lapse_refuses_without_filing_a_consent() {
-    let outcome = outcome_for_material("repo", &MaterialError::GrantLapsed);
-    assert_eq!(outcome.code(), Some(SECRET_REFUSED));
-    // A lapse never asks for a new consent: the proxy is already live.
-    assert!(!matches!(outcome, LabelOutcome::FileConsent { .. }));
+fn a_new_request_may_ask_for_a_fresh_approval() {
+    assert!(matches!(
+        outcome_for(
+            "repo",
+            &UseAnswer::ApprovalRequired(approval("next-request"))
+        ),
+        LabelOutcome::FileConsent { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -169,11 +155,9 @@ fn a_material_lapse_refuses_without_filing_a_consent() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_fake_counts_resolve_and_material_calls_and_rotates_material() {
+fn the_fake_counts_addressed_uses_and_rotates_material() {
     let mut script = FakeVaultScript::default();
-    script
-        .resolutions
-        .insert("repo".into(), granted(rule("repo"), "grant-1"));
+    script.answers.insert("repo".into(), granted(rule("repo")));
     script.material.insert(
         "repo".into(),
         vec![
@@ -183,22 +167,23 @@ fn the_fake_counts_resolve_and_material_calls_and_rotates_material() {
     );
     let vault = FakeVault::with_script(script);
     let scope = production_scope();
-    assert!(matches!(
-        vault.resolve(&scope, "repo"),
-        Resolution::Granted { .. }
-    ));
-    let first = vault.material(&scope, "repo", "grant-1").unwrap();
-    let second = vault.material(&scope, "repo", "grant-1").unwrap();
-    // One grant, two different values: the seam never assumes a grant returns
-    // the same bytes.
-    assert_eq!(first.expose(), b"first-key-material-1");
-    assert_eq!(second.expose(), b"second-key-material");
-    assert_eq!(vault.resolve_calls(), 1);
+    let UseAnswer::Released(first) = vault.use_secret(&scope, "repo", &target()) else {
+        panic!("release");
+    };
+    let UseAnswer::Released(second) = vault.use_secret(&scope, "repo", &target()) else {
+        panic!("release");
+    };
+    assert_eq!(first.material(), b"first-key-material-1");
+    assert_eq!(second.material(), b"second-key-material");
+    assert_eq!(vault.use_calls(), 2);
     assert_eq!(vault.material_calls(), 2);
-    assert_eq!(
-        vault.materials(),
-        vec!["repo".to_string(), "repo".to_string()]
-    );
+    let mut other = target();
+    other.host = "other.example.com".into();
+    assert!(matches!(
+        vault.use_secret(&scope, "repo", &other),
+        UseAnswer::NotFound
+    ));
+    assert_eq!(vault.material_calls(), 2);
 }
 
 #[test]

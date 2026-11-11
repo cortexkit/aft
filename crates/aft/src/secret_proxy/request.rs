@@ -205,7 +205,7 @@ async fn prepare_and_send(
             crate::secret::UseAnswer::Released(released) => {
                 let (location, material) = released.into_parts();
                 let location = secret_rules::location::parse_vault_location(&location)
-                    .map_err(|_| label.clone())?;
+                    .ok_or_else(|| label.clone())?;
                 check_admissible(material.expose(), label, &location).map_err(|_| label.clone())?;
                 state
                     .install(label, material.expose())

@@ -185,6 +185,12 @@ fn resolve_secret_fetch(
         vault: vault.as_ref(),
         authorization,
         labels: labels.to_vec(),
+        #[cfg(test)]
+        test_https_port: if options.allow_private {
+            url::Url::parse(file).ok().and_then(|url| url.port())
+        } else {
+            None
+        },
         call_id: req.id.clone(),
     };
     let document = crate::url_fetch::fetch_url_with_secrets(file, &document_dir, options, &secrets)
@@ -573,7 +579,7 @@ mod url_tests {
 
     mod secret_fetch {
         use super::super::*;
-        use crate::secret::{FakeVault, Resolution};
+        use crate::secret::{FakeReply, FakeVault};
         use secret_rules::location::{LabelRule, Location};
         use std::io::{Read as _, Write as _};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -740,13 +746,12 @@ mod url_tests {
                 port,
                 path_prefix: prefix.into(),
                 location: Location::Query("key".into()),
-                grant_id: String::new(),
             }
         }
 
         fn granted_vault(rule: LabelRule) -> FakeVault {
             let vault = FakeVault::new();
-            vault.set_resolution("test", crate::secret::granted(rule, "grant-1"));
+            vault.set_answer("test", crate::secret::granted(rule));
             vault.set_material("test", vec![KEY.to_vec()]);
             vault
         }
@@ -962,7 +967,7 @@ mod url_tests {
                 );
                 assert_documents_removed(&run, &cache);
 
-                assert_eq!(vault.resolve_calls(), 1);
+                assert_eq!(vault.use_calls(), 1);
                 assert_eq!(vault.material_calls(), 1);
                 let records = vault.audit_records();
                 assert_eq!(records.len(), 1, "{records:?}");
@@ -1240,7 +1245,7 @@ mod url_tests {
                     "{command}"
                 );
                 assert!(!run.text().contains("SENTINEL"), "{command}");
-                assert_eq!(vault.resolve_calls(), 0, "{command}");
+                assert_eq!(vault.use_calls(), 0, "{command}");
                 assert!(run.documents.is_empty());
             }
             assert_eq!(cache_entries(&cache), before);
@@ -1308,7 +1313,7 @@ mod url_tests {
         }
 
         #[test]
-        fn ineligible_or_refused_labels_fetch_nothing() {
+        fn ineligible_and_unavailable_fetch_nothing_but_not_found_is_literal() {
             let fixture = fixture(Default::default());
             let server = serve(&fixture.tls, |_| Some(markdown(&echo_document())));
             let port = server.addr.port();
@@ -1319,17 +1324,17 @@ mod url_tests {
             let vault = granted_vault(rule("api.secret.test", port, "/v1"));
             let unscoped = run(&fixture, &vault, &routes, &req, false);
             assert_eq!(unscoped.code(), Some(crate::secret::SECRET_REFUSED));
-            assert_eq!(vault.resolve_calls(), 0);
+            assert_eq!(vault.use_calls(), 0);
 
             let denied = FakeVault::new();
-            denied.set_resolution(
-                "test",
-                Resolution::Denied {
-                    reason: "no".into(),
-                },
-            );
+            denied.set_answer("test", FakeReply::NotFound);
             let run_denied = run(&fixture, &denied, &routes, &req, true);
-            assert_eq!(run_denied.code(), Some(crate::secret::SECRET_REFUSED));
+            assert!(run_denied.success);
+            assert_eq!(denied.material_calls(), 0);
+            assert_eq!(
+                denied.audit_summary(),
+                vec![("test".into(), secret_rules::audit::Decision::Literal)]
+            );
 
             let unavailable = FakeVault::new();
             let run_unavailable = run(&fixture, &unavailable, &routes, &req, true);
@@ -1337,10 +1342,10 @@ mod url_tests {
                 run_unavailable.code(),
                 Some(crate::secret::SECRETS_UNAVAILABLE)
             );
-            assert_eq!(unavailable.resolve_calls(), 1);
+            assert_eq!(unavailable.use_calls(), 1);
 
-            assert_eq!(server.connections.load(Ordering::SeqCst), 0);
-            for vault in [&vault, &denied, &unavailable] {
+            assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+            for vault in [&vault, &unavailable] {
                 let summary = vault.audit_summary();
                 assert_eq!(
                     summary,
@@ -1440,7 +1445,7 @@ mod url_tests {
 
         fn granted_vault_with(rule: LabelRule, key: &[u8]) -> FakeVault {
             let vault = FakeVault::new();
-            vault.set_resolution("test", crate::secret::granted(rule, "grant-1"));
+            vault.set_answer("test", crate::secret::granted(rule));
             vault.set_material("test", vec![key.to_vec()]);
             vault
         }
@@ -2034,9 +2039,9 @@ mod url_tests {
                 "https://api.secret.test:{port}/v1/doc.md?key={PLACEHOLDER}&other={{{{ck-secret:other}}}}"
             );
             let vault = FakeVault::new();
-            vault.set_resolution(
+            vault.set_answer(
                 "test",
-                crate::secret::granted(rule("api.secret.test", port, "/v1"), "grant-1"),
+                crate::secret::granted(rule("api.secret.test", port, "/v1")),
             );
             vault.set_material("test", vec![K_A.to_vec()]);
             let other = LabelRule {
@@ -2044,7 +2049,7 @@ mod url_tests {
                 location: Location::Query("other".into()),
                 ..rule("api.secret.test", port, "/v1")
             };
-            vault.set_resolution("other", crate::secret::granted(other, "grant-2"));
+            vault.set_answer("other", crate::secret::granted(other));
             vault.set_material("other", vec![K_B.to_vec()]);
             let (run, documents) = run_with(
                 &fixture,

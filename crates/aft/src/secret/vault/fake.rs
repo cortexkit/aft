@@ -234,7 +234,8 @@ impl SecretVault for FakeVault {
 }
 
 /// A matching record for an addressed test call.
-pub fn granted(rule: LabelRule) -> FakeReply {
+pub fn granted(mut rule: LabelRule) -> FakeReply {
+    rule.port = 443;
     FakeReply::Rule(rule)
 }
 

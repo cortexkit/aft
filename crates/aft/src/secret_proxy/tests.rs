@@ -10,7 +10,9 @@ use secret_rules::location::Location;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::secret::vault::{AuditError, Material, MaterialError, Resolution};
+use crate::secret::vault::{AuditError, Material, UseAnswer};
+use crate::secret::{ApiKeyTarget, ReleasedApiKey};
+use secret_rules::location::LabelRule;
 
 const K1: &[u8] = b"test-key-12345678";
 const K2: &[u8] = b"rotated-key-987654321";
@@ -18,6 +20,7 @@ const MARKER: &str = "{{ck-secret:test}}";
 const SPECIAL: &[u8] = b"alpha&percent%quote\"slash\\\r\nkey";
 
 struct Vault {
+    rules: Mutex<HashMap<String, LabelRule>>,
     calls: AtomicUsize,
     denied: AtomicBool,
     rotate: AtomicBool,
@@ -33,6 +36,7 @@ struct Vault {
 impl Vault {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            rules: Mutex::default(),
             calls: AtomicUsize::new(0),
             denied: AtomicBool::new(false),
             rotate: AtomicBool::new(false),
@@ -48,16 +52,18 @@ impl Vault {
 }
 
 impl SecretVault for Vault {
-    fn resolve(&self, _: &SecretScope, _: &str) -> Resolution {
-        panic!("proxy must not resolve or file consent")
-    }
-    fn material(
-        &self,
-        scope: &SecretScope,
-        label: &str,
-        _: &str,
-    ) -> Result<Material, MaterialError> {
+    fn use_secret(&self, scope: &SecretScope, label: &str, target: &ApiKeyTarget) -> UseAnswer {
         assert_eq!(scope.reference(), "head");
+        let Some(rule) = self.rules.lock().get(label).cloned() else {
+            return UseAnswer::NotFound;
+        };
+        if rule.host != target.host
+            || !(target.path == rule.path_prefix
+                || target.path.starts_with(&format!("{}/", rule.path_prefix)))
+        {
+            return UseAnswer::NotFound;
+        }
+        let location = crate::secret::vault::fake::location_text(&rule.location);
         let count = self.calls.fetch_add(1, Ordering::SeqCst);
         if self.block_material.load(Ordering::Acquire) {
             self.material_entered.notify_one();
@@ -68,18 +74,24 @@ impl SecretVault for Vault {
         }
         if self.denied.load(Ordering::SeqCst) || self.refused_label.lock().as_deref() == Some(label)
         {
-            return Err(MaterialError::GrantLapsed);
+            return UseAnswer::Unavailable;
         }
         if self.special.load(Ordering::SeqCst) {
-            return Ok(Material::new(SPECIAL.to_vec()));
+            return UseAnswer::Released(ReleasedApiKey::new(
+                location,
+                Material::new(SPECIAL.to_vec()),
+            ));
         }
-        Ok(Material::new(
-            if self.rotate.load(Ordering::SeqCst) && count > 0 {
-                K2
-            } else {
-                K1
-            }
-            .to_vec(),
+        UseAnswer::Released(ReleasedApiKey::new(
+            location,
+            Material::new(
+                if self.rotate.load(Ordering::SeqCst) && count > 0 {
+                    K2
+                } else {
+                    K1
+                }
+                .to_vec(),
+            ),
         ))
     }
     fn audit(&self, record: &secret_rules::audit::AuditRecordV1) -> Result<(), AuditError> {
@@ -99,25 +111,28 @@ fn scope(reference: &str) -> SecretScope {
 }
 
 fn config(vault: Arc<Vault>, port: u16, locations: &[(&str, Location)]) -> ProxyConfig {
+    *vault.rules.lock() = locations
+        .iter()
+        .map(|(label, location)| {
+            (
+                (*label).to_owned(),
+                LabelRule {
+                    label: (*label).to_owned(),
+                    host: "localhost".into(),
+                    port: 443,
+                    path_prefix: "/approved".into(),
+                    location: location.clone(),
+                },
+            )
+        })
+        .collect();
     ProxyConfig {
         vault,
         authorization_scope: scope("head"),
         lifetime_scope: scope("run"),
         scanned_labels: locations.iter().map(|(l, _)| (*l).to_owned()).collect(),
-        grants: locations
-            .iter()
-            .map(|(label, location)| GrantedLabel {
-                rule: LabelRule {
-                    label: (*label).to_owned(),
-                    host: "localhost".into(),
-                    port,
-                    path_prefix: "/approved".into(),
-                    location: location.clone(),
-                    grant_id: "grant".into(),
-                },
-                expires_at_ms: u64::MAX,
-            })
-            .collect(),
+        consent_context: None,
+        test_https_port: Some(port),
         origin: "test-task".into(),
     }
 }
@@ -1251,7 +1266,7 @@ async fn proxy_query_and_json_escape_material_without_partial_header_writes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_expired_grant_refuses_without_material_and_tunnel_closes_on_stop() {
+async fn proxy_unavailable_release_refuses_and_tunnel_closes_on_stop() {
     let server = Server::new("echo-request").await;
     let vault = Vault::new();
     let mut cfg = config(
@@ -1259,7 +1274,7 @@ async fn proxy_expired_grant_refuses_without_material_and_tunnel_closes_on_stop(
         server.address.port(),
         &[("test", Location::Bearer)],
     );
-    cfg.grants[0].expires_at_ms = 0;
+    vault.denied.store(true, Ordering::SeqCst);
     let mut proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
     let mut client = Client::spawn(&proxy, &server);
     proxy.arm_command(client.process.id()).unwrap();
@@ -1412,7 +1427,8 @@ fn proxy_only_accepts_grants_for_the_exact_launch_scan() {
         Some(ProxyError::InvalidRules)
     );
     let mut cfg = make();
-    cfg.grants[0].rule.location = Location::Header("Accept-Encoding".into());
+    vault.rules.lock().get_mut("test").unwrap().location =
+        Location::Header("Accept-Encoding".into());
     assert_eq!(
         SecretProxy::start_with_tls(cfg, tls).err(),
         Some(ProxyError::InvalidRules)

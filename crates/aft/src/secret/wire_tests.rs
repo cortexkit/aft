@@ -429,17 +429,21 @@ fn the_secret_use_client_sends_the_pinned_params_and_reads_a_release() {
     let transport = std::sync::Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
     let vault = SubcSecretVault::new(transport.clone());
     let scope = SecretScope::from_stamp(&golden_stamp());
-    let resolution = vault.resolve(&scope, "key");
-    // A released key at resolution time is reported as a granted rule and the
-    // bytes themselves are dropped (zeroized), per the contract's material rule.
-    let Resolution::Granted { rule, .. } = resolution else {
-        panic!("a release at resolution time is a grant");
+    let answer = vault.use_secret(
+        &scope,
+        "key",
+        &ApiKeyTarget {
+            scheme: "https".into(),
+            host: "x.test".into(),
+            port: Some(443),
+            path: "/repos/a".into(),
+        },
+    );
+    let UseAnswer::Released(released) = answer else {
+        panic!("a release keeps material for this request only");
     };
-    assert_eq!(rule.label, "key");
-    assert!(matches!(
-        rule.location,
-        secret_rules::location::Location::Header(ref name) if name == "X-Api-Key"
-    ));
+    assert_eq!(released.location(), "header:X-Api-Key");
+    assert_eq!(released.material(), b"sk-example");
     let sent = transport.0.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(keys(&sent[0]), set(&["name", "stamp", "target"]));
@@ -463,7 +467,16 @@ fn the_secret_use_client_reports_an_approval_as_pending() {
     }
     let vault = SubcSecretVault::new(std::sync::Arc::new(Pending));
     let scope = SecretScope::from_stamp(&golden_stamp());
-    let Resolution::ApprovalRequired(request) = vault.resolve(&scope, "key") else {
+    let UseAnswer::ApprovalRequired(request) = vault.use_secret(
+        &scope,
+        "key",
+        &ApiKeyTarget {
+            scheme: "https".into(),
+            host: "x.test".into(),
+            port: Some(443),
+            path: "/repos/a".into(),
+        },
+    ) else {
         panic!("an approval_required answer is a pending resolution");
     };
     assert_eq!(request.request_id, "01HF7YAT000000000000000001");
@@ -471,7 +484,7 @@ fn the_secret_use_client_reports_an_approval_as_pending() {
 }
 
 #[test]
-fn the_secret_use_client_maps_the_uniform_not_found_to_a_refusal() {
+fn the_secret_use_client_preserves_uniform_not_found_for_literal_forwarding() {
     struct NotFound;
     impl SecretUseTransport for NotFound {
         fn secret_use(&self, _params: Value) -> Result<Value, String> {
@@ -481,8 +494,17 @@ fn the_secret_use_client_maps_the_uniform_not_found_to_a_refusal() {
     let vault = SubcSecretVault::new(std::sync::Arc::new(NotFound));
     let scope = SecretScope::from_stamp(&golden_stamp());
     assert!(matches!(
-        vault.resolve(&scope, "key"),
-        Resolution::Denied { .. }
+        vault.use_secret(
+            &scope,
+            "key",
+            &ApiKeyTarget {
+                scheme: "https".into(),
+                host: "x.test".into(),
+                port: Some(443),
+                path: "/repos/a".into()
+            }
+        ),
+        UseAnswer::NotFound
     ));
 }
 

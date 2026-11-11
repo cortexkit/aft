@@ -22,12 +22,11 @@ use reqwest::header::{
 use reqwest::redirect::Policy;
 use secret_rules::audit::{AuditReason, AuditRecordV1, Decision};
 use secret_rules::location::{
-    evaluate_request_with_connect, location_kind_token, LabelOutcome, LabelRule, Location,
-    RequestView,
+    evaluate_request_with_connect, LabelOutcome, LabelRule, Location, RequestView,
 };
 use secret_rules::material::{check_admissible, encode_for_location};
 use secret_rules::scrub::{MatcherSet, ScrubError, Scrubber};
-use secret_rules::target::{normalize_request_target, ConnectAuthority, RequestTarget, RuleTarget};
+use secret_rules::target::{normalize_request_target, ConnectAuthority};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -825,6 +824,9 @@ pub struct SecretFetch<'a> {
     pub authorization: Option<crate::secret::SecretScope>,
     /// Every label found in the URL, in order.
     pub labels: Vec<String>,
+    /// Map an ephemeral test upstream to the vault's HTTPS/443 target.
+    #[cfg(test)]
+    pub test_https_port: Option<u16>,
     /// The fetch call's id: audit records name it, plus the hop index.
     pub call_id: String,
 }
@@ -1439,7 +1441,12 @@ fn secret_hop(
         path: String::from_utf8(normalized.wire).map_err(|_| refused(held, "malformed_path"))?,
     };
     for label in &secrets.labels {
-        if authority.port != 443 || !present.contains(label) {
+        let mut https_port = authority.port == 443;
+        #[cfg(test)]
+        {
+            https_port |= secrets.test_https_port == Some(authority.port);
+        }
+        if !https_port || !present.contains(label) {
             continue;
         }
         let answer = match crate::subc::use_current_secret_label(secrets.vault, label, &addressed) {
@@ -1459,7 +1466,7 @@ fn secret_hop(
         if let crate::secret::UseAnswer::Released(released) = answer {
             let (location, material) = released.into_parts();
             let location = secret_rules::location::parse_vault_location(&location)
-                .map_err(|_| refused(held, "missing_material"))?;
+                .ok_or_else(|| refused(held, "missing_material"))?;
             if !matches!(location, Location::Query(_)) {
                 continue;
             }
@@ -1471,7 +1478,7 @@ fn secret_hop(
             rules.push(LabelRule {
                 label: label.clone(),
                 host: addressed.host.clone(),
-                port: 443,
+                port: authority.port,
                 path_prefix: addressed.path.clone(),
                 location,
             });

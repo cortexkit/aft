@@ -3141,8 +3141,18 @@ impl BgTaskRegistry {
             append_remote_report(&mut snapshot.output_preview, &state.metadata);
         }
         #[cfg(unix)]
-        if let Some(runtime) = self.inner.secret_proxies.lock().get(&task.task_id).cloned() {
-            for line in runtime.lock().approval_status() {
+        if let Some(runtime) = self
+            .inner
+            .secret_proxies
+            .lock()
+            .ok()
+            .and_then(|proxies| proxies.get(&task.task_id).cloned())
+        {
+            for line in runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .approval_status()
+            {
                 if !snapshot.output_preview.is_empty() {
                     snapshot.output_preview.push('\n');
                 }

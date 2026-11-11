@@ -62,54 +62,55 @@ async fn audit_transfer_coding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn audit_expiry_revocation_at_send() {
-    for revoke in [false, true] {
-        let server = Server::new("delay-h1").await;
-        let vault = Vault::new();
-        let mut cfg = config(
-            vault.clone(),
-            server.address.port(),
-            &[("test", Location::Bearer)],
+async fn audit_one_addressed_release_is_consumed_by_one_request() {
+    let server = Server::new("delay-h1").await;
+    let vault = Vault::new();
+    let cfg = config(
+        vault.clone(),
+        server.address.port(),
+        &[("test", Location::Bearer)],
+    );
+    let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = std::thread::spawn(move || {
+        let reply = client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            "",
         );
-        let expiry = crate::secret::vault::now_ms() + 2000;
-        if !revoke {
-            cfg.grants[0].expires_at_ms = expiry;
-        }
-        let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
-        let mut client = Client::spawn(&proxy, &server);
-        proxy.arm_command(client.process.id()).unwrap();
-        client.connect(false);
-        let worker = std::thread::spawn(move || {
-            let reply = client.request(
-                "/approved",
-                json!({"authorization":format!("Bearer {MARKER}")}),
-                "",
-            );
-            (reply, client)
-        });
-        tokio::time::timeout(Duration::from_secs(5), server.handshake_seen.notified())
-            .await
-            .unwrap();
-        if revoke {
-            vault.denied.store(true, Ordering::SeqCst);
-        } else {
-            tokio::time::sleep(Duration::from_millis(
-                expiry.saturating_sub(crate::secret::vault::now_ms()) + 20,
-            ))
-            .await;
-        }
-        server.tls_release.notify_one();
-        let (reply, _client) = worker.join().unwrap();
-        assert_eq!(
-            reply["status"], 403,
-            "authorization lapsed during upstream TLS: {reply}"
-        );
-        assert!(server.seen.lock().is_empty());
-        assert_eq!(
-            vault.calls.load(Ordering::SeqCst),
-            if revoke { 1 } else { 0 }
-        );
-    }
+        (reply, client)
+    });
+    tokio::time::timeout(Duration::from_secs(5), server.handshake_seen.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        vault.calls.load(Ordering::SeqCst),
+        1,
+        "ask before opening the upstream"
+    );
+    vault.denied.store(true, Ordering::SeqCst);
+    server.tls_release.notify_one();
+    let (reply, mut client) = worker.join().unwrap();
+    assert_eq!(
+        reply["status"], 200,
+        "the release covers the request already admitted"
+    );
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        403
+    );
+    assert_eq!(server.seen.lock().len(), 1);
+    assert_eq!(
+        vault.calls.load(Ordering::SeqCst),
+        2,
+        "a later request must reach the vault again"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -335,7 +336,7 @@ async fn audit_ipv6_literal() {
         server.address.port(),
         &[("test", Location::Bearer)],
     );
-    cfg.grants[0].rule.host = "[::1]".into();
+    vault.rules.lock().get_mut("test").unwrap().host = "[::1]".into();
     let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
     let mut client = Client::spawn(&proxy, &server);
     proxy.arm_command(client.process.id()).unwrap();

@@ -8,9 +8,9 @@
 
 use super::*;
 use crate::secret::{
-    first_failure, outcome_for, outcome_for_second_resolve, refuse_ineligible, ApprovalRequest,
-    FakeVault, FakeVaultScript, LabelOutcome, Resolution, SecretConsentTransport, SecretVault,
-    SECRETS_UNAVAILABLE, SECRET_REFUSED,
+    first_failure, outcome_for, outcome_for_second_use, refuse_ineligible, ApiKeyTarget,
+    ApprovalRequest, FakeReply, FakeVault, FakeVaultScript, LabelOutcome, SecretConsentTransport,
+    SecretVault, UseAnswer, SECRETS_UNAVAILABLE, SECRET_REFUSED,
 };
 use serde_json::json;
 use std::sync::Mutex as StdMutex;
@@ -375,14 +375,14 @@ fn every_ineligible_form_refuses_with_secret_refused_and_never_resolves() {
         // grant the label is installed, so a launch that reached it would
         // proceed: the counts below are only zero if the seam refused first.
         let vault = FakeVault::new();
-        vault.set_resolution("repo", crate::secret::granted(rule(), "grant-1"));
+        vault.set_answer("repo", crate::secret::granted(rule()));
         vault.set_material("repo", vec![b"first-key-material-1".to_vec()]);
-        let decision = resolve_label_for_launch(&identity, &vault, "repo");
+        let decision = use_label_for_fetch(&identity, &vault, "repo", &target());
         let LaunchDecision::Refuse(outcome) = decision else {
             panic!("{name}: an ineligible scope must refuse, got {decision:?}");
         };
         assert_eq!(outcome.code(), Some(SECRET_REFUSED), "{name}");
-        assert_eq!(vault.resolve_calls(), 0, "{name}: no resolve may happen");
+        assert_eq!(vault.use_calls(), 0, "{name}: no resolve may happen");
         assert_eq!(
             vault.material_calls(),
             0,
@@ -433,8 +433,8 @@ impl SecretConsentTransport for RecordingTransport {
     }
 }
 
-fn approval(request_id: &str) -> Resolution {
-    Resolution::ApprovalRequired(ApprovalRequest {
+fn approval(request_id: &str) -> FakeReply {
+    FakeReply::ApprovalRequired(ApprovalRequest {
         request_id: request_id.into(),
         statement_b64url: "c3RhdGVtZW50".into(),
         expires_at_ms: crate::secret::now_ms() + 60_000,
@@ -444,11 +444,10 @@ fn approval(request_id: &str) -> Resolution {
 fn rule() -> secret_rules::location::LabelRule {
     secret_rules::location::LabelRule {
         label: "repo".into(),
-        host: "api.example.com".into(),
+        host: "x.test".into(),
         port: 443,
-        path_prefix: "/v1".into(),
+        path_prefix: "/repos/a".into(),
         location: secret_rules::location::Location::Bearer,
-        grant_id: "grant-1".into(),
     }
 }
 
@@ -457,7 +456,7 @@ fn a_head_call_goes_pending_then_resolves_again_then_substitutes() {
     let head = head();
     let (scopes, _) = call_scopes(&head).expect("a head call is eligible");
     let mut script = FakeVaultScript::default();
-    script.resolutions.insert("repo".into(), approval("req-1"));
+    script.answers.insert("repo".into(), approval("req-1"));
     script
         .material
         .insert("repo".into(), vec![b"first-key-material-1".to_vec()]);
@@ -470,7 +469,10 @@ fn a_head_call_goes_pending_then_resolves_again_then_substitutes() {
 
     // First resolve: the vault is waiting, so the call is held before a child,
     // a job or a proxy exists.
-    let first = outcome_for("repo", &vault.resolve(&scopes.authorization, "repo"));
+    let first = outcome_for(
+        "repo",
+        &vault.use_secret(&scopes.authorization, "repo", &target()),
+    );
     let LabelOutcome::FileConsent {
         request_id,
         statement_b64url,
@@ -494,21 +496,29 @@ fn a_head_call_goes_pending_then_resolves_again_then_substitutes() {
     // Cingulate's answer alone grants nothing: the vault still refuses until it
     // grants, and only the second resolve decides.
     assert_eq!(
-        outcome_for_second_resolve("repo", &vault.resolve(&scopes.authorization, "repo")).code(),
+        outcome_for_second_use(
+            "repo",
+            &vault.use_secret(&scopes.authorization, "repo", &target())
+        )
+        .code(),
         Some(SECRETS_UNAVAILABLE)
     );
-    vault.set_resolution("repo", crate::secret::granted(rule(), "grant-1"));
-    let second = outcome_for_second_resolve("repo", &vault.resolve(&scopes.authorization, "repo"));
+    vault.set_answer("repo", crate::secret::granted(rule()));
+    let second = outcome_for_second_use(
+        "repo",
+        &vault.use_secret(&scopes.authorization, "repo", &target()),
+    );
     assert!(second.proceeds(), "{second:?}");
 
     // The intercepted request takes its material once, under the lifetime
     // scope, from the grant the head's authorization allowed.
-    let material = vault
-        .material(&scopes.lifetime, "repo", "grant-1")
-        .expect("the grant hands out material");
-    assert_eq!(material.expose(), b"first-key-material-1");
-    assert_eq!(vault.resolve_calls(), 3);
-    assert_eq!(vault.material_calls(), 1);
+    let UseAnswer::Released(material) = vault.use_secret(&scopes.authorization, "repo", &target())
+    else {
+        panic!("addressed release");
+    };
+    assert_eq!(material.material(), b"first-key-material-1");
+    assert_eq!(vault.use_calls(), 4);
+    assert_eq!(vault.material_calls(), 2);
 }
 
 #[test]
@@ -568,60 +578,63 @@ fn approval_reply() -> serde_json::Value {
     }})
 }
 
-// The saved Cingulate 0.12.0 secret-use-approval-v1.1 responses live in
-// crates/aft/tests/fixtures/secret/cingulate-secret-use-v1.1/. These hashes pin
-// the reviewed response bytes independently of the decoder.
+// These requester records are vendored from Cingulate commit 56fa35f2.
+// Independent hashes pin their exact bytes, not a decoder's reconstruction.
 const FILER_VECTORS: &[(&str, &str, &str)] = &[
     (
         "request",
-        include_str!("../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-request.json"),
+        include_str!(
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-request.json"
+        ),
         "be75724519b10547d1baacdee20095f753130251b1519c10342ab19ed42364c9",
     ),
     (
         "request-repeat",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-request-repeat.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-request-repeat.json"
         ),
         "be75724519b10547d1baacdee20095f753130251b1519c10342ab19ed42364c9",
     ),
     (
         "pending",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-pending.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-pending.json"
         ),
         "db39e1458276124efd66694d39f64e0ce34f0811c860b3ac4af2be6e6afbd0e6",
     ),
     (
         "allowed",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-allowed.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-allowed.json"
         ),
         "e5e665b918c4cb19750a8217457497c068eb4fb098df694da5f6dbd18511b286",
     ),
     (
         "partial",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-partial.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-partial.json"
         ),
         "8ebc4ce81712071e97c1a53b471722c1ac83020ed468723b83fcb674785a6b99",
     ),
     (
         "declined",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-declined.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-declined.json"
         ),
         "f49061b64579f5601883bd466aea4d0951915fc4e121c3e1390830003acc0c84",
     ),
     (
         "expired",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-expired.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-expired.json"
         ),
         "95eb5015d42f4e3d059729696f12ac0bfc2447a6f74b24c450bef36a39b0a6c4",
     ),
     (
         "refusals",
-        include_str!("../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-refusals.json"),
+        include_str!(
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-refusals.json"
+        ),
         "66740bda26d96c0abd25e22244965209fcdee04e120bcd4d7214644e0580fa65",
     ),
 ];
@@ -662,21 +675,41 @@ fn secret_filer_vectors_are_pinned_and_decode_the_published_card_states() {
         decode_secret_elicitation(&filer_reply("request").unwrap()),
         Some("el_1")
     );
-    for name in ["allowed", "partial", "declined"] {
+    for name in ["allowed", "partial"] {
         assert_eq!(
-            decode_secret_record(&filer_reply(name).unwrap()),
+            decode_secret_record(&filer_reply(name).unwrap(), "01HF7YAT000000000000000001"),
             ConsentOutcome::Answered,
             "{name}"
         );
     }
     assert_eq!(
-        decode_secret_record(&filer_reply("pending").unwrap()),
+        decode_secret_record(
+            &filer_reply("pending").unwrap(),
+            "01HF7YAT000000000000000001"
+        ),
         ConsentOutcome::Pending
     );
     assert!(matches!(
-        decode_secret_record(&filer_reply("expired").unwrap()),
-        ConsentOutcome::Unavailable { .. }
+        decode_secret_record(
+            &filer_reply("expired").unwrap(),
+            "01HF7YAT000000000000000001"
+        ),
+        ConsentOutcome::Expired
     ));
+    assert_eq!(
+        decode_secret_record(
+            &filer_reply("partial").unwrap(),
+            "01HF7YAT000000000000000002"
+        ),
+        ConsentOutcome::Declined
+    );
+    assert_eq!(
+        decode_secret_record(
+            &filer_reply("declined").unwrap(),
+            "01HF7YAT000000000000000001"
+        ),
+        ConsentOutcome::Declined
+    );
 }
 
 #[derive(Default)]
@@ -770,8 +803,8 @@ fn a_refiled_secret_launch_recovers_the_same_card_and_exact_statement() {
     let vault = crate::secret::SubcSecretVault::new(wire.clone());
     let identity = head();
     for decision in [
-        resolve_label_for_launch(&identity, &vault, "key"),
-        runtime.block_on(async { resolve_label_for_launch(&identity, &vault, "key") }),
+        use_label_for_fetch(&identity, &vault, "key", &target()),
+        runtime.block_on(async { use_label_for_fetch(&identity, &vault, "key", &target()) }),
     ] {
         assert!(matches!(decision, LaunchDecision::Pending(_)));
     }
@@ -806,7 +839,7 @@ fn a_refiled_secret_launch_recovers_the_same_card_and_exact_statement() {
 }
 
 #[test]
-fn secret_allow_partial_and_decline_retry_secret_use_and_only_the_vault_decides() {
+fn secret_allow_and_allowed_partial_retry_but_decline_never_retries() {
     let runtime = secret_consent_runtime();
     for state in ["allowed", "partial", "declined"] {
         for (reply, expected_code) in [
@@ -816,7 +849,7 @@ fn secret_allow_partial_and_decline_retry_secret_use_and_only_the_vault_decides(
             ),
             (
                 json!({"result": {"error": {"code": "not_found", "class": "permanent"}}}),
-                Some(SECRET_REFUSED),
+                None,
             ),
             (approval_reply(), Some(SECRETS_UNAVAILABLE)),
         ] {
@@ -828,7 +861,16 @@ fn secret_allow_partial_and_decline_retry_secret_use_and_only_the_vault_decides(
             let wire = secret_use_script(vec![approval_reply(), reply]);
             let vault = crate::secret::SubcSecretVault::new(wire.clone());
             let identity = head();
-            let decision = resolve_label_for_launch(&identity, &vault, "key");
+            let decision = use_label_for_fetch(&identity, &vault, "key", &target());
+            if state == "declined" {
+                assert!(matches!(decision, LaunchDecision::Refuse(_)));
+                assert_eq!(
+                    wire.calls.lock().unwrap().len(),
+                    1,
+                    "a decline is final, without another vault call"
+                );
+                continue;
+            }
             match expected_code {
                 None => assert!(
                     matches!(decision, LaunchDecision::Proceed { .. }),
@@ -878,7 +920,8 @@ fn expired_or_refused_secret_cards_end_the_launch_without_retrying_the_vault() {
         let _guard = install_cards(&runtime, cards.clone());
         let wire = secret_use_script(vec![approval_reply()]);
         let vault = crate::secret::SubcSecretVault::new(wire.clone());
-        let LaunchDecision::Refuse(outcome) = resolve_label_for_launch(&head(), &vault, "key")
+        let LaunchDecision::Refuse(outcome) =
+            use_label_for_fetch(&head(), &vault, "key", &target())
         else {
             panic!("an expired or refused card cannot start a launch")
         };
@@ -899,14 +942,13 @@ fn secret_cards_reject_unknown_or_permission_reply_shapes() {
     for record in [
         json!({"kind": "secret_use", "state": "granted"}),
         json!({"kind": "secret_use", "state": "declined"}),
-        json!({"kind": "secret_use", "state": "withdrawn"}),
         json!({"kind": "secret_use", "state": "settled", "outcome": "allow_once"}),
         json!({"kind": "tool_permission", "state": "granted"}),
         json!({"kind": "secret_use", "state": "future"}),
         json!({"state": "granted"}),
     ] {
         assert!(matches!(
-            decode_secret_record(&record),
+            decode_secret_record(&record, "01HF7YAT000000000000000001"),
             ConsentOutcome::Unavailable { .. }
         ));
     }
@@ -929,7 +971,8 @@ fn withholding_a_secret_card_fails_closed_without_an_unsupported_method() {
     let _guard = install_cards(&runtime, cards.clone());
     let wire = secret_use_script(vec![approval_reply()]);
     let vault = crate::secret::SubcSecretVault::new(wire);
-    let LaunchDecision::Pending(pending) = resolve_label_for_launch(&head(), &vault, "key") else {
+    let LaunchDecision::Pending(pending) = use_label_for_fetch(&head(), &vault, "key", &target())
+    else {
         panic!("the card is pending")
     };
     assert!(matches!(
@@ -975,11 +1018,14 @@ fn the_production_vault_ends_an_eligible_launch_with_secrets_unavailable() {
     let (scopes, _) = call_scopes(&head()).expect("a head call is eligible");
     let vault = crate::secret::UnavailableVault;
     assert_eq!(
-        vault.resolve(&scopes.authorization, "repo"),
-        Resolution::Unavailable
+        matches!(
+            vault.use_secret(&scopes.authorization, "repo", &target()),
+            UseAnswer::Unavailable
+        ),
+        true
     );
     assert_eq!(
-        crate::secret::outcome_for("repo", &Resolution::Unavailable).code(),
+        crate::secret::outcome_for("repo", &UseAnswer::Unavailable).code(),
         Some(SECRETS_UNAVAILABLE)
     );
 }
@@ -990,7 +1036,7 @@ fn the_production_vault_never_hardens_the_process() {
     // own /proc counters. A vault that can never release a key must not
     // trigger it, even when an eligible launch names a placeholder.
     let LaunchDecision::Refuse(outcome) =
-        resolve_label_for_launch(&head(), &crate::secret::UnavailableVault, "repo")
+        use_label_for_fetch(&head(), &crate::secret::UnavailableVault, "repo", &target())
     else {
         panic!("the production vault refuses every launch")
     };
@@ -1122,12 +1168,60 @@ fn a_run_bound_to_an_unauthorized_head_stamp_is_ineligible() {
     assert_eq!(call_scopes(&run), Err(Ineligibility::HeadScopeNotAlfonso));
 
     let vault = FakeVault::new();
-    vault.set_resolution("repo", crate::secret::granted(rule(), "grant-1"));
-    let decision = resolve_label_for_launch(&run, &vault, "repo");
+    vault.set_answer("repo", crate::secret::granted(rule()));
+    let decision = use_label_for_fetch(&run, &vault, "repo", &target());
     let LaunchDecision::Refuse(outcome) = decision else {
         panic!("an unauthorized head stamp must refuse, got {decision:?}");
     };
     assert_eq!(outcome.code(), Some(SECRET_REFUSED));
-    assert_eq!(vault.resolve_calls(), 0);
+    assert_eq!(vault.use_calls(), 0);
     assert_eq!(vault.material_calls(), 0);
+}
+
+fn target() -> ApiKeyTarget {
+    ApiKeyTarget {
+        scheme: "https".into(),
+        host: "x.test".into(),
+        port: Some(443),
+        path: "/repos/a".into(),
+    }
+}
+
+#[test]
+fn every_vendored_secret_approval_sample_matches_its_source_checksum_and_decodes() {
+    use sha2::{Digest, Sha256};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/cingulate-secret-use-approval-v1");
+    let manifest =
+        include_str!("../../../../test-vectors/cingulate-secret-use-approval-v1/SHA256SUMS");
+    let mut count = 0;
+    for line in manifest.lines() {
+        let (hash, name) = line.split_once("  ").unwrap();
+        let bytes = std::fs::read(root.join(name)).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), hash, "{name}");
+        if name.ends_with(".json") {
+            let sample: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(sample.is_object(), "{name}");
+            if name.starts_with("filer-await-") {
+                let outcome =
+                    decode_secret_record(&sample["reply"]["result"], "01HF7YAT000000000000000001");
+                assert!(
+                    !matches!(outcome, ConsentOutcome::Unavailable { .. }),
+                    "{name}"
+                );
+            }
+        }
+        count += 1;
+    }
+    assert_eq!(count, 12);
+    let fallback = json!({"kind":"secret_use", "state":"answered", "answered_choice_id":"allow", "secret_use_answer":{"decision":"allow"}});
+    assert_eq!(
+        decode_secret_record(&fallback, "one"),
+        ConsentOutcome::Answered
+    );
+    let withdrawn = json!({"kind":"secret_use", "state":"withdrawn"});
+    assert_eq!(
+        decode_secret_record(&withdrawn, "one"),
+        ConsentOutcome::Expired
+    );
 }

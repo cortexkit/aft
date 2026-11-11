@@ -1,7 +1,6 @@
 use super::*;
 use crate::protocol::RawRequest;
-use crate::secret::{Material, MaterialError, Resolution};
-use secret_rules::location::{LabelRule, Location};
+use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -36,7 +35,12 @@ impl Vault {
 const KEY: &[u8] = b"s4-test-api-key-0123456789";
 
 impl SecretVault for Vault {
-    fn resolve(&self, scope: &crate::secret::SecretScope, label: &str) -> Resolution {
+    fn use_secret(
+        &self,
+        scope: &crate::secret::SecretScope,
+        label: &str,
+        target: &ApiKeyTarget,
+    ) -> UseAnswer {
         #[cfg(unix)]
         {
             assert!(
@@ -64,25 +68,13 @@ impl SecretVault for Vault {
             .lock()
             .unwrap()
             .push(scope.kind().to_owned());
-        Resolution::Granted {
-            rule: LabelRule {
-                label: label.into(),
-                host: "localhost".into(),
-                port: self.port,
-                path_prefix: "/api".into(),
-                location: Location::Bearer,
-                grant_id: "grant".into(),
-            },
-            grant_id: "grant".into(),
-            expires_at_ms: u64::MAX,
+        if target.scheme != "https"
+            || target.host != "localhost"
+            || target.port != Some(443)
+            || target.path != "/api"
+        {
+            return UseAnswer::NotFound;
         }
-    }
-    fn material(
-        &self,
-        scope: &crate::secret::SecretScope,
-        label: &str,
-        grant_id: &str,
-    ) -> Result<Material, MaterialError> {
         self.materials.fetch_add(1, Ordering::SeqCst);
         assert_eq!(scope.reference(), "secret-bash");
         assert_eq!(scope.owner(), "reserved:prefrontal-core");
@@ -91,12 +83,14 @@ impl SecretVault for Vault {
             self.expected_epoch.load(Ordering::SeqCst)
         );
         assert_eq!(label, "test");
-        assert_eq!(grant_id, "grant");
         self.material_kinds
             .lock()
             .unwrap()
             .push(scope.kind().to_owned());
-        Ok(Material::new(KEY.to_vec()))
+        UseAnswer::Released(ReleasedApiKey::new(
+            "authorization_bearer".into(),
+            Material::new(KEY.to_vec()),
+        ))
     }
     fn audit(
         &self,

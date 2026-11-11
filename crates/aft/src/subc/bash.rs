@@ -4880,21 +4880,13 @@ mod grant_path_tests {
     }
 
     fn secret_bash_scope_probe(req: RawRequest, _: &AppContext) -> Response {
-        use crate::secret::{Material, MaterialError, Resolution, SecretScope, SecretVault};
+        use crate::secret::{ApiKeyTarget, SecretScope, SecretVault, UseAnswer};
         struct Vault(std::sync::atomic::AtomicUsize);
         impl SecretVault for Vault {
-            fn resolve(&self, scope: &SecretScope, _: &str) -> Resolution {
+            fn use_secret(&self, scope: &SecretScope, _: &str, _: &ApiKeyTarget) -> UseAnswer {
                 assert_eq!(scope.reference(), "secret-bash");
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Resolution::Unavailable
-            }
-            fn material(
-                &self,
-                _: &SecretScope,
-                _: &str,
-                _: &str,
-            ) -> Result<Material, MaterialError> {
-                panic!("launch must not request material")
+                UseAnswer::Unavailable
             }
             fn audit(
                 &self,
@@ -4904,7 +4896,16 @@ mod grant_path_tests {
             }
         }
         let vault = Vault(std::sync::atomic::AtomicUsize::new(0));
-        let decision = super::super::secret_consent::resolve_current_secret_label(&vault, "test");
+        let decision = super::super::secret_consent::use_current_secret_label(
+            &vault,
+            "test",
+            &ApiKeyTarget {
+                scheme: "https".into(),
+                host: "x.test".into(),
+                port: Some(443),
+                path: "/repos/a".into(),
+            },
+        );
         let super::super::secret_consent::LaunchDecision::Refuse(outcome) = decision else {
             panic!("unavailable vault must refuse");
         };

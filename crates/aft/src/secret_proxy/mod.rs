@@ -75,7 +75,6 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::Mutex;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
-use secret_rules::location::Location;
 use secret_rules::scrub::{MatcherSet, Scrubber};
 use secret_rules::target::ConnectAuthority;
 use tokio::net::{TcpListener, TcpStream};
