@@ -625,8 +625,8 @@ impl Capture {
     fn verified_file(
         &self,
         path: &Path,
-    ) -> Result<Option<crate::commands::file_read_exact::OpenedFile>, ()> {
-        use crate::commands::file_read_exact::{open_no_follow, opened_location, ReadExactRefusal};
+    ) -> Result<Option<crate::file_read_exact::OpenedFile>, ()> {
+        use crate::file_read_exact::{open_no_follow, opened_location, ReadExactRefusal};
         let policy = self.read_policy.as_ref().ok_or(())?;
         let root = self.root.canonicalize().map_err(|_| ())?;
         let target = root.join(path);
