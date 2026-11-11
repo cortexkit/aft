@@ -316,8 +316,8 @@ pub(crate) mod tests {
                 key: key.clone(),
                 daemon_id,
                 pid: std::process::id(),
-        // The SDK requires daemon 0.39+ to open a management route without
-        // specifying a project.
+                // The SDK requires daemon 0.39+ to open a management route without
+                // specifying a project.
                 daemon_ver: "0.39.0".into(),
             },
         )
