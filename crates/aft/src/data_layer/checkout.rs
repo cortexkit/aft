@@ -1510,6 +1510,14 @@ impl Checkout {
         measure: bool,
         reservation: BuildReservation,
     ) -> Result<BuildReport, DataError> {
+        // A refresh already inside the engine finishes first. The reservation
+        // blocks new refreshes, so no decoded engine overlaps the cold scan.
+        let mut engine = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *engine = None;
+        drop(engine);
         let _alloc_label =
             crate::alloc_trace::scope(crate::alloc_trace::Label::INDEX_BUILD, Some(&self.root));
         let result = self.build_inner(measure);
@@ -1979,8 +1987,9 @@ impl Checkout {
     }
 
     /// A cold scan can reuse content already extracted by an aborted update.
-    /// Looking only at initialized values preserves the pre-extraction cutoff;
-    /// the scan still checks the on-disk content key before using a record.
+    /// Reading this cache must not start parsing: a batch rejected before
+    /// extraction should reach the cold scan unparsed. The scan looks up each
+    /// record by its on-disk content and extractor key.
     fn ready_change_records(&self) -> HashMap<String, Arc<EncodedRecord>> {
         #[cfg(feature = "test-hooks")]
         if std::env::var_os("PROBE_SKIP_HANDOFF").is_some() {

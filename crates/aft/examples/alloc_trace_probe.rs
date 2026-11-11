@@ -55,6 +55,12 @@
 //! refreshes print the block reads they made through the layer's cache.
 //! With `PROBE_TRIM=1`, `refresh` hands the allocator's free memory back
 //! before the restart's refresh.
+//!
+//! `transition` compares two exported source trees. `PROBE_STAGES=1` counts
+//! the live Rust heap at each stage; `PROBE_STAGE_TIMING=1` reports stage
+//! wall/CPU times without those counting atomics. Both require `test-hooks`.
+//! `PROBE_SKIP_HANDOFF=1` disables pending-record reuse for a timing control;
+//! `PROBE_COMPARE=1` compares every resulting engine record with a cold build.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 

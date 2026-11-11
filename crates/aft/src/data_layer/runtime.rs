@@ -540,6 +540,14 @@ impl Work {
                     work.notify_status_change();
                 }
                 if matches!(result, Ok(Some(_))) {
+                    if result
+                        .as_ref()
+                        .is_ok_and(|stats| stats.as_ref().is_some_and(|stats| stats.cold_build))
+                    {
+                        // A cold fallback already published its content, just
+                        // as start_build does, so meaning search can fill it.
+                        work.start_fill();
+                    }
                     continue;
                 }
                 match &result {
