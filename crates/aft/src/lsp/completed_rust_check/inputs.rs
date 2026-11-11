@@ -347,8 +347,11 @@ impl FileFacts {
                 )?;
                 continue;
             }
-            if node.kind() == "identifier" {
-                self.references.insert(node.utf8_text(bytes).ok()?.into());
+            if node.kind() == "use_as_clause" {
+                // Renaming can hide an invocation's original macro name.
+                // Ordinary imports preserve the name used by the resolver.
+                let original = node.child_by_field_name("path")?.utf8_text(bytes).ok()?;
+                self.references.insert(original.rsplit("::").next()?.into());
             }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {

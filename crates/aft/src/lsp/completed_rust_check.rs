@@ -2792,6 +2792,32 @@ mod tests {
     }
 
     #[test]
+    fn macro_reexports_without_renaming_keep_exact_invocations() {
+        let (_temp, mut cache) = fixture();
+        write(&cache.root, "member/data/a.txt", "before");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            r#"
+            macro_rules! fixture { ($name:literal) => { include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/", $name)) }; }
+            pub(crate) use fixture;
+        "#,
+        );
+        write(
+            &cache.root,
+            "member/tests/check.rs",
+            r#"
+            use member::fixture;
+            const DATA: &str = member::fixture!("a.txt");
+        "#,
+        );
+        cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
+        assert!(valid(&cache).is_some());
+        write(&cache.root, "member/data/a.txt", "after!");
+        assert!(valid(&cache).is_none());
+    }
+
+    #[test]
     fn unresolved_include_names_its_source_with_approved_wording() {
         let (_temp, cache) = fixture();
         for source in [
