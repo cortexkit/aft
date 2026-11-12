@@ -2595,7 +2595,13 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
         "persisted report missing: {restarted:#}"
     );
     assert_eq!(runs(), 1, "cold manager must reuse the persisted check");
-    std::fs::write(&lib, "include!(concat!(\"\", \"borrow.rs\"));\n").unwrap();
+    // Direct concat! includes are fingerprinted. Forwarding a computed expr
+    // through a local macro still requires a provisional compiler report.
+    std::fs::write(
+        &lib,
+        "macro_rules! include_file { ($path:expr) => { include!($path); }; }\ninclude_file!(concat!(\"bor\", \"row.rs\"));\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("src/borrow.rs"),
         "pub fn f() { let s = String::new(); let moved = s; println!(\"{}\", s); drop(moved); }\n",

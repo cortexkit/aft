@@ -13779,6 +13779,27 @@ mod callgraph_store_for_ops_tests {
                 .any(|gap| gap["path"] == path)
     }
 
+    #[test]
+    fn empty_watcher_drains_do_not_advance_the_pending_capture_fence() {
+        let (_dirs, ctx) = cold_build_context();
+        ctx.set_canonical_cache_root(
+            std::fs::canonicalize(ctx.config().project_root.as_ref().unwrap()).unwrap(),
+        );
+        let (_tx, rx) = crate::watcher_filter::watcher_dispatch_channel();
+        for receiver in [None, Some(rx)] {
+            *ctx.watcher_rx().lock() = receiver;
+            let activity = ctx.watcher_drain_activity.load(Ordering::Acquire);
+            let outcome = crate::runtime_drain::drain_watcher_events_bounded(&ctx, 1);
+            assert_eq!(outcome, crate::runtime_drain::DrainBatchOutcome::default());
+            assert_eq!(
+                ctx.watcher_drain_activity.load(Ordering::Acquire),
+                activity,
+                "an empty maintenance pass must not mark a concurrent grep incomplete"
+            );
+            assert!(!ctx.watcher_query_has_pending_changes());
+        }
+    }
+
     /// The watcher thread hands a flush window's files to the dispatch
     /// channel and only then clears the window. A flush that lands while an
     /// answer is capturing what is pending must not hide the file from both

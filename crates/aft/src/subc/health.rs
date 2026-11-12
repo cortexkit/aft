@@ -4928,6 +4928,62 @@ mod tests {
     }
 
     #[test]
+    fn health_budget_bounds_failed_store_names_with_long_roots() {
+        use crate::data_layer::surfaces::{reason, DataStoreHealth};
+        let paths = (0..50)
+            .map(|index| format!("/long-health-root/{}/{index:02}", "parent-".repeat(26)))
+            .collect::<Vec<_>>();
+        let store = DataStoreHealth {
+            skipped_folders: 0,
+            skipped_folder_note: None,
+            reason: Some(reason::BIND_FAILED),
+            error: Some(format!("could not bind {}", paths[0].repeat(3))),
+            pending_edits: 0,
+            unparsed_files: 0,
+            failure: None,
+        };
+        let failed =
+            DataStoreFailedRoots::collect(paths.iter().map(|path| (path.as_str(), &store)));
+        let mut metrics = json!({
+            "root_count": 50, "root_details_omitted": 49,
+            "roots": [{
+                "project_root": paths[0], "state": "degraded", "data_store": store
+            }],
+            // Fixed live counters already use most of the budget in a real
+            // report; failed-root names and error paths must yield before them.
+            "fresh_liveness": "x".repeat(11000)
+        });
+        failed.insert_into(&mut metrics);
+        let metrics = metrics.as_object_mut().unwrap();
+        assert!(refresh_metrics_bytes(metrics) > HEALTH_METRICS_BUDGET_BYTES);
+        budget_health_metrics(metrics);
+        let bytes = serde_json::to_vec(metrics).unwrap().len();
+        assert!(bytes <= HEALTH_METRICS_BUDGET_BYTES, "{bytes}");
+        assert_eq!(metrics["metrics_bytes"], bytes);
+        assert_eq!(metrics["data_store_failed_roots"], 50);
+        let names = metrics["data_store_failed"].as_array().unwrap();
+        assert_eq!(
+            names.len() as u64 + metrics["data_store_failed_omitted"].as_u64().unwrap(),
+            50
+        );
+        for (entry, path) in names.iter().zip(&paths) {
+            assert_eq!(entry["reason"], reason::BIND_FAILED);
+            assert!(entry["project_root"]
+                .as_str()
+                .unwrap()
+                .contains(blake3::hash(path.as_bytes()).to_hex().as_str()));
+        }
+        assert_eq!(
+            metrics["roots"][0]["data_store"]["reason"],
+            reason::BIND_FAILED
+        );
+        assert_eq!(metrics["fresh_liveness"].as_str().unwrap().len(), 11000);
+        let once = metrics.clone();
+        budget_health_metrics(metrics);
+        assert_eq!(*metrics, once, "budgeting must be idempotent");
+    }
+
+    #[test]
     fn health_budget_drops_healthy_roots_before_degraded_refused_and_standing_rows() {
         for (detail_bytes, expected) in [
             (

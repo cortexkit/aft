@@ -199,7 +199,7 @@ fn status_inventory_rereads_metadata_replaced_with_same_size_and_mtime() {
     // directory name, so the stack no longer counts.
     let meta = meta_path(&store, SESSION, &paths[0]);
     let before = fs::metadata(&meta).unwrap();
-    let original = paths[0].display().to_string();
+    let original = fs::canonicalize(&paths[0]).unwrap().display().to_string();
     let renamed = format!("{}x", &original[..original.len() - 1]);
     let mut value: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&meta).unwrap()).unwrap();

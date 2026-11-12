@@ -8382,6 +8382,48 @@ async fn read_raw_inventory_frame(stream: &mut tokio::net::TcpStream, label: &st
         .unwrap_or_else(|| panic!("EOF waiting for {label}"))
 }
 
+async fn accept_status_consumer(
+    listener: &TcpListener,
+    key: &[u8],
+    daemon_id: &[u8; subc_transport::DAEMON_ID_LEN],
+) -> (tokio::net::TcpStream, Frame) {
+    loop {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("fleet consumer connection timeout")
+            .expect("accept consumer");
+        authenticate_server(
+            &mut stream,
+            key,
+            daemon_id,
+            FAKE_DAEMON_VERSION,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("authenticate consumer");
+        let first = read_raw_inventory_frame(&mut stream, "consumer request").await;
+        if frame_operation(&first).as_deref() == Some("route.open") {
+            // The default-enabled GitHub shim also connects at startup. This
+            // daemon has no vault; refuse its manifest route, not the fleet dial.
+            let body: Value = serde_json::from_slice(&first.body).expect("manifest route body");
+            assert_eq!(first.header.ty, FrameType::Request);
+            assert_eq!(first.header.channel, 0);
+            assert_eq!(
+                body["target"],
+                json!({ "kind": "management_surface", "module_id": "claustrum" })
+            );
+            assert_eq!(
+                body["identity"],
+                json!({ "harness": "aft-manifest-sync", "session": "daemon" })
+            );
+            send_channel_zero_error(&mut stream, first.header.corr, "target_unavailable").await;
+            continue;
+        }
+        assert_eq!(frame_operation(&first).as_deref(), Some("catalog.list"));
+        return (stream, first);
+    }
+}
+
 fn frame_operation(frame: &Frame) -> Option<String> {
     serde_json::from_slice::<Value>(&frame.body)
         .ok()
@@ -8626,9 +8668,9 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
     // consumer actually connects. Finish each response before stopping so no
     // partial supervision-frame read is cancelled when the connection arrives.
     let (connected_tx, mut connected_rx) = tokio::sync::oneshot::channel();
-    let ((mut consumer_stream, _), ()) = tokio::join!(
+    let ((mut consumer_stream, catalog), ()) = tokio::join!(
         async {
-            let accepted = listener.accept().await.expect("accept fleet consumer");
+            let accepted = accept_status_consumer(&listener, &key, &daemon_id).await;
             connected_tx.send(()).expect("status signal driver active");
             accepted
         },
@@ -8664,17 +8706,6 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
             }
         }
     );
-    authenticate_server(
-        &mut consumer_stream,
-        &key,
-        &daemon_id,
-        FAKE_DAEMON_VERSION,
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("authenticate fleet consumer");
-
-    let catalog = read_raw_inventory_frame(&mut consumer_stream, "catalog.list").await;
     assert_eq!(frame_operation(&catalog).as_deref(), Some("catalog.list"));
     send_frame(
         &mut consumer_stream,
@@ -8895,21 +8926,7 @@ impl FakeStatusHolder {
         daemon_id: &[u8; subc_transport::DAEMON_ID_LEN],
         root: &std::path::Path,
     ) -> Self {
-        let (mut consumer_stream, _) =
-            tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("fleet consumer connection timeout")
-                .expect("accept fleet consumer");
-        authenticate_server(
-            &mut consumer_stream,
-            key,
-            daemon_id,
-            FAKE_DAEMON_VERSION,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("authenticate fleet consumer");
-        let catalog = read_raw_inventory_frame(&mut consumer_stream, "catalog.list").await;
+        let (mut consumer_stream, catalog) = accept_status_consumer(listener, key, daemon_id).await;
         assert_eq!(frame_operation(&catalog).as_deref(), Some("catalog.list"));
         reply_to(&mut consumer_stream, &catalog, holder_catalog()).await;
         let route_open = read_raw_inventory_frame(&mut consumer_stream, "route.open").await;
