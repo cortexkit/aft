@@ -3681,19 +3681,26 @@ pub(super) async fn macos_permissions(
     let program = "ck-aft";
     for observation in observations {
         let folder = observation.folder.to_string_lossy().into_owned();
-        let row: Option<(String, String, String, Option<String>)> = {
-            let conn = db
+        let read_db = Arc::clone(&db);
+        let read_folder = folder.clone();
+        let read_stamp = stamp.clone();
+        let read_identity = identity.clone();
+        let readable = observation.readable;
+        let row: Option<(String, String, String, Option<String>)> = tokio::task::spawn_blocking(move || {
+            let conn = read_db
                 .lock()
                 .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
-            if !observation.readable {
+            if !readable {
                 // The existing database column is not a wire idempotency key:
                 // informational cards use only the folder/program pair.
-                conn.execute("INSERT OR IGNORE INTO macos_permission_cards(folder,program,call_key,selector,project_root,session) VALUES (?1,?2,'',?3,?4,?5)", params![folder,program,serde_json::to_string(&selector(stamp)).expect("selector serializes"),identity.project_root.to_string_lossy(),identity.session])
+                conn.execute("INSERT OR IGNORE INTO macos_permission_cards(folder,program,call_key,selector,project_root,session) VALUES (?1,?2,'',?3,?4,?5)", params![read_folder,program,serde_json::to_string(&selector(&read_stamp)).expect("selector serializes"),read_identity.project_root.to_string_lossy(),read_identity.session])
                     .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
             }
-            conn.query_row("SELECT selector,project_root,session,elicitation_id FROM macos_permission_cards WHERE folder=?1 AND program=?2", params![folder,program], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()
-                .map_err(|e| ConsentError::Unavailable(e.to_string()))?
-        };
+            conn.query_row("SELECT selector,project_root,session,elicitation_id FROM macos_permission_cards WHERE folder=?1 AND program=?2", params![read_folder,program], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()
+                .map_err(|e| ConsentError::Unavailable(e.to_string()))
+        })
+        .await
+        .map_err(|e| ConsentError::Unavailable(e.to_string()))??;
         let Some((scope, root, session, id)) = row else {
             continue;
         };
@@ -3729,15 +3736,28 @@ pub(super) async fn macos_permissions(
                         // produce a permission answer. Remove the unpublished
                         // local row and preserve the named refusal for logging,
                         // without changing the tool's macos_permission_denied result.
-                        db.lock().map_err(|e| ConsentError::Unavailable(e.to_string()))?.execute("DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2 AND elicitation_id IS NULL", params![folder,program])
-                            .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+                        let delete_db = Arc::clone(&db);
+                        let delete_folder = folder.clone();
+                        tokio::task::spawn_blocking(move || {
+                            delete_db.lock().map_err(|e| ConsentError::Unavailable(e.to_string()))?.execute("DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2 AND elicitation_id IS NULL", params![delete_folder,program])
+                                .map_err(|e| ConsentError::Unavailable(e.to_string()))
+                        })
+                        .await
+                        .map_err(|e| ConsentError::Unavailable(e.to_string()))??;
                         return Err(error);
                     }
                     result => result?,
                 };
                 let id = decode_elicitation_id(&result)?;
-                db.lock().map_err(|e| ConsentError::Unavailable(e.to_string()))?.execute("UPDATE macos_permission_cards SET elicitation_id=?3 WHERE folder=?1 AND program=?2", params![folder,program,id])
-                    .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+                let update_db = Arc::clone(&db);
+                let update_folder = folder.clone();
+                let update_id = id.clone();
+                tokio::task::spawn_blocking(move || {
+                    update_db.lock().map_err(|e| ConsentError::Unavailable(e.to_string()))?.execute("UPDATE macos_permission_cards SET elicitation_id=?3 WHERE folder=?1 AND program=?2", params![update_folder,program,update_id])
+                        .map_err(|e| ConsentError::Unavailable(e.to_string()))
+                })
+                .await
+                .map_err(|e| ConsentError::Unavailable(e.to_string()))??;
                 id
             }
         };
@@ -3757,13 +3777,19 @@ pub(super) async fn macos_permissions(
             .map_err(|_| {
                 ConsentError::Unavailable("macOS permission card withdrawal timed out".into())
             })??;
-            db.lock()
-                .map_err(|e| ConsentError::Unavailable(e.to_string()))?
-                .execute(
-                    "DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2",
-                    params![folder, program],
-                )
-                .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+            let delete_db = Arc::clone(&db);
+            tokio::task::spawn_blocking(move || {
+                delete_db
+                    .lock()
+                    .map_err(|e| ConsentError::Unavailable(e.to_string()))?
+                    .execute(
+                        "DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2",
+                        params![folder, program],
+                    )
+                    .map_err(|e| ConsentError::Unavailable(e.to_string()))
+            })
+            .await
+            .map_err(|e| ConsentError::Unavailable(e.to_string()))??;
         }
     }
     Ok(())

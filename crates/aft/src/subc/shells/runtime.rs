@@ -315,13 +315,16 @@ impl Service {
         drop(state);
         let unknown_agent_ids = if let Some(agents) = params.agent_ids {
             let db = self.app.db();
-            let known = db
-                .and_then(|db| {
+            let known = tokio::task::spawn_blocking(move || {
+                db.and_then(|db| {
                     db.lock()
                         .ok()
                         .and_then(|conn| crate::db::access_grant_rows::known_agent_ids(&conn).ok())
                 })
-                .unwrap_or_default();
+                .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
             let unknown: Vec<_> = agents
                 .into_iter()
                 .filter(|id| !known.contains(id))

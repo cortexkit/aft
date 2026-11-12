@@ -6297,6 +6297,158 @@ async fn macos_permission_cards_deduplicate_and_withdraw_on_readable_probe() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn macos_permissions_db_contention_does_not_block_runtime_polling() {
+    #[derive(Clone, Copy, Debug)]
+    enum Stage {
+        Read,
+        RefusalDelete,
+        Update,
+        WithdrawalDelete,
+    }
+
+    struct LockBeforeWrite {
+        stage: Stage,
+        fake: Arc<FakeCingulate>,
+        acquire: std::sync::mpsc::Sender<()>,
+        acquired: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        waiting: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl ConsentTransport for LockBeforeWrite {
+        fn call(&self, call: ConsentCall) -> ConsentFuture {
+            let expected = if matches!(self.stage, Stage::WithdrawalDelete) {
+                "consent.withdraw"
+            } else {
+                "consent.request"
+            };
+            assert_eq!(call.method, expected);
+            let response = if matches!(self.stage, Stage::RefusalDelete) {
+                Err(fake_refusal("access_macos_only", "macOS is required"))
+            } else {
+                self.fake
+                    .reply(call.method, &call.params)
+                    .map(Option::unwrap)
+            };
+            self.acquire.send(()).unwrap();
+            let acquired = self.acquired.lock().unwrap().take().unwrap();
+            let waiting = self.waiting.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                acquired.await.unwrap();
+                waiting.send(()).unwrap();
+                response
+            })
+        }
+    }
+
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for stage in [
+        Stage::Read,
+        Stage::RefusalDelete,
+        Stage::Update,
+        Stage::WithdrawalDelete,
+    ] {
+        let f = fixture(FakeCingulate::up());
+        let db = f.ctx.db().unwrap();
+        let folder = f.dir.path().join("protected");
+        if matches!(stage, Stage::WithdrawalDelete) {
+            macos_permissions(
+                Arc::clone(&db),
+                f.head.clone(),
+                vec![crate::bounded_io::PermissionObservation {
+                    folder: folder.clone(),
+                    readable: false,
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        let (acquire, requested) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let holder_db = Arc::clone(&db);
+        let holder = std::thread::spawn(move || {
+            requested.recv_timeout(Duration::from_secs(2)).unwrap();
+            let _guard = holder_db.lock().unwrap();
+            locked.send(()).unwrap();
+            // Bound a runtime-blocking regression even when its timer cannot run.
+            released.recv_timeout(Duration::from_secs(2)).is_ok()
+        });
+        let waiting = if matches!(stage, Stage::Read) {
+            acquire.send(()).unwrap();
+            acquired.await.unwrap();
+            None
+        } else {
+            let (waiting, started) = tokio::sync::oneshot::channel();
+            install_test_transport(Some(Arc::new(LockBeforeWrite {
+                stage,
+                fake: Arc::clone(&f.fake),
+                acquire,
+                acquired: StdMutex::new(Some(acquired)),
+                waiting: StdMutex::new(Some(waiting)),
+            })));
+            Some(started)
+        };
+        let start = Instant::now();
+        let mut permission = tokio::spawn(macos_permissions(
+            Arc::clone(&db),
+            f.head.clone(),
+            vec![crate::bounded_io::PermissionObservation {
+                folder,
+                readable: matches!(stage, Stage::WithdrawalDelete),
+            }],
+        ));
+        if let Some(waiting) = waiting {
+            tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .expect("permission transport reached the database write")
+                .unwrap();
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+            result = &mut permission => panic!("permission finished while db was held ({stage:?}): {result:?}"),
+        }
+        let _ = release.send(());
+        assert!(
+            holder.join().unwrap(),
+            "runtime did not release the lock holder in time ({stage:?})"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "runtime stopped polling while waiting for the database ({stage:?})"
+        );
+        let result = permission.await.unwrap();
+        if matches!(stage, Stage::RefusalDelete) {
+            assert!(
+                matches!(result, Err(ConsentError::Refused { code, message }) if code == "access_macos_only" && message == "macOS is required")
+            );
+        } else {
+            result.unwrap();
+        }
+        let ids = db
+            .lock()
+            .unwrap()
+            .prepare("SELECT elicitation_id FROM macos_permission_cards")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        if matches!(stage, Stage::Read | Stage::Update) {
+            assert_eq!(ids, vec!["acc_1"]);
+            assert_eq!(f.fake.calls("consent.request").len(), 1);
+            assert!(f.fake.calls("consent.withdraw").is_empty());
+        } else {
+            assert!(ids.is_empty());
+            if matches!(stage, Stage::WithdrawalDelete) {
+                assert_eq!(f.fake.calls("consent.request").len(), 1);
+                assert_eq!(f.fake.calls("consent.withdraw").len(), 1);
+            }
+        }
+        assert!(f.fake.calls("consent.await").is_empty());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn macos_permission_startup_db_contention_does_not_block_runtime_polling() {
     struct LockBeforeDelete {
         acquire: std::sync::mpsc::Sender<()>,
