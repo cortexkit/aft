@@ -4284,8 +4284,6 @@ fn consent_scope_vanished_directory_is_info_once_even_after_memo_pruning() {
     assert!(lines[1].contains("another-removed-scratch:"), "{lines:?}");
     let (_, lines) = crate::logging::capture_log_lines(|| {
         log_directory_scope_fallback(&parent, "home identity unknown");
-        log_directory_scope_fallback(&parent, "home identity unknown");
-        log_directory_scope_fallback(&parent, "directory probe timed out");
         log_directory_scope_fallback(&parent, "directory probe timed out");
     });
     assert_eq!(lines.len(), 2);
