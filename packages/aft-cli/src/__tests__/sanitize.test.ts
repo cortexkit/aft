@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { homedir, userInfo } from "node:os";
+import { homedir } from "node:os";
 import { redactSecrets, sanitizeContent, sanitizeValue } from "../lib/sanitize.js";
 
 // Cases shared with the Rust log redactor (crates/aft/src/log_redact.rs) so the
@@ -54,7 +54,6 @@ describe("redactSecrets shared fixture", () => {
 
 describe("sanitizeContent", () => {
   const originalHome = homedir();
-  const originalUser = userInfo().username;
 
   test("replaces home directory with ~", () => {
     const input = `Error at ${originalHome}/foo/bar`;
@@ -98,9 +97,12 @@ describe("sanitizeContent", () => {
     expect(out).toContain("/home/<USER>");
   });
 
-  test("leaves bare username words alone because they may be ordinary prose", () => {
-    const input = `Config for ${originalUser} loaded`;
-    expect(sanitizeContent(input)).toBe(input);
+  test("replaces standalone username occurrences except in system paths", () => {
+    const input =
+      "Config for alicejones loaded: owner=alicejones /mnt/data/alicejones/x /dev/alicejones /usr/lib/alicejones";
+    expect(sanitizeContent(input, { username: "alicejones" })).toBe(
+      "Config for <USER> loaded: owner=<USER> /mnt/data/<USER>/x /dev/alicejones /usr/lib/alicejones",
+    );
   });
 
   test("is idempotent", () => {

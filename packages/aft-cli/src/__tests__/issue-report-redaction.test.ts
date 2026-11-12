@@ -154,4 +154,101 @@ describe("issue report path privacy", () => {
     );
     expect(sanitizeContent("%64%65%76@host ~%64%65%76", context)).toBe("<USER>@host ~<USER>");
   });
+
+  test("redacts distinctive username words in prose, paths and assignments in every spelling", () => {
+    const options = { home: "/home/alicejones", username: "alicejones" };
+    expect(
+      sanitizeContent(
+        "alicejones logged in owner=alicejones /mnt/data/alicejones/x src/alicejones/main.ts ~alicejones alicejones@host",
+        options,
+      ),
+    ).toBe(
+      "<USER> logged in owner=<USER> /mnt/data/<USER>/x src/<USER>/main.ts ~<USER> <USER>@host",
+    );
+    const cases = [
+      ["/mnt/data/alicejones/x", "/mnt/data/<USER>/x"],
+      ["\\/mnt\\/data\\/alicejones\\/x", "\\/mnt\\/data\\/<USER>\\/x"],
+      ["%2Fmnt%2Fdata%2Falicejones%2Fx", "%2Fmnt%2Fdata%2F<USER>%2Fx"],
+      ["%2fmnt%2fdata%2falicejones%2fx", "%2fmnt%2fdata%2f<USER>%2fx"],
+      ["D:\\\\data\\\\alicejones\\\\x", "D:\\\\data\\\\<USER>\\\\x"],
+      ["D%3A%5Cdata%5Calicejones%5Cx", "D%3A%5Cdata%5C<USER>%5Cx"],
+      ["D%3a%5cdata%5calicejones%5cx", "D%3a%5cdata%5c<USER>%5cx"],
+    ];
+    for (const [input, expected] of cases) {
+      expect(sanitizeContent(input, options)).toBe(expected);
+    }
+    expect(sanitizeContent("owner=%61licejones %61%6c%69%63%65%6a%6f%6e%65%73", options)).toBe(
+      "owner=<USER> <USER>",
+    );
+    const unchanged = "alicejones2 xalicejones alicejones_name unchanged%20text src/main.ts";
+    expect(sanitizeContent(unchanged, options)).toBe(unchanged);
+  });
+
+  test("preserves distinctive username components in well-known system paths in every spelling", () => {
+    const options = { username: "alicejones" };
+    for (const directory of [
+      "dev",
+      "proc",
+      "sys",
+      "usr",
+      "etc",
+      "bin",
+      "sbin",
+      "var",
+      "tmp",
+      "opt",
+      "run",
+      "lib",
+    ]) {
+      const path = `/${directory}/nested/alicejones/file`;
+      for (const spelling of [
+        path,
+        path.replaceAll("/", "\\/"),
+        path.replaceAll("/", "\\\\"),
+        encoded(path),
+        lowerEncoded(path),
+        encoded(path).replace("alicejones", "%61licejones"),
+        `file://${path}`,
+        `C:${path.replaceAll("/", "\\")}`,
+      ]) {
+        expect(sanitizeContent(spelling, options)).toBe(spelling);
+      }
+    }
+    expect(sanitizeContent("/dev/null;owner=alicejones /device/alicejones", options)).toBe(
+      "/dev/null;owner=<USER> /device/<USER>",
+    );
+  });
+
+  test("treats common account names case-insensitively and redacts only their identities", () => {
+    for (const username of [
+      "root",
+      "admin",
+      "administrator",
+      "user",
+      "dev",
+      "developer",
+      "test",
+      "guest",
+      "ubuntu",
+      "debian",
+      "pi",
+      "runner",
+      "vagrant",
+      "ec2-user",
+      "centos",
+      "git",
+      "docker",
+      "build",
+      "ci",
+      "DEV",
+      "Admin",
+    ]) {
+      const options = { username, home: "/home/someone-else" };
+      const ordinary = `${username} owner=${username} /mnt/data/${username}/x src/${username}/file /dev/null`;
+      expect(sanitizeContent(ordinary, options)).toBe(ordinary);
+      expect(sanitizeContent(`~${username} ${username}@host /home/${username}/file`, options)).toBe(
+        "~<USER> <USER>@host /home/<USER>/file",
+      );
+    }
+  });
 });

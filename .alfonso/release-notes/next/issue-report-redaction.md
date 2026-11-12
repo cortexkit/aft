@@ -1,1 +1,1 @@
-- Issue reports now redact all known project roots, including encoded and escaped project and home paths, without changing system paths such as `/dev/null` when a username is a common word.
+- Issue reports now redact all known project roots, including encoded and escaped project and home paths, and distinctive usernames in text, without changing system paths such as `/dev/null` when a username is a common word.

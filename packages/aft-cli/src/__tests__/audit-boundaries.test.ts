@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { userInfo } from "node:os";
 import { capBodyToGithubLimit } from "../lib/issue-body.js";
 import { redactUsername, sanitizeContent } from "../lib/sanitize.js";
 
@@ -12,21 +11,28 @@ test("issue truncation preserves both log fences", () => {
   expect(Buffer.byteLength(result)).toBeLessThanOrEqual(500);
 });
 
-test("username redaction recognizes identities but leaves arbitrary path components intact", () => {
-  const username = userInfo().username;
+test("distinctive username redaction preserves word boundaries but masks path components", () => {
+  const username = "alicejones";
   expect(
     sanitizeContent(
       `project_${username} ${username}@host /${username}/ \\${username}\\ ~${username}`,
+      { username },
     ),
-  ).toBe(`project_${username} <USER>@host /${username}/ \\${username}\\ ~<USER>`);
+  ).toBe(`project_${username} <USER>@host /<USER>/ \\<USER>\\ ~<USER>`);
 });
 
-test("short usernames redact only in identity positions", () => {
-  for (const user of ["root", "a", "dev"]) {
+test("common usernames redact only in identity positions", () => {
+  for (const user of ["root", "dev"]) {
     expect(
       redactUsername(`project_${user} ${user}2 /${user}/ \\${user}\\ ~${user} ${user}@host`, user),
     ).toBe(`project_${user} ${user}2 /${user}/ \\${user}\\ ~<USER> <USER>@host`);
   }
+});
+
+test("short distinctive usernames still redact whole words outside system paths", () => {
+  expect(redactUsername("project_a a2 /a/ \\a\\ ~a a@host /usr/a", "a")).toBe(
+    "project_a a2 /<USER>/ \\<USER>\\ ~<USER> <USER>@host /usr/a",
+  );
 });
 
 test("issue truncation preserves multiple harness fences and a huge line", () => {

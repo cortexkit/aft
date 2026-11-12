@@ -184,8 +184,8 @@ export function redactSecrets(content: string): string {
 }
 
 /**
- * Redact known project/home paths and explicit username positions in logs,
- * diagnostic JSON blocks and the final issue body, preserving ordinary prose.
+ * Redact known project/home paths and identifying usernames in logs,
+ * diagnostic JSON blocks and the final issue body.
  */
 export function sanitizeContent(content: string, context: SanitizeContext = {}): string {
   const username = context.username ?? userInfo().username;
@@ -219,8 +219,8 @@ export function sanitizeContent(content: string, context: SanitizeContext = {}):
     }
   }
   if (home && home !== "/") sanitized = replacePath(sanitized, home, "~");
-  // Only profile-directory components identify users. A common username such
-  // as dev must never change /dev/null, relative paths, or ordinary prose.
+  // Profile-directory components identify users even when they name an account
+  // other than the active user.
   sanitized = replaceDecoded(
     sanitized,
     /(?:(?<![\p{L}\p{N}_/.-])|(?<=file:\/\/)|(?<=file:\/\/\/))(?:\/(?:home|Users)\/|[A-Za-z]:\/Users\/)([^/\s"'<>`,;:?#&()[\]{}=]+)/gu,
@@ -276,13 +276,15 @@ function decodedView(content: string) {
 function replaceDecoded(
   content: string,
   pattern: RegExp,
-  replacement: (match: RegExpExecArray) => { offset: number; value: string },
+  replacement: (match: RegExpExecArray) => { offset: number; value: string } | null,
 ): string {
   const view = decodedView(content);
   let result = "";
   let cursor = 0;
   for (const match of view.text.matchAll(pattern)) {
-    const { offset, value } = replacement(match);
+    const change = replacement(match);
+    if (!change) continue;
+    const { offset, value } = change;
     const start = view.units[match.index + offset].start;
     const end = view.units[match.index + match[0].length - 1].end;
     result += content.slice(cursor, start) + value;
@@ -356,9 +358,47 @@ export function projectRootsFromValue(value: unknown): string[] {
   return [...roots, ...Object.values(object).flatMap(projectRootsFromValue)];
 }
 
-/** SSH identities and shell home expansion are username positions, unlike bare words or /dev/. */
+// Common account names are ordinary words outside identity positions. Masking
+// those words in prose or system paths would reveal the account name by contrast.
+const COMMON_ACCOUNT_NAMES = new Set([
+  "root",
+  "admin",
+  "administrator",
+  "user",
+  "dev",
+  "developer",
+  "test",
+  "guest",
+  "ubuntu",
+  "debian",
+  "pi",
+  "runner",
+  "vagrant",
+  "ec2-user",
+  "centos",
+  "git",
+  "docker",
+  "build",
+  "ci",
+]);
+
+/** Mask distinctive usernames everywhere except within well-known absolute system paths. */
 export function redactUsername(content: string, username: string): string {
   if (!username) return content;
+  if (!COMMON_ACCOUNT_NAMES.has(username.toLowerCase())) {
+    // Match protected paths before username words so encoded/escaped spellings
+    // keep their original bytes, just like plain /dev/null.
+    const pathBoundary = String.raw`[\s"'<>\x60,;:?#&()[\]{}=|]`;
+    const systemPath = String.raw`(?<systemPath>(?:(?<![\p{L}\p{N}_/.-])|(?<=file://)|(?<=file:///))(?:[A-Za-z]:)?/(?:dev|proc|sys|usr|etc|bin|sbin|var|tmp|opt|run|lib)(?=$|/|${pathBoundary})(?:/[^\s"'<>\x60,;:?#&()[\]{}=|]*)?)`;
+    return replaceDecoded(
+      content,
+      new RegExp(
+        `${systemPath}|(?<![\\p{L}\\p{N}_])${escapeRegex(username)}(?![\\p{L}\\p{N}_])`,
+        "gu",
+      ),
+      (match) => (match.groups?.systemPath ? null : { offset: 0, value: "<USER>" }),
+    );
+  }
   return replaceDecoded(
     content,
     new RegExp(
