@@ -840,13 +840,19 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
             },
             mapping,
         );
-        out = replace_in(out, None, &INLINE_ASSIGNMENT, |caps: &Captures<'_>| {
-            if looks_like_assignment_secret(caps[3].trim_matches(['\'', '"'])) {
-                masked_assignment(caps)
-            } else {
-                caps[0].to_string()
-            }
-        });
+        out = replace_in(
+            out,
+            None,
+            &INLINE_ASSIGNMENT,
+            |caps: &Captures<'_>| {
+                if looks_like_assignment_secret(caps[3].trim_matches(['\'', '"'])) {
+                    masked_assignment(caps)
+                } else {
+                    caps[0].to_string()
+                }
+            },
+            mapping,
+        );
     }
     if command.contains("--") {
         out = replace_in(
@@ -1183,6 +1189,7 @@ fn redact_with_range<'a>(
                     caps[0].to_string()
                 }
             },
+            mapping,
         );
     }
     out
