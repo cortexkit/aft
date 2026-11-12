@@ -44,7 +44,7 @@ use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 mod engines;
 mod fold;
 #[cfg(test)]
-mod publication_tests;
+pub(super) mod publication_tests;
 #[cfg(test)]
 mod todo_tests;
 
@@ -2360,7 +2360,7 @@ impl Checkout {
             // fallback without searching every table again for every sibling.
             let mut record_holders = HashMap::new();
             let mut fragment_holders = HashMap::new();
-            let reuse = true;
+            let reuse = states.len() > 1;
             #[cfg(test)]
             let reuse = reuse && publication_tests::reuse_lookups();
             let mut needs_unusable = false;

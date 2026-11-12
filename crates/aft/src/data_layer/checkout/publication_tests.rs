@@ -29,12 +29,12 @@ fn with_reuse<T>(reuse: bool, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-pub(super) struct Phase {
+pub(in crate::data_layer) struct Phase {
     name: &'static str,
     start: Option<(Instant, Duration)>,
 }
 
-pub(super) fn phase(name: &'static str) -> Phase {
+pub(in crate::data_layer) fn phase(name: &'static str) -> Phase {
     Phase {
         name,
         start: TIMINGS.with(|timings| timings.borrow().as_ref().map(|_| (Instant::now(), cpu()))),
@@ -181,6 +181,16 @@ fn publication_holder_memo_preserves_retirement_and_member_holders() {
             .map(|entry| snapshot.checkout_state(entry.checkout).unwrap().unwrap())
             .collect::<Vec<_>>();
         pin_readers(checkout, &snapshot, &states.iter().collect::<Vec<_>>());
+        // Repeated missing keys are memoized and still produce no holder.
+        let mut missing_paths = states[0].paths().to_vec();
+        missing_paths[0].content = ContentKey::from_digest(Digest128::of(b"absent content"));
+        missing_paths[0].language = "rust".into();
+        let fragments = vec![Some(Digest128::of(b"absent fragment")); missing_paths.len()];
+        let missing = CheckoutState::new(Vec::new(), Digest128::of(b"missing"), missing_paths)
+            .unwrap()
+            .with_fragments_for(fragments, EXTRACTOR_VERSION)
+            .unwrap();
+        pin_readers(checkout, &snapshot, &[&missing, &missing]);
         let own = checkout.view().unwrap().state().clone();
         pin_retirement(checkout, &own);
         if round == 2 {
@@ -216,7 +226,7 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// Run with --release --ignored --exact and --nocapture. Copies Git-tracked
+/// Run with --profile ci-storm --ignored --exact and --nocapture. Copies Git-tracked
 /// AFT source once, then copies its persisted family for each paired run, so
 /// both algorithms start from identical segment and checkout-state bytes.
 #[test]
@@ -234,6 +244,7 @@ fn publication_family_scaling() {
     let dir = scratch();
     let root = dir.path().join("source");
     let mut edits = Vec::new();
+    let mut seed_edits = Vec::new();
     for path in tracked
         .stdout
         .split(|&byte| byte == 0)
@@ -247,11 +258,14 @@ fn publication_family_scaling() {
         let destination = root.join(relative);
         std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
         std::fs::copy(&original, &destination).unwrap();
-        if edits.len() < 50
-            && relative.starts_with("crates/aft/src")
+        if relative.starts_with("crates/aft/src")
             && relative.extension().is_some_and(|ext| ext == "rs")
         {
-            edits.push((path.to_vec(), std::fs::read(&original).unwrap()));
+            if edits.len() < 50 {
+                edits.push((path.to_vec(), std::fs::read(&original).unwrap()));
+            } else if seed_edits.len() < 11 {
+                seed_edits.push(path.to_vec());
+            }
         }
     }
     assert_eq!(edits.len(), 50);
@@ -261,10 +275,29 @@ fn publication_family_scaling() {
     let seed = Checkout::bind(Arc::clone(&layer), &store, family(), &root).unwrap();
     eprintln!("publication fixture: building AFT source");
     let built = seed.build().unwrap();
+    assert!(
+        seed.view().unwrap().state().paths().len() >= 6000,
+        "{built:?}"
+    );
+    // Disjoint small publications keep their segments live, matching a
+    // worktree that reads a base plus several incremental generations.
+    for path in seed_edits {
+        let file = root.join(std::str::from_utf8(&path).unwrap());
+        let mut bytes = std::fs::read(&file).unwrap();
+        bytes.extend_from_slice(b"\n// distinct incremental publication\n");
+        std::fs::write(file, bytes).unwrap();
+        seed.record_paths(&[path]).unwrap();
+        seed.refresh_callgraph().unwrap();
+        seed.publish_changes().unwrap().unwrap();
+    }
     let state = seed.view().unwrap().state().clone();
-    assert!(state.paths().len() >= 6000, "{built:?}");
+    let segments = seed.family.snapshot().unwrap().manifest().segments().len();
+    assert!(
+        segments >= 12,
+        "expected a base plus incremental segments, got {segments}"
+    );
     eprintln!(
-        "publication fixture: {} paths, {} parsed, {} bytes",
+        "publication fixture: {} paths, {} parsed, {} bytes, {segments} segments; profile=ci-storm",
         state.paths().len(),
         built.parsed_files,
         built.segment_bytes
@@ -321,7 +354,13 @@ fn publication_family_scaling() {
             let total_cpu = cpu().saturating_sub(start_cpu).as_secs_f64() * 1000.0;
             let timings = TIMINGS.with(|timings| timings.borrow_mut().take().unwrap());
             let mode = if reuse { "after" } else { "before" };
+            let mut phases = BTreeMap::new();
             for (phase, wall, cpu) in timings {
+                let total = phases.entry(phase).or_insert((0.0, 0.0));
+                total.0 += wall;
+                total.1 += cpu;
+            }
+            for (phase, (wall, cpu)) in phases {
                 println!("PUBLICATION n={n} run={run} mode={mode} phase={phase} wall_ms={wall:.3} cpu_ms={cpu:.3}");
             }
             println!("PUBLICATION n={n} run={run} mode={mode} phase=total wall_ms={total_wall:.3} cpu_ms={total_cpu:.3} paths={} fragments={} retired={}", report.paths, report.fragments, report.retired_segments);
