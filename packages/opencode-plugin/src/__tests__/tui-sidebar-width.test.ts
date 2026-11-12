@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import baseline from "./fixtures/sidebar-appearance-baseline.json";
 
 /**
  * The sidebar rendered by OpenTUI's own test renderer at the width the setup
@@ -197,16 +198,25 @@ describe("operator coordination lines in the visible sidebar", () => {
 
 describe("sidebar appearance baseline", () => {
   const themes = {
-    dark: {},
+    dark: {
+      text: "#e6edf3",
+      textMuted: "#9198a1",
+      success: "#3fb950",
+      warning: "#d29922",
+      error: "#f85149",
+      accent: "#1f6feb",
+      background: "#0d1117",
+      border: "#3d444d",
+    },
     light: {
-      text: "#111111",
-      textMuted: "#666666",
-      success: "#008800",
-      warning: "#996600",
-      error: "#cc0000",
-      accent: "#0055aa",
+      text: "#1f2328",
+      textMuted: "#59636e",
+      success: "#1a7f37",
+      warning: "#9a6700",
+      error: "#cf222e",
+      accent: "#0969da",
       background: "#ffffff",
-      border: "#bbbbbb",
+      border: "#d1d9e0",
     },
   };
   const healthy = snapshot({
@@ -274,7 +284,9 @@ describe("sidebar appearance baseline", () => {
           });
           // Ignore unused renderer rows, but retain every visible row and column.
           while (frame.at(-1) === "") frame.pop();
-          expect(frame.join("\n")).toMatchSnapshot();
+          expect(frame.join("\n")).toBe(
+            (baseline as Record<string, string>)[`${theme} ${state.name}`],
+          );
         },
         TEST_TIMEOUT_MS,
       );
