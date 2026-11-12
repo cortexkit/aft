@@ -3592,7 +3592,7 @@ pub(super) async fn withdraw_macos_permission_cards(
             })
             .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ConsentError::Unavailable(e.to_string()))?
+            .map_err(|e| ConsentError::Unavailable(e.to_string()))
     })
     .await
     .map_err(|e| ConsentError::Unavailable(e.to_string()))??;
