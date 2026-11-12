@@ -29,7 +29,7 @@ def package_linux(binary, archive, objcopy):
     if build_id(binary) != original_id or build_id(debug) != original_id:
         raise ValueError("ELF executable and detached debug file have different build IDs")
     sections = subprocess.check_output(["readelf", "-SW", str(binary)], text=True)
-    debug_sections = subprocess.check_output(["readelf", "-SW", str(debug)], text=True)
+    debug_sections = subprocess.check_output(["readelf", "-SW", str(debug)], text=True, stderr=subprocess.PIPE)
     names = re.findall(r"\]\s+(\.\S+)", sections)
     # GNU strip retains Rust's tiny GDB auto-loader; it is not DWARF payload.
     embedded = [name for name in names if name == ".symtab" or (

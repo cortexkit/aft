@@ -90,7 +90,7 @@ class ReleaseDebugSymbolsTests(unittest.TestCase):
         source = self.directory / "probe.rs"
         source.write_text(
             '#[no_mangle]\n#[inline(never)]\npub extern "C" fn release_symbol_probe(value: u64) -> u64 {\n'
-            '    std::hint::black_box(value) * 3\n}\n'
+            '    value * 3\n}\n'
             'fn main() { println!("{}", release_symbol_probe(7)); }\n'
         )
         binary = self.directory / "aft"
