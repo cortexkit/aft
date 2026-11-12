@@ -9187,11 +9187,11 @@ mod tests {
             .is_none());
     }
 
-    /// A one-root reply has room for the data layer's meaning fill at its
-    /// largest: a fill that waits for another, with every count present,
-    /// large, and a failure, keeps the root's full row within the budget.
-    #[test]
-    fn one_root_reply_fits_the_meaning_fill_at_its_largest() {
+    /// Choose large-read telemetry before the first budget pass, so another
+    /// test's process-wide counters cannot decide whether this root fits.
+    fn largest_meaning_fill_health_metrics(
+        large_reads: Value,
+    ) -> (u64, serde_json::Map<String, Value>) {
         use crate::data_layer::surfaces::{MeaningCoverage, MeaningPlane, MeaningReport};
         let executor = Executor::new();
         let (_dir, root) = test_root("meaning-fill-health-budget");
@@ -9201,10 +9201,27 @@ mod tests {
         let dispatch = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
         refresh_until_root_count(&cache, &executor, &app, 1);
-        let mut report = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
-            .metrics
-            .expect("health metrics");
-        let baseline = report["metrics_bytes"].as_u64().unwrap();
+        let roots = fixture_roots(&executor);
+        let indexing_roots = roots.iter().map(|root| root.as_path()).collect::<Vec<_>>();
+        let mut report = super::assemble_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &dispatch,
+            &app,
+            |warming_roots| {
+                crate::cold_build_limiter::progress::snapshot_for_roots(
+                    &indexing_roots,
+                    warming_roots,
+                )
+            },
+        )
+        .metrics
+        .expect("health metrics");
+        let metrics = report.as_object_mut().unwrap();
+        retain_fixture_process_rows(metrics, &roots);
+        metrics.insert("large_reads".into(), large_reads);
+        let baseline = refresh_metrics_bytes(metrics) as u64;
         let fill = MeaningReport {
             plane: MeaningPlane::Serving {
                 complete: false,
@@ -9236,7 +9253,20 @@ mod tests {
         for (key, value) in fill.as_object().unwrap() {
             semantic.insert(key.clone(), value.clone());
         }
-        let mut metrics = report.as_object().unwrap().clone();
+        (baseline, report.as_object().unwrap().clone())
+    }
+
+    /// With no large reads, a one-root reply has room for the meaning fill
+    /// at its largest, including pending work and a backend failure.
+    #[test]
+    fn one_root_reply_fits_the_meaning_fill_at_its_largest() {
+        let (baseline, mut metrics) = largest_meaning_fill_health_metrics(json!({
+            "count": 0,
+            "bytes": 0,
+            "largest": 0,
+            "sites_active": 0,
+            "top": [],
+        }));
         budget_health_metrics(&mut metrics);
         let bytes = metrics["metrics_bytes"].as_u64().unwrap();
         eprintln!(
@@ -9249,6 +9279,34 @@ mod tests {
         assert_eq!(row["semantic_index"]["files_pending"], 20_988);
         assert_eq!(row["semantic_index"]["stage"], "waiting_for_another_fill");
         assert_eq!(row["semantic_index"]["filling"], true);
+    }
+
+    #[test]
+    fn largest_meaning_fill_with_17_active_large_read_sites_abbreviates_root() {
+        let large_reads = json!({
+            "count": 17,
+            "bytes": 85_000_000,
+            "largest": 5_000_000,
+            "sites_active": 17,
+            "top": [
+                {"site": "candidate_text", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+                {"site": "data_file", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+                {"site": "degraded_grep", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+                {"site": "exact_corpus", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+            ],
+        });
+        let (_, mut metrics) = largest_meaning_fill_health_metrics(large_reads.clone());
+        budget_health_metrics(&mut metrics);
+        let encoded = serde_json::to_vec(&metrics).unwrap();
+        eprintln!(
+            "largest meaning fill with 17 active large-read sites: {} bytes",
+            encoded.len()
+        );
+        assert!(encoded.len() <= HEALTH_METRICS_BUDGET_BYTES);
+        assert_eq!(metrics["metrics_bytes"], encoded.len() as u64);
+        assert_eq!(metrics["large_reads"], large_reads);
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert_eq!(metrics["roots"][0]["abbreviated"], true);
     }
 
     #[test]
