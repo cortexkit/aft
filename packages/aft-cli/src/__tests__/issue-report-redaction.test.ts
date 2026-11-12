@@ -184,7 +184,7 @@ describe("issue report path privacy", () => {
     expect(sanitizeContent(unchanged, options)).toBe(unchanged);
   });
 
-  test("preserves distinctive username components in well-known system paths in every spelling", () => {
+  test("redacts distinctive username components in system paths in every spelling", () => {
     const options = { username: "alicejones" };
     for (const directory of [
       "dev",
@@ -200,16 +200,31 @@ describe("issue report path privacy", () => {
       "run",
       "lib",
     ]) {
-      const path = `/${directory}/nested/alicejones/file`;
+      for (const [input, expected] of [
+        [`/${directory}/alicejones/x`, `/${directory}/<USER>/x`],
+        [`\\/${directory}\\/alicejones\\/x`, `\\/${directory}\\/<USER>\\/x`],
+        [`\\\\${directory}\\\\alicejones\\\\x`, `\\\\${directory}\\\\<USER>\\\\x`],
+        [`%2F${directory}%2Falicejones%2Fx`, `%2F${directory}%2F<USER>%2Fx`],
+        [`%2f${directory}%2falicejones%2fx`, `%2f${directory}%2f<USER>%2fx`],
+        [`%2F${directory}%2F%61licejones%2Fx`, `%2F${directory}%2F<USER>%2Fx`],
+        [`file:///${directory}/alicejones/x`, `file:///${directory}/<USER>/x`],
+        [`C:\\${directory}\\alicejones\\x`, `C:\\${directory}\\<USER>\\x`],
+        [`C%3A%5C${directory}%5Calicejones%5Cx`, `C%3A%5C${directory}%5C<USER>%5Cx`],
+        [`C%3a%5c${directory}%5calicejones%5cx`, `C%3a%5c${directory}%5c<USER>%5cx`],
+      ]) {
+        expect(sanitizeContent(input, options)).toBe(expected);
+      }
+    }
+    expect(
+      sanitizeContent("/tmp/alicejones/build /opt/alicejones/app /var/lib/alicejones", options),
+    ).toBe("/tmp/<USER>/build /opt/<USER>/app /var/lib/<USER>");
+    for (const path of ["/dev/null", "/usr/lib/x"]) {
       for (const spelling of [
         path,
         path.replaceAll("/", "\\/"),
         path.replaceAll("/", "\\\\"),
         encoded(path),
         lowerEncoded(path),
-        encoded(path).replace("alicejones", "%61licejones"),
-        `file://${path}`,
-        `C:${path.replaceAll("/", "\\")}`,
       ]) {
         expect(sanitizeContent(spelling, options)).toBe(spelling);
       }

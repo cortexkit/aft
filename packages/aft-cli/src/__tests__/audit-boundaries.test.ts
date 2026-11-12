@@ -29,9 +29,9 @@ test("common usernames redact only in identity positions", () => {
   }
 });
 
-test("short distinctive usernames still redact whole words outside system paths", () => {
+test("short distinctive usernames still redact whole words including system paths", () => {
   expect(redactUsername("project_a a2 /a/ \\a\\ ~a a@host /usr/a", "a")).toBe(
-    "project_a a2 /<USER>/ \\<USER>\\ ~<USER> <USER>@host /usr/a",
+    "project_a a2 /<USER>/ \\<USER>\\ ~<USER> <USER>@host /usr/<USER>",
   );
 });
 

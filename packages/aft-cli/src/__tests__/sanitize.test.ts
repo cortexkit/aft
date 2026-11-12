@@ -97,11 +97,11 @@ describe("sanitizeContent", () => {
     expect(out).toContain("/home/<USER>");
   });
 
-  test("replaces standalone username occurrences except in system paths", () => {
+  test("replaces standalone distinctive username occurrences including system paths", () => {
     const input =
       "Config for alicejones loaded: owner=alicejones /mnt/data/alicejones/x /dev/alicejones /usr/lib/alicejones";
     expect(sanitizeContent(input, { username: "alicejones" })).toBe(
-      "Config for <USER> loaded: owner=<USER> /mnt/data/<USER>/x /dev/alicejones /usr/lib/alicejones",
+      "Config for <USER> loaded: owner=<USER> /mnt/data/<USER>/x /dev/<USER> /usr/lib/<USER>",
     );
   });
 

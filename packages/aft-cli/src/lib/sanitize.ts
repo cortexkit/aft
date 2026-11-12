@@ -382,21 +382,17 @@ const COMMON_ACCOUNT_NAMES = new Set([
   "ci",
 ]);
 
-/** Mask distinctive usernames everywhere except within well-known absolute system paths. */
+/** Mask distinctive usernames as whole words; common names only in identity positions. */
 export function redactUsername(content: string, username: string): string {
   if (!username) return content;
   if (!COMMON_ACCOUNT_NAMES.has(username.toLowerCase())) {
-    // Match protected paths before username words so encoded/escaped spellings
-    // keep their original bytes, just like plain /dev/null.
-    const pathBoundary = String.raw`[\s"'<>\x60,;:?#&()[\]{}=|]`;
-    const systemPath = String.raw`(?<systemPath>(?:(?<![\p{L}\p{N}_/.-])|(?<=file://)|(?<=file:///))(?:[A-Za-z]:)?/(?:dev|proc|sys|usr|etc|bin|sbin|var|tmp|opt|run|lib)(?=$|/|${pathBoundary})(?:/[^\s"'<>\x60,;:?#&()[\]{}=|]*)?)`;
     return replaceDecoded(
       content,
       new RegExp(
-        `${systemPath}|(?<![\\p{L}\\p{N}_])${escapeRegex(username)}(?![\\p{L}\\p{N}_])`,
+        `(?<![\\p{L}\\p{N}_])${escapeRegex(username)}(?![\\p{L}\\p{N}_])`,
         "gu",
       ),
-      (match) => (match.groups?.systemPath ? null : { offset: 0, value: "<USER>" }),
+      () => ({ offset: 0, value: "<USER>" }),
     );
   }
   return replaceDecoded(
