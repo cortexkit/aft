@@ -128,7 +128,7 @@ fn note_scoped_ignore_rule_refresh_for_test() {}
 #[cfg(not(test))]
 fn note_ignore_rule_refresh_for_test() {}
 
-fn ignore_rule_refresh_now() -> Instant {
+pub(crate) fn ignore_rule_refresh_now() -> Instant {
     #[cfg(test)]
     if let Some(now) = IGNORE_RULE_REFRESH_TEST_NOW.with(std::cell::Cell::get) {
         return now;

@@ -5744,8 +5744,12 @@ impl AppContext {
                     else {
                         return false;
                     };
+                    // Checking whether the root exists applies no watcher changes.
+                    // Keep filesystem I/O outside the pending-state lock so a
+                    // concurrent query does not mistake slow metadata for cleanup.
+                    let metadata = root_metadata(&root);
                     let mut cleanup = self.deleted_root_cleanup.lock();
-                    match root_metadata(&root) {
+                    match metadata {
                         Ok(metadata) if metadata.is_dir() => {
                             *cleanup = None;
                             return false;
@@ -5907,7 +5911,7 @@ impl AppContext {
                     state.has_pending_work()
                         || state
                             .ignore_refresh_due
-                            .is_some_and(|due| Instant::now() >= due)
+                            .is_some_and(|due| crate::runtime_drain::ignore_rule_refresh_now() >= due)
                 })
             })
     }
