@@ -504,6 +504,56 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         self.jobs = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))["jobs"]
 
+    def test_real_daemon_job_runs_ignored_tool_provider_tests_on_landing_events(self) -> None:
+        job = self.jobs["unit-linux-real-daemon"]
+        self.assertEqual(job["name"], "Real-daemon tool-provider tests (Linux)")
+        self.assertEqual(job["if"], "${{ github.event_name != 'pull_request' }}")
+        self.assertEqual(job["runs-on"], "ubuntu-24.04")
+        self.assertLess(int(job["timeout-minutes"]), 20)
+        self.assertNotIn("needs", job)
+        self.assertNotIn("continue-on-error", job)
+        self.assertIn({"uses": "./.github/actions/setup-nextest"}, job["steps"])
+        self.assertIn({"name": "Run ignored real-daemon tool-provider tests",
+                       "run": "bash scripts/ci-real-daemon-tests.sh"}, job["steps"])
+        root = Path(__file__).resolve().parents[2]
+        script = (root / "scripts/ci-real-daemon-tests.sh").read_text()
+        for required in (
+            "timeout 15m cargo nextest run -p agent-file-tools --test rest",
+            "--features test-hooks,test-scope-owner", "--run-ignored only",
+            "--no-fail-fast", "--failure-output final", "--final-status-level all",
+            "-E 'test(/^tool_provider_subc_e2e::tool_provider_subc_e2e_/)'",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=",
+            "scripts/ci-real-daemon-test-runner.sh", "while sleep 60", 'tail -n 60 "$log"',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, script)
+
+    def test_real_daemon_runner_isolates_each_test_process_and_cleans_up(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        runner = root / "scripts/ci-real-daemon-test-runner.sh"
+        keys = ("HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                "XDG_STATE_HOME", "XDG_CACHE_HOME", "TMPDIR")
+        with tempfile.TemporaryDirectory() as directory:
+            homes = []
+            for rc in (0, 7):
+                probe = "\n".join(f'printf \'%s\\n\' "${key}"' for key in keys)
+                probe += f'\nmkdir -p "$TMPDIR/daemon-fixture/runtime"\nexit {rc}'
+                result = subprocess.run(
+                    ["bash", str(runner), "bash", "-c", probe],
+                    capture_output=True, text=True,
+                    env={**os.environ, "AFT_REAL_DAEMON_RUN_ROOT": directory},
+                )
+                self.assertEqual(result.returncode, rc, result.stderr)
+                paths = [Path(line) for line in result.stdout.splitlines()]
+                self.assertEqual(len(paths), len(keys))
+                self.assertEqual(len(set(paths)), len(keys))
+                fixture = paths[0].parent
+                self.assertEqual(fixture.parent, Path(directory))
+                self.assertTrue(all(path.parent == fixture for path in paths))
+                self.assertFalse(fixture.exists(), "runner must clean up even after a failure")
+                homes.append(paths[0])
+            self.assertNotEqual(*homes)
+
     def test_linux_archive_covers_units_and_proves_the_uploaded_inventory(self) -> None:
         archive = self.jobs["unit-linux-nextest-archive"]
         commands = "\n".join(step.get("run", "") for step in archive["steps"])
