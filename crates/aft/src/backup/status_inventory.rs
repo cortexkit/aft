@@ -16,8 +16,9 @@
 //! stamp (file identity, size and modification time) differs from the stamp the
 //! parse was taken from. Writers always publish `meta.json` by renaming a fresh
 //! temporary file over it, so every rewrite changes the file identity even when
-//! the size and modification time stay the same. Live-database aliasing is
-//! checked on every pass. The format gate, whose storage-root resolution is the
+//! the size and modification time stay the same. Every pass still refuses a
+//! `meta.json` that is a hard link to an open SQLite database file, exactly as
+//! a full read would. The format gate, whose storage-root resolution is the
 //! most expensive step of the whole pass, runs fully for each newly parsed file
 //! and again only when its outcome could have changed; see the comment where it
 //! is called. The count is therefore the one the full discovery would report.
