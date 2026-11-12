@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Connection-file admission rejects group-writable parent directories.
+umask 077
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"

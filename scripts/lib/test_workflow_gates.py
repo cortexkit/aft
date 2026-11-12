@@ -537,6 +537,7 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
             homes = []
             for rc in (0, 7):
                 probe = "\n".join(f'printf \'%s\\n\' "${key}"' for key in keys)
+                probe += '\ntest "$(umask)" = "0077" || exit 99'
                 probe += f'\nmkdir -p "$TMPDIR/daemon-fixture/runtime"\nexit {rc}'
                 result = subprocess.run(
                     ["bash", str(runner), "bash", "-c", probe],

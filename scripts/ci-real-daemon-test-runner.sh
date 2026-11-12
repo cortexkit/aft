@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # nextest invokes the Cargo runner separately for each test process. Isolate the
 # embedded daemon too, not just the AFT children whose fixture sets HOME/XDG.
