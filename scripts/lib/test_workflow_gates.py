@@ -40,6 +40,62 @@ def workflow_job(job_id: str) -> str:
     return match.group(1)
 
 
+class ReleaseDebugArtifactWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"
+        self.jobs = workflow_gates.parse_workflow(str(path))["jobs"]
+
+    def test_linux_detaches_and_verifies_debug_before_shipping(self):
+        for arch, target in (("x64", "x86_64"), ("arm64", "aarch64")):
+            with self.subTest(arch=arch):
+                steps = self.jobs[f"build-linux-{arch}"]["steps"]
+                build = next(step for step in steps if step.get("name") == "Build")
+                self.assertIn(f"cross build --release --target {target}-unknown-linux-gnu", build["run"])
+                self.assertIn("profile.release.strip=false", build["run"])
+                self.assertIn('profile.release.split-debuginfo="off"', build["run"])
+                split_index = next(i for i, step in enumerate(steps) if step.get("name") == "Split and verify Linux debug symbols")
+                self.assertIn("scripts/release-debug-symbols.py linux", steps[split_index]["run"])
+                self.assertIn(f"aft-linux-{arch}-debug.zip", steps[split_index]["run"])
+                uploads = [(i, step["with"]) for i, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4"]
+                self.assertTrue(all(i > split_index for i, _ in uploads))
+                debug = next(config for _, config in uploads if config["name"] == f"linux-{arch}-debug")
+                self.assertEqual(debug["if-no-files-found"], "error")
+                binary = next(config for _, config in uploads if "debug" not in config["name"])
+                self.assertNotIn("debug", binary["path"])
+
+    def test_windows_verifies_pdb_identity_before_shipping(self):
+        for arch, target in (("x64", "x86_64"), ("arm64", "aarch64")):
+            with self.subTest(arch=arch):
+                steps = self.jobs[f"build-win32-{arch}"]["steps"]
+                builds = [step for step in steps if "cargo build --release" in step.get("run", "")]
+                self.assertTrue(builds)
+                self.assertTrue(all("profile.release.strip=false" in step["run"] for step in builds))
+                verify_index = next(i for i, step in enumerate(steps) if step.get("name") == "Verify and package Windows PDB")
+                command = steps[verify_index]["run"]
+                self.assertIn("scripts/release-debug-symbols.py windows", command)
+                self.assertIn(f"{target}-pc-windows-msvc/release/aft.exe", command)
+                self.assertIn(f"$env:AFT_CI_TARGET_DIR/{target}-pc-windows-msvc/release/aft.pdb", command)
+                self.assertIn(f"aft-windows-{arch}-pdb.zip", command)
+                uploads = [(i, step["with"]) for i, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4"]
+                self.assertTrue(all(i > verify_index for i, _ in uploads))
+                pdb = next(config for _, config in uploads if config["name"] == f"windows-{arch}-pdb")
+                self.assertEqual(pdb["if-no-files-found"], "error")
+
+    def test_debug_archives_go_only_to_github_release_not_npm(self):
+        steps = self.jobs["github-release"]["steps"]
+        downloads = [step["with"] for step in steps if step.get("uses") == "actions/download-artifact@v4"]
+        for pattern in ("linux-*-debug", "windows-*-pdb"):
+            config = next(config for config in downloads if config.get("pattern") == pattern)
+            self.assertEqual(config["path"], "release-assets")
+            self.assertTrue(config["merge-multiple"])
+        for job in ("publish-npm", "rehearse-publish"):
+            for step in self.jobs[job]["steps"]:
+                config = step.get("with", {})
+                if step.get("uses") == "actions/download-artifact@v4":
+                    self.assertNotIn("debug", config.get("name", ""))
+                    self.assertNotIn("pdb", config.get("name", ""))
+
+
 class CacheSaveRefGateTests(unittest.TestCase):
     """A main-only cache write is policy; a main-only check or job is dead code."""
 
