@@ -5777,6 +5777,9 @@ impl AppContext {
                     if matches!(*cleanup, Some(DeletedRootCleanup::Complete(generation)) if generation == expected_generation) {
                         return true;
                     }
+                    // Directory cleanup can modify the same cached state as
+                    // event delivery, so guard it even without a receiver.
+                    let _in_flight = self.watcher_drain_guard();
                     *cleanup = Some(DeletedRootCleanup::Pending(expected_generation));
                     // A concurrent drain may hold the receiver while awaiting
                     // lifecycle admission. Never wait for it under this gate.
@@ -13798,6 +13801,30 @@ mod callgraph_store_for_ops_tests {
             );
             assert!(!ctx.watcher_query_has_pending_changes());
         }
+    }
+
+    #[test]
+    fn nonempty_watcher_drains_keep_the_pending_capture_fence() {
+        let (_dirs, ctx) = cold_build_context();
+        let root = std::fs::canonicalize(ctx.config().project_root.as_ref().unwrap()).unwrap();
+        ctx.set_canonical_cache_root(root.clone());
+        let source = root.join("src/lib.rs");
+        let (tx, rx) = crate::watcher_filter::watcher_dispatch_channel();
+        *ctx.watcher_rx().lock() = Some(rx);
+        let (reached, release) =
+            crate::runtime_drain::install_watcher_phase_commit_gate_for_test(source.clone());
+        tx.send(WatcherDispatchEvent::Paths(vec![source])).unwrap();
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            crate::runtime_drain::drain_watcher_events_bounded(&drain_ctx, 1)
+        });
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
+        let pending = ctx.watcher_query_has_pending_changes();
+        let in_flight = ctx.watcher_drains_in_flight.load(Ordering::Acquire);
+        release.send(()).unwrap();
+        drain.join().unwrap();
+        assert!(pending, "a dequeued event must remain visible to queries");
+        assert!(in_flight > 0, "real work must retain its in-flight guard");
     }
 
     /// The watcher thread hands a flush window's files to the dispatch

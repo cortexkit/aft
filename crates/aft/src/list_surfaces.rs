@@ -703,8 +703,8 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "subc/health.rs",
         enclosing_item: "budget_health_metrics, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
-        location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row (including ready roots) are abbreviated with full identity digests and root status instead of omitted; omitted root, sweep, cache and retention rows are counted exactly and aggregate counters remain present",
+        location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row (including ready roots) are abbreviated with full identity digests and root status instead of omitted; omitted root, sweep, cache, retention and failed-store name rows are counted exactly and aggregate counters remain present",
     },
     ExclusionEntry {
         file: "subc/route_census.rs",

@@ -2113,6 +2113,13 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
     if let Some(Value::String(refusal)) = row.get_mut("standing_refusal") {
         *refusal = abbreviated_health_refusal(refusal);
     }
+    if let Some(store) = row.get_mut("data_store") {
+        for field in ["/error", "/failure/error"] {
+            if let Some(Value::String(error)) = store.pointer_mut(field) {
+                *error = abbreviated_health_refusal(error);
+            }
+        }
+    }
     for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
         if let Some(Value::Object(component)) = row.get_mut(component) {
             component.retain(|key, _| key == "status");
@@ -2224,23 +2231,39 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
                         .rposition(ordinary_ready_health_root)
                         .unwrap_or(roots.len() - 1)
                 });
-                let Some(index) = index else {
+                if let Some(index) = index {
+                    roots.remove(index);
+                    let omitted = metrics
+                        .get("root_details_omitted")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    metrics.insert("root_details_omitted".into(), json!(omitted));
+                    continue;
+                } else {
                     // Keep an identifiable status even when the last root is ready.
                     // Abbreviating the last row does not omit a root.
                     if abbreviate_health_root(&mut roots[0]) {
                         continue;
                     }
-                    return;
-                };
-                roots.remove(index);
-                let omitted = metrics
-                    .get("root_details_omitted")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                metrics.insert("root_details_omitted".into(), json!(omitted));
-                continue;
+                }
             }
+        }
+        // The failure count and last actionable root survive even when these
+        // additional names do not fit. Keep the longest prefix that fits, and
+        // account for every removed name in the existing omitted count.
+        if metrics
+            .get_mut("data_store_failed")
+            .and_then(Value::as_array_mut)
+            .is_some_and(|failed| failed.pop().is_some())
+        {
+            let omitted = metrics
+                .get("data_store_failed_omitted")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            metrics.insert("data_store_failed_omitted".into(), json!(omitted));
+            continue;
         }
         return;
     }
@@ -4951,9 +4974,14 @@ mod tests {
             }],
             // Fixed live counters already use most of the budget in a real
             // report; failed-root names and error paths must yield before them.
-            "fresh_liveness": "x".repeat(11000)
+            "fresh_liveness": "x".repeat(11400)
         });
         failed.insert_into(&mut metrics);
+        let mut roomy = metrics.as_object().unwrap().clone();
+        roomy.insert("fresh_liveness".into(), json!("x".repeat(10000)));
+        budget_health_metrics(&mut roomy);
+        assert_eq!(roomy["data_store_failed"].as_array().unwrap().len(), 5);
+        assert_eq!(roomy["data_store_failed_omitted"], 45);
         let metrics = metrics.as_object_mut().unwrap();
         assert!(refresh_metrics_bytes(metrics) > HEALTH_METRICS_BUDGET_BYTES);
         budget_health_metrics(metrics);
@@ -4962,6 +4990,7 @@ mod tests {
         assert_eq!(metrics["metrics_bytes"], bytes);
         assert_eq!(metrics["data_store_failed_roots"], 50);
         let names = metrics["data_store_failed"].as_array().unwrap();
+        assert!(!names.is_empty() && names.len() < 5);
         assert_eq!(
             names.len() as u64 + metrics["data_store_failed_omitted"].as_u64().unwrap(),
             50
@@ -4977,7 +5006,7 @@ mod tests {
             metrics["roots"][0]["data_store"]["reason"],
             reason::BIND_FAILED
         );
-        assert_eq!(metrics["fresh_liveness"].as_str().unwrap().len(), 11000);
+        assert_eq!(metrics["fresh_liveness"].as_str().unwrap().len(), 11400);
         let once = metrics.clone();
         budget_health_metrics(metrics);
         assert_eq!(*metrics, once, "budgeting must be idempotent");
@@ -8903,7 +8932,8 @@ mod tests {
             let detail = report.detail.clone().expect("a degraded detail");
             let metrics = report.metrics.expect("health metrics");
 
-            let named = root_count.min(HEALTH_DATA_STORE_FAILED_NAMED);
+            let named = metrics["data_store_failed"].as_array().unwrap().len();
+            assert!(named <= root_count.min(HEALTH_DATA_STORE_FAILED_NAMED));
             assert_eq!(metrics["data_store_failed_roots"], json!(root_count));
             assert_eq!(
                 metrics["data_store_failed"],
@@ -8937,13 +8967,14 @@ mod tests {
                 names.len() <= HEALTH_DATA_STORE_FAILED_DETAIL_BYTES,
                 "{names}"
             );
-            let expected = paths[..named]
+            let detail_named = root_count.min(HEALTH_DATA_STORE_FAILED_NAMED);
+            let expected = paths[..detail_named]
                 .iter()
                 .map(|path| format!("{path} (bind_failed)"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let tail = if root_count > named {
-                format!(" and {} more", root_count - named)
+            let tail = if root_count > detail_named {
+                format!(" and {} more", root_count - detail_named)
             } else {
                 String::new()
             };

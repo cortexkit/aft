@@ -1578,7 +1578,6 @@ fn rebuild_gitignore_for_drain(
 }
 
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
-    let _in_flight = ctx.watcher_drain_guard();
     let started = watcher_drain_now();
     let configure_generation = ctx.configure_generation();
     let content_generation = ctx.configure_content_generation();
@@ -1598,6 +1597,14 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         return outcome;
     }
     ctx.record_checkout_pending_watcher_gap();
+    // Off-loop queries run concurrently with maintenance. An empty pass moves
+    // no events, so it must not mark their answer incomplete. Leave later
+    // arrivals in the channel for the next guarded pass.
+    if !ctx.watcher_drain_has_work() {
+        ctx.tick_tier2_refresh_scheduler(0);
+        return outcome;
+    }
+    let _in_flight = ctx.watcher_drain_guard();
     let mut state = match ctx.watcher_drain_slice().lock().take() {
         Some(state) if state.configure_generation == configure_generation => state,
         // Lifecycle-only generation change (transient unbind + equivalent
