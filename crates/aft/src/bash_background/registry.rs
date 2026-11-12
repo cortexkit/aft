@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
 #[path = "launch_tests.rs"]
 mod launch_tests;
+#[cfg(windows)]
+use crate::agent_commands::WindowsChild as Child;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -11,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
 #[cfg(windows)]
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1186,11 +1188,28 @@ impl ProjectReplayBatch<'_> {
         session_id: &str,
         project_root: &Path,
     ) -> Result<(), String> {
+        self.replay_saved_session_for_project(
+            storage_dir,
+            &harness.storage_segment(),
+            session_id,
+            project_root,
+        )
+    }
+
+    /// Saved task rows already name their storage namespace. MCP and federated
+    /// namespace slugs cannot be converted back into their original harness.
+    pub(crate) fn replay_saved_session_for_project(
+        self,
+        storage_dir: &Path,
+        harness_segment: &str,
+        session_id: &str,
+        project_root: &Path,
+    ) -> Result<(), String> {
         self.registry.replay_session_in_harness(
             storage_dir,
             session_id,
             Some(project_root),
-            Some(&harness.storage_segment()),
+            Some(harness_segment),
         )
     }
 
@@ -1247,6 +1266,9 @@ pub(crate) struct ScopeKillReport {
 
 #[path = "scratch_retention.rs"]
 mod scratch_retention;
+#[path = "shell_registry.rs"]
+mod shell_registry;
+pub(crate) use shell_registry::{ShellReader, ShellSnapshot, SHELL_MASK_WITHHELD};
 #[path = "task_image_cleanup.rs"]
 mod task_image_cleanup;
 
@@ -1403,6 +1425,13 @@ pub(crate) struct RegistryInner {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    #[cfg(all(test, unix))]
+    before_watchdog_registration: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<String>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     #[cfg(test)]
     before_promotion_commit:
         Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -1426,6 +1455,8 @@ pub(crate) struct RegistryInner {
     pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     #[cfg(test)]
     reclaim_kill_attempts: AtomicUsize,
+    #[cfg(test)]
+    process_group_sample_count: AtomicUsize,
     #[cfg(test)]
     completion_processing_attempts: AtomicUsize,
     #[cfg(test)]
@@ -1608,7 +1639,7 @@ impl BashDrainReplyCache {
         published.completion_finished_at = metadata.finished_at;
         published.completion_delivered = metadata.completion_delivered;
         // An off-thread write may publish an earlier offer while a later one
-        // is already reserved in memory. Never reopen that replay budget.
+        // is already reserved in memory. Keep the send-attempt count monotonic.
         published.runner_completion_offers = published
             .runner_completion_offers
             .max(metadata.runner_completion_offers);
@@ -2098,6 +2129,8 @@ impl BgTaskRegistry {
                 background_admission: Mutex::new(()),
                 #[cfg(all(test, unix))]
                 before_bootstrap_release: Mutex::new(None),
+                #[cfg(all(test, unix))]
+                before_watchdog_registration: Mutex::new(None),
                 #[cfg(test)]
                 before_promotion_commit: Mutex::new(None),
                 tasks: Mutex::new(HashMap::new()),
@@ -2113,6 +2146,8 @@ impl BgTaskRegistry {
                 watchdog_tasks: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 reclaim_kill_attempts: AtomicUsize::new(0),
+                #[cfg(test)]
+                process_group_sample_count: AtomicUsize::new(0),
                 #[cfg(test)]
                 completion_processing_attempts: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -2542,6 +2577,7 @@ impl BgTaskRegistry {
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
+        crate::db::deferred_checkpoint::register_shared(&conn);
         let path = conn
             .lock()
             .ok()
@@ -3309,7 +3345,13 @@ impl BgTaskRegistry {
     fn sample_task_process_group(&self, task: &Arc<BgTask>) -> Option<GroupListing> {
         let pgid = task.lock_state().ok().map(|state| state.metadata.pgid)?;
         let sample = match pgid {
-            Some(pgid) => live_process_group_members(pgid),
+            Some(pgid) => {
+                #[cfg(test)]
+                self.inner
+                    .process_group_sample_count
+                    .fetch_add(1, Ordering::SeqCst);
+                live_process_group_members(pgid)
+            }
             None => Err(LiveDescendantsUnavailable::without_group()),
         };
         let mut db = DeferredDbWrites::new(self, task);
@@ -3697,6 +3739,7 @@ impl BgTaskRegistry {
     }
 
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
+        super::shell_metadata::facts_changed();
         let pool = {
             let slot = self.inner.db_pool.read().ok();
             let pool = slot.as_ref().and_then(|slot| (*slot).clone());
@@ -5735,6 +5778,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        child.declare_agent();
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
             let _ = child.wait();
@@ -5874,14 +5918,15 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
+        #[cfg(all(test, unix))]
+        self.wait_before_watchdog_registration_for_test(&task_id);
         self.inner
             .cleanup_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(task_id.clone());
-        // Scope discovery and revocation enumerate the watchdog map. Publish
-        // there before releasing the wrapper so a close cannot miss a command
-        // that has already started but whose spawn dispatch has not returned.
+        // Register watchdog monitoring before releasing the wrapper so timeout
+        // and exit observation do not lag behind command execution.
         self.inner
             .watchdog_tasks
             .lock()
@@ -6567,6 +6612,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        child.declare_agent();
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 let _ = child.kill();
@@ -6912,6 +6958,15 @@ impl BgTaskRegistry {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
         Some(ProjectReplayBatch { registry: self })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn task_registration_identity_for_test(&self, task_id: &str) -> Option<usize> {
+        self.task(task_id).map(|task| Arc::as_ptr(&task) as usize)
+    }
+
+    pub(crate) fn task_registration_exists(&self, task_id: &str) -> bool {
+        self.task(task_id).is_some()
     }
 
     pub(crate) fn project_replay_pending(&self, storage_dir: &Path, project_root: &Path) -> bool {
@@ -8847,6 +8902,46 @@ impl BgTaskRegistry {
         Some(rows)
     }
 
+    pub(crate) fn try_scope_background_tasks(
+        &self,
+        scope: &crate::subc::scope_background_tasks::Selector,
+        remaining: &mut usize,
+    ) -> Result<
+        (
+            HashSet<String>,
+            Vec<crate::subc::scope_background_tasks::Running>,
+        ),
+        String,
+    > {
+        let tasks = self.inner.tasks.try_lock().map_err(|_| "registry_busy")?;
+        let mut known = HashSet::new();
+        let mut running = Vec::new();
+        for task in tasks.values() {
+            if *remaining == 0 {
+                return Err("walk_limit_reached".into());
+            }
+            *remaining -= 1;
+            let state = task.state.try_lock().map_err(|_| "task_busy")?;
+            let metadata = &state.metadata;
+            known.insert(metadata.task_id.clone());
+            if metadata
+                .scope
+                .as_ref()
+                .is_some_and(|stamp| scope.matches(stamp))
+                && !metadata.is_terminal()
+            {
+                running.push(crate::subc::scope_background_tasks::running(metadata));
+            }
+        }
+        Ok((known, running))
+    }
+
+    pub(crate) fn notice_metadata(&self, task_id: &str) -> Option<PersistedTask> {
+        let task = self.task(task_id)?;
+        let state = task.lock_state().ok()?;
+        Some(state.metadata.clone())
+    }
+
     fn task_watch_state(&self, task_id: &str) -> (bool, bool) {
         self.inner
             .watch_registry
@@ -9529,6 +9624,7 @@ impl BgTaskRegistry {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
         }
+        append_source_read_only_note(&mut snapshot.output_preview, &metadata, &buffer);
         Some((snapshot, resolved.paths))
     }
 
@@ -10602,6 +10698,9 @@ impl BgTaskRegistry {
         if let Some(cache) = self.ensure_terminal_output_cache(task) {
             let mut output_preview = cache.output_preview.clone();
             self.append_db_hint(&task.task_id, &mut output_preview);
+            if let Ok(state) = task.lock_state() {
+                append_source_read_only_note(&mut output_preview, &state.metadata, &state.buffer);
+            }
             let envelope = append_bash_output_envelope(&cache, &mut output_preview);
             snapshot.output_preview = output_preview;
             snapshot.bash_output_list_envelope = envelope;
@@ -11861,6 +11960,30 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    pub(crate) fn freeze_runner_completion_notice(
+        &self,
+        session: &str,
+        task_id: &str,
+        request: cortexkit_role_llm_runner::send::SendRequest,
+    ) -> std::io::Result<cortexkit_role_llm_runner::send::SendRequest> {
+        let task = self
+            .task_for_session(task_id, session)
+            .ok_or_else(|| std::io::Error::other("completion task is not owned by this session"))?;
+        self.retry_terminal_persist(&task)?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
+            metadata.runner_completion_notice.get_or_insert(request);
+        })?;
+        Ok(state
+            .metadata
+            .runner_completion_notice
+            .clone()
+            .expect("notice was frozen"))
+    }
+
     pub fn pending_completions_for_session(&self, session_id: &str) -> Vec<BgCompletion> {
         self.inner
             .completions
@@ -11901,52 +12024,54 @@ impl BgTaskRegistry {
             return None;
         }
         let metadata = task.lock_state().ok()?.metadata.clone();
-        let (output_preview, output_truncated, bash_output_list_envelope) =
-            if let Some(saved) = self.saved_completion_preview(&metadata) {
-                (
-                    saved.output_preview,
-                    saved.output_truncated,
-                    saved.bash_output_list_envelope,
-                )
+        let (output_preview, output_truncated, bash_output_list_envelope) = if let Some(saved) =
+            self.saved_completion_preview(&metadata)
+        {
+            (
+                saved.output_preview,
+                saved.output_truncated,
+                saved.bash_output_list_envelope,
+            )
+        } else {
+            let (mut output_preview, output_truncated, cache) = if snapshot.info.mode == BgMode::Pty
+            {
+                (String::new(), false, None)
             } else {
-                let (mut output_preview, output_truncated, cache) =
-                    if snapshot.info.mode == BgMode::Pty {
-                        (String::new(), false, None)
-                    } else {
-                        let metadata = task.lock_state().ok()?.metadata.clone();
-                        self.ensure_terminal_output_cache(task)
-                            .map(|cache| {
-                                let (preview, truncated) = self.completion_preview_for_notice(
-                                    &metadata,
-                                    &cache,
-                                    Some(&task.paths),
-                                );
-                                (preview, truncated, Some(cache))
-                            })
-                            .unwrap_or_else(|| (String::new(), false, None))
-                    };
-                if let Ok(state) = task.lock_state() {
-                    if let Some(note) = rendered_execution_note(&state.metadata) {
-                        output_preview = format!("{note}\n{output_preview}");
-                    }
-                }
-                self.append_db_hint(&task.task_id, &mut output_preview);
-                let bash_output_list_envelope = cache
-                    .as_ref()
-                    .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
-                self.mask_completion_text(&task.task_id, &mut output_preview);
-                let saved = self.save_completion_preview(
-                    &task.task_id,
-                    &output_preview,
-                    output_truncated,
-                    &bash_output_list_envelope,
-                );
-                (
-                    saved.output_preview,
-                    saved.output_truncated,
-                    saved.bash_output_list_envelope,
-                )
+                let metadata = task.lock_state().ok()?.metadata.clone();
+                self.ensure_terminal_output_cache(task)
+                    .map(|cache| {
+                        let (preview, truncated) = self.completion_preview_for_notice(
+                            &metadata,
+                            &cache,
+                            Some(&task.paths),
+                        );
+                        (preview, truncated, Some(cache))
+                    })
+                    .unwrap_or_else(|| (String::new(), false, None))
             };
+            if let Ok(state) = task.lock_state() {
+                if let Some(note) = rendered_execution_note(&state.metadata) {
+                    output_preview = format!("{note}\n{output_preview}");
+                }
+                append_source_read_only_note(&mut output_preview, &state.metadata, &state.buffer);
+            }
+            self.append_db_hint(&task.task_id, &mut output_preview);
+            let bash_output_list_envelope = cache
+                .as_ref()
+                .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
+            self.mask_completion_text(&task.task_id, &mut output_preview);
+            let saved = self.save_completion_preview(
+                &task.task_id,
+                &output_preview,
+                output_truncated,
+                &bash_output_list_envelope,
+            );
+            (
+                saved.output_preview,
+                saved.output_truncated,
+                saved.bash_output_list_envelope,
+            )
+        };
         Some(BgCompletion {
             changed_files: self.changed_files_report(&metadata.task_id),
             task_id: snapshot.info.task_id,
@@ -12024,6 +12149,7 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        super::shell_metadata::changed();
         // Terminal tasks can stay in the watchdog index until their surviving
         // process group releases scratch. Only cleanup needs retrying; reading
         // their written marker again cannot change the observed outcome.
@@ -12498,10 +12624,22 @@ impl BgTaskRegistry {
     /// Find live shell tasks with a persisted daemon scope identity. Keep
     /// this off the subc frame loop: locks and process sampling may block.
     pub(crate) fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
+        // Snapshot in spawn's publication order without holding both locks.
+        let published = self.task_arcs();
+        let mut candidates = self.running_tasks();
+        let mut seen: HashSet<_> = candidates.iter().map(|task| task.task_id.clone()).collect();
+        for task in published {
+            // A caller can find a new task before watchdog registration. Include
+            // those nonterminal tasks, not retired terminal history that would
+            // otherwise require extra process-group samples.
+            if !seen.contains(&task.task_id) && !task.is_terminal() {
+                seen.insert(task.task_id.clone());
+                candidates.push(task);
+            }
+        }
         // Only unix extends the task scopes with secret proxy authorizations.
         #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut scopes: Vec<_> = self
-            .running_tasks()
+        let mut scopes: Vec<_> = candidates
             .into_iter()
             .filter_map(|task| {
                 let scope = task.lock_state().ok()?.metadata.scope.clone()?;
@@ -14744,6 +14882,9 @@ impl BgTaskRegistry {
                     output_preview = format!("{note}\n{output_preview}");
                 }
                 append_remote_report(&mut output_preview, metadata);
+                if let Some(buffer) = render_buffer {
+                    append_source_read_only_note(&mut output_preview, metadata, buffer);
+                }
                 if metadata.status == BgTaskStatus::Failed
                     || metadata.status == BgTaskStatus::FateUnknown
                 {
@@ -15647,6 +15788,47 @@ impl BgTaskRegistry {
             .lock()
             .map(|tasks| tasks.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_watchdog_registration_for_test(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<String>, impl Drop) {
+        struct Release(std::sync::mpsc::Sender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let previous = self
+            .inner
+            .before_watchdog_registration
+            .lock()
+            .unwrap()
+            .replace((arrived, released));
+        assert!(
+            previous.is_none(),
+            "watchdog registration is already paused"
+        );
+        (arrival, Release(release))
+    }
+
+    #[cfg(all(test, unix))]
+    fn wait_before_watchdog_registration_for_test(&self, task_id: &str) {
+        let gate = self
+            .inner
+            .before_watchdog_registration
+            .lock()
+            .unwrap()
+            .take();
+        if let Some((arrived, release)) = gate {
+            let _ = arrived.send(task_id.to_string());
+            release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("watchdog registration test controller");
+        }
     }
 
     #[cfg(all(test, unix))]
@@ -18289,7 +18471,7 @@ fn spawn_detached_child(
                         AFT process group is killed."
                     );
                 }
-                Ok(child)
+                Ok(child.into())
             }
             Err(CandidateFailure::Stopped {
                 error: PipedAttemptError::Setup(message),
@@ -18414,6 +18596,41 @@ fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
             output.push('\n');
         }
         output.push_str(&report);
+    }
+}
+
+fn append_source_read_only_note(output: &mut String, metadata: &PersistedTask, buffer: &BgBuffer) {
+    use std::io::BufRead;
+
+    let source_read_only = metadata
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.terminal.as_ref())
+        .and_then(|terminal| terminal.source_read_only())
+        == Some(true);
+    let failed = metadata.exit_code.is_some_and(|code| code != 0)
+        || matches!(
+            metadata.status,
+            BgTaskStatus::Killed | BgTaskStatus::TimedOut
+        );
+    if !source_read_only || !failed {
+        return;
+    }
+    let (Some(root), Some(reader)) = (metadata.project_root.as_deref(), buffer.stderr_reader())
+    else {
+        return;
+    };
+    if let Some(note) = crate::exec_remote::read_only_note::source_read_only_note(
+        source_read_only,
+        failed,
+        reader.lines().map_while(Result::ok),
+        &metadata.workdir,
+        root,
+    ) {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&note);
     }
 }
 
@@ -18958,6 +19175,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_scope_stamps_skips_terminal_history_outside_watchdog() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "owner".into(),
+            },
+            "retained",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_owner_authorized(true);
+        // Unknown descendants require a process-group sample if retained pipe
+        // history is mistakenly included in scope discovery.
+        for _ in 0..200 {
+            let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+            let mut state = task.lock_state().unwrap();
+            assert_eq!(state.metadata.mode, BgMode::Pipes);
+            state.metadata.scope = Some(scope.clone());
+            state.metadata.pgid = Some(i32::MAX);
+            state.metadata.live_descendants = None;
+        }
+        assert_eq!(registry.task_arcs().len(), 200);
+        assert!(registry.running_tasks().is_empty());
+        assert!(registry.live_scope_stamps().is_empty());
+        assert_eq!(
+            registry
+                .inner
+                .process_group_sample_count
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        // Watchdog-owned terminal candidates still need the original liveness
+        // check. This also proves the counter observes a sampling attempt.
+        let task = registry.task_arcs().pop().unwrap();
+        registry
+            .inner
+            .watchdog_tasks
+            .lock()
+            .unwrap()
+            .insert(task.task_id.clone(), task);
+        let _ = registry.live_scope_stamps();
+        assert_eq!(
+            registry
+                .inner
+                .process_group_sample_count
+                .load(Ordering::SeqCst),
+            1
+        );
+    }
+
     pub(super) fn insert_terminal_piped_task(
         registry: &BgTaskRegistry,
         dir: &tempfile::TempDir,
@@ -19015,16 +19285,11 @@ mod tests {
         let layout =
             create_task_layout(dir.path(), "signal-session", "bash-0000000000000008").unwrap();
         let handles = TaskIoHandles::create(&layout, BgMode::Pipes, false).unwrap();
-        let mut child = std::process::Command::new("/bin/sh")
+        let mut child: Child = std::process::Command::new("/bin/sh")
             .args(["-c", command])
             .spawn()
-            .unwrap();
-        let exit = child.wait().unwrap();
-        match command {
-            "kill -TERM $$" => assert_eq!(exit.signal(), Some(libc::SIGTERM)),
-            "kill -KILL $$" => assert_eq!(exit.signal(), Some(libc::SIGKILL)),
-            _ => assert_eq!(exit.code(), Some(7)),
-        }
+            .unwrap()
+            .into();
         let mut metadata = PersistedTask::starting(
             layout.paths.task_id.clone(),
             "signal-session".into(),
@@ -19036,6 +19301,13 @@ mod tests {
             false,
         );
         metadata.mark_running(child.id(), child.id() as i32);
+        assert!(metadata.child_start_time_ms.is_some());
+        let exit = child.wait().unwrap();
+        match command {
+            "kill -TERM $$" => assert_eq!(exit.signal(), Some(libc::SIGTERM)),
+            "kill -KILL $$" => assert_eq!(exit.signal(), Some(libc::SIGKILL)),
+            _ => assert_eq!(exit.code(), Some(7)),
+        }
         write_task_at(&layout, &metadata).unwrap();
         registry
             .insert_rehydrated_task(metadata, layout.paths, false)
@@ -19045,7 +19317,7 @@ mod tests {
             .unwrap();
         {
             let mut state = task.lock_state().unwrap();
-            state.runtime = TaskRuntime::Piped(Some(child.into()));
+            state.runtime = TaskRuntime::Piped(Some(child));
             state.io_handles = Some(handles);
         }
         (dir, registry, task)
@@ -23424,7 +23696,7 @@ mod tests {
     /// it has terminated. Used by reap_child tests to simulate the
     /// "child exists and is dead" state when the watchdog has already
     /// nulled out the original child handle.
-    fn spawn_dead_child() -> std::process::Child {
+    fn spawn_dead_child() -> (Child, ProcessIdentity) {
         #[cfg(unix)]
         let mut cmd = std::process::Command::new("true");
         #[cfg(windows)]
@@ -23436,7 +23708,11 @@ mod tests {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
-        let mut child = cmd.spawn().expect("spawn replacement child for reap test");
+        let mut child: Child = cmd
+            .spawn()
+            .expect("spawn replacement child for reap test")
+            .into();
+        let identity = ProcessIdentity::of(child.id()).expect("read owned child start time");
         // Poll try_wait() until the child actually exits, instead of calling
         // wait() which closes the OS handle. On Windows, after wait()
         // closes the handle, subsequent try_wait() calls (which reap_child
@@ -23458,12 +23734,13 @@ mod tests {
                 Err(error) => panic!("dead-child try_wait failed: {error}"),
             }
         }
-        child
+        (child, identity)
     }
 
     #[test]
     fn terminal_child_reaper_observes_exit_before_releasing_handle() {
-        let mut child = Some(spawn_dead_child().into());
+        let (child, _identity) = spawn_dead_child();
+        let mut child = Some(child);
 
         assert!(
             reap_piped_child(&mut child),
@@ -24612,7 +24889,8 @@ mod tests {
 
         // This test exercises reaping, not shell startup. Own a direct child
         // and wait for its exit instead of racing a wrapper and the watchdog.
-        // Child::wait leaves its exit status observable through try_wait.
+        // The production wrapper must observe the first wait so it can retain
+        // the exit status after the kernel has reaped the process.
         #[cfg(unix)]
         let mut command = std::process::Command::new("true");
         #[cfg(windows)]
@@ -24621,14 +24899,13 @@ mod tests {
             command.args(["/c", "exit", "0"]);
             command
         };
-        let mut child = command
+        let mut child: Child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn child for reap test");
-        assert!(child.wait().expect("wait for child exit").success());
-        assert!(child.try_wait().unwrap().is_some());
+            .expect("spawn child for reap test")
+            .into();
 
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
@@ -24640,8 +24917,10 @@ mod tests {
             true,
             false,
         );
-        metadata.status = BgTaskStatus::Running;
-        metadata.child_pid = Some(child.id());
+        metadata.mark_running(child.id(), child.id() as i32);
+        assert!(metadata.child_start_time_ms.is_some());
+        assert!(child.wait().expect("wait for child exit").success());
+        assert!(child.try_wait().unwrap().is_some());
         write_task_at(&layout, &metadata).unwrap();
         // Restore the task from metadata without starting the watchdog. Restored
         // tasks have no open output handles, so reaping cannot write an exit
@@ -24651,7 +24930,7 @@ mod tests {
             .insert_rehydrated_task(metadata, layout.paths.clone(), false)
             .unwrap();
         let task = registry.task_for_session(&task_id, "session").unwrap();
-        task.lock_state().unwrap().runtime = TaskRuntime::Piped(Some(child.into()));
+        task.lock_state().unwrap().runtime = TaskRuntime::Piped(Some(child));
 
         // Sanity: task is still Running per metadata (replay/poll hasn't
         // observed the missing marker yet).
@@ -24793,7 +25072,11 @@ mod tests {
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
             if matches!(state.runtime, TaskRuntime::Piped(None)) {
-                state.runtime = TaskRuntime::Piped(Some(spawn_dead_child().into()));
+                let (child, identity) = spawn_dead_child();
+                state.metadata.child_pid = Some(identity.pid);
+                state.metadata.child_start_time_ms = Some(identity.started_at_ms);
+                state.metadata.pgid = Some(identity.pid as i32);
+                state.runtime = TaskRuntime::Piped(Some(child));
             }
         }
         *task.terminal_at.lock().unwrap() = None;

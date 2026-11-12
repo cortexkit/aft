@@ -1,0 +1,157 @@
+[
+  {
+    "kind": "completion",
+    "input": {
+      "task_id": "bash-short",
+      "status": "completed",
+      "exit_code": 0,
+      "duration_ms": 999.5,
+      "output_preview": "\u001b[32mok\u001b[0m\n",
+      "output_truncated": false
+    },
+    "text": "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task bash-short (exit 0, 1000ms)\n    ok\n</system-reminder>"
+  },
+  {
+    "kind": "completion",
+    "input": {
+      "task_id": "bash-failed",
+      "status": "failed",
+      "exit_code": 1,
+      "duration_ms": 59999,
+      "output_preview": "first\nlast\n\n",
+      "output_truncated": true,
+      "output_incomplete": true,
+      "status_reason": "capture stopped",
+      "live_descendants_summary": "2 descendants remain",
+      "_bash_changed_files": {
+        "text": "Changed files: src/main.rs"
+      }
+    },
+    "text": "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task bash-failed (exit 1, 1m 0s)\n    [capture stopped]\n    …\n    first\n    last\n    2 descendants remain\nChanged files: src/main.rs\n\nFor truncated tasks, use bash_status({ taskId: \"...\" }) to retrieve full output.\n</system-reminder>"
+  },
+  {
+    "kind": "completion",
+    "input": {
+      "task_id": "bash-timeout",
+      "status": "timed_out",
+      "exit_code": -9,
+      "runtime_ms": 1500,
+      "output_preview": "  \n",
+      "output_truncated": false
+    },
+    "text": "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task bash-timeout (timed out, 2s)\n</system-reminder>"
+  },
+  {
+    "kind": "completion",
+    "input": {
+      "task_id": "bash-huge",
+      "status": "completed",
+      "exit_code": 9007199254740992,
+      "duration_ms": 1e+24,
+      "output_preview": "",
+      "output_truncated": false
+    },
+    "text": "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task bash-huge (exit 9007199254740992, 16666666666666666000m 40s)\n</system-reminder>"
+  },
+  {
+    "kind": "completion",
+    "input": {
+      "task_id": "bash-small",
+      "status": "killed",
+      "exit_code": null,
+      "runtime": 0.5,
+      "output_incomplete": true,
+      "output_preview": "",
+      "output_truncated": false
+    },
+    "text": "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task bash-small (killed, 1ms)\n    [PTY output may be incomplete]\n</system-reminder>"
+  },
+  {
+    "kind": "completion",
+    "input": {
+      "task_id": "bash-negative",
+      "status": "fate_unknown",
+      "exit_code": null,
+      "duration_ms": -1,
+      "runtime_ms": 500,
+      "output_preview": "done\r\n",
+      "output_truncated": true
+    },
+    "text": "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task bash-negative (fate_unknown)\n    …\n    done\r\n\nFor truncated tasks, use bash_status({ taskId: \"...\" }) to retrieve full output.\n</system-reminder>"
+  },
+  {
+    "kind": "long_running",
+    "input": {
+      "task_id": "bash-long",
+      "command": "cargo test",
+      "elapsed_ms": 60500
+    },
+    "text": "<system-reminder>\n[BACKGROUND BASH STILL RUNNING]\n- bash-long still running after 1m 1s: cargo test\nUse bash_status({ taskId: \"...\" }) to inspect output or bash_kill({ taskId: \"...\" }) to terminate.\n</system-reminder>"
+  },
+  {
+    "kind": "long_running",
+    "input": {
+      "task_id": "bash-long-title",
+      "command": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+      "elapsed_ms": 999.5
+    },
+    "text": "<system-reminder>\n[BACKGROUND BASH STILL RUNNING]\n- bash-long-title still running after 1000ms: abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmno…\nUse bash_status({ taskId: \"...\" }) to inspect output or bash_kill({ taskId: \"...\" }) to terminate.\n</system-reminder>"
+  },
+  {
+    "kind": "watch",
+    "input": {
+      "task_id": "bash-watch",
+      "match_text": "ready\"now",
+      "match_offset": 9007199254740992,
+      "context": "ready\nnow",
+      "reason": "match"
+    },
+    "text": "<system-reminder>\n[BG BASH NOTIFY]\n- task bash-watch matched \"ready\\\"now\" (offset 9007199254740992):\n      > ready\n      > now\n</system-reminder>"
+  },
+  {
+    "kind": "watch",
+    "input": {
+      "task_id": "bash-exit",
+      "match_text": "exit",
+      "match_offset": 0,
+      "context": "last line",
+      "reason": "task_exit"
+    },
+    "text": "<system-reminder>\n[BG BASH NOTIFY]\n- task bash-exit exited:\n      > last line\n</system-reminder>"
+  },
+  {
+    "kind": "watch",
+    "input": {
+      "task_id": "bash-lines",
+      "reason": "match",
+      "batch": {
+        "lines": [
+          {
+            "stream": "stdout",
+            "offset": 42,
+            "count": 2,
+            "text": "ready"
+          },
+          {
+            "stream": "stderr",
+            "offset": 99,
+            "count": 1,
+            "text": "",
+            "unavailable": true
+          }
+        ],
+        "dropped_lines": 3,
+        "skipped_long_lines": 1,
+        "first_dropped_stream": "stderr",
+        "first_dropped_offset": 100,
+        "retry_gap": {
+          "dropped_notifications": 2,
+          "known_missing_occurrences": 1,
+          "stream": "stdout",
+          "first_offset": 8
+        }
+      }
+    },
+    "text": "<system-reminder>\n[BG BASH NOTIFY]\n- task bash-lines matching lines:\n      > stdout byte 42 ×2: ready\n      > stderr byte 99: 1 matching line over 8 KiB was not shown; AFT can check lines only up to 8 KiB for secrets.\n      > 3 matching lines dropped. 1 lines longer than 64 KiB were skipped, so the scan is incomplete. Read them with bash_status({ taskId: \"bash-lines\", stderrOffset: 100 }).\n      > Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ taskId: \"bash-lines\", outputOffset: 8 }).\n</system-reminder>"
+  }
+]

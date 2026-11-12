@@ -247,6 +247,56 @@ fn head_agent(
     .optional()
 }
 
+/// Resolve a shell's recorded scope without requiring it to hold a saved grant.
+/// Use the worker's recorded parent owner, scope and epoch. If that exact
+/// registration is absent, a revived head keeps its newest registered agent id.
+pub(crate) fn holder_for_scope(
+    conn: &Connection,
+    scope: &ScopeKey,
+) -> rusqlite::Result<Option<GrantHolder>> {
+    let registration = conn
+        .query_row(
+            "SELECT a.kind,a.agent_id,s.parent_owner,s.parent,s.parent_epoch
+         FROM access_scope_agents a JOIN access_scopes s
+         ON s.owner=a.owner AND s.scope_ref=a.scope_ref AND s.epoch=a.epoch
+         WHERE a.owner=?1 AND a.scope_ref=?2 AND a.epoch=?3",
+            params![scope.owner, scope.scope_ref, scope.epoch.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((kind, agent, owner, parent, epoch)) = registration else {
+        return Ok(None);
+    };
+    Ok(match kind.as_str() {
+        "worker" => Some(GrantHolder::Worker {
+            agent_id: match (owner, parent, epoch) {
+                (Some(owner), Some(parent), Some(epoch)) => {
+                    head_agent(conn, &(owner, parent, epoch))?
+                }
+                _ => None,
+            },
+            scope_ref: scope.scope_ref.clone(),
+        }),
+        "head" => Some(GrantHolder::Agent {
+            agent_id: (!agent.is_empty()).then_some(agent),
+        }),
+        _ => None,
+    })
+}
+
+pub(crate) fn known_agent_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    conn.prepare("SELECT DISTINCT agent_id FROM access_scope_agents WHERE kind='head' AND agent_id<>'' ORDER BY agent_id")?
+        .query_map([], |row| row.get(0))?.collect()
+}
+
 fn resolve(conn: &Connection, raw: RawRow) -> rusqlite::Result<GrantRow> {
     let RawRow {
         mut row,

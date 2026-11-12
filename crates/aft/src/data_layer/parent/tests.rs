@@ -627,7 +627,7 @@ fn a_parent_folders_todo_count_names_the_repositories_not_indexed_yet() {
     );
 
     let scope = crate::inspect::inventory::InspectInventory::collect(&root, || true).sources;
-    let job = crate::inspect::InspectJob {
+    let mut job = crate::inspect::InspectJob {
         job_id: 1,
         key: crate::inspect::JobKey::for_category_scope(
             crate::inspect::InspectCategory::Todos,
@@ -662,6 +662,38 @@ fn a_parent_folders_todo_count_names_the_repositories_not_indexed_yet() {
     );
     // The repository's files are covered by its gap, not listed one by one.
     assert!(aggregate.get("skipped_files").is_none(), "{aggregate:#}");
+    assert_eq!(
+        serde_json::to_vec(&aggregate).unwrap(),
+        serde_json::to_vec(&crate::inspect::scanners::todos::uncached_aggregate_for_test(&job))
+            .unwrap(),
+    );
+    // Once both repositories are indexed, detail order follows the caller's
+    // scope rather than the order in which child checkouts are consulted.
+    let beta = DataCheckout::open(&root.join("beta"), &storage, None).unwrap();
+    parent
+        .data_children()
+        .insert_for_test(session.root(), &root.join("beta"), Arc::clone(&beta));
+    beta.request_refresh();
+    settled(
+        || {
+            beta.view()
+                .is_some_and(|view| view.status().callgraph_published)
+                && !beta.checkout().status().building
+        },
+        |published| *published,
+    );
+    job.scope_files.reverse();
+    let aggregate = crate::inspect::scanners::todos::run_todos_scan(&job)
+        .outcome
+        .unwrap()
+        .aggregate;
+    assert_eq!(aggregate["count"], 2);
+    assert_eq!(aggregate["items"][0]["file"], "beta/src/todo.rs");
+    assert_eq!(
+        serde_json::to_vec(&aggregate).unwrap(),
+        serde_json::to_vec(&crate::inspect::scanners::todos::uncached_aggregate_for_test(&job),)
+            .unwrap()
+    );
 }
 
 #[test]

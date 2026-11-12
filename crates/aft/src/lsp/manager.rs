@@ -1206,6 +1206,15 @@ pub struct LspManager {
     /// or the watcher sees it change, because they then describe an older
     /// state of the file.
     latest_pull_for_rust: HashMap<(ServerKey, PathBuf), Vec<StoredDiagnostic>>,
+    /// Files whose latest `cargo check` push from a rust-analyzer that answers
+    /// pull requests carried compiler diagnostics AFT could not match to known
+    /// file content: the document was not open in the server, or the push named
+    /// another version. Such rows are left out of `latest_push_for_pull_servers`,
+    /// so a pulled report for the file would hold only rust-analyzer's own
+    /// analysis and read as compiler-clean. Until a newer push for the file
+    /// replaces them, a scoped inspect asks for a new check instead of
+    /// certifying the pulled report.
+    unproven_rust_compiler_reports: HashSet<(ServerKey, PathBuf)>,
     /// Times the retry window of transient start failures in `failed_spawns`.
     retry_clock: RetryClock,
     /// Project-wide diagnostic producer expectations survive walks limited to
@@ -1428,6 +1437,7 @@ impl LspManager {
             versioned_publish_servers: HashSet::new(),
             latest_push_for_pull_servers: HashMap::new(),
             latest_pull_for_rust: HashMap::new(),
+            unproven_rust_compiler_reports: HashSet::new(),
             retry_clock: RetryClock::system(),
             project_applicability: None,
         }
@@ -3969,6 +3979,46 @@ impl LspManager {
             .find_map(|(key, entry)| (key == server_key).then(|| entry.diagnostics.clone()))
     }
 
+    /// Whether rust-analyzer's latest `cargo check` push for `file` carried
+    /// compiler diagnostics that could not be matched to known file content
+    /// (see `unproven_rust_compiler_reports`). A pulled report for the file
+    /// then lacks those rows and cannot stand for its compiler result.
+    pub(crate) fn rust_compiler_report_unproven(
+        &self,
+        server_key: &ServerKey,
+        file_path: &Path,
+    ) -> bool {
+        self.unproven_rust_compiler_reports
+            .contains(&(server_key.clone(), normalize_lookup_path(file_path)))
+    }
+
+    /// Ask rust-analyzer for a new `cargo check` by telling it that `file`,
+    /// a document open in it, was saved. The check publishes its results for
+    /// open documents with their versions, which AFT can match to their
+    /// content. Until the check begins, [`Self::rust_check_state`] reports
+    /// it as running. Returns whether the save was sent.
+    pub(crate) fn request_rust_check(&mut self, server_key: &ServerKey, file_path: &Path) -> bool {
+        let Ok(content) = std::fs::read_to_string(file_path) else {
+            return false;
+        };
+        let Ok(uri) = uri_for_path(file_path) else {
+            return false;
+        };
+        let Some(client) = self.clients.get_mut(server_key) else {
+            return false;
+        };
+        if client.save_notification().is_none() {
+            return false;
+        }
+        match send_did_save(client, &uri, &content) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::slog_warn!("didSave for {} failed: {error}", uri.as_str());
+                false
+            }
+        }
+    }
+
     /// Store the union of a pulled report and the server's latest push for
     /// the same file, keeping the stored report's resultId and document
     /// version. See `latest_push_for_pull_servers` for why one would
@@ -4398,6 +4448,10 @@ impl LspManager {
                 // inputs prove which bytes its compiler diagnostics describe.
                 self.latest_push_for_pull_servers
                     .insert((key.clone(), file.clone()), compiler.clone());
+                // The completed check's verified inputs match these rows to
+                // the file's content.
+                self.unproven_rust_compiler_reports
+                    .remove(&(key.clone(), file.clone()));
                 let pulled = self.latest_pull_for_rust.get(&(key.clone(), file.clone()));
                 let merged =
                     union_of_diagnostics(pulled.cloned().unwrap_or_default(), compiler.clone());
@@ -5913,6 +5967,8 @@ impl LspManager {
             .retain(|(server, _), _| keep(server));
         self.latest_pull_for_rust
             .retain(|(server, _), _| keep(server));
+        self.unproven_rust_compiler_reports
+            .retain(|(server, _)| keep(server));
         self.inspect_closed_documents
             .retain(|(server, _), _| keep(server));
         self.late_close_replies
@@ -6165,6 +6221,52 @@ impl LspManager {
         self.clients
             .values()
             .any(|client| client.state() == ServerState::Ready)
+    }
+
+    /// Read lifecycle facts without resolving files or starting a server.
+    pub(crate) fn operator_server_states(&self) -> Vec<(String, String, Option<String>)> {
+        let mut states = std::collections::BTreeMap::<String, (String, Option<String>)>::new();
+        let rank = |state: &str| match state {
+            "degraded" => 2,
+            "building" => 1,
+            _ => 0,
+        };
+        let mut record = |server: String, state: &str, reason: Option<&str>| {
+            states
+                .entry(server)
+                .and_modify(|current| {
+                    if rank(state) > rank(&current.0)
+                        || (rank(state) == rank(&current.0)
+                            && reason.unwrap_or("") < current.1.as_deref().unwrap_or(""))
+                    {
+                        *current = (state.to_owned(), reason.map(str::to_owned));
+                    }
+                })
+                .or_insert_with(|| (state.to_owned(), reason.map(str::to_owned)));
+        };
+        for (key, client) in &self.clients {
+            let (state, reason) = match client.state() {
+                ServerState::Ready => ("ready", None),
+                ServerState::Starting | ServerState::Initializing => ("building", Some("starting")),
+                ServerState::ShuttingDown => ("degraded", Some("stopping")),
+                ServerState::Exited => ("degraded", Some("exited")),
+            };
+            record(key.kind.id_str().to_owned(), state, reason);
+        }
+        for key in self.starting.keys() {
+            record(key.kind.id_str().to_owned(), "building", Some("starting"));
+        }
+        for key in self.failed_spawns.keys() {
+            record(
+                key.kind.id_str().to_owned(),
+                "degraded",
+                Some("spawn_failed"),
+            );
+        }
+        states
+            .into_iter()
+            .map(|(server, (state, reason))| (server, state, reason))
+            .collect()
     }
 
     /// Report the SDK selected when the server started; resolving it again
@@ -7163,12 +7265,22 @@ impl LspManager {
             // Ignore close clears for the merge cache too, unless a new check
             // is pending: its empty compiler report must still clear old rows.
             // Unversioned pushes cannot borrow a later pull's content proof.
-            if stored.is_empty() || self.confirmed_document_hash(&key, &file, version).is_none() {
+            let confirmed = self.confirmed_document_hash(&key, &file, version).is_some();
+            if stored.is_empty() || !confirmed {
                 self.latest_push_for_pull_servers
                     .remove(&(key.clone(), file.clone()));
             } else {
                 self.latest_push_for_pull_servers
                     .insert((key.clone(), file.clone()), stored.clone());
+            }
+            // The newest push decides: compiler rows it dropped above leave the
+            // file's compiler result unknown, and any other push replaces them.
+            if !stored.is_empty() && !confirmed {
+                self.unproven_rust_compiler_reports
+                    .insert((key.clone(), file.clone()));
+            } else {
+                self.unproven_rust_compiler_reports
+                    .remove(&(key.clone(), file.clone()));
             }
         }
         if let Some(pulled) = self.latest_pull_for_rust.get(&(key.clone(), file.clone())) {
@@ -7527,6 +7639,8 @@ impl LspManager {
                     .retain(|(server, _), _| server != key);
                 self.latest_push_for_pull_servers
                     .retain(|(server, _), _| server != key);
+                self.unproven_rust_compiler_reports
+                    .retain(|(server, _)| server != key);
                 Ok(Some((pending, previous)))
             }
             Err(error) => {

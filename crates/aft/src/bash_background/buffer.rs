@@ -302,6 +302,13 @@ impl BgBuffer {
             .unwrap_or_else(empty_bounded_read)
     }
 
+    pub(super) fn stderr_reader(&self) -> Option<impl io::BufRead> {
+        self.source(StreamKind::Stderr)?
+            .open()
+            .ok()
+            .map(io::BufReader::new)
+    }
+
     /// Notice redaction needs contiguous input: a head/tail join could cut an
     /// opaque credential into fragments that no format matcher can recognize.
     /// Returns stdout and stderr separately so a caller can find each stream's

@@ -1,5 +1,5 @@
 use super::super::test_support::*;
-use super::tests::caller_route;
+use super::tests::{caller_route, BackgroundCompletionGate};
 use super::*;
 use crate::bash_background::{persistence, TaskIdentity};
 use crate::protocol::RawRequest;
@@ -17,7 +17,7 @@ fn fixture() -> Fixture {
     let (root_dir, root) = test_root("codemode-worker-background");
     let storage = tempfile::tempdir().unwrap();
     let mut carrier = caller_route(&root, "reserved:prefrontal-core", "runner");
-    let mut worker = caller_route(&root, "test:worker-runner", "runner");
+    let mut worker = caller_route(&root, "reserved:broca", "runner");
     let mut run = caller_route(&root, "reserved:prefrontal-core", "runner");
     for (route, session) in [
         (&mut carrier, "worker-session"),
@@ -200,6 +200,7 @@ fn with_route<T>(route: &RouteIdentity, run: impl FnOnce() -> T) -> T {
 #[tokio::test]
 async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_completes() {
     let mut f = fixture();
+    let completion_gate = BackgroundCompletionGate::new(f.root.as_path());
     save_catalog(&f, &f.worker);
     let effective = match admit(&f) {
         codemode::Admission::Owner(identity) => identity,
@@ -207,7 +208,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
         _ => panic!("worker run must resolve its owner"),
     };
     let expected = TaskIdentity {
-        principal: Some("test:worker-runner".into()),
+        principal: Some("reserved:broca".into()),
         harness: "runner".into(),
         session: "worker-session".into(),
     };
@@ -243,7 +244,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
             1,
             control_flags(),
             PROTOCOL_VERSION,
-            json!({"command":"echo worker-output","background":true,"compressed":false,"timeout":5000}),
+            json!({"command":completion_gate.command("worker-output"),"background":true,"compressed":false,"timeout":60_000}),
             crate::subc_format::FormatContext::default(),
             bash::BashWaitCancel {
                 keepalive: None,
@@ -268,21 +269,30 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
             false,
             true,
             remote_policy::RemoteSource::None,
-            Instant::now() + Duration::from_secs(10),
+            // Runner workers hold background calls when late results are supported.
+            // End this call's reply budget before releasing the running child.
+            Instant::now() + Duration::from_millis(250),
         );
     }
-    let done = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+    let done = tokio::time::timeout(Duration::from_secs(30), done_rx.recv())
         .await
         .unwrap()
         .unwrap();
     let response = done.response_for_test();
     assert!(response.success, "{response:?}");
+    assert_eq!(response.data["status"], "running", "{response:?}");
+    assert!(
+        response.data.get("output_preview").is_none(),
+        "launch guidance must not consume terminal output: {response:?}"
+    );
     let task_id = response.data["task_id"]
         .as_str()
         .expect("background task id")
         .to_owned();
+    let capture = super::super::runner_notices::test_endpoint::capture(&task_id, false);
+    completion_gate.release();
     let completion = loop {
-        let frame = tokio::time::timeout(Duration::from_secs(10), notice_rx.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(30), notice_rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -296,6 +306,10 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
     )
     .unwrap();
     let metadata = persistence::read_task_at(&task).unwrap();
+    assert!(
+        !metadata.completion_delivered,
+        "background launch must leave completion pending: {response:?}"
+    );
     assert_eq!(metadata.launching_identity, Some(expected.clone()));
     assert_eq!(metadata.scope, f.worker.scope);
     assert_ne!(metadata.scope, effective.scope);
@@ -308,7 +322,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
         panic!("the same program must be able to observe the task it launched");
     };
     assert_eq!(program_observer.task_identity(), expected);
-    let mut other_session = caller_route(&f.root, "test:worker-runner", "runner");
+    let mut other_session = caller_route(&f.root, "reserved:broca", "runner");
     let mut other_principal = caller_route(&f.root, "test:another-runner", "runner");
     for (route, session) in [
         (&mut other_session, "other-worker"),
@@ -406,12 +420,32 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
         &completion,
         None,
     );
-    assert_eq!(result.matched_channels, 1);
-    let delivered = writer_rx.try_recv().expect("worker receives completion");
-    assert_eq!((delivered.header.channel, delivered.header.epoch), (2, 1));
+    assert_eq!(result.matched_channels, 0);
+    let notice_metadata = f
+        .ctx
+        .bash_background()
+        .notice_metadata(&task_id)
+        .expect("notice task must remain registered");
+    assert!(
+        !notice_metadata.completion_delivered,
+        "task observations or fan-out consumed completion before notice offer"
+    );
+    assert!(super::super::runner_notices::enqueue(
+        f.ctx.bash_background().clone(),
+        completion.clone()
+    ));
+    let notice = capture
+        .receiver
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(notice.session, "worker-session");
+    assert_eq!(
+        notice.request["params"]["delivery"],
+        json!(["tool_result", "steer"])
+    );
     assert!(
         writer_rx.try_recv().is_err(),
-        "no carrier or foreign route receives completion"
+        "runner and foreign routes receive no completion frames"
     );
     let subs = HashMap::from([
         (

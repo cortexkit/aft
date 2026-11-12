@@ -252,6 +252,9 @@ pub(crate) fn sweep_scoped_files(
     // again now, so it can run while the files are opened.
     {
         let mut lsp = ctx.lsp();
+        // Apply queued compiler pushes first, so the files whose compiler
+        // errors could not be matched to their content are known below.
+        lsp.drain_events();
         for key in involved.iter().filter(|key| key.kind == ServerKind::Rust) {
             lsp.rearm_unreported_rust_check(key);
         }
@@ -268,6 +271,7 @@ pub(crate) fn sweep_scoped_files(
     let mut waiting: Vec<(PathBuf, ServerKey, Option<u64>)> = Vec::new();
     let mut pulled: Vec<(PathBuf, ServerKey, Vec<StoredDiagnostic>)> = Vec::new();
     let mut retry_pulls: Vec<(PathBuf, ServerKey, Option<u64>, String)> = Vec::new();
+    let mut recheck: HashMap<ServerKey, PathBuf> = HashMap::new();
     let mut late_registrations = HashSet::new();
     let mut to_pull = Vec::new();
     for (file, keys) in &selected {
@@ -366,6 +370,21 @@ pub(crate) fn sweep_scoped_files(
                 waiting.push((file.clone(), key, epoch_before));
                 continue;
             }
+            // The compiler errors rust-analyzer last pushed for this file
+            // could not be matched to its content (it was not open when the
+            // check published them), so the pulled report would lack them.
+            // Ask for a new check once every document is open, whose results
+            // then carry document versions, and pull after it.
+            if key.kind == ServerKind::Rust && lsp.rust_compiler_report_unproven(&key, file) {
+                recheck.entry(key.clone()).or_insert_with(|| file.clone());
+                retry_pulls.push((
+                    file.clone(),
+                    key,
+                    epoch_before,
+                    NO_PUBLISH_REASON.to_string(),
+                ));
+                continue;
+            }
             // A pull sent before rust-analyzer processes a watched-file
             // change can succeed with the old native analysis, not only
             // be cancelled. Request it after the current compiler check
@@ -381,6 +400,16 @@ pub(crate) fn sweep_scoped_files(
                 continue;
             }
             to_pull.push((file.clone(), key, epoch_before));
+        }
+    }
+    // One save per server is enough: the check covers the whole workspace,
+    // and each further save would restart the check it asked for.
+    for (key, file) in recheck {
+        if !ctx.lsp().request_rust_check(&key, &file) {
+            crate::slog_debug!(
+                "scoped inspect could not ask rust-analyzer to check {} again",
+                file.display()
+            );
         }
     }
     for window in to_pull.chunks(PULL_WINDOW) {
@@ -634,6 +663,15 @@ pub(crate) fn sweep_scoped_files(
         lsp.drain_events();
         for (file, key, diagnostics) in pulled {
             if key.kind == ServerKind::Rust && lsp.has_client(&key) {
+                // Compiler errors that still cannot be matched to the file's
+                // content would be missing from the union, which would then
+                // read as compiler-clean. Leave the file unknown instead.
+                if lsp.rust_compiler_report_unproven(&key, &file) {
+                    sweep
+                        .unanswered
+                        .insert(file, (key, NO_PUBLISH_REASON.to_string()));
+                    continue;
+                }
                 lsp.store_pull_push_union(&key, &file, diagnostics);
             } else if sweep
                 .requested_reports

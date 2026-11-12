@@ -311,13 +311,6 @@ impl BgTaskRegistry {
         starts_capture: bool,
         ends_capture: bool,
     ) -> Result<(String, String), UnavailablePreview> {
-        let text = String::from_utf8_lossy(bytes);
-        // A scan window can end inside a character that is intact in the full
-        // capture. Decode the expanded source neighborhood rather than separate
-        // match prefixes, then include the whole character at either match edge.
-        let mut range = lossy_watch_offset(bytes, range.start, false)
-            ..lossy_watch_offset(bytes, range.end, true);
-        align_watch_range(&text, &mut range);
         let task = self.task(task_id);
         let ticket_digest = task.as_ref().and_then(|task| {
             task.lock_state()
@@ -332,6 +325,30 @@ impl BgTaskRegistry {
         let Some(secrets) = guard.as_deref().and_then(Option::as_ref) else {
             return Err(UnavailablePreview::restart());
         };
+        Self::mask_window_with_values(
+            bytes,
+            range,
+            starts_capture,
+            ends_capture,
+            secrets,
+            ticket_digest.as_deref(),
+        )
+    }
+
+    pub(super) fn mask_window_with_values(
+        bytes: &[u8],
+        range: std::ops::Range<usize>,
+        starts_capture: bool,
+        ends_capture: bool,
+        secrets: &crate::log_redact::SecretValues,
+        ticket_digest: Option<&str>,
+    ) -> Result<(String, String), UnavailablePreview> {
+        let text = String::from_utf8_lossy(bytes);
+        // Extra masking context may end inside a character outside the
+        // displayed range; decode the whole source neighborhood first.
+        let mut range = lossy_watch_offset(bytes, range.start, false)
+            ..lossy_watch_offset(bytes, range.end, true);
+        align_watch_range(&text, &mut range);
         if secrets.longest_value_len() > WATCH_SECRET_HALO_BYTES {
             return Err(UnavailablePreview::context(TRUNCATED_PREVIEW_WITHHELD));
         }
@@ -342,8 +359,14 @@ impl BgTaskRegistry {
         {
             return Err(UnavailablePreview::line_limit());
         }
-        let Some(region) = watch_mask_region(&text, &range, secrets, starts_capture, ends_capture)
-        else {
+        let Some(region) = watch_mask_region(
+            &text,
+            &range,
+            secrets,
+            starts_capture,
+            ends_capture,
+            WATCH_PREVIEW_LINE_CAP_BYTES,
+        ) else {
             return Err(UnavailablePreview::context(TRUNCATED_PREVIEW_WITHHELD));
         };
         let mut range = range.start - region.start..range.end - region.start;
@@ -387,6 +410,77 @@ impl BgTaskRegistry {
             matched.to_string(),
             super::super::watches::context_snippet(&masked, range.start, range.end),
         ))
+    }
+
+    pub(super) fn shell_mask_window_with_values(
+        bytes: &[u8],
+        range: std::ops::Range<usize>,
+        starts_capture: bool,
+        ends_capture: bool,
+        no_format_context: bool,
+        prior_multiline: (bool, bool),
+        secrets: &crate::log_redact::SecretValues,
+        ticket_digest: Option<&str>,
+    ) -> Option<String> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut range = lossy_watch_offset(bytes, range.start, false)
+            ..lossy_watch_offset(bytes, range.end, true);
+        align_watch_range(&text, &mut range);
+        if prior_multiline.0 {
+            // Three unescaped quotes close any value or field opening that
+            // could have begun before this bounded source window.
+            let mut known = false;
+            let mut escaped = false;
+            let mut quotes = 0;
+            for byte in text.as_bytes().iter().copied().take(range.start) {
+                if !known {
+                    if byte != b'\\' {
+                        known = true;
+                    }
+                    continue;
+                }
+                if byte == b'\\' {
+                    escaped = !escaped;
+                    continue;
+                }
+                if byte == b'"' && !escaped {
+                    quotes += 1;
+                }
+                escaped = false;
+            }
+            if quotes < 3 {
+                return None;
+            }
+        }
+        if prior_multiline.1
+            && !crate::log_redact::shells_private_boundary_before(&text, range.start)
+        {
+            return None;
+        }
+        if crate::log_redact::json_secret_value_open_at_end(&text, range.end) {
+            return None;
+        }
+        let region = if no_format_context {
+            0..text.len()
+        } else {
+            watch_mask_region(
+                &text,
+                &range,
+                secrets,
+                starts_capture,
+                ends_capture,
+                usize::MAX,
+            )?
+        };
+        range = range.start - region.start..range.end - region.start;
+        // Watch matches expand to include every secret they touch. A stream
+        // instead owns a replacement only in the range containing its first
+        // raw byte; otherwise a long secret repeats its placeholder in every
+        // chunk. Stream mapping preserves unchanged header prefixes and
+        // suffixes while leaving the existing watch behavior unchanged.
+        let values = secrets.redact_stream_range(&text[region], &mut range);
+        align_watch_range(&values, &mut range);
+        crate::log_redact::shells_ticket_range(&values, range, ticket_digest).ok()
     }
 
     pub(super) fn completion_preview_for_notice(
@@ -577,7 +671,7 @@ pub(super) fn watch_preview_source_range(
 /// region is widened further for the two that do not, JSON secret fields and
 /// private-key blocks, and for exact credential values containing a newline.
 /// `None` means the preview must be withheld: the lines holding the match
-/// would exceed [`WATCH_PREVIEW_LINE_CAP_BYTES`] or reach past the window, or
+/// would exceed the caller's line limit or reach past the window, or
 /// the window cannot show whether the region starts inside a key block or ends
 /// inside a JSON secret value. Context lines that cannot be included this way
 /// are left out of the preview instead.
@@ -587,6 +681,7 @@ fn watch_mask_region(
     secrets: &crate::log_redact::SecretValues,
     starts_capture: bool,
     ends_capture: bool,
+    line_limit: usize,
 ) -> Option<std::ops::Range<usize>> {
     let shown = super::super::watches::context_range(text, matched.start, matched.end);
     // Prefer the full displayed context, side by side; a context side whose
@@ -615,6 +710,7 @@ fn watch_mask_region(
             &key_blocks,
             starts_capture,
             ends_capture,
+            line_limit,
         )
     })
 }
@@ -626,10 +722,11 @@ fn mask_region_from(
     key_blocks: &[std::ops::Range<usize>],
     starts_capture: bool,
     ends_capture: bool,
+    line_limit: usize,
 ) -> Option<std::ops::Range<usize>> {
     loop {
         region = whole_lines(text, region, starts_capture, ends_capture)?;
-        if region.len() > WATCH_PREVIEW_LINE_CAP_BYTES {
+        if region.len() > line_limit {
             return None;
         }
         let mut widened = region.clone();
@@ -832,6 +929,55 @@ fn mask_rendered_ticket_preview(
         }
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod shells_stream_tests {
+    use super::*;
+
+    #[test]
+    fn shells_v1_generic_header_replacement_is_owned_by_one_raw_chunk() {
+        let prefix = format!("{}\n", "x".repeat(61));
+        let spaces = " ".repeat(200);
+        let raw = format!(
+            "{prefix}Authorization:{spaces}Bearer {}\nafter",
+            "q".repeat(100)
+        );
+        let values = crate::log_redact::SecretValues::default();
+        let first = BgTaskRegistry::shell_mask_window_with_values(
+            raw.as_bytes(),
+            0..64,
+            true,
+            true,
+            false,
+            (false, false),
+            &values,
+            None,
+        )
+        .unwrap();
+        assert!(
+            first.len() <= 64,
+            "unchanged header prefixes must not expand a chunk"
+        );
+        let second = BgTaskRegistry::shell_mask_window_with_values(
+            raw.as_bytes(),
+            64..raw.len(),
+            true,
+            true,
+            false,
+            (false, false),
+            &values,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            first + &second,
+            format!(
+                "{prefix}Authorization:{spaces}Bearer {}\nafter",
+                crate::log_redact::SECRET_PLACEHOLDER
+            )
+        );
+    }
 }
 
 #[cfg(test)]

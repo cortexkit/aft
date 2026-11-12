@@ -1,7 +1,33 @@
 import { expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
-import { cachedExecutableBytes } from "./test-utils/cached-executable.js";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+  type CachePruneProbes,
+  cachedExecutableBytes,
+  linkCachedExecutable,
+  pruneExecutableCache,
+} from "./test-utils/cached-executable.js";
+import { type CacheUsage, scanProcessWithRetry } from "./test-utils/image-cache-usage.js";
+
+const unusedUsage: CacheUsage = { pidAlive: () => false, inUse: () => "absent" };
+const knownUsageProbes: CachePruneProbes = {
+  usage: unusedUsage,
+  freeBytes: () => 40 * 1024 ** 3,
+};
 
 test("binary executable bytes reuse one immutable content-addressed path", () => {
   const bytes = Buffer.from(`\u0000AFT test executable ${randomUUID()}\n`);
@@ -15,4 +41,259 @@ test("binary executable bytes reuse one immutable content-addressed path", () =>
   expect(after.mtimeMs).toBe(before.mtimeMs);
   expect(after.ino).toBe(before.ino);
   expect(second.split(/[\\/]/).at(-2)).toMatch(/^[a-f0-9]{64}$/);
+});
+
+test("executable cache process probe retries transient exec visibility", () => {
+  let attempts = 0;
+  scanProcessWithRetry(
+    () => {
+      if (++attempts < 3) throw new Error("transient procfs refusal");
+    },
+    () => true,
+  );
+  expect(attempts).toBe(3);
+});
+
+test("executable cache process probe preserves persistent visibility refusal", () => {
+  let attempts = 0;
+  expect(() =>
+    scanProcessWithRetry(
+      () => {
+        attempts++;
+        throw new Error("persistent procfs refusal");
+      },
+      () => true,
+    ),
+  ).toThrow("persistent procfs refusal");
+  expect(attempts).toBe(3);
+});
+
+test("executable cache prunes only stale siblings and refreshes every hit", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-retention-"));
+  try {
+    const publish = (bytes: Uint8Array) =>
+      cachedExecutableBytes(bytes, root, undefined, knownUsageProbes);
+    const current = publish(Buffer.from("current"));
+    const now = 1_700_000_000_000;
+    const retention = 24 * 60 * 60 * 1000;
+    const identity = (digit: string, age: number) => {
+      const directory = join(root, digit.repeat(64));
+      mkdirSync(directory);
+      const modified = new Date(now - age);
+      utimesSync(directory, modified, modified);
+      return directory;
+    };
+    const stale = identity("a", retention + 1000);
+    const fresh = identity("b", retention - 1000);
+    const boundary = identity("c", retention);
+    const future = identity("d", -1000);
+    const old = new Date(now - retention - 1000);
+    utimesSync(dirname(current), old, old);
+    pruneExecutableCache(root, dirname(current), now, undefined, undefined, knownUsageProbes);
+    expect(existsSync(stale)).toBe(false);
+    for (const retained of [fresh, boundary, future, dirname(current)])
+      expect(existsSync(retained)).toBe(true);
+    expect(publish(Buffer.from("current"))).toBe(current);
+    expect(statSync(dirname(current)).mtimeMs).toBeGreaterThan(now);
+    publish(Buffer.from("next image"));
+    expect(existsSync(current)).toBe(true);
+    expect(existsSync(fresh)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executable cache keeps images with unknown ownership", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-unknown-"));
+  try {
+    const image = cachedExecutableBytes(
+      Buffer.from("unobserved"),
+      root,
+      undefined,
+      knownUsageProbes,
+    );
+    utimesSync(dirname(image), new Date(0), new Date(0));
+    const unknownUsage: CacheUsage = { ...unusedUsage, inUse: () => "unknown" };
+    pruneExecutableCache(root, "another identity", Date.now(), undefined, undefined, {
+      usage: unknownUsage,
+      freeBytes: () => 0,
+    });
+    expect(existsSync(image)).toBe(true);
+    pruneExecutableCache(
+      root,
+      "another identity",
+      Date.now(),
+      undefined,
+      undefined,
+      knownUsageProbes,
+    );
+    expect(existsSync(image)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pruning restores an identity refreshed between scan and claim", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-refresh-"));
+  try {
+    const image = cachedExecutableBytes(Buffer.from("retained"), root);
+    const directory = dirname(image);
+    utimesSync(directory, new Date(0), new Date(0));
+    let claims = 0;
+    pruneExecutableCache(
+      root,
+      "another identity",
+      Date.now(),
+      (source, destination) => {
+        claims++;
+        const refreshed = new Date();
+        utimesSync(source, refreshed, refreshed);
+        renameSync(source, destination);
+      },
+      undefined,
+      knownUsageProbes,
+    );
+    expect(claims).toBe(1);
+    expect(readFileSync(image).toString()).toBe("retained");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executable cache body errors take precedence over unexpected cleanup errors", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-errors-"));
+  try {
+    const image = cachedExecutableBytes(Buffer.from("stale"), root);
+    utimesSync(dirname(image), new Date(0), new Date(0));
+    const bodyError = new Error("claim failed");
+    const cleanupError = new Error("cleanup failed");
+    let cleanups = 0;
+    const probes = {
+      usage: unusedUsage,
+      freeBytes: () => 40 * 1024 ** 3,
+    };
+    expect(() =>
+      pruneExecutableCache(
+        root,
+        "another identity",
+        Date.now(),
+        () => {
+          throw bodyError;
+        },
+        () => {
+          cleanups++;
+          throw cleanupError;
+        },
+        probes,
+      ),
+    ).toThrow(bodyError);
+    expect(cleanups).toBe(1);
+    expect(() =>
+      pruneExecutableCache(
+        root,
+        "another identity",
+        Date.now(),
+        renameSync,
+        () => {
+          throw cleanupError;
+        },
+        probes,
+      ),
+    ).toThrow(cleanupError);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executable cache count cap keeps live leases and ignores expired reused PIDs", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-count-"));
+  try {
+    const now = 1_700_000_000_000;
+    const directory = (number: number, age: number) => {
+      const path = join(root, number.toString(16).padStart(64, "0"));
+      mkdirSync(path);
+      writeFileSync(join(path, "image"), "fixture");
+      utimesSync(path, new Date(now - age), new Date(now - age));
+      return path;
+    };
+    const lease = (path: string, age: number) => {
+      const modified = statSync(path).mtime;
+      mkdirSync(join(path, ".leases"));
+      const marker = join(path, ".leases", "123");
+      writeFileSync(marker, "");
+      utimesSync(marker, new Date(now - age), new Date(now - age));
+      utimesSync(path, modified, modified);
+    };
+    const unused = Array.from({ length: 6 }, (_, index) =>
+      directory(index + 1, (index + 1) * 1000),
+    );
+    const active = directory(20, 4 * 3600_000);
+    lease(active, 0);
+    const expired = directory(21, 4 * 3600_000);
+    lease(expired, 3 * 3600_000);
+    const opened = directory(22, 25 * 3600_000);
+    pruneExecutableCache(root, "current", now, renameSync, undefined, {
+      usage: {
+        pidAlive: (pid) => pid === 123,
+        inUse: (path) => (path === opened ? "found" : "absent"),
+      },
+      freeBytes: () => 40 * 1024 ** 3,
+    });
+    for (const [index, path] of unused.entries()) expect(existsSync(path)).toBe(index < 4);
+    expect(existsSync(active)).toBe(true);
+    expect(existsSync(expired)).toBe(false);
+    expect(existsSync(opened)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executable cache low disk evicts unused images only after thirty minutes", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-pressure-"));
+  try {
+    const now = 1_700_000_000_000;
+    const paths = [1801, 1800, 1799].map((age, index) => {
+      const path = join(root, String(index).repeat(64));
+      mkdirSync(path);
+      utimesSync(path, new Date(now - age * 1000), new Date(now - age * 1000));
+      return path;
+    });
+    const usage = unusedUsage;
+    pruneExecutableCache(root, "current", now, renameSync, undefined, {
+      usage,
+      freeBytes: () => 40 * 1024 ** 3,
+    });
+    expect(paths.every(existsSync)).toBe(true);
+    pruneExecutableCache(root, "current", now, renameSync, undefined, {
+      usage,
+      freeBytes: () => 40 * 1024 ** 3 - 1,
+    });
+    expect(existsSync(paths[0]!)).toBe(false);
+    expect(existsSync(paths[1]!)).toBe(true);
+    expect(existsSync(paths[2]!)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executable cache republishes an entry deleted between lookup and linking", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-retry-"));
+  try {
+    let links = 0;
+    const source = "#!/bin/sh\nexit 0\n";
+    const path = linkCachedExecutable(
+      join(root, "fixture"),
+      source,
+      join(root, "cache"),
+      (cached, destination) => {
+        if (++links === 1) rmSync(dirname(cached), { recursive: true });
+        symlinkSync(cached, destination);
+      },
+    );
+    expect(links).toBe(2);
+    expect(readFileSync(path).toString()).toBe(source);
+    if (process.platform !== "win32") expect(spawnSync(path).status).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -139,8 +139,73 @@ def setup_windows_tool_paths() -> dict[str, Union[Path, str]]:
     return values
 
 
+def prune_run_archives(root: Path, run_dir: Path) -> None:
+    # Cancelled runs may never finalize. Bound archive retention without ever
+    # traversing Cargo's shared target directory.
+    before = shutil.disk_usage(root).free
+    low_disk = before < 40 * 1024**3
+    now = time.time()
+    archives = sorted(
+        (entry for entry in (root / "runs").iterdir()
+         if entry != run_dir and not entry.is_symlink() and entry.is_dir()),
+        key=lambda entry: (entry.stat().st_mtime, entry.name),
+    )
+    if low_disk:
+        print(f"CI archive disk free before pruning: {before / 1024**3:.1f} GiB", flush=True)
+    for old in archives:
+        if low_disk or now - old.stat().st_mtime > 86400:
+            print(f"Removing CI run archive {old}", flush=True)
+            shutil.rmtree(old)
+    if low_disk:
+        after = shutil.disk_usage(root).free
+        print(f"CI archive disk free after pruning: {after / 1024**3:.1f} GiB", flush=True)
+
+
+def target_bytes(target: Path) -> int:
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for directory, children, files in os.walk(target, followlinks=False):
+        children[:] = [name for name in children if not (Path(directory) / name).is_symlink()]
+        for name in files:
+            path = Path(directory) / name
+            try:
+                if path.is_symlink():
+                    continue
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            identity = (stat.st_dev, stat.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += stat.st_blocks * 512 if hasattr(stat, "st_blocks") else stat.st_size
+    return total
+
+
+def clean_oversized_target(target: Path) -> None:
+    if os.environ.get("RUNNER_ENVIRONMENT") != "self-hosted":
+        return
+    size = target_bytes(target)
+    if size > 50 * 1024**3:
+        print(f"CI shared target size before cleaning: {size / 1024**3:.1f} GiB ({size} bytes)", flush=True)
+        # Cargo owns the dependency graph and fingerprints. Removing the whole
+        # target is safe; deleting apparently old deps individually is not.
+        # This runs before the toolchain is on the job's PATH, and `cargo clean`
+        # refuses a target that has no CACHEDIR.TAG, so remove the folder
+        # directly. It is this state root's own `target`, never a caller path.
+        shutil.rmtree(target, onexc=_clear_read_only_and_retry)
+
+
+def _clear_read_only_and_retry(function, path, _error) -> None:
+    # Windows refuses to delete read-only files, which cargo and git leave behind.
+    os.chmod(path, 0o700)
+    function(path)
+
+
 def setup(root: Path, run_dir: Path) -> None:
     target = root / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    clean_oversized_target(target)
     target.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
@@ -158,11 +223,7 @@ def setup(root: Path, run_dir: Path) -> None:
             text = value.as_posix() if isinstance(value, Path) else value
             print(f"{key}={text}", file=env)
             print(f"{key}={text}")
-    # Cancelled runs may never reach finalization. Keep a week's grace for queued
-    # consumers, pruning only archives, never Cargo's shared build directory.
-    for old in (root / "runs").iterdir():
-        if old != run_dir and time.time() - old.stat().st_mtime > 7 * 86400:
-            shutil.rmtree(old)
+    prune_run_archives(root, run_dir)
 
 
 def main() -> None:

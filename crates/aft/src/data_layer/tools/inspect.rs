@@ -184,7 +184,47 @@ impl DeadCodeSources {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::inspect::scanners::todos::{FileTodos, StoredTodos};
+
+    #[test]
+    fn todo_store_preserves_scope_order_skips_and_unavailable_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = canonicalize_normalized(temp.path());
+        std::fs::write(root.join("first.rs"), "// TODO: first\n").unwrap();
+        std::fs::write(root.join("second.rs"), "// FIXME: second\n").unwrap();
+        std::fs::write(root.join("data.json"), "{\"x\": \"TODO\"}").unwrap();
+        std::fs::write(root.join("binary.rs"), b"// TODO: not text\0").unwrap();
+        let config = crate::config::Config::default();
+        assert!(matches!(
+            stored_todos_now(&root, &config, &[]).unwrap(),
+            (StoredTodos::Pending, false)
+        ));
+        let _ctx = bind_published_for_test(&root);
+        let scope = ["second.rs", "data.json", "first.rs", "binary.rs"].map(|path| root.join(path));
+        let (StoredTodos::Files { files, .. }, false) =
+            stored_todos_now(&root, &config, &scope).unwrap()
+        else {
+            panic!("store must be readable");
+        };
+        assert!(
+            matches!(&files[0], FileTodos::Counted { counts, items } if counts.total == 1 && items[0].marker == "FIXME")
+        );
+        assert!(matches!(&files[1], FileTodos::NotScanned));
+        assert!(
+            matches!(&files[2], FileTodos::Counted { counts, items } if counts.total == 1 && items[0].marker == "TODO")
+        );
+        assert!(matches!(&files[3], FileTodos::NotScanned));
+        let withheld = root.join("withheld");
+        std::fs::create_dir(&withheld).unwrap();
+        note_root(&withheld, RootKind::Withheld);
+        assert!(matches!(
+            stored_todos_now(&withheld, &config, &[]).unwrap(),
+            (StoredTodos::Unavailable(TODOS_NO_INDEX_STORE), false)
+        ));
+    }
+}
 
 // Agent-visible reasons for the TODO count, approved by Ufuk; change them
 // only with his approval.
@@ -361,7 +401,25 @@ fn stored_todos_now(
     config: &crate::config::Config,
     scope_files: &[PathBuf],
 ) -> Result<(crate::inspect::scanners::todos::StoredTodos, bool), String> {
-    use crate::inspect::scanners::todos::{file_todos, FileTodos, StoredTodos};
+    stored_todos_read(project_root, config, scope_files, true)
+}
+
+#[cfg(test)]
+pub(crate) fn stored_todos_uncached_for_test(
+    project_root: &Path,
+    config: &crate::config::Config,
+    scope_files: &[PathBuf],
+) -> Result<crate::inspect::scanners::todos::StoredTodos, String> {
+    stored_todos_read(project_root, config, scope_files, false).map(|(todos, _)| todos)
+}
+
+fn stored_todos_read(
+    project_root: &Path,
+    config: &crate::config::Config,
+    scope_files: &[PathBuf],
+    memoized: bool,
+) -> Result<(crate::inspect::scanners::todos::StoredTodos, bool), String> {
+    use crate::inspect::scanners::todos::{counted_file_todos, file_todos, FileTodos, StoredTodos};
     let root = canonicalize_normalized(project_root);
     let bound = BOUND
         .lock()
@@ -440,6 +498,7 @@ fn stored_todos_now(
         .map(|_| None)
         .collect::<Vec<Option<FileTodos>>>();
     let mut held = vec![false; scope_files.len()];
+    let mut views = Vec::new();
     // A repository with no checkout yet is named as a gap; its files are
     // neither counted nor listed one by one.
     for (position, file) in scope_files.iter().enumerate() {
@@ -479,32 +538,129 @@ fn stored_todos_now(
             positions.push(position);
             paths.push(relative.replace('\\', "/").into_bytes());
         }
+        if !memoized {
+            let found = checkout
+                .checkout()
+                .todo_markers(
+                    &view,
+                    &paths,
+                    crate::inspect::scanners::source_text::MAX_SOURCE_BYTES,
+                )
+                .map_err(|error| error.to_string())?;
+            for (position, todos) in positions.into_iter().zip(found) {
+                use crate::data_layer::checkout::PathTodos;
+                let path = &scope_files[position];
+                files[position] = Some(match todos {
+                    _ if file_todos_skip(path) => FileTodos::NotScanned,
+                    PathTodos::Missing => return Ok((StoredTodos::Pending, true)),
+                    PathTodos::Absent | PathTodos::Unrecorded => FileTodos::NotScanned,
+                    PathTodos::TooLarge => {
+                        FileTodos::Skipped(crate::inspect::scanners::source_text::TOO_LARGE)
+                    }
+                    PathTodos::Unextracted | PathTodos::Recorded(None) => {
+                        FileTodos::Skipped(TODOS_NOT_PARSED)
+                    }
+                    PathTodos::Recorded(Some(todos)) => {
+                        file_todos(path, todos).unwrap_or(FileTodos::Skipped(TODOS_NOT_PARSED))
+                    }
+                });
+            }
+            continue;
+        }
         let found = checkout
             .checkout()
-            .todo_markers(
+            .todo_counts(
                 &view,
                 &paths,
                 crate::inspect::scanners::source_text::MAX_SOURCE_BYTES,
             )
             .map_err(|error| error.to_string())?;
         for (position, todos) in positions.into_iter().zip(found) {
-            use crate::data_layer::checkout::PathTodos;
+            use crate::data_layer::checkout::PathTodoCounts;
             let path = &scope_files[position];
             files[position] = Some(match todos {
                 // Plain JSON is never read, whatever the store holds.
                 _ if file_todos_skip(path) => FileTodos::NotScanned,
-                PathTodos::Missing => return Ok((StoredTodos::Pending, true)),
-                PathTodos::Absent | PathTodos::Unrecorded => FileTodos::NotScanned,
-                PathTodos::TooLarge => {
+                PathTodoCounts::Missing => return Ok((StoredTodos::Pending, true)),
+                PathTodoCounts::Absent | PathTodoCounts::Unrecorded => FileTodos::NotScanned,
+                PathTodoCounts::TooLarge => {
                     FileTodos::Skipped(crate::inspect::scanners::source_text::TOO_LARGE)
                 }
-                PathTodos::Unextracted | PathTodos::Recorded(None) => {
+                PathTodoCounts::Unextracted | PathTodoCounts::Recorded(None) => {
                     FileTodos::Skipped(TODOS_NOT_PARSED)
                 }
-                PathTodos::Recorded(Some(todos)) => {
-                    file_todos(path, todos).unwrap_or(FileTodos::Skipped(TODOS_NOT_PARSED))
+                PathTodoCounts::Recorded(Some(todos)) => {
+                    counted_file_todos(path, todos).unwrap_or(FileTodos::Skipped(TODOS_NOT_PARSED))
                 }
             });
+        }
+        views.push((checkout_root, checkout, view));
+    }
+    // The count memo retains no text. Read only records contributing to the
+    // existing detail page, choosing them in scope order even when the scope
+    // spans repositories. Test-tree markers never contribute to that page.
+    let mut remaining = crate::inspect::scanners::todos::MAX_ITEMS;
+    let mut details = Vec::new();
+    for (position, file) in scope_files.iter().enumerate() {
+        let Some(FileTodos::Counted { counts, .. }) = &files[position] else {
+            continue;
+        };
+        let relative = file
+            .strip_prefix(project_root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if remaining == 0 || counts.total == 0 || crate::inspect::job::is_test_tree_file(&relative)
+        {
+            continue;
+        }
+        remaining = remaining.saturating_sub(counts.total);
+        details.push(position);
+    }
+    for (checkout_root, checkout, view) in &views {
+        let mut positions = Vec::new();
+        let mut paths = Vec::new();
+        for &position in &details {
+            let path = normalize_path(&scope_files[position]);
+            // Match the same deepest checkout used for the count.
+            let owner = covering.iter().find(|(root, _)| path.starts_with(root));
+            if !owner.is_some_and(|(root, _)| root == *checkout_root) {
+                continue;
+            }
+            let relative = path.strip_prefix(checkout_root).expect("owner covers path");
+            let Some(relative) = relative.to_str() else {
+                continue;
+            };
+            positions.push(position);
+            paths.push(relative.replace('\\', "/").into_bytes());
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        let found = checkout
+            .checkout()
+            .todo_markers(
+                view,
+                &paths,
+                crate::inspect::scanners::source_text::MAX_SOURCE_BYTES,
+            )
+            .map_err(|error| error.to_string())?;
+        for (position, todos) in positions.into_iter().zip(found) {
+            use crate::data_layer::checkout::PathTodos;
+            match todos {
+                PathTodos::Recorded(Some(todos)) => {
+                    if let Some(FileTodos::Scanned(items)) =
+                        file_todos(&scope_files[position], todos)
+                    {
+                        if let Some(FileTodos::Counted { items: detail, .. }) = &mut files[position]
+                        {
+                            *detail = items;
+                        }
+                    }
+                }
+                // A concurrent edit can make the view's record unavailable.
+                _ => return Ok((StoredTodos::Pending, true)),
+            }
         }
     }
     Ok((

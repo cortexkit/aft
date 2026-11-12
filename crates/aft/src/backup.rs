@@ -1299,6 +1299,7 @@ impl BackupStore {
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
+        crate::db::deferred_checkpoint::register_shared(&conn);
         if let Ok(mut slot) = self.db_pool.write() {
             *slot = Some(conn);
         }
@@ -5507,30 +5508,29 @@ impl BackupStore {
             path_hash: &path_hash,
         };
         let _ = conn.busy_timeout(deadline.saturating_duration_since(Instant::now()));
-        let (write_result, operation) =
-            crate::db::lifecycle::defer_wal_checkpoints(|| match plan {
-                DbMirrorPlan::Append {
+        let (write_result, operation) = match plan {
+            DbMirrorPlan::Append {
+                evicted_orders,
+                new_entry,
+                restamped,
+            } if self.db_mirror_is_synced(session, key) => (
+                apply_backup_append_delta_in_db(
+                    &conn,
+                    &context,
                     evicted_orders,
                     new_entry,
                     restamped,
-                } if self.db_mirror_is_synced(session, key) => (
-                    apply_backup_append_delta_in_db(
-                        &conn,
-                        &context,
-                        evicted_orders,
-                        new_entry,
-                        restamped,
-                    ),
-                    "append delta",
                 ),
-                // A newly configured or previously failed mirror has no trusted DB
-                // baseline. Repair it once from the authoritative disk stack before
-                // later appends switch to constant-work deltas.
-                DbMirrorPlan::Append { .. } | DbMirrorPlan::Full => (
-                    replace_backup_stack_in_db(&conn, &context, stack),
-                    "full stack",
-                ),
-            });
+                "append delta",
+            ),
+            // A newly configured or previously failed mirror has no trusted DB
+            // baseline. Repair it once from the authoritative disk stack before
+            // later appends switch to constant-work deltas.
+            DbMirrorPlan::Append { .. } | DbMirrorPlan::Full => (
+                replace_backup_stack_in_db(&conn, &context, stack),
+                "full stack",
+            ),
+        };
         let _ = conn.busy_timeout(crate::db::STEADY_BUSY_TIMEOUT);
         self.set_db_mirror_synced(session, key, write_result.is_ok());
         drop(conn);
@@ -12480,16 +12480,6 @@ mod edit_latency_tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "edited");
     }
 
-    /// Opens the deferred-checkpoint gate when dropped, so a failing
-    /// assertion cannot leave other tests' checkpoints held.
-    struct GateGuard;
-
-    impl Drop for GateGuard {
-        fn drop(&mut self) {
-            crate::db::deferred_checkpoint::test_hooks::open_gate();
-        }
-    }
-
     /// The aft.db mirror commit of an undo snapshot must not run the WAL
     /// checkpoint SQLite triggers past the autocheckpoint threshold: that
     /// copies the WAL into the database and syncs both files while the edit
@@ -12510,10 +12500,7 @@ mod edit_latency_tests {
         store.set_db_harness(Harness::Opencode);
         store.set_db_project_key("project".to_string());
         // Start from an empty WAL, then let any commit of two or more pages
-        // pass the shared connection's threshold, so the mirror commit would
-        // checkpoint inline. The hook still checkpoints inline once the WAL
-        // holds `DEFERRED_CHECKPOINT_LIMIT` (8) thresholds, 16 pages here; a
-        // single mirror commit to an empty WAL stays well under that.
+        // pass the shared connection's background checkpoint threshold.
         let db_file = {
             let conn = pool.lock().unwrap();
             conn.checkpoint_wal_as(
@@ -12527,8 +12514,7 @@ mod edit_latency_tests {
 
         let finished_before = test_hooks::finished(&db_file);
         let inline_before = crate::db::lifecycle::inline_checkpoints_on_this_thread();
-        test_hooks::close_gate();
-        let gate = GateGuard;
+        let gate = test_hooks::close_gate(&db_file);
         store
             .snapshot_with_op("deferred", &path, "edit", Some("op-1"))
             .unwrap();

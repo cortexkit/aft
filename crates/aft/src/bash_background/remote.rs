@@ -1405,7 +1405,7 @@ impl TaskSink {
                 remote.return_paths.clone(),
                 remote.return_max_bytes,
                 &workdir,
-                project_root.as_deref().unwrap_or(&workdir),
+                &return_paths_root(project_root.as_deref().unwrap_or(&workdir), &workdir),
                 worktree_root_containing(&workdir, exec::DirectoryKind::WorkingDirectory)
                     .ok()
                     .flatten()
@@ -1882,6 +1882,23 @@ impl OutputSink for TaskSink {
     }
 
     fn admission_progress(&mut self, progress: &exec::types::Progress) {
+        if let Some(job_id) = progress.job_id() {
+            let mut db = DeferredDbWrites::new(&self.registry, &self.task);
+            if let Ok(mut state) = self.task.lock_state() {
+                let job_id = job_id.to_string();
+                if state.metadata.shell_remote_job_id.as_ref() != Some(&job_id) {
+                    // Display a job id before acceptance without marking the
+                    // job accepted or changing the execution retry state.
+                    state.metadata.shell_remote_job_id = Some(job_id);
+                    if let Err(error) =
+                        self.registry
+                            .persist_task_locked(&self.task, &state.metadata, &mut db)
+                    {
+                        log::warn!("could not persist shell job id: {error}");
+                    }
+                }
+            }
+        }
         let Some(note) = admission_progress_line(progress) else {
             return;
         };
@@ -1941,6 +1958,10 @@ impl OutputSink for TaskSink {
         if accepted.env_not_forwarded.is_some() {
             r.env_not_forwarded = accepted.env_not_forwarded.clone();
         }
+        state.metadata.shell_remote_host = accepted
+            .placement()
+            .and_then(|placement| placement.host())
+            .map(str::to_owned);
         // The job id and the execution note below are saved in one record
         // write: a restart needs only the job id, and the note is derived
         // from the same acceptance.
@@ -5820,6 +5841,17 @@ fn build_remote_request(
         Some(timeout_seconds),
         preset,
     )
+}
+
+#[cfg(unix)]
+/// Use the same checkout boundary for submission checks and returned writes
+/// as the runner's workspace key. Non-git workdirs retain the project boundary;
+/// request construction separately refuses workdirs it cannot snapshot.
+pub(crate) fn return_paths_root(project_root: &Path, workdir: &Path) -> PathBuf {
+    worktree_root_containing(workdir, exec::DirectoryKind::WorkingDirectory)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| project_root.to_path_buf())
 }
 
 #[cfg(unix)]

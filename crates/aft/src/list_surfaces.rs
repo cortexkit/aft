@@ -359,6 +359,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "exec_remote/read_only_note.rs",
+        enclosing_item: "source_read_only_note",
+        location_or_primitive: ".take(1_000)",
+        reason: "Internal permission-error scan stops after 1,000 matching lines to select one explanatory note; it never truncates the command output or returns a result list.",
+    },
+    ExclusionEntry {
         file: "gh_shim_speech/start_view/sweep.rs",
         enclosing_item: "sweep_entries",
         location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",
@@ -405,6 +411,60 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "saved_scope_batch",
         location_or_primitive: "SQL LIMIT, PER_TICK (4)",
         reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
+    },
+    ExclusionEntry {
+        file: "subc/shells/runtime.rs",
+        enclosing_item: "list, project_row, output",
+        location_or_primitive: "PAGE_SIZE, 2048, DEFAULT_CHUNK_BYTES, take_while",
+        reason: "The operator-only shells/v1 wire protocol uses next_cursor for 50-row pages, command_truncated for command previews, and raw offset/end_offset for bounded output chunks; no agent-visible list is shortened.",
+    },
+    ExclusionEntry {
+        file: "subc/shells/runtime.rs",
+        enclosing_item: "read_root_agents",
+        location_or_primitive: "SQL LIMIT, ROOT_ASSOCIATION_LIMIT (256), lookahead (257)",
+        reason: "Operator sidebar root-agent hints have one shared 256-association budget. A bounded SQL iterator reads one lookahead row; agent_ids_truncated marks that root and any later roots whose association lists were not fully visited. Shell rows and their holder resolution remain complete.",
+    },
+    ExclusionEntry {
+        file: "subc/shells/state.rs",
+        enclosing_item: "push, resync",
+        location_or_primitive: "HISTORY, PAGE_SIZE",
+        reason: "The provider journal has finite cursor retention; an expired position triggers a full resync. Split resync parts deliver every matching row and are applied only at final:true.",
+    },
+    ExclusionEntry {
+        file: "subc/shells/output.rs",
+        enclosing_item: "next, plan, backfill_start",
+        location_or_primitive: "max, budget, BACKFILL_BYTES",
+        reason: "Shell output is a byte-addressed subscription, not an agent list: backfill cuts are explicit in truncated_before, subsequent chunks preserve raw offset/end_offset, and oversized escapes are omitted without losing raw byte accounting.",
+    },
+    ExclusionEntry {
+        file: "subc/shells/wire.rs",
+        enclosing_item: "PAGE_SIZE, RETENTION_MS, DEFAULT_CHUNK_BYTES, MAX_CHUNK_BYTES, BACKFILL_BYTES",
+        location_or_primitive: "shells/v1 protocol constants",
+        reason: "Operator-only wire limits use explicit continuation cursors, resync parts and raw byte offsets; they do not bound or change any agent tool reply.",
+    },
+    ExclusionEntry {
+        file: "subc/shells/capture.rs",
+        enclosing_item: "open, read, read_screen",
+        location_or_primitive: "DEFAULT_CHUNK_BYTES, max, take_while, 500 ms",
+        reason: "Capture reads and incremental screen rendering have bounded working memory and preserve raw offset coverage. Screen coalescing limits update rate, not the shell inventory or any agent-visible list.",
+    },
+    ExclusionEntry {
+        file: "bash_background/shell_registry.rs",
+        enclosing_item: "shell_masked_range, format_context_possible, SHELL_MASK_CONTEXT_BYTES",
+        location_or_primitive: "bounded file scan and masking context",
+        reason: "Internal masking windows preserve raw byte coverage; undecidable ranges carry explicit withheld text. These bounds neither drop shell rows nor shorten an agent-visible list.",
+    },
+    ExclusionEntry {
+        file: "bash_background/completion_preview.rs",
+        enclosing_item: "shell_mask_window_with_values, watch_mask_region, mask_region_from",
+        location_or_primitive: "take(range.start), line_limit",
+        reason: "Masking inspects a byte-addressed context rather than returning a result list. Operator output uses bounded source windows with explicit withheld ranges; existing agent watch-preview limits remain unchanged.",
+    },
+    ExclusionEntry {
+        file: "log_redact.rs",
+        enclosing_item: "shells_ticket_range, SHELL_TICKET_RANGE_BYTES, replace_in",
+        location_or_primitive: "4 KiB ticket masking windows; take_while common prefix and suffix",
+        reason: "Every requested byte remains covered while ticket masking uses bounded overlapping source windows. This cap limits masking work per window, not rows, tool results or streamed raw offset coverage.",
     },
     ExclusionEntry {
         file: "db/call_ledger.rs",
@@ -741,6 +801,30 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "output_tail",
         location_or_primitive: "worker watch tail byte and line preview",
         reason: "a recent-output prose preview, not a result list; limits bytes as well as lines so a single huge log line cannot bypass the preview budget; full task output remains on disk",
+    },
+    ExclusionEntry {
+        file: "subc/scope_background_tasks.rs",
+        enclosing_item: "running, scan_saved, expected_roots, registry_snapshot",
+        location_or_primitive: "COMMAND_BYTES and WALK_LIMIT",
+        reason: "owner-only management snapshot, not an agent result list; command_truncated identifies the UTF-8 command ceiling and complete false with a reason discloses every bounded or failed walk",
+    },
+    ExclusionEntry {
+        file: "subc/bash_notice_text.rs",
+        enclosing_item: "long_running",
+        location_or_primitive: "120 UTF-16 code-unit command preview",
+        reason: "a command text preview rather than a result list; preserves the existing OpenCode reminder formatter, including its ellipsis and full-command inspection guidance",
+    },
+    ExclusionEntry {
+        file: "db/runner_harness_keys.rs",
+        enclosing_item: "copy_aliases_with_limit, lookup_alias",
+        location_or_primitive: "SOURCE_LIMIT and SQL LIMIT",
+        reason: "startup value migration bounds source rows before copying and skips an oversized batch atomically; fallback reads select one authoritative row by identical key and deterministic recency, not an agent result list; originals remain available for rollback",
+    },
+    ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "try_scope_background_tasks",
+        location_or_primitive: "remaining iterator budget",
+        reason: "scope.background_tasks shares its bounded scan budget with saved records and returns complete false on exhaustion, never a complete empty done-gate snapshot",
     },
     ExclusionEntry {
         file: "cold_build_limiter/progress.rs",
@@ -1243,6 +1327,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "walk_permission_gap",
         location_or_primitive: ".take(3)",
         reason: "three-folder preview inside a gap note with the full skipped count, not a pageable list",
+    },
+    ExclusionEntry {
+        file: "bounded_io.rs",
+        enclosing_item: "Reader::chunk",
+        location_or_primitive: "buffer.truncate(count)",
+        reason: "shrinks an I/O buffer to the number of bytes read; later chunks retain the rest of the file, so no result rows are cut",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/snippet_bounds.rs",
+        enclosing_item: "LineWindow",
+        location_or_primitive: "SNIPPET_LINE_MAX_CHARS",
+        reason: "incremental implementation of the existing per-line text window, with exactly the same ellipsis and truncation marker; bounds retained characters, not result rows",
     },
 ];
 

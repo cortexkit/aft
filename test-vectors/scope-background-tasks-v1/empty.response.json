@@ -1,0 +1,8 @@
+{
+  "op": "scope.background_tasks",
+  "status": "ok",
+  "data": {
+    "running": [],
+    "complete": true
+  }
+}

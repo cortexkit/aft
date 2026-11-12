@@ -30,6 +30,7 @@ pub mod github_read_cache;
 pub mod remote_exec;
 pub mod removal;
 pub mod rich_ui;
+pub(crate) mod runner_harness_keys;
 pub mod standing_roots;
 pub mod state;
 

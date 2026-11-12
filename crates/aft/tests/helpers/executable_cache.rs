@@ -7,6 +7,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+#[path = "image_cache.rs"]
+mod image_cache;
+
 const CACHE_ROOT: &str = "aft-test-executables";
 
 fn cache_root() -> PathBuf {
@@ -48,9 +51,40 @@ pub fn cached_executable_named_in(root: &Path, bytes: &[u8], name: &str) -> io::
             "cached executable name must be one path component",
         ));
     }
+    let result = publish_executable(root, bytes, name);
+    match result {
+        // Another language's cache pruner can claim an old identity between
+        // lookup and refresh. Republish once rather than exposing that race.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            publish_executable(root, bytes, name)
+        }
+        result => result,
+    }
+}
+
+fn publish_executable(root: &Path, bytes: &[u8], name: &str) -> io::Result<PathBuf> {
+    publish_with_pruner(root, bytes, name, image_cache::prune)
+}
+
+fn publish_with_pruner(
+    root: &Path,
+    bytes: &[u8],
+    name: &str,
+    prune: impl Fn(&Path, &Path, std::time::SystemTime) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    fs::create_dir_all(root)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("publish.lock"))?;
+    lock.lock()?;
     let path = cache_path(root, bytes, name);
+    let directory = path.parent().expect("cache path has a parent");
     if path.exists() {
         verify_cached(&path, bytes)?;
+        image_cache::refresh(directory)?;
         return Ok(path);
     }
 
@@ -73,6 +107,8 @@ pub fn cached_executable_named_in(root: &Path, bytes: &[u8], name: &str) -> io::
         Err(error) => return Err(error),
     }
     verify_cached(&path, bytes)?;
+    image_cache::refresh(directory)?;
+    prune(root, directory, std::time::SystemTime::now())?;
     Ok(path)
 }
 
@@ -90,8 +126,30 @@ pub fn link_cached_path(source: &Path, destination: &Path) -> io::Result<PathBuf
 
 /// Make a named fixture resolve to the shared executable without copying it.
 pub fn link_cached_executable(destination: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
-    let cached = cached_executable(bytes)?;
-    link_cached_path(&cached, destination)
+    link_cached_executable_with(destination, bytes, cached_executable, link_cached_path)
+}
+
+fn link_cached_executable_with(
+    destination: &Path,
+    bytes: &[u8],
+    mut lookup: impl FnMut(&[u8]) -> io::Result<PathBuf>,
+    mut link: impl FnMut(&Path, &Path) -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    for attempt in 0..2 {
+        let cached = lookup(bytes)?;
+        let result = link(&cached, destination).and_then(|path| {
+            // Unix symlink creation succeeds even when its target vanished.
+            fs::metadata(&cached)?;
+            Ok(path)
+        });
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && attempt == 0 => {
+                let _ = fs::remove_file(destination);
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
 }
 
 /// Executing an executable while any process still has it open for writing can fail
@@ -209,4 +267,66 @@ fn verify_cached(path: &Path, bytes: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn executable_cache_refreshes_hits_and_prunes_on_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"#!/bin/sh\nexit 0\n";
+        let mut usage = image_cache::Usage::default();
+        usage.live_pids = Some([std::process::id()].into());
+        let publish = |bytes: &[u8]| {
+            publish_with_pruner(root.path(), bytes, "executable", |root, current, now| {
+                image_cache::prune_with_usage(root, current, now, false, &usage)
+            })
+        };
+        let old = publish(bytes).unwrap();
+        let stale_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        let stale = filetime::FileTime::from_system_time(stale_time);
+        filetime::set_file_mtime(old.parent().unwrap(), stale).unwrap();
+        assert_eq!(publish(bytes).unwrap(), old);
+        assert!(
+            fs::metadata(old.parent().unwrap())
+                .unwrap()
+                .modified()
+                .unwrap()
+                > stale_time
+        );
+        let abandoned = root.path().join("f".repeat(64));
+        fs::create_dir(&abandoned).unwrap();
+        filetime::set_file_mtime(&abandoned, stale).unwrap();
+        publish(b"another image").unwrap();
+        assert!(old.exists());
+        assert!(!abandoned.exists());
+    }
+
+    #[test]
+    fn executable_cache_republishes_when_entry_disappears_before_linking() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("fixture");
+        let cache = root.path().join("cache");
+        let mut links = 0;
+        let path = link_cached_executable_with(
+            &destination,
+            b"#!/bin/sh\nexit 0\n",
+            |bytes| cached_executable_named_in(&cache, bytes, "executable"),
+            |source, destination| {
+                links += 1;
+                if links == 1 {
+                    fs::remove_dir_all(source.parent().unwrap())?;
+                }
+                link_cached_path(source, destination)
+            },
+        )
+        .unwrap();
+        assert_eq!(links, 2);
+        assert_eq!(fs::read(&path).unwrap(), b"#!/bin/sh\nexit 0\n");
+        #[cfg(unix)]
+        assert!(std::process::Command::new(path).status().unwrap().success());
+    }
 }

@@ -2156,6 +2156,7 @@ fn fallback_grep_with_limits_counted(
     // Files for a path-ordered scan, searched one at a time after the walk.
     let mut ordered: Vec<PathBuf> = Vec::new();
     let io_budget = crate::bounded_io::current();
+    let alloc_label = crate::alloc_trace::carry();
     let confinement = crate::context::confinement::capture();
 
     let flush_batch = |batch: &mut Vec<PathBuf>, matches: &mut Vec<GrepMatch>| {
@@ -2166,7 +2167,12 @@ fn fallback_grep_with_limits_counted(
         let partial: Vec<GrepMatch> = chunk
             .par_iter()
             .map_init(
-                || crate::bounded_io::enter(io_budget.clone()),
+                || {
+                    (
+                        crate::bounded_io::enter(io_budget.clone()),
+                        alloc_label.enter(),
+                    )
+                },
                 |_scope, file| {
                     crate::context::confinement::inherit(confinement.clone(), || {
                         #[cfg(test)]
@@ -2304,7 +2310,12 @@ fn fallback_grep_with_limits_counted(
             None => batch
                 .par_iter()
                 .map_init(
-                    || crate::bounded_io::enter(io_budget.clone()),
+                    || {
+                        (
+                            crate::bounded_io::enter(io_budget.clone()),
+                            alloc_label.enter(),
+                        )
+                    },
                     |_scope, file| {
                         crate::context::confinement::inherit(confinement.clone(), || {
                             search_one(file)
@@ -2415,16 +2426,16 @@ fn fallback_search_file(
         return Vec::new();
     }
 
-    let bytes = match crate::project_content::read_bounded(file, deadline, authorized_task_artifact)
-    {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                engine_capped.store(true, Ordering::Relaxed);
+    let bytes =
+        match crate::search_index::read_grep_file_bytes(file, deadline, authorized_task_artifact) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    engine_capped.store(true, Ordering::Relaxed);
+                }
+                return Vec::new();
             }
-            return Vec::new();
-        }
-    };
+        };
     if crate::search_index::is_binary_bytes(&bytes) {
         return Vec::new();
     }

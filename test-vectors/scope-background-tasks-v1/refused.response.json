@@ -1,0 +1,8 @@
+{
+  "op": "scope.background_tasks",
+  "status": "error",
+  "data": {
+    "code": "scope_owner_mismatch",
+    "message": "scope.background_tasks requires the scope's owner"
+  }
+}

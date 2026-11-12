@@ -105,6 +105,7 @@ fn removal_health_for_status(req: &RawRequest) -> Option<serde_json::Value> {
 enum StatusSnapshotKind {
     Explicit,
     Push,
+    Operator,
 }
 
 impl AppContext {
@@ -138,6 +139,19 @@ impl AppContext {
             StatusSnapshotKind::Push,
         );
         Some(crate::status_push::project(self, snapshot))
+    }
+
+    /// Operator status still reports index readiness when language-server
+    /// diagnostics are busy. Unknown counts stay absent on the operator wire.
+    /// Agent publishers retain their existing all-or-retry snapshot behavior.
+    pub(crate) fn build_operator_status_snapshot(&self) -> StatusPayload {
+        let counts = self.try_status_bar_count_values().unwrap_or_default();
+        let snapshot = self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Operator,
+        );
+        crate::status_push::project(self, snapshot)
     }
 
     fn build_status_snapshot_with_counts(
@@ -359,7 +373,8 @@ impl AppContext {
         // Per-session undo/checkpoint counts (issue #14 — one shared bridge serves
         // many sessions; surface both the global footprint and the current
         // session's own slice so `/aft-status` can split them in the UI).
-        let backups_enabled = config.backup.enabled.unwrap_or(true);
+        let backups_enabled =
+            kind != StatusSnapshotKind::Operator && config.backup.enabled.unwrap_or(true);
         let checkpoint_total = if backups_enabled {
             self.checkpoint().lock().total_count()
         } else {
@@ -382,7 +397,14 @@ impl AppContext {
         } else {
             0
         };
-        let compression = self.compression_stats_for_session(session_id);
+        // Shell sidebar status consumes neither undo nor compression history.
+        // In particular, idle operator refreshes must not reacquire aft.db to
+        // hydrate aggregates unrelated to readiness and health counts.
+        let compression = if kind == StatusSnapshotKind::Operator {
+            CompressionStats::default()
+        } else {
+            self.compression_stats_for_session(session_id)
+        };
 
         // Degraded-mode reasons recorded by `handle_configure` when the
         // project root doesn't look like a real project (`home_root`). Heavy
@@ -570,7 +592,7 @@ impl AppContext {
         if let Some(report) = &data_store_report {
             crate::data_layer::surfaces::apply_to_status(&mut payload, report);
         }
-        if kind == StatusSnapshotKind::Push {
+        if kind != StatusSnapshotKind::Explicit {
             // Read only this root's LSP applicability rather than cloning
             // applicability for every root and the other lifecycle details.
             let root = config.project_root.clone().unwrap_or_default();

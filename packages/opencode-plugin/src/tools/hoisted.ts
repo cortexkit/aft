@@ -1402,7 +1402,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
       });
 
       if (response.success === false) {
-        throw new Error((response.message as string | undefined) ?? "delete failed");
+        throw toolErrorFromResponse("delete", response);
       }
 
       const deletedEntries = (response.deleted as Array<{ file: string }> | undefined) ?? [];

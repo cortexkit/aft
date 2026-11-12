@@ -2043,6 +2043,7 @@ impl SearchIndexSnapshot {
         let stop_scan = Arc::new(AtomicBool::new(false));
         let deadline = make_deadline();
         let io_budget = crate::bounded_io::current();
+        let alloc_label = crate::alloc_trace::carry();
         let floor_disclosure = crate::context::confinement::capture();
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
@@ -2076,7 +2077,12 @@ impl SearchIndexSnapshot {
                 let per_file: Vec<(Vec<SharedGrepMatch>, bool)> = batch
                     .par_iter()
                     .map_init(
-                        || crate::bounded_io::enter(io_budget.clone()),
+                        || {
+                            (
+                                crate::bounded_io::enter(io_budget.clone()),
+                                alloc_label.enter(),
+                            )
+                        },
                         |_scope, file| {
                             if !claim_verification() {
                                 truncated.store(true, Ordering::Relaxed);
@@ -2164,7 +2170,12 @@ impl SearchIndexSnapshot {
             candidate_files
                 .par_iter()
                 .map_init(
-                    || crate::bounded_io::enter(io_budget.clone()),
+                    || {
+                        (
+                            crate::bounded_io::enter(io_budget.clone()),
+                            alloc_label.enter(),
+                        )
+                    },
                     |_scope, file| {
                         if grep_scan_should_stop(
                             Some(&stop_scan),
@@ -2357,6 +2368,7 @@ impl SearchIndexSnapshot {
         let started = Instant::now();
         let stopped_early = AtomicBool::new(false);
         let io_budget = crate::bounded_io::current();
+        let alloc_label = crate::alloc_trace::carry();
         let files_examined = AtomicUsize::new(0);
         let missing_on_disk = AtomicUsize::new(0);
         // Rayon tasks run on other threads, where the request's file set is
@@ -2366,7 +2378,12 @@ impl SearchIndexSnapshot {
         let files: Vec<GrepFileMatches> = examined_slice
             .par_iter()
             .map_init(
-                || crate::bounded_io::enter(io_budget.clone()),
+                || {
+                    (
+                        crate::bounded_io::enter(io_budget.clone()),
+                        alloc_label.enter(),
+                    )
+                },
                 |_scope, (_, file)| {
                     if started.elapsed() >= limits.budget
                         || job_cancellation
@@ -3870,7 +3887,66 @@ pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
 /// Read an indexed file for grep verification. Keep the original I/O error so
 /// callers distinguish a missing entry from blocked access or a scan timeout.
 fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
-    crate::project_content::read_bounded(path, deadline, false)
+    read_grep_file_bytes(path, deadline, false)
+}
+
+/// Reject the same binary prefix as a completed grep read before reserving
+/// its body. Text keeps the original whole-buffer scan and matcher semantics.
+pub(crate) fn read_grep_file_bytes(
+    path: &Path,
+    deadline: Option<Instant>,
+    authorized_task_artifact: bool,
+) -> std::io::Result<Vec<u8>> {
+    let mut reader =
+        crate::project_content::reader_bounded(path, deadline, authorized_task_artifact)?;
+    let prefix = reader.chunk(Vec::new(), 1024)?;
+    if is_binary_bytes(&prefix) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "binary grep input",
+        ));
+    }
+    if prefix.len() < 1024 {
+        return Ok(prefix);
+    }
+    reader.rest(prefix)
+}
+
+#[cfg(test)]
+mod grep_binary_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn grep_binary_prefix_rejects_archive_before_returning_its_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.tgz");
+        std::fs::write(&path, [0x1f, 0x8b, 8, 0, 0, 0, 0, 0]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(100 << 20)
+            .unwrap();
+        assert_eq!(
+            read_indexed_file_bytes(&path, None).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn grep_binary_prefix_preserves_text_bytes_and_inspection_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("text.txt");
+        for length in [0, 1, 1023, 1024, 1025, 3 << 20] {
+            let mut content = vec![b'x'; length];
+            if length > 1024 {
+                content[1024] = 0;
+            }
+            std::fs::write(&path, &content).unwrap();
+            assert!(!is_binary_bytes(&content));
+            assert_eq!(read_indexed_file_bytes(&path, None).unwrap(), content);
+        }
+    }
 }
 
 /// Whether an I/O error says the path does not exist (including a path whose

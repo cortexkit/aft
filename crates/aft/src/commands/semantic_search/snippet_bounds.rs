@@ -35,6 +35,88 @@ const LEADING_ELLIPSIS: &str = "…";
 /// match is shown with some of the text that leads into it.
 const WINDOW_LEAD_CHARS: usize = 80;
 
+/// Incremental equivalent of `window_snippet_line`, indexed by character
+/// column. It keeps only the prefix, the match window and a bounded tail.
+pub(crate) struct LineWindow {
+    anchor: usize,
+    count: usize,
+    prefix: String,
+    window: String,
+    tail: std::collections::VecDeque<char>,
+    pending: Option<char>,
+}
+
+impl LineWindow {
+    pub(crate) fn new(column: u32) -> Self {
+        Self {
+            anchor: column.saturating_sub(1) as usize,
+            count: 0,
+            prefix: String::new(),
+            window: String::new(),
+            tail: std::collections::VecDeque::new(),
+            pending: None,
+        }
+    }
+
+    pub(crate) fn push(&mut self, text: &str) {
+        for character in text.chars() {
+            if let Some(previous) = self.pending.replace(character) {
+                self.character(previous);
+            }
+        }
+    }
+
+    fn character(&mut self, character: char) {
+        let body = SNIPPET_LINE_MAX_CHARS - 1;
+        if self.count < SNIPPET_LINE_MAX_CHARS {
+            self.prefix.push(character);
+        }
+        let start = self.anchor.saturating_sub(WINDOW_LEAD_CHARS);
+        if (start..start.saturating_add(body)).contains(&self.count) {
+            self.window.push(character);
+        }
+        if self.tail.len() == body {
+            self.tail.pop_front();
+        }
+        self.tail.push_back(character);
+        self.count += 1;
+    }
+
+    /// Once the window has text beyond it, later bytes cannot change it.
+    pub(crate) fn ready(&self) -> bool {
+        self.count
+            > if self.anchor <= WINDOW_LEAD_CHARS {
+                SNIPPET_LINE_MAX_CHARS
+            } else {
+                self.anchor
+                    .saturating_sub(WINDOW_LEAD_CHARS)
+                    .saturating_add(SNIPPET_LINE_MAX_CHARS - 1)
+            }
+    }
+
+    pub(crate) fn finish(mut self) -> String {
+        if let Some(last) = self.pending.take().filter(|&character| character != '\r') {
+            self.character(last);
+        }
+        if self.count <= SNIPPET_LINE_MAX_CHARS {
+            return self.prefix;
+        }
+        if self.anchor <= WINDOW_LEAD_CHARS {
+            return format!("{}{SNIPPET_LINE_TRUNCATED_MARKER}", self.prefix);
+        }
+        let start = self.anchor.saturating_sub(WINDOW_LEAD_CHARS);
+        let body = SNIPPET_LINE_MAX_CHARS - 1;
+        if start >= self.count.saturating_sub(body) {
+            format!("{LEADING_ELLIPSIS}{}", self.tail.iter().collect::<String>())
+        } else {
+            format!(
+                "{LEADING_ELLIPSIS}{}{SNIPPET_LINE_TRUNCATED_MARKER}",
+                self.window
+            )
+        }
+    }
+}
+
 /// Cut a snippet line to [`SNIPPET_LINE_MAX_CHARS`] characters from its start.
 ///
 /// A line this module already cut (it ends with the truncation marker and is

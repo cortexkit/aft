@@ -520,3 +520,127 @@ fn bash_posix_spawn_no_daemon_fd_leak() {
         );
     }
 }
+
+#[test]
+fn agent_commands_local_shell_roots_and_cpu_are_declared_but_internal_children_are_not() {
+    const CHILD: &str = "AFT_AGENT_COMMANDS_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = concat!(
+            module_path!(),
+            "::agent_commands_local_shell_roots_and_cpu_are_declared_but_internal_children_are_not"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                name.strip_prefix("aft::").unwrap_or(name),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated regression did not run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            crate::agent_commands::started(std::process::id()).is_none(),
+            "standalone mode must not register roots"
+        );
+        crate::agent_commands::enable(root.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _connection = crate::agent_commands::connect(move |batch| {
+            tx.send(batch).unwrap();
+            async { Ok(()) }
+        });
+        let initial = rx.recv().await.unwrap();
+        assert_eq!(initial.known, Some(vec![]));
+        let mut internal = std::process::Command::new("/bin/sh")
+            .args(["-c", "true"])
+            .spawn()
+            .unwrap();
+        internal.wait().unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "internal subprocesses must not be declared"
+        );
+
+        let registry = BgTaskRegistry::default();
+        for mode in ["foreground", "background", "pty"] {
+            let command = "sleep 1; printf accounted";
+            let task_id = if mode == "pty" {
+                registry
+                    .spawn_pty(
+                        SpawnPlan::Unsandboxed,
+                        command,
+                        "spawn-contract".into(),
+                        root.path().to_owned(),
+                        HashMap::new(),
+                        super::super::HardKill::After(Duration::from_secs(60)),
+                        None,
+                        root.path().to_owned(),
+                        100,
+                        false,
+                        false,
+                        Some(root.path().to_owned()),
+                        24,
+                        80,
+                    )
+                    .unwrap()
+            } else {
+                spawn(&registry, root.path(), command, mode == "background")
+            };
+            let task = registry.task(&task_id).unwrap();
+            let pid = task.lock_state().unwrap().metadata.child_pid.unwrap();
+            let start = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let batch = rx.recv().await.expect("declaration sender stopped");
+                    if let Some(root) = batch.started.into_iter().find(|root| root.pid == pid) {
+                        break root;
+                    }
+                }
+            })
+            .await
+            .expect("local shell root was never declared");
+            assert_eq!(
+                Some(start.start_time_ms),
+                subc_os::process_start_time_ms(pid),
+                "{mode}: kernel start identity"
+            );
+            let finish = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    registry.reap_child(&task);
+                    while let Ok(batch) = rx.try_recv() {
+                        if let Some(finished) =
+                            batch.finished.into_iter().find(|root| root.pid == pid)
+                        {
+                            return finished;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("reaped shell root was never finished");
+            assert_eq!(finish.start_time_ms, start.start_time_ms);
+            assert!(
+                finish.cpu_ms.is_some(),
+                "{mode}: wait4 must supply CPU, even if it rounds to zero"
+            );
+        }
+    });
+}

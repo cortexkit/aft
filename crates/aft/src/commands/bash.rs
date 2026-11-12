@@ -93,6 +93,21 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+    let _shell_call = crate::bash_background::shell_metadata::enter(
+        crate::bash_background::shell_metadata::ShellCall {
+            description: params.description.clone(),
+            session: req.session().to_owned(),
+            call_id: None,
+            kind: if params.pty {
+                "pty"
+            } else if params.background {
+                "background"
+            } else {
+                "foreground"
+            }
+            .into(),
+        },
+    );
     let secret_labels = crate::bash_background::secrets::labels(&params.command);
     let has_secrets = !secret_labels.is_empty();
     let sandbox_requirement =
@@ -824,8 +839,8 @@ fn default_workdir(ctx: &AppContext) -> PathBuf {
 
 /// Check `return_paths` and hand them to the remote launch, before anything
 /// runs. They need `runon`: only a remote run has files to copy back. Each
-/// path must name a file inside the project, checked exactly as `write`
-/// checks its path, including symlinks that lead out of it.
+/// path must name a file inside the copied checkout and pass the session's
+/// path policy, including checks for symlinks that lead outside the checkout.
 fn attach_return_paths(
     req_id: &str,
     ctx: &AppContext,
@@ -859,13 +874,16 @@ fn attach_return_paths(
             "return_paths refused: {message}; the command did not run"
         ))
     })?;
-    // The files are written into the project whether or not this session
-    // restricts other tools to it, so containment is checked here too.
+    // The runner copies the checkout containing workdir, which may be a linked
+    // worktree outside the session's project. Containment still applies even
+    // when the session permits other tools to write outside its project.
     let root = ctx
         .config()
         .project_root
         .clone()
         .unwrap_or_else(|| workdir.to_path_buf());
+    #[cfg(unix)]
+    let root = crate::bash_background::registry::remote::return_paths_root(&root, workdir);
     let root = std::fs::canonicalize(&root).map_err(|error| {
         refused(format!(
             "return_paths refused: cannot resolve the project root {}: {error}",

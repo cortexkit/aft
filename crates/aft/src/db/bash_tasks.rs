@@ -728,6 +728,22 @@ fn map_bash_task_row(row: &Row<'_>) -> rusqlite::Result<BashTaskRow> {
     })
 }
 
+/// Operator inventory includes acknowledged terminal tasks until its shorter
+/// display retention expires, as well as every task whose outcome is pending.
+pub(crate) fn operator_shell_rows(
+    conn: &Connection,
+    cutoff_ms: u64,
+) -> rusqlite::Result<Vec<BashTaskRow>> {
+    conn.prepare(
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+        exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+        compressed, timeout_ms, completion_delivered, output_bytes, metadata
+        FROM bash_tasks WHERE completed_at IS NULL OR completed_at > ?1",
+    )?
+    .query_map(params![cutoff_ms as i64], map_bash_task_row)?
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

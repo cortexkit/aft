@@ -305,7 +305,7 @@ impl<'i> SectionsWriter<'i> {
         file: &String,
         resolution: &FileResolution,
     ) -> Result<(), String> {
-        let built = self.built(inputs, file, resolution, &mut HashMap::new());
+        let built = self.built(inputs, file, resolution, &mut HashMap::new())?;
         self.insert(inputs, file, built)
     }
 
@@ -330,7 +330,7 @@ impl<'i> SectionsWriter<'i> {
                 let _label = carry.enter();
                 this.built(inputs, file, resolution, subjects)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         for ((file, _), built) in files.iter().zip(built) {
             self.insert(inputs, file, built)?;
         }
@@ -344,13 +344,22 @@ impl<'i> SectionsWriter<'i> {
         file: &String,
         resolution: &FileResolution,
         subjects: &mut HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
-    ) -> BuiltFragment {
+    ) -> Result<BuiltFragment, String> {
         let facts = super::callgraph::CheckoutFacts { inputs };
-        let (key, parse) = &inputs.parses[file];
-        let slice = FileSlice::build(file, key, parse, resolution);
+        // Publication reads each fragment's parse once. Keeping newly decoded
+        // parses in the shared input slots would retain them in the kept engine,
+        // even after a broad refresh had released its decoded parses.
+        // A failed stored read returns an empty parse with an empty key. It
+        // must fail publication, not serialize that fallback as a valid graph.
+        let (key, parse) = inputs
+            .parses
+            .read(file)
+            .filter(|(key, _)| !key.is_empty())
+            .ok_or_else(|| format!("parse of {file}: the stored parse could not be read"))?;
+        let slice = FileSlice::build(file, &key, &parse, resolution);
         let mut terms = slice_terms(&slice);
         terms.extend(input_terms(resolution, &facts, subjects));
-        terms.extend(method_terms(parse));
+        terms.extend(method_terms(&parse));
         let bytes = super::fragment::encode(resolution);
         #[cfg(test)]
         let bytes = if self.legacy {
@@ -373,13 +382,13 @@ impl<'i> SectionsWriter<'i> {
             .collect::<Vec<_>>();
         fact_subjects.sort_unstable();
         fact_subjects.dedup();
-        let fragment = fragment_key(key, file, &bytes, &fact_subjects);
-        BuiltFragment {
+        let fragment = fragment_key(&key, file, &bytes, &fact_subjects);
+        Ok(BuiltFragment {
             fragment,
             bytes,
             slice: slice.encode(),
             terms,
-        }
+        })
     }
 
     /// Adds `file`'s content record, when the writer takes records one at a

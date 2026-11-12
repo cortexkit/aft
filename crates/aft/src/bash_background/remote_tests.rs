@@ -5,6 +5,195 @@ use crate::exec_remote::wire_tests::{daemon, id, Script};
 #[path = "bookkeeping_probe.rs"]
 mod bookkeeping_probe;
 
+const READ_ONLY_NOTE: &str = "note: the build server keeps tracked files read-only during a job, so the write to src/x.rs was refused (Operation not permitted). Edit files on this machine; the job's copy is discarded.";
+
+fn read_only_result_case(
+    locked: Option<bool>,
+    outcome: Outcome,
+    error: &str,
+) -> (String, String, String) {
+    read_only_result_with_stdout(locked, outcome, error, b"command output\n", true)
+}
+
+fn read_only_result_with_stdout(
+    locked: Option<bool>,
+    outcome: Outcome,
+    error: &str,
+    stdout: &[u8],
+    compressed: bool,
+) -> (String, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        state.metadata.workdir = dir.path().join("package");
+        state.metadata.compressed = compressed;
+        // The synthetic environment has no secrets, so notices may retain its captured output.
+        state.metadata.completion_has_env_secrets = Some(false);
+        state.metadata.completion_has_non_ticket_env_secrets = Some(false);
+        state.metadata.completion_has_secret_placeholders = Some(false);
+    }
+    let error = error.replace("$ROOT", &dir.path().to_string_lossy());
+    let mut record = TerminalRecord::new(id(), outcome, 2, 0, 0)
+        .with_ran(Ran::Remote)
+        .with_workspace_changes(Vec::new());
+    if let Some(locked) = locked {
+        record = record.with_source_read_only(locked);
+    }
+    let verdict = exec::grade(&record);
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.output(1, OutputStream::Stdout, stdout).unwrap();
+    sink.output(2, OutputStream::Stderr, error.as_bytes())
+        .unwrap();
+    sink.terminal(&record, &verdict).unwrap();
+    let readonly = self::registry();
+    let (disk, _) = readonly
+        .terminal_status_from_disk(&task_id, "session", Some(dir.path()), dir.path())
+        .unwrap();
+    registry.remote_terminal(&task, verdict, None);
+    let done = registry.observed_status(&task_id, "session", 8192).unwrap();
+    let foreground = crate::commands::bash_orchestrate::foreground_result_response("lock", done);
+    let completion = registry
+        .drain_completions()
+        .into_iter()
+        .find(|completion| completion.task_id == task_id)
+        .expect("remote completion notice");
+    assert_eq!(
+        serde_json::to_value(completion.clone().into_push_frame()).unwrap()["output_preview"],
+        completion.output_preview
+    );
+    (
+        foreground.data["output"].as_str().unwrap().to_owned(),
+        completion.output_preview,
+        disk.output_preview,
+    )
+}
+
+fn assert_read_only_note(error: &str) {
+    let (foreground, completion, disk) =
+        read_only_result_case(Some(true), Outcome::Exit { code: 1 }, error);
+    for text in [foreground, completion, disk] {
+        assert_eq!(text.matches(READ_ONLY_NOTE).count(), 1, "{text}");
+        assert!(text.lines().any(|line| line == READ_ONLY_NOTE), "{text}");
+        assert!(
+            text.find("Operation not permitted").unwrap() < text.find(READ_ONLY_NOTE).unwrap(),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn runon_read_only_note_quoted_path_foreground_and_background() {
+    for quote in ['\'', '"'] {
+        assert_read_only_note(&format!(
+            "cp: cannot create regular file {quote}$ROOT/src/x.rs{quote}: Operation not permitted\n"
+        ));
+    }
+}
+
+#[test]
+fn runon_read_only_note_bsd_and_redirect_relative_paths() {
+    for prefix in ["touch: ", "bash: line 1: "] {
+        assert_read_only_note(&format!("{prefix}../src/x.rs: Operation not permitted\n"));
+    }
+}
+
+#[test]
+fn runon_read_only_note_python_permission_error() {
+    assert_read_only_note("PermissionError: [Errno 1] Operation not permitted: '../src/x.rs'\n");
+}
+
+#[test]
+fn runon_read_only_note_precedes_the_single_final_list_trailer() {
+    let stdout = "ordinary output\n".repeat(10_000);
+    let (foreground, completion, _) = read_only_result_with_stdout(
+        Some(true),
+        Outcome::Exit { code: 1 },
+        "../src/x.rs: Operation not permitted\n",
+        stdout.as_bytes(),
+        true,
+    );
+    for text in [foreground, completion] {
+        assert_eq!(text.matches(READ_ONLY_NOTE).count(), 1, "{text}");
+        let trailers: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("shown "))
+            .collect();
+        assert_eq!(trailers.len(), 1, "{text}");
+        assert_eq!(text.lines().last(), trailers.first().copied(), "{text}");
+        assert!(text.find(READ_ONLY_NOTE).unwrap() < text.find(trailers[0]).unwrap());
+    }
+}
+
+#[test]
+fn runon_read_only_note_killed_job_completion() {
+    let (foreground, completion, disk) = read_only_result_case(
+        Some(true),
+        Outcome::Cancelled,
+        "../src/x.rs: Operation not permitted\n",
+    );
+    for text in [foreground, completion, disk] {
+        assert!(text.contains(READ_ONLY_NOTE), "{text}");
+    }
+}
+
+#[test]
+fn runon_read_only_note_requires_lock_failure_and_in_checkout_eperm() {
+    for (locked, code, error) in [
+        (None, 1, "../src/x.rs: Operation not permitted\n"),
+        (Some(false), 1, "../src/x.rs: Operation not permitted\n"),
+        (Some(true), 0, "../src/x.rs: Operation not permitted\n"),
+        (
+            Some(true),
+            1,
+            "'$ROOT/../outside.rs': Operation not permitted\n",
+        ),
+        (Some(true), 1, "../../outside.rs: Operation not permitted\n"),
+        (Some(true), 1, "../src/x.rs: Permission denied\n"),
+        (Some(true), 1, "failed without an error path\n"),
+    ] {
+        let (foreground, completion, disk) =
+            read_only_result_case(locked, Outcome::Exit { code }, error);
+        for text in [foreground, completion, disk] {
+            assert!(
+                !text.contains("note: the build server keeps tracked files"),
+                "{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn runon_read_only_note_ignores_stdout_and_local_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let error = b"src/x.rs: Operation not permitted\n";
+    sink.output(1, OutputStream::Stdout, error).unwrap();
+    let mut state = task.state.lock().unwrap();
+    let mut metadata = state.metadata.clone();
+    metadata.mark_terminal(BgTaskStatus::Failed, Some(1), None);
+    metadata.remote.as_mut().unwrap().terminal = Some(
+        TerminalRecord::new(id(), Outcome::Exit { code: 1 }, 1, 0, 0).with_source_read_only(true),
+    );
+    let mut text = "original output".to_owned();
+    append_source_read_only_note(&mut text, &metadata, &state.buffer);
+    assert_eq!(text, "original output", "stdout alone is not error output");
+    metadata.remote = None;
+    drop(state);
+    sink.output(2, OutputStream::Stderr, error).unwrap();
+    state = task.state.lock().unwrap();
+    append_source_read_only_note(&mut text, &metadata, &state.buffer);
+    assert_eq!(
+        text, "original output",
+        "local jobs have no remote lock proof"
+    );
+}
+
 fn assert_remote_oom_terminal(cause: Option<&str>, expected: &str) {
     let dir = tempfile::tempdir().unwrap();
     let (registry, task_id, paths) =
@@ -5862,6 +6051,103 @@ fn persist_accepted_with_snapshot(
     persist_accepted_with_snapshot_cap(dir, connection, command, None)
 }
 
+#[tokio::test]
+async fn held_call_startup_reattaches_remote_job_without_a_route_bind() {
+    held_call_startup_remote_result(false).await;
+}
+
+#[tokio::test]
+async fn held_call_startup_lost_remote_job_settles_as_unknown_outcome() {
+    held_call_startup_remote_result(true).await;
+}
+
+async fn held_call_startup_remote_result(lost: bool) {
+    use crate::subc::held_task_recovery::tests as recovery;
+    let daemon = daemon(
+        if lost { Script::Lost } else { Script::Restart },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    let root = storage.join("runner");
+    fs::create_dir_all(&root).unwrap();
+    let old = recovery::context(&root, &storage);
+    let (registry, task_id, _) = persist_accepted_with_snapshot(
+        &root,
+        daemon.connection.clone(),
+        "printf must-not-run-locally",
+    );
+    registry.detach();
+    drop(registry);
+    let layout = resolve_task_layout(&session_tasks_dir(&root, "session"), &task_id).unwrap();
+    let key = recovery::hold_task(&old, &layout, "remote-held");
+    drop(old);
+    let restarted = recovery::context(&root, &storage);
+    let executor = recovery::startup(&restarted).await;
+    let frame = recovery::settled(&restarted, &key).await;
+    if lost {
+        assert_eq!(
+            frame.body,
+            crate::db::call_ledger::unknown_held_result().body
+        );
+    } else {
+        let result: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert!(result["content"].to_string().contains("ABCD"), "{result}");
+        assert_eq!(result["structuredContent"]["exit_code"], 0, "{result}");
+    }
+    let log = daemon.log.lock().unwrap();
+    assert!(log.iter().any(|(_, body)| body["method"] == "exec.attach"));
+    assert!(!log.iter().any(|(_, body)| body["method"] == "exec.run"));
+    drop(log);
+    for actor in executor.actor_contexts() {
+        actor.bash_background().detach();
+    }
+}
+
+#[test]
+fn shells_v1_remote_acceptance_persists_only_a_reported_placement_host() {
+    use exec::types::Placement;
+    for (placement, expected) in [
+        (
+            Some(Placement::new("first_party").with_host("ovh-1")),
+            Some("ovh-1"),
+        ),
+        (Some(Placement::new("overflow")), None),
+        (None, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task_id, paths) = persist_accepted_with_snapshot(
+            dir.path(),
+            dir.path().join("connection.json"),
+            "printf host",
+        );
+        let task = registry.task(&task_id).unwrap();
+        task.state.lock().unwrap().metadata.shell_remote_host = Some("previous-host".into());
+        let mut sink = TaskSink::new(&registry, task).unwrap();
+        let mut accepted = serde_json::to_value(Accepted::new(id(), 1)).unwrap();
+        if let Some(placement) = placement {
+            accepted["placement"] = serde_json::to_value(placement).unwrap();
+        }
+        let accepted: Accepted = serde_json::from_value(accepted).unwrap();
+        sink.accepted(&accepted).unwrap();
+        let layout = resolve_task_layout(&paths.session_dir, &task_id).unwrap();
+        let saved = read_task_at(&layout).unwrap();
+        assert_eq!(saved.shell_remote_host.as_deref(), expected);
+        assert_eq!(
+            registry.shell_snapshots()[0]
+                .metadata
+                .shell_remote_host
+                .as_deref(),
+            expected
+        );
+        assert!(serde_json::to_value(&saved)
+            .unwrap()
+            .get("provider")
+            .is_none());
+    }
+}
+
 fn persist_accepted_with_snapshot_cap(
     dir: &Path,
     connection: PathBuf,
@@ -8207,6 +8493,7 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
             .unwrap()
             .is_none()
     );
+    assert_eq!(return_paths_root(&main, outside.path()), main);
     let error = build_remote_request(
         &main,
         outside.path(),
@@ -15863,6 +16150,77 @@ fn return_call(paths: &[&str]) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn runon_return_paths_side_worktree_uses_copied_checkout_for_submit_and_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    git_fixture(&main);
+    let main = main.canonicalize().unwrap();
+    let linked = temp.path().join("linked");
+    add_git_worktree(&main, &linked, "returned-files");
+    let linked = linked.canonicalize().unwrap();
+    assert!(!linked.starts_with(&main));
+    assert!(linked.join(".git").is_file());
+    let ctx = restarted_context(&main);
+
+    // Both checkouts use the same project context. A subdirectory cwd must
+    // select its checkout's top level, not the session root or the cwd itself.
+    for checkout in [&main, &linked] {
+        let cwd = checkout.join("build");
+        fs::create_dir(&cwd).unwrap();
+        let daemon = return_daemon("failed-missing").await;
+        let mut call = return_call(&["dist/hello.txt", "dist/absent.txt"]);
+        call["workdir"] = serde_json::json!(cwd);
+        let (reply, _) = orchestrated_reply(&ctx, &daemon, call).await;
+        assert!(reply.success, "{reply:?}");
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["workspace_key"], checkout.to_str().unwrap());
+        assert_eq!(runs[0]["repository_root"], main.to_str().unwrap());
+        assert_eq!(runs[0]["cwd"], cwd.to_str().unwrap());
+        assert_eq!(fs::read(cwd.join("dist/hello.txt")).unwrap(), b"hello");
+        assert!(!cwd.join("dist/absent.txt").exists());
+        let task_id = reply.data["task_id"].as_str().unwrap();
+        let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
+        let report = saved.remote.unwrap().returned_files.unwrap();
+        assert_eq!(
+            report[0].checkout_path.as_deref(),
+            Some("build/dist/hello.txt")
+        );
+        assert_eq!(
+            report[0].outcome,
+            super::return_files::ReturnOutcome::Returned { bytes: 5 }
+        );
+        let mut refused = return_call(&["../../outside.txt"]);
+        refused["workdir"] = serde_json::json!(cwd);
+        let response = crate::bash_background::with_remote_policy(
+            Some(launch(daemon.connection.clone())),
+            || crate::commands::bash::handle(&orchestrated_request(refused), &ctx),
+        );
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "return_paths_refused");
+        assert_eq!(response.data["message"], "return_paths refused: return_paths path ../../outside.txt must not use ..; the command did not run");
+
+        if checkout == &linked {
+            // This points back into the session project: project containment
+            // alone would incorrectly allow a return outside the copied tree.
+            std::os::unix::fs::symlink(&main, cwd.join("link-to-main")).unwrap();
+            let mut refused = return_call(&["link-to-main/escaped.txt"]);
+            refused["workdir"] = serde_json::json!(cwd);
+            let response = crate::bash_background::with_remote_policy(
+                Some(launch(daemon.connection.clone())),
+                || crate::commands::bash::handle(&orchestrated_request(refused), &ctx),
+            );
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "return_paths_refused");
+            assert_eq!(response.data["message"], "return_paths refused: link-to-main/escaped.txt resolves outside the project; the command did not run");
+        }
+        assert_eq!(exec_runs(&daemon).len(), 1, "refused calls must not submit");
+        assert!(!main.join("escaped.txt").exists());
+    }
+    assert!(!temp.path().join("outside.txt").exists());
+}
+
+#[tokio::test]
 async fn runon_return_paths_places_verified_files_and_lists_every_path() {
     // One path returned, one missing on the server, in one job.
     let daemon = return_daemon("failed-missing").await;
@@ -17000,4 +17358,60 @@ async fn runon_draining_wait_saves_its_record_at_a_coarse_step() {
         "59 one-second passes saved the record {} times",
         waited - wait_began
     );
+}
+
+#[tokio::test]
+async fn agent_commands_runon_never_declares_a_local_root() {
+    const CHILD: &str = "AFT_AGENT_COMMANDS_RUNON_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = concat!(
+            module_path!(),
+            "::agent_commands_runon_never_declares_a_local_root"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                name.strip_prefix("aft::").unwrap_or(name),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated regression did not run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    crate::agent_commands::enable(dir.path());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let connection = crate::agent_commands::connect(move |batch| {
+        tx.send(batch).unwrap();
+        async { Ok(()) }
+    });
+    assert_eq!(rx.recv().await.unwrap().known, Some(vec![]));
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command":"uname -a","runon":"linux","compressed":false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let _done = terminal(ctx.bash_background(), &task_id).await;
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    tokio::task::yield_now().await;
+    assert!(
+        rx.try_recv().is_err(),
+        "remote jobs and internal git helpers have no declared local root"
+    );
+    connection.stop().await;
 }

@@ -1,0 +1,18 @@
+{
+  "op": "scope.background_tasks",
+  "status": "ok",
+  "data": {
+    "running": [
+      {
+        "task_id": "bash-0000000000000001",
+        "title": "cargo test",
+        "command": "cargo test",
+        "started_at_ms": 1730000000000,
+        "remote": {
+          "job_id": "00000000-0000-4000-8000-000000000007"
+        }
+      }
+    ],
+    "complete": true
+  }
+}

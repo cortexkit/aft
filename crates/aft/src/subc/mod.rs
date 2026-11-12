@@ -228,6 +228,7 @@ mod diagnostics_findings;
 mod drain;
 mod flow_read;
 mod health;
+pub(crate) mod held_task_recovery;
 #[cfg(test)]
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
@@ -249,6 +250,7 @@ pub(crate) use secret_consent::{
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
+mod bash_notice_text;
 mod keepalive;
 mod manifest;
 mod page_collect;
@@ -264,7 +266,25 @@ pub(crate) mod result_body;
 mod retained_result;
 pub(crate) mod rich_ui;
 mod run_scope;
+mod runner_notices;
+
+#[cfg(feature = "test-scope-owner")]
+#[doc(hidden)]
+pub use runner_notices::RunnerNoticeRecoveryForTest;
+
+/// Exercise the production notice consumer from a supervised test module.
+#[cfg(feature = "test-scope-owner")]
+#[doc(hidden)]
+pub async fn runner_notice_transport_for_test(
+    connection: &Path,
+    session: &str,
+    scope: subc_protocol::scope::ScopeSelector,
+) -> serde_json::Value {
+    runner_notices::transport_for_test(connection, session, scope).await
+}
+pub(crate) mod scope_background_tasks;
 mod scope_describe;
+mod shells;
 #[cfg(test)]
 mod stack_budget_tests;
 pub(crate) mod watch_delivery;
@@ -1629,8 +1649,19 @@ struct RouteIdentity(Arc<RouteIdentityData>);
 #[derive(Default)]
 struct ManagementIdentity {
     principal: Option<Principal>,
+    harness: Option<String>,
     scope: Option<subc_protocol::scope::ScopeStamp>,
     admission: ManagementAdmission,
+    shells_cancel: ShellsRouteLifetime,
+}
+
+#[derive(Debug, Default)]
+struct ShellsRouteLifetime(tokio_util::sync::CancellationToken);
+
+impl Drop for ShellsRouteLifetime {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -1640,6 +1671,8 @@ enum ManagementAdmission {
     FlowOnly,
     /// Cingulate's route: the `permissions/v1` operations and nothing else.
     PermissionsOnly,
+    /// Phone and simulator operator routes have read-only shell authority only.
+    ShellsOnly,
     /// Tool-provider metadata and custodian feeds without a project root;
     /// grants no management authority or project-tool access.
     ProjectFree {
@@ -1665,7 +1698,11 @@ impl RouteIdentity {
         };
         crate::bash_background::TaskIdentity {
             principal,
-            harness: self.harness.clone(),
+            harness: self
+                .harness
+                .parse::<crate::harness::Harness>()
+                .map(|harness| harness.wire_label())
+                .unwrap_or_else(|_| self.harness.clone()),
             session: self.session.clone(),
         }
     }
@@ -2373,6 +2410,9 @@ fn quiesce_connection_roots(
         }
     }
 
+    for route in routes.values() {
+        runner_notices::route_unbound(route);
+    }
     routes.clear();
     root_channels.clear();
     installed_route_epochs.clear();
@@ -3898,6 +3938,7 @@ fn remove_route_channel(
 ) -> Option<RouteIdentity> {
     let removed = routes.remove(&channel);
     if let Some(identity) = &removed {
+        runner_notices::route_unbound(identity);
         remove_root_channel(root_channels, &identity.root, channel);
         release_semantic_opener_if_unrouted(routes, identity);
     }
@@ -3930,6 +3971,7 @@ fn insert_route_channel(
         crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
     }
     if let Some(previous) = routes.insert(channel, identity.clone()) {
+        runner_notices::route_unbound(&previous);
         remove_root_channel(root_channels, &previous.root, channel);
         release_semantic_opener_if_unrouted(routes, &previous);
     }
@@ -4530,6 +4572,7 @@ fn run_subc_mode_on_runtime_thread(
     crate::db::call_ledger::mark_provider_process();
     let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
+    crate::db::runner_harness_keys::start(ctx.app(), ctx.storage_dir().join("aft.db"));
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
     let runtime = dispatch_path_metrics
         .frame_loop_runtime()
@@ -4540,6 +4583,9 @@ fn run_subc_mode_on_runtime_thread(
         let shared_app = ctx.app();
         // Stall captures land under `<storage>/diagnostics`.
         let storage_dir = ctx.storage_dir();
+        if crate::launch_nonce::current().is_some() {
+            crate::agent_commands::enable(&storage_dir);
+        }
         drop(ctx);
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
@@ -5307,6 +5353,13 @@ where
         HELLO_CORR + 1,
     ));
     let run_scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
+    let agent_commands = crate::launch_nonce::current().map(|_| {
+        let control = control.clone();
+        crate::agent_commands::connect(move |batch| {
+            let control = control.clone();
+            async move { control.agent_commands(batch).await }
+        })
+    });
     let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
     let speech_control = Arc::clone(&control);
     let speech = crate::gh_shim_speech::service::start(
@@ -5426,6 +5479,7 @@ where
         }
     }
     rich_ui::display::start(connection_file_path.to_path_buf());
+    runner_notices::install(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
@@ -5438,6 +5492,7 @@ where
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
+    let shells_service = shells::Service::new(shared_app.clone(), executor.clone());
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
     // Opened by the daemon's `module.draining` notice (bounded by the drain
@@ -5487,6 +5542,24 @@ where
     // Arm the existing promised-wake marker before the first turn too: a lock
     // taken before the first select must be just as recoverable as a later one.
     dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
+    let notice_executor = executor.clone();
+    held_task_recovery::start(
+        shared_app.clone(),
+        executor.clone(),
+        push_senders.clone(),
+        storage_dir.to_path_buf(),
+        move |replayed| {
+            if replayed.is_empty() {
+                return;
+            }
+            // Each recovered task lives in its own project's registry, and an
+            // offer against a registry that doesn't hold the task does nothing,
+            // so every actor can be offered the whole set.
+            for actor in notice_executor.actor_contexts() {
+                runner_notices::offer_replayed(actor.bash_background().clone(), replayed);
+            }
+        },
+    );
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
         dispatch_path_metrics.mark_frame_loop_step("LedgerEdge::detach_shells", "", 0);
         for route in ledger_edge.unrouted_shells(&routes) {
@@ -6019,6 +6092,29 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        // Flow routes keep their operation allowlist refusal even
+                        // when an operation has a separate operator-only gate.
+                        if let Some(identity) = management_routes.get(&route) {
+                            if identity.admission == ManagementAdmission::FlowOnly {
+                                if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                    if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                        break Err(error);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Ok(body) = decoded.body() {
+                            if shells::is_request(body) {
+                                let result = if let Some(identity) = management_routes.get(&route) {
+                                    shells_service.dispatch(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, body).await
+                                } else {
+                                    send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, shells::operator_required()).await
+                                };
+                                if let Err(error) = result { break Err(error); }
+                                continue;
+                            }
+                        }
                         // Bind admission, not request-supplied scope data, limits
                         // flow management routes to the manifest's flow operations
                         // before any store, provider, or general tool dispatch.
@@ -6312,6 +6408,7 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
+                        if shells_service.cancel(channel, corr).await { continue; }
                         if gh_relay_requests.cancel(channel, corr) {
                             continue;
                         }
@@ -6459,7 +6556,8 @@ where
                                      }
                                  }
                                  if let Some(error) = admission_error { break Err(error); }
-                                 let ended = match end_bg_subscriptions_for_drain(
+                                  shells_service.drain().await;
+                                  let ended = match end_bg_subscriptions_for_drain(
                                     &writer_tx,
                                     &dispatch_path_metrics,
                                     &mut bg_subs,
@@ -6904,6 +7002,8 @@ where
         }
     };
 
+    shells_service.drain().await;
+    shells_service.stop();
     dispatch_path_metrics.held_bash_calls.clear_all_progress();
     a0.stop();
     let loop_result = if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
@@ -7042,6 +7142,9 @@ where
     // The daemon control handle also holds a writer sender. The loop keeps it
     // so flow reads can ask the daemon whether their parent scope is still
     // live; the writer tasks cannot drain while the handle is alive.
+    if let Some(sender) = agent_commands {
+        sender.stop().await;
+    }
     drop(control);
     a0.stop();
     drop(a0);
@@ -7912,6 +8015,9 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             lifecycle_probe,
         );
+        if let Some(route) = routes.get(&route_id) {
+            runner_notices::route_bound(ctx.bash_background().clone(), route);
+        }
     }
     let replayed = push::replay_buffered_push_frames(
         tx,
@@ -8515,6 +8621,22 @@ async fn handle_control_request(
                 matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
             schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
             if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
+                if !project_free
+                    && matches!(principal.as_ref(), Some(Principal::Reserved { module_id }) if module_id == "callosum")
+                    && !shells::operator(
+                        principal.as_ref(),
+                        Some(&identity.harness),
+                        scope.is_some(),
+                    )
+                {
+                    return send_route_bind_error_body(
+                        tx,
+                        frame,
+                        &shells::operator_required(),
+                        metrics,
+                    )
+                    .await;
+                }
                 if let Err(refusal) = if project_free {
                     Ok(())
                 } else {
@@ -8537,6 +8659,11 @@ async fn handle_control_request(
                     && !matches!(bind_trust, BindTrust::FirstParty)
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
                     && !permissions::is_cingulate(principal.as_ref())
+                    && !shells::operator(
+                        principal.as_ref(),
+                        Some(&identity.harness),
+                        scope.is_some(),
+                    )
                 {
                     return send_route_bind_error(
                         tx,
@@ -8566,6 +8693,14 @@ async fn handle_control_request(
                     .is_some_and(diagnostics_findings::is_flow_scope)
                 {
                     ManagementAdmission::FlowOnly
+                } else if matches!(principal.as_ref(), Some(Principal::Reserved { module_id }) if module_id == "callosum")
+                    && shells::operator(
+                        principal.as_ref(),
+                        Some(&identity.harness),
+                        scope.is_some(),
+                    )
+                {
+                    ManagementAdmission::ShellsOnly
                 } else if !matches!(bind_trust, BindTrust::FirstParty)
                     && permissions::is_cingulate(principal.as_ref())
                 {
@@ -8638,8 +8773,10 @@ async fn handle_control_request(
                             route: route_id,
                             identity: ManagementIdentity {
                                 principal,
+                                harness: Some(identity.harness.clone()),
                                 scope,
                                 admission,
+                                shells_cancel: ShellsRouteLifetime::default(),
                             },
                             corr: frame.header.corr,
                         },
@@ -8883,7 +9020,10 @@ async fn handle_control_request(
                 output_scope: Default::default(),
                 root: bind_root_id.clone(),
                 project_root: PathBuf::from(&bind_project_root),
-                harness: bind_harness.clone(),
+                harness: active_harness
+                    .as_ref()
+                    .map(|harness| harness.wire_label())
+                    .unwrap_or_else(|| bind_harness.clone()),
                 session: bind_session.clone(),
                 role: route_role,
                 trust: bind_trust,
@@ -9219,6 +9359,24 @@ async fn handle_management_request(
 
     metrics.mark_frame_loop_command("handle_management_request", operation, frame.header.corr);
     let result = match operation {
+        scope_background_tasks::OPERATION => {
+            let params = decoded
+                .as_ref()
+                .and_then(|value| value.get("params"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let expected_roots = scope_background_tasks::expected_roots(&params, routes);
+            scope_background_tasks::spawn(
+                tx,
+                frame,
+                metrics,
+                principal.cloned(),
+                params,
+                storage_dir.to_path_buf(),
+                expected_roots,
+            );
+            return Ok(());
+        }
         crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION => {
             let params = decoded
                 .as_ref()
@@ -9943,8 +10101,7 @@ async fn send_management_response(
     result: Response,
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
-    let status = if result.success { "ok" } else { "error" };
-    let body = json!({ "op": operation, "status": status, "data": result.data });
+    let body = management_response_body(operation, result);
     let response = Frame::build_with_version(
         request.header.ver,
         FrameType::Response,
@@ -9956,6 +10113,11 @@ async fn send_management_response(
     )
     .map_err(SubcError::FrameBuild)?;
     send_reliable_writer_frame(tx, metrics, response, "management response").await
+}
+
+fn management_response_body(operation: &str, result: Response) -> Value {
+    let status = if result.success { "ok" } else { "error" };
+    json!({ "op": operation, "status": status, "data": result.data })
 }
 
 fn install_bash_compressor(ctx: &AppContext) {
@@ -10197,6 +10359,16 @@ fn admit_management_flow_request(
     identity: &ManagementIdentity,
     body: Option<&Value>,
 ) -> Result<(), ErrorBody> {
+    if identity.admission == ManagementAdmission::ShellsOnly {
+        return if body.is_some_and(shells::is_request) {
+            Ok(())
+        } else {
+            Err(ErrorBody::new(
+                "route_not_admitted",
+                "this operator route serves only shells/v1",
+            ))
+        };
+    }
     if identity.admission == ManagementAdmission::PermissionsOnly {
         return if body.is_some_and(permissions::is_request) {
             Ok(())
@@ -11298,6 +11470,18 @@ async fn handle_tool_call_with_capabilities(
                 .await
             }
         };
+        if call.name == "bash_ack_completions" && runner_notices::runner_route(&identity) {
+            return send_provider_error(
+                tx,
+                metrics,
+                frame,
+                subc_protocol::ErrorBody::new(
+                    "completion_ack_unsupported",
+                    "runner completions are acknowledged by session.send",
+                ),
+            )
+            .await;
+        }
         match carrier_read_only::admit_operation(&identity, &call.name, &call.arguments) {
             Err(error) => {
                 let response = wire::build_carrier_response_frame(

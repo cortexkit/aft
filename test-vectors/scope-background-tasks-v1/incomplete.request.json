@@ -1,0 +1,13 @@
+{
+  "op": "scope.background_tasks",
+  "params": {
+    "scope": {
+      "owner": {
+        "kind": "reserved",
+        "module_id": "prefrontal-core"
+      },
+      "ref": "worker-7",
+      "epoch": 3
+    }
+  }
+}

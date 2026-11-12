@@ -1284,6 +1284,27 @@ describe("Hoisted tool execute handlers", () => {
     );
   });
 
+  test("delete preserves the temporary path refusal code and exact message", async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+    const response = {
+      success: false,
+      code: "unsafe_temp_path",
+      message:
+        "temporary path '/tmp/foreign' is another session's scratch folder; AFT changes only this session's scratch folders",
+      text: "rendered refusal",
+    };
+    const { tools } = createMockHoistedHarness(async () => response);
+
+    await expect(tools.aft_delete.execute({ files: ["doomed.ts"] }, sdkCtx)).rejects.toMatchObject({
+      name: "AftToolError",
+      code: "unsafe_temp_path",
+      message: response.message,
+      response,
+      cause: { code: "unsafe_temp_path", message: response.message, response },
+    });
+  });
+
   test("delete returns readable partial-success text when some files fail", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);

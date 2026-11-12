@@ -14,6 +14,7 @@ pub mod process;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
+pub(crate) mod shell_metadata;
 mod temp_cleanup;
 pub(crate) mod viewed_task;
 pub mod watch_lines;
@@ -557,8 +558,19 @@ pub struct TaskCallKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskIdentity {
     pub principal: Option<String>,
+    #[serde(deserialize_with = "deserialize_task_harness")]
     pub harness: String,
     pub session: String,
+}
+
+fn deserialize_task_harness<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let raw = String::deserialize(deserializer)?;
+    Ok(raw
+        .parse::<crate::harness::Harness>()
+        .map(|harness| harness.wire_label())
+        .unwrap_or(raw))
 }
 
 thread_local! {
@@ -598,7 +610,10 @@ impl TaskIdentity {
                 ..
             } => Some(Self {
                 principal: principal_id.clone(),
-                harness: harness.clone(),
+                harness: harness
+                    .parse::<crate::harness::Harness>()
+                    .map(|harness| harness.wire_label())
+                    .unwrap_or_else(|_| harness.clone()),
                 session: session_id.clone(),
             }),
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => None,

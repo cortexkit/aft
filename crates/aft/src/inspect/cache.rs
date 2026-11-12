@@ -611,7 +611,7 @@ pub struct InspectCache {
     sqlite_path: PathBuf,
     writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
     read_marker: Option<crate::root_cache::ReadMarker>,
-    conn: Mutex<TrackedConnection>,
+    conn: Arc<Mutex<TrackedConnection>>,
     memory: RwLock<MemoryAggregates>,
     writer_retry_at: Option<Instant>,
 }
@@ -837,6 +837,8 @@ impl InspectCache {
         read_marker: Option<crate::root_cache::ReadMarker>,
         conn: TrackedConnection,
     ) -> Self {
+        let conn = Arc::new(Mutex::new(conn));
+        crate::db::deferred_checkpoint::register(&conn);
         Self {
             memory_clock: AtomicU64::new(0),
             project_root,
@@ -844,7 +846,7 @@ impl InspectCache {
             sqlite_path,
             writer_lease,
             read_marker,
-            conn: Mutex::new(conn),
+            conn,
             memory: RwLock::new(MemoryAggregates::default()),
             writer_retry_at: None,
         }

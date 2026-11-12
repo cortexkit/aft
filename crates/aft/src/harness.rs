@@ -176,7 +176,7 @@ impl std::str::FromStr for Harness {
             // is loaded there, so they are runner sessions in everything the
             // harness decides (storage, consent, reply shape). The route
             // identity keeps the name the daemon sent.
-            "runner" | "opencode2" | "claude-code" => Ok(Harness::Runner),
+            "runner" | "opencode2" | "claude-code" | "broca" => Ok(Harness::Runner),
             other if other.starts_with("mcp:") => {
                 let client = &other[4..];
                 if client.is_empty() {
@@ -200,6 +200,16 @@ impl std::str::FromStr for Harness {
 #[cfg(test)]
 mod tests {
     use super::{sanitize_client, Harness};
+
+    #[test]
+    fn runner_alias_switch_preserves_canonical_storage_namespace() {
+        for raw in ["runner", "opencode2", "claude-code", "broca"] {
+            let harness: Harness = raw.parse().unwrap();
+            assert_eq!(harness, Harness::Runner);
+            assert_eq!(harness.storage_segment(), "runner");
+            assert_eq!(serde_json::to_string(&harness).unwrap(), "\"runner\"");
+        }
+    }
 
     #[test]
     fn directly_constructed_fed_storage_segment_handles_invalid_utf8_boundaries() {

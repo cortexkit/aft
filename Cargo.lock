@@ -78,6 +78,7 @@ dependencies = [
  "cortexkit-project-identity",
  "cortexkit-role-agent-data",
  "cortexkit-role-harness",
+ "cortexkit-role-llm-runner",
  "cortexkit-role-tool-display",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -145,8 +146,8 @@ dependencies = [
  "subc-client-rs",
  "subc-daemon",
  "subc-os",
- "subc-protocol",
- "subc-transport",
+ "subc-protocol 0.35.0",
+ "subc-transport 0.16.0",
  "tempfile",
  "tokenizers",
  "tokio",
@@ -782,9 +783,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-exec-remote-types"
-version = "0.2.20"
+version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2711e556b5101a28ff43ac88f29ca63ed2a4d500600a412e8f86a7c93e5eb0db"
+checksum = "040478ec7d626331dabd64871cb878ef1469f087b8cfe0d2045b1f21f6e8d45d"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -834,6 +835,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-rich-ui-syntax"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98509395f8f7afce4127b6c6e1f1eaf11ee20fba57a86c27a21da67e10a3bc45"
+dependencies = [
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "cortexkit-role-agent-data"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -853,6 +863,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-role-llm-runner"
+version = "0.8.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec3dd82662de68fc128ae405d914a639435e5522069a3778bd0576171bfaea64"
+dependencies = [
+ "cortexkit-rich-ui-syntax",
+ "cortexkit-role-tool-provider",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "cortexkit-role-tool-display"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -861,7 +885,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.35.0",
  "url",
 ]
 
@@ -876,7 +900,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2",
- "subc-protocol",
+ "subc-protocol 0.35.0",
 ]
 
 [[package]]
@@ -890,7 +914,7 @@ dependencies = [
  "cortexkit-role-tool-provider",
  "futures-util",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.35.0",
  "tokio",
 ]
 
@@ -3314,6 +3338,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+dependencies = [
+ "bitflags 2.11.0",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4169,18 +4204,18 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.33.1"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "082e0ca74885e6441f607db5c445d44136fae0b61b9d785da47ac0341bc53b44"
+checksum = "e29eac1e4e1f9c0ee7f86f925fef59cc43f1b8d4d1e408100a5022e7cc4e65b1"
 dependencies = [
  "async-trait",
  "serde",
  "serde_json",
  "sha2",
- "subc-control",
+ "subc-control 0.36.0",
  "subc-os",
- "subc-protocol",
- "subc-transport",
+ "subc-protocol 0.35.0",
+ "subc-transport 0.16.0",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4194,7 +4229,18 @@ checksum = "d339866d62da0f376dec7f13c897cd764ead24fc93ca6d764cb3e6ab81844d64"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.34.3",
+]
+
+[[package]]
+name = "subc-control"
+version = "0.36.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53fc6c43be13980d532228848efc3bc7a4ca02ce3c862f489b607dfb70b3441a"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-protocol 0.35.0",
 ]
 
 [[package]]
@@ -4216,13 +4262,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-cgroup",
- "subc-control",
+ "subc-control 0.34.0",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
  "subc-presence",
- "subc-protocol",
- "subc-transport",
+ "subc-protocol 0.34.3",
+ "subc-transport 0.15.0",
  "subc-uptime",
  "subtle",
  "tokio",
@@ -4250,9 +4296,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.26"
+version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ec6e1e76111fd7ecdeae8701a8cb5cae83b704b0c92e6e8f44164cb50fd07c"
+checksum = "1ec5828d41eb22334c1b0a2c002d3af1efd432e6a0cef703b4d25747851f3a66"
 dependencies = [
  "libc",
  "rustix",
@@ -4286,6 +4332,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-protocol"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87ffe347a74e006edfa40cadc60e32c488d66165d851f4ffc96daaa12e7c187f"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "subc-transport"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4298,7 +4354,25 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.34.3",
+ "subtle",
+ "tokio",
+]
+
+[[package]]
+name = "subc-transport"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01d69d19fb808ab46905e9949f2ba68df148f5b3bbc1fc20cd5f55aadd999586"
+dependencies = [
+ "getrandom 0.2.17",
+ "hmac",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subc-os",
+ "subc-protocol 0.35.0",
  "subtle",
  "tokio",
 ]
@@ -5050,6 +5124,12 @@ name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-id-start"

@@ -209,7 +209,7 @@ rcgen = "0.13"
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
 cortexkit-paths = "0.1"
-cortexkit-exec-remote-types = "=0.2.20"
+cortexkit-exec-remote-types = "=0.2.21"
 
 glob = "0.3"
 which = "7"
@@ -254,18 +254,19 @@ markup5ever_rcdom = "0.38"
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
 cortexkit-role-tool-provider = "=0.15.5"
+cortexkit-role-llm-runner = "=0.8.36"
 cortexkit-role-tool-display = "=0.1.5"
 cortexkit-role-agent-data = "=0.2.4"
 cortexkit-project-identity = "=0.1.4"
 cortexkit-agent-identity = "=0.1.1"
 jsonschema = { version = "0.33", default-features = false }
-subc-protocol = "=0.34.3"
-subc-transport = "=0.15.0"
-subc-client-rs = "=0.33.1"
+subc-protocol = "=0.35.0"
+subc-transport = "=0.16.0"
+subc-client-rs = "=0.35.0"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.
-subc-os = "=0.1.26"
+subc-os = "=0.1.30"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }

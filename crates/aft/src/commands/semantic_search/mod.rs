@@ -566,6 +566,7 @@ fn standing_snapshot_metadata(
     let Ok(conn) = crate::db::open(&db_path) else {
         return ExternalBorrowMetadata::default();
     };
+    conn.close_in_background();
     let Ok(needs_strict_verify) =
         crate::db::standing_roots::needs_strict_verify_for_resolved_target(
             &conn,
@@ -7282,10 +7283,12 @@ fn execute_degraded_grep_fallback(
     let read_budget_reached = AtomicBool::new(walk_budget_reached);
     let cancellation = crate::executor::current_job_cancellation();
     let rayon_wait = waits::time(waits::SearchWait::Rayon);
+    let alloc_label = crate::alloc_trace::carry();
     let mut readable_files = files
         .par_iter()
         .enumerate()
         .filter_map(|(index, file)| {
+            let _alloc_label = alloc_label.enter();
             if cancellation
                 .as_ref()
                 .is_some_and(|token| token.cancel_requested_before_commit())

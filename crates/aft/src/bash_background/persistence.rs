@@ -1761,6 +1761,16 @@ pub struct PersistedCompletionPreview {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedTask {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_call: Option<super::shell_metadata::ShellCall>,
+    #[serde(default)]
+    pub(crate) shell_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_remote_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shell_remote_host: Option<String>,
     /// Storage namespace captured at spawn, independent of later route binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
@@ -1768,6 +1778,10 @@ pub struct PersistedTask {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launching_identity: Option<super::TaskIdentity>,
+    /// The daemon's original harness label, used only to bind notices back to
+    /// the runner. Storage and ownership continue to use the canonical harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launching_raw_harness: Option<String>,
     pub command: String,
     /// Scanner-derived segment labels retained so completion rendering does not
     /// need to parse the command again.
@@ -1920,10 +1934,14 @@ pub struct PersistedTask {
     /// and clears this. Persisted so the notice survives an AFT restart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancelled_call_unannounced: bool,
-    /// Successful completion offers to an acknowledging runner, including the
-    /// first offer. Persisted so reconnect budgets survive daemon restarts.
+    /// Runner completion send attempts, including the first offer. Persisted
+    /// so retry backoff survives daemon restarts; it is not a delivery limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) runner_completion_offers: usize,
+    /// Freeze the exact runner send before its first attempt. A restart must
+    /// reuse the same text and delivery list even if task observations change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_completion_notice: Option<cortexkit_role_llm_runner::send::SendRequest>,
     /// The saved folder grants this command's sandbox allowed, so revoking
     /// one can stop it. Persisted so a restarted AFT still knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1965,11 +1983,29 @@ impl PersistedTask {
         compressed: bool,
     ) -> Self {
         let call_key = Some(super::call_key_for_new_task(&task_id));
+        let shell_call = super::shell_metadata::current().map(|mut call| {
+            call.call_id = call_key
+                .as_ref()
+                .filter(|key| !key.minted)
+                .map(|key| key.key.clone());
+            call
+        });
         let completion_has_secret_placeholders = Some(!super::secrets::labels(&command).is_empty());
         let metadata = Self {
             schema_version: SCHEMA_VERSION,
+            shell_call,
+            shell_revision: 0,
+            shell_fingerprint: None,
+            shell_remote_job_id: None,
+            shell_remote_host: None,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
             launching_identity: super::TaskIdentity::current(),
+            launching_raw_harness: match crate::sandbox_spawn::current_authenticated_principal() {
+                crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { harness, .. } => {
+                    Some(harness)
+                }
+                crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => None,
+            },
             task_id,
             session_id,
             command,
@@ -2023,6 +2059,7 @@ impl PersistedTask {
             local_fallback_started: false,
             cancelled_call_unannounced: false,
             runner_completion_offers: 0,
+            runner_completion_notice: None,
             folder_grants: super::registry::folder_grants::for_spawn(),
         };
         crate::gh_shim_ticket::capture_spawn(&metadata);
@@ -2119,7 +2156,7 @@ impl PersistedTask {
 
 impl From<BashTaskRow> for PersistedTask {
     fn from(row: BashTaskRow) -> Self {
-        if let Ok(mut task) = serde_json::from_str::<PersistedTask>(&row.metadata) {
+        if let Ok(mut task) = decode_persisted_task(&row.metadata) {
             task.harness = Some(row.harness.clone());
             // A foreign registry acknowledges the row without rewriting its
             // metadata snapshot, so the durable column may be newer.
@@ -2142,9 +2179,15 @@ impl From<BashTaskRow> for PersistedTask {
         Self {
             schema_version: SCHEMA_VERSION,
             harness: Some(row.harness.clone()),
+            shell_call: None,
+            shell_revision: 0,
+            shell_fingerprint: None,
+            shell_remote_job_id: None,
+            shell_remote_host: None,
             task_id: row.task_id,
             session_id: row.session_id,
             launching_identity: None,
+            launching_raw_harness: None,
             command: row.command,
             pipeline_segments: Vec::new(),
             pipeline_status_unavailable: None,
@@ -2196,9 +2239,49 @@ impl From<BashTaskRow> for PersistedTask {
             local_fallback_started: false,
             cancelled_call_unannounced: false,
             runner_completion_offers: 0,
+            runner_completion_notice: None,
             folder_grants: None,
         }
     }
+}
+
+fn decode_persisted_task(content: &str) -> serde_json::Result<PersistedTask> {
+    let value: serde_json::Value = serde_json::from_str(content)?;
+    let mut task: PersistedTask = serde_json::from_str(content)?;
+    // Older records kept the original route harness in launching_identity.
+    // Read that string from JSON because the decoded TaskIdentity replaces
+    // runner aliases with "runner" for ownership comparisons.
+    if task.launching_raw_harness.is_none() {
+        task.launching_raw_harness = value
+            .pointer("/launching_identity/harness")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+    }
+    Ok(task)
+}
+
+#[cfg(test)]
+#[test]
+fn bash_background_legacy_runner_identity_keeps_raw_notice_address() {
+    let metadata = PersistedTask::starting(
+        "bash-0000000000000001".into(),
+        "session".into(),
+        "echo ok".into(),
+        PathBuf::from("."),
+        None,
+        None,
+        true,
+        false,
+    );
+    let mut value = serde_json::to_value(metadata).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("launching_raw_harness");
+    value["launching_identity"] = serde_json::json!({"principal":"reserved:thalamus-harness", "harness":"opencode2", "session":"session"});
+    let restored = decode_persisted_task(&serde_json::to_string(&value).unwrap()).unwrap();
+    assert_eq!(restored.launching_raw_harness.as_deref(), Some("opencode2"));
+    assert_eq!(restored.launching_identity.unwrap().harness, "runner");
 }
 
 fn status_name(status: &BgTaskStatus) -> &'static str {
@@ -2919,7 +3002,7 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
     // different shape and must be refused, not quarantined as corrupt tasks.
     #[cfg(test)]
     work_counts::record_parse();
-    let decoded = serde_json::from_str::<PersistedTask>(&content);
+    let decoded = decode_persisted_task(&content);
     let version = match &decoded {
         Ok(task) => Some(u64::from(task.schema_version)),
         Err(_) => {
@@ -3202,9 +3285,14 @@ where
         let runner_completion_offers = metadata
             .runner_completion_offers
             .max(original.runner_completion_offers);
+        let runner_completion_notice = original
+            .runner_completion_notice
+            .clone()
+            .or(metadata.runner_completion_notice);
         metadata = original;
         metadata.completion_delivered = completion_delivered;
         metadata.runner_completion_offers = runner_completion_offers;
+        metadata.runner_completion_notice = runner_completion_notice;
         metadata.schema_version = SCHEMA_VERSION;
     }
     write_task_at(task, &metadata)?;

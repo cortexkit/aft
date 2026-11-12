@@ -1371,6 +1371,36 @@ mod tests {
         ctx
     }
 
+    /// Pauses the initial build after publication but before it starts a
+    /// meaning fill. Published planes alone do not mean the build job ended.
+    /// Sending on, or dropping, the returned sender lets the build continue.
+    fn context_before_automatic_fill(
+        root: &Path,
+        storage: &Path,
+    ) -> (AppContext, std::sync::mpsc::Sender<()>) {
+        let held_build = super::super::runtime::hold_builds_for_test(root);
+        let ctx = context(root, storage);
+        let checkout = ctx.data_checkout().unwrap();
+        let (published, publication) = std::sync::mpsc::channel();
+        let (resume, continuation) = std::sync::mpsc::channel();
+        let continuation = std::sync::Mutex::new(Some(continuation));
+        checkout.on_status_change(std::sync::Arc::new(move || {
+            let continuation = continuation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(continuation) = continuation {
+                let _ = published.send(());
+                let _ = continuation.recv();
+            }
+        }));
+        drop(held_build);
+        publication
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the initial build did not publish");
+        (ctx, resume)
+    }
+
     #[test]
     fn an_idle_release_drops_the_checkout_and_its_next_use_serves_the_publication() {
         let dir = tempfile::tempdir().unwrap();
@@ -1983,7 +2013,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
-        let ctx = context(&root, storage.path());
+        let (ctx, _resume_build) = context_before_automatic_fill(&root, storage.path());
         let checkout = ctx.data_checkout().unwrap();
         settled(&ctx);
         let starting = Some(crate::data_layer::meaning::STARTING_STAGE.to_string());
@@ -2000,6 +2030,65 @@ mod tests {
         );
         let payload = ctx.build_status_snapshot();
         assert_eq!(payload["semantic_index"]["stage"], json!(starting));
+        // The build must not start a model load when its pause is released.
+        checkout.configure_meaning_without_fill_for_test(None);
+    }
+
+    /// A build can still start a real fill after its planes report ready.
+    /// Configuring without a fill only avoids starting one on that call.
+    #[test]
+    fn health_reports_the_meaning_fill_started_by_a_published_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let _failed_model = crate::data_layer::meaning::fail_model_loads_for_test(
+            &root,
+            "the test does not load a model",
+        );
+        let held_model = crate::data_layer::meaning::hold_model_loads_for_test(&root);
+        let (ctx, resume_build) = context_before_automatic_fill(&root, storage.path());
+        let checkout = ctx.data_checkout().unwrap();
+        settled(&ctx);
+        checkout.configure_meaning_without_fill_for_test(Some(&ctx.config().semantic));
+        assert_eq!(
+            ctx.try_health_snapshot(&root).semantic_index.unwrap().fill,
+            None
+        );
+
+        resume_build.send(()).unwrap();
+        let started = Instant::now();
+        while !checkout.filling() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the published build did not start its fill"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let health = ctx.try_health_snapshot(&root).semantic_index.unwrap();
+        assert_eq!(
+            health.stage.as_deref(),
+            Some(crate::data_layer::meaning::STARTING_STAGE)
+        );
+        assert_eq!(
+            health.fill,
+            Some(SemanticFillHealth {
+                filling: Some(true),
+                ..SemanticFillHealth::default()
+            }),
+            "the build queued a real fill before any files were counted"
+        );
+
+        let (finished, completion) = std::sync::mpsc::channel();
+        checkout.on_status_change(std::sync::Arc::new(move || {
+            let _ = finished.send(());
+        }));
+        checkout.configure_meaning_without_fill_for_test(None);
+        drop(held_model);
+        while checkout.filling() {
+            completion
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the held fill did not finish");
+        }
     }
 
     /// Health carries the meaning plane's fill in the shape it gives

@@ -75,3 +75,7 @@ crates/aft/tests/fixtures/imports_ts.ts -text
 # Windows too.
 crates/secret-rules/src/scope/public_suffix_list.dat text eol=lf
 crates/secret-rules/tests/vectors/** text eol=lf
+# Shared contract vectors under test-vectors/ are published with SHA256SUMS
+# of their exact bytes and compared byte-for-byte against our serializers,
+# so a Windows checkout with core.autocrlf=true must not rewrite them.
+test-vectors/** -text

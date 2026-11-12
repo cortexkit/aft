@@ -91,6 +91,29 @@ describe("fs tool adapters", () => {
     );
   });
 
+  test("aft_delete preserves the temporary path refusal code and exact message", async () => {
+    const { api, tools } = makeMockApi();
+    const response = {
+      success: false,
+      code: "unsafe_temp_path",
+      message:
+        "temporary path '/tmp/foreign' is another session's scratch folder; AFT changes only this session's scratch folders",
+      text: "rendered refusal",
+    };
+    const { bridge } = makeMockBridge(() => response);
+    registerFsTools(api, makePluginContext(bridge), { delete: true, move: false });
+
+    await expect(
+      executeTool(tools.get("aft_delete")!, { files: ["locked.ts"] }),
+    ).rejects.toMatchObject({
+      name: "AftToolError",
+      code: "unsafe_temp_path",
+      message: response.message,
+      response,
+      cause: { code: "unsafe_temp_path", message: response.message, response },
+    });
+  });
+
   test("aft_move forwards agent-typed filePath and destination", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({

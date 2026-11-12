@@ -8,6 +8,8 @@ use subc_protocol::Principal;
 
 struct ScopeOwner;
 
+mod runner_notice_fixture;
+
 #[async_trait]
 impl ModuleHandler for ScopeOwner {
     async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
@@ -15,8 +17,22 @@ impl ModuleHandler for ScopeOwner {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    if std::env::var_os("AFT_TEST_RUNNER_NOTICE").is_some() {
+        aft::launch_nonce::capture_at_startup();
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run());
+}
+
+async fn run() {
+    if std::env::var_os("AFT_TEST_RUNNER_NOTICE").is_some() {
+        runner_notice_fixture::run().await;
+        return;
+    }
     let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("isolated test home"));
     let fixture = home.parent().expect("fixture directory");
     let project = fixture.join("project");

@@ -4281,6 +4281,14 @@ fn assemble_health_report(
         dispatch_path.insert("mutating_lanes".to_string(), mutating_lanes);
     }
     metrics.insert("dispatch_path".to_string(), dispatch_path);
+    let (awaiting_retry, expired) = super::runner_notices::health();
+    metrics.insert(
+        "runner_notices".to_string(),
+        json!({
+            "completions_awaiting_retry": awaiting_retry,
+            "completions_expired": expired,
+        }),
+    );
     metrics.insert(
         "process_io".to_string(),
         crate::process_io::ProcessIoSnapshot::capture().to_value(),

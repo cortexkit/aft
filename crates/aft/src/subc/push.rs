@@ -31,13 +31,13 @@ mod completion_settlement;
 type UnackedCompletions =
     Arc<std::sync::Mutex<HashMap<ProjectRootId, HashMap<String, HashSet<String>>>>>;
 
-/// Plugin and acknowledging runner offers remain eligible until acknowledged.
-/// Offers to other runners are no longer eligible after acceptance; all durable
-/// delivery writes run off-thread.
+/// Plugin offers remain eligible until acknowledged. Runner sessions use
+/// session.send instead; durable plugin delivery writes run off-thread.
 #[derive(Default)]
 pub(super) struct CompletionDelivery {
     state: std::sync::Mutex<CompletionOffers>,
-    registries: std::sync::Mutex<HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>>,
+    pub(super) registries:
+        std::sync::Mutex<HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>>,
     unacked: UnackedCompletions,
     #[cfg(test)]
     settlement_gate: std::sync::Mutex<Option<completion_settlement::TestGate>>,
@@ -62,23 +62,8 @@ impl std::fmt::Debug for CompletionDelivery {
 }
 
 fn caller_acknowledges_completions(principal: Option<&str>) -> bool {
-    // RouteIdentity's authenticated principal (also carried in ReplayKey) is
-    // stable across reconnects. Harness names are shared by plugins and runners.
-    acknowledging_runner(principal)
-        || !principal.is_some_and(|principal| principal.starts_with("reserved:"))
+    !principal.is_some_and(|principal| principal.starts_with("reserved:"))
 }
-
-fn acknowledging_runner(principal: Option<&str>) -> bool {
-    matches!(
-        principal,
-        Some("reserved:thalamus-harness" | "reserved:thalamus-pi")
-    )
-}
-
-// Count the initial successful offer as well as rebind offers. Plugin delivery
-// is not subject to this runner-specific replay budget.
-const RUNNER_COMPLETION_MAX_OFFERS: usize = 3;
-const RUNNER_COMPLETION_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
 enum CompletionSend {
     Send,
@@ -151,14 +136,6 @@ impl CompletionDelivery {
                 return;
             }
         }
-        if acknowledging_runner(key.principal.as_deref()) {
-            if let Some(offers) = self
-                .registry(&key.root)
-                .and_then(|registry| registry.reserve_runner_completion_offer(task))
-            {
-                self.queue_write(key, task, Some(offers));
-            }
-        }
     }
 
     fn registry(&self, root: &ProjectRootId) -> Option<crate::bash_background::BgTaskRegistry> {
@@ -229,24 +206,6 @@ impl CompletionDelivery {
         let Some(registry) = self.registry(&key.root) else {
             return CompletionSend::Send;
         };
-        if acknowledging_runner(key.principal.as_deref()) {
-            let Some(state) = registry.runner_completion_state(task) else {
-                return CompletionSend::Hold;
-            };
-            if state.completion_delivered {
-                return CompletionSend::Settled;
-            }
-            let expired = state.completion_finished_at.is_none_or(|finished| {
-                crate::bash_background::persistence::unix_millis().saturating_sub(finished)
-                    >= RUNNER_COMPLETION_MAX_AGE_MS
-            });
-            if expired || state.runner_completion_offers >= RUNNER_COMPLETION_MAX_OFFERS {
-                log::info!("subc completion push: task={task} outcome=retired key={key:?} reason={} offers={}", if expired { "runner_completion_expired" } else { "runner_completion_offer_limit" }, state.runner_completion_offers);
-                self.settle(key, task);
-                return CompletionSend::Settled;
-            }
-            return CompletionSend::Send;
-        }
         if caller_acknowledges_completions(key.principal.as_deref()) {
             return CompletionSend::Send;
         }
@@ -422,6 +381,24 @@ pub(super) fn recover_registry_completions(
             // existing memory replay behavior, but do not guess which caller
             // should receive a recovered task after restart.
             if completion.launching_identity.as_ref() != Some(&identity) {
+                continue;
+            }
+            if super::runner_notices::is_runner(&identity) {
+                let task_id = completion.task_id.clone();
+                if super::runner_notices::retired(&identity) {
+                    if metrics.completion_delivery.settle(&key, &task_id) {
+                        log::info!("runner notice task={task_id} delivered-as-unsendable: thalamus-pi was retired");
+                    }
+                    continue;
+                }
+                if metrics.completion_delivery.admit(root, &task_id)
+                    && !super::runner_notices::enqueue(
+                        registry.clone(),
+                        completion.into_push_frame(),
+                    )
+                {
+                    metrics.completion_delivery.forget(root, &task_id);
+                }
                 continue;
             }
             // A queued mark may hold the task state lock while syncing storage.
@@ -1179,9 +1156,19 @@ pub(super) fn replay_buffered_push_frames(
     trust: BindTrust,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> usize {
+    let runner = super::runner_notices::is_runner(&crate::bash_background::TaskIdentity {
+        principal: key.principal.clone(),
+        harness: key.harness.clone(),
+        session: key.session.clone(),
+    });
+    if runner {
+        if let Some(queue) = push_buffer.get_mut(key) {
+            queue.retain(|frame| matches!(frame, PushFrame::Progress(_)));
+        }
+    }
     // Tasks saved without launching_identity can still replay within the same
     // root, harness and session without matching the caller's principal.
-    if trust.allows_bash_observation() {
+    if trust.allows_bash_observation() && !runner {
         let legacy_keys: Vec<_> = push_buffer
             .keys()
             .filter(|candidate| {
@@ -1378,6 +1365,17 @@ fn matching_route_channels(
     )
     .into_iter()
     .filter(|channel| {
+        if routes
+            .get(channel)
+            .is_some_and(super::runner_notices::runner_route)
+            && (frame_is_bash_observation(frame)
+                || matches!(
+                    frame,
+                    PushFrame::StatusChanged(_) | PushFrame::ConfigureWarnings(_)
+                ))
+        {
+            return false;
+        }
         frame_task_identity(frame).is_none_or(|owner| {
             routes
                 .get(channel)
@@ -1484,6 +1482,14 @@ fn fan_out_lossy_push_frame(
     root: &ProjectRootId,
     frame: &PushFrame,
 ) -> FanOutResult {
+    if let PushFrame::BashLongRunning(_) = frame {
+        if frame_task_identity(frame).is_some_and(super::runner_notices::is_runner) {
+            if let Some(registry) = metrics.completion_delivery.registry(root) {
+                super::runner_notices::enqueue(registry, frame.clone());
+            }
+            return FanOutResult::default();
+        }
+    }
     let matching_channels = matching_route_channels(routes, root_channels, root, frame);
     let matched_channels = matching_channels.len();
     if matched_channels == 0 {
@@ -1608,6 +1614,18 @@ fn fan_out_reliable_push_frame(
     frame: &PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> FanOutResult {
+    if let PushFrame::ConfigureWarnings(warning) = frame {
+        for route in routes.values().filter(|route| {
+            &route.root == root
+                && super::runner_notices::runner_route(route)
+                && warning
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|session| &route.session == session)
+        }) {
+            super::runner_notices::warning(route, root, warning);
+        }
+    }
     let matching_channels = matching_route_channels(routes, root_channels, root, frame);
     let matched_channels = matching_channels.len();
     if matched_channels == 0 {
@@ -1706,6 +1724,41 @@ fn process_reliable_push_frame(
     Option<crate::bash_background::TaskIdentity>,
 )> {
     let durable_bg_session = durable_bg_session_key(&root, &frame);
+    if frame_task_identity(&frame).is_some_and(super::runner_notices::is_runner) {
+        let task = completed_task_id(&frame).map(str::to_string);
+        if task
+            .as_ref()
+            .is_some_and(|task| !metrics.completion_delivery.admit(&root, task))
+        {
+            return None;
+        }
+        if let Some(owner) =
+            frame_task_identity(&frame).filter(|owner| super::runner_notices::retired(owner))
+        {
+            if let Some(task) = &task {
+                let key = ReplayKey {
+                    root: root.clone(),
+                    principal: owner.principal.clone(),
+                    harness: owner.harness.clone(),
+                    session: owner.session.clone(),
+                };
+                if metrics.completion_delivery.settle(&key, task) {
+                    log::info!("runner notice task={task} delivered-as-unsendable: thalamus-pi was retired");
+                }
+            }
+            return None;
+        }
+        if let Some(registry) = metrics.completion_delivery.registry(&root) {
+            if !super::runner_notices::enqueue(registry, frame) {
+                if let Some(task) = &task {
+                    metrics.completion_delivery.forget(&root, task);
+                }
+            }
+        } else if let Some(task) = &task {
+            metrics.completion_delivery.forget(&root, task);
+        }
+        return None;
+    }
     if let Some(task_id) = completed_task_id(&frame) {
         completed_tasks.remember(task_id);
         if !metrics.completion_delivery.admit(&root, task_id) {
@@ -2000,6 +2053,11 @@ impl StatusPushes {
                     false,
                 );
                 recipients.retain(|channel| !pending.queued_recipients.contains(channel));
+                recipients.retain(|channel| {
+                    !routes
+                        .get(channel)
+                        .is_some_and(super::runner_notices::runner_route)
+                });
                 recipients.sort_by_key(|route| (route.channel, route.epoch));
                 pending.recipients = recipients.into();
             }
@@ -2155,6 +2213,45 @@ mod tests {
     use super::*;
     use crate::protocol::{BashLongRunningFrame, BashPatternMatchFrame};
 
+    /// Delay command exit until its background-launch reply has been received.
+    /// A terminal launch reply includes command output and acknowledges the task,
+    /// leaving no pending completion notice for these tests to send.
+    pub(super) struct BackgroundCompletionGate(PathBuf);
+
+    impl BackgroundCompletionGate {
+        pub(super) fn new(root: &Path) -> Self {
+            Self(root.join("background-completion-release"))
+        }
+
+        pub(super) fn command(&self, output: &str) -> String {
+            if cfg!(windows) {
+                let release = self
+                    .0
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .replace('\'', "''");
+                let output = output.replace('\'', "''");
+                format!("while (-not (Test-Path -LiteralPath '{release}')) {{ Start-Sleep -Milliseconds 50 }}; Write-Output '{output}'")
+            } else {
+                let release = self.0.to_string_lossy().replace('\'', "'\\''");
+                let output = output.replace('\'', "'\\''");
+                format!(
+                    "while [ ! -f '{release}' ]; do sleep 0.05; done; printf '%s\\n' '{output}'"
+                )
+            }
+        }
+
+        pub(super) fn release(&self) {
+            std::fs::write(&self.0, b"release").unwrap();
+        }
+    }
+
+    impl Drop for BackgroundCompletionGate {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+
     pub(super) fn caller_route(
         root: &ProjectRootId,
         principal: &str,
@@ -2175,9 +2272,52 @@ mod tests {
         route
     }
 
+    #[test]
+    fn runner_routes_receive_neither_completion_frames_nor_root_broadcasts() {
+        let (_dir, root) = test_root("runner-frame-cutover");
+        let runner = caller_route(&root, "reserved:broca", "broca");
+        let plugin = caller_route(&root, "direct", "opencode");
+        let pi = caller_route(&root, "direct", "pi");
+        let routes = HashMap::from([
+            (route_key(1, 1), runner.clone()),
+            (route_key(2, 1), plugin.clone()),
+            (route_key(3, 1), pi),
+        ]);
+        let roots = HashMap::from([(
+            root.clone(),
+            HashSet::from([route_key(1, 1), route_key(2, 1), route_key(3, 1)]),
+        )]);
+        for frame in [
+            PushFrame::StatusChanged(crate::protocol::StatusChangedFrame::new(None, json!({}))),
+            PushFrame::ConfigureWarnings(crate::protocol::ConfigureWarningsFrame::new(
+                root.as_path().display().to_string(),
+                vec![],
+            )),
+        ] {
+            assert_eq!(
+                matching_route_channels(&routes, &roots, &root, &frame)
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                HashSet::from([route_key(2, 1), route_key(3, 1)])
+            );
+        }
+        let mut frame = completion_frame_with_session("owned-task", "moved-session");
+        if let PushFrame::BashCompleted(frame) = &mut frame {
+            frame.launching_identity = Some(runner.task_identity());
+        }
+        assert!(matching_route_channels(&routes, &roots, &root, &frame).is_empty());
+        if let PushFrame::BashCompleted(frame) = &mut frame {
+            frame.launching_identity = Some(plugin.task_identity());
+        }
+        assert_eq!(
+            matching_route_channels(&routes, &roots, &root, &frame),
+            vec![route_key(2, 1)]
+        );
+    }
+
     fn assert_task_notice_isolation(other_principal: &str, other_harness: &str) {
         let (_dir, root) = test_root("task-notice-caller-root");
-        let owner = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        let owner = caller_route(&root, "direct", "opencode");
         let other = caller_route(&root, other_principal, other_harness);
         let owner_channel = route_key(1, 1);
         let other_channel = route_key(2, 1);
@@ -2317,7 +2457,7 @@ mod tests {
             ),
             0
         );
-        let reconnect = caller_route(&root, "reserved:thalamus-harness", "opencode");
+        let reconnect = caller_route(&root, "direct", "opencode");
         assert_eq!(
             replay_buffered_push_frames(
                 &writer_tx,
@@ -2366,12 +2506,12 @@ mod tests {
     }
 
     #[test]
-    fn task_notices_isolate_principals_and_reconnect() {
-        assert_task_notice_isolation("direct", "opencode");
+    fn plugin_task_notices_isolate_principals_and_reconnect() {
+        assert_task_notice_isolation("reserved:prefrontal-core", "opencode");
     }
 
     #[test]
-    fn task_notices_isolate_harnesses_and_reconnect() {
+    fn plugin_task_notices_isolate_harnesses_and_reconnect() {
         assert_task_notice_isolation("reserved:thalamus-harness", "opencode2");
     }
 
@@ -2381,6 +2521,7 @@ mod tests {
         use subc_protocol::call_mode::CallMode;
 
         let (_root_dir, root) = test_root("codemode-background-owner");
+        let completion_gate = BackgroundCompletionGate::new(root.as_path());
         let storage = tempfile::tempdir().unwrap();
         let storage_root = storage.path().join("opencode");
         let mut head = caller_route(&root, "reserved:thalamus-harness", "opencode");
@@ -2470,7 +2611,7 @@ mod tests {
                 1,
                 control_flags(),
                 PROTOCOL_VERSION,
-                json!({"command":"echo codemode-head-complete","background":true,"compressed":false,"timeout":5000}),
+                json!({"command":completion_gate.command("codemode-head-complete"),"background":true,"compressed":false,"timeout":60_000}),
                 crate::subc_format::FormatContext::default(),
                 bash::BashWaitCancel {
                     keepalive: None,
@@ -2507,10 +2648,17 @@ mod tests {
             .unwrap();
         let response = done.response_for_test();
         assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "running", "{response:?}");
+        assert!(
+            response.data.get("output_preview").is_none(),
+            "launch guidance must not consume terminal output: {response:?}"
+        );
         let task_id = response.data["task_id"]
             .as_str()
             .expect("background task id")
             .to_string();
+        let capture = super::super::runner_notices::test_endpoint::capture(&task_id, false);
+        completion_gate.release();
         let completion = loop {
             let frame = tokio::time::timeout(Duration::from_secs(30), notice_rx.recv())
                 .await
@@ -2526,6 +2674,10 @@ mod tests {
         )
         .unwrap();
         let metadata = persistence::read_task_at(&task).unwrap();
+        assert!(
+            !metadata.completion_delivered,
+            "background launch must leave completion pending: {response:?}"
+        );
         assert_eq!(metadata.launching_identity, Some(expected));
         assert_eq!(metadata.session_id, "head-session");
         // The task belongs to the head the program ran for, under the head's
@@ -2555,17 +2707,32 @@ mod tests {
             &completion,
             None,
         );
-        assert_eq!(result.matched_channels, 1);
-        assert_eq!(result.sent_frames, 1);
-        let delivered = writer_rx.try_recv().expect("head receives completion");
-        assert_eq!((delivered.header.channel, delivered.header.epoch), (1, 1));
+        assert_eq!(result.matched_channels, 0);
+        assert_eq!(result.sent_frames, 0);
+        let notice_metadata = ctx
+            .bash_background()
+            .notice_metadata(&task_id)
+            .expect("notice task must remain registered");
+        assert!(
+            !notice_metadata.completion_delivered,
+            "fan-out consumed completion before notice offer"
+        );
+        assert!(super::super::runner_notices::enqueue(
+            ctx.bash_background().clone(),
+            completion
+        ));
+        let notice = capture
+            .receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(notice.session, "head-session");
         assert_eq!(
-            push_frame_task_id(&delivered).as_deref(),
-            Some(task_id.as_str())
+            notice.request["params"]["send_id"],
+            format!("aft:bash:{task_id}")
         );
         assert!(
             writer_rx.try_recv().is_err(),
-            "run route must not receive the head's completion"
+            "neither the head nor run tool route receives a completion frame"
         );
         ctx.bash_background().shutdown();
     }

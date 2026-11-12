@@ -706,7 +706,9 @@ fn open_purge_db(
         crate::db::open(&db_path)
     }
     .map_err(|error| format!("could not open {}: {error}", db_path.display()))?;
-    Ok(Some(Arc::new(Mutex::new(conn))))
+    let conn = Arc::new(Mutex::new(conn));
+    crate::db::deferred_checkpoint::register(&conn);
+    Ok(Some(conn))
 }
 
 fn same_dir(left: &Path, right: &Path) -> bool {

@@ -157,7 +157,7 @@ pub struct BuildDeathBreaker {
     /// connection safe when a health thread and a build overlap. Build paths may
     /// open the same WAL file independently: readers do not block writers, and
     /// each connection has a five-second busy timeout for contested operations.
-    connection: Mutex<TrackedConnection>,
+    connection: std::sync::Arc<Mutex<TrackedConnection>>,
 }
 
 impl BuildDeathBreaker {
@@ -198,10 +198,9 @@ impl BuildDeathBreaker {
                     PRIMARY KEY(root_id, domain, corpus_fingerprint, attempt_id)
                  );",
         )?;
-        Ok(Self {
-            path,
-            connection: Mutex::new(connection),
-        })
+        let connection = std::sync::Arc::new(Mutex::new(connection));
+        crate::db::deferred_checkpoint::register(&connection);
+        Ok(Self { path, connection })
     }
 
     pub fn path(&self) -> &Path {

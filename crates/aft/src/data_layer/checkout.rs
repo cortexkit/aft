@@ -42,6 +42,8 @@ use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
 mod engines;
 mod fold;
+#[cfg(test)]
+mod todo_tests;
 
 pub use fold::{FoldReport, Folded, OtherFoldReport};
 
@@ -84,6 +86,7 @@ pub(crate) struct SourceWork {
     /// kept, since nothing is let go before then.
     pub(crate) decoded_parses: usize,
     pub(crate) decoded_resolutions: usize,
+    pub(crate) todo_decodes: usize,
 }
 
 #[cfg(test)]
@@ -335,6 +338,7 @@ pub struct Checkout {
     /// Wakes readers at publication, including the text-only publication
     /// that precedes the rest of a checkout's first build.
     readiness: (Mutex<u64>, std::sync::Condvar),
+    todo_counts: Mutex<TodoCountMemo>,
 }
 
 /// A checkout's call graph kept up to date between publications.
@@ -362,6 +366,10 @@ struct GraphEngine {
     overlay: OverlaySlices<Arc<StoredSlices>>,
     /// What the overlay replaces and removes, for the dead-code snapshot.
     refreshed: Refreshed,
+    /// A refresh measured the overlay, or a broad publication discarded
+    /// substantial state. The publication must replace that size estimate;
+    /// small publications otherwise keep the ordinary measurement cadence.
+    measure_after_publication: bool,
 }
 
 impl GraphEngine {
@@ -392,13 +400,23 @@ impl GraphEngine {
         if configs != self.live.inputs.configs {
             return Err("the publication's configuration differs from the engine's".to_string());
         }
-        let live = self
+        let broad = self.applied.len() > ENGINE_DECODED_FILES
+            || self.refreshed.replaced.len() > ENGINE_DECODED_FILES;
+        let mut live = self
             .live
             .rebased(to.state.clone(), Arc::clone(&to.graph))
             .map_err(str::to_string)?;
+        // Changed parses could not be released before publication. The rebased
+        // slots now read from storage and are unshared, so the same decoded-file
+        // bound can release those too, without losing bindings or method inputs.
+        let release_parses = live.inputs.parses.decoded_count() > ENGINE_DECODED_FILES;
+        if release_parses {
+            live.inputs.parses.release_decoded();
+        }
         Ok(Self {
             published: Arc::clone(to),
             live,
+            measure_after_publication: self.measure_after_publication || broad || release_parses,
             applied: BTreeMap::new(),
             overlay: OverlaySlices::new(Arc::clone(&to.graph)),
             refreshed: Refreshed {
@@ -901,6 +919,7 @@ impl Checkout {
             recording: Mutex::new(()),
             memory_epoch,
             readiness: (Mutex::new(0), std::sync::Condvar::new()),
+            todo_counts: Mutex::new(TodoCountMemo::default()),
         };
         handle.adopt_newest()?;
         Ok(handle)
@@ -2535,9 +2554,12 @@ impl Checkout {
         // against the budget every checkout's engine shares.
         let kept = stats.is_some().then(|| {
             self.layer.engines.touch(&self.engine);
-            slot.as_ref()
+            slot.as_mut()
                 .filter(|_| self.layer.engines.measure_due(&self.engine))
-                .map(GraphEngine::census_bytes)
+                .map(|engine| {
+                    engine.measure_after_publication = true;
+                    engine.census_bytes()
+                })
         });
         drop(slot);
         if let Some(bytes) = kept {
@@ -2758,7 +2780,8 @@ impl Checkout {
     ///
     /// # Errors
     ///
-    /// When the store cannot be written; nothing is published then.
+    /// When stored call-graph data is damaged or the store cannot be written;
+    /// nothing is published then.
     pub fn publish_changes(&self) -> Result<Option<DeltaReport>, DataError> {
         self.publish_changes_as(false)
     }
@@ -2923,7 +2946,16 @@ impl Checkout {
             for (file, resolution) in &resolved {
                 sections
                     .add(&inputs, file, &resolution.decode(file))
-                    .map_err(DataError::Store)?;
+                    .map_err(DataError::Damaged)?;
+            }
+            // Input terms can read other files' stored parses. Any failed
+            // stored read must reject publication, not commit incomplete facts.
+            let failures = published.graph.failures();
+            if !failures.is_empty() {
+                return Err(DataError::Damaged(format!(
+                    "reading the stored call graph failed: {}",
+                    failures.join("; ")
+                )));
             }
             if let Some(read) = &read_by_others {
                 let left = read.leave_out(None, Some(&mut sections), |_| true);
@@ -3057,12 +3089,11 @@ impl Checkout {
         self.touch_memory();
         let started = Instant::now();
         match engine.rebased(to, applied) {
-            Ok(engine) => {
-                let bytes = self
-                    .layer
-                    .engines
-                    .measure_due(&self.engine)
-                    .then(|| engine.census_bytes());
+            Ok(mut engine) => {
+                let bytes = (engine.measure_after_publication
+                    || self.layer.engines.measure_due(&self.engine))
+                .then(|| engine.census_bytes());
+                engine.measure_after_publication = false;
                 *slot = Some(engine);
                 drop(slot);
                 self.layer.engines.kept(&self.engine, bytes);
@@ -3087,6 +3118,13 @@ impl Checkout {
     pub fn engine_census_bytes(&self) -> Option<u64> {
         let slot = self.engine.try_lock().ok()?;
         slot.as_ref().map(GraphEngine::census_bytes)
+    }
+
+    /// The engine budget's cached size estimate, for comparing it with a fresh census.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn engine_budget_bytes(&self) -> u64 {
+        self.engine.budget_bytes()
     }
 
     /// How many call-graph engines refreshes of this checkout have started:
@@ -3342,6 +3380,7 @@ impl Checkout {
         )
         .map_err(|error| DataError::Resolve(error.to_string()))?;
         Ok(GraphEngine {
+            measure_after_publication: false,
             published: Arc::clone(published),
             live,
             applied: BTreeMap::new(),
@@ -5022,7 +5061,8 @@ impl Checkout {
             }
             parts.callgraph += live.unparsed.heap_bytes(seen)
                 + live.callgraph_pending.heap_bytes(seen)
-                + live.graph.heap_bytes(seen);
+                + live.graph.heap_bytes(seen)
+                + self.todo_counts.heap_bytes(seen);
             if let Some(refreshed) = &live.refreshed {
                 if seen.first(Arc::as_ptr(refreshed)) {
                     parts.shared += aft_store::heap::COUNTS + std::mem::size_of::<Refreshed>();
@@ -5059,6 +5099,7 @@ impl Checkout {
                         applied,
                         overlay,
                         refreshed,
+                        measure_after_publication: _,
                     } = engine;
                     // The engine started from the publication the checkout
                     // serves, counted above, unless a newer one replaced it
@@ -5097,6 +5138,7 @@ impl Checkout {
             applied,
             overlay,
             refreshed,
+            measure_after_publication: _,
         } = engine.as_ref()?;
         let mut seen = aft_store::heap::Seen::new();
         let mut parts = resolution.memory_parts(&mut seen);
@@ -5241,7 +5283,167 @@ pub(crate) enum PathTodos {
     Missing,
 }
 
+/// The record's language and counts; unlike `TodoMarkers`, owns no marker text.
+#[derive(Clone, Debug)]
+pub(crate) struct TodoSummary {
+    pub(crate) language: Option<crate::inspect::scanners::todos::TodoLanguage>,
+    pub(crate) counts: Option<crate::inspect::scanners::todos::TodoCounts>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PathTodoCounts {
+    Recorded(Option<TodoSummary>),
+    Absent,
+    TooLarge,
+    Unrecorded,
+    Unextracted,
+    Missing,
+}
+
+impl From<PathTodos> for PathTodoCounts {
+    fn from(todos: PathTodos) -> Self {
+        use crate::inspect::scanners::todos::{TodoCounts, TodoLanguage};
+        match todos {
+            PathTodos::Absent => Self::Absent,
+            PathTodos::TooLarge => Self::TooLarge,
+            PathTodos::Unrecorded => Self::Unrecorded,
+            PathTodos::Unextracted => Self::Unextracted,
+            PathTodos::Missing => Self::Missing,
+            PathTodos::Recorded(todos) => Self::Recorded(todos.map(|todos| {
+                TodoSummary {
+                    language: TodoLanguage::from_name(&todos.language)
+                        .filter(|language| language.name() == todos.language),
+                    counts: todos.items.as_deref().map(TodoCounts::of),
+                }
+            })),
+        }
+    }
+}
+
+/// One entry per path, replaced on edits and reused across publications by
+/// record key. Limits bound both entry overhead and unusually long paths.
+#[derive(Default)]
+struct TodoCountMemo {
+    entries: HashMap<Vec<u8>, (RecordKey, PathTodoCounts)>,
+    path_bytes: usize,
+}
+
+aft_store::heap_bytes_none!(PathTodoCounts);
+aft_store::heap_bytes_of_fields!(TodoCountMemo {
+    entries,
+    path_bytes
+});
+
+impl TodoCountMemo {
+    const MAX_ENTRIES: usize = 16_384;
+    const MAX_PATH_BYTES: usize = 1_048_576;
+
+    fn insert(&mut self, path: &[u8], key: RecordKey, counts: PathTodoCounts) {
+        if path.len() > Self::MAX_PATH_BYTES {
+            return;
+        }
+        if !self.entries.contains_key(path) {
+            if self.entries.len() == Self::MAX_ENTRIES
+                || self.path_bytes + path.len() > Self::MAX_PATH_BYTES
+            {
+                self.entries.clear();
+                self.path_bytes = 0;
+            }
+            self.path_bytes += path.len();
+        }
+        self.entries.insert(path.to_vec(), (key, counts));
+    }
+}
+
 impl Checkout {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn todo_count_memo_stats_for_test(&self) -> (usize, usize) {
+        use aft_store::heap::HeapBytes as _;
+        let memo = self.todo_counts.lock().unwrap();
+        (
+            memo.entries.len(),
+            memo.heap_bytes(&mut aft_store::heap::Seen::new()),
+        )
+    }
+
+    /// Counts only: cached unchanged records need no decode. Missing and
+    /// unextracted records are not memoized, since publication can repair them
+    /// without changing the content key. Overlay hits still verify that the
+    /// live change belongs to this view, as `todo_markers` does.
+    pub(crate) fn todo_counts(
+        &self,
+        view: &CheckoutView,
+        paths: &[Vec<u8>],
+        max_len: u64,
+    ) -> Result<Vec<PathTodoCounts>, DataError> {
+        let keys = {
+            let live = self.live.read().expect("no panics while holding it");
+            paths
+                .iter()
+                .map(|path| {
+                    let record = view.current_state().get(path)?;
+                    if record.stat.size > max_len || record.language.is_empty() {
+                        return None;
+                    }
+                    let published = view.published.state.get(path).is_some_and(|published| {
+                        published.content == record.content && published.language == record.language
+                    });
+                    if published {
+                        if view.unparsed.contains(path) {
+                            return None;
+                        }
+                    } else {
+                        let change = live.changes.get(path)?;
+                        if change.record.as_ref()?.content != record.content {
+                            return None;
+                        }
+                    }
+                    Some(RecordKey::new(
+                        record.content,
+                        &record.language,
+                        EXTRACTOR_VERSION,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut counts = {
+            let memo = self.todo_counts.lock().expect("no panics while holding it");
+            paths
+                .iter()
+                .zip(&keys)
+                .map(|(path, key)| {
+                    let (cached_key, counts) = memo.entries.get(path)?;
+                    (Some(cached_key) == key.as_ref()).then(|| counts.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let missing = paths
+            .iter()
+            .zip(&counts)
+            .filter(|(_, counts)| counts.is_none())
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let mut found = self.todo_markers(view, &missing, max_len)?.into_iter();
+            let mut memo = self.todo_counts.lock().expect("no panics while holding it");
+            for ((path, key), counts) in paths.iter().zip(keys).zip(&mut counts) {
+                if counts.is_some() {
+                    continue;
+                }
+                let summary = PathTodoCounts::from(found.next().expect("one result per path"));
+                if let (Some(key), PathTodoCounts::Recorded(_)) = (key, &summary) {
+                    memo.insert(path, key, summary.clone());
+                }
+                *counts = Some(summary);
+            }
+            self.touch_memory();
+        }
+        Ok(counts
+            .into_iter()
+            .map(|counts| counts.expect("every path counted"))
+            .collect())
+    }
+
     /// The TODO markers of the files of `view` at `paths` (relative to the
     /// root, `/`-separated), from the records the view's state names: the
     /// publication's for a file unchanged since it, and for a changed file
@@ -5305,6 +5507,7 @@ impl Checkout {
                     let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
                     for content in &contents {
                         if let Some(ordinal) = content.find(key).map_err(DataError::store)? {
+                            note_source_work(&self.root, |work| work.todo_decodes += 1);
                             let todos = content.todos(ordinal).map_err(DataError::store)?;
                             return Ok(PathTodos::Recorded(todos));
                         }
@@ -5321,6 +5524,7 @@ impl Checkout {
                     Extracted::Parse(_, _, stored)
                     | Extracted::Config(_, stored)
                     | Extracted::Markers(stored) => {
+                        note_source_work(&self.root, |work| work.todo_decodes += 1);
                         PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
                     }
                     Extracted::Nothing => PathTodos::Unextracted,
@@ -5434,6 +5638,78 @@ fn wait_while_publication_held_for_test(root: &Path) {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+impl Checkout {
+    /// Corrupts a stored parse after a refresh, without recording its failure
+    /// until publication reads it. The fixture must use a one-block cache and
+    /// enough symbol metadata to evict the old cached body.
+    pub(crate) fn damage_stored_parse_for_test(&self, file: &str) {
+        use aft_store::content::ContentSegment;
+        use aft_store::segment::{KeySpace, SectionId};
+
+        {
+            let mut slot = self.engine.lock().unwrap();
+            let engine = slot.as_mut().unwrap();
+            assert!(engine.refreshed.replaced.contains_key(file));
+            engine.live.inputs.parses.release_decoded();
+            assert_eq!(engine.live.inputs.parses.decoded_count(), 0);
+        }
+        let published = self.live.read().unwrap().published.clone().unwrap();
+        assert!(published.graph.failures().is_empty());
+        let path = published
+            .state
+            .paths()
+            .iter()
+            .find(|path| path.path == file.as_bytes())
+            .unwrap();
+        let key = RecordKey::new(path.content, &path.language, EXTRACTOR_VERSION);
+        let mut damaged = false;
+        for segment in &published.segments {
+            let Some(content) = ContentSegment::open(segment).unwrap() else {
+                continue;
+            };
+            let Some(ordinal) = content.find(key).unwrap() else {
+                continue;
+            };
+            assert!(!content.body(ordinal).unwrap().is_empty());
+            // Bodies can be compressed. Change the stored section bytes, not
+            // the decoded record, and leave its checksum unchanged.
+            let bodies = segment
+                .section(SectionId::new(
+                    aft_store::content::KNOWN[2].kind,
+                    KeySpace::new(0),
+                ))
+                .unwrap();
+            let body = segment
+                .read_range(bodies, 0..segment.info(bodies).len)
+                .unwrap();
+            assert!(!body.is_empty());
+            let mut bytes = std::fs::read(segment.path()).unwrap();
+            let offsets = bytes
+                .windows(body.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| (bytes == body.as_slice()).then_some(offset))
+                .collect::<Vec<_>>();
+            assert_eq!(offsets.len(), 1, "the body must have one location on disk");
+            bytes[offsets[0] + body.len() / 2] ^= 0x40;
+            std::fs::write(segment.path(), bytes).unwrap();
+            // Evict the old cached body without decoding the damaged parse.
+            assert!(content.surface(ordinal).unwrap().len() >= 64 << 10);
+            assert!(
+                content.body(ordinal).is_err(),
+                "the damaged body must not be cached"
+            );
+            damaged = true;
+            break;
+        }
+        assert!(damaged, "the stored parse was found");
+        assert!(
+            published.graph.failures().is_empty(),
+            "publication has not read the damaged parse yet"
+        );
     }
 }
 
@@ -5984,6 +6260,73 @@ pub fn other() { callee(); }
         assert!(callers.contains("p/use.go"), "{callers}");
     }
 
+    #[test]
+    fn a_damaged_stored_parse_fails_publication_without_committing_or_panicking() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        // The added functions make the stored symbol metadata fill a cache
+        // block, evicting the old body when the metadata is read. Small
+        // partial blocks could otherwise all remain cached together.
+        let mut source = std::fs::read_to_string(root.path().join("src/lib.rs")).unwrap();
+        for n in 0..2000 {
+            source.push_str(&format!("pub fn padding_function_{n}() {{}}\n"));
+        }
+        write(root.path(), "src/lib.rs", &source);
+        let layer = Arc::new(DataLayer::new(64 << 10, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        edit(&checkout, "src/util.rs", "pub fn replacement() {}\n");
+        checkout.refresh_callgraph().unwrap().expect("applied");
+        checkout.damage_stored_parse_for_test("src/lib.rs");
+        let published = checkout.live.read().unwrap().published.clone().unwrap();
+        let before = checkout
+            .family
+            .snapshot()
+            .unwrap()
+            .manifest()
+            .checkout(checkout.checkout)
+            .cloned();
+        // No panic catcher: a panic from publication fails this test directly.
+        for _ in 0..2 {
+            let result = checkout.publish_changes();
+            assert!(
+                matches!(result, Err(DataError::Damaged(ref why)) if why.contains("src/lib.rs")),
+                "{result:?}"
+            );
+        }
+        assert!(!published.graph.failures().is_empty());
+        assert_eq!(
+            checkout
+                .family
+                .snapshot()
+                .unwrap()
+                .manifest()
+                .checkout(checkout.checkout),
+            before.as_ref()
+        );
+        assert_eq!(checkout.changed_paths(), 1, "the edit was not committed");
+        drop(published);
+        checkout.build().unwrap();
+        assert!(checkout.view().unwrap().callgraph_failures().is_empty());
+        edit(
+            &checkout,
+            "src/util.rs",
+            "pub fn replacement() {}\npub fn callee() {}\n",
+        );
+        checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("refreshed after rebuilding");
+        checkout
+            .publish_changes()
+            .unwrap()
+            .expect("published after rebuilding");
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(callers.contains("caller"), "{callers}");
+    }
+
     /// Publishes the older string-table representation with keys from another
     /// extractor, without running another binary or sharing process globals.
     fn publish_legacy_graph(checkout: &Checkout, stamp: Option<&str>) {
@@ -6506,6 +6849,84 @@ pub fn other() { callee(); }
             callers.contains("more") && callers.contains("third"),
             "{callers}"
         );
+    }
+
+    #[test]
+    fn a_broad_publication_bounds_decoded_parses_and_replaces_its_budget_measurement() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let files = ENGINE_DECODED_FILES + 16;
+        let source = (0..80)
+            .map(|n| format!("pub fn item_{n}() {{}}\n"))
+            .collect::<String>();
+        write(
+            root.path(),
+            "Cargo.toml",
+            "[package]\nname='broad'\nversion='0.1.0'\n",
+        );
+        let modules = (0..files)
+            .map(|n| format!("mod file_{n};\n"))
+            .collect::<String>();
+        write(root.path(), "src/lib.rs", &modules);
+        for n in 0..files {
+            write(root.path(), &format!("src/file_{n}.rs"), &source);
+        }
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        for n in 0..files {
+            edit(
+                &checkout,
+                &format!("src/file_{n}.rs"),
+                &format!("{source}\npub fn extra() {{}}\n"),
+            );
+        }
+        checkout.refresh_callgraph().unwrap().expect("applied");
+        let before = checkout.engine_budget_bytes();
+        assert!(before > 0);
+        checkout.publish_changes().unwrap().expect("published");
+        let held = checkout.engine_census_bytes().expect("kept");
+        assert_eq!(
+            checkout.engine_budget_bytes(),
+            held,
+            "must not keep the overlay's cached size"
+        );
+        let decoded = checkout
+            .inspect_engine(|engine| engine.inputs.parses.decoded_count())
+            .unwrap()
+            .unwrap();
+        assert!(
+            decoded <= ENGINE_DECODED_FILES,
+            "kept {decoded} decoded parses"
+        );
+        // Bound the whole retained heap as well as its decoded entry count;
+        // the fixture has eighty files with eighty tiny definitions each.
+        assert!(held < 8 << 20, "kept {held} bytes after publication");
+        assert!(
+            held < before,
+            "publication did not release overlay state: {before} -> {held}"
+        );
+        assert_eq!(checkout.engine_starts(), 1);
+        edit(
+            &checkout,
+            "src/file_0.rs",
+            &format!("{source}\npub fn later() {{}}\n"),
+        );
+        checkout
+            .refresh_callgraph()
+            .unwrap()
+            .expect("next edit applied");
+        let estimated = checkout.engine_budget_bytes();
+        checkout
+            .publish_changes()
+            .unwrap()
+            .expect("published again");
+        assert_eq!(
+            checkout.engine_budget_bytes(),
+            estimated,
+            "a small publication inside the measurement interval must not walk again"
+        );
+        assert_eq!(checkout.engine_starts(), 1);
     }
 
     /// Waits up to ten seconds for `holds` to turn false.

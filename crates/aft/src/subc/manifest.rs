@@ -501,12 +501,14 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
                 "tool-views/v1".to_string(),
                 super::tool_provider::SESSION_NOTICES.to_string(),
+                super::scope_background_tasks::CAPABILITY.to_string(),
                 super::call_yield::CALL_YIELD.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
                 crate::page_collect::CAPABILITY.to_string(),
                 super::permissions::CAPABILITY.to_string(),
+                super::shells::CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -562,6 +564,11 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             // the management route itself is not bound to that target.
             ProviderRole::ManagementSurface {
                 operations: vec![
+                    ManagementOperation {
+                        name: super::scope_background_tasks::OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
                     ManagementOperation {
                         name: crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION
                             .to_string(),
@@ -651,6 +658,26 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                     ManagementOperation {
                         name: super::permissions::REVOKE_OPERATION.to_string(),
                         kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.list".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.watch".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "shells.output".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "aft.status".into(),
+                        kind: ManagementOperationKind::Query,
                         description: None,
                     },
                 ],
@@ -898,12 +925,14 @@ mod tests {
                 "call-modes/v1".to_string(),
                 "tool-views/v1".to_string(),
                 "session-notices/v1".to_string(),
+                "scope-background-tasks/v1".to_string(),
                 "call-yield/v1".to_string(),
                 "flow-scopes/v1".to_string(),
                 "worker-runs/v1".to_string(),
                 "scope-workdir/v1".to_string(),
                 "page-collect/v1".to_string(),
                 "permissions/v1".to_string(),
+                "shells/v1".to_string(),
             ]
         );
         assert!(capabilities.requires.is_empty());
@@ -916,12 +945,14 @@ mod tests {
                 "call-modes/v1",
                 "tool-views/v1",
                 "session-notices/v1",
+                "scope-background-tasks/v1",
                 "call-yield/v1",
                 "flow-scopes/v1",
                 "worker-runs/v1",
                 "scope-workdir/v1",
                 "page-collect/v1",
-                "permissions/v1"
+                "permissions/v1",
+                "shells/v1"
             ]))
         );
     }
@@ -952,6 +983,10 @@ mod tests {
                 .map(|operation| (operation.name.as_str(), &operation.kind))
                 .collect::<Vec<_>>(),
             vec![
+                (
+                    super::super::scope_background_tasks::OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
                 (
                     crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION,
                     &ManagementOperationKind::Mutate,
@@ -1012,6 +1047,10 @@ mod tests {
                     super::super::permissions::REVOKE_OPERATION,
                     &ManagementOperationKind::Mutate,
                 ),
+                ("shells.list", &ManagementOperationKind::Query),
+                ("shells.watch", &ManagementOperationKind::Query),
+                ("shells.output", &ManagementOperationKind::Query),
+                ("aft.status", &ManagementOperationKind::Query),
             ]
         );
         for operation in operations {
@@ -1225,7 +1264,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1", "shells/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
@@ -1242,7 +1281,7 @@ mod tests {
         // The snapshot predates the gh shim relay operations, the backup purge
         // and the page-bundle operations, so they are appended to its
         // management operation list here.
-        // It also predates `bash.kill_scope`, which the manifest lists first.
+        // It also predates the scope task operations listed before older queries.
         let operations = management
             .get_mut("operations")
             .and_then(Value::as_array_mut)
@@ -1258,6 +1297,10 @@ mod tests {
                 "description": "Read AFT's recorded health findings without scheduling work.",
             }),
         );
+        operations.insert(
+            0,
+            json!({"name": "scope.background_tasks", "kind": "query"}),
+        );
         operations.extend([
             json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
             json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
@@ -1269,6 +1312,10 @@ mod tests {
             json!({"name": crate::page_collect::RELEASE_OPERATION, "kind": "mutate"}),
             json!({"name": super::super::permissions::LIST_OPERATION, "kind": "query"}),
             json!({"name": super::super::permissions::REVOKE_OPERATION, "kind": "mutate"}),
+            json!({"name": "shells.list", "kind": "query"}),
+            json!({"name": "shells.watch", "kind": "query"}),
+            json!({"name": "shells.output", "kind": "query"}),
+            json!({"name": "aft.status", "kind": "query"}),
         ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.

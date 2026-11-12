@@ -251,6 +251,7 @@ impl Store {
             SqliteStore::AftDb,
         )
         .map_err(db_error)?;
+        conn.close_in_background();
         conn.busy_timeout(BUSY_TIMEOUT).map_err(db_error)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(db_error)?;
