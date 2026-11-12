@@ -134,6 +134,10 @@ const SHELL_FORMAT_TRIGGERS: &[&str] = &[
     "://",
     "?",
     "&",
+    // Short password assignments (`PW=`, `DB_PASS=`): the name must end in
+    // PW or PASS directly before `=`.
+    "pw=",
+    "pass=",
 ];
 
 /// A conservative prefilter, not a second masker. A complete capture with no
