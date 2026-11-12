@@ -13,7 +13,7 @@ use crate::commands::multi_path::{
 };
 use crate::context::AppContext;
 use crate::large_read::{MatchVisit, ScanLines};
-use crate::pattern_compile::{CompiledPattern, LiteralSearch};
+use crate::pattern_compile::CompiledPattern;
 use crate::protocol::Response;
 use crate::search_index::{
     build_path_filters, decompose_grep_pattern, resolve_search_scope,
@@ -3046,6 +3046,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::pattern_compile::LiteralSearch;
 
     fn audit10_fallback_matches(bytes: &[u8], pattern: CompiledPattern) -> Vec<GrepMatch> {
         let dir = tempfile::tempdir().unwrap();

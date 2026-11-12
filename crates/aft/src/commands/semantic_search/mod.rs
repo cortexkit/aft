@@ -10832,7 +10832,7 @@ mod tests {
         assert!(!first.contains("No file contains"), "{first}");
         take_literal_presence_counts();
         let second = crate::large_read::with_test_steps(8, 0, || {
-            presence_search(&ctx, "bash_wait_detach(", 1, 1)
+            presence_search(&ctx, "bash_wait_detach(", 10, 0)
         });
         assert!(second.starts_with(BASH_WAIT_DETACH_ABSENT), "{second}");
         let (reads, _) = take_literal_presence_counts();

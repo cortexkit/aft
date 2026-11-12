@@ -3647,20 +3647,12 @@ pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Read an indexed file for grep verification. Keep the original I/O error so
-/// callers distinguish a missing entry from blocked access or a scan timeout.
+/// Read an indexed file whole for grep verification, as the scans read a
+/// file they do not stream. Keep the original I/O error so callers
+/// distinguish a missing entry from blocked access or a scan timeout.
+#[cfg(test)]
 fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
-    read_grep_file_bytes(path, deadline, false)
-}
-
-/// Reject the same binary prefix as a completed grep read before reserving
-/// its body. Text keeps the original whole-buffer scan and matcher semantics.
-pub(crate) fn read_grep_file_bytes(
-    path: &Path,
-    deadline: Option<Instant>,
-    authorized_task_artifact: bool,
-) -> std::io::Result<Vec<u8>> {
-    match open_grep_file(path, deadline, authorized_task_artifact, || false)? {
+    match open_grep_file(path, deadline, false, || false)? {
         GrepFileRead::Whole(bytes) => Ok(bytes),
         GrepFileRead::Large(_) => unreachable!("a large read was not asked for"),
     }
@@ -3668,7 +3660,7 @@ pub(crate) fn read_grep_file_bytes(
 
 /// A grep input the way its scan will read it.
 pub(crate) enum GrepFileRead {
-    /// The whole file, as [`read_grep_file_bytes`] returns it.
+    /// The whole file.
     Whole(Vec<u8>),
     /// A large text file to read in steps.
     Large(LargeGrepFile),
@@ -3681,10 +3673,11 @@ pub(crate) struct LargeGrepFile {
     pub(crate) head: Vec<u8>,
 }
 
-/// [`read_grep_file_bytes`], except that a text file whose size at open is a
-/// large read, when `stream` says the scan can read it in steps, is returned
-/// open instead of read whole. Admission, the binary check and the deadline
-/// are the same either way.
+/// Open a grep input and reject the same binary prefix as a completed grep
+/// read before reserving its body. A text file is then read whole, except
+/// that one whose size at open is a large read, when `stream` says the scan
+/// can read it in steps, is returned open instead. Admission, the binary
+/// check and the deadline are the same either way.
 pub(crate) fn open_grep_file(
     path: &Path,
     deadline: Option<Instant>,
