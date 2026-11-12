@@ -620,6 +620,7 @@ pub(super) struct DispatchPathMetrics {
     /// call, each counted once.
     scoped_routes_with_tool_calls: AtomicU64,
     pub(super) scope_descriptions: StdMutex<super::route_census::ScopeDescriptions>,
+    pub(super) scope_background_tasks: super::scope_background_tasks::Metrics,
 }
 
 impl DispatchPathMetrics {
@@ -679,6 +680,7 @@ impl DispatchPathMetrics {
             presetless_tool_calls: StdMutex::new(BTreeMap::new()),
             scoped_routes_with_tool_calls: AtomicU64::new(0),
             scope_descriptions: StdMutex::new(super::route_census::ScopeDescriptions::default()),
+            scope_background_tasks: Default::default(),
         }
     }
 
@@ -1484,6 +1486,7 @@ impl DispatchPathMetrics {
             "bind_acks": self.bind_ack_snapshot(),
             "reliable_push": reliable_push,
             "tool_call_presets": self.tool_call_preset_snapshot(),
+            "scope_background_tasks": self.scope_background_tasks.snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_queued.load(Ordering::Relaxed),
