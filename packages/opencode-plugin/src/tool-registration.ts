@@ -252,6 +252,8 @@ export function registerAftTools(
           },
           options: {
             ...projected.options,
+            // OpenCode shares one registry across both surfaces. A dotted namespace
+            // avoids overwriting direct names such as aft_search and aft_outline.
             namespace: "aft.code",
             permission: projected.name,
             codemode: true,
