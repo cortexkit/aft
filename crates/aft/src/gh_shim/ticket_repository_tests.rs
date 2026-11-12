@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::gh_shim::ticket_repository_snapshot;
 
 fn git(root: &Path, args: &[&str]) {
