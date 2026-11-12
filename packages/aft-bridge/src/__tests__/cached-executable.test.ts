@@ -16,11 +16,18 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  type CachePruneProbes,
   cachedExecutableBytes,
   linkCachedExecutable,
   pruneExecutableCache,
 } from "./test-utils/cached-executable.js";
-import { scanProcessWithRetry } from "./test-utils/image-cache-usage.js";
+import { type CacheUsage, scanProcessWithRetry } from "./test-utils/image-cache-usage.js";
+
+const unusedUsage: CacheUsage = { pidAlive: () => false, inUse: () => "absent" };
+const knownUsageProbes: CachePruneProbes = {
+  usage: unusedUsage,
+  freeBytes: () => 40 * 1024 ** 3,
+};
 
 test("binary executable bytes reuse one immutable content-addressed path", () => {
   const bytes = Buffer.from(`\u0000AFT test executable ${randomUUID()}\n`);
@@ -64,7 +71,9 @@ test("executable cache process probe preserves persistent visibility refusal", (
 test("executable cache prunes only stale siblings and refreshes every hit", () => {
   const root = mkdtempSync(join(tmpdir(), "aft-cache-retention-"));
   try {
-    const current = cachedExecutableBytes(Buffer.from("current"), root);
+    const publish = (bytes: Uint8Array) =>
+      cachedExecutableBytes(bytes, root, undefined, knownUsageProbes);
+    const current = publish(Buffer.from("current"));
     const now = 1_700_000_000_000;
     const retention = 24 * 60 * 60 * 1000;
     const identity = (digit: string, age: number) => {
@@ -80,15 +89,45 @@ test("executable cache prunes only stale siblings and refreshes every hit", () =
     const future = identity("d", -1000);
     const old = new Date(now - retention - 1000);
     utimesSync(dirname(current), old, old);
-    pruneExecutableCache(root, dirname(current), now);
+    pruneExecutableCache(root, dirname(current), now, undefined, undefined, knownUsageProbes);
     expect(existsSync(stale)).toBe(false);
     for (const retained of [fresh, boundary, future, dirname(current)])
       expect(existsSync(retained)).toBe(true);
-    expect(cachedExecutableBytes(Buffer.from("current"), root)).toBe(current);
+    expect(publish(Buffer.from("current"))).toBe(current);
     expect(statSync(dirname(current)).mtimeMs).toBeGreaterThan(now);
-    cachedExecutableBytes(Buffer.from("next image"), root);
+    publish(Buffer.from("next image"));
     expect(existsSync(current)).toBe(true);
     expect(existsSync(fresh)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executable cache keeps images with unknown ownership", () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-cache-unknown-"));
+  try {
+    const image = cachedExecutableBytes(
+      Buffer.from("unobserved"),
+      root,
+      undefined,
+      knownUsageProbes,
+    );
+    utimesSync(dirname(image), new Date(0), new Date(0));
+    const unknownUsage: CacheUsage = { ...unusedUsage, inUse: () => "unknown" };
+    pruneExecutableCache(root, "another identity", Date.now(), undefined, undefined, {
+      usage: unknownUsage,
+      freeBytes: () => 0,
+    });
+    expect(existsSync(image)).toBe(true);
+    pruneExecutableCache(
+      root,
+      "another identity",
+      Date.now(),
+      undefined,
+      undefined,
+      knownUsageProbes,
+    );
+    expect(existsSync(image)).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -112,7 +151,7 @@ test("pruning restores an identity refreshed between scan and claim", () => {
         renameSync(source, destination);
       },
       undefined,
-      { usage: { pidAlive: () => false, inUse: () => false }, freeBytes: () => 40 * 1024 ** 3 },
+      knownUsageProbes,
     );
     expect(claims).toBe(1);
     expect(readFileSync(image).toString()).toBe("retained");
@@ -130,7 +169,7 @@ test("executable cache body errors take precedence over unexpected cleanup error
     const cleanupError = new Error("cleanup failed");
     let cleanups = 0;
     const probes = {
-      usage: { pidAlive: () => false, inUse: () => false },
+      usage: unusedUsage,
       freeBytes: () => 40 * 1024 ** 3,
     };
     expect(() =>
@@ -194,7 +233,10 @@ test("executable cache count cap keeps live leases and ignores expired reused PI
     lease(expired, 3 * 3600_000);
     const opened = directory(22, 25 * 3600_000);
     pruneExecutableCache(root, "current", now, renameSync, undefined, {
-      usage: { pidAlive: (pid) => pid === 123, inUse: (path) => path === opened },
+      usage: {
+        pidAlive: (pid) => pid === 123,
+        inUse: (path) => (path === opened ? "found" : "absent"),
+      },
       freeBytes: () => 40 * 1024 ** 3,
     });
     for (const [index, path] of unused.entries()) expect(existsSync(path)).toBe(index < 4);
@@ -216,7 +258,7 @@ test("executable cache low disk evicts unused images only after thirty minutes",
       utimesSync(path, new Date(now - age * 1000), new Date(now - age * 1000));
       return path;
     });
-    const usage = { pidAlive: () => false, inUse: () => false };
+    const usage = unusedUsage;
     pruneExecutableCache(root, "current", now, renameSync, undefined, {
       usage,
       freeBytes: () => 40 * 1024 ** 3,

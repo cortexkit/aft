@@ -25,6 +25,11 @@ const pressureRetentionMs = 30 * 60 * 1000;
 const leaseRetentionMs = 3 * 60 * 60 * 1000;
 const freeFloor = 40 * 1024 ** 3;
 
+export interface CachePruneProbes {
+  usage?: CacheUsage;
+  freeBytes?: (root: string) => number;
+}
+
 function refresh(directory: string): void {
   const now = new Date();
   const leases = join(directory, ".leases");
@@ -60,7 +65,7 @@ export function pruneExecutableCache(
   claim: (source: string, destination: string) => void = renameSync,
   cleanup: (directory: string) => void = (directory) =>
     rmSync(directory, { recursive: true, force: true }),
-  probes: { usage?: CacheUsage; freeBytes?: (root: string) => number } = {},
+  probes: CachePruneProbes = {},
 ): void {
   let free = Number.POSITIVE_INFINITY;
   try {
@@ -82,7 +87,7 @@ export function pruneExecutableCache(
       }
     })
     .sort((a, b) => b.modified - a.modified || a.directory.localeCompare(b.directory));
-  const leaseUsage = probes.usage ?? { pidAlive, inUse: () => false };
+  const leaseUsage: CacheUsage = probes.usage ?? { pidAlive, inUse: () => "absent" };
   const candidates = entries.filter((entry) => {
     try {
       const active = leased(entry.directory, now, leaseUsage);
@@ -113,7 +118,7 @@ export function pruneExecutableCache(
     let preserve = false;
     let failure: { error: unknown } | undefined;
     try {
-      if (leased(directory, now, usage) || usage.inUse(directory)) continue;
+      if (leased(directory, now, usage) || usage.inUse(directory) !== "absent") continue;
       const age = now - modified;
       if (unused++ < 4 && age <= retentionMs && !(free < freeFloor && age > pressureRetentionMs))
         continue;
@@ -127,7 +132,7 @@ export function pruneExecutableCache(
         retain =
           statSync(removed).mtimeMs > modified ||
           leased(removed, now, usage) ||
-          usage.inUse(removed);
+          usage.inUse(removed) !== "absent";
       } catch {
         // Uncertain ownership must restore the claimed image, not delete it.
       }
@@ -171,17 +176,23 @@ export function cachedExecutableBytes(
   bytes: Uint8Array,
   root = cacheRoot,
   name = process.platform === "win32" ? "executable.exe" : "executable",
+  probes: CachePruneProbes = {},
 ): string {
   try {
-    return publishExecutable(bytes, root, name);
+    return publishExecutable(bytes, root, name, probes);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     // A pruner may have claimed an old identity during lookup. Republish once.
-    return publishExecutable(bytes, root, name);
+    return publishExecutable(bytes, root, name, probes);
   }
 }
 
-function publishExecutable(bytes: Uint8Array, root: string, name: string): string {
+function publishExecutable(
+  bytes: Uint8Array,
+  root: string,
+  name: string,
+  probes: CachePruneProbes,
+): string {
   const digest = createHash("sha256").update("mode:755\0").update(bytes).digest("hex");
   const path = join(root, digest, name);
   try {
@@ -218,7 +229,7 @@ function publishExecutable(bytes: Uint8Array, root: string, name: string): strin
     }
   }
   refresh(dirname(path));
-  pruneExecutableCache(root, dirname(path));
+  pruneExecutableCache(root, dirname(path), Date.now(), undefined, undefined, probes);
   return path;
 }
 
