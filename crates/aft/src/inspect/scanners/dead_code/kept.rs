@@ -538,26 +538,11 @@ fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::i
     }
 }
 
-/// Whether the first `body` bytes of the base `file` (at `path`) hash to
-/// `digest`. A daemon opens the same base on every rollup, so a base
-/// verified once is remembered by its path, length and modification time
-/// and not read whole again.
-fn verified(path: &Path, file: &std::fs::File, body: u64, digest: &[u8]) -> bool {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static VERIFIED: OnceLock<Mutex<HashSet<(PathBuf, u64, Option<std::time::SystemTime>)>>> =
-        OnceLock::new();
-    let key = (
-        path.to_path_buf(),
-        body,
-        file.metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok()),
-    );
-    let seen = VERIFIED.get_or_init(|| Mutex::new(HashSet::new()));
-    if seen.lock().is_ok_and(|seen| seen.contains(&key)) {
-        return true;
-    }
+/// Whether the first `body` bytes of the base `file` hash to
+/// `digest`. Check the bytes on every open: a same-length rewrite can
+/// leave the modification time unchanged, so metadata cannot prove that
+/// the base still has its verified contents.
+fn verified(file: &std::fs::File, body: u64, digest: &[u8]) -> bool {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 1 << 20];
     let mut offset = 0u64;
@@ -569,13 +554,7 @@ fn verified(path: &Path, file: &std::fs::File, body: u64, digest: &[u8]) -> bool
         hasher.update(&buffer[..len]);
         offset += len as u64;
     }
-    let good = hasher.finalize().as_bytes()[..] == *digest;
-    if good {
-        if let Ok(mut seen) = seen.lock() {
-            seen.insert(key);
-        }
-    }
-    good
+    hasher.finalize().as_bytes()[..] == *digest
 }
 
 /// The first two lines of a kept file: its header and its configuration
@@ -620,7 +599,7 @@ impl Base {
         if &trailer[48..] != TRAILER_MAGIC {
             return None;
         }
-        if !verified(path, &file, body, &trailer[16..48]) {
+        if !verified(&file, body, &trailer[16..48]) {
             crate::slog_warn!(
                 "tier2 dead_code: the kept dead-code graph {} is damaged; working out every file again",
                 path.display()
@@ -949,4 +928,41 @@ fn overlay_base(path: &Path) -> Option<String> {
     (lines.next()?.ok()? == OVERLAY_HEADER).then_some(())?;
     lines.next()?.ok()?;
     lines.next()?.ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn verification_rechecks_same_length_content_with_unchanged_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kept-body");
+        let bytes = b"the verified graph body";
+        std::fs::write(&path, bytes).unwrap();
+        let digest = blake3::hash(bytes);
+        let file = std::fs::File::open(&path).unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        assert!(super::verified(
+            &file,
+            bytes.len() as u64,
+            digest.as_bytes()
+        ));
+        drop(file);
+
+        let mut damaged = bytes.to_vec();
+        damaged[0] ^= 1;
+        std::fs::write(&path, damaged).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().modified().unwrap(), modified);
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        assert!(
+            !super::verified(&file, bytes.len() as u64, digest.as_bytes()),
+            "unchanged length and mtime must not hide damaged graph bytes"
+        );
+    }
 }
