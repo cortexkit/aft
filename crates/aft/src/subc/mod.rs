@@ -268,6 +268,10 @@ pub(crate) mod rich_ui;
 mod run_scope;
 mod runner_notices;
 
+#[cfg(feature = "test-scope-owner")]
+#[doc(hidden)]
+pub use runner_notices::RunnerNoticeRecoveryForTest;
+
 /// Exercise the production notice consumer from a supervised test module.
 #[cfg(feature = "test-scope-owner")]
 #[doc(hidden)]
@@ -3931,6 +3935,7 @@ fn remove_route_channel(
 ) -> Option<RouteIdentity> {
     let removed = routes.remove(&channel);
     if let Some(identity) = &removed {
+        runner_notices::route_unbound(identity);
         remove_root_channel(root_channels, &identity.root, channel);
         release_semantic_opener_if_unrouted(routes, identity);
     }
@@ -3963,6 +3968,7 @@ fn insert_route_channel(
         crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
     }
     if let Some(previous) = routes.insert(channel, identity.clone()) {
+        runner_notices::route_unbound(&previous);
         remove_root_channel(root_channels, &previous.root, channel);
         release_semantic_opener_if_unrouted(routes, &previous);
     }

@@ -13,6 +13,11 @@ const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const RUNNER_CARRIERS: &[&str] = &["reserved:thalamus-harness", "reserved:broca"];
 static CONNECTION: OnceLock<std::sync::RwLock<PathBuf>> = OnceLock::new();
+// These weak references are registered only for live runner routes. Closing a
+// route removes its reference; disconnected sessions are not harness evidence.
+static BOUND_ROUTES: OnceLock<
+    std::sync::Mutex<HashMap<usize, std::sync::Weak<RouteIdentityData>>>,
+> = OnceLock::new();
 static SCHEDULER: OnceLock<Result<Arc<Scheduler>, String>> = OnceLock::new();
 static EXPIRED: AtomicU64 = AtomicU64::new(0);
 const QUEUE_CAPACITY: usize = 1024;
@@ -262,6 +267,41 @@ struct Address {
     worker: bool,
 }
 
+fn concrete_route_harness(owner: &crate::bash_background::TaskIdentity) -> Option<String> {
+    let mut routes = BOUND_ROUTES.get_or_init(Default::default).lock().unwrap();
+    routes.retain(|_, route| route.strong_count() > 0);
+    let mut harness = None;
+    for route in routes.values().filter_map(std::sync::Weak::upgrade) {
+        let AuthenticatedPrincipal::RouteBind {
+            principal_id,
+            session_id,
+            harness: raw,
+            ..
+        } = &route.spawn_principal
+        else {
+            continue;
+        };
+        if principal_id != &owner.principal || session_id != &owner.session || raw == "runner" {
+            continue;
+        }
+        if harness.as_ref().is_some_and(|previous| previous != raw) {
+            // Conflicting live bindings cannot safely identify a host harness.
+            return None;
+        }
+        harness = Some(raw.clone());
+    }
+    harness
+}
+
+pub(super) fn route_unbound(route: &RouteIdentity) {
+    if let Some(routes) = BOUND_ROUTES.get() {
+        routes
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(&route.0) as usize));
+    }
+}
+
 impl Address {
     fn new(
         owner: &crate::bash_background::TaskIdentity,
@@ -276,6 +316,13 @@ impl Address {
             .as_deref()?
             .strip_prefix("reserved:")?
             .to_string();
+        let raw_harness = if raw_harness != "runner" {
+            raw_harness
+        } else if module == "broca" {
+            "broca".into()
+        } else {
+            concrete_route_harness(owner)?
+        };
         Some(Self {
             worker: module == "broca"
                 || stamp.is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker),
@@ -572,15 +619,34 @@ fn deliver(
 #[path = "runner_notices_tests.rs"]
 mod tests;
 
+#[cfg(feature = "test-scope-owner")]
+#[path = "runner_notice_recovery_fixture.rs"]
+mod recovery_fixture;
+#[cfg(feature = "test-scope-owner")]
+pub use recovery_fixture::RunnerNoticeRecoveryForTest;
+
 async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
     #[cfg(test)]
-    if let Some(outcome) = test_endpoint::send(address, request) {
-        return outcome;
+    let captured = test_endpoint::send(address, request);
+    #[cfg(not(test))]
+    let captured: Option<Outcome> = None;
+    let outcome = match captured {
+        Some(outcome) => outcome,
+        None => match call(path, address, envelope(request)).await {
+            Ok(bytes) => decode_send_reply(&bytes),
+            Err(outcome) => outcome,
+        },
+    };
+    if matches!(outcome, Outcome::Accepted) {
+        log::info!(
+            "runner notice {} delivered to {} harness={} session={}",
+            request.send_id,
+            address.module,
+            address.identity.harness,
+            address.identity.session
+        );
     }
-    match call(path, address, envelope(request)).await {
-        Ok(bytes) => decode_send_reply(&bytes),
-        Err(outcome) => outcome,
-    }
+    outcome
 }
 
 fn decode_send_reply(bytes: &[u8]) -> Outcome {
@@ -604,11 +670,19 @@ fn decode_send_reply(bytes: &[u8]) -> Outcome {
 
 #[cfg(feature = "test-scope-owner")]
 pub(super) async fn transport_for_test(path: &Path, session: &str, scope: ScopeSelector) -> Value {
+    let address = Address::new(
+        &crate::bash_background::TaskIdentity {
+            principal: Some("reserved:broca".into()),
+            harness: "runner".into(),
+            session: session.into(),
+        },
+        "runner".into(),
+        None,
+    )
+    .unwrap();
     let address = Address {
-        module: "broca".into(),
-        identity: BindIdentity::new("runner", session),
         scope: Some(scope),
-        worker: true,
+        ..address
     };
     let request = request(
         format!("aft:bash:{session}"),
@@ -776,6 +850,12 @@ pub(crate) fn offer_replayed(
 pub(super) fn route_bound(registry: crate::bash_background::BgTaskRegistry, route: &RouteIdentity) {
     if !runner_route(route) || !route.trust.allows_bash_observation() {
         return;
+    }
+    if matches!(&route.spawn_principal, AuthenticatedPrincipal::RouteBind { harness, .. } if harness != "runner")
+    {
+        let mut routes = BOUND_ROUTES.get_or_init(Default::default).lock().unwrap();
+        routes.retain(|_, route| route.strong_count() > 0);
+        routes.insert(Arc::as_ptr(&route.0) as usize, Arc::downgrade(&route.0));
     }
     let owner = route.task_identity();
     let _identity = crate::bash_background::task_identity_scope(Some(owner.clone()));

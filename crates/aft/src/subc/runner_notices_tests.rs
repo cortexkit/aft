@@ -23,6 +23,10 @@ struct Completion {
 
 impl Completion {
     fn new(task: &str, offers: usize) -> Self {
+        Self::new_runner(task, offers, "reserved:broca", "broca")
+    }
+
+    fn new_runner(task: &str, offers: usize, principal: &str, raw: &str) -> Self {
         use crate::bash_background::persistence::{
             create_task_layout, write_task_at, PersistedTask,
         };
@@ -32,7 +36,7 @@ impl Completion {
             &root,
             task,
             BindTrust::FirstParty,
-            "broca",
+            raw,
         );
         if let AuthenticatedPrincipal::RouteBind {
             principal_id,
@@ -40,8 +44,8 @@ impl Completion {
             ..
         } = &mut Arc::get_mut(&mut route.0).unwrap().spawn_principal
         {
-            *principal_id = Some("reserved:broca".into());
-            *harness = "broca".into();
+            *principal_id = Some(principal.into());
+            *harness = raw.into();
         }
         let _scope = crate::bash_background::task_identity_scope(Some(route.task_identity()));
         let paths = create_task_layout(storage.path(), task, task).unwrap();
@@ -60,7 +64,7 @@ impl Completion {
             Some(0),
             None,
         );
-        metadata.launching_raw_harness = Some("broca".into());
+        metadata.launching_raw_harness = Some(raw.into());
         metadata.runner_completion_offers = offers;
         let finished = metadata.finished_at.unwrap();
         write_task_at(&paths, &metadata).unwrap();
@@ -680,4 +684,106 @@ fn runner_notices_readable_sender_grant_can_disable_idle_start() {
         false,
     ));
     assert_eq!(idle_start_grant(&full), Some(true));
+}
+
+#[test]
+fn runner_notices_address_never_uses_runner_alias() {
+    let broca = owner("reserved:broca", "runner");
+    assert_eq!(
+        Address::new(&broca, "runner".into(), None)
+            .unwrap()
+            .identity
+            .harness,
+        "broca"
+    );
+    assert_eq!(
+        Address::new(&broca, "opencode2".into(), None)
+            .unwrap()
+            .identity
+            .harness,
+        "opencode2"
+    );
+    let mut head = owner("reserved:thalamus-harness", "runner");
+    head.session = "unknown-concrete-head".into();
+    assert!(Address::new(&head, "runner".into(), None).is_none());
+    for raw in ["opencode2", "pi", "claude-code"] {
+        assert_eq!(
+            Address::new(&head, raw.into(), None)
+                .unwrap()
+                .identity
+                .harness,
+            raw
+        );
+    }
+}
+
+#[test]
+fn runner_notices_legacy_thalamus_waits_for_concrete_session_binding() {
+    let mut task = Completion::new_runner(
+        "bash-00000000000b0010",
+        100,
+        "reserved:thalamus-harness",
+        "runner",
+    );
+    let capture = test_endpoint::capture(&task.task, false);
+    assert!(enqueue(task.registry.clone(), task.frame()));
+    wait_for(scheduler().unwrap(), &task.task, false);
+    assert!(!task.delivered());
+    assert_eq!(
+        task.registry
+            .notice_metadata(&task.task)
+            .unwrap()
+            .runner_completion_offers,
+        100
+    );
+    assert!(capture.receiver.try_recv().is_err());
+
+    let route = Arc::get_mut(&mut task.route.0).unwrap();
+    route.harness = "opencode2".into();
+    if let AuthenticatedPrincipal::RouteBind { harness, .. } = &mut route.spawn_principal {
+        *harness = "opencode2".into();
+    }
+    route_bound(task.registry.clone(), &task.route);
+    let received = capture
+        .receiver
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap();
+    wait_for(scheduler().unwrap(), &task.task, true);
+    assert_eq!(received.harness, "opencode2");
+    assert!(task.delivered());
+    assert_eq!(
+        Address::new(&task.route.task_identity(), "pi".into(), None)
+            .unwrap()
+            .identity
+            .harness,
+        "pi"
+    );
+    route_unbound(&task.route);
+    assert!(
+        Address::new(&task.route.task_identity(), "runner".into(), None).is_none(),
+        "a closed route is not a harness source"
+    );
+}
+
+#[test]
+fn runner_notices_wire_params_have_no_model_or_plan() {
+    for worker in [true, false] {
+        let body: Value = serde_json::from_slice(&envelope(&request(
+            "aft:bash:keys".into(),
+            "completion".into(),
+            true,
+            worker,
+        )))
+        .unwrap();
+        let keys: std::collections::BTreeSet<_> = body["params"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["prompt", "send_id", "notice", "delivery"])
+        );
+    }
 }

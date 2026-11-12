@@ -718,7 +718,9 @@ async fn runner_notice_real_daemon_scoped_carrier_authority() {
         1,
         "runner must receive exactly one send: {received}"
     );
-    let body: Value = serde_json::from_str(received.lines().next().unwrap()).unwrap();
+    let record: Value = serde_json::from_str(received.lines().next().unwrap()).unwrap();
+    assert_eq!(record["harness"], "broca");
+    let body = &record["request"];
     assert_eq!(body["method"], "session.send");
     assert_eq!(body["params"]["send_id"], "aft:bash:notice-allowed");
     assert_eq!(body["params"]["notice"], true);
@@ -740,4 +742,83 @@ async fn runner_notice_real_daemon_scoped_carrier_authority() {
         assert!(refusals[0].contains(field), "missing {field}: {log}");
     }
     println!("real subc-daemon 0.39: denied scope_not_carrier (final, one ERROR); targeted reserved:aft carrier accepted; runner received 1 session.send");
+}
+
+#[cfg(all(target_os = "linux", feature = "test-scope-owner"))]
+#[tokio::test]
+#[ignore = "opt-in real-daemon runner transport; Linux only, needs test-scope-owner"]
+async fn runner_notice_real_daemon_recovers_concrete_harnesses_without_model() {
+    let (_temp, home, _project) = hermetic_home();
+    let config_path = home.join("config/cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    let mut module = config["modules"]["aft-test-scope-owner"].clone();
+    module["program"] = json!(option_env!("CARGO_BIN_EXE_aft-test-scope-owner").unwrap());
+    module["env"]["AFT_TEST_RUNNER_NOTICE"] = json!("1");
+    module["env"]["AFT_TEST_RUNNER_ALIAS"] = json!("1");
+    module["env"]["AFT_TEST_CONNECTION"] = json!(home.join("runtime/subc-connection.json"));
+    for id in ["aft", "aft-test-scope-owner", "broca", "thalamus-harness"] {
+        config["modules"][id] = module.clone();
+    }
+    std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let _daemon = HermeticDaemon::start(&home).await;
+    let result_path = home.join("runner-outcomes.json");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !result_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "runner alias recovery timed out:\n{}\n{}",
+            fixture_logs(&home.join("logs")),
+            std::fs::read_to_string(home.join("runner-transport.log")).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let result: Value = serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
+    assert_eq!(result["waited_for_harness"], true);
+    let received = std::fs::read_to_string(home.join("runner-received.jsonl")).unwrap();
+    let records: Vec<Value> = received
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records.len(),
+        3,
+        "each recovered task must send once: {received}"
+    );
+    let log = std::fs::read_to_string(home.join("runner-transport.log")).unwrap();
+    for (task, module, harness) in [
+        ("bash-00000000000d0011", "broca", "broca"),
+        ("bash-00000000000d0012", "thalamus-harness", "opencode2"),
+        ("bash-00000000000d0013", "thalamus-harness", "pi"),
+    ] {
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|record| record["session"] == task)
+            .collect();
+        assert_eq!(matching.len(), 1, "{task}: {received}");
+        let record = matching[0];
+        assert_eq!(record["module"], module);
+        assert_eq!(record["harness"], harness);
+        assert_eq!(record["request"]["method"], "session.send");
+        assert_eq!(
+            record["request"]["params"]["send_id"],
+            format!("aft:bash:{task}")
+        );
+        let keys: std::collections::BTreeSet<_> = record["request"]["params"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["prompt", "send_id", "notice", "delivery"])
+        );
+        let delivered = format!("INFO runner notice aft:bash:{task} delivered to {module} harness={harness} session={task}");
+        assert_eq!(
+            log.lines().filter(|line| *line == delivered).count(),
+            1,
+            "each accepted send logs once: {log}"
+        );
+    }
+    println!("real daemon: adopted broca runner -> broca; thalamus runner waited for opencode2 bind; stored pi unchanged; 3 accepted sends, 3 success logs, exactly prompt/send_id/notice/delivery (no model or plan)");
 }
