@@ -11,7 +11,7 @@ import zipfile
 
 
 def build_id(path):
-    notes = subprocess.check_output(["readelf", "-n", str(path)], text=True)
+    notes = subprocess.check_output(["readelf", "-n", str(path)], text=True, stderr=subprocess.PIPE)
     match = re.search(r"Build ID: ([0-9a-f]+)", notes)
     if not match:
         raise ValueError(f"{path}: missing ELF build ID")
@@ -30,8 +30,13 @@ def package_linux(binary, archive, objcopy):
         raise ValueError("ELF executable and detached debug file have different build IDs")
     sections = subprocess.check_output(["readelf", "-SW", str(binary)], text=True)
     debug_sections = subprocess.check_output(["readelf", "-SW", str(debug)], text=True)
-    if re.search(r"\.(?:debug_|zdebug_|symtab\b)", sections):
-        raise ValueError("shipped ELF executable still contains debug sections or a symbol table")
+    names = re.findall(r"\]\s+(\.\S+)", sections)
+    # GNU strip retains Rust's tiny GDB auto-loader; it is not DWARF payload.
+    embedded = [name for name in names if name == ".symtab" or (
+        name.startswith((".debug_", ".zdebug_")) and name != ".debug_gdb_scripts"
+    )]
+    if embedded:
+        raise ValueError(f"shipped ELF executable still contains debug sections: {embedded}")
     if ".debug_line " not in debug_sections or ".gnu_debuglink " not in sections:
         raise ValueError("missing detached line tables or executable debuglink")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
