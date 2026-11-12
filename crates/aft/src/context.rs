@@ -13878,7 +13878,7 @@ mod callgraph_store_for_ops_tests {
                     ctx.configure_content_generation(),
                 );
                 if pending {
-                    state.pending_paths.insert(PathBuf::from("src/lib.rs"));
+                    state.pending_paths.push_back(PathBuf::from("src/lib.rs"));
                 }
                 *ctx.watcher_drain_slice().lock() = parked.then_some(state);
                 let actual = with_contended_watcher_continuation(&ctx, || {
