@@ -551,10 +551,26 @@ fn status_push_backup_listing_cost_probe() {
                 assert_eq!(std::hint::black_box(f()), 256);
             }
             let cpu = ThreadCpuSample::elapsed(start, ThreadCpuSample::now()).unwrap();
-            eprintln!("{label}: resident={resident}, calls=50, CPU/call={:?}", cpu / 50);
+            eprintln!(
+                "{label}: resident={resident}, calls=50, CPU/call={:?}",
+                cpu / 50
+            );
         };
-        measure("tracked_files (unchanged)", &|| backup.tracked_files(DEFAULT_SESSION_ID).len());
-        measure("names only + hashed resident keys", &|| names_only(&resident_now));
+        measure("tracked_files (unchanged)", &|| {
+            backup.tracked_files(DEFAULT_SESSION_ID).len()
+        });
+        // Warm the parse cache once; steady pushes find every file unchanged.
+        backup
+            .status_inventory(DEFAULT_SESSION_ID)
+            .tracked_file_count();
+        measure("status_inventory push count (warm cache)", &|| {
+            backup
+                .status_inventory(DEFAULT_SESSION_ID)
+                .tracked_file_count()
+        });
+        measure("names only + hashed resident keys", &|| {
+            names_only(&resident_now)
+        });
         measure("names + meta.json stat + hashed resident keys", &|| {
             names_and_meta_stat(&resident_now)
         });

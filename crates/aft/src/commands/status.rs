@@ -408,10 +408,16 @@ impl AppContext {
         } else {
             (Some(0), Some(0))
         };
-        let session_tracked_files = if backups_enabled {
-            self.backup().lock().tracked_files(session_id).len()
-        } else {
+        let session_tracked_files = if !backups_enabled {
             0
+        } else if kind == StatusSnapshotKind::Push {
+            // Copy the inputs under the store mutex and scan the session's
+            // backup directory after releasing it, so edits never wait on a
+            // push. Unchanged metadata files are not re-read.
+            let inventory = self.backup().lock().status_inventory(session_id);
+            inventory.tracked_file_count()
+        } else {
+            self.backup().lock().tracked_files(session_id).len()
         };
         #[cfg(test)]
         cost.mark("checkpoints_and_backup");
