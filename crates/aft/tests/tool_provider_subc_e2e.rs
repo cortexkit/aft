@@ -50,7 +50,13 @@ impl HermeticDaemon {
         let task = tokio::spawn(subc_daemon::bootstrap::run_with_config(config));
         let deadline = Instant::now() + Duration::from_secs(60);
         while !connection_file.exists() {
-            assert!(!task.is_finished(), "embedded daemon exited during startup");
+            if task.is_finished() {
+                panic!(
+                    "embedded daemon exited during startup: {:?}\n{}",
+                    task.await,
+                    fixture_logs(&home.join("logs"))
+                );
+            }
             assert!(
                 Instant::now() < deadline,
                 "embedded daemon did not publish its connection file"
