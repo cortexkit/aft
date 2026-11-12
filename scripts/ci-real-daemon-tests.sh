@@ -56,12 +56,15 @@ heartbeat=$!
 
 # The real daemon is the dev-only subc-daemon dependency pinned in Cargo.toml.
 # fetch-subc-core.sh supplies a different daemon for the plugin suites, not these tests.
+# The filter names the whole module rather than a test-name prefix: every
+# ignored test there needs the real daemon, and a prefix silently skips tests
+# named differently (the runner_notice_real_daemon_* tests).
 rc=0
 timeout 15m cargo nextest run -p agent-file-tools --test rest \
   --features test-hooks,test-scope-owner --profile gate --no-fail-fast \
   --run-ignored only --test-threads 2 --failure-output final \
   --status-level pass --final-status-level fail \
-  -E 'test(/^tool_provider_subc_e2e::tool_provider_subc_e2e_/)' > "$log" 2>&1 || rc=$?
+  -E 'test(/^tool_provider_subc_e2e::/)' > "$log" 2>&1 || rc=$?
 if (( rc != 0 )); then
   printf '==> Real-daemon gate FAILED (rc=%s); failing test names:\n' "$rc" >&2
   grep -E '(FAIL|TIMEOUT|LEAK) \[' "$log" >&2 || true
