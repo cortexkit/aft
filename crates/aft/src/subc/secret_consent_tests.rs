@@ -1215,7 +1215,7 @@ fn target() -> ApiKeyTarget {
 #[test]
 fn every_vendored_secret_approval_sample_matches_its_source_checksum_and_decodes() {
     use sha2::{Digest, Sha256};
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let root = crate::test_support::manifest_dir()
         .join("../../test-vectors/cingulate-secret-use-approval-v1");
     let manifest =
         include_str!("../../../../test-vectors/cingulate-secret-use-approval-v1/SHA256SUMS");

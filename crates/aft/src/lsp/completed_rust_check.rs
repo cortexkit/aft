@@ -2712,9 +2712,12 @@ mod tests {
         write(
             &cache.root,
             "member/src/nested/inputs.rs",
-            r#"
-            const DATA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/", "a.txt"));
-        "#,
+            concat!(
+                r#"
+            const DATA: &str = include_str!(concat!(env"#,
+                r#"!("CARGO_MANIFEST_DIR"), "/data/", "a.txt"));
+        "#
+            ),
         );
         cache.saved_mut().fingerprint = capture_inputs(&cache).unwrap();
         assert!(cache
@@ -2789,10 +2792,13 @@ mod tests {
         write(
             &cache.root,
             "member/src/lib.rs",
-            r#"
+            concat!(
+                r#"
             macro_rules! relative { ($name:literal) => { include_bytes!(concat!("data/", $name)) }; }
-            macro_rules! absolute { ($name:literal) => { include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/", $name)) }; }
-        "#,
+            macro_rules! absolute { ($name:literal) => { include_str!(concat!(env"#,
+                r#"!("CARGO_MANIFEST_DIR"), "/data/", $name)) }; }
+        "#
+            ),
         );
         write(
             &cache.root,
@@ -2831,10 +2837,13 @@ mod tests {
         write(
             &cache.root,
             "member/src/lib.rs",
-            r#"
-            macro_rules! fixture { ($name:literal) => { include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/", $name)) }; }
+            concat!(
+                r#"
+            macro_rules! fixture { ($name:literal) => { include_str!(concat!(env"#,
+                r#"!("CARGO_MANIFEST_DIR"), "/data/", $name)) }; }
             pub(crate) use fixture;
-        "#,
+        "#
+            ),
         );
         write(
             &cache.root,
