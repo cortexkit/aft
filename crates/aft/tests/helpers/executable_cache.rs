@@ -63,6 +63,15 @@ pub fn cached_executable_named_in(root: &Path, bytes: &[u8], name: &str) -> io::
 }
 
 fn publish_executable(root: &Path, bytes: &[u8], name: &str) -> io::Result<PathBuf> {
+    publish_with_pruner(root, bytes, name, image_cache::prune)
+}
+
+fn publish_with_pruner(
+    root: &Path,
+    bytes: &[u8],
+    name: &str,
+    prune: impl Fn(&Path, &Path, std::time::SystemTime) -> io::Result<()>,
+) -> io::Result<PathBuf> {
     fs::create_dir_all(root)?;
     let lock = OpenOptions::new()
         .read(true)
@@ -99,7 +108,7 @@ fn publish_executable(root: &Path, bytes: &[u8], name: &str) -> io::Result<PathB
     }
     verify_cached(&path, bytes)?;
     image_cache::refresh(directory)?;
-    image_cache::prune(root, directory, std::time::SystemTime::now())?;
+    prune(root, directory, std::time::SystemTime::now())?;
     Ok(path)
 }
 
@@ -269,19 +278,29 @@ mod tests {
     fn executable_cache_refreshes_hits_and_prunes_on_publication() {
         let root = tempfile::tempdir().unwrap();
         let bytes = b"#!/bin/sh\nexit 0\n";
-        let old = cached_executable_named_in(root.path(), bytes, "executable").unwrap();
-        let stale = filetime::FileTime::from_system_time(
-            SystemTime::now() - Duration::from_secs(25 * 60 * 60),
-        );
+        let mut usage = image_cache::Usage::default();
+        usage.live_pids = Some([std::process::id()].into());
+        let publish = |bytes: &[u8]| {
+            publish_with_pruner(root.path(), bytes, "executable", |root, current, now| {
+                image_cache::prune_with_usage(root, current, now, false, &usage)
+            })
+        };
+        let old = publish(bytes).unwrap();
+        let stale_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        let stale = filetime::FileTime::from_system_time(stale_time);
         filetime::set_file_mtime(old.parent().unwrap(), stale).unwrap();
-        assert_eq!(
-            cached_executable_named_in(root.path(), bytes, "executable").unwrap(),
-            old
+        assert_eq!(publish(bytes).unwrap(), old);
+        assert!(
+            fs::metadata(old.parent().unwrap())
+                .unwrap()
+                .modified()
+                .unwrap()
+                > stale_time
         );
         let abandoned = root.path().join("f".repeat(64));
         fs::create_dir(&abandoned).unwrap();
         filetime::set_file_mtime(&abandoned, stale).unwrap();
-        cached_executable_named_in(root.path(), b"another image", "executable").unwrap();
+        publish(b"another image").unwrap();
         assert!(old.exists());
         assert!(!abandoned.exists());
     }

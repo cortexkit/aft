@@ -10,6 +10,9 @@ use std::time::{Duration, SystemTime};
 #[path = "image_cache_usage.rs"]
 mod usage;
 
+#[cfg(test)]
+pub use usage::Usage;
+
 const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const PRESSURE_RETENTION: Duration = Duration::from_secs(30 * 60);
 const LEASE_RETENTION: Duration = Duration::from_secs(3 * 60 * 60);
@@ -32,6 +35,19 @@ pub fn prune(root: &Path, current: &Path, now: SystemTime) -> io::Result<()> {
 /// Include old Cargo/nextest cache roots left behind by older test binaries.
 pub fn prune_real_images(root: &Path, current: &Path, now: SystemTime) -> io::Result<()> {
     prune_cache(root, current, now, true)
+}
+
+/// Use test-supplied live PIDs and open-file identities instead of scanning
+/// unrelated host processes when asserting eviction.
+#[cfg(test)]
+pub fn prune_with_usage(
+    root: &Path,
+    current: &Path,
+    now: SystemTime,
+    legacy: bool,
+    usage: &Usage,
+) -> io::Result<()> {
+    prune_with(root, current, now, legacy, usage, |_| Some(FREE_FLOOR))
 }
 
 fn prune_cache(root: &Path, current: &Path, now: SystemTime, legacy: bool) -> io::Result<()> {
@@ -129,7 +145,7 @@ fn protected(
 ) -> io::Result<bool> {
     Ok(pid.is_some_and(|pid| usage.pid_alive(pid))
         || leased(directory, now, usage)?
-        || usage.in_use(directory)?)
+        || usage.in_use(directory)? != usage::ImageUse::Absent)
 }
 
 fn cache_entries(root: &Path, legacy: bool) -> io::Result<Vec<(PathBuf, SystemTime, Option<u32>)>> {
@@ -373,7 +389,56 @@ mod tests {
         let alias = root.path().join("alias");
         fs::hard_link(directory.join("image"), &alias).unwrap();
         let _open = fs::File::open(alias).unwrap();
-        assert!(usage::snapshot().unwrap().in_use(&directory).unwrap());
+        #[cfg(target_os = "linux")]
+        let child = usage::non_dumpable_child();
+        #[cfg(target_os = "linux")]
+        let child_path = PathBuf::from(format!("/proc/{}", child.pid));
+        #[cfg(target_os = "linux")]
+        let snapshot = usage::snapshot_process_paths(
+            [
+                PathBuf::from(format!("/proc/{}", std::process::id())),
+                child_path.clone(),
+            ],
+            &fs::read_to_string("/proc/self/mountinfo").unwrap(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let snapshot = usage::snapshot().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let unreadable = snapshot
+                .unreadable
+                .iter()
+                .find(|process| process.pid == child.pid)
+                .expect("the non-dumpable child must be counted as unreadable");
+            assert!(unreadable
+                .paths
+                .iter()
+                .any(|path| path == &child_path || path.ends_with("fd") || path.ends_with("maps")));
+        }
+        assert_eq!(snapshot.in_use(&directory).unwrap(), usage::ImageUse::Found);
+    }
+
+    #[test]
+    fn image_cache_unknown_usage_keeps_an_unobserved_image() {
+        let root = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let current = entry(root.path(), 99, Duration::ZERO, now);
+        let old = entry(root.path(), 1, RETENTION + Duration::from_secs(1), now);
+        let mut incomplete = usage::Usage::default();
+        incomplete.unreadable.push(usage::UnreadableProcess {
+            pid: 123,
+            paths: vec![PathBuf::from("/proc/123/maps")],
+        });
+        assert_eq!(incomplete.in_use(&old).unwrap(), usage::ImageUse::Unknown);
+        prune_with(root.path(), &current, now, false, &incomplete, |_| Some(0)).unwrap();
+        assert!(
+            old.exists(),
+            "unknown ownership must defeat age and low-disk eviction"
+        );
+        let complete = usage::Usage::default();
+        assert_eq!(complete.in_use(&old).unwrap(), usage::ImageUse::Absent);
+        prune_with(root.path(), &current, now, false, &complete, |_| Some(0)).unwrap();
+        assert!(!old.exists(), "known-absent ownership permits eviction");
     }
 
     #[test]

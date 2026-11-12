@@ -152,6 +152,23 @@ fn deploy_with_warmup(
     copied: impl FnOnce(&Path),
     warm: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<PathBuf> {
+    deploy_with_pruner(
+        source,
+        temporary_root,
+        copied,
+        warm,
+        image_cache::prune_real_images,
+    )
+}
+
+#[cfg(unix)]
+fn deploy_with_pruner(
+    source: &Path,
+    temporary_root: &Path,
+    copied: impl FnOnce(&Path),
+    warm: impl FnOnce(&Path) -> io::Result<()>,
+    prune: impl Fn(&Path, &Path, SystemTime) -> io::Result<()>,
+) -> io::Result<PathBuf> {
     use std::process::{Command, Stdio};
 
     let source = source.canonicalize()?;
@@ -182,7 +199,7 @@ fn deploy_with_warmup(
         }
         unchanged(&input, &source, &identity)?;
         image_cache::refresh(&directory)?;
-        image_cache::prune_real_images(&cache, &directory, SystemTime::now())?;
+        prune(&cache, &directory, SystemTime::now())?;
         return Ok(image);
     }
     let pending = tempfile::Builder::new()
@@ -227,7 +244,7 @@ fn deploy_with_warmup(
         return Err(error);
     }
     image_cache::refresh(&directory)?;
-    image_cache::prune_real_images(&cache, &directory, SystemTime::now())?;
+    prune(&cache, &directory, SystemTime::now())?;
     Ok(image)
 }
 
@@ -318,12 +335,25 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let source = source_image(root.path(), b"first image");
-        let old = deploy(&source, root.path()).unwrap();
+        let mut usage = image_cache::Usage::default();
+        usage.live_pids = Some([std::process::id()].into());
+        let deploy = |source: &Path| {
+            deploy_with_pruner(
+                source,
+                root.path(),
+                |_| {},
+                |_| Ok(()),
+                |cache, current, now| {
+                    image_cache::prune_with_usage(cache, current, now, true, &usage)
+                },
+            )
+        };
+        let old = deploy(&source).unwrap();
         let directory = old.parent().unwrap();
         let stale_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
         let stale = filetime::FileTime::from_system_time(stale_time);
         filetime::set_file_mtime(directory, stale).unwrap();
-        assert_eq!(deploy(&source, root.path()).unwrap(), old);
+        assert_eq!(deploy(&source).unwrap(), old);
         assert!(fs::metadata(directory).unwrap().modified().unwrap() > stale_time);
         let abandoned = directory.parent().unwrap().join("f".repeat(64));
         fs::create_dir(&abandoned).unwrap();
@@ -331,7 +361,7 @@ mod tests {
         let replacement = root.path().join("replacement");
         fs::write(&replacement, b"second image").unwrap();
         fs::rename(replacement, &source).unwrap();
-        let new = deploy(&source, root.path()).unwrap();
+        let new = deploy(&source).unwrap();
         assert!(new.exists());
         assert!(
             old.exists(),
