@@ -214,7 +214,7 @@ pub(super) async fn run() {
             .close_handle(&route, Default::default())
             .await
             .unwrap();
-        consumer.close().await.unwrap();
+        consumer.close().await;
     } else {
         assert_eq!(module, "aft");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
