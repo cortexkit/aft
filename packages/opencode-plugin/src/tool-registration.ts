@@ -38,6 +38,16 @@ import type { PluginContext } from "./types.js";
  */
 const V2_BUILTIN_REPLACEMENTS = new Set(["read", "edit", "write", "apply_patch"]);
 
+const V2_CODEMODE_NAMES: Readonly<Record<string, string>> = {
+  read: "read",
+  grep: "grep",
+  glob: "glob",
+  aft_search: "search",
+  aft_outline: "outline",
+  aft_zoom: "zoom",
+  aft_callgraph: "callgraph",
+};
+
 export interface V2ToolEditor {
   add(definition: V2ProviderTool): void;
   remove(name: string): void;
@@ -209,7 +219,7 @@ export function buildOpenCodeToolMap(
 }
 
 /**
- * Register the shared definition inventory on V2 as direct provider tools.
+ * Register the shared inventory directly, with read-only copies in Code Mode.
  *
  * `definitions` is keyed by AFT tool name; each tool is registered under its
  * OpenCode 2 name (`bash` as `shell`, `apply_patch` as `patch`).
@@ -230,6 +240,26 @@ export function registerAftTools(
       const projected = projectV2Tool(name, definition, location, consumers);
       if (V2_BUILTIN_REPLACEMENTS.has(name)) editor.remove(projected.name);
       editor.add(projected);
+      const codeModeName = V2_CODEMODE_NAMES[name];
+      if (codeModeName) {
+        editor.add({
+          name: codeModeName,
+          get description() {
+            return projected.description;
+          },
+          get input() {
+            return projected.input;
+          },
+          options: {
+            ...projected.options,
+            namespace: "aft.code",
+            permission: projected.name,
+            codemode: true,
+          },
+          // Reuse the direct executor so permission ids and resources cannot drift.
+          execute: projected.execute,
+        });
+      }
     }
   });
 }

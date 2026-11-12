@@ -167,6 +167,8 @@ export interface V2HostOptions {
   files?: Record<string, string>;
   /** User-tier AFT config, written under the host's own XDG_CONFIG_HOME. */
   userAftConfig?: Record<string, unknown>;
+  /** Use XDG storage resolution instead of an explicit AFT_STORAGE_DIR override. */
+  defaultAftStorage?: boolean;
   modelErrors?: Record<string, { status: number; code: string; message: string }>;
 }
 
@@ -262,7 +264,7 @@ export async function bootV2Host(hostBinary: string, options: V2HostOptions) {
       OPENCODE_DISABLE_MODELS_FETCH: "true",
       OPENCODE_DB: `v2-host-${options.label}.db`,
       AFT_BINARY_PATH: aftBinary,
-      AFT_STORAGE_DIR: dirs["aft-storage"],
+      ...(options.defaultAftStorage ? {} : { AFT_STORAGE_DIR: dirs["aft-storage"] }),
       AFT_CACHE_DIR: dirs["aft-cache"],
       // AFT's own log goes to stderr, and so into a failure's host output.
       AFT_LOG_STDERR: "1",
