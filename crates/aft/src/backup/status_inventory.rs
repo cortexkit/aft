@@ -139,7 +139,12 @@ impl StatusMetaCaches {
 
     pub(super) fn put_back(&self, session: &str, epoch: u64, cache: SessionMetaCache) {
         #[cfg(test)]
-        self.parses.fetch_add(cache.parses, Ordering::Relaxed);
+        let cache = {
+            let mut cache = cache;
+            self.parses
+                .fetch_add(std::mem::take(&mut cache.parses), Ordering::Relaxed);
+            cache
+        };
         let mut state = self
             .state
             .lock()

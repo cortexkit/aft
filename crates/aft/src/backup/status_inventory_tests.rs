@@ -244,3 +244,60 @@ fn status_inventory_cache_is_freed_with_session_memory() {
     assert_eq!(caches.cached_stacks(SESSION), 0);
     assert_eq!(inventory.tracked_file_count(), 2);
 }
+
+/// Splits the warm status-inventory pass into its per-stack checks, to show
+/// which one dominates the push cost.
+#[test]
+#[ignore = "manual status inventory component cost probe"]
+fn status_inventory_component_cost_probe() {
+    use crate::run_tool_call::ThreadCpuSample;
+    let (mut store, _temp, paths) = store_with_files(256);
+    for path in &paths {
+        store.snapshot(SESSION, path, "probe").unwrap();
+    }
+    store.release_session_memory(SESSION);
+    let metas = paths
+        .iter()
+        .map(|path| meta_path(&store, SESSION, path))
+        .collect::<Vec<_>>();
+    let version = Some(u64::from(ORDINARY_SCHEMA_VERSION));
+    let session_dir = store.session_dir(SESSION).unwrap();
+    let measure = |label: &str, f: &dyn Fn()| {
+        let start = ThreadCpuSample::now();
+        for _ in 0..50 {
+            f();
+        }
+        let cpu = ThreadCpuSample::elapsed(start, ThreadCpuSample::now()).unwrap();
+        eprintln!("{label}: 256 stacks, CPU/pass={:?}", cpu / 50);
+    };
+    measure("read_dir only", &|| {
+        std::hint::black_box(fs::read_dir(&session_dir).unwrap().count());
+    });
+    measure("file_identity::metadata", &|| {
+        for meta in &metas {
+            std::hint::black_box(crate::file_identity::metadata(meta).unwrap());
+        }
+    });
+    measure("refuse_live_history_file", &|| {
+        for meta in &metas {
+            refuse_live_history_file(meta).unwrap();
+        }
+    });
+    measure("check_backup_meta_version", &|| {
+        for meta in &metas {
+            check_backup_meta_version(meta, version).unwrap();
+        }
+    });
+    measure("is_loadable_backup_path", &|| {
+        for (path, meta) in paths.iter().zip(&metas) {
+            assert!(is_loadable_backup_path(
+                &canonicalize_key(path),
+                meta.parent().unwrap()
+            ));
+        }
+    });
+    store.status_inventory(SESSION).tracked_file_count();
+    measure("whole warm pass", &|| {
+        assert_eq!(store.status_inventory(SESSION).tracked_file_count(), 256);
+    });
+}
