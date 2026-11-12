@@ -37,8 +37,8 @@ describe("Pi aft-status compression rendering", () => {
     snapshot.session.checkpoints = null;
     snapshot.checkpoints_total = null;
     const lines = renderStatusDialogInnerForTest(snapshot, null, theme, 100);
-    expect(lines.some((line) => /checkpoints\s+—/.test(line))).toBe(true);
-    expect(lines.some((line) => /all-session\s+—/.test(line))).toBe(true);
+    expect(lines.some((line) => /checkpoints:\s+—/.test(line))).toBe(true);
+    expect(lines.some((line) => /all-session:\s+—/.test(line))).toBe(true);
   });
 
   test("pi_status_renders_compression_when_project_events_present", () => {
