@@ -95,7 +95,7 @@ fn family() -> FamilyId {
 }
 
 fn scratch() -> tempfile::TempDir {
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch/publication");
+    let base = crate::test_support::manifest_dir().join("../../target/scratch/publication");
     std::fs::create_dir_all(&base).unwrap();
     tempfile::tempdir_in(base).unwrap()
 }
@@ -234,7 +234,7 @@ fn copy_tree(from: &Path, to: &Path) {
 fn publication_family_scaling() {
     assert!(cfg!(target_os = "linux"), "CPU measurements require Linux");
     assert!(!cfg!(debug_assertions), "use a release build");
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = crate::test_support::manifest_dir().join("../..");
     let tracked = std::process::Command::new("git")
         .args(["ls-files", "-z"])
         .current_dir(&source)

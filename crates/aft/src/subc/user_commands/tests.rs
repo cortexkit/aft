@@ -305,7 +305,7 @@ fn user_commands_building_preview_carries_real_meaning_progress_without_starting
 fn vector(name: &str) -> Value {
     serde_json::from_slice(
         &std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            crate::test_support::manifest_dir()
                 .join("tests/fixtures/user-commands-v1")
                 .join(name),
         )
@@ -326,8 +326,7 @@ fn roundtrip<T: DeserializeOwned + serde::Serialize>(body: &Value) -> T {
 
 #[test]
 fn user_commands_pinned_vectors_roundtrip_through_real_body_serializer() {
-    let directory =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/user-commands-v1");
+    let directory = crate::test_support::manifest_dir().join("tests/fixtures/user-commands-v1");
     let sums = std::fs::read_to_string(directory.join("SHA256SUMS")).unwrap();
     let mut files = 0;
     for line in sums.lines() {
