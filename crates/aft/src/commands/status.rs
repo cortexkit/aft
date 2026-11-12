@@ -5,6 +5,10 @@ use crate::context::SemanticIndexStatus;
 use crate::db::compression_events::CompressionAggregate;
 use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
 
+#[cfg(test)]
+#[path = "status_cost_tests.rs"]
+mod cost_tests;
+
 // Operator-only copy: never use these lines as fill errors or agent reply reasons.
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -160,6 +164,8 @@ impl AppContext {
         status_bar_values: crate::context::StatusBarCountValues,
         kind: StatusSnapshotKind,
     ) -> StatusPayload {
+        #[cfg(test)]
+        let mut cost = cost_tests::PushCost::start();
         #[cfg(test)]
         self.status_emitter()
             .snapshot_builds
@@ -369,6 +375,8 @@ impl AppContext {
 
         // Symbol cache stats
         let symbol_cache_stats = self.symbol_cache_stats();
+        #[cfg(test)]
+        cost.mark("indexes_config_symbols");
 
         // Per-session undo/checkpoint counts (issue #14 — one shared bridge serves
         // many sessions; surface both the global footprint and the current
@@ -397,6 +405,8 @@ impl AppContext {
         } else {
             0
         };
+        #[cfg(test)]
+        cost.mark("checkpoints_and_backup");
         // Shell sidebar status consumes neither undo nor compression history.
         // In particular, idle operator refreshes must not reacquire aft.db to
         // hydrate aggregates unrelated to readiness and health counts.
@@ -405,6 +415,8 @@ impl AppContext {
         } else {
             self.compression_stats_for_session(session_id)
         };
+        #[cfg(test)]
+        cost.mark("compression");
 
         // Degraded-mode reasons recorded by `handle_configure` when the
         // project root doesn't look like a real project (`home_root`). Heavy
@@ -433,6 +445,8 @@ impl AppContext {
         // same way, after them. Push projection adds it itself, with this
         // project's other refusals.
         let data_store_report = crate::data_layer::surfaces::report(self);
+        #[cfg(test)]
+        cost.mark("data_report");
         let data_store_refusal = data_store_report
             .as_ref()
             .and_then(|report| report.refusal.as_ref())
@@ -589,9 +603,13 @@ impl AppContext {
 
         // With the data layer on, its planes replace today's stores for text
         // and the call graph on every status surface.
+        #[cfg(test)]
+        cost.mark("payload");
         if let Some(report) = &data_store_report {
             crate::data_layer::surfaces::apply_to_status(&mut payload, report);
         }
+        #[cfg(test)]
+        cost.mark("data_apply");
         if kind != StatusSnapshotKind::Explicit {
             // Read only this root's LSP applicability rather than cloning
             // applicability for every root and the other lifecycle details.
@@ -636,6 +654,8 @@ impl AppContext {
                 runtime["bash_spawn"] = crate::posix_spawn::health();
             }
         }
+        #[cfg(test)]
+        cost.mark("lifecycle");
         payload
     }
 

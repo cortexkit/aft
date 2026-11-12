@@ -1346,6 +1346,11 @@ impl DataCheckout {
         &self.work.checkout
     }
 
+    #[cfg(test)]
+    pub(crate) fn checkout_arc_for_test(&self) -> Arc<Checkout> {
+        Arc::clone(&self.work.checkout)
+    }
+
     /// Only a queued or running first text build warrants waiting. An old
     /// publication, a failure, or a checkout with no build scheduled does not.
     pub(crate) fn first_text_building(&self) -> bool {
