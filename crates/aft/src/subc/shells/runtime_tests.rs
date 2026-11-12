@@ -1186,7 +1186,7 @@ async fn shells_list_agent_db_contention_does_not_block_runtime_polling() {
             })
             .await
     });
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_millis(50)) => {},
         result = &mut list => panic!("list finished while db was held: {result:?}"),
