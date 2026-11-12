@@ -609,15 +609,8 @@ fn native_launcher_candidates(
     // Nextest only supplies BIN_EXE variables to integration tests and benches,
     // not library tests. Locate the profile above Cargo's old `deps` or new
     // `build/<package>/<unit>` intermediate tree in the extracted archive.
-    let Some(profile_dir) = executable.ancestors().find_map(|ancestor| {
-        matches!(
-            ancestor.file_name().and_then(|name| name.to_str()),
-            Some("deps" | "build")
-        )
-        .then(|| ancestor.parent())
-        .flatten()
-    }) else {
-        return vec![executable.with_file_name("aft")];
+    let Some(profile_dir) = cortexkit_test_support::cargo_profile_dir_of(executable) else {
+        return Vec::new();
     };
     let profile = profile_dir.file_name().unwrap();
     let mut candidates = vec![profile_dir.join("aft")];

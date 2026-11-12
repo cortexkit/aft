@@ -4373,18 +4373,27 @@ fn main() {
         );
         // Cargo's intermediate directory layout is not stable. Require this
         // crate's compiler artifact under the isolated target, not a `deps` folder.
+        let mut directories = vec![analyzer_target.clone()];
+        let mut found_compiler_artifact = false;
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).expect("read analyzer artifacts") {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    directories.push(entry.path());
+                } else if kind.is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("liblock_isolation")
+                    && entry.path().extension().is_some_and(|ext| ext == "rmeta")
+                {
+                    found_compiler_artifact = true;
+                }
+            }
+        }
         assert!(
-            walkdir::WalkDir::new(&analyzer_target)
-                .into_iter()
-                .any(|entry| {
-                    let entry = entry.expect("read analyzer artifacts");
-                    entry.file_type().is_file()
-                        && entry
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with("liblock_isolation")
-                        && entry.path().extension().is_some_and(|ext| ext == "rmeta")
-                }),
+            found_compiler_artifact,
             "{mode}: check compiler artifacts missing under {}",
             analyzer_target.display()
         );

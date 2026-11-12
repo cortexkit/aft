@@ -297,6 +297,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+cortexkit-test-support = "=0.1.14"
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.15.6"
 cortexkit-role-tool-provider = { version = "=0.15.5", features = ["test-vectors"] }
