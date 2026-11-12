@@ -3562,7 +3562,7 @@ fn macos_request_params(folder: &str, program: &str, steps: &str) -> Value {
     json!({"kind":"macos_permission","folder":folder,"program":program,"steps":steps})
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub(super) async fn withdraw_macos_permission_cards(
     db: Arc<StdMutex<crate::db::TrackedConnection>>,
 ) -> Result<usize, ConsentError> {
@@ -3570,8 +3570,11 @@ pub(super) async fn withdraw_macos_permission_cards(
     let transport =
         transport().ok_or_else(|| ConsentError::Unavailable("Cingulate is unavailable".into()))?;
     let _serial = MACOS_CARDS_LOCK.lock().await;
-    let rows = {
-        let conn = db
+    let read_db = Arc::clone(&db);
+    // The subc runtime has one thread. Even waiting for the shared database
+    // mutex here would stop frame polling while startup recovery reads a page.
+    let rows = tokio::task::spawn_blocking(move || {
+        let conn = read_db
             .lock()
             .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
         let mut statement = conn.prepare("SELECT folder,program,selector,project_root,session,elicitation_id FROM macos_permission_cards")
@@ -3590,7 +3593,9 @@ pub(super) async fn withdraw_macos_permission_cards(
             .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| ConsentError::Unavailable(e.to_string()))?
-    };
+    })
+    .await
+    .map_err(|e| ConsentError::Unavailable(e.to_string()))??;
     let mut withdrawn = 0;
     for (folder, program, scope, root, session, id) in rows {
         let had_id = id.is_some();
@@ -3629,13 +3634,19 @@ pub(super) async fn withdraw_macos_permission_cards(
                     Err(error) => return Err(error),
                 }
             }
-            db.lock()
-                .map_err(|e| ConsentError::Unavailable(e.to_string()))?
-                .execute(
-                    "DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2",
-                    params![folder, program],
-                )
-                .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+            let delete_db = Arc::clone(&db);
+            let delete_folder = folder.clone();
+            tokio::task::spawn_blocking(move || {
+                delete_db.lock()
+                    .map_err(|e| ConsentError::Unavailable(e.to_string()))?
+                    .execute(
+                        "DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2",
+                        params![delete_folder, program],
+                    )
+                    .map_err(|e| ConsentError::Unavailable(e.to_string()))
+            })
+            .await
+            .map_err(|e| ConsentError::Unavailable(e.to_string()))??;
             Ok(())
         }
         .await;

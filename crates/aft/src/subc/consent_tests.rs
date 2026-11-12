@@ -6296,7 +6296,81 @@ async fn macos_permission_cards_deduplicate_and_withdraw_on_readable_probe() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "current_thread")]
+async fn macos_permission_startup_db_contention_does_not_block_runtime_polling() {
+    struct LockBeforeDelete {
+        acquire: std::sync::mpsc::Sender<()>,
+        acquired: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+    impl ConsentTransport for LockBeforeDelete {
+        fn call(&self, call: ConsentCall) -> ConsentFuture {
+            assert_eq!(call.method, "consent.withdraw");
+            self.acquire.send(()).unwrap();
+            let acquired = self.acquired.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                acquired.await.unwrap();
+                Ok(json!({}))
+            })
+        }
+    }
+
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for before_delete in [false, true] {
+        let f = fixture(FakeCingulate::up());
+        let db = f.ctx.db().unwrap();
+        db.lock().unwrap().execute(
+            "INSERT INTO macos_permission_cards(folder,program,call_key,selector,project_root,session,elicitation_id)
+             VALUES ('folder','program','key',?1,'/root','session','id')",
+            [serde_json::to_string(&selector(f.head.scope.as_ref().unwrap())).unwrap()],
+        ).unwrap();
+        let (acquire, requested) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let holder_db = Arc::clone(&db);
+        let holder = std::thread::spawn(move || {
+            requested.recv().unwrap();
+            let _guard = holder_db.lock().unwrap();
+            locked.send(()).unwrap();
+            // A broken cleanup must fail rather than deadlock the test runtime.
+            released.recv_timeout(Duration::from_secs(2)).is_ok()
+        });
+        if before_delete {
+            install_test_transport(Some(Arc::new(LockBeforeDelete {
+                acquire,
+                acquired: StdMutex::new(Some(acquired)),
+            })));
+        } else {
+            acquire.send(()).unwrap();
+            acquired.await.unwrap();
+        }
+        let mut cleanup = tokio::spawn(withdraw_macos_permission_cards(Arc::clone(&db)));
+        let start = std::time::Instant::now();
+        let kept_polling = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => true,
+            result = &mut cleanup => { panic!("cleanup finished while db was held: {result:?}"); }
+        };
+        release.send(()).unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "runtime did not release the lock holder in time"
+        );
+        assert!(
+            kept_polling && start.elapsed() < Duration::from_secs(1),
+            "runtime stopped polling while waiting for the database (delete={before_delete})"
+        );
+        assert_eq!(cleanup.await.unwrap().unwrap(), 1);
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM macos_permission_cards", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        install_test_transport(None);
+    }
+}
+
 struct StartupMacosWithdrawal {
     fake: Arc<FakeCingulate>,
     failed_id: String,
@@ -6305,7 +6379,6 @@ struct StartupMacosWithdrawal {
     calls: StdMutex<Vec<Value>>,
 }
 
-#[cfg(target_os = "macos")]
 impl ConsentTransport for StartupMacosWithdrawal {
     fn call(&self, call: ConsentCall) -> ConsentFuture {
         assert_eq!(call.method, "consent.withdraw");
@@ -6332,7 +6405,6 @@ impl ConsentTransport for StartupMacosWithdrawal {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn macos_permission_startup_withdraws_ids_deletes_unpublished_and_keeps_failed_rows() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -6399,7 +6471,6 @@ async fn macos_permission_startup_withdraws_ids_deletes_unpublished_and_keeps_fa
 /// A card filed by a session that has since ended can't be withdrawn under its
 /// scope; Cingulate settles it, so startup drops the record instead of
 /// retrying it at every start.
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn macos_permission_startup_drops_cards_whose_scope_ended() {
     let _lock = CONSENT_TEST_LOCK.lock().await;

@@ -437,6 +437,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
     },
     ExclusionEntry {
+        file: "subc/held_task_recovery.rs",
+        enclosing_item: "sessions",
+        location_or_primitive: "RECOVERY_CHUNK (64), SQL LIMIT, keyset pagination",
+        reason: "Internal startup recovery exhausts every candidate source in index-seeking pages; the chunk bounds one shared database mutex hold, not an agent-visible result list.",
+    },
+    ExclusionEntry {
         file: "subc/shells/runtime.rs",
         enclosing_item: "list, project_row, output",
         location_or_primitive: "PAGE_SIZE, 2048, DEFAULT_CHUNK_BYTES, take_while",
