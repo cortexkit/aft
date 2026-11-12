@@ -1,0 +1,113 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/data_file.rs",
+    "crates/aft/src/commands/semantic_search/external_exact.rs",
+    "crates/aft/src/commands/semantic_search/memo.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/nearest_names.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/parser.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "streamed-large-file-presence-and-line-local-scans"
+  ],
+  "note": "Combined post-0.64 batch 4 integration, based on main 1e62352b0566160eb132207be5a932b3a12e2134 (batch 3). Copied ci-speed-post064-batch-3.json, retaining its inherited reference pattern-count declarations. The paths from git diff --name-only origin/main intersect RANKING_FENCE_PREFIXES at the semantic_search files, lib.rs, parser.rs and search_index.rs listed in fixtures. These changes belong to #1432 stage 1: presence checks and line-local scans stream files larger than 4 MiB instead of reading the complete file. No routing, candidate selection, score, range or ranked rendering change is intended. Accepted delivery evidence: all 6,897 real queries were byte-identical, so this fenced change is engine_unwired with targeted_mechanism none. The other deliveries change recovery, health, shell notices and guards, logging, issue-report privacy, tool registration and publication lookup cost, not ranking. The pattern_counts below remain only the pre-0.64 reference transitions inherited through batch 3; they grant no new difference.",
+  "pattern_counts": {
+    "followup-census:910002": {
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
+    },
+    "followup-census:910003": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910004": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910005": {
+      "candidate_files": {
+        "before": 194,
+        "after": 141
+      },
+      "files_examined": {
+        "before": 194,
+        "after": 141
+      }
+    },
+    "followup-census:910010": {
+      "candidate_files": {
+        "before": 6,
+        "after": 19
+      },
+      "files_examined": {
+        "before": 6,
+        "after": 19
+      }
+    },
+    "followup-census:910011": {
+      "candidate_files": {
+        "before": 942,
+        "after": 729
+      },
+      "files_examined": {
+        "before": 942,
+        "after": 729
+      }
+    },
+    "followup-census:910012": {
+      "candidate_files": {
+        "before": 1031,
+        "after": 730
+      },
+      "files_examined": {
+        "before": 1031,
+        "after": 730
+      }
+    },
+    "followup-census:910013": {
+      "candidate_files": {
+        "before": 908,
+        "after": 45
+      },
+      "files_examined": {
+        "before": 908,
+        "after": 45
+      }
+    },
+    "followup-census:910014": {
+      "candidate_files": {
+        "before": 1011,
+        "after": 24
+      },
+      "files_examined": {
+        "before": 1011,
+        "after": 24
+      }
+    }
+  }
+}
