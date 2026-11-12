@@ -125,7 +125,24 @@ impl CortexkitFloorFixture {
         }
         std::fs::write(&connection, "daemon-token").unwrap();
         let shim_image = if copy_shim {
-            Some(crate::test_helpers::aft_binary::private_shim_binary())
+            let bytes = std::fs::read(crate::test_helpers::aft_binary::source_binary()).unwrap();
+            #[cfg(target_os = "macos")]
+            let warm = crate::test_helpers::aft_binary::warm_fixture_image;
+            #[cfg(not(target_os = "macos"))]
+            let warm = |_: &Path| Ok(());
+            // macOS can delay a new inode's first execution beyond configure's
+            // two-second `gh-shim --shim-version` validation deadline. Warm it
+            // in setup, keeping mode 0755 so write-denial assertions still
+            // depend on the sandbox, not chmod.
+            Some(
+                crate::test_helpers::executable_cache::cached_executable_named_in_with_warmup(
+                    &std::env::temp_dir().join("aft-test-private-shims"),
+                    &bytes,
+                    "aft",
+                    warm,
+                )
+                .expect("cache and warm isolated shim image"),
+            )
         } else {
             None
         };
