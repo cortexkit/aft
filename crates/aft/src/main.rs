@@ -3519,7 +3519,7 @@ mod deferred_semantic_search_tests {
                 request(
                     "preceding-edit",
                     "write",
-                    serde_json::json!({"path": file, "content": "after\n"}),
+                    serde_json::json!({"file": file, "content": "after\n"}),
                 ),
                 &ctx,
             );
@@ -3540,7 +3540,7 @@ mod deferred_semantic_search_tests {
                 }
             };
             aft::commands::tool_call::register_dispatch(dispatch);
-            let expected = dispatch(make_request(), &ctx);
+            let mut expected = dispatch(make_request(), &ctx);
             assert!(expected.success, "{expected:?}");
             let (entered_tx, entered_rx) = mpsc::sync_channel(1);
             let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -3564,7 +3564,10 @@ mod deferred_semantic_search_tests {
             // A later configuration publication must not change this grep's pin.
             ctx.update_config(|config| config.restrict_to_project_root = true);
             release_tx.send(()).unwrap();
-            let actual = wait_for_response(&ctx, &mut pending);
+            let mut actual = wait_for_response(&ctx, &mut pending);
+            // Native grep includes elapsed time; tool_call returns rendered text.
+            expected.data.as_object_mut().unwrap().remove("search_ms");
+            actual.data.as_object_mut().unwrap().remove("search_ms");
             assert_eq!(
                 serde_json::to_vec(&actual).unwrap(),
                 serde_json::to_vec(&expected).unwrap()
