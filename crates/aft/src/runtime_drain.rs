@@ -2739,6 +2739,8 @@ mod tests {
     #[test]
     fn ignore_rule_refresh_armed_during_unbind_replays_after_rebind() {
         let _reset = begin_ignore_rule_refresh_test();
+        // Keep the injected deadline ahead of wall time even on a slow runner.
+        set_ignore_rule_refresh_now_for_test(Some(Instant::now() + Duration::from_secs(60)));
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (ctx, tx) = watcher_context(&root);
@@ -2757,6 +2759,27 @@ mod tests {
         let state = state.as_ref().expect("replayed watcher state");
         assert!(state.ignore_refresh_due.is_none());
         assert!(state.ignore_changed_paths.is_empty());
+    }
+
+    #[test]
+    fn healthy_root_metadata_probe_does_not_mark_queries_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, _tx) = watcher_context(&root);
+        assert!(!ctx.watcher_query_has_pending_changes());
+
+        let stopped = ctx.try_cleanup_deleted_root_with_probe(ctx.configure_generation(), |path| {
+            // A filesystem probe can be slow without moving any watcher events.
+            // Capture a query while the probe is running, not after it returns.
+            assert!(
+                !ctx.watcher_query_has_pending_changes(),
+                "checking an existing root must not manufacture pending changes"
+            );
+            std::fs::metadata(path)
+        });
+
+        assert!(!stopped);
+        assert!(!ctx.watcher_query_has_pending_changes());
     }
 
     #[test]

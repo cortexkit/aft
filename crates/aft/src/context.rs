@@ -5719,8 +5719,7 @@ impl AppContext {
         })
     }
 
-    // Only the Unix-only idle language-server tests inject a probe.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn try_cleanup_deleted_root_with_probe(
         &self,
         expected_generation: u64,
