@@ -3893,6 +3893,8 @@ impl BgTaskRegistry {
         let render = super::buffer::with_recovered_read_diagnostics(&metadata.task_id, || {
             self.render_terminal_output_from_paths(metadata, paths)
         });
+        let unknown_result = (metadata.status == BgTaskStatus::FateUnknown)
+            .then(|| self.unknown_bash_result_from_render(metadata, paths, render.as_ref()));
         crate::slog_info!(
             "recovered bash reply phase=render_finished task={} preview_bytes={:?} truncated={:?}",
             metadata.task_id,
@@ -3937,11 +3939,58 @@ impl BgTaskRegistry {
                     Some(&frame),
                     &outcome,
                     tool_result_body.as_deref(),
+                    unknown_result.as_ref(),
                 ) {
                     crate::slog_warn!("call ledger recovered settlement failed: {error}");
                 }
             }
         }
+    }
+
+    fn unknown_bash_result_from_render(
+        &self,
+        metadata: &PersistedTask,
+        paths: &TaskPaths,
+        render: Option<&TerminalOutputCache>,
+    ) -> crate::db::call_ledger::RecordedFrame {
+        let preview = render
+            .map(|cache| {
+                self.terminal_preview_for_reply(metadata, cache, Some(paths))
+                    .0
+            })
+            .unwrap_or_default();
+        crate::db::call_ledger::unknown_bash_result(
+            &metadata.task_id,
+            remote_job_id(metadata).as_deref(),
+            &preview,
+        )
+    }
+
+    pub(crate) fn unknown_bash_result_for_task(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> crate::db::call_ledger::RecordedFrame {
+        let Some(task) = self.task_for_session(task_id, session_id) else {
+            return crate::db::call_ledger::unknown_bash_result(task_id, None, "");
+        };
+        let Ok(state) = task.lock_state() else {
+            return crate::db::call_ledger::unknown_bash_result(task_id, None, "");
+        };
+        let metadata = state.metadata.clone();
+        drop(state);
+        let render = if metadata.mode == BgMode::Pipes {
+            let buffer = BgBuffer::registered(&task.paths, BgMode::Pipes);
+            Some(self.render_terminal_output(
+                &metadata,
+                &buffer,
+                DiskTruncation::default(),
+                Some(&task.paths),
+            ))
+        } else {
+            None
+        };
+        self.unknown_bash_result_from_render(&metadata, &task.paths, render.as_ref())
     }
 
     /// Record a finished shell call when its attachment left after the task
@@ -22700,6 +22749,60 @@ mod tests {
                 assert!(live_text.contains(reason), "{live_text}");
             }
         }
+    }
+
+    #[test]
+    fn unknown_bash_result_masks_secrets_and_reuses_shell_preview_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let secret = "opaque-deploy-credential";
+        let output = format!(
+            "first line {secret}\n{}\nlast line\n",
+            "middle line\n".repeat(10_000)
+        );
+        let (id, task) =
+            insert_terminal_piped_task(&registry, &dir, "printf output", &output, "", false);
+        *task.completion_secrets.lock().unwrap() = Some(
+            crate::log_redact::SecretValues::from_environment([("DEPLOY_TOKEN", secret)]),
+        );
+        let frame = registry.unknown_bash_result_for_task(&id, "session");
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        let text = body["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains(secret), "{text}");
+        assert!(
+            text.contains(crate::log_redact::SECRET_PLACEHOLDER),
+            "{text}"
+        );
+        assert!(text.contains("first line"), "{text}");
+        assert!(text.contains("last line"), "{text}");
+        assert!(text.len() > super::super::output::COMPLETION_FAILURE_PREVIEW_BYTES);
+        assert!(text.len() < output.len());
+    }
+
+    #[test]
+    fn unknown_bash_result_withholds_output_when_restart_secrets_are_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let (id, task) = insert_terminal_piped_task(
+            &registry,
+            &dir,
+            "printf output",
+            "opaque-deploy-credential\n",
+            "",
+            false,
+        );
+        *task.completion_secrets.lock().unwrap() = None;
+        let frame = registry.unknown_bash_result_for_task(&id, "session");
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        let text = body["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(super::super::completion_preview::RESTART_PREVIEW_WITHHELD),
+            "{text}"
+        );
+        assert!(!text.contains("opaque-deploy-credential"), "{text}");
+        assert!(
+            text.ends_with("Check this task with bash_status before running the command again.")
+        );
     }
 
     #[test]

@@ -357,7 +357,7 @@ fn settle_missing_root(
             settled += usize::from(ledger::settle(
                 &conn,
                 &key,
-                &ledger::unknown_held_result(),
+                &ledger::unknown_bash_result_missing_root(task),
                 "outcome_unknown",
                 None,
                 ledger::now_ms(),
@@ -624,8 +624,9 @@ pub(crate) mod tests {
         let restarted = context(dir.path(), &dir.path().join("storage"));
         let executor = startup(&restarted).await;
         assert_eq!(
-            settled(&restarted, &key).await.body,
-            ledger::unknown_held_result().body
+            serde_json::from_slice::<serde_json::Value>(&settled(&restarted, &key).await.body)
+                .unwrap()["content"][0]["text"],
+            "Task bash-0000000000000001: outcome unknown (AFT lost the command's result).\nCheck this task with bash_status before running the command again."
         );
         for actor in executor.actor_contexts() {
             actor.bash_background().detach();
@@ -666,8 +667,9 @@ pub(crate) mod tests {
         assert!(!root.exists());
         let executor = startup(&restarted).await;
         assert_eq!(
-            settled(&restarted, &key).await.body,
-            ledger::unknown_held_result().body
+            serde_json::from_slice::<serde_json::Value>(&settled(&restarted, &key).await.body)
+                .unwrap()["content"][0]["text"],
+            "Task bash-0000000000000003: outcome unknown (AFT restarted and this command's project folder no longer exists, so it can't tell whether the command ran)."
         );
         assert_eq!(
             executor.actor_count(),

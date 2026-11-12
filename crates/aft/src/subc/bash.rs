@@ -1188,7 +1188,16 @@ pub(super) async fn answer_yielded_bash_call(
             Ok(Ok(_)) => frame,
             error => {
                 log::warn!("runner restart hold failed: {error:?}");
-                let unknown = crate::db::call_ledger::unknown_held_result();
+                let registry = target.registry.clone();
+                let task = target.task_id.clone();
+                let session = target.session_id.clone();
+                let unknown = tokio::task::spawn_blocking(move || {
+                    registry.unknown_bash_result_for_task(&task, &session)
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    crate::db::call_ledger::unknown_bash_result(&target.task_id, None, "")
+                });
                 Frame::build_with_version(
                     target.ver,
                     unknown.ty,

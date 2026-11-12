@@ -484,13 +484,45 @@ pub(crate) fn hold_watch(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite:
 }
 
 pub(crate) fn unknown_held_result() -> RecordedFrame {
+    unknown_held_result_with_text("")
+}
+
+fn unknown_held_result_with_text(text: &str) -> RecordedFrame {
     RecordedFrame {
         ty: FrameType::Response,
         body: serde_json::to_vec(
-            &json!({"content":[{"type":"text","text":""}],"isError":true,"errorCode":"outcome_unknown"}),
+            &json!({"content":[{"type":"text","text":text}],"isError":true,"errorCode":"outcome_unknown"}),
         )
         .expect("unknown outcome is JSON"),
     }
+}
+
+/// The preview must already have the shell output's usual cap and masking.
+pub(crate) fn unknown_bash_result(
+    task_id: &str,
+    job_id: Option<&str>,
+    output_preview: &str,
+) -> RecordedFrame {
+    let reason = match job_id {
+        Some(job_id) => format!("AFT lost the result of build-server job {job_id}"),
+        None => "AFT lost the command's result".to_owned(),
+    };
+    let mut text = format!("Task {task_id}: outcome unknown ({reason}).\n");
+    if !output_preview.is_empty() {
+        text.push_str("Output received before that:\n");
+        text.push_str(output_preview);
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    text.push_str("Check this task with bash_status before running the command again.");
+    unknown_held_result_with_text(&text)
+}
+
+pub(crate) fn unknown_bash_result_missing_root(task_id: &str) -> RecordedFrame {
+    unknown_held_result_with_text(&format!(
+        "Task {task_id}: outcome unknown (AFT restarted and this command's project folder no longer exists, so it can't tell whether the command ran)."
+    ))
 }
 
 pub fn not_started(key: &Key, reason: &str) -> RecordedFrame {
@@ -1322,14 +1354,13 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
                 conn.execute("UPDATE call_ledger SET task_id=?3,recovered=1 WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key,task])?;
             } else {
                 if has_held_reply(&row) {
-                    settle(
-                        conn,
-                        &key,
-                        &unknown_held_result(),
-                        "outcome_unknown",
-                        None,
-                        now_ms(),
-                    )?;
+                    let unknown = row
+                        .task_id
+                        .as_deref()
+                        .map_or_else(unknown_held_result, |task| {
+                            unknown_bash_result(task, None, "")
+                        });
+                    settle(conn, &key, &unknown, "outcome_unknown", None, now_ms())?;
                     continue;
                 }
                 settle(
@@ -1396,9 +1427,12 @@ pub fn observe_task(
     result: Option<&RecordedFrame>,
     outcome: &str,
 ) -> rusqlite::Result<bool> {
-    observe_task_with_tool_result_source(conn, carrier, call_key, task_id, result, outcome, None)
+    observe_task_with_tool_result_source(
+        conn, carrier, call_key, task_id, result, outcome, None, None,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn observe_task_with_tool_result_source(
     conn: &Connection,
     carrier: &str,
@@ -1407,6 +1441,7 @@ pub fn observe_task_with_tool_result_source(
     result: Option<&RecordedFrame>,
     outcome: &str,
     body: Option<&[u8]>,
+    unknown_result: Option<&RecordedFrame>,
 ) -> rusqlite::Result<bool> {
     let key = Key {
         carrier: carrier.into(),
@@ -1424,7 +1459,9 @@ pub fn observe_task_with_tool_result_source(
         let row = get(conn, &key)?;
         if row.as_ref().is_some_and(has_held_reply) {
             let frame = if outcome == "unknown" {
-                unknown_held_result()
+                unknown_result
+                    .cloned()
+                    .unwrap_or_else(|| unknown_bash_result(task_id, None, ""))
             } else {
                 let structured = row
                     .as_ref()
@@ -1519,6 +1556,40 @@ fn run_before_recovery_read(conn: &Connection, key: &Key) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_bash_result_remote_with_output() {
+        let frame = super::unknown_bash_result("bash-task", Some("remote-job"), "partial output\n");
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["content"][0]["text"], "Task bash-task: outcome unknown (AFT lost the result of build-server job remote-job).\nOutput received before that:\npartial output\nCheck this task with bash_status before running the command again.");
+    }
+
+    #[test]
+    fn unknown_bash_result_remote_without_output() {
+        let frame = super::unknown_bash_result("bash-task", Some("remote-job"), "");
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["content"][0]["text"], "Task bash-task: outcome unknown (AFT lost the result of build-server job remote-job).\nCheck this task with bash_status before running the command again.");
+    }
+
+    #[test]
+    fn unknown_bash_result_changes_only_text() {
+        let original = super::unknown_held_result();
+        for frame in [
+            super::unknown_bash_result("bash-task", Some("remote-job"), "partial output"),
+            super::unknown_bash_result("bash-task", Some("remote-job"), ""),
+            super::unknown_bash_result("bash-task", None, "local output"),
+            super::unknown_bash_result_missing_root("bash-task"),
+        ] {
+            assert_eq!(frame.ty, original.ty);
+            let mut body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            assert!(!body["content"][0]["text"].as_str().unwrap().is_empty());
+            body["content"][0]["text"] = serde_json::json!("");
+            assert_eq!(
+                body,
+                serde_json::json!({"content":[{"type":"text","text":""}],"isError":true,"errorCode":"outcome_unknown"})
+            );
+        }
+    }
+
     #[test]
     fn schema_29_preserves_schema_28_rows_and_indexes_but_allows_carrier_custody() {
         use super::*;
@@ -2174,7 +2245,10 @@ mod tests {
         );
         let lost = get(&conn, &super::tests::key("lost")).unwrap().unwrap();
         assert_eq!(lost.state, State::Settled);
-        assert_eq!(lost.frame.unwrap().body, unknown_held_result().body);
+        assert_eq!(
+            lost.frame.unwrap().body,
+            unknown_bash_result("missing-task", None, "").body
+        );
         let ordinary = RecordedFrame {
             ty: FrameType::Response,
             body: serde_json::to_vec(
