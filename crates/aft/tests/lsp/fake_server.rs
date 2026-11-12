@@ -596,12 +596,26 @@ pub(crate) fn main() -> io::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .map(std::time::Duration::from_millis);
     let dropped_checks = std::env::var("AFT_FAKE_LSP_CHECK_DROP").unwrap_or_default();
+    // AFT_FAKE_LSP_CHECK_LOG=<path>: append one line naming the trigger of
+    // every check asked for (with " dropped" when it starts none), so a test
+    // can count them.
+    let check_log = std::env::var_os("AFT_FAKE_LSP_CHECK_LOG");
     let schedule_check = |trigger: &str| -> Option<std::time::Instant> {
         let delay = check_on_save_delay?;
-        (!dropped_checks
+        let scheduled = !dropped_checks
             .split(',')
-            .any(|dropped| dropped.trim() == trigger))
-        .then(|| std::time::Instant::now() + delay)
+            .any(|dropped| dropped.trim() == trigger);
+        if let Some(path) = &check_log {
+            use std::io::Write;
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("open check log");
+            let dropped = if scheduled { "" } else { " dropped" };
+            writeln!(log, "{trigger}{dropped}").expect("write check log");
+        }
+        scheduled.then(|| std::time::Instant::now() + delay)
     };
     let mut check_begins_at: Option<std::time::Instant> = None;
     let mut check_completed = false;

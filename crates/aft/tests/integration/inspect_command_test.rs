@@ -7630,6 +7630,156 @@ fn scoped_rust_inspect_reports_an_unstarted_first_check_as_unknown_then_asks_aga
     );
 }
 
+/// Start the fake rust-analyzer for `lib` and return once its first check
+/// (the one it runs on becoming quiescent) has published and its events are
+/// queued, before anything opened `lib` in it. Its push for `lib` therefore
+/// carries no document version, as rust-analyzer's does when its first check
+/// finishes before a scoped inspect opens the files. The fake answers pulls
+/// from the synced text and pushes only check results, as rust-analyzer does
+/// in pull mode, and logs every check asked for to the returned file.
+fn start_fake_rust_after_unopened_first_check(
+    ctx: &AppContext,
+    root: &Path,
+    lib: &Path,
+) -> PathBuf {
+    configure_fake_rust_lsp(ctx);
+    let check_log = root.join("check-log");
+    let completed = root.join("initial-check-completed");
+    {
+        let mut lsp = ctx.lsp();
+        lsp.set_extra_env("AFT_FAKE_LSP_PULL", "1");
+        lsp.set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+        lsp.set_extra_env("AFT_FAKE_LSP_PULL_FROM_CONTENT", "1");
+        lsp.set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+        lsp.set_extra_env("AFT_FAKE_LSP_CHECK_LOG", check_log.to_str().unwrap());
+        lsp.set_extra_env(
+            "AFT_FAKE_LSP_CHECK_COMPLETED_SIGNAL",
+            completed.to_str().unwrap(),
+        );
+    }
+    let config = ctx.config().clone();
+    let started = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_server_for_file(lib, &config)
+    });
+    assert!(!started.is_empty(), "the fake rust server must start");
+    wait_for_path_event(&completed, "initial check completed");
+    // A request round trip proves the reader queued the check's events.
+    ctx.lsp()
+        .client_for_file_mut(lib, &config)
+        .unwrap()
+        .send_request_with_timeout::<lsp_types::request::HoverRequest>(
+            serde_json::from_value(json!({
+                "textDocument": { "uri": file_uri(lib) },
+                "position": { "line": 0, "character": 0 },
+            }))
+            .unwrap(),
+            Duration::from_secs(30),
+        )
+        .expect("reader barrier after initial check");
+    check_log
+}
+
+fn checks_asked_for(check_log: &Path) -> Vec<String> {
+    fs::read_to_string(check_log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// rust-analyzer's first check can finish before a scoped inspect opens the
+/// files. Its compiler errors then arrive for a document that is not open,
+/// so AFT cannot match them to the file's content and leaves them out of the
+/// pulled report. Certifying that report alone answered FRESH with 0 errors
+/// for a file with a compiler error. Inspect instead asks for one new check
+/// once the file is open and reports its error; a later inspect, with the
+/// error now matched to the file, asks for no further check.
+#[test]
+fn scoped_rust_inspect_rechecks_compiler_errors_pushed_for_an_unopened_file() {
+    let (_temp_dir, root, lib) = single_crate_fixture("unopened-first-check");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    let check_log = start_fake_rust_after_unopened_first_check(&ctx, &root, &lib);
+    assert_eq!(checks_asked_for(&check_log), ["load"], "control");
+
+    let first = scoped_diagnostics_inspect(&ctx, "unopened-first-check", "src/lib.rs");
+    assert_eq!(first["inspect_terminal"], "fresh", "{first:#}");
+    assert!(
+        diagnostic_messages_for(&first, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the compiler error must not be certified away: {first:#}"
+    );
+    assert_eq!(
+        checks_asked_for(&check_log),
+        ["load", "save"],
+        "exactly one extra check, for the unmatched compiler errors"
+    );
+
+    let second = scoped_diagnostics_inspect(&ctx, "unopened-first-check-again", "src/lib.rs");
+    assert_eq!(second["inspect_terminal"], "fresh", "{second:#}");
+    assert!(
+        diagnostic_messages_for(&second, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "{second:#}"
+    );
+    assert_eq!(
+        checks_asked_for(&check_log),
+        ["load", "save"],
+        "matched compiler errors need no further check"
+    );
+}
+
+/// The same ordering, but the check inspect asks for never begins (the fake
+/// drops checks a save asks for). The compiler errors stay unmatched, so the
+/// file's diagnostics are unknown and must not be certified clean.
+#[test]
+fn scoped_rust_inspect_never_certifies_unmatched_compiler_errors_when_the_recheck_never_runs() {
+    let (_temp_dir, root, lib) = single_crate_fixture("unopened-first-check-held");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_DROP", "save");
+    let check_log = start_fake_rust_after_unopened_first_check(&ctx, &root, &lib);
+
+    let response = scoped_diagnostics_inspect(&ctx, "unopened-first-check-held", "src/lib.rs");
+    assert!(
+        reported_check_still_running(&response),
+        "the check asked for never ran, so the result must be unknown: {response:#}"
+    );
+    let checks = checks_asked_for(&check_log);
+    assert_eq!(checks[0], "load", "{checks:?}");
+    assert!(
+        checks.len() > 1 && checks[1..].iter().all(|check| check == "save dropped"),
+        "{checks:?}"
+    );
+}
+
+/// A sweep with no unmatched compiler errors asks rust-analyzer for no check
+/// beyond the one it runs on becoming quiescent.
+#[test]
+fn scoped_rust_inspect_asks_for_no_extra_check_without_unmatched_compiler_errors() {
+    let (_temp_dir, root, lib) = single_crate_fixture("unopened-first-check-clean");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    let check_log = start_fake_rust_after_unopened_first_check(&ctx, &root, &lib);
+
+    let response = scoped_diagnostics_inspect(&ctx, "unopened-first-check-clean", "src/lib.rs");
+    assert_eq!(response["inspect_terminal"], "fresh", "{response:#}");
+    assert!(
+        diagnostic_messages_for(&response, "src/lib.rs").is_empty(),
+        "{response:#}"
+    );
+    assert_eq!(checks_asked_for(&check_log), ["load"]);
+}
+
 /// An unscoped inspect makes a whole-project claim, so it too must wait for
 /// rust-analyzer's `cargo check`. The fake's check never finishes: the
 /// answer names the running check instead of certifying the published
