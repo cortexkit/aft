@@ -19,8 +19,8 @@
 //!   `…secret=`, `password=`), and `key=` when its value looks like a secret.
 //!
 //! Ordinary `key=value` fields stay readable: AFT's structured lines use them
-//! for index keys. Assignment values are masked only for short password names
-//! or when the value itself has a secret-like shape.
+//! for index keys and session identifiers. Short password names are masked in
+//! every log line; value-shape assignment masking is limited to shell commands.
 //!
 //! Shell commands quoted in a log line additionally go through
 //! [`redact_command`], which masks credentials typed inline in a command
@@ -94,9 +94,15 @@ static CREDENTIAL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// `key=` is too generic to mask on its name alone; see [`looks_like_secret`].
 static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([^&\s#"'<>]+)"#));
-// Also protects log lines from older versions that recorded raw commands.
+// Value-shape checks are restricted to explicit shell command text.
 static INLINE_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     compile(r#"\b(([A-Za-z_][A-Za-z0-9_]*)=)("[^"\r\n]+"|'[^'\r\n]+'|[^\s,;&|<>()'"]+)"#)
+});
+// Also protects log lines from older versions that recorded raw commands.
+static SHORT_PASSWORD_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"(?i)\b(((?:[A-Za-z_][A-Za-z0-9_]*_)?(?:PW|PASS))=)("[^"\r\n]+"|'[^'\r\n]+'|[^\s,;&|<>()'"]+)"#,
+    )
 });
 
 /// Mask credentials in `text`. Returns the input unchanged (borrowed) when it
@@ -834,6 +840,13 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
             },
             mapping,
         );
+        out = replace_in(out, None, &INLINE_ASSIGNMENT, |caps: &Captures<'_>| {
+            if looks_like_assignment_secret(caps[3].trim_matches(['\'', '"'])) {
+                masked_assignment(caps)
+            } else {
+                caps[0].to_string()
+            }
+        });
     }
     if command.contains("--") {
         out = replace_in(
@@ -1160,19 +1173,12 @@ fn redact_with_range<'a>(
         out = replace_in(
             out,
             range.as_deref_mut(),
-            &INLINE_ASSIGNMENT,
+            &SHORT_PASSWORD_ASSIGNMENT,
             |caps: &Captures<'_>| {
                 let raw = &caps[3];
                 let value = raw.trim_matches(['\'', '"']);
-                if (is_short_password_name(&caps[2]) && !command_value_is_reference(raw))
-                    || looks_like_assignment_secret(value)
-                {
-                    let quote = if raw.starts_with(['\'', '"']) {
-                        &raw[..1]
-                    } else {
-                        ""
-                    };
-                    format!("{}{quote}{SECRET_PLACEHOLDER}{quote}", &caps[1])
+                if is_short_password_name(&caps[2]) && !value.starts_with(['$', '<']) {
+                    masked_assignment(caps)
                 } else {
                     caps[0].to_string()
                 }
@@ -1180,6 +1186,16 @@ fn redact_with_range<'a>(
         );
     }
     out
+}
+
+fn masked_assignment(caps: &Captures<'_>) -> String {
+    let raw = &caps[3];
+    let quote = if raw.starts_with(['\'', '"']) {
+        &raw[..1]
+    } else {
+        ""
+    };
+    format!("{}{quote}{SECRET_PLACEHOLDER}{quote}", &caps[1])
 }
 
 fn is_short_password_name(key: &str) -> bool {
@@ -1643,7 +1659,7 @@ mod tests {
 
     #[test]
     fn only_json_fields_and_private_keys_match_across_a_newline() {
-        let line_anchored: [(&str, &Regex); 13] = [
+        let line_anchored: [(&str, &Regex); 14] = [
             ("AUTHORIZATION_HEADER", &AUTHORIZATION_HEADER),
             ("API_KEY_HEADER", &API_KEY_HEADER),
             ("AWS_SECRET_FIELD", &AWS_SECRET_FIELD),
@@ -1657,6 +1673,7 @@ mod tests {
             ("CREDENTIAL_QUERY", &CREDENTIAL_QUERY),
             ("KEY_QUERY", &KEY_QUERY),
             ("INLINE_ASSIGNMENT", &INLINE_ASSIGNMENT),
+            ("SHORT_PASSWORD_ASSIGNMENT", &SHORT_PASSWORD_ASSIGNMENT),
         ];
         let samples = [
             "Authorization: Bearer opaque-auth-value".to_string(),
@@ -1841,6 +1858,8 @@ mod tests {
     struct Fixture {
         masked: Vec<MaskedCase>,
         untouched: Vec<String>,
+        command_masked: Vec<MaskedCase>,
+        command_untouched: Vec<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -2356,7 +2375,25 @@ mod tests {
         for input in fixture.untouched {
             let out = aft_redactor(&input);
             assert!(matches!(out, Cow::Borrowed(_)), "mangled: {input} -> {out}");
-            assert_eq!(redact_command(&input), input);
+        }
+    }
+
+    #[test]
+    fn shared_fixture_command_shapes_do_not_redact_structured_fields() {
+        let fixture = fixture();
+        assert!(!fixture.command_masked.is_empty());
+        for case in fixture.command_masked {
+            assert_eq!(aft_redactor(&case.input), case.input);
+            assert_eq!(
+                redact_command(&case.input),
+                case.expected,
+                "command: {}",
+                case.input
+            );
+        }
+        assert!(!fixture.command_untouched.is_empty());
+        for command in fixture.command_untouched {
+            assert_eq!(redact_command(&command), command);
         }
     }
 

@@ -87,6 +87,7 @@ function shouldRedactAssignment(
   value: string,
   offset: number,
   content: string,
+  commandContext: boolean,
 ): boolean {
   // The query-specific pass already decided whether a generic key is secret.
   if (keyName.toLowerCase() === "key" && /[?&]/.test(content[offset - 1] ?? "")) {
@@ -94,8 +95,41 @@ function shouldRedactAssignment(
   }
   return (
     isSensitiveKeyName(keyName) ||
-    (prefix.trimEnd().endsWith("=") && looksLikeAssignmentSecret(value))
+    (commandContext && prefix.trimEnd().endsWith("=") && looksLikeAssignmentSecret(value))
   );
+}
+
+function redactAssignments(content: string, commandContext: boolean): string {
+  let sanitized = content.replace(
+    unquotedSensitiveKeyValuePattern,
+    (
+      match: string,
+      prefix: string,
+      keyName: string,
+      valueQuote: string,
+      value: string,
+      offset: number,
+      input: string,
+    ) =>
+      shouldRedactAssignment(prefix, keyName, value, offset, input, commandContext)
+        ? `${prefix}${valueQuote}${SECRET_PLACEHOLDER}${valueQuote}`
+        : match,
+  );
+  sanitized = sanitized.replace(
+    bareSensitiveKeyValuePattern,
+    (
+      match: string,
+      prefix: string,
+      keyName: string,
+      value: string,
+      offset: number,
+      input: string,
+    ) =>
+      shouldRedactAssignment(prefix, keyName, value, offset, input, commandContext)
+        ? `${prefix}${SECRET_PLACEHOLDER}`
+        : match,
+  );
+  return sanitized;
 }
 
 /**
@@ -131,40 +165,20 @@ export function redactSecrets(content: string): string {
         ? `${prefix}${valueQuote}${SECRET_PLACEHOLDER}${valueQuote}`
         : match,
   );
-  sanitized = sanitized.replace(
-    unquotedSensitiveKeyValuePattern,
-    (
-      match: string,
-      prefix: string,
-      keyName: string,
-      valueQuote: string,
-      value: string,
-      offset: number,
-      content: string,
-    ) =>
-      shouldRedactAssignment(prefix, keyName, value, offset, content)
-        ? `${prefix}${valueQuote}${SECRET_PLACEHOLDER}${valueQuote}`
-        : match,
-  );
-  sanitized = sanitized.replace(
-    bareSensitiveKeyValuePattern,
-    (
-      match: string,
-      prefix: string,
-      keyName: string,
-      value: string,
-      offset: number,
-      content: string,
-    ) =>
-      shouldRedactAssignment(prefix, keyName, value, offset, content)
-        ? `${prefix}${SECRET_PLACEHOLDER}`
-        : match,
-  );
+  sanitized = redactAssignments(sanitized, false);
   sanitized = sanitized.replace(
     /\b([a-z][a-z0-9+.-]*:\/\/)[^@\s/?#]+@/gi,
     `$1${URL_CREDENTIAL_PLACEHOLDER}@`,
   );
   sanitized = sanitized.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "<EMAIL>");
+
+  // Session and request IDs often look like tokens. Only the shell command
+  // after cmd= is eligible for value-shape masking, not the log metadata.
+  sanitized = sanitized.replace(
+    /^([^\r\n]*\bbash spawned task=[^\r\n]*? cmd=)([^\r\n]*)/gm,
+    (_match: string, prefix: string, command: string) =>
+      `${prefix}${redactAssignments(command, true)}`,
+  );
 
   return sanitized;
 }

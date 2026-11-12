@@ -12,7 +12,13 @@ const sharedRedactionCases = JSON.parse(
     new URL("../../../../crates/aft/tests/fixtures/log_redaction_cases.json", import.meta.url),
     "utf8",
   ),
-) as { masked: Array<{ input: string; expected: string }>; untouched: string[] };
+) as {
+  masked: Array<{ input: string; expected: string }>;
+  untouched: string[];
+  command_masked: Array<{ input: string; expected: string }>;
+  command_untouched: string[];
+  command_logs: Array<{ input: string; expected: string }>;
+};
 
 describe("redactSecrets shared fixture", () => {
   test("masks every shared case exactly as the Rust redactor does", () => {
@@ -26,6 +32,22 @@ describe("redactSecrets shared fixture", () => {
     expect(sharedRedactionCases.untouched.length).toBeGreaterThan(0);
     for (const input of sharedRedactionCases.untouched) {
       expect(redactSecrets(input)).toBe(input);
+    }
+  });
+
+  test("masks shared command shapes without masking structured fields", () => {
+    const prefix = "bash spawned task=bgb_test session=ses_abcDEF0123456789 cmd=";
+    expect(sharedRedactionCases.command_masked.length).toBeGreaterThan(0);
+    for (const { input, expected } of sharedRedactionCases.command_masked) {
+      expect(redactSecrets(input)).toBe(input);
+      expect(redactSecrets(`${prefix}${input}`)).toBe(`${prefix}${expected}`);
+    }
+    for (const command of sharedRedactionCases.command_untouched) {
+      expect(redactSecrets(`${prefix}${command}`)).toBe(`${prefix}${command}`);
+    }
+    for (const { input, expected } of sharedRedactionCases.command_logs) {
+      expect(redactSecrets(input)).toBe(expected);
+      expect(sanitizeContent(input)).toBe(expected);
     }
   });
 });
@@ -142,8 +164,8 @@ describe("sanitizeContent", () => {
     expect(sanitizeContent(`${prefix}PW=${secret}${suffix}`)).toBe(
       `${prefix}PW=<REDACTED_SECRET>${suffix}`,
     );
-    expect(sanitizeContent(`PASS=small DB_PW=small DB_PASS=small X=${secret}`)).toBe(
-      "PASS=<REDACTED_SECRET> DB_PW=<REDACTED_SECRET> DB_PASS=<REDACTED_SECRET> X=<REDACTED_SECRET>",
+    expect(sanitizeContent(`${prefix}PASS=small DB_PW=small DB_PASS=small X=${secret}`)).toBe(
+      `${prefix}PASS=<REDACTED_SECRET> DB_PW=<REDACTED_SECRET> DB_PASS=<REDACTED_SECRET> X=<REDACTED_SECRET>`,
     );
     expect(sanitizeContent("PWD=/tmp/x ?key=src_main_rs")).toBe("PWD=/tmp/x ?key=src_main_rs");
   });

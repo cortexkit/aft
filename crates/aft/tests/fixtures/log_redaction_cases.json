@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared by the Rust log redactor (crates/aft/src/log_redact.rs) and the CLI issue sanitizer (packages/aft-cli/src/lib/sanitize.ts). Both must turn every masked input into exactly its expected output and leave every untouched input byte-for-byte unchanged.",
+  "_comment": "Shared by the Rust log redactor (crates/aft/src/log_redact.rs) and the CLI issue sanitizer (packages/aft-cli/src/lib/sanitize.ts). masked/untouched apply to general log text. command_masked/command_untouched apply only to shell command text; command_logs verify spawn-log metadata stays readable. Masked inputs must match their expected output exactly, and untouched inputs must remain byte-for-byte unchanged.",
   "masked": [
     {
       "input": "push failed: ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 rejected",
@@ -62,6 +62,20 @@
       "expected": "pw=<REDACTED_SECRET> pass=<REDACTED_SECRET> db_pw=<REDACTED_SECRET> db_pass=<REDACTED_SECRET> ./run"
     },
     {
+      "input": "PW=-hunter2 PASS=-hunter2 ./run",
+      "expected": "PW=<REDACTED_SECRET> PASS=<REDACTED_SECRET> ./run"
+    },
+    {
+      "input": "bash spawned task=bgb_test cmd=PW=hunter2 curl http://127.0.0.1:4599/api/status",
+      "expected": "bash spawned task=bgb_test cmd=PW=<REDACTED_SECRET> curl http://127.0.0.1:4599/api/status"
+    }
+  ],
+  "command_masked": [
+    {
+      "input": "session=ses_abcDEF0123456789 curl http://127.0.0.1:4599/api/status",
+      "expected": "session=<REDACTED_SECRET> curl http://127.0.0.1:4599/api/status"
+    },
+    {
       "input": "X=Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe ./run",
       "expected": "X=<REDACTED_SECRET> ./run"
     },
@@ -78,12 +92,38 @@
       "expected": "X=<REDACTED_SECRET>|cat"
     }
   ],
+  "command_logs": [
+    {
+      "input": "bash spawned task=bgb_0123456789 pid=1 session=ses_abcDEF0123456789 root=/project cmd=X=Ab3deFghIjklMnopQ curl http://127.0.0.1:4599/api/status",
+      "expected": "bash spawned task=bgb_0123456789 pid=1 session=ses_abcDEF0123456789 root=/project cmd=X=<REDACTED_SECRET> curl http://127.0.0.1:4599/api/status"
+    },
+    {
+      "input": "bash spawned task=bgb_0123456789 pid=1 session=ses_abcDEF0123456789 root=/project cmd=session=ses_abcDEF0123456789 curl http://127.0.0.1:4599/api/status",
+      "expected": "bash spawned task=bgb_0123456789 pid=1 session=ses_abcDEF0123456789 root=/project cmd=session=<REDACTED_SECRET> curl http://127.0.0.1:4599/api/status"
+    }
+  ],
+  "command_untouched": [
+    "PWD=/tmp/x",
+    "SHA=3f2c9a1b7e4d5c6a8b9f0e1d2c3b4a5968778695",
+    "FILE=/tmp/x",
+    "FILE=/tmp/Ab3deFghIjklMnop",
+    "FILE=~/Ab3deFghIjklMnop",
+    "FILE=./Ab3deFghIjklMnop",
+    "FILE=../Ab3deFghIjklMnop",
+    "COUNT=12345678901234567",
+    "URL=https://example.com/a",
+    "URL=https://example.com/Ab3deFghIjklMnop",
+    "WORD=ordinarywordsarenotsecrets",
+    "X=Ab3dEfGhIjKlMnO"
+  ],
   "untouched": [
     "read crates/aft/src/commands/bash.rs:120",
     "log at /tmp/aft/logs/aft-4242.log rotated",
     "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
     "commit 3f2c9a1b7e4d5c6a8b9f0e1d2c3b4a5968778695",
     "index_event plane=callgraph build_id=b1a2c3 session=ses_0123456789abcdef",
+    "task_id=bgb_0123456789 session=ses_abcDEF0123456789",
+    "request_id=req_Ab3deFghIjklMnopQ task_id=bgb_Ab3deFghIjklMnopQ",
     "identifiers ghost_writer github_patterns gh_cli ghp_short",
     "https://github.com/cortexkit/aft/pull/12?tab=files&page=3",
     "https://maps.example.com/api?key=src_main_rs",

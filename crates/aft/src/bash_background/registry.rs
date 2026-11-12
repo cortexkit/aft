@@ -27827,7 +27827,7 @@ mod tests {
         let root = Path::new("/project");
         let durable = |command: &str| -> String {
             let ((), lines) = crate::logging::capture_log_lines(|| {
-                log_bash_spawn("bgb_test", 1, "session", root, command)
+                log_bash_spawn("bgb_0123456789", 1, "ses_abcDEF0123456789", root, command)
             });
             assert_eq!(lines.len(), 1, "{lines:?}");
             crate::log_redact::aft_redactor(&lines[0]).into_owned()
@@ -27882,6 +27882,18 @@ mod tests {
             if !line.ends_with(&format!("cmd={command}")) {
                 problems.push(format!("mangled: {line}"));
             }
+        }
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/log_redaction_cases.json"
+        ))
+        .unwrap();
+        let command_logs = fixture["command_logs"].as_array().unwrap();
+        assert!(!command_logs.is_empty());
+        for case in command_logs {
+            let input = case["input"].as_str().unwrap();
+            let (_, command) = input.split_once(" cmd=").unwrap();
+            let line = durable(command);
+            assert!(line.ends_with(case["expected"].as_str().unwrap()), "{line}");
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
