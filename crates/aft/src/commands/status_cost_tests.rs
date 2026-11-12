@@ -96,6 +96,7 @@ impl Fixture {
             crate::context::App::default_shared(),
             config,
         ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
         ctx.set_canonical_cache_root(root.clone());
         std::fs::create_dir_all(&storage).unwrap();
         let mut db = crate::db::TrackedConnection::open(
