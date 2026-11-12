@@ -65,10 +65,16 @@ describe("issue report path privacy", () => {
   });
 
   test("redacts supplied roots even when cwd is elsewhere and respects path boundaries", () => {
-    const input = `${root}/src ${root}-public/src docs${root}/src src/main.ts`;
+    const input = `${root}/src ${root}-public/src docs${root}/src .${root}/src ..${root}/src src/main.ts`;
     expect(sanitizeContent(input, { ...context, projectRoots: [root] })).toBe(
-      `<PROJECT>/src ${root}-public/src docs${root}/src src/main.ts`,
+      `<PROJECT>/src ${root}-public/src docs${root}/src .${root}/src ..${root}/src src/main.ts`,
     );
+    expect(
+      sanitizeContent(`file://${root}/src file:///home/dev/config`, {
+        ...context,
+        projectRoots: [root],
+      }),
+    ).toBe("file://<PROJECT>/src file://~/config");
   });
 
   test("redacts home paths in cache, storage and config in plain, escaped and encoded forms", () => {
@@ -132,7 +138,7 @@ describe("issue report path privacy", () => {
   test("never reveals a common username by modifying system paths or relative paths", () => {
     const input = [
       "2>/dev/null /proc/dev/status /sys/dev /usr/dev /etc/dev /bin/dev /var/dev /tmp/dev /opt/dev /sbin/dev /run/dev",
-      "dev build src/dev/main.ts ./dev/null relative/home/dev/file docs/Users/dev/file",
+      "dev build src/dev/main.ts ./dev/null relative/home/dev/file docs/Users/dev/file ./home/dev/file ../home/dev/file ./Users/dev/file",
       "%2Fdev%2Fnull \\/dev\\/null C:\\dev\\null",
       "src/main.ts unchanged%20text",
     ].join("\n");

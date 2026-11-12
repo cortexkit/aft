@@ -223,7 +223,7 @@ export function sanitizeContent(content: string, context: SanitizeContext = {}):
   // as dev must never change /dev/null, relative paths, or ordinary prose.
   sanitized = replaceDecoded(
     sanitized,
-    /(?<![\p{L}\p{N}_/])(?:\/(?:home|Users)\/|[A-Za-z]:\/Users\/)([^/\s"'<>`,;:?#&()[\]{}=]+)/gu,
+    /(?:(?<![\p{L}\p{N}_/.-])|(?<=file:\/\/)|(?<=file:\/\/\/))(?:\/(?:home|Users)\/|[A-Za-z]:\/Users\/)([^/\s"'<>`,;:?#&()[\]{}=]+)/gu,
     (match) => ({ offset: match[0].length - match[1].length, value: "<USER>" }),
   );
   return redactUsername(sanitized, username);
@@ -295,7 +295,7 @@ function replacePath(content: string, path: string, value: string): string {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
   if (!normalized) return content;
   const pattern = new RegExp(
-    `(?<![\\p{L}\\p{N}_/])${escapeRegex(normalized)}(?=$|[/\\s"'<>\x60,;:)\\]?#&])`,
+    `(?:(?<![\\p{L}\\p{N}_/.-])|(?<=file://)|(?<=file:///))${escapeRegex(normalized)}(?=$|[/\\s"'<>\x60,;:)\\]?#&])`,
     /^[A-Za-z]:/.test(path) ? "giu" : "gu",
   );
   return replaceDecoded(content, pattern, () => ({ offset: 0, value }));
@@ -361,7 +361,7 @@ export function redactUsername(content: string, username: string): string {
   return replaceDecoded(
     content,
     new RegExp(
-      `(?<![\\p{L}\\p{N}_/])~${escapeRegex(username)}(?![\\p{L}\\p{N}_])|(?<![\\p{L}\\p{N}_/])${escapeRegex(username)}(?=@[\\p{L}\\p{N}])`,
+      `(?<![\\p{L}\\p{N}_/.-])~${escapeRegex(username)}(?![\\p{L}\\p{N}_])|(?<![\\p{L}\\p{N}_/.-])${escapeRegex(username)}(?=@[\\p{L}\\p{N}])`,
       "gu",
     ),
     (match) => ({ offset: match[0].startsWith("~") ? 1 : 0, value: "<USER>" }),
