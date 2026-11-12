@@ -785,6 +785,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "consumer_capabilities",
     },
     ExclusionEntry {
+        file: "subc/held_task_recovery.rs",
+        enclosing_item: "recover",
+        location_or_primitive: "missing root log preview (five examples)",
+        reason: "Bounds an INFO log preview only; the total count is logged and no product result list is cut.",
+    },
+    ExclusionEntry {
         file: "url_fetch.rs",
         enclosing_item: "hash_url",
         location_or_primitive: "URL cache hash prefix",

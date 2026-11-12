@@ -305,10 +305,25 @@ fn recover(
             }
         }
     }
+    let mut empty_count = 0;
+    let mut examples = Vec::new();
     for (root, settled) in missing_roots {
-        log::warn!(
-            "held task startup recovery reason=root_missing root={} settled_entries={settled}",
-            root.display()
+        if settled > 0 {
+            crate::slog_warn!(
+                "held task startup recovery reason=root_missing root={} settled_entries={settled}",
+                root.display()
+            );
+        } else {
+            empty_count += 1;
+            if examples.len() < 5 {
+                examples.push(root.display().to_string());
+            }
+        }
+    }
+    if empty_count > 0 {
+        crate::slog_info!(
+            "held task startup recovery: {empty_count} task roots no longer exist and had nothing to settle (e.g. {})",
+            examples.join(", ")
         );
     }
     Ok(replayed.into_iter().collect())
@@ -659,6 +674,90 @@ pub(crate) mod tests {
             0,
             "missing roots must not start a registry worker"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_roots_log_settlements_and_one_bounded_empty_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        let ctx = context(dir.path(), &storage);
+        let mut held = Vec::new();
+        let mut empty_roots = Vec::new();
+        for i in 0..10 {
+            // Two sessions share one empty root, which must be counted only once.
+            let root_index = if i == 9 { 2 } else { i };
+            let root = dir.path().join(format!("missing-{root_index:02}"));
+            let session = format!("worker-{i}");
+            let task = format!("bash-{i:016x}");
+            let layout = crate::bash_background::persistence::create_task_layout(
+                &ctx.harness_dir(),
+                &session,
+                &task,
+            )
+            .unwrap();
+            let mut metadata = crate::bash_background::persistence::PersistedTask::starting(
+                task,
+                session,
+                "lost command".into(),
+                root.clone(),
+                Some(root.clone()),
+                None,
+                true,
+                false,
+            );
+            metadata.status = crate::bash_background::BgTaskStatus::Running;
+            metadata.harness = Some("runner".into());
+            write_task_at(&layout, &metadata).unwrap();
+            if i < 2 {
+                held.push((root, hold_task(&ctx, &layout, &format!("held-{i}"))));
+            } else {
+                crate::db::bash_tasks::upsert_bash_task(
+                    &ctx.db().unwrap().lock().unwrap(),
+                    &metadata.to_bash_task_row("runner", &layout.paths).unwrap(),
+                )
+                .unwrap();
+                if i != 9 {
+                    empty_roots.push(root);
+                }
+            }
+        }
+        let executor = Arc::new(Executor::new());
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            recover(&ctx.app(), &executor, &senders(), &storage)
+        });
+        assert!(result.unwrap().is_empty());
+        let recovery_logs: Vec<_> = logs
+            .iter()
+            .filter(|line| line.contains("held task startup recovery"))
+            .collect();
+        assert_eq!(recovery_logs.len(), 3, "{recovery_logs:?}");
+        for (root, key) in &held {
+            let expected = format!(
+                "WARN held task startup recovery reason=root_missing root={} settled_entries=1",
+                root.display()
+            );
+            assert_eq!(
+                recovery_logs
+                    .iter()
+                    .filter(|line| line.as_str() == expected)
+                    .count(),
+                1
+            );
+            let row = ledger::get(&ctx.db().unwrap().lock().unwrap(), key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, ledger::State::Settled);
+            assert_eq!(row.frame.unwrap().body, ledger::unknown_held_result().body);
+        }
+        let summary = recovery_logs
+            .iter()
+            .find(|line| line.starts_with("INFO "))
+            .unwrap();
+        assert!(summary.contains("7 task roots no longer exist and had nothing to settle"));
+        for (index, root) in empty_roots.iter().enumerate() {
+            assert_eq!(summary.contains(&root.display().to_string()), index < 5);
+        }
     }
 
     #[tokio::test]
