@@ -1600,7 +1600,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     // Off-loop queries run concurrently with maintenance. An empty pass moves
     // no events, so it must not mark their answer incomplete. Leave later
     // arrivals in the channel for the next guarded pass.
-    if !ctx.watcher_drain_has_work() {
+    if !ctx.watcher_drain_has_work_waiting_for_continuation() {
         ctx.tick_tier2_refresh_scheduler(0);
         return outcome;
     }

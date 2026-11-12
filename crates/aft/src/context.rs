@@ -2157,13 +2157,15 @@ pub struct QueryPendingChanges {
     pub callgraph: CallgraphUnappliedChanges,
 }
 
-/// Points between two stage reads of [`AppContext::pending_changes_for_query`]
-/// where a test can move a file one stage downstream.
+/// Points in pending-change capture where a test can move work downstream or
+/// release a concurrent metadata reader before the capture continues.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PendingCaptureBoundary {
     /// After the flush-window set, before the dispatch channel and drain.
     AfterFlushWindow,
+    /// After probing the continuation mutex, before waiting for its metadata.
+    AfterContinuationProbe,
 }
 
 #[cfg(test)]
@@ -2216,18 +2218,6 @@ fn pending_capture_boundary_for_test(boundary: PendingCaptureBoundary) {
 pub(crate) struct WatcherDrainGuard<'a> {
     in_flight: &'a AtomicUsize,
     activity: &'a AtomicU64,
-}
-
-fn trace_watcher_pending(pending: bool, reason: &str) -> bool {
-    #[cfg(feature = "test-hooks")]
-    if pending && std::env::var_os("AFT_TEST_WATCHER_PENDING_TRACE").is_some() {
-        eprintln!(
-            "watcher pending {:?}: {reason}",
-            std::thread::current().id()
-        );
-    }
-    let _ = reason;
-    pending
 }
 
 impl Drop for WatcherDrainGuard<'_> {
@@ -5905,38 +5895,48 @@ impl AppContext {
     /// use `try_lock` and treat contention as pending work. The verification
     /// registry lock must never cover per-view locks or I/O.
     pub fn watcher_drain_has_work(&self) -> bool {
-        let cleanup_pending = self.deleted_root_cleanup.try_lock().map_or_else(|| trace_watcher_pending(true, "cleanup_lock_busy"), |cleanup| {
-            trace_watcher_pending(matches!(
+        self.watcher_drain_has_work_inner(false)
+    }
+
+    /// Confirm the continuation portion of query capture and drain admission:
+    /// another reader of that metadata is not evidence of unapplied changes.
+    /// Drains take the continuation out before doing I/O, so waiting for this
+    /// slot cannot wait for a drain to apply its files. Receiver and cleanup
+    /// locks can cover I/O and retain their conservative probes. The frame-loop
+    /// scheduler keeps the fully nonblocking probe above.
+    pub(crate) fn watcher_drain_has_work_waiting_for_continuation(&self) -> bool {
+        self.watcher_drain_has_work_inner(true)
+    }
+
+    fn watcher_drain_has_work_inner(&self, wait_for_continuation: bool) -> bool {
+        let cleanup_pending = self.deleted_root_cleanup.try_lock().is_none_or(|cleanup| {
+            matches!(
                 *cleanup,
                 Some(DeletedRootCleanup::Pending(generation) | DeletedRootCleanup::Inconclusive(generation))
                     if generation == self.configure_generation()
-            ), "cleanup_state")
-        });
-        let receiver_pending = self.watcher_rx.try_lock().map_or_else(
-            || trace_watcher_pending(true, "receiver_lock_busy"),
-            |slot| {
-                trace_watcher_pending(
-                    slot.as_ref().is_some_and(|rx| !rx.is_empty()),
-                    "receiver_events",
-                )
-            },
-        );
-        cleanup_pending
-            || receiver_pending
-            || self.watcher_drain_slice.try_lock().map_or_else(
-                || trace_watcher_pending(true, "slice_lock_busy"),
-                |slot| {
-                    slot.as_ref().is_some_and(|state| {
-                        trace_watcher_pending(state.has_pending_work(), "slice_work")
-                            || trace_watcher_pending(
-                                state.ignore_refresh_due.is_some_and(|due| {
-                                    crate::runtime_drain::ignore_rule_refresh_now() >= due
-                                }),
-                                "ignore_refresh_due",
-                            )
-                    })
-                },
             )
+        });
+        let receiver_pending = self
+            .watcher_rx
+            .try_lock()
+            .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
+        cleanup_pending || receiver_pending || {
+            let slot = self.watcher_drain_slice.try_lock();
+            #[cfg(test)]
+            if wait_for_continuation {
+                pending_capture_boundary_for_test(PendingCaptureBoundary::AfterContinuationProbe);
+            }
+            let slot =
+                slot.or_else(|| wait_for_continuation.then(|| self.watcher_drain_slice.lock()));
+            slot.is_none_or(|slot| {
+                slot.as_ref().is_some_and(|state| {
+                    state.has_pending_work()
+                        || state.ignore_refresh_due.is_some_and(|due| {
+                            crate::runtime_drain::ignore_rule_refresh_now() >= due
+                        })
+                })
+            })
+        }
     }
 
     pub fn lsp_drain_has_work(&self) -> bool {
@@ -5968,20 +5968,12 @@ impl AppContext {
                 counters.into_inner().query_delivery_pending()
             }
             // Contended: assume events may be held, as the probes below do.
-            Err(std::sync::TryLockError::WouldBlock) => {
-                trace_watcher_pending(true, "intake_lock_busy")
-            }
+            Err(std::sync::TryLockError::WouldBlock) => true,
         };
-        trace_watcher_pending(intake_pending, "query_intake")
-            || trace_watcher_pending(self.watcher_drain_has_work(), "query_drain_work")
-            || trace_watcher_pending(
-                self.watcher_drains_in_flight.load(Ordering::Acquire) > 0,
-                "query_in_flight",
-            )
-            || trace_watcher_pending(
-                self.watcher_drain_activity.load(Ordering::Acquire) != activity,
-                "query_activity_changed",
-            )
+        intake_pending
+            || self.watcher_drain_has_work_waiting_for_continuation()
+            || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
+            || self.watcher_drain_activity.load(Ordering::Acquire) != activity
     }
 
     /// Changes still held by the watcher when an answer starts, including
@@ -13833,6 +13825,89 @@ mod callgraph_store_for_ops_tests {
                 activity,
                 "an empty maintenance pass must not mark a concurrent grep incomplete"
             );
+            assert!(!ctx.watcher_query_has_pending_changes());
+        }
+    }
+
+    fn with_contended_watcher_continuation<T>(
+        ctx: &Arc<AppContext>,
+        capture: impl FnOnce() -> T,
+    ) -> T {
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (unlocked_tx, unlocked_rx) = std::sync::mpsc::sync_channel(1);
+        let reader_ctx = Arc::clone(ctx);
+        let reader = std::thread::spawn(move || {
+            reader_ctx.hold_maintenance_probe_lock_for_test(
+                MaintenanceProbeLock::WatcherDrainSlice,
+                || {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                },
+            );
+            unlocked_tx.send(()).unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(ctx.watcher_drain_has_work(), "the scheduler must not wait");
+        let probe_ctx = Arc::clone(ctx);
+        let hook = install_pending_capture_hook_for_test(move |boundary| {
+            if boundary == PendingCaptureBoundary::AfterContinuationProbe {
+                // The capture has already observed contention. Release only
+                // the reader; the parked continuation itself is unchanged.
+                assert!(probe_ctx.watcher_drain_slice().try_lock().is_none());
+                release_tx.send(()).unwrap();
+                unlocked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        });
+        let result = capture();
+        drop(hook);
+        reader.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn watcher_query_reads_contended_continuation_instead_of_inventing_changes() {
+        let (_dirs, ctx) = cold_build_context();
+        for parked in [false, true] {
+            for pending in [false, true] {
+                if pending && !parked {
+                    continue;
+                }
+                let mut state = WatcherDrainSliceState::new(
+                    ctx.configure_generation(),
+                    ctx.configure_content_generation(),
+                );
+                if pending {
+                    state.pending_paths.insert(PathBuf::from("src/lib.rs"));
+                }
+                *ctx.watcher_drain_slice().lock() = parked.then_some(state);
+                let actual = with_contended_watcher_continuation(&ctx, || {
+                    ctx.watcher_query_has_pending_changes()
+                });
+                assert_eq!(actual, pending, "parked={parked}, pending={pending}");
+            }
+        }
+    }
+
+    #[test]
+    fn watcher_drain_does_not_fence_contended_empty_continuation() {
+        let (_dirs, ctx) = cold_build_context();
+        ctx.set_canonical_cache_root(
+            std::fs::canonicalize(ctx.config().project_root.as_ref().unwrap()).unwrap(),
+        );
+        for parked in [false, true] {
+            *ctx.watcher_drain_slice().lock() = parked.then(|| {
+                WatcherDrainSliceState::new(
+                    ctx.configure_generation(),
+                    ctx.configure_content_generation(),
+                )
+            });
+            let activity = ctx.watcher_drain_activity.load(Ordering::Acquire);
+            let outcome = with_contended_watcher_continuation(&ctx, || {
+                crate::runtime_drain::drain_watcher_events_bounded(&ctx, 1)
+            });
+            assert_eq!(outcome, crate::runtime_drain::DrainBatchOutcome::default());
+            assert_eq!(ctx.watcher_drain_activity.load(Ordering::Acquire), activity);
             assert!(!ctx.watcher_query_has_pending_changes());
         }
     }
