@@ -18,6 +18,24 @@ fn trace_sql(sql: &str) {
     SQL.with(|statements| statements.borrow_mut().push(sql.to_string()));
 }
 
+fn db_page_reads(ctx: &AppContext) -> (i32, i32) {
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    let read = |operation| {
+        let (mut current, mut high) = (0, 0);
+        // The connection mutex keeps the SQLite handle live and exclusively held.
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_db_status(conn.handle(), operation, &mut current, &mut high, 1)
+        };
+        assert_eq!(code, rusqlite::ffi::SQLITE_OK);
+        current
+    };
+    (
+        read(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT),
+        read(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS),
+    )
+}
+
 pub(super) struct PushCost(Option<ThreadCpuSample>);
 
 impl PushCost {
@@ -81,7 +99,7 @@ impl Fixture {
         ctx.set_canonical_cache_root(root.clone());
         std::fs::create_dir_all(&storage).unwrap();
         let mut db = crate::db::TrackedConnection::open(
-            storage.join("aft.db"),
+            &storage.join("aft.db"),
             crate::db::SqliteStore::AftDb,
         )
         .unwrap();
@@ -111,9 +129,13 @@ impl Fixture {
         db.execute_batch("COMMIT").unwrap();
         db.trace(Some(trace_sql));
         ctx.set_db(Arc::new(std::sync::Mutex::new(db)));
-        let checkout =
-            DataCheckout::open_planes(&root, &storage, None, crate::data_layer::Planes::ALL)
-                .unwrap();
+        let checkout = DataCheckout::open_planes(
+            &root,
+            &storage,
+            None,
+            crate::data_layer::checkout::Planes::ALL,
+        )
+        .unwrap();
         assert!(matches!(
             checkout.fresh_view(Duration::from_secs(120)),
             Fresh::Ready(_)
@@ -170,6 +192,7 @@ impl Fixture {
 fn status_push_filled_store_cost_probe() {
     let fixture = Fixture::new(256);
     for edited in [false, true] {
+        db_page_reads(&fixture.ctx);
         SQL.with(|statements| statements.borrow_mut().clear());
         COSTS.with(|costs| *costs.borrow_mut() = Some(BTreeMap::new()));
         let mut cpu = Duration::ZERO;
@@ -195,11 +218,17 @@ fn status_push_filled_store_cost_probe() {
             *grouped.entry(sql).or_insert(0usize) += 1;
         }
         eprintln!("SQL across 50 pushes: {grouped:?}");
+        eprintln!(
+            "SQLite page-cache hits/misses across 50 pushes: {:?}",
+            db_page_reads(&fixture.ctx)
+        );
     }
     let (sender, receiver) = std::sync::mpsc::channel();
-    fixture.ctx.set_progress_sender(Some(Arc::new(move |frame| {
-        let _ = sender.send(frame);
-    })));
+    fixture
+        .ctx
+        .set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            let _ = sender.send(frame);
+        }))));
     fixture.ctx.bind_status_context();
     let start = Instant::now();
     let before = fixture
