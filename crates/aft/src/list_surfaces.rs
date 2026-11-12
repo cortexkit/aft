@@ -929,6 +929,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal LRU database reclamation, not result lists; every deletion rechecks references and live holds and insufficient reclaim preserves the device-space refusal",
     },
     ExclusionEntry {
+        file: "gh_shim/ticket_repository.rs",
+        enclosing_item: "Cache::insert",
+        location_or_primitive: "MAX_ROOTS",
+        reason: "internal repository snapshot LRU, not a result list; eviction recomputes the binding from Git on the next ticket rather than omitting a repository",
+    },
+    ExclusionEntry {
         file: "cache_location.rs",
         enclosing_item: "candidates_and_durable, candidates_and_durable_with_budget, deletion_protections, deletion_protections_with_budget, retention_protections_with_budget, ensure_cache_idle",
         location_or_primitive: "RepairBudget",

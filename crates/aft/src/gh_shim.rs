@@ -37,6 +37,7 @@ mod manifest_wire;
 mod native_guard;
 pub(crate) mod read_contract;
 mod rename_guard;
+mod ticket_repository;
 mod v22_rows;
 mod v23_queue;
 mod worker_reads;
@@ -3509,49 +3510,8 @@ pub(crate) fn seed_worker_state(root: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn ticket_repository_snapshot(project_root: &Path) -> Option<String> {
-    if !project_root.is_dir() {
-        return None;
-    }
-    let git = which::which("git").ok()?;
-    let command = || {
-        let mut command = Command::new(&git);
-        command.env_clear().env("GIT_CONFIG_NOSYSTEM", "1");
-        #[cfg(windows)]
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            command.env("SystemRoot", root);
-        }
-        command
-    };
-    let output = command()
-        .arg("-C")
-        .arg(project_root)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let common = PathBuf::from(std::str::from_utf8(&output.stdout).ok()?.trim());
-    if !common.is_absolute() {
-        return None;
-    }
-    // Read the primary repository's config, not a worktree-specific override.
-    // The resulting name is saved in the daemon's ticket registry before exec.
-    let output = command()
-        .args(["config", "--no-includes", "--file"])
-        .arg(common.join("config"))
-        .args(["--get", "remote.origin.url"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    canonical_repository_key(std::str::from_utf8(&output.stdout).ok()?.trim())
+    ticket_repository::snapshot(project_root)
 }
-
-#[cfg(test)]
-#[path = "gh_shim/ticket_repository_tests.rs"]
-mod ticket_repository_tests;
 
 /// The target's binding, else the checkout's.
 ///
