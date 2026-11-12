@@ -1425,6 +1425,13 @@ pub(crate) struct RegistryInner {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    #[cfg(all(test, unix))]
+    before_watchdog_registration: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<String>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     #[cfg(test)]
     before_promotion_commit:
         Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -1448,6 +1455,8 @@ pub(crate) struct RegistryInner {
     pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     #[cfg(test)]
     reclaim_kill_attempts: AtomicUsize,
+    #[cfg(test)]
+    process_group_sample_count: AtomicUsize,
     #[cfg(test)]
     completion_processing_attempts: AtomicUsize,
     #[cfg(test)]
@@ -2120,6 +2129,8 @@ impl BgTaskRegistry {
                 background_admission: Mutex::new(()),
                 #[cfg(all(test, unix))]
                 before_bootstrap_release: Mutex::new(None),
+                #[cfg(all(test, unix))]
+                before_watchdog_registration: Mutex::new(None),
                 #[cfg(test)]
                 before_promotion_commit: Mutex::new(None),
                 tasks: Mutex::new(HashMap::new()),
@@ -2135,6 +2146,8 @@ impl BgTaskRegistry {
                 watchdog_tasks: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 reclaim_kill_attempts: AtomicUsize::new(0),
+                #[cfg(test)]
+                process_group_sample_count: AtomicUsize::new(0),
                 #[cfg(test)]
                 completion_processing_attempts: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -3332,7 +3345,13 @@ impl BgTaskRegistry {
     fn sample_task_process_group(&self, task: &Arc<BgTask>) -> Option<GroupListing> {
         let pgid = task.lock_state().ok().map(|state| state.metadata.pgid)?;
         let sample = match pgid {
-            Some(pgid) => live_process_group_members(pgid),
+            Some(pgid) => {
+                #[cfg(test)]
+                self.inner
+                    .process_group_sample_count
+                    .fetch_add(1, Ordering::SeqCst);
+                live_process_group_members(pgid)
+            }
             None => Err(LiveDescendantsUnavailable::without_group()),
         };
         let mut db = DeferredDbWrites::new(self, task);
@@ -5899,14 +5918,15 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
+        #[cfg(all(test, unix))]
+        self.wait_before_watchdog_registration_for_test(&task_id);
         self.inner
             .cleanup_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(task_id.clone());
-        // Scope discovery and revocation enumerate the watchdog map. Publish
-        // there before releasing the wrapper so a close cannot miss a command
-        // that has already started but whose spawn dispatch has not returned.
+        // Register watchdog monitoring before releasing the wrapper so timeout
+        // and exit observation do not lag behind command execution.
         self.inner
             .watchdog_tasks
             .lock()
@@ -12604,10 +12624,22 @@ impl BgTaskRegistry {
     /// Find live shell tasks with a persisted daemon scope identity. Keep
     /// this off the subc frame loop: locks and process sampling may block.
     pub(crate) fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
+        // Snapshot in spawn's publication order without holding both locks.
+        let published = self.task_arcs();
+        let mut candidates = self.running_tasks();
+        let mut seen: HashSet<_> = candidates.iter().map(|task| task.task_id.clone()).collect();
+        for task in published {
+            // A caller can find a new task before watchdog registration. Include
+            // those nonterminal tasks, not retired terminal history that would
+            // otherwise require extra process-group samples.
+            if !seen.contains(&task.task_id) && !task.is_terminal() {
+                seen.insert(task.task_id.clone());
+                candidates.push(task);
+            }
+        }
         // Only unix extends the task scopes with secret proxy authorizations.
         #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut scopes: Vec<_> = self
-            .running_tasks()
+        let mut scopes: Vec<_> = candidates
             .into_iter()
             .filter_map(|task| {
                 let scope = task.lock_state().ok()?.metadata.scope.clone()?;
@@ -15756,6 +15788,47 @@ impl BgTaskRegistry {
             .lock()
             .map(|tasks| tasks.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_watchdog_registration_for_test(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<String>, impl Drop) {
+        struct Release(std::sync::mpsc::Sender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let previous = self
+            .inner
+            .before_watchdog_registration
+            .lock()
+            .unwrap()
+            .replace((arrived, released));
+        assert!(
+            previous.is_none(),
+            "watchdog registration is already paused"
+        );
+        (arrival, Release(release))
+    }
+
+    #[cfg(all(test, unix))]
+    fn wait_before_watchdog_registration_for_test(&self, task_id: &str) {
+        let gate = self
+            .inner
+            .before_watchdog_registration
+            .lock()
+            .unwrap()
+            .take();
+        if let Some((arrived, release)) = gate {
+            let _ = arrived.send(task_id.to_string());
+            release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("watchdog registration test controller");
+        }
     }
 
     #[cfg(all(test, unix))]
@@ -19100,6 +19173,59 @@ mod tests {
             task.lock_state().unwrap().terminal_output_cache = None;
             assert_eq!(registry.estimated_memory().estimated_bytes, Some(0));
         }
+    }
+
+    #[test]
+    fn live_scope_stamps_skips_terminal_history_outside_watchdog() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "owner".into(),
+            },
+            "retained",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_owner_authorized(true);
+        // Unknown descendants require a process-group sample if retained pipe
+        // history is mistakenly included in scope discovery.
+        for _ in 0..200 {
+            let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+            let mut state = task.lock_state().unwrap();
+            assert_eq!(state.metadata.mode, BgMode::Pipes);
+            state.metadata.scope = Some(scope.clone());
+            state.metadata.pgid = Some(i32::MAX);
+            state.metadata.live_descendants = None;
+        }
+        assert_eq!(registry.task_arcs().len(), 200);
+        assert!(registry.running_tasks().is_empty());
+        assert!(registry.live_scope_stamps().is_empty());
+        assert_eq!(
+            registry
+                .inner
+                .process_group_sample_count
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        // Watchdog-owned terminal candidates still need the original liveness
+        // check. This also proves the counter observes a sampling attempt.
+        let task = registry.task_arcs().pop().unwrap();
+        registry
+            .inner
+            .watchdog_tasks
+            .lock()
+            .unwrap()
+            .insert(task.task_id.clone(), task);
+        let _ = registry.live_scope_stamps();
+        assert_eq!(
+            registry
+                .inner
+                .process_group_sample_count
+                .load(Ordering::SeqCst),
+            1
+        );
     }
 
     pub(super) fn insert_terminal_piped_task(

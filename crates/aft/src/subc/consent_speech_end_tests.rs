@@ -371,6 +371,10 @@ async fn audit_started_shell_is_killed_by_scope_cleanup_and_never_not_started() 
         .update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
     let mut run = program(&f, false, "run:audit-started-shell-end");
     let mut end_control = ScopeEndControl::bind_live(&mut run).await;
+    let (published, registration_gate) = f
+        .ctx
+        .bash_background()
+        .pause_watchdog_registration_for_test();
     let (command, _) = gated_command(&run.project_root);
     let mut replies = f
         .send_tool(
@@ -381,7 +385,13 @@ async fn audit_started_shell_is_killed_by_scope_cleanup_and_never_not_started() 
             shell_dispatch,
         )
         .await;
+    let published_task = tokio::time::timeout(Duration::from_secs(10), published)
+        .await
+        .unwrap()
+        .unwrap();
     let task = task_for(&f, &run, 9443).await;
+    assert_eq!(task, published_task);
+    assert!(f.ctx.bash_background().running_tasks().is_empty());
     let _kill = KillTask(
         f.ctx.bash_background().clone(),
         task.clone(),
@@ -402,7 +412,20 @@ async fn audit_started_shell_is_killed_by_scope_cleanup_and_never_not_started() 
     );
     let stamp = run.scope.as_ref().unwrap();
     describes.goodbye(stamp.clone());
-    let request = end_control.next().await;
+    // Goodbye must see the addressable task before watchdog registration, not
+    // wait for the 60-second periodic scope scan to discover it later.
+    let request = tokio::time::timeout(Duration::from_secs(2), end_control.next())
+        .await
+        .expect("Goodbye describes a task before watchdog registration");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request.body).unwrap(),
+        serde_json::to_value(subc_protocol::session::ModuleControlRequestFromModule::ScopeDescribe {
+            owner: stamp.owner.clone(),
+            scope_ref: stamp.scope_ref.clone(),
+        })
+        .unwrap()
+    );
+    drop(registration_gate);
     end_control.reply(&request, subc_protocol::scope::ScopeStatus::Ended, stamp);
     tokio::time::timeout(Duration::from_secs(10), ended.recv())
         .await
