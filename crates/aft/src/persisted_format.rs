@@ -756,6 +756,18 @@ pub(crate) fn try_floor_refusal_counts() -> Option<std::collections::BTreeMap<St
     Some(counts)
 }
 
+/// Whether a reader-floor refusal for `store` stands for any storage root.
+/// While none does, [`gate`] can refuse an artifact only for its own version,
+/// so a reader re-checking an artifact it has already gated, unchanged, need
+/// not resolve which storage root owns it.
+pub(crate) fn has_floor_refusal(store: PersistedStore) -> bool {
+    with_registry(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.refusal.store == store && !entry.refusal.source.is_artifact())
+    })
+}
+
 fn with_registry<T>(f: impl FnOnce(&mut Vec<Entry>) -> T) -> T {
     let mut guard = registry()
         .lock()

@@ -16,16 +16,18 @@
 //! stamp (file identity, size and modification time) differs from the stamp the
 //! parse was taken from. Writers always publish `meta.json` by renaming a fresh
 //! temporary file over it, so every rewrite changes the file identity even when
-//! the size and modification time stay the same. Every other check that decides
-//! whether a stack counts (live-database aliasing, format and reader-floor
-//! gates, path identity, entry count) still runs on every pass, so the count is
-//! the one the full discovery would report.
+//! the size and modification time stay the same. Live-database aliasing is
+//! checked on every pass. The format gate, whose storage-root resolution is the
+//! most expensive step of the whole pass, runs fully for each newly parsed file
+//! and again only when its outcome could have changed; see the comment where it
+//! is called. The count is therefore the one the full discovery would report.
 
 use super::{
     check_backup_meta_version, is_loadable_backup_path, meta_entry_count, refuse_live_history_file,
     AftError, BackupIoBudget, DiskMeta,
 };
 use crate::file_identity::FileIdentity;
+use crate::persisted_format::{PersistedStore, UnsupportedPersistedFormat};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -49,13 +51,15 @@ pub(super) struct DiscoveryLimits {
 #[derive(Debug, Clone)]
 struct ParsedStackMeta {
     schema_version: Option<u64>,
-    path: Option<String>,
+    /// The recorded path, and whether it hashes to the stack directory's name
+    /// (a pure function of the two, so it is decided once per parse).
+    path: Option<(String, bool)>,
     count: Option<usize>,
 }
 
 impl ParsedStackMeta {
     /// The caller has already refused live-database aliases for `meta_path`.
-    fn read(meta_path: &Path) -> Result<Self, AftError> {
+    fn read(meta_path: &Path, path_dir: &Path) -> Result<Self, AftError> {
         let io_error = |message: String| AftError::IoError {
             path: meta_path.display().to_string(),
             message,
@@ -71,7 +75,10 @@ impl ParsedStackMeta {
             path: meta
                 .get("path")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+                .map(|path| {
+                    let loadable = is_loadable_backup_path(Path::new(path), path_dir);
+                    (path.to_string(), loadable)
+                }),
             count: meta_entry_count(&meta),
         })
     }
@@ -298,8 +305,10 @@ fn discover_into(
             message,
         };
         refuse_live_history_file(&meta_path).map_err(|error| meta_error(error.to_string()))?;
-        let meta = match cache.as_deref_mut() {
-            None => ParsedStackMeta::read(&meta_path)?,
+        // `fresh` is false only when this exact published file was parsed and
+        // fully gated by an earlier pass.
+        let (meta, fresh) = match cache.as_deref_mut() {
+            None => (ParsedStackMeta::read(&meta_path, &path_dir)?, true),
             Some(cache) => {
                 let stamp = MetaStamp {
                     identity,
@@ -309,8 +318,8 @@ fn discover_into(
                 let cached = previous
                     .remove(&path_dir)
                     .filter(|cached| cached.stamp == stamp);
-                let cached = match cached {
-                    Some(cached) => cached,
+                let (cached, fresh) = match cached {
+                    Some(cached) => (cached, false),
                     None => {
                         #[cfg(test)]
                         {
@@ -318,26 +327,40 @@ fn discover_into(
                         }
                         #[cfg(not(test))]
                         let _ = cache;
-                        CachedStackMeta {
-                            stamp,
-                            meta: ParsedStackMeta::read(&meta_path)?,
-                        }
+                        let meta = ParsedStackMeta::read(&meta_path, &path_dir)?;
+                        (CachedStackMeta { stamp, meta }, true)
                     }
                 };
                 let meta = cached.meta.clone();
                 reached.insert(path_dir.clone(), cached);
-                meta
+                (meta, fresh)
             }
         };
-        check_backup_meta_version(&meta_path, meta.schema_version)
-            .map_err(|refusal| meta_error(refusal.to_string()))?;
-        let path_str = meta
+        // The full format gate resolves which storage root owns the file,
+        // which costs far more than everything else here. For a file an
+        // earlier pass already gated, the outcome can differ only through a
+        // reader-floor refusal recorded since (checked here process-wide) or a
+        // version this build does not read (a pure check). Its other effect,
+        // forgetting a stale refusal recorded for this file, already happened
+        // when the file was first gated, and a refusal is only ever recorded
+        // for a file whose own version is too new.
+        let regate = fresh
+            || crate::persisted_format::has_floor_refusal(PersistedStore::BackupMeta)
+            || meta.schema_version.is_some_and(|version| {
+                UnsupportedPersistedFormat::check(PersistedStore::BackupMeta, &meta_path, version)
+                    .is_some()
+            });
+        if regate {
+            check_backup_meta_version(&meta_path, meta.schema_version)
+                .map_err(|refusal| meta_error(refusal.to_string()))?;
+        }
+        let (path_str, loadable) = meta
             .path
             .ok_or_else(|| meta_error("backup meta missing path".to_string()))?;
-        let key = PathBuf::from(path_str);
-        if !is_loadable_backup_path(&key, &path_dir) {
+        if !loadable {
             continue;
         }
+        let key = PathBuf::from(path_str);
         let count = meta
             .count
             .ok_or_else(|| meta_error("backup meta missing entry count".to_string()))?;

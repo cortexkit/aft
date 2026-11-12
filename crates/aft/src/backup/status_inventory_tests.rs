@@ -225,6 +225,37 @@ fn status_inventory_rereads_metadata_replaced_with_same_size_and_mtime() {
 }
 
 #[test]
+fn status_inventory_regates_cached_metadata_after_a_reader_floor_refusal() {
+    use crate::persisted_format::{self, PersistedStore, UnsupportedPersistedFormat};
+    let (mut store, temp, paths) = store_with_files(2);
+    for path in &paths {
+        store.snapshot(SESSION, path, "create").unwrap();
+    }
+    store.release_session_memory(SESSION);
+    assert_eq!(store.status_inventory(SESSION).tracked_file_count(), 2);
+    let parses = store.status_meta_parses_for_test();
+
+    // A newer build raised this storage root's reader floor for backup
+    // metadata. Discovery now fails, and both counts fall back to the
+    // (released, so empty) resident keys even though no file changed.
+    let storage = temp.path().join("storage");
+    let refusal = UnsupportedPersistedFormat::floor(
+        PersistedStore::BackupMeta,
+        storage.join("reader-floor.json"),
+        999,
+    );
+    persisted_format::record(&refusal, &storage);
+    let refused = (
+        store.tracked_files(SESSION).len(),
+        store.status_inventory(SESSION).tracked_file_count(),
+    );
+    persisted_format::replace_floor_refusals(&storage, &[]);
+    assert_eq!(refused, (0, 0));
+    assert_eq!(store.status_meta_parses_for_test(), parses);
+    assert_eq!(store.status_inventory(SESSION).tracked_file_count(), 2);
+}
+
+#[test]
 fn status_inventory_cache_is_freed_with_session_memory() {
     let (mut store, _temp, paths) = store_with_files(2);
     for path in &paths {
