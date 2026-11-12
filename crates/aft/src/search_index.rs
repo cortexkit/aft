@@ -3673,8 +3673,8 @@ pub(crate) struct LargeGrepFile {
     pub(crate) head: Vec<u8>,
 }
 
-/// Open a grep input and reject the same binary prefix as a completed grep
-/// read before reserving its body. A text file is then read whole, except
+/// Open a grep input and check its first 1,024 bytes for binary data before
+/// reserving the rest of the file. A text file is then read whole, except
 /// that one whose size at open is a large read, when `stream` says the scan
 /// can read it in steps, is returned open instead. Admission, the binary
 /// check and the deadline are the same either way.

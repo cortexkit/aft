@@ -1,4 +1,4 @@
-//! Reading large files in fixed steps instead of whole (#1432).
+//! Reading large files in fixed steps instead of reading each file whole.
 //!
 //! Search and grep used to read every candidate file whole, on every search
 //! thread at once, so a few growing multi-hundred-megabyte logs gave
