@@ -3518,8 +3518,8 @@ mod deferred_semantic_search_tests {
             let edited = dispatch(
                 request(
                     "preceding-edit",
-                    "edit",
-                    serde_json::json!({"path": file, "edits": [{"oldString": "before", "newString": "after"}]}),
+                    "write",
+                    serde_json::json!({"path": file, "content": "after\n"}),
                 ),
                 &ctx,
             );
