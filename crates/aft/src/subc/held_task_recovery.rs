@@ -24,6 +24,12 @@ const RUNNER_PAGE: &str = "SELECT harness,session_id,cwd,task_id,metadata,
       AND (harness,project_key,started_at,task_id,rowid)>(?1,?2,?3,?4,?5)
     ORDER BY harness,project_key,started_at,task_id,rowid LIMIT ?6";
 
+#[cfg(test)]
+thread_local! {
+    // The offline benchmark starts cleanup only after recovery owns the mutex.
+    static FIRST_RECOVERY_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 struct RecoveryReader<'a> {
     db: &'a Arc<StdMutex<crate::db::TrackedConnection>>,
     #[cfg(test)]
@@ -38,6 +44,12 @@ impl RecoveryReader<'_> {
         let conn = self.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
         #[cfg(test)]
         let started = Instant::now();
+        #[cfg(test)]
+        FIRST_RECOVERY_LOCK.with(|probe| {
+            if let Some(observer) = probe.borrow_mut().take() {
+                observer();
+            }
+        });
         let rows = query(&conn)?;
         #[cfg(test)]
         let held = started.elapsed();
@@ -407,6 +419,10 @@ fn replay(
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[cfg(test)]
+#[path = "held_task_recovery_benchmark.rs"]
+mod benchmark;
 
 #[cfg(test)]
 pub(crate) mod tests {
