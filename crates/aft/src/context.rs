@@ -2218,6 +2218,18 @@ pub(crate) struct WatcherDrainGuard<'a> {
     activity: &'a AtomicU64,
 }
 
+fn trace_watcher_pending(pending: bool, reason: &str) -> bool {
+    #[cfg(feature = "test-hooks")]
+    if pending && std::env::var_os("AFT_TEST_WATCHER_PENDING_TRACE").is_some() {
+        eprintln!(
+            "watcher pending {:?}: {reason}",
+            std::thread::current().id()
+        );
+    }
+    let _ = reason;
+    pending
+}
+
 impl Drop for WatcherDrainGuard<'_> {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -5893,27 +5905,38 @@ impl AppContext {
     /// use `try_lock` and treat contention as pending work. The verification
     /// registry lock must never cover per-view locks or I/O.
     pub fn watcher_drain_has_work(&self) -> bool {
-        let cleanup_pending = self.deleted_root_cleanup.try_lock().is_none_or(|cleanup| {
-            matches!(
+        let cleanup_pending = self.deleted_root_cleanup.try_lock().map_or_else(|| trace_watcher_pending(true, "cleanup_lock_busy"), |cleanup| {
+            trace_watcher_pending(matches!(
                 *cleanup,
                 Some(DeletedRootCleanup::Pending(generation) | DeletedRootCleanup::Inconclusive(generation))
                     if generation == self.configure_generation()
-            )
+            ), "cleanup_state")
         });
-        let receiver_pending = self
-            .watcher_rx
-            .try_lock()
-            .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
+        let receiver_pending = self.watcher_rx.try_lock().map_or_else(
+            || trace_watcher_pending(true, "receiver_lock_busy"),
+            |slot| {
+                trace_watcher_pending(
+                    slot.as_ref().is_some_and(|rx| !rx.is_empty()),
+                    "receiver_events",
+                )
+            },
+        );
         cleanup_pending
             || receiver_pending
-            || self.watcher_drain_slice.try_lock().is_none_or(|slot| {
-                slot.as_ref().is_some_and(|state| {
-                    state.has_pending_work()
-                        || state.ignore_refresh_due.is_some_and(|due| {
-                            crate::runtime_drain::ignore_rule_refresh_now() >= due
-                        })
-                })
-            })
+            || self.watcher_drain_slice.try_lock().map_or_else(
+                || trace_watcher_pending(true, "slice_lock_busy"),
+                |slot| {
+                    slot.as_ref().is_some_and(|state| {
+                        trace_watcher_pending(state.has_pending_work(), "slice_work")
+                            || trace_watcher_pending(
+                                state.ignore_refresh_due.is_some_and(|due| {
+                                    crate::runtime_drain::ignore_rule_refresh_now() >= due
+                                }),
+                                "ignore_refresh_due",
+                            )
+                    })
+                },
+            )
     }
 
     pub fn lsp_drain_has_work(&self) -> bool {
@@ -5945,12 +5968,20 @@ impl AppContext {
                 counters.into_inner().query_delivery_pending()
             }
             // Contended: assume events may be held, as the probes below do.
-            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                trace_watcher_pending(true, "intake_lock_busy")
+            }
         };
-        intake_pending
-            || self.watcher_drain_has_work()
-            || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
-            || self.watcher_drain_activity.load(Ordering::Acquire) != activity
+        trace_watcher_pending(intake_pending, "query_intake")
+            || trace_watcher_pending(self.watcher_drain_has_work(), "query_drain_work")
+            || trace_watcher_pending(
+                self.watcher_drains_in_flight.load(Ordering::Acquire) > 0,
+                "query_in_flight",
+            )
+            || trace_watcher_pending(
+                self.watcher_drain_activity.load(Ordering::Acquire) != activity,
+                "query_activity_changed",
+            )
     }
 
     /// Changes still held by the watcher when an answer starts, including
