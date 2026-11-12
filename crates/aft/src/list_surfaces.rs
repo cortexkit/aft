@@ -791,6 +791,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Bounds an INFO log preview only; the total count is logged and no product result list is cut.",
     },
     ExclusionEntry {
+        file: "large_read.rs",
+        enclosing_item: "summarize_health_sites",
+        location_or_primitive: "top-site health preview truncate(4)",
+        reason: "Bounds supplemental health telemetry only; count, bytes, largest and sites_active still aggregate every active site, so the preview does not cut a tool result list.",
+    },
+    ExclusionEntry {
         file: "url_fetch.rs",
         enclosing_item: "hash_url",
         location_or_primitive: "URL cache hash prefix",

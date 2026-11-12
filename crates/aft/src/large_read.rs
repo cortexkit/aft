@@ -923,32 +923,89 @@ pub(crate) fn record_whole(site: Site, bytes: usize) {
     record(site, bytes as u64, bytes as u64);
 }
 
-/// Large reads by site since start: one entry per site that had any, with
-/// its count, bytes read and largest read.
-pub(crate) fn health() -> serde_json::Value {
-    let mut sites = serde_json::Map::new();
-    for (site, name) in SITES {
-        let counter = &COUNTERS[site as usize];
-        let count = counter.count.load(Ordering::Relaxed);
-        if count == 0 {
-            continue;
-        }
-        sites.insert(
-            name.to_string(),
-            serde_json::json!({
-                "count": count,
-                "bytes": counter.bytes.load(Ordering::Relaxed),
-                "largest": counter.largest.load(Ordering::Relaxed),
-            }),
-        );
+struct HealthSite {
+    site: &'static str,
+    count: u64,
+    bytes: u64,
+    largest: u64,
+}
+
+fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
+    sites.retain(|site| site.count > 0);
+    let sites_active = sites.len();
+    let mut count = 0_u64;
+    let mut bytes = 0_u64;
+    let mut largest = 0_u64;
+    for site in &sites {
+        count = count.saturating_add(site.count);
+        bytes = bytes.saturating_add(site.bytes);
+        largest = largest.max(site.largest);
     }
-    serde_json::Value::Object(sites)
+    sites.sort_unstable_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| left.site.cmp(right.site))
+    });
+    // Keep health within SUBC's byte budget while totals still cover every site.
+    sites.truncate(4);
+    let top = sites
+        .into_iter()
+        .map(|site| {
+            serde_json::json!({
+                "site": site.site,
+                "count": site.count,
+                "bytes": site.bytes,
+                "largest": site.largest,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "count": count,
+        "bytes": bytes,
+        "largest": largest,
+        "sites_active": sites_active,
+        "top": top,
+    })
+}
+
+/// Large reads since start, with totals over all sites and a bounded preview
+/// of the four sites that read the most bytes, ordered by bytes then name.
+pub(crate) fn health() -> serde_json::Value {
+    summarize_health_sites(
+        SITES
+            .into_iter()
+            .map(|(site, name)| {
+                let counter = &COUNTERS[site as usize];
+                HealthSite {
+                    site: name,
+                    count: counter.count.load(Ordering::Relaxed),
+                    bytes: counter.bytes.load(Ordering::Relaxed),
+                    largest: counter.largest.load(Ordering::Relaxed),
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Every site's name, for tests that size the health entry at its largest.
 #[cfg(test)]
 pub(crate) fn site_names() -> impl Iterator<Item = &'static str> {
     SITES.into_iter().map(|(_, name)| name)
+}
+
+#[cfg(test)]
+pub(crate) fn widest_health_for_test() -> serde_json::Value {
+    summarize_health_sites(
+        site_names()
+            .map(|site| HealthSite {
+                site,
+                count: u64::MAX,
+                bytes: u64::MAX,
+                largest: u64::MAX,
+            })
+            .collect(),
+    )
 }
 
 /// Count `read`, a loader's whole read of a file, at `site` when it is a
@@ -1070,6 +1127,84 @@ mod tests {
     fn site_names_follow_the_site_order() {
         for (index, (site, _)) in SITES.iter().enumerate() {
             assert_eq!(*site as usize, index);
+        }
+    }
+
+    #[test]
+    fn health_without_reads_has_zero_totals_and_no_top_sites() {
+        let sites = site_names()
+            .map(|site| HealthSite {
+                site,
+                count: 0,
+                bytes: 0,
+                largest: 0,
+            })
+            .collect();
+        assert_eq!(
+            summarize_health_sites(sites),
+            serde_json::json!({
+                "count": 0,
+                "bytes": 0,
+                "largest": 0,
+                "sites_active": 0,
+                "top": [],
+            })
+        );
+    }
+
+    #[test]
+    fn health_aggregates_all_17_sites_and_orders_four_by_bytes_then_name() {
+        let sites = site_names()
+            .enumerate()
+            .map(|(index, site)| HealthSite {
+                site,
+                count: index as u64 + 1,
+                bytes: (index as u64 % 3 + 1) * 10,
+                largest: index as u64 + 1,
+            })
+            .collect();
+        let health = summarize_health_sites(sites);
+        assert_eq!(health["sites_active"], 17);
+        assert_eq!(health["count"], 153);
+        assert_eq!(health["bytes"], 330);
+        assert_eq!(health["largest"], 17);
+        assert_eq!(
+            health["top"],
+            serde_json::json!([
+                {"site": "exact_corpus", "count": 12, "bytes": 30, "largest": 12},
+                {"site": "grep_fallback", "count": 3, "bytes": 30, "largest": 3},
+                {"site": "lexical_exactness", "count": 9, "bytes": 30, "largest": 9},
+                {"site": "line_windows", "count": 15, "bytes": 30, "largest": 15},
+            ])
+        );
+    }
+
+    #[test]
+    fn health_totals_saturate_with_all_17_sites_at_maximum() {
+        let health = widest_health_for_test();
+        assert_eq!(health["sites_active"], 17);
+        assert_eq!(health["count"], u64::MAX);
+        assert_eq!(health["bytes"], u64::MAX);
+        assert_eq!(health["largest"], u64::MAX);
+        let top = health["top"].as_array().unwrap();
+        assert_eq!(top.len(), 4);
+        let names = top
+            .iter()
+            .map(|site| site["site"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "candidate_text",
+                "data_file",
+                "degraded_grep",
+                "exact_corpus"
+            ]
+        );
+        for site in top {
+            assert_eq!(site["count"], u64::MAX);
+            assert_eq!(site["bytes"], u64::MAX);
+            assert_eq!(site["largest"], u64::MAX);
         }
     }
 
