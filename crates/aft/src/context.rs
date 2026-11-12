@@ -5744,9 +5744,9 @@ impl AppContext {
                     else {
                         return false;
                     };
-                    // Checking whether the root exists applies no watcher changes.
-                    // Keep filesystem I/O outside the pending-state lock so a
-                    // concurrent query does not mistake slow metadata for cleanup.
+                    // Pending-change queries count a contended cleanup lock as
+                    // watcher work. Probe metadata before taking that lock so a
+                    // slow existence check cannot make an idle query incomplete.
                     let metadata = root_metadata(&root);
                     let mut cleanup = self.deleted_root_cleanup.lock();
                     match metadata {
