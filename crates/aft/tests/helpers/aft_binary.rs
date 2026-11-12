@@ -37,6 +37,30 @@ pub fn aft_binary() -> PathBuf {
         .unwrap_or_else(|error| panic!("cannot deploy real AFT fixture image: {error}"))
 }
 
+/// Use a separate inode so failed sandbox write-denial probes cannot damage the
+/// daemon. On macOS, run the new image before the two-second `--shim-version`
+/// validator: the OS can spend longer than two seconds assessing its first execution.
+#[cfg(unix)]
+pub fn private_shim_binary() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let warm = warm_fixture_image;
+    #[cfg(not(target_os = "macos"))]
+    let warm = |_: &Path| Ok(());
+    deploy_private_shim_with_warmup(&source_binary(), &std::env::temp_dir(), warm)
+        .unwrap_or_else(|error| panic!("cannot deploy private AFT shim image: {error}"))
+}
+
+#[cfg(unix)]
+fn deploy_private_shim_with_warmup(
+    source: &Path,
+    temporary_root: &Path,
+    warm: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    let isolated_root = temporary_root.join("aft-private-shim-images");
+    fs::create_dir_all(&isolated_root)?;
+    deploy_with_warmup(source, &isolated_root, |_| {}, warm)
+}
+
 /// Pay macOS's first-exec cost before a command's own timeout starts. Production
 /// warms its startup pin too; the integration launcher override uses this copy.
 #[cfg(target_os = "macos")]
@@ -403,6 +427,38 @@ mod tests {
         .unwrap();
         assert_eq!(first, second);
         assert_eq!(*warmed.borrow(), vec![first]);
+    }
+
+    #[test]
+    fn fixture_private_shim_is_isolated_and_warmed_once_before_use() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source_image(root.path(), b"private shim image bytes");
+        let daemon = deploy(&source, root.path()).unwrap();
+        let warmed = std::cell::RefCell::new(Vec::new());
+        let shim = deploy_private_shim_with_warmup(&source, root.path(), |image| {
+            assert_eq!(fs::read(image).unwrap(), b"private shim image bytes");
+            assert!(fs::metadata(image).unwrap().permissions().readonly());
+            assert_eq!(image.file_name().unwrap(), "aft");
+            assert_eq!(
+                image.parent().unwrap().parent().unwrap(),
+                root.path()
+                    .join("aft-private-shim-images/aft-real-module-images")
+            );
+            warmed.borrow_mut().push(image.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*warmed.borrow(), vec![shim.clone()]);
+        assert_ne!(
+            fs::metadata(&shim).unwrap().ino(),
+            fs::metadata(&daemon).unwrap().ino(),
+            "a sandbox write regression must not corrupt the daemon image"
+        );
+        let cached = deploy_private_shim_with_warmup(&source, root.path(), |_| {
+            panic!("a cached private shim must not be warmed again")
+        })
+        .unwrap();
+        assert_eq!(cached, shim);
     }
 
     #[test]

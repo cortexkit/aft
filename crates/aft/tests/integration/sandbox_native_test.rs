@@ -125,11 +125,7 @@ impl CortexkitFloorFixture {
         }
         std::fs::write(&connection, "daemon-token").unwrap();
         let shim_image = if copy_shim {
-            let bytes = std::fs::read(env!("CARGO_BIN_EXE_aft")).unwrap();
-            Some(
-                crate::test_helpers::executable_cache::cached_executable(&bytes)
-                    .expect("cache isolated shim image"),
-            )
+            Some(crate::test_helpers::aft_binary::private_shim_binary())
         } else {
             None
         };
@@ -347,7 +343,14 @@ fn cortexkit_floor_shim_and_managed_hooks_execute_read_only() {
     // Executing a Mach-O image does not by itself prove file-read access on
     // Seatbelt. Check the managed bytes too, before exercising both consumers.
     let response = foreground(&mut f.aft, "governed-child", "cat \"$AFT_GH_SHIMS_DIR/gh\" > /dev/null && gh --status && cat \"$GIT_CONFIG_VALUE_0/prepare-commit-msg\" > /dev/null && git init -q --template= && printf tracked > tracked && git add tracked && git -c user.name='AFT Test' -c user.email=aft@example.invalid commit -qm initial && git log -1 --format=%B");
-    assert_eq!(response["status"], "completed", "{response:?}");
+    if response["status"] != "completed" {
+        let shim = f.storage.join("shims/gh");
+        let target = std::fs::read_link(&shim);
+        let (_, stderr) = f.aft.stderr_output();
+        panic!(
+            "governed child did not complete: {response:?}; shim target: {target:?}; daemon stderr:\n{stderr}"
+        );
+    }
     let output = response["output"].as_str().unwrap();
     assert!(output.contains("rung"), "shim status missing: {response:?}");
     assert!(
