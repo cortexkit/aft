@@ -156,17 +156,19 @@ fn sessions(
                      ORDER BY settled_at,rowid LIMIT ?3"
                 };
                 let mut stmt = conn.prepare(sql)?;
-                stmt.query_map(params![cursor.0, cursor.1, RECOVERY_CHUNK], |row| {
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, bool>(5)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()
+                let rows = stmt
+                    .query_map(params![cursor.0, cursor.1, RECOVERY_CHUNK], |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, bool>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                rows
             })?;
             if keys.is_empty() {
                 break;
