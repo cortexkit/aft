@@ -27836,12 +27836,24 @@ mod tests {
         // cut, too few for the GitHub token pattern to recognise.
         let cut_token_body = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
         let cut_token_command = format!("#{} ghp_{cut_token_body}", "x".repeat(179));
+        let inline_password = "Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe";
+        assert_eq!(inline_password.len(), 43);
+        let inline_command = format!(
+            "cd /work/x/opencode PW={inline_password} curl -s -u \"opencode:$PW\" http://127.0.0.1:4599/api/status"
+        );
+        // Only ten value characters would survive a cut made before masking.
+        let cut_assignment = format!("#{} X={inline_password}", "x".repeat(186));
         let mut problems = Vec::new();
         for (command, secret) in [
             ("GITHUB_TOKEN=plainvalue123 gh api /user", "plainvalue123"),
             ("export OPENAI_API_KEY=plainvalue123", "plainvalue123"),
             ("export DB_PASSWORD='plain value 123'", "plain value 123"),
             ("PGPASSWORD=plainvalue123 psql -h db", "plainvalue123"),
+            ("PASS=plainvalue123 ./run", "plainvalue123"),
+            ("DB_PW=plainvalue123 ./run", "plainvalue123"),
+            ("DB_PASS=plainvalue123 ./run", "plainvalue123"),
+            (inline_command.as_str(), inline_password),
+            (cut_assignment.as_str(), &inline_password[..10]),
             (
                 "docker login --password plainvalue123 -u me",
                 "plainvalue123",
@@ -27863,6 +27875,8 @@ mod tests {
             "GIT_AUTHOR_NAME=Someone GH_SHIM_BYPASS=1 git commit -m x",
             "export GITHUB_TOKEN=$GH_TOKEN",
             "gcloud secrets versions access latest --secret=prod-db",
+            "PWD=/tmp/x SHA=3f2c9a1b7e4d5c6a8b9f0e1d2c3b4a5968778695 ./run",
+            "COUNT=12345678901234567 URL=https://example.com/a ./run",
         ] {
             let line = durable(command);
             if !line.ends_with(&format!("cmd={command}")) {

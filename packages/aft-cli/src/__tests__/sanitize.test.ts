@@ -134,6 +134,20 @@ describe("sanitizeContent", () => {
     expect(out).toContain("aws access key id <REDACTED_SECRET>");
   });
 
+  test("redacts inline passwords in historical bash spawn logs", () => {
+    const secret = "Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe";
+    expect(secret.length).toBe(43);
+    const prefix = "bash spawned task=bgb_test cmd=cd /work/x/opencode ";
+    const suffix = ' curl -s -u "opencode:$PW" http://127.0.0.1:4599/api/status';
+    expect(sanitizeContent(`${prefix}PW=${secret}${suffix}`)).toBe(
+      `${prefix}PW=<REDACTED_SECRET>${suffix}`,
+    );
+    expect(sanitizeContent(`PASS=small DB_PW=small DB_PASS=small X=${secret}`)).toBe(
+      "PASS=<REDACTED_SECRET> DB_PW=<REDACTED_SECRET> DB_PASS=<REDACTED_SECRET> X=<REDACTED_SECRET>",
+    );
+    expect(sanitizeContent("PWD=/tmp/x ?key=src_main_rs")).toBe("PWD=/tmp/x ?key=src_main_rs");
+  });
+
   test("redacts env-style sensitive keys", () => {
     const input = [
       "OPENCODE_SERVER_PASSWORD=swordfish",

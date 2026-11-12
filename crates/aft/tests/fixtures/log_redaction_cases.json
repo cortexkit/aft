@@ -48,6 +48,34 @@
     {
       "input": "GET https://maps.example.com/api?key=AIzaSyA1b2C3d4E5f6G7h8I9j0KlMnOpQrStUv&q=x",
       "expected": "GET https://maps.example.com/api?key=<REDACTED_SECRET>&q=x"
+    },
+    {
+      "input": "cd /work/x/opencode PW=Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe curl -s -u \"opencode:$PW\" http://127.0.0.1:4599/api/status",
+      "expected": "cd /work/x/opencode PW=<REDACTED_SECRET> curl -s -u \"opencode:$PW\" http://127.0.0.1:4599/api/status"
+    },
+    {
+      "input": "PW=hunter2 PASS=hunter2 DB_PW=hunter2 DB_PASS=hunter2 ./run",
+      "expected": "PW=<REDACTED_SECRET> PASS=<REDACTED_SECRET> DB_PW=<REDACTED_SECRET> DB_PASS=<REDACTED_SECRET> ./run"
+    },
+    {
+      "input": "pw=hunter2 pass=hunter2 db_pw=hunter2 db_pass=hunter2 ./run",
+      "expected": "pw=<REDACTED_SECRET> pass=<REDACTED_SECRET> db_pw=<REDACTED_SECRET> db_pass=<REDACTED_SECRET> ./run"
+    },
+    {
+      "input": "X=Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe ./run",
+      "expected": "X=<REDACTED_SECRET> ./run"
+    },
+    {
+      "input": "X=\"Ab3dEfGhIjKlMnOp\" Y='Ab3dEfGhIjKlMnOp' ./run",
+      "expected": "X=\"<REDACTED_SECRET>\" Y='<REDACTED_SECRET>' ./run"
+    },
+    {
+      "input": "X=Ab3dEfGh/IjKlMnOp ./run",
+      "expected": "X=<REDACTED_SECRET> ./run"
+    },
+    {
+      "input": "X=Ab3dEfGhIjKlMnOp|cat",
+      "expected": "X=<REDACTED_SECRET>|cat"
     }
   ],
   "untouched": [
@@ -60,6 +88,21 @@
     "https://github.com/cortexkit/aft/pull/12?tab=files&page=3",
     "https://maps.example.com/api?key=src_main_rs",
     "https://cdn.example.com/blob?key=9f86d081884c7d659a2feaa0c55ad015",
-    "search ?q=token+refresh+flow"
+    "search ?q=token+refresh+flow",
+    "?key=src_main_rs",
+    "&key=src_main_rs",
+    "PWD=/tmp/x",
+    "SHA=3f2c9a1b7e4d5c6a8b9f0e1d2c3b4a5968778695",
+    "FILE=/tmp/x",
+    "FILE=/tmp/Ab3deFghIjklMnop",
+    "FILE=~/Ab3deFghIjklMnop",
+    "FILE=./Ab3deFghIjklMnop",
+    "FILE=../Ab3deFghIjklMnop",
+    "COUNT=12345678901234567",
+    "URL=https://example.com/a",
+    "URL=https://example.com/Ab3deFghIjklMnop",
+    "WORD=ordinarywordsarenotsecrets",
+    "X=Ab3dEfGhIjKlMnO",
+    "BYPASS=ordinary COMPASS=ordinary"
   ]
 }

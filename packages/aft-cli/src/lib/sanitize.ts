@@ -19,6 +19,7 @@ const KEY_NAME = "[A-Za-z_][A-Za-z0-9_.-]*";
 const SENSITIVE_KEY_WORD = /(?:token|password|secret|api[_-]?key|passwd|pwd|credential)/i;
 const SEGMENTED_KEY_WORD = /(?:^|[_.-])key(?:$|[_.-])/i;
 const CAMEL_CASE_KEY_WORD = /[a-z0-9]Key(?:$|[A-Z_.-])/;
+const SHORT_PASSWORD_NAME = /(?:^|_)(?:pw|pass)$/i;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b/g;
 // Credential query parameters inside a URL. The generic key/value passes below
@@ -47,6 +48,16 @@ function looksLikeSecret(value: string): boolean {
   );
 }
 
+// Keep assignment paths and URLs readable, but allow base64 slashes inside
+// tokens. Identical to looks_like_assignment_secret in the Rust log redactor.
+function looksLikeAssignmentSecret(value: string): boolean {
+  return (
+    !["/", "~/", "./", "../"].some((prefix) => value.startsWith(prefix)) &&
+    !value.includes("://") &&
+    looksLikeSecret(value)
+  );
+}
+
 const quotedSensitiveKeyValuePattern = new RegExp(
   String.raw`((['"])(${KEY_NAME})\2[^\S\r\n]*:[^\S\r\n]*)(['"])([^'"\r\n]+)\4`,
   "gi",
@@ -56,15 +67,34 @@ const unquotedSensitiveKeyValuePattern = new RegExp(
   "gi",
 );
 const bareSensitiveKeyValuePattern = new RegExp(
-  String.raw`\b((${KEY_NAME})[^\S\r\n]*[=:][^\S\r\n]*)([^\s,;&'"]+)`,
+  String.raw`\b((${KEY_NAME})[^\S\r\n]*[=:][^\S\r\n]*)([^\s,;&|<>()'"]+)`,
   "gi",
 );
 
 function isSensitiveKeyName(keyName: string): boolean {
   return (
-    SENSITIVE_KEY_WORD.test(keyName) ||
-    SEGMENTED_KEY_WORD.test(keyName) ||
-    CAMEL_CASE_KEY_WORD.test(keyName)
+    keyName !== "PWD" &&
+    (SENSITIVE_KEY_WORD.test(keyName) ||
+      SEGMENTED_KEY_WORD.test(keyName) ||
+      CAMEL_CASE_KEY_WORD.test(keyName) ||
+      SHORT_PASSWORD_NAME.test(keyName))
+  );
+}
+
+function shouldRedactAssignment(
+  prefix: string,
+  keyName: string,
+  value: string,
+  offset: number,
+  content: string,
+): boolean {
+  // The query-specific pass already decided whether a generic key is secret.
+  if (keyName.toLowerCase() === "key" && /[?&]/.test(content[offset - 1] ?? "")) {
+    return false;
+  }
+  return (
+    isSensitiveKeyName(keyName) ||
+    (prefix.trimEnd().endsWith("=") && looksLikeAssignmentSecret(value))
   );
 }
 
@@ -103,15 +133,32 @@ export function redactSecrets(content: string): string {
   );
   sanitized = sanitized.replace(
     unquotedSensitiveKeyValuePattern,
-    (match: string, prefix: string, keyName: string, valueQuote: string) =>
-      isSensitiveKeyName(keyName)
+    (
+      match: string,
+      prefix: string,
+      keyName: string,
+      valueQuote: string,
+      value: string,
+      offset: number,
+      content: string,
+    ) =>
+      shouldRedactAssignment(prefix, keyName, value, offset, content)
         ? `${prefix}${valueQuote}${SECRET_PLACEHOLDER}${valueQuote}`
         : match,
   );
   sanitized = sanitized.replace(
     bareSensitiveKeyValuePattern,
-    (match: string, prefix: string, keyName: string) =>
-      isSensitiveKeyName(keyName) ? `${prefix}${SECRET_PLACEHOLDER}` : match,
+    (
+      match: string,
+      prefix: string,
+      keyName: string,
+      value: string,
+      offset: number,
+      content: string,
+    ) =>
+      shouldRedactAssignment(prefix, keyName, value, offset, content)
+        ? `${prefix}${SECRET_PLACEHOLDER}`
+        : match,
   );
   sanitized = sanitized.replace(
     /\b([a-z][a-z0-9+.-]*:\/\/)[^@\s/?#]+@/gi,

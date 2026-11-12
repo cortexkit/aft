@@ -18,9 +18,9 @@
 //! - credential query parameters (`token=`, `access_token=`, `api_key=`,
 //!   `…secret=`, `password=`), and `key=` when its value looks like a secret.
 //!
-//! Deliberately NOT masked: bare `key=value` fields outside a URL query. AFT's
-//! own structured lines use `key=` for index keys, and masking them would
-//! destroy the forensic value of the log.
+//! Ordinary `key=value` fields stay readable: AFT's structured lines use them
+//! for index keys. Assignment values are masked only for short password names
+//! or when the value itself has a secret-like shape.
 //!
 //! Shell commands quoted in a log line additionally go through
 //! [`redact_command`], which masks credentials typed inline in a command
@@ -94,6 +94,10 @@ static CREDENTIAL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// `key=` is too generic to mask on its name alone; see [`looks_like_secret`].
 static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([^&\s#"'<>]+)"#));
+// Also protects log lines from older versions that recorded raw commands.
+static INLINE_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    compile(r#"\b(([A-Za-z_][A-Za-z0-9_]*)=)("[^"\r\n]+"|'[^'\r\n]+'|[^\s,;&|<>()'"]+)"#)
+});
 
 /// Mask credentials in `text`. Returns the input unchanged (borrowed) when it
 /// contains nothing to mask, so the common case allocates nothing.
@@ -178,7 +182,7 @@ macro_rules! shell_word {
 /// `GIT_AUTHOR_NAME` and `GH_SHIM_BYPASS` stay.
 static COMMAND_SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     compile(concat!(
-        r#"(^|[^A-Za-z0-9_])((?:[A-Z][A-Z0-9_]*?)?(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY|_KEY|_PAT|_AUTH)(?:_[A-Z0-9]+)*=)("#,
+        r#"(^|[^A-Za-z0-9_])((?:(?:[A-Z][A-Z0-9_]*?)?(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY|_KEY|_PAT|_AUTH)(?:_[A-Z0-9]+)*|(?:[A-Z_][A-Z0-9_]*_)?(?:PW|PASS))=)("#,
         shell_word!(),
         ")"
     ))
@@ -1152,7 +1156,35 @@ fn redact_with_range<'a>(
             mapping,
         );
     }
+    if text.contains('=') {
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &INLINE_ASSIGNMENT,
+            |caps: &Captures<'_>| {
+                let raw = &caps[3];
+                let value = raw.trim_matches(['\'', '"']);
+                if (is_short_password_name(&caps[2]) && !command_value_is_reference(raw))
+                    || looks_like_assignment_secret(value)
+                {
+                    let quote = if raw.starts_with(['\'', '"']) {
+                        &raw[..1]
+                    } else {
+                        ""
+                    };
+                    format!("{}{quote}{SECRET_PLACEHOLDER}{quote}", &caps[1])
+                } else {
+                    caps[0].to_string()
+                }
+            },
+        );
+    }
     out
+}
+
+fn is_short_password_name(key: &str) -> bool {
+    let suffix = key.rsplit('_').next().unwrap_or(key);
+    suffix.eq_ignore_ascii_case("PW") || suffix.eq_ignore_ascii_case("PASS")
 }
 
 /// A command's credential values, retained only with its live in-memory task.
@@ -1182,6 +1214,7 @@ pub fn is_secret_environment_key(key: &str) -> bool {
     ["TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "CREDENTIAL"]
         .iter()
         .any(|part| contains_ignore_ascii_case(key, part))
+        || is_short_password_name(key)
         || names_auth(key)
 }
 
@@ -1475,6 +1508,17 @@ fn looks_like_secret(value: &str) -> bool {
         && value.chars().any(|ch| ch.is_ascii_lowercase())
 }
 
+/// Paths and URLs in command assignments are useful diagnostics, not tokens.
+/// Keep this rule identical to the CLI sanitizer. Query keys instead use
+/// [`looks_like_secret`] without the path-prefix exclusions.
+fn looks_like_assignment_secret(value: &str) -> bool {
+    !["/", "~/", "./", "../"]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+        && !value.contains("://")
+        && looks_like_secret(value)
+}
+
 fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -1599,7 +1643,7 @@ mod tests {
 
     #[test]
     fn only_json_fields_and_private_keys_match_across_a_newline() {
-        let line_anchored: [(&str, &Regex); 12] = [
+        let line_anchored: [(&str, &Regex); 13] = [
             ("AUTHORIZATION_HEADER", &AUTHORIZATION_HEADER),
             ("API_KEY_HEADER", &API_KEY_HEADER),
             ("AWS_SECRET_FIELD", &AWS_SECRET_FIELD),
@@ -1612,6 +1656,7 @@ mod tests {
             ("URL_USERINFO", &URL_USERINFO),
             ("CREDENTIAL_QUERY", &CREDENTIAL_QUERY),
             ("KEY_QUERY", &KEY_QUERY),
+            ("INLINE_ASSIGNMENT", &INLINE_ASSIGNMENT),
         ];
         let samples = [
             "Authorization: Bearer opaque-auth-value".to_string(),
@@ -1626,6 +1671,7 @@ mod tests {
             "AKIAABCDEFGHIJKLMNOP".to_string(),
             "https://user:password@example.com/path".to_string(),
             "https://e.com/p?access_token=opaque&key=AbCdEfGh12345678Zz".to_string(),
+            "PW=opaque X=\"AbCdEfGh12345678Zz\"".to_string(),
         ];
         for sample in &samples {
             for (cut, _) in sample.char_indices().skip(1) {
@@ -1731,6 +1777,16 @@ mod tests {
             secrets.redact("ABCDEFGH short public-value"),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn short_password_environment_names_do_not_include_pwd_or_bypass() {
+        for key in ["PW", "PASS", "DB_PW", "DB_PASS", "db_pw", "db_pass"] {
+            assert!(is_secret_environment_key(key), "missed {key}");
+        }
+        for key in ["PWD", "BYPASS", "COMPASS"] {
+            assert!(!is_secret_environment_key(key), "mangled {key}");
+        }
     }
 
     #[test]
@@ -2284,6 +2340,12 @@ mod tests {
                 "input: {}",
                 case.input
             );
+            assert_eq!(
+                redact_command(&case.input),
+                case.expected,
+                "command: {}",
+                case.input
+            );
         }
     }
 
@@ -2294,6 +2356,7 @@ mod tests {
         for input in fixture.untouched {
             let out = aft_redactor(&input);
             assert!(matches!(out, Cow::Borrowed(_)), "mangled: {input} -> {out}");
+            assert_eq!(redact_command(&input), input);
         }
     }
 
