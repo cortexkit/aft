@@ -642,12 +642,18 @@ fn managed_git_hook_contents(hook_name: &str) -> String {
 /// configure and is also cheap enough to repair a stale entry immediately
 /// before a child spawn.
 pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
+    maintain_with_probe(config, storage_root, probe_gh_shim_binary)
+}
+
+fn maintain_with_probe(
+    config: &Config,
+    storage_root: &Path,
+    probe: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     let shims_dir = crate::pinned_executable::shims_dir(storage_root);
     if config.github.shim {
         let binary = shim_binary(config)?;
-        match reject_self_referential_pin(&binary, &shims_dir)
-            .and_then(|()| probe_gh_shim_binary(&binary))
-        {
+        match reject_self_referential_pin(&binary, &shims_dir).and_then(|()| probe(&binary)) {
             Ok(()) => ensure_gh_entry(&shims_dir, &binary)?,
             Err(reason) => {
                 crate::slog_warn!(
@@ -655,11 +661,7 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
                     binary.display()
                 );
                 if !existing_gh_entry_is_valid(&shims_dir) {
-                    remove_gh_entry(&shims_dir)?;
-                    crate::slog_warn!(
-                        "[agent_child_env] removed unverified gh shim entry after refusing candidate {}",
-                        binary.display()
-                    );
+                    ensure_refusing_gh_entry(&shims_dir)?;
                 }
             }
         }
@@ -1046,10 +1048,53 @@ fn probe_gh_shim_binary(binary: &Path) -> Result<(), String> {
 fn probe_gh_shim_binary_uncached(binary: &Path) -> Result<(), String> {
     // Invoke the image directly, including on Windows where the managed entry is
     // a gh.cmd wrapper. This keeps validation independent of the wrapper's shell.
-    probe_gh_shim_binary_with_budget(binary, Duration::from_secs(2))
+    probe_gh_shim_binary_with_recovery(binary, probe_gh_shim_binary_with_budget)
 }
 
-fn probe_gh_shim_binary_with_budget(binary: &Path, budget: Duration) -> Result<(), String> {
+const SHIM_PROBE_BUDGET: Duration = Duration::from_secs(2);
+const SHIM_WARMUP_BUDGET: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+enum ShimProbeFailure {
+    TimedOut,
+    Rejected(String),
+}
+
+impl From<String> for ShimProbeFailure {
+    fn from(reason: String) -> Self {
+        Self::Rejected(reason)
+    }
+}
+
+impl std::fmt::Display for ShimProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => f.write_str("--shim-version probe exceeded its deadline"),
+            Self::Rejected(reason) => f.write_str(reason),
+        }
+    }
+}
+
+fn probe_gh_shim_binary_with_recovery(
+    binary: &Path,
+    mut probe: impl FnMut(&Path, Duration) -> Result<(), ShimProbeFailure>,
+) -> Result<(), String> {
+    match probe(binary, SHIM_PROBE_BUDGET) {
+        Err(ShimProbeFailure::TimedOut) => {
+            // A freshly placed image can exceed the probe deadline on its first
+            // macOS exec. Pay that cost once, then require the normal 2s probe.
+            probe(binary, SHIM_WARMUP_BUDGET)
+                .map_err(|error| format!("shim warm-up failed: {error}"))?;
+            probe(binary, SHIM_PROBE_BUDGET).map_err(|error| error.to_string())
+        }
+        result => result.map_err(|error| error.to_string()),
+    }
+}
+
+fn probe_gh_shim_binary_with_budget(
+    binary: &Path,
+    budget: Duration,
+) -> Result<(), ShimProbeFailure> {
     use std::io::{Read, Seek};
     use std::process::Stdio;
     struct ProbeOutput(PathBuf);
@@ -1109,14 +1154,16 @@ fn probe_gh_shim_binary_with_budget(binary: &Path, budget: Duration) -> Result<(
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(match result {
-                    Err(error) => format!("could not wait for --shim-version probe: {error}"),
-                    _ => "--shim-version probe exceeded its deadline".to_string(),
+                    Err(error) => ShimProbeFailure::Rejected(format!(
+                        "could not wait for --shim-version probe: {error}"
+                    )),
+                    _ => ShimProbeFailure::TimedOut,
                 });
             }
         }
     };
     if !status.success() {
-        return Err(format!("--shim-version probe exited with {status}"));
+        return Err(format!("--shim-version probe exited with {status}").into());
     }
     stdout.rewind().map_err(|error| error.to_string())?;
     let mut bytes = Vec::new();
@@ -1126,7 +1173,9 @@ fn probe_gh_shim_binary_with_budget(binary: &Path, budget: Duration) -> Result<(
     let report: ShimSelfReport = serde_json::from_slice(&bytes)
         .map_err(|error| format!("--shim-version probe emitted invalid JSON: {error}"))?;
     if report.shim_version.is_empty() || report.gh_routing_schema_floor == 0 {
-        return Err("--shim-version probe omitted required shim identity fields".to_string());
+        return Err("--shim-version probe omitted required shim identity fields"
+            .to_string()
+            .into());
     }
     Ok(())
 }
@@ -1829,18 +1878,53 @@ fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
+    ensure_windows_gh_entries(shims_dir, binary)
+}
+
+#[cfg(any(windows, test))]
+fn ensure_windows_gh_entries(shims_dir: &Path, binary: &Path) -> Result<(), String> {
     crate::private_storage::create_dir_all(shims_dir).map_err(|error| {
         format!(
             "failed to create gh shim directory {}: {error}",
             shims_dir.display()
         )
     })?;
-    write_if_changed(&shims_dir.join("gh.cmd"), &windows_gh_cmd(binary))
+    write_if_changed(&shims_dir.join("gh.cmd"), &windows_gh_cmd(binary))?;
+    // Git Bash finds the extensionless entry before gh.cmd. Replace its
+    // refusal too, so a repaired candidate restores both shell families.
+    write_hook_if_changed(&shims_dir.join("gh"), &windows_gh_posix(binary))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn ensure_gh_entry(_shims_dir: &Path, _binary: &Path) -> Result<(), String> {
     Err("gh child PATH injection is unsupported on this platform".to_string())
+}
+
+const GH_SHIM_VERIFICATION_REFUSAL: &str = "gh: AFT could not verify its GitHub shim for this shell, so this command was not run. Run it again; if it keeps failing, AFT's log names the reason.";
+
+fn refusing_gh_script() -> Vec<u8> {
+    format!("#!/bin/sh\nprintf '%s\\n' \"{GH_SHIM_VERIFICATION_REFUSAL}\" >&2\nexit 86\n")
+        .into_bytes()
+}
+
+#[cfg(any(windows, test))]
+fn refusing_gh_cmd() -> Vec<u8> {
+    format!("@echo off\r\n>&2 echo {GH_SHIM_VERIFICATION_REFUSAL}\r\nexit /b 86\r\n").into_bytes()
+}
+
+#[cfg(any(windows, test))]
+fn ensure_refusing_windows_gh_entries(shims_dir: &Path) -> Result<(), String> {
+    install_managed_file(&shims_dir.join("gh"), &refusing_gh_script(), true)?;
+    install_managed_file(&shims_dir.join("gh.cmd"), &refusing_gh_cmd(), false)
+}
+
+fn ensure_refusing_gh_entry(shims_dir: &Path) -> Result<(), String> {
+    // Keep a command at the front of PATH even when no trusted image is
+    // available; removing it would expose the operator's own gh further down.
+    #[cfg(not(windows))]
+    return install_managed_file(&shims_dir.join("gh"), &refusing_gh_script(), true);
+    #[cfg(windows)]
+    ensure_refusing_windows_gh_entries(shims_dir)
 }
 
 fn remove_gh_entry(shims_dir: &Path) -> Result<(), String> {
@@ -1894,9 +1978,9 @@ fn write_hook_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
     install_managed_file(path, bytes, true)
 }
 
-// Only the Windows `gh.cmd` wrapper is a plain managed file; hooks go through
-// `write_hook_if_changed` so their executable bit is set before install.
-#[cfg(windows)]
+// The Windows command wrapper needs no executable bit; executable scripts use
+// `write_hook_if_changed` or `install_managed_file` with executable=true.
+#[cfg(any(windows, test))]
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if fs::read(path).is_ok_and(|existing| existing == bytes) {
         return Ok(());
@@ -2000,6 +2084,15 @@ pub fn windows_gh_cmd(binary: &Path) -> Vec<u8> {
     debug_assert!(!rendered.contains('"'));
     let rendered = rendered.replace('%', "%%");
     format!("@echo off\r\n\"{rendered}\" gh-shim %*\r\n").into_bytes()
+}
+
+#[cfg(any(windows, test))]
+fn windows_gh_posix(binary: &Path) -> Vec<u8> {
+    let rendered = binary
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "'\\''");
+    format!("#!/bin/sh\nexec '{rendered}' gh-shim \"$@\"\n").into_bytes()
 }
 
 #[cfg(test)]
@@ -2413,10 +2506,11 @@ mod tests {
 
         fs::remove_file(&entry).unwrap();
         maintain(&config, temp.path()).unwrap();
-        assert!(
-            fs::symlink_metadata(entry).is_err(),
-            "a rejected candidate must not install a new gh entry"
-        );
+        assert_eq!(fs::read(&entry).unwrap(), refusing_gh_script());
+
+        config.gh_shim.binary_path = Some(verified.clone());
+        maintain(&config, temp.path()).unwrap();
+        assert_eq!(fs::read_link(&entry).unwrap(), verified);
     }
 
     #[test]
@@ -2425,6 +2519,80 @@ mod tests {
             String::from_utf8(windows_gh_cmd(Path::new(r"C:\AFT Dev\aft.exe"))).unwrap(),
             "@echo off\r\n\"C:\\AFT Dev\\aft.exe\" gh-shim %*\r\n"
         );
+    }
+
+    #[test]
+    fn windows_refusing_entries_cover_cmd_and_git_bash() {
+        assert_eq!(
+            String::from_utf8(refusing_gh_cmd()).unwrap(),
+            format!("@echo off\r\n>&2 echo {GH_SHIM_VERIFICATION_REFUSAL}\r\nexit /b 86\r\n")
+        );
+        assert_eq!(
+            String::from_utf8(refusing_gh_script()).unwrap(),
+            format!("#!/bin/sh\nprintf '%s\\n' \"{GH_SHIM_VERIFICATION_REFUSAL}\" >&2\nexit 86\n")
+        );
+        let temp = tempfile::tempdir().unwrap();
+        ensure_refusing_windows_gh_entries(temp.path()).unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("gh")).unwrap(),
+            refusing_gh_script()
+        );
+        assert_eq!(
+            fs::read(temp.path().join("gh.cmd")).unwrap(),
+            refusing_gh_cmd()
+        );
+        let binary = Path::new(r"C:\AFT's 100% Dev\aft.exe");
+        ensure_windows_gh_entries(temp.path(), binary).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("gh.cmd")).unwrap(),
+            "@echo off\r\n\"C:\\AFT's 100%% Dev\\aft.exe\" gh-shim %*\r\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("gh")).unwrap(),
+            "#!/bin/sh\nexec 'C:/AFT'\\''s 100% Dev/aft.exe' gh-shim \"$@\"\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_shim_refuses_child_without_falling_through_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = temp.path().join("broken-aft");
+        write_executable(&candidate, "#!/bin/sh\nexit 2\n");
+        let real_dir = temp.path().join("real-bin");
+        fs::create_dir(&real_dir).unwrap();
+        let marker = temp.path().join("real-gh-ran");
+        write_executable(
+            &real_dir.join("gh"),
+            &format!("#!/bin/sh\n: > '{}'\n", marker.display()),
+        );
+        let mut config = Config::default();
+        config.git.co_author = "off".to_string();
+        config.gh_shim.binary_path = Some(candidate);
+        let mut environment =
+            HashMap::from([("PATH".to_string(), real_dir.to_string_lossy().into_owned())]);
+        inject(&config, temp.path(), &mut environment, None).unwrap();
+        let shims = temp.path().join("shims");
+        assert_eq!(environment[GH_SHIMS_DIR_ENV], shims.to_string_lossy());
+        assert_eq!(
+            fs::metadata(shims.join("gh")).unwrap().permissions().mode() & 0o777,
+            crate::private_storage::DIR_MODE
+        );
+        let output = Command::new("/bin/sh")
+            .args(["-c", "gh --status"])
+            .env_clear()
+            .envs(&environment)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(86));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "gh: AFT could not verify its GitHub shim for this shell, so this command was not run. Run it again; if it keeps failing, AFT's log names the reason.\n"
+        );
+        assert!(!marker.exists(), "the operator's gh must never be reached");
     }
 
     #[test]
@@ -3000,7 +3168,7 @@ mod tests {
         let binary = temp.path().join("aft-probe");
         write_executable(&binary, "#!/bin/sh\nexec /bin/sleep 60\n");
         let error = probe_gh_shim_binary_with_budget(&binary, Duration::ZERO).unwrap_err();
-        assert!(error.contains("deadline"), "{error}");
+        assert!(matches!(error, ShimProbeFailure::TimedOut), "{error}");
         write_executable(&binary, "#!/bin/sh\n[ -z \"${HOME:-}\" ] || exit 1\nprintf '%s' '{\"shim_version\":\"test\",\"gh_routing_schema_floor\":1}'\n");
         probe_gh_shim_binary_uncached(&binary).unwrap();
     }
@@ -3014,6 +3182,91 @@ mod tests {
         write_executable(&binary, &format!("#!/bin/sh\nif [ ! -f '{}' ]; then : > '{}'; exit 1; fi\nprintf '%s' '{{\"shim_version\":\"test\",\"gh_routing_schema_floor\":1}}'\n", marker.display(), marker.display()));
         assert!(probe_gh_shim_binary(&binary).is_err());
         probe_gh_shim_binary(&binary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_probe_warms_once_then_installs_verified_shim() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("aft-probe");
+        write_self_reporting_shim(&binary);
+        let slow = temp.path().join("slow-probe");
+        write_executable(&slow, "#!/bin/sh\nexec /bin/sleep 60\n");
+        let mut config = Config::default();
+        config.git.co_author = "off".to_string();
+        config.gh_shim.binary_path = Some(binary.clone());
+        let mut budgets = Vec::new();
+        maintain_with_probe(&config, temp.path(), |candidate| {
+            probe_gh_shim_binary_with_recovery(candidate, |path, budget| {
+                assert_eq!(path, binary);
+                budgets.push(budget);
+                if budgets.len() == 1 {
+                    probe_gh_shim_binary_with_budget(&slow, Duration::ZERO)
+                } else {
+                    probe_gh_shim_binary_with_budget(path, budget)
+                }
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            budgets,
+            [
+                Duration::from_secs(2),
+                Duration::from_secs(30),
+                Duration::from_secs(2)
+            ]
+        );
+        assert_eq!(fs::read_link(temp.path().join("shims/gh")).unwrap(), binary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_probe_timeout_installs_refusal_and_later_validation_repairs_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("aft-probe");
+        write_self_reporting_shim(&binary);
+        let mut config = Config::default();
+        config.git.co_author = "off".to_string();
+        config.gh_shim.binary_path = Some(binary.clone());
+        let mut calls = 0;
+        maintain_with_probe(&config, temp.path(), |candidate| {
+            probe_gh_shim_binary_with_recovery(candidate, |_, budget| {
+                calls += 1;
+                if budget == SHIM_WARMUP_BUDGET {
+                    Ok(())
+                } else {
+                    Err(ShimProbeFailure::TimedOut)
+                }
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, 3, "only one warm-up and one retry are allowed");
+        let entry = temp.path().join("shims/gh");
+        assert_eq!(fs::read(&entry).unwrap(), refusing_gh_script());
+        maintain(&config, temp.path()).unwrap();
+        assert_eq!(fs::read_link(entry).unwrap(), binary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_shim_identity_does_not_warm_or_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("aft-probe");
+        for answer in [
+            "printf '%s' '{\"shim_version\":\"\",\"gh_routing_schema_floor\":1}'",
+            "printf '%s' '{\"shim_version\":\"test\",\"gh_routing_schema_floor\":0}'",
+            "printf '%s' 'not JSON'",
+            "exit 2",
+        ] {
+            write_executable(&binary, &format!("#!/bin/sh\n{answer}\n"));
+            let mut calls = 0;
+            let error = probe_gh_shim_binary_with_recovery(&binary, |path, budget| {
+                calls += 1;
+                probe_gh_shim_binary_with_budget(path, budget)
+            })
+            .unwrap_err();
+            assert_eq!(calls, 1, "a bad answer must fail immediately: {error}");
+        }
     }
 
     #[cfg(unix)]
