@@ -124,8 +124,13 @@ fn resolve_session(
         return Err(ErrorBody::new(contract::UNKNOWN_SUBJECT, "unknown subject"));
     }
     let mut found = None;
-    for (_, identity) in page_collect::session_routes(routes, &session.harness, &session.session) {
-        if !runner_matches(&identity, &session.runner) {
+    for identity in routes.values() {
+        // Match the harness, session and runner regardless of whether tools
+        // execute as classic calls or through codemode.
+        if identity.harness != session.harness
+            || identity.session != session.session
+            || !runner_matches(identity, &session.runner)
+        {
             continue;
         }
         if let Some(ctx) = executor.actor_context(&identity.root) {

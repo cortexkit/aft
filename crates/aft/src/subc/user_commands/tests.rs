@@ -149,6 +149,15 @@ fn user_commands_session_lookup_matches_attested_runner_harness_and_session() {
             .unwrap(),
         &ctx
     ));
+    Arc::get_mut(&mut routes.get_mut(&route_key(1, 1)).unwrap().0)
+        .unwrap()
+        .call_mode = subc_protocol::call_mode::CallMode::Codemode;
+    assert!(Arc::ptr_eq(
+        &resolve_session(&routes, &executor, &subject)
+            .unwrap()
+            .unwrap(),
+        &ctx
+    ));
     subject.session = "missing".into();
     let mut body = request("commands.preview");
     body["params"]["subject"]["session"] = encode(&subject);
