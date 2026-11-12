@@ -7219,7 +7219,9 @@ mod streamed_scan_tests {
     fn refused_step_reservation_skips_the_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = early_matches_file(directory.path());
-        let streamed = crate::large_read::with_test_steps(64, 0, || {
+        // A step larger than the 1,024 bytes the binary check read, so the
+        // first step has to grow the buffer those bytes are in.
+        let streamed = crate::large_read::with_test_steps(2048, 0, || {
             crate::large_read::with_reserve_limit(1024, || {
                 candidate_scan(&path, &foo_literal(), 1000)
             })
