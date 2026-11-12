@@ -4,7 +4,8 @@
 #   <dir>/ts7/node_modules  typescript 7 and its platform package, served by
 #                           the native language server (tsc --lsp --stdio)
 #   <dir>/ts5/node_modules  typescript 5 and typescript-language-server
-# and export both paths through $GITHUB_ENV when it is set. A directory
+#   <dir>/ts4/node_modules  typescript 4.9, served by the language server in ts5
+# and export all three paths through $GITHUB_ENV when it is set. A directory
 # restored from the CI cache is verified and reused; anything incomplete is
 # reinstalled. The tests fail, rather than skip, when these variables point at
 # a missing install, so a broken step cannot hide the coverage.
@@ -14,6 +15,7 @@ set -euo pipefail
 
 TS7_VERSION="7.0.2"
 TS5_VERSION="5.9.3"
+TS4_VERSION="4.9.5"
 TSLS_VERSION="6.0.1"
 
 dest="${1:?usage: install-typescript-test-servers.sh <dir>}"
@@ -55,11 +57,24 @@ fi
   exit 1
 }
 
+ts4="$dest/ts4"
+if [ "$(installed_version "$ts4/node_modules/typescript/package.json")" != "$TS4_VERSION" ] ||
+  [ ! -f "$ts4/node_modules/typescript/lib/tsserver.js" ]; then
+  install_into "$ts4" "typescript@$TS4_VERSION"
+fi
+[ "$(installed_version "$ts4/node_modules/typescript/package.json")" = "$TS4_VERSION" ] &&
+  [ -f "$ts4/node_modules/typescript/lib/tsserver.js" ] || {
+  echo "typescript@$TS4_VERSION in $ts4 is missing or has no lib/tsserver.js" >&2
+  exit 1
+}
+
 echo "TypeScript $TS7_VERSION: $ts7/node_modules"
 echo "TypeScript $TS5_VERSION + typescript-language-server $TSLS_VERSION: $ts5/node_modules"
+echo "TypeScript $TS4_VERSION: $ts4/node_modules (served by typescript-language-server in ts5)"
 if [ -n "${GITHUB_ENV:-}" ]; then
   {
     echo "AFT_TEST_TS7_NODE_MODULES=$ts7/node_modules"
     echo "AFT_TEST_TS5_NODE_MODULES=$ts5/node_modules"
+    echo "AFT_TEST_TS4_NODE_MODULES=$ts4/node_modules"
   } >>"$GITHUB_ENV"
 fi
