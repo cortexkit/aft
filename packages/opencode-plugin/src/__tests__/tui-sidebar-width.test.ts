@@ -194,3 +194,90 @@ describe("operator coordination lines in the visible sidebar", () => {
     );
   }
 });
+
+describe("sidebar appearance baseline", () => {
+  const themes = {
+    dark: {},
+    light: {
+      text: "#111111",
+      textMuted: "#666666",
+      success: "#008800",
+      warning: "#996600",
+      error: "#cc0000",
+      accent: "#0055aa",
+      background: "#ffffff",
+      border: "#bbbbbb",
+    },
+  };
+  const healthy = snapshot({
+    degraded: false,
+    degraded_reasons: [],
+    semantic_index: { status: "ready", entries: 24 },
+    status_bar: { errors: 0, warnings: 0, todos: 0 },
+  });
+  const states = [
+    { name: "expanded", status: healthy },
+    { name: "collapsed", status: healthy, collapsed: true },
+    { name: "git warning", status: snapshot() },
+    { name: "degraded", status: snapshot({ degraded_reasons: ["home_root"] }) },
+    {
+      name: "collapsed degraded",
+      status: snapshot({ degraded_reasons: ["home_root"] }),
+      collapsed: true,
+    },
+    {
+      name: "unknown values",
+      status: snapshot({
+        degraded: false,
+        degraded_reasons: [],
+        search_index: { status: "?", files: null },
+        semantic_index: { status: "?", entries: null },
+        status_bar: {},
+      }),
+    },
+    {
+      name: "not initialized",
+      status: snapshot({ cache_role: "not_initialized", degraded: false, degraded_reasons: [] }),
+      collapsed: true,
+    },
+    {
+      name: "config error",
+      status: snapshot({
+        cache_role: "not_initialized",
+        degraded: false,
+        degraded_reasons: [],
+        config_error: true,
+        message: "Invalid configuration",
+      }),
+    },
+    ...[0, 50, 100].map((percent) => {
+      const scope = {
+        events: 1,
+        original_tokens: 1000,
+        compressed_tokens: 1000 - percent * 10,
+        savings_tokens: percent * 10,
+      };
+      return {
+        name: `compression ${percent}%`,
+        status: { ...healthy, compression: { session: scope, project: scope } },
+      };
+    }),
+  ];
+  for (const [theme, palette] of Object.entries(themes)) {
+    for (const state of states) {
+      test(
+        `${theme} ${state.name}`,
+        async () => {
+          const frame = await renderFrame(state.status, {
+            AFT_SIDEBAR_COLLAPSED: String("collapsed" in state && state.collapsed),
+            AFT_SIDEBAR_PALETTE: JSON.stringify(palette),
+          });
+          // Ignore unused renderer rows, but retain every visible row and column.
+          while (frame.at(-1) === "") frame.pop();
+          expect(frame.join("\n")).toMatchSnapshot();
+        },
+        TEST_TIMEOUT_MS,
+      );
+    }
+  }
+});

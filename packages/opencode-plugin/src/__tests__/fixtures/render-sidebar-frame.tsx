@@ -6,7 +6,9 @@
 // and a real render needs the real ones.
 //
 // Input (environment): AFT_SIDEBAR_SNAPSHOT is the status snapshot as JSON,
-// AFT_SIDEBAR_WIDTH the panel width in columns.
+// AFT_SIDEBAR_WIDTH the panel width in columns, AFT_SIDEBAR_COLLAPSED selects
+// the compact view, and AFT_SIDEBAR_PALETTE overrides the default theme roles.
+// AFT_SIDEBAR_CAPTURE=spans includes cell colors alongside the character frame.
 
 import { testRender } from "@opentui/solid";
 import { DEFAULT_PREFS } from "../../tui/preferences.ts";
@@ -23,6 +25,7 @@ const palette = {
   accent: "#0088ff",
   background: "#000000",
   border: "#444444",
+  ...JSON.parse(process.env.AFT_SIDEBAR_PALETTE ?? "{}"),
 };
 
 const setup = await testRender(
@@ -31,7 +34,7 @@ const setup = await testRender(
       palette={palette}
       snapshot={snapshot}
       prefs={structuredClone(DEFAULT_PREFS)}
-      collapsed={false}
+      collapsed={process.env.AFT_SIDEBAR_COLLAPSED === "true"}
       onToggleCollapsed={() => {}}
       pluginVersion="0.0.0"
     />
@@ -45,7 +48,11 @@ try {
     await new Promise((resolve) => setTimeout(resolve, renderDelayMs));
   }
   await setup.renderOnce();
-  process.stdout.write(setup.captureCharFrame());
+  process.stdout.write(
+    process.env.AFT_SIDEBAR_CAPTURE === "spans"
+      ? JSON.stringify({ frame: setup.captureCharFrame(), spans: setup.captureSpans() })
+      : setup.captureCharFrame(),
+  );
 } finally {
   setup.renderer.destroy();
 }
