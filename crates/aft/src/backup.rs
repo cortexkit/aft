@@ -1572,6 +1572,11 @@ impl BackupStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn status_discovery_entries_for_test(&self) -> u64 {
+        self.discovery_entries_examined.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     fn migration_backups_dir_reads_for_tests(&self) -> u64 {
         self.migration_backups_dir_reads.load(Ordering::Relaxed)
     }

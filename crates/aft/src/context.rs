@@ -4461,6 +4461,37 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(self);
     }
 
+    pub(crate) fn status_completion_notifier(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let context = self
+            .status_emitter
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Arc::new(move || {
+            if let Some(context) = context.upgrade() {
+                context.signal_status_changed();
+            }
+        })
+    }
+
+    pub(crate) fn refresh_compression_for_status(
+        &self,
+        harness: String,
+        project: String,
+        session: String,
+    ) {
+        if let Some(db) = self.db() {
+            self.compression_aggregates.refresh_for_status(
+                db,
+                harness,
+                project,
+                session,
+                self.status_completion_notifier(),
+            );
+        }
+    }
+
     pub fn signal_status_changed(&self) {
         let context = self
             .status_emitter

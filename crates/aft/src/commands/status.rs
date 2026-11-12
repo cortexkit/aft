@@ -15,10 +15,12 @@ mod cost_tests;
 pub struct CompressionStats {
     pub project: CompressionAggregateSerde,
     pub session: CompressionAggregateSerde,
-    /// True when another thread held the database connection, so the totals
-    /// are the last ones this process computed (zero if it never had any).
+    /// True while the last exact totals await background revalidation, or
+    /// while another thread holds the database connection.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
+    #[serde(skip)]
+    unknown: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -383,22 +385,28 @@ impl AppContext {
         // session's own slice so `/aft-status` can split them in the UI).
         let backups_enabled =
             kind != StatusSnapshotKind::Operator && config.backup.enabled.unwrap_or(true);
-        let checkpoint_total = if backups_enabled {
-            self.checkpoint().lock().total_count()
+        let (checkpoint_total, session_checkpoints) = if backups_enabled {
+            let mut store = self.checkpoint().lock();
+            let resident_total = store.total_count();
+            if kind == StatusSnapshotKind::Push {
+                let session = store.status_count(session_id);
+                // Refresh this session's slice without hydrating blobs. Other
+                // sessions retain their resident, in-memory freshness as before.
+                let total = session
+                    .map(|count| resident_total - store.resident_session_count(session_id) + count);
+                (total, session)
+            } else {
+                let session = store
+                    .list(session_id)
+                    .map(|checkpoints| checkpoints.len())
+                    .unwrap_or_else(|error| {
+                        crate::slog_warn!("status checkpoint hydration failed: {}", error);
+                        0
+                    });
+                (Some(resident_total), Some(session))
+            }
         } else {
-            0
-        };
-        let session_checkpoints = if backups_enabled {
-            self.checkpoint()
-                .lock()
-                .list(session_id)
-                .map(|checkpoints| checkpoints.len())
-                .unwrap_or_else(|error| {
-                    crate::slog_warn!("status checkpoint hydration failed: {}", error);
-                    0
-                })
-        } else {
-            0
+            (Some(0), Some(0))
         };
         let session_tracked_files = if backups_enabled {
             self.backup().lock().tracked_files(session_id).len()
@@ -413,8 +421,9 @@ impl AppContext {
         let compression = if kind == StatusSnapshotKind::Operator {
             CompressionStats::default()
         } else {
-            self.compression_stats_for_session(session_id)
+            self.compression_stats_for_session_kind(session_id, kind)
         };
+        let compression_unknown = compression.unknown;
         #[cfg(test)]
         cost.mark("compression");
 
@@ -444,7 +453,11 @@ impl AppContext {
         // build wrote as today's stores refuse theirs, and is listed the
         // same way, after them. Push projection adds it itself, with this
         // project's other refusals.
-        let data_store_report = crate::data_layer::surfaces::report(self);
+        let data_store_report = if kind == StatusSnapshotKind::Push {
+            crate::data_layer::surfaces::report_for_push(self)
+        } else {
+            crate::data_layer::surfaces::report(self)
+        };
         #[cfg(test)]
         cost.mark("data_report");
         let data_store_refusal = data_store_report
@@ -603,10 +616,18 @@ impl AppContext {
 
         // With the data layer on, its planes replace today's stores for text
         // and the call graph on every status surface.
+        if compression_unknown {
+            payload["compression"]["project"] = serde_json::Value::Null;
+            payload["compression"]["session"] = serde_json::Value::Null;
+        }
         #[cfg(test)]
         cost.mark("payload");
         if let Some(report) = &data_store_report {
-            crate::data_layer::surfaces::apply_to_status(&mut payload, report);
+            if kind == StatusSnapshotKind::Push {
+                crate::data_layer::surfaces::apply_to_status_push(&mut payload, report);
+            } else {
+                crate::data_layer::surfaces::apply_to_status(&mut payload, report);
+            }
         }
         #[cfg(test)]
         cost.mark("data_apply");
@@ -659,7 +680,11 @@ impl AppContext {
         payload
     }
 
-    fn compression_stats_for_session(&self, session_id: &str) -> CompressionStats {
+    fn compression_stats_for_session_kind(
+        &self,
+        session_id: &str,
+        kind: StatusSnapshotKind,
+    ) -> CompressionStats {
         let mut compression = CompressionStats::default();
         let Some(project_root) = self.config().project_root.clone() else {
             return compression;
@@ -683,17 +708,46 @@ impl AppContext {
                 {
                     compression.project = project.into();
                     compression.session = session.into();
+                } else if kind == StatusSnapshotKind::Push {
+                    compression.unknown = true;
+                }
+                if kind == StatusSnapshotKind::Push {
+                    self.refresh_compression_for_status(
+                        harness,
+                        project_key,
+                        session_id.to_string(),
+                    );
                 }
                 return compression;
             }
             Err(std::sync::TryLockError::Poisoned(_)) => return compression,
         };
 
-        if let Ok((project, session)) =
-            cache.aggregates_for_session(&conn, &harness, &project_key, session_id)
-        {
+        let totals = if kind == StatusSnapshotKind::Push {
+            cache
+                .validated_for_status(&conn, &harness, &project_key, session_id)
+                .ok()
+                .flatten()
+        } else {
+            cache
+                .aggregates_for_session(&conn, &harness, &project_key, session_id)
+                .ok()
+        };
+        if let Some((project, session)) = totals {
             compression.project = project.into();
             compression.session = session.into();
+        } else if kind == StatusSnapshotKind::Push {
+            compression.stale = true;
+            if let Some((project, session)) =
+                cache.cached_for_session(&harness, &project_key, session_id)
+            {
+                compression.project = project.into();
+                compression.session = session.into();
+            } else {
+                compression.unknown = true;
+            }
+            drop(conn);
+            self.refresh_compression_for_status(harness, project_key, session_id.to_string());
         }
 
         compression

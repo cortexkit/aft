@@ -519,6 +519,8 @@ impl Members {
     }
 
     fn build(view: &CheckoutView, loaded: &Loaded, max_files: usize) -> Result<Self, DataError> {
+        #[cfg(test)]
+        STATUS_MEMBER_BUILDS.with(|count| count.set(count.get() + 1));
         let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
         let surveyed = survey(view.current_state(), loaded, index.as_ref(), max_files)?;
         let absolute = |path: &[u8]| {
@@ -1176,6 +1178,22 @@ impl VectorPlane {
         Ok(MeaningSnapshot {
             loaded,
             members,
+            root: view.root().to_path_buf(),
+            dimensions: self.producer.model.dimensions as usize,
+        })
+    }
+
+    /// A snapshot only if a producer already surveyed this exact text view and
+    /// vector generation. Status must not rebuild members on the push thread.
+    pub(crate) fn cached_snapshot(&self, view: &CheckoutView) -> Option<MeaningSnapshot> {
+        let loaded = Arc::clone(&self.loaded.try_lock().ok()?);
+        let cached = self.members.try_lock().ok()?;
+        let members = cached.as_ref().filter(|members| {
+            members.view == view.text_generation() && members.generation == loaded.generation
+        })?;
+        Some(MeaningSnapshot {
+            loaded,
+            members: Arc::clone(members),
             root: view.root().to_path_buf(),
             dimensions: self.producer.model.dimensions as usize,
         })
@@ -3085,4 +3103,14 @@ mod tests {
             per(refresh)
         );
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATUS_MEMBER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn status_member_builds_for_test() -> usize {
+    STATUS_MEMBER_BUILDS.with(|count| count.replace(0))
 }

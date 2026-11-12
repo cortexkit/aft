@@ -377,6 +377,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Internal vanished-directory INFO-log history is cleared at capacity; older scopes may log again, without changing the original file grant or any agent-visible result list.",
     },
     ExclusionEntry {
+        file: "checkpoint.rs",
+        enclosing_item: "status_count, STATUS_DIRECTORY_ENTRIES, STATUS_MANIFEST_BYTES, STATUS_BLOB_CHECKS",
+        location_or_primitive: "bounded status observation",
+        reason: "The checkpoint status reader caps directory entries, metadata bytes and blob validations; exhaustion returns unknown, never a truncated count or result list. Authoritative list and mutations retain full recovery semantics.",
+    },
+    ExclusionEntry {
         file: "gh_shim_speech/start_view/sweep.rs",
         enclosing_item: "sweep_entries",
         location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",

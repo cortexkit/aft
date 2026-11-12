@@ -65,6 +65,7 @@ impl PushCost {
 struct Fixture {
     ctx: Arc<AppContext>,
     checkout: Arc<DataCheckout>,
+    plane: VectorPlane,
     _dir: tempfile::TempDir,
 }
 
@@ -173,6 +174,7 @@ impl Fixture {
         Self {
             ctx,
             checkout,
+            plane,
             _dir: dir,
         }
     }
@@ -186,6 +188,123 @@ impl Fixture {
             Fresh::Ready(_)
         ));
     }
+}
+
+#[test]
+fn status_push_matches_legacy_after_fill_refresh_checkpoint_create_and_delete_without_store_reads()
+{
+    let fixture = Fixture::new(32);
+    fixture.ctx.bind_status_context();
+    let assert_parity = || {
+        // Explicit status retains the old hydration/report/disk-walk function.
+        // Disk bytes on pushes are now a timestamped sample, so take a fresh
+        // sample while the fixture is idle before comparing that measurement.
+        fixture.checkout.meaning_status();
+        fixture.checkout.disk_measurement().expire_for_test();
+        let start = Instant::now();
+        loop {
+            let push = fixture.ctx.try_build_status_push_snapshot().unwrap();
+            if push["disk"]["data_store_bytes_stale"] == false
+                && push["compression"].get("stale").is_none()
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "status producers did not settle: {push}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let old = crate::status_push::project(
+            &fixture.ctx,
+            fixture
+                .ctx
+                .build_status_snapshot_for_session(DEFAULT_SESSION_ID),
+        );
+        crate::checkpoint::status_read_counters_for_test();
+        crate::data_layer::vectors::status_member_builds_for_test();
+        crate::data_layer::surfaces::status_disk_walks_for_test();
+        SQL.with(|statements| statements.borrow_mut().clear());
+        let mut push = fixture.ctx.try_build_status_push_snapshot().unwrap();
+        assert_eq!(crate::checkpoint::status_read_counters_for_test().0, 0);
+        assert_eq!(
+            crate::data_layer::vectors::status_member_builds_for_test(),
+            0
+        );
+        assert_eq!(crate::data_layer::surfaces::status_disk_walks_for_test(), 0);
+        let sql = SQL.with(|statements| std::mem::take(&mut *statements.borrow_mut()));
+        assert!(
+            sql.iter()
+                .all(|sql| !sql.contains("SUM(") && !sql.contains("COUNT(")),
+            "push scanned SQLite: {sql:?}"
+        );
+        assert_eq!(push["disk"]["data_store_bytes_stale"], false);
+        push["disk"]
+            .as_object_mut()
+            .unwrap()
+            .remove("data_store_bytes_stale");
+        assert_eq!(push, old);
+    };
+    assert_parity();
+    fixture.edit(1000);
+    fixture
+        .plane
+        .fill(
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            FillBudget::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+    fixture.checkout.refresh_meaning_for_test();
+    assert_parity();
+    fixture
+        .ctx
+        .checkpoint()
+        .lock()
+        .create_for_files(
+            DEFAULT_SESSION_ID,
+            "new_checkpoint",
+            vec![fixture.checkout.root().join("file_0.rs")],
+        )
+        .unwrap();
+    assert_parity();
+    assert!(fixture
+        .ctx
+        .checkpoint()
+        .lock()
+        .delete(DEFAULT_SESSION_ID, "new_checkpoint"));
+    assert_parity();
+    assert!(fixture
+        .ctx
+        .checkpoint()
+        .lock()
+        .delete(DEFAULT_SESSION_ID, "checkpoint_1"));
+    assert_eq!(
+        fixture.ctx.try_build_status_push_snapshot().unwrap()["checkpoints_total"],
+        18
+    );
+    let mut external = crate::checkpoint::CheckpointStore::unbound_in_for_test(
+        &fixture._dir.path().join("storage"),
+    );
+    external
+        .create_for_files(
+            DEFAULT_SESSION_ID,
+            "external",
+            vec![fixture.checkout.root().join("file_0.rs")],
+        )
+        .unwrap();
+    let push = fixture.ctx.try_build_status_push_snapshot().unwrap();
+    assert_eq!(push["session"]["checkpoints"], 19);
+    assert_eq!(push["checkpoints_total"], 19);
+    assert_eq!(
+        fixture
+            .ctx
+            .checkpoint()
+            .lock()
+            .resident_session_count(DEFAULT_SESSION_ID),
+        18,
+        "push must not hydrate"
+    );
 }
 
 #[test]
@@ -257,4 +376,41 @@ fn status_push_filled_store_cost_probe() {
         after - before,
         (after - before) as f64 * 60.0 / start.elapsed().as_secs_f64()
     );
+}
+
+#[test]
+#[ignore = "manual deferred backup-inventory cost probe"]
+fn status_push_backup_inventory_cost_probe() {
+    let fixture = Fixture::new(256);
+    let mut backup = fixture.ctx.backup().lock();
+    backup.set_storage_dir_for_harness(
+        fixture._dir.path().join("storage"),
+        crate::harness::Harness::Opencode,
+        0,
+    );
+    for file in 0..256 {
+        assert!(backup
+            .snapshot(
+                DEFAULT_SESSION_ID,
+                &fixture.checkout.root().join(format!("file_{file}.rs")),
+                "status inventory probe"
+            )
+            .unwrap()
+            .is_some());
+    }
+    for resident in [true, false] {
+        if !resident {
+            backup.release_session_memory(DEFAULT_SESSION_ID);
+        }
+        let before = backup.status_discovery_entries_for_test();
+        let start = ThreadCpuSample::now();
+        for _ in 0..50 {
+            assert_eq!(
+                std::hint::black_box(backup.tracked_files(DEFAULT_SESSION_ID)).len(),
+                256
+            );
+        }
+        let cpu = ThreadCpuSample::elapsed(start, ThreadCpuSample::now()).unwrap();
+        eprintln!("backup inventory (unchanged push call): paths=256, resident={resident}, calls=50, CPU/call={:?}, directory entries/call={}", cpu/50, (backup.status_discovery_entries_for_test() - before)/50);
+    }
 }

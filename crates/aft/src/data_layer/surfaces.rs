@@ -174,6 +174,7 @@ pub(crate) struct DataStoreReport {
     pub(crate) refusal: Option<NewerFormat>,
     /// The family store's folder, for its disk use.
     pub(crate) family_dir: Option<PathBuf>,
+    disk_measurement: Option<Arc<DiskMeasurement>>,
     /// Meaning search's plane: the status tool's and each root's health
     /// `semantic_index`. `None` while semantic search is off for the
     /// checkout, or before anything gave it the root's semantic
@@ -195,6 +196,7 @@ impl DataStoreReport {
             failure: None,
             refusal: None,
             family_dir: None,
+            disk_measurement: None,
             meaning: None,
         }
     }
@@ -457,6 +459,14 @@ pub(crate) fn disclose_index_gaps(
 }
 
 pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
+    report_inner(ctx, false)
+}
+
+pub(crate) fn report_for_push(ctx: &AppContext) -> Option<DataStoreReport> {
+    report_inner(ctx, true)
+}
+
+fn report_inner(ctx: &AppContext, cached_only: bool) -> Option<DataStoreReport> {
     Some(match ctx.probe_data_checkout()? {
         DataCheckoutProbe::NotBound => {
             DataStoreReport::both(PlaneReport::because(OFF, reason::NOT_BOUND, None))
@@ -486,7 +496,7 @@ pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
         DataCheckoutProbe::Withheld(Withheld::IndexesOff) => {
             DataStoreReport::both(PlaneReport::of(OFF))
         }
-        DataCheckoutProbe::Bound(checkout) => report_of(&checkout),
+        DataCheckoutProbe::Bound(checkout) => report_of_inner(&checkout, cached_only),
     })
 }
 
@@ -494,7 +504,11 @@ pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
 /// at its last bind, build or refresh, without binding it; `None` when the
 /// data layer is off or nothing was refused.
 pub(crate) fn storage_refusal(ctx: &AppContext) -> Option<NewerFormat> {
-    report(ctx)?.refusal
+    match ctx.probe_data_checkout()? {
+        DataCheckoutProbe::BindFailed(error) => error.refusal().cloned(),
+        DataCheckoutProbe::Bound(checkout) => checkout.last_failure()?.refusal,
+        _ => None,
+    }
 }
 
 /// The degraded reason status gives a refused family store, in the form
@@ -518,6 +532,10 @@ pub(crate) fn refusal_json(refusal: &NewerFormat) -> Value {
 
 /// How a bound checkout stands.
 pub(crate) fn report_of(checkout: &DataCheckout) -> DataStoreReport {
+    report_of_inner(checkout, false)
+}
+
+fn report_of_inner(checkout: &DataCheckout, cached_only: bool) -> DataStoreReport {
     let status = checkout.checkout().status();
     let files = checkout.view().map(|view| view.state().paths().len());
     let mut report = report_from(
@@ -526,7 +544,8 @@ pub(crate) fn report_of(checkout: &DataCheckout) -> DataStoreReport {
         checkout.last_failure(),
         Some(checkout.checkout().family_dir().to_path_buf()),
     );
-    report.meaning = meaning_report(checkout);
+    report.meaning = meaning_report(checkout, cached_only);
+    report.disk_measurement = Some(Arc::clone(checkout.disk_measurement()));
     report.skipped_folders = checkout
         .view()
         .map_or(0, |view| view.current_state().skipped_directories().len());
@@ -767,10 +786,14 @@ impl MeaningReport {
 
 /// How `checkout`'s meaning plane stands; `None` while semantic search is
 /// off for the checkout.
-fn meaning_report(checkout: &DataCheckout) -> Option<MeaningReport> {
+fn meaning_report(checkout: &DataCheckout, cached_only: bool) -> Option<MeaningReport> {
     use crate::context::SemanticIndexStatus;
     use crate::data_layer::tools::search::DataSemantic;
-    let semantic = DataSemantic::of_checkout(checkout)?;
+    let semantic = if cached_only {
+        DataSemantic::from_state(checkout.cached_meaning_status())?
+    } else {
+        DataSemantic::of_checkout(checkout)?
+    };
     let filling = checkout.filling();
     let plane = match semantic {
         DataSemantic::Serving(meaning) => MeaningPlane::Serving {
@@ -853,12 +876,15 @@ fn report_from(
         refusal: failure.as_ref().and_then(|failure| failure.refusal.clone()),
         failure,
         family_dir,
+        disk_measurement: None,
         meaning: None,
     }
 }
 
 /// The bytes of every file under `dir`; zero when it cannot be read.
 fn dir_bytes(dir: &Path) -> u64 {
+    #[cfg(test)]
+    STATUS_DISK_WALKS.with(|count| count.set(count.get() + 1));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -870,6 +896,134 @@ fn dir_bytes(dir: &Path) -> u64 {
             _ => 0,
         })
         .fold(0, u64::saturating_add)
+}
+
+const DISK_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct DiskSample {
+    bytes: Option<u64>,
+    completed: Option<std::time::Instant>,
+    started: Option<std::time::Instant>,
+    running: bool,
+    #[cfg(test)]
+    walks: usize,
+}
+
+/// Physical bytes are a timestamped measurement, not a generation invariant:
+/// temporary files can grow without publishing a generation. All checkouts of
+/// a family share one coalesced sampler; no push walks the family directory.
+#[derive(Default)]
+pub(crate) struct DiskMeasurement {
+    sample: std::sync::Mutex<DiskSample>,
+    listeners: std::sync::Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    gate: std::sync::Mutex<Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>>,
+}
+
+impl std::fmt::Debug for DiskMeasurement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskMeasurement").finish_non_exhaustive()
+    }
+}
+
+impl DiskMeasurement {
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&self) {
+        let mut sample = self.sample.lock().unwrap();
+        assert!(!sample.running);
+        sample.started = None;
+        sample.completed = None;
+    }
+    pub(crate) fn for_family(dir: &Path) -> Arc<Self> {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        static FAMILIES: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<DiskMeasurement>>>,
+        > = std::sync::LazyLock::new(Default::default);
+        let mut families = FAMILIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        families.retain(|_, sample| sample.strong_count() > 0);
+        if let Some(sample) = families.get(&dir).and_then(std::sync::Weak::upgrade) {
+            return sample;
+        }
+        let sample = Arc::new(Self::default());
+        families.insert(dir, Arc::downgrade(&sample));
+        sample
+    }
+
+    pub(crate) fn on_change(&self, listener: &super::runtime::StatusListener) {
+        let mut listeners = self
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listeners.retain(|old| old.strong_count() > 0);
+        listeners.push(Arc::downgrade(listener));
+    }
+
+    fn observe(self: &Arc<Self>, dir: &Path) -> (Option<u64>, bool) {
+        let mut sample = self
+            .sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sample.running
+            && sample
+                .started
+                .is_none_or(|at| at.elapsed() >= DISK_REFRESH_INTERVAL)
+        {
+            sample.running = true;
+            sample.started = Some(std::time::Instant::now());
+            let own = Arc::clone(self);
+            let dir = dir.to_path_buf();
+            if std::thread::Builder::new()
+                .name("aft-status-disk".into())
+                .spawn(move || {
+                    #[cfg(test)]
+                    if let Some(gate) = own.gate.lock().unwrap().clone() {
+                        let (held, changed) = &*gate;
+                        let mut held = held.lock().unwrap();
+                        while *held {
+                            held = changed.wait(held).unwrap();
+                        }
+                    }
+                    let bytes = dir_bytes(&dir);
+                    {
+                        let mut sample = own
+                            .sample
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        sample.bytes = Some(bytes);
+                        sample.completed = Some(std::time::Instant::now());
+                        sample.running = false;
+                        #[cfg(test)]
+                        {
+                            sample.walks += 1;
+                        }
+                    }
+                    let listeners = own
+                        .listeners
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .filter_map(std::sync::Weak::upgrade)
+                        .collect::<Vec<_>>();
+                    for listener in listeners {
+                        listener();
+                    }
+                })
+                .is_err()
+            {
+                sample.running = false;
+            }
+        }
+        (
+            sample.bytes,
+            sample.running
+                || sample
+                    .completed
+                    .is_none_or(|at| at.elapsed() >= DISK_REFRESH_INTERVAL),
+        )
+    }
 }
 
 /// The data layer's memory for one root's checkout, measured as the
@@ -1122,6 +1276,14 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
 /// old call-graph store's refresh queue (`callgraph_refresh`) are dropped:
 /// neither describes what these planes answer from.
 pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
+    apply_to_status_inner(payload, report, false)
+}
+
+pub(crate) fn apply_to_status_push(payload: &mut Value, report: &DataStoreReport) {
+    apply_to_status_inner(payload, report, true)
+}
+
+fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bool) {
     payload["search_index"] = report.search_index_json();
     if let Some(meaning) = &report.meaning {
         let meaning = meaning.status_json();
@@ -1161,7 +1323,16 @@ pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
         &report.family_dir,
     ) {
         disk.insert("data_store_dir".into(), json!(dir.display().to_string()));
-        disk.insert("data_store_bytes".into(), json!(dir_bytes(dir)));
+        if push {
+            let (bytes, stale) = report
+                .disk_measurement
+                .as_ref()
+                .map_or((None, true), |measurement| measurement.observe(dir));
+            disk.insert("data_store_bytes".into(), json!(bytes));
+            disk.insert("data_store_bytes_stale".into(), json!(stale));
+        } else {
+            disk.insert("data_store_bytes".into(), json!(dir_bytes(dir)));
+        }
     }
     if let Some(object) = payload.as_object_mut() {
         object.remove("views");
@@ -2763,5 +2934,65 @@ mod tests {
         for (path, bytes) in segments.iter().zip(&planted) {
             assert_eq!(&std::fs::read(path).unwrap(), bytes, "{}", path.display());
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATUS_DISK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn status_disk_walks_for_test() -> usize {
+    STATUS_DISK_WALKS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+mod status_disk_tests {
+    use super::*;
+
+    #[test]
+    fn status_disk_measurement_coalesces_bursts_and_marks_inflight_and_expired_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("growing.tmp");
+        std::fs::write(&temp, b"first").unwrap();
+        let sample = DiskMeasurement::for_family(dir.path());
+        assert!(Arc::ptr_eq(
+            &sample,
+            &DiskMeasurement::for_family(dir.path())
+        ));
+        let gate = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+        *sample.gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener: super::super::runtime::StatusListener = Arc::new(move || {
+            let _ = tx.send(());
+        });
+        sample.on_change(&listener);
+        for _ in 0..50 {
+            assert_eq!(sample.observe(dir.path()), (None, true));
+        }
+        *gate.0.lock().unwrap() = false;
+        gate.1.notify_all();
+        rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(sample.observe(dir.path()), (Some(5), false));
+        assert_eq!(sample.sample.lock().unwrap().walks, 1);
+        std::fs::write(&temp, b"a substantially larger temporary file").unwrap();
+        for _ in 0..50 {
+            assert_eq!(sample.observe(dir.path()), (Some(5), false));
+        }
+        assert_eq!(sample.sample.lock().unwrap().walks, 1, "60-second throttle");
+        sample.expire_for_test();
+        *gate.0.lock().unwrap() = true;
+        for _ in 0..50 {
+            assert_eq!(sample.observe(dir.path()), (Some(5), true));
+        }
+        *gate.0.lock().unwrap() = false;
+        gate.1.notify_all();
+        rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            sample.observe(dir.path()),
+            (Some(dir_bytes(dir.path())), false)
+        );
+        assert_eq!(sample.sample.lock().unwrap().walks, 2);
     }
 }

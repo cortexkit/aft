@@ -314,6 +314,21 @@ impl Meaning {
     /// How meaning search stands for `view`, the checkout's current view
     /// (`None` before anything is published).
     pub(crate) fn state(&self, view: Option<&CheckoutView>) -> MeaningState {
+        self.state_inner(view, false)
+    }
+
+    pub(crate) fn cached_state(&self, view: Option<&CheckoutView>) -> MeaningState {
+        self.state_inner(view, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_for_test(&self, view: Option<&CheckoutView>) {
+        *lock(&self.refreshed_at) = None;
+        self.refresh_read_only();
+        self.state(view);
+    }
+
+    fn state_inner(&self, view: Option<&CheckoutView>, cached_only: bool) -> MeaningState {
         if !self.enabled() {
             return MeaningState::Off;
         }
@@ -330,7 +345,17 @@ impl Meaning {
                 None => MeaningState::Starting,
             };
         };
-        match plane.snapshot(view) {
+        let snapshot = if cached_only {
+            match plane.cached_snapshot(view) {
+                Some(snapshot) => Ok(snapshot),
+                // No counts are certified for this view yet; never label an
+                // older view's coverage as current during refresh.
+                None => return MeaningState::Starting,
+            }
+        } else {
+            plane.snapshot(view)
+        };
+        match snapshot {
             Ok(snapshot) => MeaningState::Serving { snapshot, failure },
             Err(error) => MeaningState::Blocked(FillFailure::Failed(error.to_string())),
         }

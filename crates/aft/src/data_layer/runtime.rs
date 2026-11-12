@@ -1108,6 +1108,9 @@ impl Work {
     /// Tells the status listener, if any, that the checkout's status may
     /// have changed.
     fn notify_status_change(&self) {
+        // Build coverage on its producer, before announcing the new view. A
+        // push only consumes a cache entry for the exact view/generation pair.
+        self.meaning.state(self.checkout.view().as_ref());
         self.checkout.notify_readiness_change();
         let listener = self
             .status_listener
@@ -1137,6 +1140,7 @@ pub(crate) struct DataCheckout {
     /// The last memory figure the census walked for this checkout, and when
     /// (see [`Self::memory_figure`]).
     memory_figure: std::sync::Mutex<Option<(Instant, u64, super::surfaces::DataLayerMemory)>>,
+    disk_measurement: Arc<super::surfaces::DiskMeasurement>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
 }
@@ -1320,6 +1324,9 @@ impl DataCheckout {
         // A bind may have recorded what changed while nothing watched.
         work.catch_up(Publish::WhenMany);
         let checkout = Arc::new(Self {
+            disk_measurement: super::surfaces::DiskMeasurement::for_family(
+                work.checkout.family_dir(),
+            ),
             work,
             quiet,
             bound_once: AtomicBool::new(false),
@@ -1770,11 +1777,16 @@ impl DataCheckout {
     /// round of this checkout ends, so status pushes follow the data layer.
     /// Replaces any earlier listener.
     pub(crate) fn on_status_change(&self, notify: StatusListener) {
+        self.disk_measurement.on_change(&notify);
         *self
             .work
             .status_listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify);
+    }
+
+    pub(crate) fn disk_measurement(&self) -> &Arc<super::surfaces::DiskMeasurement> {
+        &self.disk_measurement
     }
 
     /// Whether the checkout's TODO markers became readable since the last
@@ -1834,6 +1846,15 @@ impl DataCheckout {
         self.work.meaning.state(self.view().as_ref())
     }
 
+    pub(crate) fn cached_meaning_status(&self) -> MeaningState {
+        self.work.meaning.cached_state(self.view().as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_meaning_for_test(&self) {
+        self.work.meaning.refresh_for_test(self.view().as_ref());
+    }
+
     /// Makes this checkout's meaning search read only the vectors its
     /// repository's store already holds for `config`'s model (identified by
     /// `fingerprint`), and never fill: for a child repository of a parent
@@ -1849,7 +1870,9 @@ impl DataCheckout {
     ) -> Result<(), String> {
         self.work
             .meaning
-            .read_only(&self.work.checkout, config, fingerprint)
+            .read_only(&self.work.checkout, config, fingerprint)?;
+        self.meaning_status();
+        Ok(())
     }
 
     /// Whether a fill round is queued or running.
