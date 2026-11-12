@@ -161,7 +161,7 @@ fn unconfigured_binding_refusal_is_info_once_per_agent() {
 }
 
 #[test]
-fn configured_binding_absence_is_info_and_other_refusals_still_warn_each_time() {
+fn configured_binding_absence_and_other_refusals_still_warn_each_time() {
     let desired = BTreeMap::from([("org/repo".into(), "configured-log-test-agent".into())]);
     let reply = serde_json::json!({"repo_binding_generation":36,"bindings":[]});
     let (_, lines) = crate::logging::capture_log_lines(|| {
@@ -176,17 +176,17 @@ fn configured_binding_absence_is_info_and_other_refusals_still_warn_each_time() 
             binding_unverifiable("binding_read_timeout");
         }
     });
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    assert!(
-        lines[0].starts_with("INFO ") && lines[0].contains("org/repo"),
-        "{lines:?}"
-    );
-    assert!(
-        lines[1..]
-            .iter()
-            .all(|line| line.starts_with("WARN ") && line.contains("binding_read_timeout")),
-        "{lines:?}"
-    );
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    for pair in lines.chunks_exact(2) {
+        assert!(
+            pair[0].starts_with("WARN ") && pair[0].contains("org/repo"),
+            "{lines:?}"
+        );
+        assert!(
+            pair[1].starts_with("WARN ") && pair[1].contains("binding_read_timeout"),
+            "{lines:?}"
+        );
+    }
 }
 
 #[test]

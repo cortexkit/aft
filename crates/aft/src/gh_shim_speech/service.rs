@@ -741,8 +741,9 @@ pub(crate) fn parse_bindings(
         let detail = format!("no_binding_row: launch_agent={agent:?} repositories={expected:?}");
         if expected.is_empty() {
             UNCONFIGURED_BINDING_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(no_binding_row_refusal(agent, detail));
         }
-        return Err(no_binding_row_refusal(agent, detail));
+        return Err(binding_unverifiable(detail));
     }
     Ok(found)
 }

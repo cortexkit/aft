@@ -2033,6 +2033,7 @@ const DIRECTORY_SCOPE_MISSING_LOG_CAP: usize = 4_096;
 #[derive(Default)]
 struct DirectoryScopeProbes {
     probes: HashMap<PathBuf, Arc<DirectoryScopeProbe>>,
+    logged: HashMap<(PathBuf, &'static str), Instant>,
     missing_logged: std::collections::HashSet<PathBuf>,
     last_pruned: Option<Instant>,
 }
@@ -2044,6 +2045,8 @@ impl DirectoryScopeProbes {
             .is_none_or(|at| at.elapsed() >= DIRECTORY_SCOPE_MEMO_TTL)
         {
             self.probes.retain(|_, probe| probe.reusable());
+            self.logged
+                .retain(|_, at| at.elapsed() < DIRECTORY_SCOPE_MEMO_TTL);
             self.last_pruned = Some(Instant::now());
         }
         // Ask grants already contain canonical policy identities. Do not resolve
@@ -2068,6 +2071,17 @@ impl DirectoryScopeProbes {
                 self.missing_logged.clear();
             }
             return self.missing_logged.insert(directory.to_path_buf());
+        }
+        match self.logged.entry((directory.to_path_buf(), reason)) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().elapsed() < DIRECTORY_SCOPE_MEMO_TTL {
+                    return false;
+                }
+                entry.insert(Instant::now());
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Instant::now());
+            }
         }
         true
     }

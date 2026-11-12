@@ -4240,7 +4240,7 @@ fn consent_scope_unknown_alias_answer_is_not_memoized() {
         2,
         "unknown answers must be retried"
     );
-    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(
         lines.iter().all(|line| line.starts_with("WARN ")),
         "{lines:?}"
@@ -4284,6 +4284,8 @@ fn consent_scope_vanished_directory_is_info_once_even_after_memo_pruning() {
     assert!(lines[1].contains("another-removed-scratch:"), "{lines:?}");
     let (_, lines) = crate::logging::capture_log_lines(|| {
         log_directory_scope_fallback(&parent, "home identity unknown");
+        log_directory_scope_fallback(&parent, "home identity unknown");
+        log_directory_scope_fallback(&parent, "directory probe timed out");
         log_directory_scope_fallback(&parent, "directory probe timed out");
     });
     assert_eq!(lines.len(), 2);
@@ -4293,6 +4295,13 @@ fn consent_scope_vanished_directory_is_info_once_even_after_memo_pruning() {
     );
 
     let mut probes = DirectoryScopeProbes::default();
+    assert!(probes.note_fallback(&parent, "home identity unknown"));
+    assert!(!probes.note_fallback(&parent, "home identity unknown"));
+    probes.logged.insert(
+        (parent.clone(), "home identity unknown"),
+        Instant::now() - DIRECTORY_SCOPE_MEMO_TTL,
+    );
+    assert!(probes.note_fallback(&parent, "home identity unknown"));
     for index in 0..DIRECTORY_SCOPE_MISSING_LOG_CAP {
         assert!(probes.note_fallback(&parent.join(index.to_string()), "directory does not exist"));
         assert_eq!(probes.missing_logged.len(), index + 1);
