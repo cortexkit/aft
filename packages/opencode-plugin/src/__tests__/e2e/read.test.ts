@@ -18,6 +18,7 @@ import {
   prepareBinary,
   readTextFile,
   sendReadLikePlugin,
+  withoutTrailingStatusBar,
 } from "./helpers.js";
 
 type ReadObjectResult = {
@@ -214,20 +215,26 @@ maybeDescribe("e2e read command", () => {
 
     const plainPath = h.path("sample.ts");
     const plain = await executeReadTool(h, { filePath: "sample.ts" });
-    expect(plain.output).toBe(lineNumberText(await readTextFile(plainPath)));
+    expect(withoutTrailingStatusBar(plain.output, "\n")).toBe(
+      lineNumberText(await readTextFile(plainPath)),
+    );
     expect(plain.title).toBe("sample.ts");
     expect(plain.metadata).toEqual({ title: "sample.ts" });
 
     const ranged = await executeReadTool(h, { filePath: "sample.ts", startLine: 4, endLine: 7 });
-    expect(ranged.output).toBe(lineNumberRangeText(await readTextFile(plainPath), 4, 7));
+    expect(withoutTrailingStatusBar(ranged.output, "\n")).toBe(
+      lineNumberRangeText(await readTextFile(plainPath), 4, 7),
+    );
     expect(ranged.output).not.toContain("Use startLine/endLine");
 
     const directory = await executeReadTool(h, { filePath: "directory" });
-    expect(directory.output).toBe("alpha.ts\nbeta.ts\ngamma.ts");
+    expect(withoutTrailingStatusBar(directory.output)).toBe("alpha.ts\nbeta.ts\ngamma.ts");
     expect(directory.title).toBe("directory");
 
     const binary = await executeReadTool(h, { filePath: "binary.bin" });
-    expect(binary.output).toBe("Binary file (8 bytes), cannot display as text");
+    expect(withoutTrailingStatusBar(binary.output)).toBe(
+      "Binary file (8 bytes), cannot display as text",
+    );
     expect(binary.title).toBe("binary.bin");
   });
 
@@ -254,7 +261,9 @@ maybeDescribe("e2e read command", () => {
       offset: 4,
       limit: 4,
     });
-    expect(paged.output).toBe(lineNumberRangeText(await readTextFile(h.path("sample.ts")), 4, 7));
+    expect(withoutTrailingStatusBar(paged.output, "\n")).toBe(
+      lineNumberRangeText(await readTextFile(h.path("sample.ts")), 4, 7),
+    );
   });
 
   test("hoisted read tool preserves the server footer for default truncated reads", async () => {
@@ -282,7 +291,9 @@ maybeDescribe("e2e read command", () => {
     await writeFile(h.path("doc.pdf"), pdfBytes);
 
     const image = await executeReadTool(h, { filePath: "pixel.png" });
-    expect(image.output).toBe(`Read image attachment (image/png, 1×1, ${pngBytes.length} bytes).`);
+    expect(withoutTrailingStatusBar(image.output)).toBe(
+      `Read image attachment (image/png, 1×1, ${pngBytes.length} bytes).`,
+    );
     expect(image.attachments).toEqual([
       {
         type: "file",
@@ -296,7 +307,9 @@ maybeDescribe("e2e read command", () => {
     expect(image.metadata?.isPdf).toBe(false);
 
     const pdf = await executeReadTool(h, { filePath: "doc.pdf" });
-    expect(pdf.output).toBe(`Read PDF attachment (${pdfBytes.length} bytes).`);
+    expect(withoutTrailingStatusBar(pdf.output)).toBe(
+      `Read PDF attachment (${pdfBytes.length} bytes).`,
+    );
     expect(pdf.attachments).toEqual([
       {
         type: "file",

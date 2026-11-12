@@ -18,10 +18,20 @@ import {
   harnessPool,
   type PreparedBinary,
   prepareBinary,
+  withoutTrailingStatusBar,
 } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
+
+test("content assertions strip only an optional trailing status bar", () => {
+  const body = "shown 200 of ≥200 files (walk) · narrow: path";
+  expect(withoutTrailingStatusBar(`${body}\n\n[AFT E? W? | T0]`)).toBe(body);
+  expect(withoutTrailingStatusBar(`${body}\n`)).toBe(`${body}\n`);
+  expect(withoutTrailingStatusBar(`${body}\n[AFT E? W? | T0]`, "\n")).toBe(`${body}\n`);
+  const internal = "[AFT E? W? | T0]\nsource content";
+  expect(withoutTrailingStatusBar(internal)).toBe(internal);
+});
 
 function createMockClient(): any {
   return {
@@ -151,7 +161,7 @@ export function runHonestReportingSuite(
       expect(() => JSON.parse(output)).toThrow();
       expect(output).toContain("file-000.ts");
       expect(output).toContain(" files (walk) · narrow: path");
-      expect(output.trimEnd().split("\n").at(-1)).toMatch(
+      expect(withoutTrailingStatusBar(output).trimEnd().split("\n").at(-1)).toMatch(
         /^shown \d+ of ≥200 files \(walk\) · narrow: path$/,
       );
     });

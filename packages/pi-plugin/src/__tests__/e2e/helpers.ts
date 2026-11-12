@@ -458,6 +458,12 @@ function flattenText(result: AgentToolResultLike): string {
     .join("\n");
 }
 
+// Session count updates may append a status bar after the tool's own footer.
+// Content assertions choose the original renderer's trailing-newline shape.
+export function withoutTrailingStatusBar(text: string, trailingNewline: "" | "\n" = ""): string {
+  return text.replace(/\n*\[AFT [^\]\n]*\]\s*$/, trailingNewline);
+}
+
 // ExtensionAPI has 20+ methods tests don't exercise; any is intentional here
 // (test overrides in biome.json permit noExplicitAny).
 type AnyExtensionApi = any;

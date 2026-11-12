@@ -10,7 +10,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
-import { createHarness, type Harness, prepareBinary } from "./helpers.js";
+import { createHarness, type Harness, prepareBinary, withoutTrailingStatusBar } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = initialBinary.binaryPath ? describe : describe.skip;
@@ -140,7 +140,7 @@ maybeDescribe("hoisted tools (real bridge)", () => {
     });
     // The status bar follows when a count changed since the session's last
     // result, for example once the first TODO count lands, so drop it here.
-    const text = harness.text(result).replace(/\n*\[AFT [^\]\n]*\]\s*$/, "");
+    const text = withoutTrailingStatusBar(harness.text(result));
     expect(text).toBe("Edited (+3/-3).");
     expect((result as { details?: { editsApplied?: number } }).details?.editsApplied).toBe(1);
 
