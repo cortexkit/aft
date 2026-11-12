@@ -20,6 +20,7 @@ static BOUND_ROUTES: OnceLock<
 > = OnceLock::new();
 static SCHEDULER: OnceLock<Result<Arc<Scheduler>, String>> = OnceLock::new();
 static EXPIRED: AtomicU64 = AtomicU64::new(0);
+static IDLE_START_FALLBACK: AtomicU64 = AtomicU64::new(0);
 const QUEUE_CAPACITY: usize = 1024;
 type Work = Box<dyn FnMut() -> Next + Send>;
 
@@ -162,7 +163,7 @@ fn scheduler() -> Option<&'static Arc<Scheduler>> {
     }
 }
 
-pub(super) fn health() -> (usize, u64) {
+pub(super) fn health() -> (usize, u64, u64) {
     let waiting = SCHEDULER
         .get()
         .and_then(|result| result.as_ref().ok())
@@ -176,7 +177,11 @@ pub(super) fn health() -> (usize, u64) {
                 .count()
         })
         .unwrap_or(0);
-    (waiting, EXPIRED.load(Ordering::Relaxed))
+    (
+        waiting,
+        EXPIRED.load(Ordering::Relaxed),
+        IDLE_START_FALLBACK.load(Ordering::Relaxed),
+    )
 }
 
 pub(super) fn install(path: PathBuf) {
@@ -376,6 +381,7 @@ pub(super) mod test_endpoint {
         lose_response: AtomicBool,
         effects: Arc<AtomicU64>,
         retries: std::sync::Mutex<u64>,
+        refusals: std::sync::Mutex<std::collections::VecDeque<Value>>,
         active: AtomicU64,
         max_active: AtomicU64,
         gate:
@@ -394,6 +400,7 @@ pub(super) mod test_endpoint {
         pub session: String,
         pub scope: Option<ScopeSelector>,
         pub request: Value,
+        pub bytes: Vec<u8>,
     }
     pub(in crate::subc) struct Capture {
         key: String,
@@ -404,6 +411,17 @@ pub(super) mod test_endpoint {
     impl Capture {
         pub(super) fn retry(&self, count: u64) {
             *self.endpoint.retries.lock().unwrap() = count;
+        }
+        pub(super) fn refuse(&self, code: &str, field: Option<&str>) {
+            let mut error = json!({"code": code, "message": "notice refused"});
+            if let Some(field) = field {
+                error["detail"] = json!({"field": field});
+            }
+            self.endpoint
+                .refusals
+                .lock()
+                .unwrap()
+                .push_back(json!({"error": error}));
         }
         pub(super) fn block_next(
             &self,
@@ -432,6 +450,7 @@ pub(super) mod test_endpoint {
             lose_response: AtomicBool::new(lose_response),
             effects: effects.clone(),
             retries: Default::default(),
+            refusals: Default::default(),
             active: AtomicU64::new(0),
             max_active: AtomicU64::new(0),
             gate: Default::default(),
@@ -448,8 +467,13 @@ pub(super) mod test_endpoint {
             endpoint,
         }
     }
-    pub(super) fn send(address: &Address, request: &SendRequest) -> Option<Outcome> {
-        let endpoint = endpoints().lock().unwrap().get(&request.send_id).cloned()?;
+    pub(super) fn call(address: &Address, bytes: &[u8]) -> Option<Result<Vec<u8>, Outcome>> {
+        let body: Value = serde_json::from_slice(bytes).unwrap();
+        let key = body["params"]["send_id"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("aft:bash:{}", address.identity.session));
+        let endpoint = endpoints().lock().unwrap().get(&key).cloned()?;
         let active = endpoint.active.fetch_add(1, Ordering::Relaxed) + 1;
         endpoint.max_active.fetch_max(active, Ordering::Relaxed);
         struct Active<'a>(&'a AtomicU64);
@@ -459,22 +483,28 @@ pub(super) mod test_endpoint {
             }
         }
         let _active = Active(&endpoint.active);
-        let body: Value = serde_json::from_slice(&envelope(request)).unwrap();
-        assert_eq!(body["method"], "session.send");
         assert_eq!(body.as_object().unwrap().len(), 2);
-        let decoded: SendRequest = serde_json::from_value(body["params"].clone()).unwrap();
-        decoded.check_prompt().unwrap();
-        assert_eq!(body["params"]["notice"], true);
         let _ = endpoint.sender.send(Received {
             harness: address.identity.harness.clone(),
             session: address.identity.session.clone(),
             scope: address.scope.clone(),
-            request: body,
+            request: body.clone(),
+            bytes: bytes.to_vec(),
         });
+        if body["method"] != "session.send" {
+            assert_eq!(body["method"], "session.head");
+            return Some(Err(refusal("invalid_params")));
+        }
+        let decoded: SendRequest = serde_json::from_value(body["params"].clone()).unwrap();
+        decoded.check_prompt().unwrap();
+        assert_eq!(body["params"]["notice"], true);
         let gate = endpoint.gate.lock().unwrap().take();
         if let Some((entered, release)) = gate {
             entered.send(()).unwrap();
             release.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        if let Some(refusal) = endpoint.refusals.lock().unwrap().pop_front() {
+            return Some(Ok(serde_json::to_vec(&refusal).unwrap()));
         }
         let should_retry = {
             let mut remaining = endpoint.retries.lock().unwrap();
@@ -483,27 +513,30 @@ pub(super) mod test_endpoint {
             retry
         };
         if should_retry {
-            return Some(retry(FailureClass::TestEndpoint, "endpoint unavailable"));
+            return Some(Err(retry(
+                FailureClass::TestEndpoint,
+                "endpoint unavailable",
+            )));
         }
         let bytes = serde_json::to_vec(&decoded).unwrap();
         let mut stored = endpoint.stored.lock().unwrap();
         if let Some(first) = stored.as_ref() {
             if first != &bytes {
-                return Some(refusal("send_id_reuse"));
+                return Some(Err(refusal("send_id_reuse")));
             }
         } else {
             *stored = Some(bytes);
             endpoint.effects.fetch_add(1, Ordering::Relaxed);
         }
         if endpoint.lose_response.swap(false, Ordering::Relaxed) {
-            return Some(retry(FailureClass::TestEndpoint, "response lost"));
+            return Some(Err(retry(FailureClass::TestEndpoint, "response lost")));
         }
         let reply = cortexkit_role_llm_runner::wire::reply_body(
             &SendReply::new("pending").with_submission_id("notice-1"),
         )
         .unwrap();
         cortexkit_role_llm_runner::wire::read_reply::<SendReply>(&reply).unwrap();
-        Some(Outcome::Accepted)
+        Some(Ok(reply))
     }
 }
 
@@ -534,6 +567,7 @@ enum FailureClass {
 struct Failure {
     class: FailureClass,
     code: Option<String>,
+    field: Option<String>,
     detail: String,
 }
 
@@ -542,6 +576,7 @@ impl Failure {
         Self {
             class,
             code: None,
+            field: None,
             detail: detail.to_string(),
         }
     }
@@ -550,6 +585,7 @@ impl Failure {
         Self {
             class,
             code: Some(code.into()),
+            field: None,
             detail: detail.to_string(),
         }
     }
@@ -626,16 +662,9 @@ mod recovery_fixture;
 pub use recovery_fixture::RunnerNoticeRecoveryForTest;
 
 async fn send(path: &Path, address: &Address, request: &SendRequest) -> Outcome {
-    #[cfg(test)]
-    let captured = test_endpoint::send(address, request);
-    #[cfg(not(test))]
-    let captured: Option<Outcome> = None;
-    let outcome = match captured {
-        Some(outcome) => outcome,
-        None => match call(path, address, envelope(request)).await {
-            Ok(bytes) => decode_send_reply(&bytes),
-            Err(outcome) => outcome,
-        },
+    let outcome = match call(path, address, envelope(request)).await {
+        Ok(bytes) => decode_send_reply(&bytes),
+        Err(outcome) => outcome,
     };
     if matches!(outcome, Outcome::Accepted) {
         log::info!(
@@ -658,6 +687,11 @@ fn decode_send_reply(bytes: &[u8]) -> Outcome {
                 if let Some(code) = refusal_body.get("code").and_then(Value::as_str) {
                     let mut outcome = refusal(code);
                     if let Outcome::Final(failure) | Outcome::Retry(failure) = &mut outcome {
+                        failure.field = refusal_body
+                            .get("detail")
+                            .and_then(|detail| detail.get("field"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                         failure.detail = refusal_body.to_string();
                     }
                     return outcome;
@@ -665,6 +699,43 @@ fn decode_send_reply(bytes: &[u8]) -> Outcome {
             }
             retry(FailureClass::ReplyDecode, error)
         }
+    }
+}
+
+fn idle_start_fallback(request: &SendRequest, outcome: &Outcome) -> Option<SendRequest> {
+    let Outcome::Final(failure) = outcome else {
+        return None;
+    };
+    if failure.class != FailureClass::PeerRefusal
+        || failure.code.as_deref() != Some("invalid_params")
+        || failure.field.as_deref() != Some("delivery")
+    {
+        return None;
+    }
+    let mut order = request.delivery_order().ok()??;
+    if !order.modes.contains(&Mode::IdleStart) {
+        return None;
+    }
+    order.modes.retain(|mode| *mode != Mode::IdleStart);
+    Some(request.clone().with_delivery_order(&order))
+}
+
+fn request_failure(error: CallError) -> Outcome {
+    match error {
+        CallError::Module(error) => {
+            let mut outcome = refusal(&error.code);
+            if let Outcome::Final(failure) | Outcome::Retry(failure) = &mut outcome {
+                failure.field = error
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("field"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                failure.detail = error.message;
+            }
+            outcome
+        }
+        error => retry(FailureClass::Request, error),
     }
 }
 
@@ -734,23 +805,11 @@ fn log_route_refusal(address: &Address, failure: &Failure) {
     }
 }
 
-fn idle_start_grant(head: &cortexkit_role_llm_runner::read::HeadMeta) -> Option<bool> {
-    head.sender
-        .as_ref()
-        .map(|sender| sender.modes.iter().any(|mode| mode == "idle_start"))
-}
-
-async fn read_idle_start_grant(path: &Path, address: &Address) -> Option<bool> {
-    let body = serde_json::to_vec(&json!({"method":"session.head", "params":cortexkit_role_llm_runner::read::HeadRequest::default()})).ok()?;
-    let bytes = call(path, address, body).await.ok()?;
-    let head = cortexkit_role_llm_runner::wire::read_reply::<
-        cortexkit_role_llm_runner::read::HeadMeta,
-    >(&bytes)
-    .ok()?;
-    idle_start_grant(&head)
-}
-
 async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, Outcome> {
+    #[cfg(test)]
+    if let Some(result) = test_endpoint::call(address, &body) {
+        return result;
+    }
     let Some(principal) = crate::launch_nonce::consumer_identity() else {
         return Err(retry(
             FailureClass::ConsumerIdentity,
@@ -798,14 +857,7 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
                 .await;
             match result {
                 Ok(bytes) => Ok(bytes),
-                Err(CallError::Module(error)) => {
-                    let mut outcome = refusal(&error.code);
-                    if let Outcome::Final(failure) | Outcome::Retry(failure) = &mut outcome {
-                        failure.detail = error.message;
-                    }
-                    Err(outcome)
-                }
-                Err(error) => Err(retry(FailureClass::Request, error)),
+                Err(error) => Err(request_failure(error)),
             }
         }
         Err(error) => Err(route_failure(address, error)),
@@ -995,16 +1047,7 @@ fn offer(
                         Ok(runtime) => runtime,
                         Err(error) => return retry(FailureClass::Runtime, error),
                     };
-                    let no_idle_grant = completion
-                        && !address.worker
-                        && metadata.runner_completion_notice.is_none()
-                        && runtime.block_on(read_idle_start_grant(&path, &address)) == Some(false);
-                    let request = request(
-                        id.clone(),
-                        text.clone(),
-                        completion,
-                        address.worker || no_idle_grant,
-                    );
+                    let request = request(id.clone(), text.clone(), completion, address.worker);
                     let request = if let Some(request) = metadata
                         .runner_completion_notice
                         .clone()
@@ -1044,7 +1087,27 @@ fn offer(
                             return retry(FailureClass::Persistence, error);
                         }
                     }
-                    runtime.block_on(send(&path, &address, &request))
+                    let outcome = runtime.block_on(send(&path, &address, &request));
+                    if completion && !address.worker {
+                        if let Some(request) = idle_start_fallback(&request, &outcome) {
+                            // A delivery refusal records no send_id on the runner, so the
+                            // frozen request can be replaced before retrying the send.
+                            if let Err(error) = registry.replace_runner_completion_notice(
+                                &owner.session,
+                                &task_id,
+                                request.clone(),
+                            ) {
+                                return retry(FailureClass::Persistence, error);
+                            }
+                            IDLE_START_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                            log::info!(
+                                "runner notice task={task_id} session={} retrying without idle_start after delivery refusal",
+                                owner.session
+                            );
+                            return runtime.block_on(send(&path, &address, &request));
+                        }
+                    }
+                    outcome
                 })();
                 outcome
             };

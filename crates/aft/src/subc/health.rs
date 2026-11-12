@@ -4373,12 +4373,13 @@ fn assemble_health_report(
         dispatch_path.insert("mutating_lanes".to_string(), mutating_lanes);
     }
     metrics.insert("dispatch_path".to_string(), dispatch_path);
-    let (awaiting_retry, expired) = super::runner_notices::health();
+    let (awaiting_retry, expired, idle_start_fallback) = super::runner_notices::health();
     metrics.insert(
         "runner_notices".to_string(),
         json!({
             "completions_awaiting_retry": awaiting_retry,
             "completions_expired": expired,
+            "completions_idle_start_fallback": idle_start_fallback,
         }),
     );
     metrics.insert(

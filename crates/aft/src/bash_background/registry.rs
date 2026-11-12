@@ -12047,6 +12047,33 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    /// Replace a completion request only after the runner definitively refused it.
+    /// Refused sends record no send_id, so retries can safely use the new bytes.
+    pub(crate) fn replace_runner_completion_notice(
+        &self,
+        session: &str,
+        task_id: &str,
+        request: cortexkit_role_llm_runner::send::SendRequest,
+    ) -> std::io::Result<()> {
+        let task = self
+            .task_for_session(task_id, session)
+            .ok_or_else(|| std::io::Error::other("completion task is not owned by this session"))?;
+        self.retry_terminal_persist(&task)?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        let mut updated = state.metadata.clone();
+        updated.runner_completion_notice = Some(request);
+        if let Err(error) = self.persist_task_locked(&task, &updated, &mut db) {
+            task.drain_reply
+                .publish_metadata(&state.metadata, task.hard_kill_renewable);
+            return Err(error);
+        }
+        state.metadata = updated;
+        Ok(())
+    }
+
     pub(crate) fn freeze_runner_completion_notice(
         &self,
         session: &str,
