@@ -524,6 +524,8 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
             "-E 'test(/^tool_provider_subc_e2e::tool_provider_subc_e2e_/)'",
             "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=",
             "scripts/ci-real-daemon-test-runner.sh", "while sleep 60", 'tail -n 60 "$log"',
+            'mktemp -d "$base/aft-real-daemon.XXXXXXXX"', 'export TMPDIR="$run_root/tmp"',
+            "stat -L -c '%a %u:%g %n'", "Insecure daemon fixture ancestor:", "trap cleanup EXIT",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, script)
@@ -554,6 +556,21 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
                 self.assertFalse(fixture.exists(), "runner must clean up even after a failure")
                 homes.append(paths[0])
             self.assertNotEqual(*homes)
+
+    def test_real_daemon_gate_rejects_insecure_ancestors_before_running_tests(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "writable"
+            base.mkdir(mode=0o777)
+            base.chmod(0o777)
+            result = subprocess.run(
+                ["bash", str(root / "scripts/ci-real-daemon-tests.sh")],
+                capture_output=True, text=True, env={**os.environ, "RUNNER_TEMP": str(base)},
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(f"Insecure daemon fixture ancestor: {base} (mode 777)", result.stderr)
+            self.assertNotIn("Building and running", result.stdout)
+            self.assertEqual(list(base.iterdir()), [], "failed preflight must clean up its private directory")
 
     def test_linux_archive_covers_units_and_proves_the_uploaded_inventory(self) -> None:
         archive = self.jobs["unit-linux-nextest-archive"]
