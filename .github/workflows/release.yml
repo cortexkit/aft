@@ -441,7 +441,22 @@ jobs:
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
-        run: cross build --release --target aarch64-unknown-linux-gnu
+        # Keep line tables only until objcopy detaches them below; shipped code
+        # and optimization settings are unchanged.
+        run: cross build --release --target aarch64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"'
+
+      - name: Install ARM64 debug extraction tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y binutils-aarch64-linux-gnu
+      - name: Split and verify Linux debug symbols
+        run: python3 scripts/release-debug-symbols.py linux --binary target/aarch64-unknown-linux-gnu/release/aft --objcopy aarch64-linux-gnu-objcopy --archive release-debug/aft-linux-arm64-debug.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-debug
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
+          path: release-debug/aft-linux-arm64-debug.zip
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         with:
@@ -484,7 +499,16 @@ jobs:
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
-        run: cross build --release --target x86_64-unknown-linux-gnu
+        run: cross build --release --target x86_64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"'
+
+      - name: Split and verify Linux debug symbols
+        run: python3 scripts/release-debug-symbols.py linux --binary target/x86_64-unknown-linux-gnu/release/aft --archive release-debug/aft-linux-x64-debug.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-debug
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
+          path: release-debug/aft-linux-x64-debug.zip
+          if-no-files-found: error
 
       - name: Bundle shipped Linux binary
         id: bundle
@@ -601,7 +625,8 @@ jobs:
           }
 
       - name: Build
-        run: cargo build --release --target aarch64-pc-windows-msvc
+        # MSVC keeps debug info in a PDB, not in the shipped executable.
+        run: cargo build --release --target aarch64-pc-windows-msvc --config 'profile.release.strip=false'
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
@@ -615,6 +640,16 @@ jobs:
           if ((Get-FileHash $source).Hash -ne (Get-FileHash $destination).Hash) {
             throw "Staged release binary differs from the compiled bytes"
           }
+
+      - name: Verify and package Windows PDB
+        shell: pwsh
+        run: python scripts/release-debug-symbols.py windows --binary target/aarch64-pc-windows-msvc/release/aft.exe --pdb "$env:AFT_CI_TARGET_DIR/aarch64-pc-windows-msvc/release/aft.pdb" --archive release-debug/aft-windows-arm64-pdb.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-pdb
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
+          path: release-debug/aft-windows-arm64-pdb.zip
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         with:
@@ -685,13 +720,13 @@ jobs:
         shell: pwsh
 
       - name: Release library codegen (shipped profile)
-        run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings
+        run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false'
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Build
-        run: cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
+        run: cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false'
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
@@ -706,6 +741,16 @@ jobs:
           if ((Get-FileHash $source).Hash -ne (Get-FileHash $destination).Hash) {
             throw "Staged release binary differs from the compiled bytes"
           }
+
+      - name: Verify and package Windows PDB
+        shell: pwsh
+        run: python scripts/release-debug-symbols.py windows --binary target/x86_64-pc-windows-msvc/release/aft.exe --pdb "$env:AFT_CI_TARGET_DIR/x86_64-pc-windows-msvc/release/aft.pdb" --archive release-debug/aft-windows-x64-pdb.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-pdb
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
+          path: release-debug/aft-windows-x64-pdb.zip
+          if-no-files-found: error
 
       # Execute the exact bytes being published once on Windows.
       - name: Smoke-test binary
@@ -1393,6 +1438,18 @@ jobs:
         with:
           name: win32-arm64
           path: artifacts/win32-arm64
+      - name: Download Linux debug symbols
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*-debug
+          path: release-assets
+          merge-multiple: true
+      - name: Download Windows PDBs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*-pdb
+          path: release-assets
+          merge-multiple: true
 
       - name: Verify tested macOS binary for release
         run: python3 scripts/native-release-artifact.py unpack-published --target aarch64-apple-darwin --archive "$RUNNER_TEMP/tested-darwin-arm64/release.tar" --binary release-assets/aft-darwin-arm64 --dsym release-assets/aft-darwin-arm64-dsym.zip
