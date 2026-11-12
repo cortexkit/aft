@@ -83,7 +83,7 @@ fn call(
             let request: contract::ModuleRunRequest = params(body)?;
             let command = select(&request.id)?;
             request.check(&command).map_err(|error| error.refusal())?;
-            unreachable!("status is read-only; contract validation refuses run")
+            Err(contract::ValidationError::new("id").refusal())
         }
         _ => Err(ErrorBody::new(contract::UNKNOWN_COMMAND, "unknown command")),
     })();
@@ -245,7 +245,7 @@ fn preview(snapshot: &Value, running: Option<usize>) -> contract::Preview {
         ),
     ]);
     reply.table = Some(contract::Table::new(
-        vec!["State".into(), "Files".into(), "Size".into()],
+        vec!["State".into(), "Files".into()],
         [
             ("Text search", "search_index", text),
             ("Code map", "callgraph_store", graph),
@@ -255,12 +255,7 @@ fn preview(snapshot: &Value, running: Option<usize>) -> contract::Preview {
         .map(|(label, key, state)| {
             contract::TableRow::new(
                 label,
-                vec![
-                    state,
-                    number(snapshot[key]["files"].as_u64(), "count"),
-                    // Shared index storage cannot be assigned to one table row.
-                    number(snapshot[key]["bytes"].as_u64(), "bytes"),
-                ],
+                vec![state, number(snapshot[key]["files"].as_u64(), "count")],
             )
         })
         .collect(),

@@ -255,7 +255,10 @@ fn user_commands_preview_shapes_progress_versions_and_low_disk() {
     assert_eq!(facts[2].data.tone.as_deref(), Some("danger"));
     assert_eq!(facts[3].data.value, Some(3.0));
     assert_eq!(facts[4].data.value, Some(1.0));
-    assert_eq!(building.table.as_ref().unwrap().rows.len(), 3);
+    let table = building.table.as_ref().unwrap();
+    assert_eq!(table.columns, ["State", "Files"]);
+    assert_eq!(table.rows.len(), 3);
+    assert!(table.rows.iter().all(|row| row.cells.len() == 2));
     assert_eq!(
         building.table.as_ref().unwrap().rows[2].cells[0].progress,
         Some(0.4)
