@@ -1756,11 +1756,21 @@ impl LspManager {
     }
 
     /// Count currently replayable failed server/root starts without starting a server.
+    /// Files outside every TypeScript project remain named in status, but their
+    /// cached not-applicable outcome is not a start failure.
     pub(crate) fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
         let now = self.retry_clock.now();
         let mut counts = std::collections::BTreeMap::new();
         for (key, failure) in &self.failed_spawns {
             if failure.retry_at.is_some_and(|at| now >= at) {
+                continue;
+            }
+            if matches!(
+                &failure.result,
+                ServerAttemptResult::SpawnFailed { reason, .. }
+                    if reason.strip_prefix("server not ready: ")
+                        .is_some_and(|reason| reason.starts_with(NOT_IN_TYPESCRIPT_PROJECT))
+            ) {
                 continue;
             }
             *counts.entry(key.kind.id_str().to_owned()).or_default() += 1;
@@ -10663,6 +10673,88 @@ mod transient_retry_tests {
         );
         manager.note_start_succeeded(&key());
         assert!(manager.cached_start_failure_counts().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_ignores_capacity_refused_start() {
+        let (mut manager, _) = manager_with_clock();
+        let key = key();
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == key.kind)
+            .unwrap();
+        let error = LspError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 2 },
+        ));
+        let durability = process_start_durability(&error);
+        let result =
+            manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+
+        assert!(reason(&result).contains("rust_analyzer_capacity_exhausted"));
+        assert!(manager.cached_start_failure_counts().is_empty());
+        assert!(manager.failure_to_replay(&key).is_none());
+        assert!(manager.transient_backoff.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_ignores_not_applicable_start_but_keeps_status() {
+        let gap = typescript_initialize_failure_reason(
+            super::super::environmental::TS_LS5_NO_INSTALLATION.into(),
+            None,
+            || true,
+        );
+        for durability in [FailureDurability::Permanent, FailureDurability::Transient] {
+            let (mut manager, _) = manager_with_clock();
+            let key = ServerKey {
+                kind: ServerKind::TypeScript,
+                ..key()
+            };
+            let def = crate::lsp::registry::builtin_servers()
+                .into_iter()
+                .find(|def| def.kind == key.kind)
+                .unwrap();
+            manager.record_file_start_failure(
+                &def,
+                &key,
+                StartFailure {
+                    error: LspError::ServerNotReady(gap.clone()),
+                    durability,
+                },
+            );
+
+            assert!(manager.cached_start_failure_counts().is_empty());
+            let cached = manager.failure_to_replay(&key).unwrap();
+            assert!(reason(&cached).contains(NOT_IN_TYPESCRIPT_PROJECT));
+            assert_eq!(manager.failed_spawns.len(), 1);
+        }
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_counts_real_spawn_and_environment_failures() {
+        let cases = [
+            (ServerKind::Rust, LspError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))),
+            (ServerKind::Rust, LspError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))),
+            (ServerKind::Rust, LspError::NotFound("rust-analyzer".into())),
+            (ServerKind::Rust, LspError::ServerNotReady("server crashed during initialize: mise ERROR error parsing config file mise.toml".into())),
+            (ServerKind::TypeScript, LspError::ServerNotReady("TypeScript SDK unavailable: no tsserver.js".into())),
+        ];
+        let (mut manager, _) = manager_with_clock();
+        for (kind, error) in cases {
+            let key = ServerKey { kind, ..key() };
+            let def = crate::lsp::registry::builtin_servers()
+                .into_iter()
+                .find(|def| def.kind == key.kind)
+                .unwrap();
+            let durability = process_start_durability(&error);
+            manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+
+            assert_eq!(
+                manager.cached_start_failure_counts().get(key.kind.id_str()),
+                Some(&1)
+            );
+            manager.clear_failed_spawns();
+        }
     }
 
     fn reason(result: &ServerAttemptResult) -> &str {
