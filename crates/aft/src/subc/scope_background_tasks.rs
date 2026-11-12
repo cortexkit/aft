@@ -517,6 +517,60 @@ mod tests {
         lines.into_inner()
     }
 
+    #[tokio::test]
+    async fn scope_background_tasks_spawn_records_answers_and_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = selector();
+        let params = json!({"scope": selected});
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (writer, mut replies) = tokio::sync::mpsc::channel(8);
+        let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 1, vec![]).unwrap();
+        spawn(
+            &writer,
+            &frame,
+            &metrics,
+            Some(selected.owner.clone()),
+            params.clone(),
+            dir.path().into(),
+            Ok(vec![]),
+        );
+        replies.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.scope_background_tasks.snapshot()["answered"] != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        spawn(
+            &writer,
+            &frame,
+            &metrics,
+            Some(Principal::Direct {}),
+            params,
+            dir.path().into(),
+            Ok(vec![]),
+        );
+        replies.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.scope_background_tasks.snapshot()["refused"]["scope_owner_mismatch"] != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["scope_background_tasks"]["answered"],
+            1
+        );
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["scope_background_tasks"]["refused"]
+                ["scope_owner_mismatch"],
+            1
+        );
+    }
+
     #[test]
     fn scope_background_tasks_empty_and_refused_observations() {
         let dir = tempfile::tempdir().unwrap();
