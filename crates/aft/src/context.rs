@@ -5909,9 +5909,9 @@ impl AppContext {
             || self.watcher_drain_slice.try_lock().is_none_or(|slot| {
                 slot.as_ref().is_some_and(|state| {
                     state.has_pending_work()
-                        || state
-                            .ignore_refresh_due
-                            .is_some_and(|due| crate::runtime_drain::ignore_rule_refresh_now() >= due)
+                        || state.ignore_refresh_due.is_some_and(|due| {
+                            crate::runtime_drain::ignore_rule_refresh_now() >= due
+                        })
                 })
             })
     }
