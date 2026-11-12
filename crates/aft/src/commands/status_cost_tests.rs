@@ -199,7 +199,6 @@ fn status_push_matches_legacy_after_fill_refresh_checkpoint_create_and_delete_wi
         // Explicit status retains the old hydration/report/disk-walk function.
         // Disk bytes on pushes are now a timestamped sample, so take a fresh
         // sample while the fixture is idle before comparing that measurement.
-        fixture.checkout.meaning_status();
         fixture.checkout.disk_measurement().expire_for_test();
         let start = Instant::now();
         loop {
@@ -215,12 +214,6 @@ fn status_push_matches_legacy_after_fill_refresh_checkpoint_create_and_delete_wi
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        let old = crate::status_push::project(
-            &fixture.ctx,
-            fixture
-                .ctx
-                .build_status_snapshot_for_session(DEFAULT_SESSION_ID),
-        );
         crate::checkpoint::status_read_counters_for_test();
         crate::data_layer::vectors::status_member_builds_for_test();
         crate::data_layer::surfaces::status_disk_walks_for_test();
@@ -243,6 +236,12 @@ fn status_push_matches_legacy_after_fill_refresh_checkpoint_create_and_delete_wi
             .as_object_mut()
             .unwrap()
             .remove("data_store_bytes_stale");
+        let old = crate::status_push::project(
+            &fixture.ctx,
+            fixture
+                .ctx
+                .build_status_snapshot_for_session(DEFAULT_SESSION_ID),
+        );
         assert_eq!(push, old);
     };
     assert_parity();
@@ -305,6 +304,37 @@ fn status_push_matches_legacy_after_fill_refresh_checkpoint_create_and_delete_wi
         18,
         "push must not hydrate"
     );
+
+    // Record a new text view without running its producer. The previous
+    // coverage is no longer a certificate for this view: a push must report
+    // unknown counts rather than rebuild or borrow the previous coverage.
+    fixture.checkout.pause_meaning_summary_for_test();
+    std::fs::write(
+        fixture.checkout.root().join("file_0.rs"),
+        "pub fn pending_view() {}\n",
+    )
+    .unwrap();
+    fixture
+        .checkout
+        .checkout()
+        .record_paths(&[b"file_0.rs".to_vec()])
+        .unwrap();
+    crate::data_layer::vectors::status_member_builds_for_test();
+    crate::checkpoint::status_read_counters_for_test();
+    crate::data_layer::surfaces::status_disk_walks_for_test();
+    SQL.with(|statements| statements.borrow_mut().clear());
+    let pending = fixture.ctx.try_build_status_push_snapshot().unwrap();
+    assert_eq!(
+        crate::data_layer::vectors::status_member_builds_for_test(),
+        0
+    );
+    assert_eq!(crate::checkpoint::status_read_counters_for_test().0, 0);
+    assert_eq!(crate::data_layer::surfaces::status_disk_walks_for_test(), 0);
+    assert!(pending["semantic_index"]["files"].is_null(), "{pending}");
+    assert!(SQL.with(|statements| statements
+        .borrow()
+        .iter()
+        .all(|sql| !sql.contains("SUM(") && !sql.contains("COUNT("))));
 }
 
 #[test]

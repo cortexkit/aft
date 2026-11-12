@@ -452,6 +452,8 @@ struct Work {
     /// Told when a build, refresh or fill round ends (see
     /// [`DataCheckout::on_status_change`]).
     status_listener: std::sync::Mutex<Option<StatusListener>>,
+    #[cfg(test)]
+    status_summary_paused: std::sync::Mutex<bool>,
     /// Meaning search: its vector plane and the fill that embeds for it.
     meaning: Meaning,
     /// A fill round is queued or running.
@@ -1110,7 +1112,17 @@ impl Work {
     fn notify_status_change(&self) {
         // Build coverage on its producer, before announcing the new view. A
         // push only consumes a cache entry for the exact view/generation pair.
-        self.meaning.state(self.checkout.view().as_ref());
+        #[cfg(test)]
+        let paused = self.status_summary_paused.lock().unwrap();
+        #[cfg(test)]
+        let prepare = !*paused;
+        #[cfg(not(test))]
+        let prepare = true;
+        if prepare {
+            self.meaning.state(self.checkout.view().as_ref());
+        }
+        #[cfg(test)]
+        drop(paused);
         self.checkout.notify_readiness_change();
         let listener = self
             .status_listener
@@ -1297,6 +1309,8 @@ impl DataCheckout {
             rescanning: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),
             status_listener: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            status_summary_paused: std::sync::Mutex::new(false),
             meaning: Meaning::new(storage),
             filling: Arc::new(AtomicBool::new(false)),
             fill_retry: std::sync::Mutex::default(),
@@ -1853,6 +1867,11 @@ impl DataCheckout {
     #[cfg(test)]
     pub(crate) fn refresh_meaning_for_test(&self) {
         self.work.meaning.refresh_for_test(self.view().as_ref());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_meaning_summary_for_test(&self) {
+        *self.work.status_summary_paused.lock().unwrap() = true;
     }
 
     /// Makes this checkout's meaning search read only the vectors its
