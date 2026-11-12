@@ -89,7 +89,7 @@ import { findOnnxFixCandidates, runOnnxFix } from "../lib/onnx-fix.js";
 import { describePluginVersion, doctorInstalledVersion } from "../lib/opencode-plugin-cache.js";
 import { getAftBinaryCacheDir } from "../lib/paths.js";
 import { confirm, intro, log, note, outro, selectMany, selectOne, text } from "../lib/prompts.js";
-import { sanitizeContent } from "../lib/sanitize.js";
+import { projectRootsFromValue, sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import { compareSemver } from "../lib/semver.js";
 import { readLogHistory, readSessionLog } from "../lib/session-log.js";
@@ -2189,6 +2189,16 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   const report = await collectDiagnostics(adapters);
 
+  const sanitizeContext = {
+    projectRoots: [
+      ...adapters.flatMap((adapter) =>
+        projectRootsFromValue(readJsoncFile(adapter.detectConfigPaths().aftConfig).value),
+      ),
+      ...adapters.flatMap((adapter) => projectRootsFromValue(listRecentSessions(adapter))),
+      ...projectRootsFromValue(report),
+    ],
+  };
+
   const logResults = adapters.flatMap((adapter) => {
     const path = adapter.getLogFile();
     const { logText, errors, notice } = collectIssueLog(path, selectedSession);
@@ -2206,7 +2216,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
   });
   const logSections = logResults.map((result) => result.section).join("\n");
   const recentErrorLines = extractRecentErrors(
-    logResults.map((result) => sanitizeContent(result.errors)).join("\n"),
+    logResults.map((result) => sanitizeContent(result.errors, sanitizeContext)).join("\n"),
     20,
   );
   const recentErrorsSection =
@@ -2250,7 +2260,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
   // limit. The cap only shrinks the main `## Logs (last...` block, so
   // the Description/Environment/Diagnostics/Recent errors sections are
   // preserved intact.
-  const body = capBodyToGithubLimit(sanitizeContent(rawBody));
+  const body = capBodyToGithubLimit(sanitizeContent(rawBody, sanitizeContext));
 
   const reviewFile = writeIssueReviewFile(body);
   if (!reviewFile) {
@@ -2292,7 +2302,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     outro("Done.");
     return 1;
   }
-  const finalBody = capBodyToGithubLimit(sanitizeContent(reviewedBody));
+  const finalBody = capBodyToGithubLimit(sanitizeContent(reviewedBody, sanitizeContext));
   const finalTitle = deriveIssueTitleFromBody(finalBody);
 
   if (isGhInstalled()) {

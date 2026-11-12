@@ -47,7 +47,7 @@ describe("redactSecrets shared fixture", () => {
     }
     for (const { input, expected } of sharedRedactionCases.command_logs) {
       expect(redactSecrets(input)).toBe(expected);
-      expect(sanitizeContent(input)).toBe(expected);
+      expect(sanitizeContent(input)).toBe(expected.replaceAll("root=/project", "root=<PROJECT>"));
     }
   });
 });
@@ -98,13 +98,9 @@ describe("sanitizeContent", () => {
     expect(out).toContain("/home/<USER>");
   });
 
-  test("replaces standalone username occurrences", () => {
-    // Only meaningful when the test runner actually has a username.
-    if (!originalUser) return;
+  test("leaves bare username words alone because they may be ordinary prose", () => {
     const input = `Config for ${originalUser} loaded`;
-    const out = sanitizeContent(input);
-    expect(out).not.toContain(originalUser);
-    expect(out).toContain("<USER>");
+    expect(sanitizeContent(input)).toBe(input);
   });
 
   test("is idempotent", () => {

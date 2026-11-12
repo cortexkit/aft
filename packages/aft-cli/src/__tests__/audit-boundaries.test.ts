@@ -12,20 +12,20 @@ test("issue truncation preserves both log fences", () => {
   expect(Buffer.byteLength(result)).toBeLessThanOrEqual(500);
 });
 
-test("username redaction leaves identifiers intact", () => {
+test("username redaction recognizes identities but leaves arbitrary path components intact", () => {
   const username = userInfo().username;
   expect(
     sanitizeContent(
       `project_${username} ${username}@host /${username}/ \\${username}\\ ~${username}`,
     ),
-  ).toBe(`project_${username} <USER>@host /<USER>/ \\<USER>\\ ~<USER>`);
+  ).toBe(`project_${username} <USER>@host /${username}/ \\${username}\\ ~<USER>`);
 });
 
-test("short usernames redact only at boundaries", () => {
+test("short usernames redact only in identity positions", () => {
   for (const user of ["root", "a", "dev"]) {
     expect(
       redactUsername(`project_${user} ${user}2 /${user}/ \\${user}\\ ~${user} ${user}@host`, user),
-    ).toBe(`project_${user} ${user}2 /<USER>/ \\<USER>\\ ~<USER> <USER>@host`);
+    ).toBe(`project_${user} ${user}2 /${user}/ \\${user}\\ ~<USER> <USER>@host`);
   }
 });
 

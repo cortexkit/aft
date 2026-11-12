@@ -184,70 +184,186 @@ export function redactSecrets(content: string): string {
 }
 
 /**
- * Strip personally identifiable path segments and usernames from arbitrary
- * text. Used on log contents, diagnostic JSON blocks, and the final issue body
- * so reports never leak usernames or home-directory paths.
+ * Redact known project/home paths and explicit username positions in logs,
+ * diagnostic JSON blocks and the final issue body, preserving ordinary prose.
  */
-export function sanitizeContent(content: string): string {
-  const username = userInfo().username;
-  const home = homedir();
-
+export function sanitizeContent(content: string, context: SanitizeContext = {}): string {
+  const username = context.username ?? userInfo().username;
+  const home = context.home ?? homedir();
   let sanitized = redactSecrets(content);
-
-  // Redact the project/working-directory prefix first. It's the most specific
-  // path and often the biggest leak in logs (it names the repo the user is
-  // working on). Done before the home-dir pass because the cwd usually lives
-  // under home; in-project relative structure is left intact for debugging.
   const cwd = process.cwd();
-  for (const candidate of new Set([cwd, safeRealpath(cwd)])) {
-    if (candidate && candidate !== "/" && candidate !== home) {
-      sanitized = sanitized.replace(new RegExp(escapeRegex(candidate), "g"), "<PROJECT>");
+  const roots = new Set([
+    cwd,
+    safeRealpath(cwd),
+    ...(context.projectRoots ?? []).flatMap((root) =>
+      root.startsWith("~/") ? [root, home + root.slice(1)] : [root],
+    ),
+    ...reportProjectRoots(decodedView(content).text),
+  ]);
+  const candidates = [...roots].filter((root): root is string => Boolean(root));
+  for (const root of candidates) {
+    const real = safeRealpath(root);
+    if (real) roots.add(real);
+  }
+  // A report may include several project roots, not just the CLI's cwd.
+  // Replace nested roots first so their private suffixes cannot survive.
+  for (const root of [...roots]
+    .filter((root): root is string => Boolean(root))
+    .sort((a, b) => b.length - a.length)) {
+    if (
+      /^(?:\/|[A-Za-z]:[/\\]|~\/)/.test(root) &&
+      root !== home &&
+      !/^(?:[/\\]|[A-Za-z]:[/\\])$/.test(root)
+    ) {
+      sanitized = replacePath(sanitized, root, "<PROJECT>");
     }
   }
+  if (home && home !== "/") sanitized = replacePath(sanitized, home, "~");
+  // Only profile-directory components identify users. A common username such
+  // as dev must never change /dev/null, relative paths, or ordinary prose.
+  sanitized = replaceDecoded(
+    sanitized,
+    /(?<![\p{L}\p{N}_/])(?:\/(?:home|Users)\/|[A-Za-z]:\/Users\/)([^/\s"'<>`,;:?#&()[\]{}=]+)/gu,
+    (match) => ({ offset: match[0].length - match[1].length, value: "<USER>" }),
+  );
+  return redactUsername(sanitized, username);
+}
 
-  if (home) {
-    sanitized = sanitized.replace(new RegExp(escapeRegex(home), "g"), "~");
+export interface SanitizeContext {
+  projectRoots?: readonly string[];
+  home?: string;
+  username?: string;
+}
+
+/** Decode for matching only; retain source spans so unrelated text stays byte-for-byte intact. */
+function decodedView(content: string) {
+  let units = Array.from({ length: content.length }, (_, i) => ({
+    char: content[i],
+    start: i,
+    end: i + 1,
+  }));
+  const decoded: typeof units = [];
+  for (let i = 0; i < units.length; ) {
+    const byte = content.slice(i, i + 3);
+    const first = /^%[\da-f]{2}$/i.test(byte) ? Number.parseInt(byte.slice(1), 16) : -1;
+    const width = first < 0x80 ? 1 : first >= 0xc2 && first <= 0xdf ? 2 : first <= 0xef ? 3 : 4;
+    const spelling = content.slice(i, i + width * 3);
+    if (first >= 0 && /^(?:%[\da-f]{2})+$/i.test(spelling)) {
+      try {
+        const value = decodeURIComponent(spelling);
+        for (const char of value.split(""))
+          decoded.push({ char, start: i, end: i + spelling.length });
+        i += spelling.length;
+        continue;
+      } catch {
+        // Malformed URL bytes are not paths; keep them unchanged.
+      }
+    }
+    decoded.push(units[i++]);
   }
-  sanitized = sanitized.replace(/\/Users\/[^/\s"']+/g, "/Users/<USER>");
-  sanitized = sanitized.replace(/\/home\/[^/\s"']+/g, "/home/<USER>");
-  // Windows user dirs, any drive letter, both slash styles, and escaped-backslash
-  // (JSON-encoded) forms. The home/username passes only catch the ACTIVE user;
-  // a log can carry other users' paths or a non-C: drive (e.g. a CI runner or a
-  // pasted path), which would otherwise leak into the public issue body. The
-  // drive letter is preserved (not PII); only the username segment is redacted.
-  sanitized = sanitized.replace(/([A-Za-z]:\\\\Users\\\\)[^\\\\"'\s]+/g, "$1<USER>");
-  sanitized = sanitized.replace(/([A-Za-z]:\\Users\\)[^\\"'\s]+/g, "$1<USER>");
-  sanitized = sanitized.replace(/([A-Za-z]:\/Users\/)[^/\s"']+/g, "$1<USER>");
-  if (username) {
-    sanitized = redactUsername(sanitized, username);
+  units = [];
+  for (let i = 0; i < decoded.length; i++) {
+    const unit = decoded[i];
+    const next = decoded[i + 1];
+    if (unit.char === "\\" && next && (next.char === "/" || next.char === "\\")) {
+      units.push({ char: "/", start: unit.start, end: next.end });
+      i++;
+    } else units.push({ ...unit, char: unit.char === "\\" ? "/" : unit.char });
   }
-  return sanitized;
+  return { text: units.map((unit) => unit.char).join(""), units };
+}
+
+function replaceDecoded(
+  content: string,
+  pattern: RegExp,
+  replacement: (match: RegExpExecArray) => { offset: number; value: string },
+): string {
+  const view = decodedView(content);
+  let result = "";
+  let cursor = 0;
+  for (const match of view.text.matchAll(pattern)) {
+    const { offset, value } = replacement(match);
+    const start = view.units[match.index + offset].start;
+    const end = view.units[match.index + match[0].length - 1].end;
+    result += content.slice(cursor, start) + value;
+    cursor = end;
+  }
+  return result + content.slice(cursor);
+}
+
+function replacePath(content: string, path: string, value: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!normalized) return content;
+  const pattern = new RegExp(
+    `(?<![\\p{L}\\p{N}_/])${escapeRegex(normalized)}(?=$|[/\\s"'<>\x60,;:)\\]?#&])`,
+    /^[A-Za-z]:/.test(path) ? "giu" : "gu",
+  );
+  return replaceDecoded(content, pattern, () => ({ offset: 0, value }));
+}
+
+/** Root metadata is authoritative; arbitrary absolute paths in commands are not project roots. */
+function reportProjectRoots(content: string): string[] {
+  return [
+    ...content.matchAll(
+      /(?:\broot=|project root set: |watcher started: |"(?:projectRoot|project_root|canonical_root)"\s*:\s*)("[^"]+"|'[^']+'|[^\s"'<>`,;]+)/g,
+    ),
+  ]
+    .map((match) => match[1].replace(/^["']|["']$/g, ""))
+    .filter((root) => /^(?:\/|[A-Za-z]:\/)/.test(root));
 }
 
 /**
  * Recursively sanitize any value by deep-walking objects/arrays. Strings are
  * passed through `sanitizeContent`; other primitives are preserved.
  */
-export function sanitizeValue(value: unknown): unknown {
+export function sanitizeValue(value: unknown, context: SanitizeContext = {}): unknown {
+  const scoped = {
+    ...context,
+    projectRoots: [...(context.projectRoots ?? []), ...projectRootsFromValue(value)],
+  };
+  return sanitizeNestedValue(value, scoped);
+}
+
+function sanitizeNestedValue(value: unknown, context: SanitizeContext): unknown {
   if (typeof value === "string") {
-    return sanitizeContent(value);
+    return sanitizeContent(value, context);
   }
   if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeValue(entry));
+    return value.map((entry) => sanitizeNestedValue(entry, context));
   }
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, sanitizeValue(entry)]),
+      Object.entries(value).map(([key, entry]) => [key, sanitizeNestedValue(entry, context)]),
     );
   }
   return value;
 }
 
-/** Redact a username only as a whole word or path segment, never inside identifiers. */
+/** Collect only declared root fields, never arbitrary file/config/cache paths. */
+export function projectRootsFromValue(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value)) return value.flatMap(projectRootsFromValue);
+  const object = value as Record<string, unknown>;
+  const roots = [object.projectRoot, object.project_root, object.canonical_root].filter(
+    (root): root is string => typeof root === "string",
+  );
+  const index = object.index as { roots?: { path?: unknown }[] } | undefined;
+  if (index && Array.isArray(index.roots)) {
+    for (const root of index.roots)
+      if (root && typeof root.path === "string") roots.push(root.path);
+  }
+  return [...roots, ...Object.values(object).flatMap(projectRootsFromValue)];
+}
+
+/** SSH identities and shell home expansion are username positions, unlike bare words or /dev/. */
 export function redactUsername(content: string, username: string): string {
   if (!username) return content;
-  return content.replace(
-    new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRegex(username)}(?![\\p{L}\\p{N}_])`, "gu"),
-    "<USER>",
+  return replaceDecoded(
+    content,
+    new RegExp(
+      `(?<![\\p{L}\\p{N}_/])~${escapeRegex(username)}(?![\\p{L}\\p{N}_])|(?<![\\p{L}\\p{N}_/])${escapeRegex(username)}(?=@[\\p{L}\\p{N}])`,
+      "gu",
+    ),
+    (match) => ({ offset: match[0].startsWith("~") ? 1 : 0, value: "<USER>" }),
   );
 }
