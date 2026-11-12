@@ -1874,35 +1874,17 @@ function locationContext(id) {
   };
 }
 
-function assertCodeModeTools(tools) {
-  // Only the read-only tools have a Code Mode permission design. Keep this
-  // expectation independent of the production allowlist so drift fails here.
-  const readOnly = new Set([
-    "read", "grep", "glob", "aft_search", "aft_outline", "aft_zoom", "aft_callgraph",
-  ]);
-  for (const name of readOnly) {
-    const tool = tools.find((tool) => tool.name === name);
-    if (!tool) throw new Error("enabled V2 effect did not register " + name);
-    if (tool.options?.codemode !== true) {
-      throw new Error("enabled V2 effect did not enable CodeMode for " + name);
-    }
-  }
-  for (const tool of tools) {
-    if (!readOnly.has(tool.name) && tool.options?.codemode !== false) {
-      throw new Error("enabled V2 effect did not disable CodeMode for " + tool.name);
-    }
-  }
-}
-
 const first = locationContext("location-a");
 const second = locationContext("location-b");
 await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   yield* loaded.effect(first.context);
   yield* loaded.effect(second.context);
   for (const [index, location] of [first, second].entries()) {
-    assertCodeModeTools(location.tools);
     const outline = location.tools.find((tool) => tool.name === "aft_outline");
     if (!outline) throw new Error("enabled V2 effect did not register aft_outline");
+    if (outline.options?.codemode !== false) {
+      throw new Error("enabled V2 effect did not disable CodeMode for aft_outline");
+    }
     yield* outline.execute(
       { target: directory },
       {
@@ -2069,9 +2051,11 @@ if (first.rpcDisposals() !== 1 || second.rpcDisposals() !== 1) {
 const reloaded = locationContext("location-reload");
 await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   yield* loaded.effect(reloaded.context);
-  assertCodeModeTools(reloaded.tools);
   const outline = reloaded.tools.find((tool) => tool.name === "aft_outline");
   if (!outline) throw new Error("reloaded V2 effect did not register aft_outline");
+  if (outline.options?.codemode !== false) {
+    throw new Error("reloaded V2 effect did not disable CodeMode for aft_outline");
+  }
   yield* outline.execute(
     { target: directory },
     {

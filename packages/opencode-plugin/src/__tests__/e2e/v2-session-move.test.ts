@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { bootV2Host, type ModelRequest, type ModelScript, messageText, until } from "./v2-host.js";
 
 const hostBinary = process.env.AFT_V2_HOST_BINARY;
-const readDescriptionCode = 'return await tools.read({ path: "DESCRIPTION" });';
 
 function latestDescriptionRead(requests: ModelRequest[]): string | undefined {
   for (const request of requests.toReversed()) {
@@ -14,8 +13,8 @@ function latestDescriptionRead(requests: ModelRequest[]): string | undefined {
         (message.tool_calls ?? [])
           .filter(
             (call) =>
-              call.function.name === "execute" &&
-              JSON.parse(call.function.arguments).code === readDescriptionCode,
+              call.function.name === "read" &&
+              JSON.parse(call.function.arguments).path === "DESCRIPTION",
           )
           .map((call) => call.id),
       ),
@@ -31,12 +30,9 @@ function latestDescriptionRead(requests: ModelRequest[]): string | undefined {
 test.skipIf(!hostBinary)(
   "real V2 host: relative reads follow a session moved to another repository",
   async () => {
-    // Read-only tools are exposed through Code Mode: the model invokes them
-    // through execute rather than calling read directly.
-    // Match the execute call's result so an unrelated tool output cannot pass.
     const script: ModelScript = {
-      "read before move": { name: "execute", arguments: { code: readDescriptionCode } },
-      "read after move": { name: "execute", arguments: { code: readDescriptionCode } },
+      "read before move": { name: "read", arguments: { path: "DESCRIPTION" } },
+      "read after move": { name: "read", arguments: { path: "DESCRIPTION" } },
     };
     const host = await bootV2Host(hostBinary as string, {
       label: "session-move",
@@ -54,14 +50,10 @@ test.skipIf(!hostBinary)(
       );
       const session = await host.newSession("Move between repositories");
       await host.turn(session.id, "read before move");
-      const offered = host.requests.at(-1)?.tools ?? [];
-      const offeredNames = offered.map((tool) => tool.function.name);
-      expect(offeredNames).toContain("execute");
-      expect(offeredNames).not.toContain("read");
-      console.log("[v2-session-move] read is Code Mode only; model calls execute");
       expect(latestDescriptionRead(host.requests)).toContain("first-repository-only");
       expect(latestDescriptionRead(host.requests)).not.toContain("second-repository-only");
 
+      const offered = host.requests.at(-1)?.tools ?? [];
       const move = offered.find((tool) => /^(opencode[._])?session_move$/.test(tool.function.name));
       if (move) {
         script["move the session"] = {
