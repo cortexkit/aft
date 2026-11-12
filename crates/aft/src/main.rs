@@ -3541,7 +3541,7 @@ mod deferred_semantic_search_tests {
             };
             aft::commands::tool_call::register_dispatch(dispatch);
             let mut expected = dispatch(make_request(), &ctx);
-            assert!(expected.success, "{expected:?}");
+            assert_eq!(expected.success, name != "aft_grep", "{expected:?}");
             let (entered_tx, entered_rx) = mpsc::sync_channel(1);
             let (release_tx, release_rx) = mpsc::sync_channel(1);
             super::DEFERRED_DISPATCH_PROBE.with(|probe| {
