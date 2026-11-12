@@ -212,7 +212,10 @@ fn bash_kill_of_a_finished_task_names_what_survived_it() {
     let task_id = spawn_for_kill(
         &registry,
         dir.path(),
-        "(trap '' TERM; touch ready; exec sleep 30) & while [ ! -f ready ]; do sleep 0.01; done",
+        &format!(
+            "(trap '' TERM; touch ready; exec sleep 30) & {}",
+            crate::test_gate::gate("ready", "sleep 0.01")
+        ),
     );
     wait_for_file(&dir.path().join("ready"), "the command did not start");
     let pgid = task_pgid(&registry, &task_id);
@@ -446,7 +449,7 @@ fn finish_leaving_a_survivor(
         dir,
         // Write the pid to a temp file and rename it, so the reader never sees
         // the file between its creation and the write (an empty read failed once).
-        "sh -c 'trap \"\" TERM; echo $$ > survivor.pid.tmp && mv survivor.pid.tmp survivor.pid; exec sleep 30' & while [ ! -f go ]; do sleep 0.01; done",
+        &format!("sh -c 'trap \"\" TERM; echo $$ > survivor.pid.tmp && mv survivor.pid.tmp survivor.pid; exec sleep 30' & {}", crate::test_gate::gate("go", "sleep 0.01")),
     );
     wait_for_file(&dir.join("survivor.pid"), "the survivor did not start");
     let survivor = std::fs::read_to_string(dir.join("survivor.pid"))

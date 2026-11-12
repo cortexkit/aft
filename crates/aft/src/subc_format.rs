@@ -1166,6 +1166,11 @@ pub(crate) fn format_bash_task_status_header(
     exit_code: Option<i64>,
     status_reason: Option<&str>,
 ) -> String {
+    if status == "fate_unknown"
+        && status_reason == Some(crate::bash_background::PTY_EXIT_STATUS_UNKNOWN_REASON)
+    {
+        return format!("Task {task_id}: exit status unknown (AFT could not read how it ended)");
+    }
     let mut text = format!("Task {task_id}: {status}");
     if status == "killed" {
         if let Some(label) = crate::bash_background::registry::scope_end_label(status_reason) {
@@ -1212,7 +1217,11 @@ fn format_bash_status(
     if paged {
         return text;
     }
-    if let Some(duration_ms) = data.get("duration_ms").and_then(Value::as_u64) {
+    if let Some(duration_ms) = data.get("duration_ms").and_then(Value::as_u64).filter(|_| {
+        !(status == "fate_unknown"
+            && data.get("status_reason").and_then(Value::as_str)
+                == Some(crate::bash_background::PTY_EXIT_STATUS_UNKNOWN_REASON))
+    }) {
         // Rounded to the nearest second, as the plugin displays it.
         text.push_str(&format!(" {}s", duration_ms.saturating_add(500) / 1000));
     }
@@ -5509,6 +5518,35 @@ mod bash_companion_format_tests {
                 assert!(text.contains(reason), "status text: {text}");
             }
         }
+    }
+
+    #[test]
+    fn pty_lost_exit_status_renders_approved_line_without_exit_code() {
+        let text = status_text(
+            json!({
+                "task_id": "bash-lost", "status": "fate_unknown", "mode": "pty",
+                "exit_code": null, "duration_ms": 1000,
+                "status_reason": "AFT could not read how it ended",
+            }),
+            None,
+        );
+        assert_eq!(
+            text,
+            "Task bash-lost: exit status unknown (AFT could not read how it ended)"
+        );
+        assert_eq!(
+            format_bash_task_status_header("bash-killed", "killed", Some(137), None),
+            "Task bash-killed: killed (exit 137)"
+        );
+        assert_eq!(
+            format_bash_task_status_header(
+                "bash-remote",
+                "fate_unknown",
+                None,
+                Some("connection lost")
+            ),
+            "Task bash-remote: fate_unknown"
+        );
     }
 
     #[test]

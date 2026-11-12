@@ -709,7 +709,10 @@ mod tests {
             let _token = crate::executor::install_job_cancellation(token);
             supervised_output(Command::new("sh").current_dir(root).args([
                 "-c",
-                "while [ ! -f release ]; do sleep 0.02; done; printf out; printf err >&2; exit 7",
+                &format!(
+                    "{}; printf out; printf err >&2; exit 7",
+                    crate::test_gate::gate("release", "sleep 0.02")
+                ),
             ]))
         });
         for at in [30_000, 60_000, 90_000, 120_000] {

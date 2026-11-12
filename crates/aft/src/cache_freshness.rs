@@ -705,7 +705,7 @@ mod tests {
         let fresh = collect(&path).unwrap();
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(b"").unwrap();
-        file.sync_all().unwrap();
+        aft_store::sync::sync_all(&file, &path).unwrap();
         filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
         assert!(matches!(
             verify_file(&path, &fresh),

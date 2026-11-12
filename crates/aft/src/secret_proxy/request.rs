@@ -10,10 +10,7 @@ use secret_rules::location::{
     evaluate_request_with_connect, HeaderField, LabelOutcome, Location, RequestView,
 };
 use secret_rules::material::{check_admissible, encode_for_location};
-use secret_rules::target::{
-    authority_matches_connect, normalize_request_target, ConnectAuthority, RequestTarget,
-    RuleTarget,
-};
+use secret_rules::target::{authority_matches_connect, normalize_request_target, ConnectAuthority};
 use zeroize::Zeroizing;
 
 use super::{full, refusal, Body, State};
@@ -36,9 +33,9 @@ pub(super) async fn forward(
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let fallback = state
         .config
-        .grants
+        .scanned_labels
         .first()
-        .map(|g| g.rule.label.as_str())
+        .map(String::as_str)
         .unwrap_or("");
     let result = if let Some(lease) = &lease {
         prepare_and_send(request, &authority, &state, lease.clone(), &mut audit).await
@@ -120,28 +117,8 @@ async fn prepare_and_send(
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let client_upgrade = ws.then(|| hyper::upgrade::on(&mut request));
     let (mut parts, mut incoming) = request.into_parts();
-    let rules: Vec<_> = state.config.grants.iter().map(|g| g.rule.clone()).collect();
-    let target_view = RequestTarget {
-        host: authority.host.clone(),
-        port: authority.port,
-        scheme: "https",
-        target: &target,
-    };
-    let matches: Vec<_> = rules
-        .iter()
-        .map(|r| {
-            target_view
-                .matches(&RuleTarget {
-                    host: &r.host,
-                    port: r.port,
-                    path_prefix: &r.path_prefix,
-                })
-                .is_ok()
-        })
-        .collect();
-    // A runtime-built header label is not a launch grant. Refuse it before
-    // contacting the vault; other destinations and non-header text are literal.
-    if matches.iter().any(|matched| *matched) {
+    // Runtime-built labels cannot widen the labels scanned at launch.
+    {
         for value in parts.headers.values() {
             for (offset, byte) in value.as_bytes().iter().enumerate() {
                 if *byte != b'{' {
@@ -150,19 +127,25 @@ async fn prepare_and_send(
                 if let Some(placeholder) =
                     secret_rules::placeholder::parse_at(value.as_bytes(), offset)
                 {
-                    if !rules.iter().any(|rule| rule.label == placeholder.label) {
+                    if !state
+                        .config
+                        .scanned_labels
+                        .iter()
+                        .any(|label| label == placeholder.label)
+                    {
                         return Err(placeholder.label.to_owned());
                     }
                 }
             }
         }
     }
-    let has_json = rules
-        .iter()
-        .zip(&matches)
-        .any(|(r, m)| *m && matches!(r.location, Location::Json(_)));
-    // Only JSON substitution needs a buffered body. Other uploads remain
-    // streaming; they are never searched for placeholders outside their rule.
+    // The vault names the substitution location only when it releases a key.
+    // Buffer bounded JSON bodies to discover placeholders before asking it.
+    let has_json = parts
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(secret_rules::location::is_json_content_type);
     let mut body = body_buffer(has_json);
     if has_json {
         while let Some(frame) = incoming.frame().await {
@@ -185,6 +168,155 @@ async fn prepare_and_send(
             }
         }
     }
+    let path = target.split(['?', '#']).next().unwrap_or("/");
+    let path = normalize_request_target(path).map_err(|_| fail())?;
+    let addressed = crate::secret::ApiKeyTarget {
+        scheme: "https".into(),
+        host: authority.host.clone(),
+        port: Some(443),
+        path: String::from_utf8(path.wire).map_err(|_| fail())?,
+    };
+    let labels: Vec<_> = state
+        .config
+        .scanned_labels
+        .iter()
+        .filter(|label| {
+            super::audit::mentions(target.as_bytes(), label)
+                || parts
+                    .headers
+                    .values()
+                    .any(|value| super::audit::mentions(value.as_bytes(), label))
+                || super::audit::mentions(&body, label)
+        })
+        .cloned()
+        .collect();
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
+        .collect();
+    let structure = RequestView::new(&target, headers).with_body(&body);
+    if has_json && !labels.is_empty() {
+        secret_rules::location::validate_json_request(&structure).map_err(|_| fail())?;
+    }
+    if evaluate_request_with_connect(&structure, authority, &[], &[])
+        .refusal
+        .is_some()
+    {
+        return Err(fail());
+    }
+    drop(structure);
+    let mut budget = state.approvals.budget();
+    // Finish verified TLS before any releasing call. Approval waits reconnect
+    // before their retry; no socket held across a phone wait authorizes a send.
+    let initial = connect_upstream(authority, state, ws).await?;
+    let reconnected = tokio::sync::Mutex::new(Vec::new());
+    use futures_util::StreamExt;
+    let mut pending = futures_util::stream::FuturesUnordered::new();
+    for label in &labels {
+        audit.mention(label);
+        let addressed = &addressed;
+        let reconnected = &reconnected;
+        let expires = budget.expires_at_ms;
+        let (target, headers, body) = (&target, &parts.headers, &body);
+        pending.push(async move {
+            let answer = if state.is_https_port(authority.port) {
+                state
+                    .approvals
+                    .use_planned_in_request(
+                        label,
+                        addressed,
+                        expires,
+                        |location| {
+                            plan_location(
+                                label, location, addressed, authority, target, headers, body,
+                            )
+                            .map_err(|_| crate::secret::requests::UseError::Unavailable)
+                        },
+                        |key| {
+                            state
+                                .install(label, key)
+                                .map_err(|_| crate::secret::requests::UseError::Unavailable)
+                        },
+                        || async {
+                            let connection = connect_upstream(authority, state, ws)
+                                .await
+                                .map_err(|_| crate::secret::requests::UseError::Unavailable)?;
+                            reconnected.lock().await.push(connection);
+                            Ok(())
+                        },
+                    )
+                    .await
+            } else {
+                Ok(crate::secret::UseAnswer::NotFound)
+            };
+            (label, answer)
+        });
+    }
+    let mut rules = Vec::new();
+    let mut materials = Vec::new();
+    let mut unsettled = labels.clone();
+    while !pending.is_empty() {
+        let (label, answer) = tokio::select! {
+            biased;
+            () = budget.expired() => return Ok(not_approved(unsettled.first().map(String::as_str).unwrap_or(""), &authority.host, state, crate::secret::requests::UseError::Expired)),
+            result = pending.next() => result.ok_or_else(fail)?,
+        };
+        unsettled.retain(|name| name != label);
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(
+                reason @ (crate::secret::requests::UseError::Declined
+                | crate::secret::requests::UseError::Expired
+                | crate::secret::requests::UseError::Cancelled
+                | crate::secret::requests::UseError::Unavailable),
+            ) => return Ok(not_approved(label, &authority.host, state, reason)),
+            Err(_) => return Err(label.clone()),
+        };
+        match answer {
+            crate::secret::UseAnswer::NotFound => continue,
+            crate::secret::UseAnswer::Released(released) => {
+                let (location, material) = released.into_parts();
+                let location = secret_rules::location::parse_vault_location(&location)
+                    .ok_or_else(|| label.clone())?;
+                // Without a pending card, the vault reveals a deposit location only
+                // when releasing its key, so location-dependent refusals can follow that release.
+                let rule = secret_rules::location::LabelRule {
+                    label: label.clone(),
+                    host: addressed.host.clone(),
+                    port: authority.port,
+                    path_prefix: addressed.path.clone(),
+                    location,
+                };
+                let headers = parts
+                    .headers
+                    .iter()
+                    .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
+                    .collect();
+                let view = RequestView::new(&target, headers).with_body(&body);
+                let dummy = [(label.clone(), b"proxy-planning-value-0000".to_vec())];
+                if evaluate_request_with_connect(
+                    &view,
+                    authority,
+                    std::slice::from_ref(&rule),
+                    &dummy,
+                )
+                .refusal
+                .is_some()
+                {
+                    return Err(label.clone());
+                }
+                check_admissible(material.expose(), label, &rule.location)
+                    .map_err(|_| label.clone())?;
+                state
+                    .install(label, material.expose())
+                    .map_err(|_| label.clone())?;
+                rules.push(rule);
+                materials.push(Some(material));
+            }
+            _ => return Err(label.clone()),
+        }
+    }
     let headers = parts
         .headers
         .iter()
@@ -203,53 +335,21 @@ async fn prepare_and_send(
     }
     if has_json {
         let json: serde_json::Value = serde_json::from_slice(&body).map_err(|_| fail())?;
-        for (rule, matched) in rules.iter().zip(&matches) {
+        for rule in &rules {
             if let Location::Json(pointer) = &rule.location {
-                if *matched && json.pointer(pointer).is_some_and(|v| !v.is_string()) {
+                if json.pointer(pointer).is_some_and(|v| !v.is_string()) {
                     return Err(rule.label.clone());
                 }
             }
         }
     }
-    for (grant, matched) in state.config.grants.iter().zip(&matches) {
-        if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
-            return Err(grant.rule.label.clone());
-        }
-    }
-    // Authenticate the upstream first. Material is the vault's revocation
-    // check, so obtain it only after asynchronous connection work ends.
-    let upstream = connect_upstream(authority, state, ws).await?;
+    // Earlier releases belong only to this request and are already spent: any
+    // later refusal or deadline drops them without sending or reusing them.
+    drop(pending);
+    let upstream = reconnected.into_inner().pop().unwrap_or(initial);
     let http2 = matches!(&upstream, Upstream::Http2(_));
     let response = {
         let _gate = state.material_gate.lock();
-        let mut materials = Vec::new();
-        for ((rule, matched), grant) in rules.iter().zip(&matches).zip(&state.config.grants) {
-            if !matched {
-                materials.push(None);
-                continue;
-            }
-            if state.stopped.load(Ordering::Acquire)
-                || !state.generation_valid()
-                || crate::secret::vault::now_ms() >= grant.expires_at_ms
-            {
-                return Err(rule.label.clone());
-            }
-            let material = state
-                .config
-                .vault
-                .material(
-                    &state.config.authorization_scope,
-                    &rule.label,
-                    &rule.grant_id,
-                )
-                .map_err(|_| rule.label.clone())?;
-            check_admissible(material.expose(), &rule.label, &rule.location)
-                .map_err(|_| rule.label.clone())?;
-            state
-                .install(&rule.label, material.expose())
-                .map_err(|_| rule.label.clone())?;
-            materials.push(Some(material));
-        }
         let mut query_edits = Vec::new();
         let mut body_edits = Vec::new();
         let mut header_edits = Vec::new();
@@ -341,30 +441,21 @@ async fn prepare_and_send(
         }
         #[cfg(test)]
         state.headers_sensitive.store(
-            plan.header_edits.iter().all(|edit| {
-                outbound
-                    .headers()
-                    .get(edit.name.as_str())
-                    .is_some_and(|value| value.is_sensitive())
-            }),
+            !plan.header_edits.is_empty()
+                && plan.header_edits.iter().all(|edit| {
+                    outbound
+                        .headers()
+                        .get(edit.name.as_str())
+                        .is_some_and(|value| value.is_sensitive())
+                }),
             Ordering::Release,
         );
         if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
             return Err(fail());
         }
-        for (grant, matched) in state.config.grants.iter().zip(&matches) {
-            if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
-                return Err(grant.rule.label.clone());
-            }
-        }
-        audit.decide(&plan.labels)?;
+        audit.decide(&rules, &plan.labels)?;
         if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
             return Err(fail());
-        }
-        for (grant, matched) in state.config.grants.iter().zip(&matches) {
-            if *matched && crate::secret::vault::now_ms() >= grant.expires_at_ms {
-                return Err(grant.rule.label.clone());
-            }
         }
         let response = upstream.send(outbound);
         drop(materials);
@@ -374,6 +465,66 @@ async fn prepare_and_send(
     super::response::forward(response, state.clone(), client_upgrade, lease)
         .await
         .map_err(|_| fail())
+}
+
+fn not_approved(
+    label: &str,
+    host: &str,
+    state: &State,
+    reason: crate::secret::requests::UseError,
+) -> Response<Body> {
+    let body = Zeroizing::new(crate::secret::requests::consent_failure_message(
+        label, host, reason,
+    ));
+    let mut response = Response::new(full(Bytes::from(
+        state
+            .scrub(body.as_bytes())
+            .unwrap_or_else(|_| super::PROXY_REFUSAL.as_bytes().to_vec()),
+    )));
+    *response.status_mut() = hyper::StatusCode::FORBIDDEN;
+    response
+}
+
+fn plan_location(
+    label: &str,
+    token: &str,
+    addressed: &crate::secret::ApiKeyTarget,
+    authority: &ConnectAuthority,
+    target: &str,
+    headers: &hyper::HeaderMap,
+    body: &[u8],
+) -> Result<(), ()> {
+    let location = secret_rules::location::parse_vault_location(token).ok_or(())?;
+    if let Location::Json(pointer) = &location {
+        let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
+        if value
+            .pointer(pointer)
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err(());
+        }
+    }
+    let rule = secret_rules::location::LabelRule {
+        label: label.into(),
+        host: addressed.host.clone(),
+        port: authority.port,
+        path_prefix: addressed.path.clone(),
+        location,
+    };
+    let headers = headers
+        .iter()
+        .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
+        .collect();
+    let view = RequestView::new(target, headers).with_body(body);
+    let dummy = [(label.to_owned(), b"proxy-planning-value-0000".to_vec())];
+    if evaluate_request_with_connect(&view, authority, &[rule], &dummy)
+        .refusal
+        .is_some()
+    {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn body_buffer(_has_json: bool) -> Zeroizing<Vec<u8>> {
@@ -438,10 +589,16 @@ async fn connect_upstream(
     websocket: bool,
 ) -> Result<Upstream, String> {
     let fail = || String::new();
-    let socket = tokio::time::timeout(
-        state.idle_timeout(),
-        tokio::net::TcpStream::connect((super::network_host(&authority.host), authority.port)),
-    )
+    let socket = tokio::time::timeout(state.idle_timeout(), async {
+        #[cfg(test)]
+        {
+            let address = state.test_upstream.lock().get(&authority.host).copied();
+            if let Some(address) = address {
+                return tokio::net::TcpStream::connect(address).await;
+            }
+        }
+        tokio::net::TcpStream::connect((super::network_host(&authority.host), authority.port)).await
+    })
     .await
     .map_err(|_| fail())?
     .map_err(|_| fail())?;

@@ -282,7 +282,7 @@ mod tests {
         let (task, mut metadata) = saved_image(storage.path(), 1);
         let mut command = Command::new("sh");
         command.current_dir(storage.path()).args(["-c",
-            "sh -c 'echo $$ > descendant.tmp; mv descendant.tmp descendant; exec sleep 30' & while [ ! -f release-shell ]; do sleep 0.01; done",
+            &format!("sh -c 'echo $$ > descendant.tmp; mv descendant.tmp descendant; exec sleep 30' & {}", crate::test_gate::gate("release-shell", "sleep 0.01")),
         ]).stdout(Stdio::null()).stderr(Stdio::null());
         start_new_session(&mut command);
         let mut shell = Shell(command.spawn().unwrap());

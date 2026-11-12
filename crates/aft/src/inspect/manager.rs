@@ -704,8 +704,11 @@ pub struct InspectManager {
     /// When an `aft_inspect` that read the dead-code graph last finished;
     /// `None` once the graph was released, or before any such request.
     last_dead_code_request: Mutex<Option<Instant>>,
-    /// Set while a thread is waiting to release the dead-code graph.
+    /// Set while a deadline or release-pool job is pending.
     dead_code_release_armed: AtomicBool,
+    dead_code_release_timer: Mutex<Option<crate::shared_timer::Timer>>,
+    dead_code_release_generation: AtomicU64,
+    dead_code_release_stopped: AtomicBool,
     /// How many dead-code passes are waiting for their call graph right now:
     /// for it to be published, or to catch up with recorded edits. A pass
     /// that is building but not waiting is working out dead code itself.
@@ -875,6 +878,9 @@ impl InspectManager {
             data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources::default(),
             last_dead_code_request: Mutex::new(None),
             dead_code_release_armed: AtomicBool::new(false),
+            dead_code_release_timer: Mutex::new(None),
+            dead_code_release_generation: AtomicU64::new(0),
+            dead_code_release_stopped: AtomicBool::new(false),
             dead_code_callgraph_waits: AtomicUsize::new(0),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
@@ -923,6 +929,15 @@ impl InspectManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .request_cancel();
+        let mut timer = self
+            .dead_code_release_timer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.dead_code_release_stopped.store(true, Ordering::SeqCst);
+        self.dead_code_release_generation
+            .fetch_add(1, Ordering::SeqCst);
+        timer.take();
+        self.dead_code_release_armed.store(false, Ordering::SeqCst);
     }
 
     pub(crate) fn set_root_lifecycle(&self, lifecycle: crate::context::SubcLifecycleAdmission) {
@@ -934,6 +949,8 @@ impl InspectManager {
     }
 
     pub(crate) fn resume_root_work(&self) {
+        self.dead_code_release_stopped
+            .store(false, Ordering::SeqCst);
         let mut token = self
             .root_work_cancellation
             .lock()
@@ -1771,51 +1788,104 @@ impl InspectManager {
     }
 
     /// Note that an `aft_inspect` which read the dead-code graph finished at
-    /// `now`, and make sure a thread will release the graph once it has gone
+    /// `now`, and schedule release of the graph once it has gone
     /// [`DEAD_CODE_GRAPH_IDLE_RELEASE`] without another such request.
     pub(crate) fn note_dead_code_request(self: &Arc<Self>, now: Instant) {
+        if self.dead_code_release_stopped.load(Ordering::SeqCst) {
+            return;
+        }
         self.record_dead_code_request(now);
         if self.dead_code_release_armed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let generation = self.dead_code_release_generation.load(Ordering::SeqCst);
+        self.schedule_dead_code_release(Instant::now(), generation);
+    }
+
+    fn schedule_dead_code_release(self: &Arc<Self>, at: Instant, generation: u64) {
+        // Cache destruction must not block the timer or the interactive inspect
+        // pool. Two release workers bound concurrency across all roots.
+        static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+        let pool = POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .thread_name(|_| "aft-dead-code-release".into())
+                .build()
+                .ok()
+        });
+        let mut timer = self
+            .dead_code_release_timer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.dead_code_release_stopped.load(Ordering::SeqCst) {
+            self.dead_code_release_armed.store(false, Ordering::SeqCst);
+            return;
+        }
+        if self.dead_code_release_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let Some(pool) = pool else {
+            self.dead_code_release_armed.store(false, Ordering::SeqCst);
+            return;
+        };
         let manager = Arc::downgrade(self);
-        let spawned = std::thread::Builder::new()
-            .name("aft-dead-code-release".into())
-            .spawn(move || loop {
-                // Hold the manager only while checking, so dropping the
-                // manager ends the thread at its next wake-up.
+        *timer = crate::shared_timer::Timer::at(at, move || {
+            let manager = manager.clone();
+            pool.spawn(move || {
                 let Some(current) = manager.upgrade() else {
                     return;
                 };
+                if current.dead_code_release_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
                 match current.release_idle_dead_code_graph(Instant::now()) {
                     DeadCodeGraphRelease::KeepFor(wait) => {
-                        drop(current);
-                        std::thread::sleep(wait);
+                        current.schedule_dead_code_release(Instant::now() + wait, generation);
                     }
                     DeadCodeGraphRelease::Released | DeadCodeGraphRelease::NotHeld => {
+                        let timer = current
+                            .dead_code_release_timer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if current.dead_code_release_generation.load(Ordering::SeqCst) != generation
+                        {
+                            return;
+                        }
                         current
                             .dead_code_release_armed
                             .store(false, Ordering::SeqCst);
-                        // A request noted while this thread was deciding found
-                        // it armed and started none; keep watching for it.
                         let pending = current
                             .last_dead_code_request
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .is_some();
-                        if !pending || current.dead_code_release_armed.swap(true, Ordering::SeqCst)
-                        {
-                            return;
+                        let rearm = pending
+                            && !current.dead_code_release_armed.swap(true, Ordering::SeqCst);
+                        drop(timer);
+                        if rearm {
+                            current.schedule_dead_code_release(Instant::now(), generation);
                         }
                     }
                 }
             });
-        if spawned.is_err() {
+            None
+        })
+        .ok();
+        if timer.is_none() {
             self.dead_code_release_armed.store(false, Ordering::SeqCst);
         }
     }
 
-    /// Record a dead-code request at `now` without arming the release thread.
+    #[cfg(test)]
+    pub(crate) fn dead_code_timer_registration_for_test(&self) -> Option<u64> {
+        self.dead_code_release_timer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(crate::shared_timer::Timer::registration_for_test)
+    }
+
+    /// Record a dead-code request at `now` without arming a release deadline.
     pub(crate) fn record_dead_code_request(&self, now: Instant) {
         *self
             .last_dead_code_request
@@ -6592,6 +6662,31 @@ mod guard_tests {
                 .any(|export| export.symbol == "neverCalled"),
             "dead-code inputs must include the decodable files"
         );
+    }
+
+    #[test]
+    fn dead_code_release_cancellation_removes_deadline_and_resumes() {
+        let manager = Arc::new(InspectManager::new());
+        manager
+            .dead_code_release_armed
+            .store(true, Ordering::SeqCst);
+        manager.schedule_dead_code_release(Instant::now() + DEAD_CODE_GRAPH_IDLE_RELEASE, 0);
+        let id = manager.dead_code_timer_registration_for_test().unwrap();
+        assert!(crate::shared_timer::Timer::registered_for_test(id));
+        manager.cancel_root_work();
+        assert!(!crate::shared_timer::Timer::registered_for_test(id));
+        assert!(!manager.dead_code_release_armed.load(Ordering::SeqCst));
+        // A completion already queued before teardown cannot rearm its deadline.
+        manager.schedule_dead_code_release(Instant::now(), 0);
+        assert!(manager.dead_code_timer_registration_for_test().is_none());
+        manager.resume_root_work();
+        let generation = manager.dead_code_release_generation.load(Ordering::SeqCst);
+        manager
+            .schedule_dead_code_release(Instant::now() + DEAD_CODE_GRAPH_IDLE_RELEASE, generation);
+        let id = manager.dead_code_timer_registration_for_test().unwrap();
+        assert!(crate::shared_timer::Timer::registered_for_test(id));
+        drop(manager);
+        assert!(!crate::shared_timer::Timer::registered_for_test(id));
     }
 
     /// The dead-code graph a request builds stays in memory for

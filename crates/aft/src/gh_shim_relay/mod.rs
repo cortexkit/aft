@@ -1213,6 +1213,7 @@ async fn post_captured_inner(
         &desired,
         &facade_reply(&reply),
         launch.agent()?,
+        &redeemed.session_id,
     )?;
     let expect = current_bindings.get(&repo).ok_or_else(|| {
         crate::gh_shim_speech::service::binding_refusal(

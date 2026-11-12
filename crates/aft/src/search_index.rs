@@ -1,3 +1,10 @@
+//! Shared file-search helpers and the bounded unpublished-pattern corpus.
+//!
+//! Published roots are queried through the data layer's index store. The mutable
+//! trigram corpus remains only for explicit patterns against an unpublished
+//! external repository; grep/glob also reuse the snapshot's file scanner over
+//! candidates selected by the store. Unbounded index construction is test-only.
+
 // Only the debug-build trigram counter and test hooks use `Cell`.
 #[cfg(any(debug_assertions, test))]
 use std::cell::Cell;
@@ -124,9 +131,7 @@ pub struct SearchIndex {
     pub path_to_id: Arc<HashMap<PathBuf, u32>>,
     pub ready: bool,
     project_root: PathBuf,
-    git_head: Option<String>,
     max_file_size: u64,
-    ignore_rules_fingerprint: String,
     pub file_trigram_count: Arc<Vec<u32>>,
     unindexed_files: Arc<HashSet<u32>>,
 }
@@ -166,94 +171,6 @@ impl SearchIndex {
         self.delta.postings.len()
     }
 
-    /// Estimate resident postings and file-table bytes.
-    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
-        if self.delta.postings.is_empty()
-            && self.delta_file_trigrams.is_empty()
-            && self.files.is_empty()
-            && self.path_to_id.is_empty()
-            && self.file_trigram_count.is_empty()
-            && self.unindexed_files.is_empty()
-        {
-            return crate::memory::MemoryEstimate::estimated(0)
-                .count("files", 0)
-                .count("delta_trigrams", 0)
-                .count("delta_postings", 0)
-                .count("superseded_files", 0)
-                .count("unindexed_files", 0)
-                .count("base_lookup_entries", 0)
-                .count_u64("delta_packed_bytes", 0)
-                .count_u64("base_postings_resident_bytes", 0);
-        }
-        let delta_posting_count = self
-            .delta
-            .postings
-            .values()
-            .map(Vec::len)
-            .fold(0usize, usize::saturating_add);
-        let delta_postings_bytes = crate::memory::usize_to_u64(delta_posting_count)
-            .saturating_mul(std::mem::size_of::<Posting>() as u64)
-            .saturating_add(
-                crate::memory::usize_to_u64(self.delta.postings.len())
-                    .saturating_mul(std::mem::size_of::<u32>() as u64),
-            );
-        let delta_file_trigram_count = self
-            .delta_file_trigrams
-            .values()
-            .map(Vec::len)
-            .fold(0usize, usize::saturating_add);
-        let delta_file_table_bytes = crate::memory::usize_to_u64(delta_file_trigram_count)
-            .saturating_mul(std::mem::size_of::<u32>() as u64)
-            .saturating_add(
-                crate::memory::usize_to_u64(self.delta_file_trigrams.len())
-                    .saturating_mul(std::mem::size_of::<u32>() as u64),
-            );
-        let files_bytes = crate::memory::usize_to_u64(self.files.len())
-            .saturating_mul(std::mem::size_of::<FileEntry>() as u64)
-            .saturating_add(
-                self.files
-                    .iter()
-                    .map(|entry| crate::memory::path_bytes(&entry.path))
-                    .fold(0u64, u64::saturating_add),
-            );
-        let path_table_bytes = self.path_to_id.iter().fold(0u64, |bytes, (path, _)| {
-            bytes
-                .saturating_add(std::mem::size_of::<u32>() as u64)
-                .saturating_add(std::mem::size_of::<PathBuf>() as u64)
-                .saturating_add(crate::memory::path_bytes(path))
-        });
-        let file_count_table_bytes = crate::memory::usize_to_u64(self.file_trigram_count.len())
-            .saturating_mul(std::mem::size_of::<u32>() as u64);
-        let masks_bytes = crate::memory::usize_to_u64(self.unindexed_files.len())
-            .saturating_mul(std::mem::size_of::<u32>() as u64);
-        let metadata_bytes = crate::memory::path_bytes(&self.project_root)
-            .saturating_add(
-                self.git_head
-                    .as_ref()
-                    .map(|head| crate::memory::usize_to_u64(head.len()))
-                    .unwrap_or(0),
-            )
-            .saturating_add(crate::memory::usize_to_u64(
-                self.ignore_rules_fingerprint.len(),
-            ));
-        let estimated_bytes = delta_postings_bytes
-            .saturating_add(delta_file_table_bytes)
-            .saturating_add(files_bytes)
-            .saturating_add(path_table_bytes)
-            .saturating_add(file_count_table_bytes)
-            .saturating_add(masks_bytes)
-            .saturating_add(metadata_bytes);
-        crate::memory::MemoryEstimate::estimated(estimated_bytes)
-            .count("files", self.files.len())
-            .count("delta_trigrams", self.delta.postings.len())
-            .count("delta_postings", delta_posting_count)
-            .count("superseded_files", 0)
-            .count("unindexed_files", self.unindexed_files.len())
-            .count("base_lookup_entries", 0)
-            .count_u64("delta_packed_bytes", 0)
-            .count_u64("base_postings_resident_bytes", 0)
-    }
-
     /// Returns an immutable snapshot for queries. Callers must obtain the
     /// snapshot while holding the RwLock that protects the SearchIndex, then
     /// drop the guard before running expensive operations such as grep, glob, or
@@ -276,42 +193,8 @@ impl SearchIndex {
         query_trigrams_from_tokens(tokens)
     }
 
-    /// Score-rank file candidates by lexical relevance to query trigrams.
-    pub fn lexical_rank(
-        &self,
-        query_trigrams: &[u32],
-        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-        max_files: usize,
-    ) -> std::io::Result<Vec<(PathBuf, f32)>> {
-        self.snapshot()
-            .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
-            .map(|result| result.files)
-    }
-
     pub fn is_ready(&self) -> bool {
         self.ready
-    }
-
-    /// Evaluates lexical candidates and scores them up to the specified depth limit, applying an optional candidate filter.
-    pub fn lexical_rank_at_depth(
-        &self,
-        query_trigrams: &[u32],
-        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-        depth: usize,
-    ) -> std::io::Result<LexicalRankResult> {
-        self.snapshot()
-            .lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
-    }
-
-    /// Discovers and ranks lexical candidates up to the specified depth limit, applying an optional candidate filter.
-    pub fn lexical_discovery_and_rank_at_depth(
-        &self,
-        query_trigrams: &[u32],
-        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-        depth: usize,
-    ) -> std::io::Result<LexicalRankResult> {
-        self.snapshot()
-            .lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
     }
 
     /// Whole-corpus exact pass over the trigram index in ready mode.
@@ -324,18 +207,6 @@ impl SearchIndex {
         self.snapshot()
             .whole_corpus_exact_pass(query, search_root, candidate_filter)
     }
-
-    /// Score-rank file candidates and report whether the pre-filter step that
-    /// collects candidates reached its internal size limit before ranking.
-    pub fn lexical_rank_with_stats(
-        &self,
-        query_trigrams: &[u32],
-        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-        max_files: usize,
-    ) -> std::io::Result<LexicalRankResult> {
-        self.snapshot()
-            .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
-    }
 }
 
 impl SearchIndexSnapshot {
@@ -344,18 +215,6 @@ impl SearchIndexSnapshot {
     #[cfg(test)]
     pub(crate) fn file_entries(&self) -> &[FileEntry] {
         &self.files
-    }
-
-    pub(crate) fn content_generation(&self) -> String {
-        let mut digest = blake3::Hasher::new();
-        digest.update(&self.max_file_size.to_be_bytes());
-        for file in self.files.iter() {
-            let path = file.path.as_os_str().as_encoded_bytes();
-            digest.update(&(path.len() as u64).to_be_bytes());
-            digest.update(path);
-            digest.update(file.content_hash.as_bytes());
-        }
-        digest.finalize().to_hex().to_string()
     }
 
     /// Reuses the query engine over already verified, in-memory posting rows.
@@ -427,87 +286,11 @@ impl SearchIndexSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_file_in_scope(&self, search_root: &Path) -> bool {
         let search_root = canonicalize_for_search_membership(search_root);
         self.files.iter().any(|file| {
             !file.path.as_os_str().is_empty() && is_within_search_root(&search_root, &file.path)
-        })
-    }
-
-    /// Score-rank file candidates and report whether the pre-filter step that
-    /// collects candidates reached its internal size limit before ranking.
-    pub fn lexical_rank_with_stats(
-        &self,
-        query_trigrams: &[u32],
-        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-        max_files: usize,
-    ) -> std::io::Result<LexicalRankResult> {
-        if query_trigrams.is_empty() || max_files == 0 {
-            return Ok(LexicalRankResult::default());
-        }
-
-        let mut non_zero: Vec<(u32, usize)> = query_trigrams
-            .iter()
-            .filter_map(|trigram| {
-                let posting_count = self.posting_count(*trigram);
-                (posting_count > 0).then_some((*trigram, posting_count))
-            })
-            .collect();
-        if non_zero.is_empty() {
-            return Ok(LexicalRankResult::default());
-        }
-
-        non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
-        let selected_count = non_zero.len().min(3);
-        let candidate_cap = if selected_count == 3 { 200 } else { 500 };
-
-        // Candidate discovery needs only the three rarest trigrams, while scoring
-        // needs every query trigram. Materialize all lists once per query so both
-        // phases reuse the same disk-backed postings instead of rereading them for
-        // every candidate. Memory remains bounded by the query's posting lists.
-        let postings_by_trigram = materialize_query_postings(self, query_trigrams)?;
-        let mut candidate_ids = BTreeSet::new();
-        for (trigram, _) in non_zero.iter().take(selected_count) {
-            if let Some(postings) = postings_by_trigram.get(trigram) {
-                candidate_ids.extend(postings.iter().copied());
-            }
-        }
-        let pre_filter_candidate_count = candidate_ids.len();
-        let engine_capped = pre_filter_candidate_count > candidate_cap;
-        let filtered_candidates = candidate_ids
-            .into_iter()
-            .filter_map(|file_id| {
-                self.files
-                    .get(file_id as usize)
-                    .map(|entry| (file_id, entry))
-            })
-            .filter(|(_, entry)| {
-                if let Some(filter) = candidate_filter {
-                    filter(&entry.path)
-                } else {
-                    true
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut ranked = Vec::new();
-        for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {
-            let score =
-                lexical_score_from_postings(self, query_trigrams, &postings_by_trigram, file_id);
-            if score > 0.0 {
-                ranked.push((entry.path.clone(), score));
-            }
-        }
-
-        #[cfg(test)]
-        crate::search_hot_path_measurements::record(|counts| {
-            counts.candidates_sorted += ranked.len()
-        });
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(max_files);
-        Ok(LexicalRankResult {
-            files: ranked,
-            engine_capped,
         })
     }
 
@@ -637,16 +420,6 @@ impl SearchIndexSnapshot {
         });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(ranked)
-    }
-
-    /// Discovers and ranks lexical candidates up to the specified depth limit, applying an optional candidate filter.
-    pub fn lexical_discovery_and_rank_at_depth(
-        &self,
-        query_trigrams: &[u32],
-        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-        depth: usize,
-    ) -> std::io::Result<LexicalRankResult> {
-        self.lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
     }
 
     /// Indexed files under `search_root` that may hold `phrase`, compared
@@ -1374,14 +1147,13 @@ impl SearchIndex {
             path_to_id: Arc::new(HashMap::new()),
             ready: false,
             project_root: PathBuf::new(),
-            git_head: None,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
-            ignore_rules_fingerprint: String::new(),
             file_trigram_count: Arc::new(Vec::new()),
             unindexed_files: Arc::new(HashSet::new()),
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn build(root: &Path) -> Self {
         Self::build_with_limit(root, DEFAULT_MAX_FILE_SIZE)
     }
@@ -1397,118 +1169,19 @@ impl SearchIndex {
         }
     }
 
+    /// Builds a fixture for tests of the bounded external-pattern engine.
+    /// Production queries may only populate a corpus through its bounded walk.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
-        Self::build_in_memory(root, max_file_size, Instant::now())
-    }
-
-    fn build_in_memory(root: &Path, max_file_size: u64, started: Instant) -> Self {
-        Self::build_in_memory_cancellable(root, max_file_size, started, &|| true)
-            .expect("uncancellable in-memory search build")
-    }
-
-    fn build_in_memory_cancellable(
-        root: &Path,
-        max_file_size: u64,
-        started: Instant,
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<Self> {
-        let _progress = crate::cold_build_limiter::progress::start(
-            root,
-            "trigram build",
-            None,
-            crate::cold_build_limiter::progress::StartLog::Info,
-        );
-        crate::cold_build_limiter::progress::phase("enumerating", None);
-        let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let mut index = SearchIndex {
-            project_root: project_root.clone(),
-            max_file_size,
-            ignore_rules_fingerprint: ignore_rules_fingerprint_cancellable(
-                &project_root,
-                keep_going,
-            )?,
-            ..SearchIndex::new()
-        };
-        let filters = PathFilters::default();
-        let paths = walk_build_files_cancellable(&index.project_root, &filters, keep_going)?;
-        crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
-        let indexed = index.ingest_paths_parallel_cancellable(&paths, keep_going);
-        if !keep_going() {
-            return None;
+        let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let mut index = Self::empty_ready_for_root(&root);
+        index.max_file_size = max_file_size;
+        for entry in project_walk_builder(&root).build().flatten() {
+            if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                index.update_file(entry.path());
+            }
         }
-        index.git_head = current_git_head(&index.project_root);
-        index.ready = true;
-        crate::slog_info!(
-            "search index fallback build: {} files, {} trigrams, {} ms (pool={})",
-            indexed,
-            index.trigram_count(),
-            started.elapsed().as_millis(),
-            search_index_build_pool_size()
-        );
-        Some(index)
-    }
-
-    fn ingest_paths_parallel_cancellable(
-        &mut self,
-        paths: &[PathBuf],
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> usize {
-        let max_file_size = self.max_file_size;
-        let pool_size = search_index_build_pool_size();
-        let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
-        let pool = match rayon::ThreadPoolBuilder::new()
-            .num_threads(pool_size)
-            .thread_name(|index| format!("aft-rayon-search-build-{index}"))
-            .stack_size(8 * 1024 * 1024)
-            .build()
-        {
-            Ok(pool) => Some(pool),
-            Err(error) => {
-                log::warn!(
-                    "search index: bounded build pool unavailable ({error}); using global pool"
-                );
-                None
-            }
-        };
-
-        let mut indexed = 0usize;
-        for chunk in paths.chunks(chunk_size) {
-            if !keep_going() {
-                break;
-            }
-            let prepare_chunk = || -> Vec<PreparedSearchPath> {
-                chunk
-                    .par_iter()
-                    .map(|path| {
-                        if keep_going() {
-                            prepare_search_path(path, max_file_size)
-                        } else {
-                            PreparedSearchPath::Skipped
-                        }
-                    })
-                    .collect()
-            };
-            let prepared = match &pool {
-                Some(pool) => pool.install(prepare_chunk),
-                None => prepare_chunk(),
-            };
-
-            for (path, prepared) in chunk.iter().zip(prepared) {
-                let inserted = match prepared {
-                    PreparedSearchPath::Indexed(file) => self.index_prepared_new_file(path, file),
-                    PreparedSearchPath::Unindexed(metadata) => {
-                        self.track_unindexed_file_with_metadata(path, metadata)
-                    }
-                    PreparedSearchPath::Skipped => false,
-                };
-                if inserted {
-                    indexed += 1;
-                }
-            }
-            crate::cold_build_limiter::progress::advance(chunk.len());
-        }
-
-        indexed
+        index
     }
 
     pub fn index_file(&mut self, path: &Path, content: &[u8]) {
@@ -3226,16 +2899,6 @@ fn read_search_corpus_file_with_metadata(
     })
 }
 
-/// Returns the worker pool size for cold search-index builds: half of available
-/// cores, capped at 8 to keep the same limit used by the callgraph store.
-fn search_index_build_pool_size() -> usize {
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1)
-        .div_ceil(2)
-        .clamp(1, 8)
-}
-
 fn ensure_count_slot(counts: &mut Vec<u32>, file_id: u32) {
     let len = file_id as usize + 1;
     if counts.len() < len {
@@ -3486,100 +3149,6 @@ fn lexical_score_from_postings(
     (hits as f32) / (1.0 + file_trigram_count.ln())
 }
 
-#[cfg(test)]
-fn lexical_rank_with_stats_reference(
-    index: &SearchIndexSnapshot,
-    query_trigrams: &[u32],
-    candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    max_files: usize,
-) -> LexicalRankResult {
-    if query_trigrams.is_empty() || max_files == 0 {
-        return LexicalRankResult::default();
-    }
-
-    let mut non_zero: Vec<(u32, usize)> = query_trigrams
-        .iter()
-        .filter_map(|trigram| {
-            let posting_count = index.posting_count(*trigram);
-            (posting_count > 0).then_some((*trigram, posting_count))
-        })
-        .collect();
-    if non_zero.is_empty() {
-        return LexicalRankResult::default();
-    }
-
-    non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
-    let selected_count = non_zero.len().min(3);
-    let candidate_cap = if selected_count == 3 { 200 } else { 500 };
-
-    let mut candidate_ids = BTreeSet::new();
-    for (trigram, _) in non_zero.iter().take(selected_count) {
-        candidate_ids.extend(index.postings_for_trigram(*trigram, None).unwrap());
-    }
-    let pre_filter_candidate_count = candidate_ids.len();
-    let engine_capped = pre_filter_candidate_count > candidate_cap;
-    let filtered_candidates = candidate_ids
-        .into_iter()
-        .filter_map(|file_id| {
-            index
-                .files
-                .get(file_id as usize)
-                .map(|entry| (file_id, entry))
-        })
-        .filter(|(_, entry)| {
-            candidate_filter
-                .map(|filter| filter(&entry.path))
-                .unwrap_or(true)
-        })
-        .collect::<Vec<_>>();
-
-    let mut ranked = Vec::new();
-    for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {
-        let score = lexical_score_snapshot_reference(index, query_trigrams, file_id);
-        if score > 0.0 {
-            ranked.push((entry.path.clone(), score));
-        }
-    }
-
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(max_files);
-    LexicalRankResult {
-        files: ranked,
-        engine_capped,
-    }
-}
-
-#[cfg(test)]
-fn lexical_score_snapshot_reference(
-    index: &SearchIndexSnapshot,
-    query_trigrams: &[u32],
-    file_id: u32,
-) -> f32 {
-    if query_trigrams.is_empty() {
-        return 0.0;
-    }
-
-    let mut hits = 0u32;
-    for &trigram in query_trigrams {
-        let postings = index.postings_for_trigram(trigram, None).unwrap();
-        if postings.binary_search(&file_id).is_ok() {
-            hits += 1;
-        }
-    }
-
-    if hits == 0 {
-        return 0.0;
-    }
-
-    let file_trigram_count = index
-        .file_trigram_count
-        .get(file_id as usize)
-        .copied()
-        .unwrap_or(1)
-        .max(1) as f32;
-    (hits as f32) / (1.0 + file_trigram_count.ln())
-}
-
 /// Resolve a cache directory using configure's registered key when available.
 /// Persistent writers should pass their chosen key to `resolve_cache_dir_with_key`
 /// directly; callers without a configured project fall back to a Git probe.
@@ -3595,62 +3164,6 @@ pub(crate) fn build_path_filters(
         includes: build_globset(include)?,
         excludes: build_globset(exclude)?,
     })
-}
-
-/// The in-memory corpus builder's cancellable file walk, read in chunks.
-struct BuildFileWalk<'a> {
-    root: &'a Path,
-    filters: &'a PathFilters,
-    walker: ignore::Walk,
-    finished: bool,
-}
-
-impl<'a> BuildFileWalk<'a> {
-    fn new(root: &'a Path, filters: &'a PathFilters) -> Self {
-        Self {
-            root,
-            filters,
-            walker: project_walk_builder(root).build(),
-            finished: false,
-        }
-    }
-
-    #[cfg(test)]
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    /// The next `max` admitted files, or fewer when the walk ends first.
-    /// `keep_going` is checked before every walk entry; cancellation returns `None`.
-    fn next_chunk(&mut self, max: usize, keep_going: &dyn Fn() -> bool) -> Option<Vec<PathBuf>> {
-        let mut paths = Vec::new();
-        while paths.len() < max && !self.finished {
-            if !keep_going() {
-                return None;
-            }
-            let Some(entry) = self.walker.next() else {
-                self.finished = true;
-                break;
-            };
-            let Ok(entry) = entry else {
-                continue;
-            };
-            if entry.file_type().is_some_and(|kind| kind.is_file())
-                && self.filters.matches(self.root, entry.path())
-            {
-                paths.push(entry.into_path());
-            }
-        }
-        Some(paths)
-    }
-}
-
-fn walk_build_files_cancellable(
-    root: &Path,
-    filters: &PathFilters,
-    keep_going: &dyn Fn() -> bool,
-) -> Option<Vec<PathBuf>> {
-    BuildFileWalk::new(root, filters).next_chunk(usize::MAX, keep_going)
 }
 
 pub fn walk_project_files_bounded_default(
@@ -4445,10 +3958,6 @@ pub(crate) fn is_binary_bytes(content: &[u8]) -> bool {
     content_inspector::inspect(content).is_binary()
 }
 
-pub(crate) fn current_git_head(root: &Path) -> Option<String> {
-    run_git(root, &["rev-parse", "HEAD"])
-}
-
 /// `storage_dir` is the root for rebuildable cache artifacts (see
 /// [`crate::bash_background::cache_artifact_root`]), not AFT's storage root
 /// for data that must survive (aft.db, backups).
@@ -5206,55 +4715,6 @@ mod tests {
         assert_eq!(sent.load(Ordering::SeqCst), 6);
     }
 
-    /// A tree that spans several walk chunks and has every kind of file the
-    /// build records: indexed, binary (unindexed) and over the size limit.
-    fn chunked_build_fixture(root: &Path) {
-        for dir in 0..5 {
-            let dir_path = root.join(format!("dir_{dir}")).join("nested");
-            fs::create_dir_all(&dir_path).unwrap();
-            for file in 0..30 {
-                fs::write(
-                    dir_path.join(format!("file_{file:02}.rs")),
-                    format!("fn marker_{dir}_{file}() {{ let shared_token = {file}; }}\n"),
-                )
-                .unwrap();
-            }
-        }
-        fs::write(root.join("binary.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
-        fs::write(root.join("large.txt"), "shared_token ".repeat(200)).unwrap();
-    }
-
-    #[test]
-    fn issue1007_chunked_build_walk_matches_collected_walk_and_cancels() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        chunked_build_fixture(&root);
-        let filters = PathFilters::default();
-        let collected = walk_build_files_cancellable(&root, &filters, &|| true).unwrap();
-        assert!(collected.len() > 100, "fixture must span several chunks");
-
-        let mut walk = BuildFileWalk::new(&root, &filters);
-        let mut chunked = Vec::new();
-        while !walk.is_finished() {
-            let chunk = walk.next_chunk(7, &|| true).unwrap();
-            assert!(chunk.len() <= 7);
-            chunked.extend(chunk);
-        }
-        assert_eq!(chunked, collected, "chunks must keep the walk's order");
-
-        let calls = AtomicUsize::new(0);
-        let mut walk = BuildFileWalk::new(&root, &filters);
-        assert!(walk.next_chunk(5, &|| true).is_some());
-        assert!(walk
-            .next_chunk(usize::MAX, &|| calls.fetch_add(1, Ordering::SeqCst) < 3)
-            .is_none());
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            4,
-            "checked before every entry"
-        );
-    }
-
     #[test]
     fn semantic_namespaces_share_type_identity() {
         use std::any::TypeId;
@@ -5478,56 +4938,6 @@ mod tests {
             index.path_to_id.contains_key(&added),
             "in-root updates still apply"
         );
-    }
-
-    fn lexical_rank_mixed_storage_fixture() -> (tempfile::TempDir, SearchIndex) {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
-        for index in 0..205 {
-            fs::write(
-                project.join(format!("file_{index:03}.txt")),
-                format!("abcdefghij sharedalpha marker_{index}"),
-            )
-            .expect("write base fixture file");
-        }
-
-        let mut index = SearchIndex::build(&project);
-
-        let replaced = project.join("file_000.txt");
-        index.remove_file(&replaced);
-        index.index_file(&replaced, b"abcdefghij sharedalpha replacement_delta");
-
-        let removed = project.join("file_001.txt");
-        index.remove_file(&removed);
-
-        let added = project.join("added_delta.txt");
-        fs::write(&added, "abcdefghij sharedalpha added_delta").expect("write delta file");
-        index.index_file(&added, b"abcdefghij sharedalpha added_delta");
-
-        assert!(!index.delta.postings.is_empty());
-        (dir, index)
-    }
-
-    fn assert_rank_matches_reference(
-        index: &SearchIndex,
-        query_trigrams: &[u32],
-        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-        max_files: usize,
-    ) -> LexicalRankResult {
-        let snapshot = index.snapshot();
-        let expected = lexical_rank_with_stats_reference(
-            &snapshot,
-            query_trigrams,
-            candidate_filter,
-            max_files,
-        );
-        let actual = snapshot
-            .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
-            .unwrap();
-        assert_eq!(actual.files, expected.files);
-        assert_eq!(actual.engine_capped, expected.engine_capped);
-        actual
     }
 
     #[test]
@@ -5761,17 +5171,6 @@ mod tests {
     }
 
     #[test]
-    fn trigram_memory_estimate_is_zero_when_empty_and_nonzero_when_populated() {
-        let mut index = SearchIndex::new();
-        assert_eq!(index.estimated_memory().estimated_bytes, Some(0));
-        index.index_file(Path::new("memory-estimate.rs"), b"fn memory_estimate() {}");
-        let estimate = index.estimated_memory();
-        assert!(estimate.estimated_bytes.unwrap() > 0);
-        assert!(estimate.counts["delta_postings"] > 0);
-        assert_eq!(estimate.counts["base_postings_resident_bytes"], 0);
-    }
-
-    #[test]
     fn extract_trigrams_tracks_next_char_and_position() {
         let trigrams = extract_trigrams(b"Rust");
         assert_eq!(trigrams.len(), 2);
@@ -5944,49 +5343,6 @@ mod tests {
             .unwrap();
         assert_eq!(dirty_result.matches, reference_result.matches);
         assert_eq!(dirty_result.total_matches, reference_result.total_matches);
-    }
-
-    #[test]
-    fn lexical_rank_cached_postings_match_reference_for_base_delta_and_superseded_files() {
-        let (_dir, index) = lexical_rank_mixed_storage_fixture();
-        let long_query = query_trigrams_from_tokens(&["abcdefghij"]);
-        assert!(long_query.len() > 3);
-        let long_result = assert_rank_matches_reference(&index, &long_query, None, 1_000);
-        assert!(long_result.engine_capped);
-
-        let short_query = query_trigrams_from_tokens(&["abc"]);
-        assert_eq!(short_query.len(), 1);
-        assert_rank_matches_reference(&index, &short_query, None, 100);
-
-        let mixed_query = query_trigrams_from_tokens(&["sharedalpha", "absentzzz"]);
-        let production_only = |path: &Path| !path.ends_with("file_002.txt");
-        assert_rank_matches_reference(&index, &mixed_query, Some(&production_only), 25);
-
-        let mut duplicate_query = query_trigrams_from_tokens(&["abcdefghij"]);
-        duplicate_query.push(duplicate_query[0]);
-        assert_rank_matches_reference(&index, &duplicate_query, None, 40);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn lexical_rank_reads_each_distinct_query_posting_list_once() {
-        let (_dir, index) = lexical_rank_mixed_storage_fixture();
-        let mut query = query_trigrams_from_tokens(&["abcdefghij", "sharedalpha"]);
-        query.push(query[0]);
-        let distinct_trigrams = query.iter().copied().collect::<HashSet<_>>().len();
-
-        reset_postings_for_trigram_count_for_debug();
-        let result = index
-            .snapshot()
-            .lexical_rank_with_stats(&query, None, 1_000)
-            .unwrap();
-
-        assert!(result.files.len() > 1);
-        assert_eq!(
-            postings_for_trigram_count_for_debug(),
-            distinct_trigrams,
-            "candidate discovery and scoring must share query-local posting lists"
-        );
     }
 
     #[test]

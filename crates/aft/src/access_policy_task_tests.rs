@@ -138,6 +138,18 @@ fn assert_floor(response: crate::protocol::Response, path: &Path) {
     assert_eq!(
         response.data["message"],
         format!(
+            "path '{}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.",
+            path.display()
+        )
+    );
+}
+
+fn assert_credential_floor(response: crate::protocol::Response, path: &Path) {
+    assert!(!response.success, "{:?}", response.data);
+    assert_eq!(response.data["code"], "denied_floor", "{:?}", response.data);
+    assert_eq!(
+        response.data["message"],
+        format!(
             "path '{}' is denied by the access policy floor",
             path.display()
         )
@@ -281,7 +293,7 @@ fn access_policy_worker_cannot_read_sibling_or_head_task_records() {
 fn access_policy_head_cannot_read_task_environment() {
     let f = fixture();
     crate::access_policy::with_scope(Some(f.head.clone()), || {
-        assert_floor(
+        assert_credential_floor(
             read_as(&f.ctx, "head-session", &f.worker.environment),
             &f.worker.environment,
         )
@@ -291,13 +303,13 @@ fn access_policy_head_cannot_read_task_environment() {
 #[test]
 fn access_policy_session_cannot_read_task_environment() {
     let f = fixture();
-    assert_floor(
+    assert_credential_floor(
         read_as(&f.ctx, "worker-session", &f.worker.environment),
         &f.worker.environment,
     );
     f.ctx
         .update_config(|config| config.project_root = Some(f.worker.dir.clone()));
-    assert_floor(
+    assert_credential_floor(
         read_as(&f.ctx, "worker-session", &f.worker.environment),
         &f.worker.environment,
     );

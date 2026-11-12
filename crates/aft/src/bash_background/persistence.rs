@@ -634,7 +634,7 @@ impl PinnedDir {
     pub(crate) fn repair_sync(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
-            self.file.sync_all()?;
+            aft_store::sync::sync_all(&self.file, &self.path)?;
         }
         Ok(())
     }
@@ -1968,6 +1968,7 @@ fn is_zero(value: &usize) -> bool {
 pub enum ExitMarker {
     Code(i32),
     Killed,
+    Unknown,
 }
 
 impl PersistedTask {
@@ -3100,6 +3101,14 @@ enum ReplaceSync {
     FileAndDirectory,
 }
 
+/// Kept only while a registry owns the task. The file is still compared on
+/// every request: another registry can replace or acknowledge its metadata.
+pub(super) struct MetadataSync {
+    directory: DirectoryIdentity,
+    content: Vec<u8>,
+    sync: ReplaceSync,
+}
+
 impl ReplaceSync {
     /// Remote tasks and local fallbacks of remote tasks resume from their
     /// metadata after a crash, so their records are written durably.
@@ -3154,27 +3163,67 @@ fn write_task_in_dir(
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    if sync_unchanged_metadata(dir, name, &content, sync) {
+    let order = super::registry::DbWriteOrder::lookup(&task.session_id, &task.task_id);
+    let mut memo = order.as_ref().map(|order| {
+        order
+            .metadata_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    let directory = memo.as_ref().and_then(|_| dir.identity().ok());
+    let already_synced = memo
+        .as_deref()
+        .and_then(Option::as_ref)
+        .is_some_and(|saved| {
+            Some(&saved.directory) == directory.as_ref()
+                && saved.content == content
+                && (saved.sync == ReplaceSync::FileAndDirectory || saved.sync == sync)
+        });
+    if sync_unchanged_metadata(dir, name, &content, sync, already_synced) {
+        if !already_synced && sync != ReplaceSync::None {
+            if let (Some(memo), Some(directory)) = (memo.as_deref_mut(), directory) {
+                *memo = Some(MetadataSync {
+                    directory,
+                    content,
+                    sync,
+                });
+            }
+        }
         return Ok(());
+    }
+    // A different replacement, or a failed shortcut sync, invalidates the old
+    // durability even if the replacement later fails after its rename.
+    if let Some(memo) = memo.as_deref_mut() {
+        *memo = None;
     }
     #[cfg(test)]
     work_counts::record_metadata_write();
     super::gc_memo::metadata_written(&dir.path().join(name));
     let result = atomic_replace(dir, name, &content, sync);
     super::gc_memo::metadata_written(&dir.path().join(name));
+    if result.is_ok() && sync != ReplaceSync::None {
+        if let (Some(memo), Some(directory)) = (memo.as_deref_mut(), directory) {
+            *memo = Some(MetadataSync {
+                directory,
+                content,
+                sync,
+            });
+        }
+    }
     result
 }
 
 /// Compare the file, not an in-memory cache: another registry can acknowledge
 /// a completed task through the same pinned directory. Equal bytes need no
-/// replacement, but a durable state write must still sync an earlier checkpoint
-/// whose rename may not have reached disk yet. A failed shortcut sync falls
-/// back to replacement with the same durability requirements.
+/// replacement or repeated syncs, but a durable state write must still sync an
+/// earlier checkpoint whose rename may not have reached disk yet. A failed
+/// shortcut sync falls back to replacement with the same durability requirements.
 fn sync_unchanged_metadata(
     dir: &PinnedDir,
     name: &OsStr,
     content: &[u8],
     sync: ReplaceSync,
+    already_synced: bool,
 ) -> bool {
     let Ok(mut file) = dir.open_file(name, sync != ReplaceSync::None) else {
         // Missing, unreadable or non-regular metadata can still be replaced.
@@ -3187,7 +3236,10 @@ fn sync_unchanged_metadata(
     {
         return false;
     }
-    if sync != ReplaceSync::None && sync_task_file(&file).is_err() {
+    if already_synced {
+        return true;
+    }
+    if sync != ReplaceSync::None && sync_task_file(&file, &dir.path.join(name)).is_err() {
         return false;
     }
     if sync == ReplaceSync::FileAndDirectory && sync_task_directory(dir).is_err() {
@@ -4658,6 +4710,9 @@ pub(super) fn read_exit_marker_with_reason(
     if content == "killed" {
         return Ok(Some(ExitMarker::Killed));
     }
+    if content == "unknown" {
+        return Ok(Some(ExitMarker::Unknown));
+    }
     Ok(content.parse::<i32>().ok().map(ExitMarker::Code))
 }
 
@@ -4810,7 +4865,7 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
     atomic_replace(dir, name, content, ReplaceSync::None)
 }
 
-pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
+pub(crate) fn sync_task_file(file: &File, path: &Path) -> io::Result<()> {
     #[cfg(test)]
     work_counts::record_sync();
     #[cfg(test)]
@@ -4832,7 +4887,7 @@ pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
     }
     #[cfg(test)]
     let started = std::time::Instant::now();
-    let result = file.sync_all();
+    let result = aft_store::sync::sync_all(file, path);
     #[cfg(test)]
     work_counts::record_sync_time(started.elapsed());
     result
@@ -4841,7 +4896,7 @@ pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
 fn sync_task_directory(dir: &PinnedDir) -> io::Result<()> {
     #[cfg(unix)]
     {
-        sync_task_file(&dir.file)
+        sync_task_file(&dir.file, &dir.path)
     }
     #[cfg(windows)]
     {
@@ -4865,7 +4920,7 @@ fn sync_task_directory(dir: &PinnedDir) -> io::Result<()> {
                 "pinned directory path identity changed",
             ));
         }
-        sync_task_file(&writable.file)?;
+        sync_task_file(&writable.file, &dir.path)?;
         dir.ensure_current_identity()
     }
 }
@@ -4886,7 +4941,7 @@ fn atomic_replace(
         let result = (|| {
             file.write_all(content)?;
             if sync != ReplaceSync::None {
-                sync_task_file(&file)?;
+                sync_task_file(&file, &dir.path.join(&temporary))?;
             }
             // Atomic replacement protects readers after a daemon kill. Task
             // history is mirrored in a weaker database and is not a durable log.
@@ -7181,6 +7236,18 @@ mod tests {
         assert_eq!(counts.metadata_reads, 1);
         // A missing marker still needs only one typed metadata decode.
         assert_eq!(counts.parses, 1);
+    }
+
+    #[test]
+    fn pty_unknown_exit_marker_round_trips() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        let mut handles = TaskIoHandles::create(&task, BgMode::Pty, false).unwrap();
+        handles.write(TaskArtifact::Exit, b"unknown").unwrap();
+        assert_eq!(
+            read_exit_marker(&task.paths).unwrap(),
+            Some(ExitMarker::Unknown)
+        );
     }
 
     #[cfg(unix)]

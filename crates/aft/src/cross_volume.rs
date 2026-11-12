@@ -499,7 +499,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     if kind.is_file() {
         fs::copy(from, to)?;
         #[cfg(not(windows))]
-        fs::File::open(to)?.sync_all()?;
+        aft_store::sync::sync_all(&fs::File::open(to)?, to)?;
         #[cfg(windows)]
         {
             // FlushFileBuffers requires a writable handle. fs::copy preserves

@@ -10,6 +10,7 @@ import {
   coerceBoolean,
   escalationAskText,
   formatBashOutputPages,
+  formatUnknownPtyExit,
   groupBashPermissionAsks,
   isLiveBackgroundTaskReply,
   LONGEST_TIMER_DELAY_MS,
@@ -924,7 +925,7 @@ async function formatBashStatusText(
   const exit = typeof data.exit_code === "number" ? ` (exit ${data.exit_code})` : "";
   const dur =
     typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
-  let text = `Task ${taskId}: ${status}${exit}${dur}`;
+  let text = formatUnknownPtyExit(taskId, data) ?? `Task ${taskId}: ${status}${exit}${dur}`;
   if (typeof data.live_descendants_summary === "string") {
     text += ` · ${data.live_descendants_summary}`;
   }

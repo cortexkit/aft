@@ -204,6 +204,7 @@ mod cost_trace {
     thread_local! {
         static PHASES: RefCell<Option<Vec<(&'static str, f64)>>> = const { RefCell::new(None) };
         static CPU_PHASES: RefCell<Vec<(&'static str, f64)>> = const { RefCell::new(Vec::new()) };
+        static COUNTS: RefCell<std::collections::BTreeMap<&'static str, usize>> = const { RefCell::new(std::collections::BTreeMap::new()) };
     }
 
     fn thread_cpu_ms() -> Option<f64> {
@@ -236,6 +237,7 @@ mod cost_trace {
             if enabled {
                 PHASES.with(|phases| *phases.borrow_mut() = Some(Vec::new()));
                 CPU_PHASES.with(|phases| phases.borrow_mut().clear());
+                COUNTS.with(|counts| counts.borrow_mut().clear());
             }
             Self {
                 id: id.to_string(),
@@ -251,14 +253,22 @@ mod cost_trace {
                 let phases = PHASES.with(|phases| std::mem::take(&mut *phases.borrow_mut()));
                 let cpu_phases =
                     CPU_PHASES.with(|phases| std::mem::take(&mut *phases.borrow_mut()));
+                let counts = COUNTS.with(|counts| std::mem::take(&mut *counts.borrow_mut()));
                 eprintln!(
                     "AFT_SEARCH_COST {}",
                     serde_json::json!({
                         "id": self.id, "total_ms": self.started.elapsed().as_secs_f64() * 1000.0,
                         "phases": phases, "cpu_phases": cpu_phases,
+                        "counts": counts,
                     })
                 );
             }
+        }
+    }
+
+    pub(crate) fn count(name: &'static str, value: usize) {
+        if PHASES.with(|phases| phases.borrow().is_some()) {
+            COUNTS.with(|counts| *counts.borrow_mut().entry(name).or_default() += value);
         }
     }
 
@@ -290,6 +300,7 @@ mod cost_trace {
 
 #[cfg(not(feature = "test-timing-hooks"))]
 mod cost_trace {
+    pub(crate) fn count(_: &'static str, _: usize) {}
     pub(crate) struct Request;
     impl Request {
         pub(crate) fn start(_: &str) -> Self {
@@ -304,4 +315,5 @@ mod cost_trace {
     }
 }
 
+pub(crate) use cost_trace::count as cost_count;
 pub(crate) use cost_trace::{Phase as CostPhase, Request as CostRequest};

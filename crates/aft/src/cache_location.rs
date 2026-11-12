@@ -1174,7 +1174,7 @@ pub fn prepare_cache_root(
                         })
                         .map_err(io::Error::other)?,
                     )?;
-                    marker.sync_all()?;
+                    aft_store::sync::sync_all(&marker, &lease.root.path().join(OWNER))?;
                 }
                 Err(error) => return Err(error),
             }

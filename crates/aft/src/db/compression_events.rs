@@ -94,6 +94,8 @@ struct CompressionAggregateCacheInner {
 #[derive(Debug, Default)]
 pub struct CompressionAggregateCache {
     inner: Mutex<CompressionAggregateCacheInner>,
+    refreshing: Mutex<std::collections::HashSet<(usize, SessionAggregateKey)>>,
+    epoch: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     aggregate_scan_count: AtomicUsize,
 }
@@ -106,46 +108,151 @@ impl CompressionAggregateCache {
         project_key: &str,
         session_id: &str,
     ) -> rusqlite::Result<(CompressionAggregate, CompressionAggregate)> {
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        self.aggregates_for_session_at_epoch(conn, harness, project_key, session_id, epoch)
+    }
+
+    fn aggregates_for_session_at_epoch(
+        &self,
+        conn: &Connection,
+        harness: &str,
+        project_key: &str,
+        session_id: &str,
+        epoch: u64,
+    ) -> rusqlite::Result<(CompressionAggregate, CompressionAggregate)> {
+        // Keep the watermark and both aggregates in one SQLite read snapshot:
+        // another process may insert or roll up events between statements.
+        let read = conn
+            .is_autocommit()
+            .then(|| conn.unchecked_transaction())
+            .transpose()?;
+        let watermark = compression_event_watermark(conn)?;
+        let project_key = ProjectAggregateKey::new(harness, project_key);
+        let session_key = SessionAggregateKey::new(harness, &project_key.project_key, session_id);
+        let (cached_project, cached_session) = {
+            let mut inner = self.inner.lock();
+            if self.epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            reset_for_connection_change(&mut inner, conn);
+            (
+                inner
+                    .projects
+                    .get(&project_key)
+                    .filter(|cached| cached.watermark == watermark)
+                    .map(|cached| cached.aggregate),
+                inner
+                    .sessions
+                    .get(&session_key)
+                    .filter(|cached| cached.watermark == watermark)
+                    .map(|cached| cached.aggregate),
+            )
+        };
+        // Do not hold the cache mutex during SQL: a busy-connection status
+        // reader must be able to serve the last exact values immediately.
+        let project = match cached_project {
+            Some(project) => project,
+            None => {
+                self.note_aggregate_scan();
+                aggregate_for_project(conn, harness, &project_key.project_key)?
+            }
+        };
+        let session = match cached_session {
+            Some(session) => session,
+            None => {
+                self.note_aggregate_scan();
+                aggregate_for_session(conn, harness, &project_key.project_key, session_id)?
+            }
+        };
+        if let Some(read) = read {
+            read.commit()?;
+        }
+        let mut inner = self.inner.lock();
+        if inner.connection_identity == Some(conn as *const Connection as usize)
+            && self.epoch.load(std::sync::atomic::Ordering::Acquire) == epoch
+        {
+            inner.projects.insert(
+                project_key,
+                CachedAggregate {
+                    aggregate: project,
+                    watermark,
+                },
+            );
+            inner.sessions.insert(
+                session_key,
+                CachedAggregate {
+                    aggregate: session,
+                    watermark,
+                },
+            );
+        }
+        Ok((project, session))
+    }
+
+    /// Validate warm totals with one indexed watermark lookup, never aggregate
+    /// on the push thread. A miss is recomputed by `refresh_for_status`.
+    pub(crate) fn validated_for_status(
+        &self,
+        conn: &Connection,
+        harness: &str,
+        project_key: &str,
+        session_id: &str,
+    ) -> rusqlite::Result<Option<(CompressionAggregate, CompressionAggregate)>> {
         let watermark = compression_event_watermark(conn)?;
         let project_key = ProjectAggregateKey::new(harness, project_key);
         let session_key = SessionAggregateKey::new(harness, &project_key.project_key, session_id);
         let mut inner = self.inner.lock();
         reset_for_connection_change(&mut inner, conn);
+        Ok(inner
+            .projects
+            .get(&project_key)
+            .zip(inner.sessions.get(&session_key))
+            .filter(|(project, session)| {
+                project.watermark == watermark && session.watermark == watermark
+            })
+            .map(|(project, session)| (project.aggregate, session.aggregate)))
+    }
 
-        let project = match inner.projects.get(&project_key) {
-            Some(cached) if cached.watermark == watermark => cached.aggregate,
-            _ => {
-                self.note_aggregate_scan();
-                let aggregate = aggregate_for_project(conn, harness, &project_key.project_key)?;
-                inner.projects.insert(
-                    project_key.clone(),
-                    CachedAggregate {
-                        aggregate,
-                        watermark,
-                    },
-                );
-                aggregate
-            }
-        };
-
-        let session = match inner.sessions.get(&session_key) {
-            Some(cached) if cached.watermark == watermark => cached.aggregate,
-            _ => {
-                self.note_aggregate_scan();
-                let aggregate =
-                    aggregate_for_session(conn, harness, &project_key.project_key, session_id)?;
-                inner.sessions.insert(
-                    session_key,
-                    CachedAggregate {
-                        aggregate,
-                        watermark,
-                    },
-                );
-                aggregate
-            }
-        };
-
-        Ok((project, session))
+    pub(crate) fn refresh_for_status(
+        self: &std::sync::Arc<Self>,
+        db: std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+        harness: String,
+        project_key: String,
+        session_id: String,
+        notify: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) {
+        let key = (
+            std::sync::Arc::as_ptr(&db) as usize,
+            SessionAggregateKey::new(&harness, &project_key, &session_id),
+        );
+        if !self.refreshing.lock().insert(key.clone()) {
+            return;
+        }
+        let own = std::sync::Arc::clone(self);
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let failure_key = key.clone();
+        if std::thread::Builder::new()
+            .name("aft-status-compression".into())
+            .spawn(move || {
+                let completed = db.lock().ok().is_some_and(|conn| {
+                    own.aggregates_for_session_at_epoch(
+                        &conn,
+                        &harness,
+                        &project_key,
+                        &session_id,
+                        epoch,
+                    )
+                    .is_ok()
+                });
+                own.refreshing.lock().remove(&key);
+                if completed {
+                    notify();
+                }
+            })
+            .is_err()
+        {
+            self.refreshing.lock().remove(&failure_key);
+        }
     }
 
     /// The aggregates last computed for this key, without revalidating them
@@ -214,6 +321,7 @@ impl CompressionAggregateCache {
     }
 
     pub fn clear(&self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         *self.inner.lock() = CompressionAggregateCacheInner::default();
     }
 
@@ -1716,6 +1824,91 @@ mod tests {
                 "local inserts must advance warm entries without rescanning"
             );
         }
+    }
+
+    #[test]
+    fn status_compression_refresh_coalesces_and_matches_full_totals_after_insert_and_retention() {
+        let dir = tempdir().unwrap();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        let cache = std::sync::Arc::new(CompressionAggregateCache::default());
+        {
+            let conn = db.lock().unwrap();
+            cache
+                .aggregates_for_session(&conn, "opencode", "project-a", "session-1")
+                .unwrap();
+        }
+        let mut external = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        insert_compression_event(&external, &row("project-a", "old", 100, 40, 1)).unwrap();
+        insert_compression_event(&external, &row("project-a", "new", 200, 80, 2)).unwrap();
+        insert_compression_event(&external, &row("project-b", "watermark", 5, 2, 3)).unwrap();
+        // Rows newer than the cached watermark can be rolled up before status
+        // sees them. A raw id-range delta alone would miss these events.
+        assert_eq!(
+            prune_compression_events(&mut external, RETENTION_AGE_MS + 100).unwrap(),
+            2
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let notify: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            let _ = tx.send(());
+        });
+        let held = db.lock().unwrap();
+        assert_eq!(
+            cache
+                .validated_for_status(&held, "opencode", "project-a", "session-1")
+                .unwrap(),
+            None
+        );
+        let scans = cache.aggregate_scan_count_for_test();
+        for _ in 0..50 {
+            cache.refresh_for_status(
+                std::sync::Arc::clone(&db),
+                "opencode".into(),
+                "project-a".into(),
+                "session-1".into(),
+                std::sync::Arc::clone(&notify),
+            );
+        }
+        assert_eq!(cache.refreshing.lock().len(), 1);
+        assert_eq!(cache.aggregate_scan_count_for_test(), scans);
+        assert_eq!(
+            cache
+                .cached_for_session("opencode", "project-a", "session-1")
+                .unwrap()
+                .0
+                .events,
+            0
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        assert!(rx.try_recv().is_err());
+        let conn = db.lock().unwrap();
+        let exact = (
+            aggregate_for_project(&conn, "opencode", "project-a").unwrap(),
+            aggregate_for_session(&conn, "opencode", "project-a", "session-1").unwrap(),
+        );
+        assert_eq!(exact.0.events, 2);
+        assert_eq!(
+            cache
+                .validated_for_status(&conn, "opencode", "project-a", "session-1")
+                .unwrap(),
+            Some(exact)
+        );
+        drop(conn);
+        let warm = cache
+            .cached_for_session("opencode", "project-a", "session-1")
+            .unwrap();
+        assert_eq!(
+            prune_compression_events(&mut external, RETENTION_AGE_MS + 100).unwrap(),
+            0
+        );
+        assert_eq!(
+            cache
+                .validated_for_status(&db.lock().unwrap(), "opencode", "project-a", "session-1")
+                .unwrap(),
+            Some(warm)
+        );
     }
 
     fn row<'a>(

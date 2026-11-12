@@ -15,6 +15,7 @@ import {
   type PreparedBinary,
   prepareBinary,
   readTextFile,
+  withoutTrailingStatusBar,
 } from "./helpers.js";
 
 type MutationToolResult = {
@@ -62,7 +63,8 @@ function asMutationResult(result: ToolResult): MutationToolResult {
   if (typeof result === "string") {
     throw new Error(`expected object ToolResult, got string: ${result}`);
   }
-  return result as MutationToolResult;
+  const mutation = result as MutationToolResult;
+  return { ...mutation, output: withoutTrailingStatusBar(mutation.output) };
 }
 
 async function executeEdit(

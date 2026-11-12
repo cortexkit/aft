@@ -486,7 +486,7 @@ pub(crate) fn assert_artifact_read_policy(
         assert_eq!(
             denied.data["message"],
             format!(
-                "path '{}' is denied by the access policy floor",
+                "path '{}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.",
                 path.display()
             )
         );
@@ -884,7 +884,7 @@ fn artifact_read_search_does_not_authorize_containing_git_store() {
     assert_eq!(
         response.data["message"],
         format!(
-            "path '{}' is denied by the access policy floor",
+            "path '{}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.",
             std::fs::canonicalize(storage).unwrap().display()
         )
     );

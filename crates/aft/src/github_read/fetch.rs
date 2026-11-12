@@ -12,7 +12,7 @@ use super::resource::{GithubResource, GithubResourceKind};
 
 const ISSUE_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,url";
 const PR_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,files,reviews,baseRefName,headRefName,reviewDecision,url";
-const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100) { nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { author { login } body createdAt updatedAt isMinimized path line originalLine } } } } } } }";
+const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100) { nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { id author { login } body createdAt updatedAt isMinimized path line originalLine } } } } } } }";
 
 /// Request context passed to a structured GitHub fetcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,6 +302,10 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
             )?;
             let review_document = normalize_document(&request.resource, &review_json)?;
             document.review_comment_sections = review_document.review_comment_sections;
+            // Thread lookup is independent: a failed lookup must not hide comments.
+            document.review_threads = self
+                .fetch_review_threads(request, &document.repository)
+                .ok();
         }
         let timeline_json = self.structured_json(
             &request.working_directory,
@@ -320,7 +324,7 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
 }
 
 impl<R: GhCommandRunner> GhCliFetcher<R> {
-    fn structured_json(
+    pub(super) fn structured_json(
         &self,
         working_directory: &std::path::Path,
         args: &[String],

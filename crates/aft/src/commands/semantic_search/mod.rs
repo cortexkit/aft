@@ -660,6 +660,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             response.data["text"] = serde_json::json!(format!("{line}\n\n{output}"));
         }
     }
+    disclose_skipped_folders(req, ctx, &mut response);
     response
 }
 
@@ -667,11 +668,26 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 /// must still run the bounded exact/lexical scan while the indexes warm.
 pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
-    handle_semantic_search_with_disk_fallback(
+    let mut response = handle_semantic_search_with_disk_fallback(
         req,
         ctx,
         config.indexes.trigram || config.indexes.semantic,
-    )
+    );
+    disclose_skipped_folders(req, ctx, &mut response);
+    response
+}
+
+fn disclose_skipped_folders(req: &RawRequest, ctx: &AppContext, response: &mut Response) {
+    let Some(root) = ctx.config().project_root.clone() else {
+        return;
+    };
+    let scope = req
+        .params
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| root.clone(), |path| root.join(path));
+    let scope = std::fs::canonicalize(&scope).unwrap_or(scope);
+    crate::data_layer::surfaces::disclose_index_gaps(ctx, &[scope], response);
 }
 
 thread_local! {
@@ -3871,22 +3887,12 @@ fn matching_line_in_text(
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
     let _cost = telemetry::CostPhase::start("matching_line");
-    static CACHE: std::sync::OnceLock<MatchingSourceCache> = std::sync::OnceLock::new();
-    let prepare_cost = telemetry::CostPhase::start("matching_prepare");
-    let prepare_wait = waits::time(waits::SearchWait::MatchingPrepare);
-    let prepared = CACHE
-        .get_or_init(|| MatchingSourceCache::new(32 * 1024 * 1024))
-        .prepare(source);
-    drop(prepare_cost);
-    drop(prepare_wait);
+    telemetry::cost_count("matching_calls", 1);
     let phrase_cost = telemetry::CostPhase::start("matching_phrase");
     let phrase_wait = waits::time(waits::SearchWait::MatchingPhrase);
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
-        if let Some((line_index, line)) = source.lines().enumerate().find(|(index, _)| {
-            prepared.normalized[prepared.lines[*index].normalized.clone()]
-                .contains(&normalized_phrase)
-        }) {
+        if let Some((line_index, line)) = matching_phrase_line(source, &normalized_phrase) {
             // The phrase matched after whitespace normalization, so its first
             // word locates the match in the raw line.
             let anchor = normalized_phrase
@@ -3915,6 +3921,17 @@ fn matching_line_in_text(
         })
         .filter(|token| token.len() >= 3)
         .collect::<Vec<_>>();
+    if compact_tokens.is_empty() {
+        return line_at_offset(source, symbol_range?.start);
+    }
+    static CACHE: std::sync::OnceLock<MatchingSourceCache> = std::sync::OnceLock::new();
+    let prepare_cost = telemetry::CostPhase::start("matching_prepare");
+    let prepare_wait = waits::time(waits::SearchWait::MatchingPrepare);
+    let prepared = CACHE
+        .get_or_init(|| MatchingSourceCache::new(32 * 1024 * 1024))
+        .prepare(source);
+    drop(prepare_cost);
+    drop(prepare_wait);
     let best_cost = telemetry::CostPhase::start("matching_best_line");
     let best_wait = waits::time(waits::SearchWait::MatchingBestLine);
     let best = prepared.best_line(source, &compact_tokens);
@@ -3939,51 +3956,93 @@ fn matching_line_in_text(
     line_at_offset(source, symbol_range?.start)
 }
 
+fn matching_phrase_line<'a>(source: &'a str, phrase: &str) -> Option<(usize, &'a str)> {
+    let word = phrase.split(' ').next()?;
+    let first = *word.as_bytes().first()?;
+    let bytes = source.as_bytes();
+    let mut after_line = 0;
+    let mut line_index = 0;
+    let mut normalized = String::new();
+    // Whitespace folding cannot create a word. Find its raw bytes first and
+    // normalize only lines containing it; ASCII case folding preserves offsets
+    // and leaves non-ASCII bytes unchanged, just like phrase normalization.
+    for start in memchr::memchr2_iter(first, first.to_ascii_uppercase(), bytes) {
+        if start < after_line
+            || !bytes[start..]
+                .get(..word.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(word.as_bytes()))
+        {
+            continue;
+        }
+        let preceding = &bytes[after_line..start];
+        line_index += memchr::memchr_iter(b'\n', preceding).count();
+        let line_start = memchr::memrchr(b'\n', preceding)
+            .map_or(after_line, |newline| after_line + newline + 1);
+        let line_end =
+            memchr::memchr(b'\n', &bytes[start..]).map_or(bytes.len(), |newline| start + newline);
+        let raw = &source[line_start..line_end];
+        let line = if line_end < bytes.len() {
+            raw.strip_suffix('\r').unwrap_or(raw)
+        } else {
+            raw
+        };
+        telemetry::cost_count("matching_phrase_lines_prepared", 1);
+        #[cfg(test)]
+        MATCHING_PHRASE_LINES_PREPARED.with(|count| count.set(count.get() + 1));
+        normalized.clear();
+        exact_lane::push_normalized_exact_phrase(line, &mut normalized);
+        if normalized.contains(phrase) {
+            return Some((line_index, line));
+        }
+        after_line = line_end.saturating_add(1);
+        line_index += 1;
+    }
+    None
+}
+
 struct MatchingContentLine {
-    normalized: std::ops::Range<usize>,
     compact: std::ops::Range<usize>,
     trigrams: std::sync::OnceLock<Box<[[u8; 3]]>>,
 }
 
 struct MatchingSource {
     lines: Vec<MatchingContentLine>,
-    normalized: String,
     compact: String,
 }
 
 impl MatchingSource {
     fn new(source: &str) -> Self {
-        // Two source-wide buffers avoid allocating and freeing two strings
-        // per line while concurrent searches churn the bounded content cache.
-        // Ranges keep line boundaries: neither phrase nor trigram matches may
-        // cross a newline, even though adjacent lines share an allocation.
-        let mut normalized = String::new();
+        let _cost = telemetry::CostPhase::start("matching_source_new");
+        // The fuzzy scorer needs compact text only after the phrase scan misses.
+        // Pack it in one buffer, keeping line boundaries so trigrams cannot
+        // cross a newline. Phrase normalization needs no retained per-line text.
         let mut compact = String::new();
         let lines = source
             .lines()
             .map(|line| {
-                let normalized_start = normalized.len();
-                exact_lane::push_normalized_exact_phrase(line, &mut normalized);
+                telemetry::cost_count("matching_lines_prepared", 1);
                 let compact_start = compact.len();
-                compact.extend(
-                    line.chars()
-                        .filter(|ch| ch.is_alphanumeric())
-                        .flat_map(char::to_lowercase),
-                );
+                if line.is_ascii() {
+                    compact.extend(
+                        line.bytes()
+                            .filter(u8::is_ascii_alphanumeric)
+                            .map(|byte| byte.to_ascii_lowercase() as char),
+                    );
+                } else {
+                    compact.extend(
+                        line.chars()
+                            .filter(|ch| ch.is_alphanumeric())
+                            .flat_map(char::to_lowercase),
+                    );
+                }
                 MatchingContentLine {
-                    normalized: normalized_start..normalized.len(),
                     compact: compact_start..compact.len(),
                     trigrams: std::sync::OnceLock::new(),
                 }
             })
             .collect();
-        normalized.shrink_to_fit();
         compact.shrink_to_fit();
-        Self {
-            lines,
-            normalized,
-            compact,
-        }
+        Self { lines, compact }
     }
 
     // Reserve the worst-case trigram storage before lazy initialization, so
@@ -3991,7 +4050,6 @@ impl MatchingSource {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.lines.capacity() * std::mem::size_of::<MatchingContentLine>()
-            + self.normalized.capacity()
             + self.compact.capacity()
             + self
                 .lines
@@ -4012,6 +4070,7 @@ impl MatchingSource {
         let mut best_score = 0_usize;
         let mut missing = Vec::with_capacity(tokens.len());
         for (index, (line, prepared)) in source.lines().zip(&self.lines).enumerate() {
+            telemetry::cost_count("matching_best_lines_used", 1);
             let compact = &self.compact[prepared.compact.clone()];
             missing.clear();
             let mut score = 0_usize;
@@ -4201,6 +4260,7 @@ fn best_content_line<'a>(
 #[cfg(test)]
 thread_local! {
     static MATCHING_LINE_TRIGRAM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MATCHING_PHRASE_LINES_PREPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The line holding byte `offset` of `source`, as a 0-based line number and
@@ -4886,9 +4946,8 @@ fn run_engine_ranking(
     use telemetry::{ConfidenceTelemetry, TelemetryAssembler, TelemetryRun};
     use trailer::{ExactPassState, SearchTrailer};
 
-    // With the data layer running and its view's text plane ready, the
-    // lexical and exact lanes read that view; otherwise they read the legacy
-    // index, or the borrowed one of an external root.
+    // Published roots read their store's text plane. Only an unpublished
+    // external pattern request supplies an ephemeral, bounded corpus here.
     let data_text = borrowed_index
         .is_none()
         .then(|| crate::data_layer::tools::search::DataText::ready(ctx))
@@ -4908,7 +4967,6 @@ fn run_engine_ranking(
             return Err("request_cancelled".to_string());
         }
     }
-    let view_snapshot: Option<crate::search_index::SearchIndexSnapshot> = None;
     let empty_index = SearchIndex::new();
     let index = borrowed_index
         .map(|(index, _)| index)
@@ -4928,11 +4986,6 @@ fn run_engine_ranking(
     let generation = data_text
         .as_ref()
         .map(|text| GenerationToken::new_with_str(&with_meaning(text.generation())))
-        .or_else(|| {
-            view_snapshot.as_ref().map(|snapshot| {
-                GenerationToken::new_with_str(&with_meaning(snapshot.content_generation()))
-            })
-        })
         .or_else(|| borrowed_index.map(|(_, generation)| generation.clone()))
         .unwrap_or_else(|| {
             GenerationToken::new_with_str(&with_meaning(format!(
@@ -4940,8 +4993,8 @@ fn run_engine_ranking(
                 ctx.semantic_index_rx_generation()
             )))
         });
-    let index_ready = data_text.is_some() || view_snapshot.is_some() || index.is_ready();
-    let snapshot = view_snapshot.unwrap_or_else(|| index.snapshot());
+    let index_ready = data_text.is_some() || index.is_ready();
+    let snapshot = index.snapshot();
     let text_index = match &data_text {
         Some(text) => TextIndex::Data(text),
         None => TextIndex::Snapshot(&snapshot),
@@ -4952,7 +5005,7 @@ fn run_engine_ranking(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
+    let query_trigrams = crate::search_index::query_trigrams_from_tokens(&token_refs);
     // The lexical lane still ranks by the query's words, but only the tokens the
     // exact lane accepts may promote a lexical candidate to exact evidence; a
     // hyphenated literal has none, so only a file holding the whole string can.
@@ -12960,14 +13013,10 @@ mod tests {
     }
 
     #[test]
-    fn matching_line_packed_buffers_preserve_line_boundaries_and_normalization() {
+    fn matching_line_compact_buffer_preserves_line_boundaries_and_normalization() {
         let source = "  Alpha\tBETA \r\n\nİ café 中中中\u{2003}tail\nabc\ndef\n";
         let prepared = MatchingSource::new(source);
         for (line, stored) in source.lines().zip(&prepared.lines) {
-            assert_eq!(
-                &prepared.normalized[stored.normalized.clone()],
-                exact_lane::normalize_exact_phrase(line)
-            );
             assert_eq!(
                 &prepared.compact[stored.compact.clone()],
                 line.chars()
@@ -12976,7 +13025,6 @@ mod tests {
                     .collect::<String>()
             );
         }
-        assert_eq!(prepared.normalized.capacity(), prepared.normalized.len());
         assert_eq!(prepared.compact.capacity(), prepared.compact.len());
         let boundary = MatchingSource::new("ab\nc");
         assert_eq!(boundary.best_line("ab\nc", &["abc".into()]), None);
@@ -12988,6 +13036,82 @@ mod tests {
                 .sum::<usize>(),
             3
         );
+    }
+
+    #[test]
+    fn matching_line_phrase_prepares_only_possible_lines() {
+        let mut source = "unrelated line\n".repeat(5_000);
+        source.push_str("TARGET wrong\r\n\n  target\tVALUE\r\ntarget value\n");
+        MATCHING_PHRASE_LINES_PREPARED.with(|count| count.set(0));
+        assert_eq!(
+            matching_phrase_line(&source, "target value"),
+            Some((5_002, "  target\tVALUE"))
+        );
+        assert_eq!(MATCHING_PHRASE_LINES_PREPARED.with(|count| count.get()), 2);
+        MATCHING_PHRASE_LINES_PREPARED.with(|count| count.set(0));
+        assert_eq!(matching_phrase_line(&source, "absent word"), None);
+        assert_eq!(MATCHING_PHRASE_LINES_PREPARED.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    fn matching_line_phrase_prefilter_is_differentially_byte_identical() {
+        let glyphs = [
+            'a', 'A', 'b', 'c', 'é', 'É', 'İ', '中', '🙂', '_', ' ', '\t', '\r', '\n', '\u{2003}',
+        ];
+        let mut random = 0x7a31_5d09_4c2e_8b17_u64;
+        let mut next = || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+        for case in 0..400 {
+            let mut source = (0..(next() % 700))
+                .map(|_| glyphs[next() as usize % glyphs.len()])
+                .collect::<String>();
+            source.push_str("\r\n xxALPHA\tBeTA_suffix\nİ café 中中中\u{2003}tail\r\nlast\r");
+            for phrase in [
+                "alpha beta",
+                "é",
+                "É",
+                "İ café",
+                "中中中 tail",
+                "last",
+                "a",
+                " ",
+                "",
+                "missing",
+                "beTA_suffix",
+            ] {
+                let phrase = exact_lane::normalize_exact_phrase(phrase);
+                let expected = (!phrase.is_empty())
+                    .then(|| {
+                        source.lines().enumerate().find(|(_, line)| {
+                            exact_lane::normalize_exact_phrase(line).contains(&phrase)
+                        })
+                    })
+                    .flatten();
+                assert_eq!(
+                    matching_phrase_line(&source, &phrase),
+                    expected,
+                    "case {case}: {phrase:?}"
+                );
+            }
+        }
+        for source in [
+            "",
+            "\n",
+            "word\r",
+            "word\r\n",
+            "xxword word\n",
+            "\n\nword\n",
+        ] {
+            let expected = source
+                .lines()
+                .enumerate()
+                .find(|(_, line)| exact_lane::normalize_exact_phrase(line).contains("word"));
+            assert_eq!(matching_phrase_line(source, "word"), expected);
+        }
     }
 
     #[test]
@@ -13023,9 +13147,9 @@ mod tests {
                     })
                     .sum::<usize>();
             let packed_bytes = MatchingSource::new(source).retained_bytes();
-            // Only the two source-wide String headers are new fixed overhead;
+            // Only the source-wide String header is new fixed overhead;
             // every nonempty line saves headers and per-string spare capacity.
-            assert!(packed_bytes <= legacy_bytes + 2 * std::mem::size_of::<String>());
+            assert!(packed_bytes <= legacy_bytes + std::mem::size_of::<String>());
             eprintln!("matching storage: {} source bytes, {legacy_bytes} legacy charge, {packed_bytes} packed charge", source.len());
         }
     }

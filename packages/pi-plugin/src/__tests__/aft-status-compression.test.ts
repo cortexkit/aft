@@ -32,6 +32,15 @@ function status(compression: Record<string, unknown> | undefined) {
 }
 
 describe("Pi aft-status compression rendering", () => {
+  test("renders unknown current and all-session checkpoint counts", () => {
+    const snapshot = status(undefined);
+    snapshot.session.checkpoints = null;
+    snapshot.checkpoints_total = null;
+    const lines = renderStatusDialogInnerForTest(snapshot, null, theme, 100);
+    expect(lines.some((line) => /checkpoints:\s+—/.test(line))).toBe(true);
+    expect(lines.some((line) => /all-session:\s+—/.test(line))).toBe(true);
+  });
+
   test("pi_status_renders_compression_when_project_events_present", () => {
     const lines = renderStatusDialogInnerForTest(
       status({

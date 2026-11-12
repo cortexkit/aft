@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #[path = "helpers/context_storage.rs"]
 mod context_storage;
+#[path = "../src/test_gate.rs"]
+mod test_gate;
 
 #[cfg(target_os = "linux")]
 use aft::bash_background::persistence::resolve_task;
@@ -595,8 +597,8 @@ fn dangling_socket_deny_blocks_target_created_after_sandbox_start() {
     let release = root.join("release");
     let python = "import socket,sys,errno\nfor path in sys.argv[1:]:\n try:\n  socket.socket(socket.AF_UNIX).connect(path)\n except OSError as e:\n  assert e.errno in (errno.EPERM, errno.EACCES), e\n else:\n  raise AssertionError('socket connection escaped deny: ' + path)\nprint('BOTH_DENIED')";
     let script = format!(
-        "printf 'ready\\n'; while [ ! -e {} ]; do sleep 0.01; done; python3 -B -c {} {} {}",
-        shell_path(&release),
+        "printf 'ready\\n'; {}; python3 -B -c {} {} {}",
+        test_gate::gate_exists(&shell_path(&release), "sleep 0.01"),
         shell_path(Path::new(python)),
         shell_path(&alias),
         shell_path(&target),
@@ -1020,8 +1022,8 @@ fn read_deny_created_after_sandbox_start_remains_denied() {
     let mut inherited = InheritedProfile::new(&profile);
     inherited.rewind();
     let script = format!(
-        "printf 'ready\\n'; while [ ! -e {} ]; do sleep 0.01; done; cat {}",
-        shell_path(&release),
+        "printf 'ready\\n'; {}; cat {}",
+        test_gate::gate_exists(&shell_path(&release), "sleep 0.01"),
         shell_path(&secret_file)
     );
     let mut child = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
@@ -1084,8 +1086,8 @@ fn home_directory_created_after_launch_remains_read_denied() {
     let late_dir = home.join("late-directory");
     let late_file = late_dir.join("value");
     let script = format!(
-        "printf 'ready\\n'; while [ ! -e {} ]; do sleep 0.01; done; cat {}",
-        shell_path(&release),
+        "printf 'ready\\n'; {}; cat {}",
+        test_gate::gate_exists(&shell_path(&release), "sleep 0.01"),
         shell_path(&late_file)
     );
     let mut child = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])

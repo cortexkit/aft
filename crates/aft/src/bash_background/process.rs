@@ -891,14 +891,46 @@ fn macos_pid_exists(pid: u32) -> bool {
 // 32-bit exit range, so neither this gate nor its marker interpretation is used there.
 pub(crate) const BOOTSTRAP_ABORTED_MARKER: i32 = i32::MIN;
 
+// Use shell builtins before user code, keeping the posix_spawn fast path. A
+// subshell here would adjust only itself, not the shell that launches the command.
+#[cfg(target_os = "linux")]
+macro_rules! shell_oom_priority {
+    ($init:literal) => {
+        concat!(
+            $init,
+            r#"if [ -n "$__aft_oom_failure" ]; then
+  { printf '%s' 1000 > /proc/self/oom_score_adj; } 2>/dev/null || :
+  __aft_oom_value=unreadable
+  { IFS= read -r __aft_oom_value < /proc/self/oom_score_adj; } 2>/dev/null || :
+  if [ "$__aft_oom_value" != 1000 ]; then
+    { printf '%s\n' "$__aft_oom_value" > "$__aft_oom_failure"; } 2>/dev/null || :
+  fi
+fi
+unset __aft_oom_failure __aft_oom_value
+"#
+        )
+    };
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+macro_rules! shell_oom_priority {
+    ($init:literal) => {
+        ""
+    };
+}
+#[cfg(target_os = "linux")]
+pub(crate) use shell_oom_priority;
+
 #[cfg(unix)]
-pub(crate) const PAYLOAD_WRAPPER: &[u8] = br#"#!/bin/sh
+pub(crate) const PAYLOAD_WRAPPER: &[u8] = concat!(
+    r#"#!/bin/sh
 shell=$1
 command=$2
 exit_fd=$3
 pipeline_status_path=$4
 pipeline_shell=$5
-if [ "${6-}" = "wait-for-identity" ]; then
+"#,
+    shell_oom_priority!("__aft_oom_failure=${7-}\n"),
+    r#"if [ "${6-}" = "wait-for-identity" ]; then
   if ! IFS= read -r __aft_start || [ "$__aft_start" != "run" ]; then
     printf '%s' '-2147483648' >&"$exit_fd"
     exit 125
@@ -937,7 +969,9 @@ esac
 code=$?
 printf "%s" "$code" >&"$exit_fd"
 exit "$code"
-"#;
+"#
+)
+.as_bytes();
 
 #[cfg(unix)]
 pub(crate) fn pipeline_shell_kind(shell: &Path) -> Option<&'static str> {
@@ -963,6 +997,42 @@ pub(crate) fn start_new_session(command: &mut std::process::Command) {
                 Ok(())
             }
         });
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn oom_priority_marker(scratch: Option<&Path>, io_dir: &Path) -> std::path::PathBuf {
+    scratch.unwrap_or(io_dir).join("oom-priority-failure")
+}
+
+#[cfg(target_os = "linux")]
+static OOM_PRIORITY_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+pub(crate) fn oom_priority_failures() -> u64 {
+    OOM_PRIORITY_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_oom_priority_failure(marker: &Path) {
+    let Some(bytes) = crate::file_kind::read_head(marker, 16) else {
+        return;
+    };
+    // Removing the marker claims it even when terminal publication is retried.
+    if std::fs::remove_file(marker).is_err() {
+        return;
+    }
+    let value = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|value| (-1000..=1000).contains(value));
+    if OOM_PRIORITY_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        crate::slog_warn!(
+            "Linux agent shell OOM priority could not be raised to 1000; observed oom_score_adj={}",
+            value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unreadable".into())
+        );
     }
 }
 
@@ -1068,6 +1138,131 @@ pub fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    fn oom_priority_wrapper_output(
+        wrapper: &str,
+        shell: &str,
+        command: &str,
+        marker: &Path,
+        enabled: bool,
+    ) -> std::process::Output {
+        // The exit marker normally uses fd 3; send it to a separate file here.
+        let script = format!("exec 3>\"$8\"\n{wrapper}");
+        std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &script,
+                "aft-wrapper-test",
+                shell,
+                command,
+                "3",
+                "",
+                "",
+                "",
+            ])
+            .arg(if enabled { marker } else { Path::new("") })
+            .arg(marker.with_extension("exit"))
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_oom_priority_wrapper_preserves_output_exit_and_pipeline_status() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("failure");
+        let wrapper = std::str::from_utf8(PAYLOAD_WRAPPER).unwrap();
+        // Omitting the marker disables only the OOM step, not the payload wrapper.
+        for shell in ["/bin/sh", "/bin/bash"] {
+            let command = "printf 'stdout\\000bytes\\n'; printf 'stderr\\n' >&2; exit 37";
+            let before = oom_priority_wrapper_output(wrapper, shell, command, &marker, false);
+            let after = oom_priority_wrapper_output(wrapper, shell, command, &marker, true);
+            assert_eq!(after.stdout, b"stdout\0bytes\n");
+            assert_eq!(before.stdout, after.stdout);
+            assert_eq!(before.stderr, after.stderr);
+            assert_eq!(before.status.code(), Some(37));
+            assert_eq!(before.status, after.status);
+        }
+        let status = root.path().join("pipeline");
+        let script = format!("exec 3>\"$8\"\n{wrapper}");
+        let result = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &script,
+                "aft-wrapper-test",
+                "/bin/bash",
+                "false | true",
+                "3",
+            ])
+            .arg(&status)
+            .args(["bash", ""])
+            .arg(&marker)
+            .arg(root.path().join("exit"))
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{:?}", result.stderr);
+        assert_eq!(std::fs::read_to_string(status).unwrap(), "1\n0\n");
+        assert!(
+            !marker.exists(),
+            "successful adjustment must not write a failure marker"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_oom_priority_write_failure_runs_command_and_warns_once() {
+        // The warning budget is process-wide; unrelated parallel tests must not
+        // consume it before this forced-failure scenario runs.
+        const CHILD: &str = "AFT_TEST_OOM_PRIORITY_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "bash_background::process::tests::linux_oom_priority_write_failure_runs_command_and_warns_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{result:?}");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let readback = root.path().join("readback");
+        std::fs::write(&readback, "17\n").unwrap();
+        let wrapper = std::str::from_utf8(PAYLOAD_WRAPPER)
+            .unwrap()
+            .replacen("/proc/self/oom_score_adj", "/dev/full", 1)
+            .replace("/proc/self/oom_score_adj", readback.to_str().unwrap());
+        assert_eq!(oom_priority_failures(), 0);
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for i in 0..2 {
+                let marker = root.path().join(format!("failure-{i}"));
+                let result = oom_priority_wrapper_output(
+                    &wrapper,
+                    "/bin/sh",
+                    "printf ran; exit 23",
+                    &marker,
+                    true,
+                );
+                assert_eq!(result.stdout, b"ran");
+                assert_eq!(result.stderr, b"");
+                assert_eq!(result.status.code(), Some(23));
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), "17\n");
+                observe_oom_priority_failure(&marker);
+                observe_oom_priority_failure(&marker);
+            }
+        });
+        assert_eq!(oom_priority_failures(), 2);
+        let warnings: Vec<_> = logs
+            .iter()
+            .filter(|line| line.contains("Linux agent shell OOM priority"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert!(warnings[0].contains("WARN"));
+        assert!(warnings[0].contains("oom_score_adj=17"));
+    }
+
     #[test]
     fn documented_termination_grace_matches_policy() {
         let comment = include_str!("process.rs")
@@ -1429,7 +1624,8 @@ mod tests {
         // the descendant.
         let script = format!(
             "sh -c \"trap '' TERM; echo \\$$ > '{pid}'; touch '{ready}'; sleep 30\" & \
-             while [ ! -f '{ready}' ]; do sleep 0.02; done; exit 0",
+             {}; exit 0",
+            crate::test_gate::gate(&format!("'{}'", ready.display()), "sleep 0.02"),
             pid = pidfile.display(),
             ready = ready.display(),
         );

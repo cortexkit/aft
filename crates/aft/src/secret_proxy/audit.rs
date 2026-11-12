@@ -5,8 +5,8 @@ use super::State;
 use hyper::body::Incoming;
 use hyper::Request;
 use secret_rules::audit::{AuditReason, AuditRecordV1, Decision};
-use secret_rules::location::{location_kind_token, LabelOutcome};
-use secret_rules::target::{ConnectAuthority, RequestTarget, RuleTarget};
+use secret_rules::location::{location_kind_token, LabelOutcome, LabelRule};
+use secret_rules::target::ConnectAuthority;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -16,6 +16,7 @@ pub(super) struct RequestAudit<'a> {
     authority: ConnectAuthority,
     request_id: String,
     labels: Vec<(Option<usize>, String)>,
+    rules: Vec<LabelRule>,
     done: bool,
 }
 
@@ -30,35 +31,15 @@ impl<'a> RequestAudit<'a> {
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/");
-        let view = RequestTarget {
-            host: authority.host.clone(),
-            port: authority.port,
-            scheme: "https",
-            target,
-        };
         let mut labels = Vec::new();
-        for (index, grant) in state.config.grants.iter().enumerate() {
-            let rule = &grant.rule;
-            let matched = view
-                .matches(&RuleTarget {
-                    host: &rule.host,
-                    port: rule.port,
-                    path_prefix: &rule.path_prefix,
-                })
-                .is_ok();
-            if matched
-                || mentions(target.as_bytes(), &rule.label)
+        for label in &state.config.scanned_labels {
+            if mentions(target.as_bytes(), label)
                 || request
                     .headers()
                     .values()
-                    .any(|v| mentions(v.as_bytes(), &rule.label))
+                    .any(|v| mentions(v.as_bytes(), label))
             {
-                labels.push((Some(index), rule.label.clone()));
-            }
-        }
-        if labels.is_empty() {
-            if let Some(grant) = state.config.grants.first() {
-                labels.push((Some(0), grant.rule.label.clone()));
+                labels.push((None, label.clone()));
             }
         }
         Self {
@@ -66,12 +47,27 @@ impl<'a> RequestAudit<'a> {
             authority: authority.clone(),
             request_id: REQUEST_ID.fetch_add(1, Ordering::Relaxed).to_string(),
             labels,
+            rules: Vec::new(),
             done: false,
         }
     }
 
-    pub(super) fn decide(&mut self, outcomes: &[LabelOutcome]) -> Result<(), String> {
+    pub(super) fn decide(
+        &mut self,
+        rules: &[LabelRule],
+        outcomes: &[LabelOutcome],
+    ) -> Result<(), String> {
+        self.rules = rules.to_vec();
+        for (index, label) in &mut self.labels {
+            *index = rules.iter().position(|rule| &rule.label == label);
+        }
         self.emit(Some(outcomes))
+    }
+
+    pub(super) fn mention(&mut self, label: &str) {
+        if !self.labels.iter().any(|(_, known)| known == label) {
+            self.labels.push((None, label.to_owned()));
+        }
     }
 
     pub(super) fn refused_for(&mut self, label: &str) {
@@ -80,9 +76,9 @@ impl<'a> RequestAudit<'a> {
             && !self
                 .state
                 .config
-                .grants
+                .scanned_labels
                 .iter()
-                .any(|g| g.rule.label == label)
+                .any(|known| known == label)
         {
             self.labels.clear();
             self.labels.push((None, label.to_owned()));
@@ -107,6 +103,7 @@ impl<'a> RequestAudit<'a> {
                     (Decision::Literal, AuditReason::NotWholeValue)
                 }
                 Some(_) => (Decision::Literal, AuditReason::OutOfScope),
+                None if outcomes.is_some() => (Decision::Literal, AuditReason::OutOfScope),
                 None => (Decision::Refused, AuditReason::Refused),
             };
             let mut record = AuditRecordV1::new(
@@ -119,7 +116,7 @@ impl<'a> RequestAudit<'a> {
             )
             .with_scope(Some(self.state.config.authorization_scope.to_scope_ref()));
             if let Some(index) = index {
-                let rule = &self.state.config.grants[*index].rule;
+                let rule = &self.rules[*index];
                 record = record.with_rule(
                     &self.authority.host,
                     self.authority.port,
@@ -157,7 +154,7 @@ impl Drop for RequestAudit<'_> {
     }
 }
 
-fn mentions(bytes: &[u8], label: &str) -> bool {
+pub(super) fn mentions(bytes: &[u8], label: &str) -> bool {
     let needle = secret_rules::placeholder::placeholder_text(label);
     for start in 0..bytes.len() {
         if bytes[start] != b'{' && bytes[start] != b'%' {

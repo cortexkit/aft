@@ -20,6 +20,7 @@ type Key = (PathBuf, Vec<u8>);
 
 const INITIAL_INCOMPLETE_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_INCOMPLETE_BACKOFF: Duration = Duration::from_secs(10 * 60);
+const WALK_SETTLE: Duration = Duration::from_millis(100);
 
 struct IncompleteWalk {
     error: ApplicabilityResolutionError,
@@ -69,6 +70,7 @@ pub(crate) struct ApplicabilityMetrics {
     pub dependency_count: usize,
     pub full_walks: u64,
     pub full_walk_micros: u64,
+    pub absorbed_triggers: u64,
 }
 
 #[derive(PartialEq, Eq)]
@@ -296,6 +298,7 @@ fn unchanged(paths: &HashMap<PathBuf, PathState>) -> bool {
 #[derive(Default)]
 struct State {
     generation: u64,
+    pending_triggers: u64,
     running: Option<Arc<RunningScan>>,
     result: Option<ApplicabilityWalk>,
     // This is a failed walk, never a partial applicability snapshot. Checks of
@@ -360,6 +363,9 @@ fn input_directories(root: &Path, inputs: &HashSet<PathBuf>) -> HashSet<PathBuf>
 #[derive(Default)]
 struct Flight {
     state: Mutex<State>,
+    /// Different configurations need different answers, but must not walk the
+    /// same physical root concurrently.
+    root_scan: Arc<Mutex<()>>,
     /// Cache-wide use counter of the latest lookup, for capacity eviction.
     last_used: AtomicU64,
 }
@@ -375,7 +381,6 @@ struct Completion {
 
 #[derive(Default)]
 struct RunningScan {
-    generation: u64,
     completion: Mutex<Completion>,
     changed: Condvar,
 }
@@ -409,6 +414,8 @@ pub(super) struct ApplicabilityCache {
     metrics: Mutex<HashMap<PathBuf, ApplicabilityMetrics>>,
     #[cfg(test)]
     waiter_joined: (Mutex<bool>, Condvar),
+    #[cfg(test)]
+    queued: (Mutex<(bool, usize)>, Condvar),
 }
 
 /// Make room for one new key. Only the least recently used idle snapshots go:
@@ -700,6 +707,38 @@ impl ApplicabilityCache {
         self.waiter_joined.1.notify_all();
     }
 
+    #[cfg(test)]
+    pub(super) fn hold_queue_for_test(&self) {
+        self.queued.0.lock().0 = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_queue_for_test(&self, deadline: Instant) -> bool {
+        let mut queued = self.queued.0.lock();
+        while queued.1 == 0 {
+            if self.queued.1.wait_until(&mut queued, deadline).timed_out() {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_queue_for_test(&self) {
+        self.queued.0.lock().0 = false;
+        self.queued.1.notify_all();
+    }
+
+    #[cfg(test)]
+    fn note_queue_for_test(&self) {
+        let mut queued = self.queued.0.lock();
+        queued.1 += 1;
+        self.queued.1.notify_all();
+        while queued.0 {
+            self.queued.1.wait(&mut queued);
+        }
+    }
+
     pub(super) fn walk(
         &self,
         root: &Path,
@@ -742,7 +781,17 @@ impl ApplicabilityCache {
             if !entries.contains_key(&key) {
                 evict_least_recently_used(&mut entries);
             }
-            let flight = Arc::clone(entries.entry(key).or_default());
+            let root_scan = entries
+                .iter()
+                .find(|((cached_root, _), _)| cached_root == root)
+                .map(|(_, flight)| Arc::clone(&flight.root_scan))
+                .unwrap_or_default();
+            let flight = Arc::clone(entries.entry(key).or_insert_with(|| {
+                Arc::new(Flight {
+                    root_scan,
+                    ..Flight::default()
+                })
+            }));
             flight
                 .last_used
                 .store(self.uses.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
@@ -777,10 +826,10 @@ impl ApplicabilityCache {
                 state.result = None;
                 state.cause = Some(InvalidationCause::DependencyValidation);
                 state.generation = state.generation.wrapping_add(1);
+                state.pending_triggers += 1;
             }
             if let Some(running) = &state.running {
                 let running = Arc::clone(running);
-                let joined_generation = running.generation == state.generation;
                 drop(state);
                 let mut completion = running.completion.lock();
                 #[cfg(test)]
@@ -796,103 +845,133 @@ impl ApplicabilityCache {
                         });
                     }
                 }
-                // Retain a per-scan completion for its original waiter cohort.
-                // Later binds must not consume a result invalidated before they
-                // arrived, even if they waited for that scan to release the root.
-                if joined_generation {
-                    if let Some(result) = &completion.result {
-                        self.metrics
-                            .lock()
-                            .entry(root.into())
-                            .or_default()
-                            .coalesced_hits += 1;
-                        return result.clone();
-                    }
+                // A completion is published only after every invalidation that
+                // arrived during scanning has been covered by a follow-up.
+                if let Some(result) = &completion.result {
+                    self.metrics
+                        .lock()
+                        .entry(root.into())
+                        .or_default()
+                        .coalesced_hits += 1;
+                    return result.clone();
                 }
                 continue;
             }
-            let running = Arc::new(RunningScan {
-                generation: state.generation,
-                ..RunningScan::default()
-            });
+            let running = Arc::new(RunningScan::default());
             state.running = Some(Arc::clone(&running));
             state.marker_names = super::registry::applicability_marker_names(config);
-            let cause = state
-                .cause
-                .take()
-                .map_or("cold_or_config", InvalidationCause::label);
+            if state.cause.is_none() {
+                state.pending_triggers += 1;
+            }
             drop(state);
             let guard = ScanGuard {
                 flight: &flight,
                 scan: Arc::clone(&running),
             };
-            let start = Instant::now();
-            let capture = Capture::start(root);
-            observe_ancestor_ignores(root);
-            let root_walk_number = {
-                let mut metrics = self.metrics.lock();
-                let metrics = metrics.entry(root.into()).or_default();
-                metrics.misses += 1;
-                metrics.full_walks += 1;
-                metrics.full_walks
+            let Some(_root_scan) = flight.root_scan.try_lock_until(deadline) else {
+                return Err(ApplicabilityResolutionError::RequestDeadline { root: root.into() });
             };
-            let result = scan();
-            let elapsed = start.elapsed();
-            let (dependencies, inputs, input_identities) = capture.finish();
-            {
-                let mut metrics = self.metrics.lock();
-                let metrics = metrics.entry(root.into()).or_default();
-                metrics.full_walk_micros += elapsed.as_micros() as u64;
-                metrics.dependency_count = inputs.len();
-            }
-            crate::slog_info!(
-                "LSP applicability full walk root={} cause={} root_walk_number={} duration_micros={} dependencies={} success={}",
-                root.display(), cause, root_walk_number, elapsed.as_micros(), inputs.len(), result.is_ok()
-            );
-            let input_dirs = Arc::new(input_directories(
-                &crate::inspect::job::normalize_path(root),
-                &inputs,
-            ));
-            let mut state = flight.state.lock();
-            // Entry-limit failures throttle retries even if watcher events
-            // arrived during the scan. They never certify applicability.
-            if let Err(error @ ApplicabilityResolutionError::EntryLimitReached { entries, .. }) =
-                &result
-            {
-                let backoff = state
-                    .incomplete
-                    .as_ref()
-                    .map_or(INITIAL_INCOMPLETE_BACKOFF, |previous| {
-                        (previous.backoff * 2).min(MAX_INCOMPLETE_BACKOFF)
+            loop {
+                #[cfg(test)]
+                self.note_queue_for_test();
+                // Reserve the flight before settling. Invalidations in this fixed,
+                // bounded window join the queued scan rather than invalidate it.
+                std::thread::sleep(
+                    WALK_SETTLE.min(deadline.saturating_duration_since(Instant::now())),
+                );
+                let mut state = flight.state.lock();
+                if Instant::now() >= deadline {
+                    return Err(ApplicabilityResolutionError::RequestDeadline {
+                        root: root.into(),
                     });
-                // Frequent log or database writes must not shorten the delay.
-                // Only a completed walk clears the failure's retry history.
-                state.incomplete = Some(IncompleteWalk {
-                    error: error.clone(),
-                    retry_at: retry_clock() + backoff,
-                    backoff,
-                });
-                crate::slog_warn!(
+                }
+                let generation = state.generation;
+                let absorbed_triggers = std::mem::take(&mut state.pending_triggers);
+                let cause = state
+                    .cause
+                    .take()
+                    .map_or("cold_or_config", InvalidationCause::label);
+                drop(state);
+                let start = Instant::now();
+                let capture = Capture::start(root);
+                observe_ancestor_ignores(root);
+                let root_walk_number = {
+                    let mut metrics = self.metrics.lock();
+                    let metrics = metrics.entry(root.into()).or_default();
+                    metrics.misses += 1;
+                    metrics.full_walks += 1;
+                    metrics.full_walks
+                };
+                let result = scan();
+                let elapsed = start.elapsed();
+                let (dependencies, inputs, input_identities) = capture.finish();
+                {
+                    let mut metrics = self.metrics.lock();
+                    let metrics = metrics.entry(root.into()).or_default();
+                    metrics.full_walk_micros += elapsed.as_micros() as u64;
+                    metrics.dependency_count = inputs.len();
+                    metrics.absorbed_triggers += absorbed_triggers;
+                }
+                crate::slog_info!(
+                "LSP applicability full walk root={} cause={} root_walk_number={} duration_micros={} dependencies={} success={} absorbed_triggers={}",
+                root.display(), cause, root_walk_number, elapsed.as_micros(), inputs.len(), result.is_ok(), absorbed_triggers
+            );
+                let input_dirs = Arc::new(input_directories(
+                    &crate::inspect::job::normalize_path(root),
+                    &inputs,
+                ));
+                let mut state = flight.state.lock();
+                // Entry-limit failures throttle retries even if watcher events
+                // arrived during the scan. They never certify applicability.
+                if let Err(
+                    error @ ApplicabilityResolutionError::EntryLimitReached { entries, .. },
+                ) = &result
+                {
+                    let backoff = state
+                        .incomplete
+                        .as_ref()
+                        .map_or(INITIAL_INCOMPLETE_BACKOFF, |previous| {
+                            (previous.backoff * 2).min(MAX_INCOMPLETE_BACKOFF)
+                        });
+                    // Frequent log or database writes must not shorten the delay.
+                    // Only a completed walk clears the failure's retry history.
+                    state.incomplete = Some(IncompleteWalk {
+                        error: error.clone(),
+                        retry_at: retry_clock() + backoff,
+                        backoff,
+                    });
+                    crate::slog_warn!(
                     "language-server applicability walk incomplete: root={} entries={} retry_in_seconds={}",
                     root.display(), entries, backoff.as_secs()
                 );
-            } else if let Ok(walk) = &result {
-                state.incomplete = None;
-                // Only unchanged complete scans become applicability snapshots.
-                if state.generation == running.generation && unchanged(&dependencies) {
-                    state.input_dirs = input_dirs;
-                    state.config = Some(Arc::new(config.clone()));
-                    state.absorbed_entries = 0;
-                    state.result = Some(walk.clone());
-                    state.dependencies = dependencies;
-                    state.inputs = inputs;
-                    state.input_identities = input_identities;
+                } else if let Ok(walk) = &result {
+                    state.incomplete = None;
+                    // Only unchanged complete scans become applicability snapshots.
+                    if state.generation == generation && unchanged(&dependencies) {
+                        state.input_dirs = input_dirs;
+                        state.config = Some(Arc::new(config.clone()));
+                        state.absorbed_entries = 0;
+                        state.result = Some(walk.clone());
+                        state.dependencies = dependencies;
+                        state.inputs = inputs;
+                        state.input_identities = input_identities;
+                    }
                 }
+                if result.is_ok() && state.generation != generation {
+                    // All triggers received during this scan share one next scan.
+                    // Its generation is captured only after settling, so none of
+                    // their filesystem changes can be certified by the old result.
+                    drop(state);
+                    continue;
+                }
+                running.completion.lock().result = Some(result.clone());
+                // Clear the reservation while holding the invalidation lock. A
+                // trigger after this point belongs to a new flight, not this result.
+                state.running = None;
+                drop(state);
+                drop(guard);
+                return result;
             }
-            drop(state);
-            running.completion.lock().result = Some(result.clone());
-            drop(guard);
-            return result;
         }
     }
 
@@ -905,6 +984,7 @@ impl ApplicabilityCache {
             if cached_root.starts_with(root) || root.starts_with(cached_root) {
                 let mut state = flight.state.lock();
                 state.generation = state.generation.wrapping_add(1);
+                state.pending_triggers += 1;
                 state.result = None;
                 state.cause = Some(cause);
                 affected.insert(cached_root.clone());

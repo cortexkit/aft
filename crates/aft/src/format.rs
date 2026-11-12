@@ -2874,7 +2874,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut command = Command::new("sh");
             command
-                .args(["-c", "while [ ! -f release ]; do sleep 0.02; done; exit 7"])
+                .args([
+                    "-c",
+                    &format!(
+                        "{}; exit 7",
+                        crate::test_gate::gate("release", "sleep 0.02")
+                    ),
+                ])
                 .current_dir(dir.path())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());

@@ -592,6 +592,23 @@ impl EncodedResolution {
 }
 
 impl Resolutions {
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn profile_parts(&self) -> [usize; 5] {
+        use aft_store::heap::HeapBytes as _;
+        let mut seen = aft_store::heap::Seen::new();
+        let mut parts = [0; 5];
+        for slot in self.map.values() {
+            if let Some(Some(file)) = slot.value.get() {
+                parts[0] += file.rows.heap_bytes(&mut seen);
+                parts[1] += file.binding.heap_bytes(&mut seen);
+                parts[2] += file.dispatch.heap_bytes(&mut seen);
+                parts[3] += file.sites.heap_bytes(&mut seen);
+                parts[4] += file.site_dependencies.heap_bytes(&mut seen);
+            }
+        }
+        parts
+    }
+
     /// Every file `stored` has a resolution for, each decoded on first read.
     pub(crate) fn stored(stored: &Arc<StoredSlices>) -> Self {
         Self {
@@ -1270,6 +1287,8 @@ pub(crate) fn resolve_checkout_into(
     crate::alloc_trace::install(&pool(threads)?, || {
         let paths = inputs.parses.keys().cloned().collect::<Vec<_>>();
         let bound = BindCache::default();
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("binding");
         // The whole-checkout lists read every parse, so they are built here,
         // a batch at a time: each parse is decoded once, for its kinds, and
         // kept until binding (which keeps none it decodes) has read it.
@@ -1299,6 +1318,8 @@ pub(crate) fn resolve_checkout_into(
         relieve_allocator();
         lap(&mut memory, "bind");
         let mut resolved = Vec::with_capacity(paths.len());
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("resolution");
         for batch in paths.chunks(BATCH) {
             let parses = &inputs.parses;
             resolved.extend(resolve_files_with(
@@ -1352,6 +1373,8 @@ pub(crate) fn resolve_checkout_into(
         // in parallel, and the sink builds their fragments in parallel too;
         // a whole batch decoded and built at once held about 750 MB more.
         let mut sites_ms = 0u128;
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("sites");
         for batch in paths.chunks(BATCH) {
             let started = std::time::Instant::now();
             let mut reached = calls
@@ -1723,6 +1746,29 @@ pub(crate) struct MethodCallInputs {
 const SMALL_SITE_RUN: usize = 64;
 
 impl MethodCallInputs {
+    /// Declaration changes already identify method readers before resolving
+    /// any importer. Compare raw facts on both sides: import/type targets are
+    /// filled by resolution and are admitted separately when they are known.
+    pub(crate) fn changed_parse_method_keys(
+        old: &CheckoutInputs,
+        next: &CheckoutInputs,
+        changed: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        for path in changed {
+            let before = old
+                .parses
+                .read(path)
+                .map(|(_, parse)| FileFacts::new(&parse));
+            let after = next
+                .parses
+                .read(path)
+                .map(|(_, parse)| FileFacts::new(&parse));
+            FileFacts::changed_keys_by_method(path, before.as_ref(), after.as_ref(), &mut keys);
+        }
+        keys
+    }
+
     /// The files whose inputs the resolver computed itself since the last
     /// call.
     #[cfg(test)]

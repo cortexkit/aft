@@ -20,6 +20,11 @@ mod ordinary_format_tests;
 #[path = "agent_data/backup.rs"]
 mod portable;
 pub mod purge;
+mod status_inventory;
+#[cfg(test)]
+mod status_inventory_tests;
+
+pub(crate) use status_inventory::StatusInventory;
 
 pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
 /// Default upper bound for one automatic undo snapshot (64 MiB).
@@ -1093,9 +1098,12 @@ pub struct BackupStore {
     #[cfg(test)]
     discovery_entry_limit: usize,
     #[cfg(test)]
-    discovery_entries_examined: AtomicU64,
+    discovery_entries_examined: Arc<AtomicU64>,
     #[cfg(test)]
     discovery_deadline_override: Option<Instant>,
+    /// Parsed `meta.json` fields kept between status pushes; see
+    /// `status_inventory`.
+    status_meta_caches: Arc<status_inventory::StatusMetaCaches>,
     #[cfg(test)]
     discard_outcome_for_tests: Option<Result<(), String>>,
     /// When the last operation discard's cleanup allowance began, so tests can
@@ -1192,9 +1200,10 @@ impl BackupStore {
             #[cfg(test)]
             discovery_entry_limit: MAX_SESSION_DISCOVERY_ENTRIES,
             #[cfg(test)]
-            discovery_entries_examined: AtomicU64::new(0),
+            discovery_entries_examined: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             discovery_deadline_override: None,
+            status_meta_caches: Arc::default(),
             #[cfg(test)]
             discard_outcome_for_tests: None,
             #[cfg(test)]
@@ -1235,6 +1244,7 @@ impl BackupStore {
     /// Forget reconstructible stacks, not undo history or unfinished mutation
     /// annotations. An in-flight request can reload its stack before stamping.
     pub fn release_session_memory(&mut self, session: &str) {
+        self.status_meta_caches.release_session(session);
         if self.storage_dir.is_none() {
             return;
         }
@@ -1249,6 +1259,7 @@ impl BackupStore {
 
     /// Release all durable stack metadata; later undo reloads it from disk.
     pub fn release_memory(&mut self) {
+        self.status_meta_caches.release_all();
         if self.storage_dir.is_none() {
             return;
         }
@@ -1361,6 +1372,7 @@ impl BackupStore {
         self.session_meta.clear();
         self.skipped_backups.clear();
         self.clear_db_mirror_sync();
+        self.status_meta_caches.release_all();
     }
 
     /// Retry moving root backups from `<storage>/backups` into
@@ -1569,6 +1581,17 @@ impl BackupStore {
     #[cfg(test)]
     pub(crate) fn disk_io_count_for_tests(&self) -> u64 {
         self.disk_io_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status_discovery_entries_for_test(&self) -> u64 {
+        self.discovery_entries_examined.load(Ordering::Relaxed)
+    }
+
+    /// How many `meta.json` files status inventories have parsed so far.
+    #[cfg(test)]
+    pub(crate) fn status_meta_parses_for_test(&self) -> u64 {
+        self.status_meta_caches.parses()
     }
 
     #[cfg(test)]
@@ -4890,10 +4913,14 @@ impl BackupStore {
         let Some(session_dir) = self.session_dir(session) else {
             return Ok(HashMap::new());
         };
-        if !session_dir.exists() {
-            return Ok(HashMap::new());
-        }
+        status_inventory::discover_session_stacks(
+            &session_dir,
+            &self.discovery_limits(budget),
+            None,
+        )
+    }
 
+    fn discovery_limits(&self, budget: BackupIoBudget) -> status_inventory::DiscoveryLimits {
         #[cfg(test)]
         let budget = BackupIoBudget {
             deadline: self
@@ -4905,84 +4932,25 @@ impl BackupStore {
         let entry_limit = MAX_SESSION_DISCOVERY_ENTRIES;
         #[cfg(test)]
         let entry_limit = self.discovery_entry_limit;
-        let mut path_dirs = std::fs::read_dir(&session_dir).map_err(|error| AftError::IoError {
-            path: session_dir.display().to_string(),
-            message: error.to_string(),
-        })?;
-        let mut per_session = HashMap::new();
-        let mut examined = 0;
-        loop {
-            // Check before advancing ReadDir, including entries that will be
-            // ignored. An incomplete scan must never certify absent history.
-            budget.check(&session_dir)?;
-            if examined >= entry_limit {
-                return Err(AftError::IoError {
-                    path: session_dir.display().to_string(),
-                    message: format!("backup stack discovery reached its {entry_limit}-entry limit; use per-file undo or retry"),
-                });
-            }
-            let Some(path_entry) = path_dirs.next() else {
-                break;
-            };
-            examined += 1;
+        status_inventory::DiscoveryLimits {
+            budget,
+            entry_limit,
             #[cfg(test)]
-            self.discovery_entries_examined
-                .fetch_add(1, Ordering::Relaxed);
-            let path_entry = path_entry.map_err(|error| AftError::IoError {
-                path: session_dir.display().to_string(),
-                message: error.to_string(),
-            })?;
-            let path_dir = path_entry.path();
-            if !path_dir.is_dir() {
-                continue;
-            }
-            let meta_path = path_dir.join("meta.json");
-            if !meta_path.exists() {
-                continue;
-            }
-            let content = read_history_text(&meta_path).map_err(|error| AftError::IoError {
-                path: meta_path.display().to_string(),
-                message: error.to_string(),
-            })?;
-            let meta = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
-                AftError::IoError {
-                    path: meta_path.display().to_string(),
-                    message: error.to_string(),
-                }
-            })?;
-            check_backup_meta_format(&meta_path, Some(&meta)).map_err(|refusal| {
-                AftError::IoError {
-                    path: meta_path.display().to_string(),
-                    message: refusal.to_string(),
-                }
-            })?;
-            let path_str = meta
-                .get("path")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| AftError::IoError {
-                    path: meta_path.display().to_string(),
-                    message: "backup meta missing path".to_string(),
-                })?;
-            let key = PathBuf::from(path_str);
-            if !is_loadable_backup_path(&key, &path_dir) {
-                continue;
-            }
-            let count = meta_entry_count(&meta).ok_or_else(|| AftError::IoError {
-                path: meta_path.display().to_string(),
-                message: "backup meta missing entry count".to_string(),
-            })?;
-            if count > 0 {
-                per_session.insert(
-                    key,
-                    DiskMeta {
-                        dir: path_dir,
-                        count,
-                    },
-                );
-            }
+            examined: Arc::clone(&self.discovery_entries_examined),
         }
+    }
 
-        Ok(per_session)
+    /// Copy what a status push needs to count `session`'s tracked files, so the
+    /// directory pass can run after the caller drops this store's mutex. The
+    /// count equals `tracked_files(session).len()`; see `StatusInventory`.
+    pub(crate) fn status_inventory(&self, session: &str) -> StatusInventory {
+        StatusInventory {
+            session: session.to_string(),
+            resident: self.cached_tracked_files(session),
+            session_dir: self.session_dir(session),
+            limits: self.discovery_limits(BackupIoBudget::request()),
+            caches: Arc::clone(&self.status_meta_caches),
+        }
     }
 
     fn restore_operation_candidate_keys(
@@ -5844,6 +5812,13 @@ fn check_backup_meta_format(
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .and_then(|meta| meta.get("schema_version")?.as_u64()),
     };
+    check_backup_meta_version(meta_path, version)
+}
+
+fn check_backup_meta_version(
+    meta_path: &Path,
+    version: Option<u64>,
+) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
     crate::persisted_format::gate(
         crate::persisted_format::PersistedStore::BackupMeta,
         meta_path,

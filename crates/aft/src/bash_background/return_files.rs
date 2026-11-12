@@ -706,7 +706,8 @@ mod receiver {
                     error: format!("staged {} bytes, expected {size}", staged_stat.st_size),
                 });
             }
-            staged.file.sync_all().map_err(local)?;
+            aft_store::sync::sync_all(&staged.file, &self.private.path().join(&staged.name))
+                .map_err(local)?;
             // The private entry must still be the file the bytes were written to.
             if !stat_at(self.private.as_raw_fd(), &staged.name)
                 .map_err(local)?
@@ -799,7 +800,7 @@ mod receiver {
                 source.seek(SeekFrom::Start(0))?;
                 copy_staged(&mut source, &mut out)?;
                 out.set_permissions(fs::Permissions::from_mode(mode))?;
-                out.sync_all()?;
+                aft_store::sync::sync_all(&out, &directory_path.join(&temp))?;
                 before_publish_for_test(&directory_path.join(&temp))?;
                 rename_at(directory.as_raw_fd(), &temp, directory.as_raw_fd(), name)
             })();

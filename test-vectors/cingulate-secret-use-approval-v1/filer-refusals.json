@@ -1,0 +1,92 @@
+{
+  "cases": [
+    {
+      "method": "consent.request",
+      "name": "agent-mismatch",
+      "params": {
+        "kind": "secret_use",
+        "secret_use": {
+          "items": [
+            {
+              "request_id": "01HF7YAT000000000000000001",
+              "statement_b64url": "eyJhZ2VudF9pZCI6ImFnZW50LUEiLCJjb3ZlcmFnZSI6InNjb3BlIiwiZHVyYXRpb25zIjpbIm9uY2UiLCJob3VyIiwic2Vzc2lvbiIsInBlcm1hbmVudCJdLCJtZW1iZXJfaWQiOiJmZWQtY29tcHV0ZXI6MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIiLCJyZXF1ZXN0X2V4cGlyZXNfYXRfbXMiOjE3MDAwMDA2MDAwMDAsInJlcXVlc3RfaWQiOiIwMUhGN1lBVDAwMDAwMDAwMDAwMDAwMDAwMSIsInNjb3BlIjp7ImVwb2NoIjo3LCJraW5kIjoiaGVhZCIsIm93bmVyIjoicmVzZXJ2ZWQ6cHJlZnJvbnRhbC1jb3JlIiwicmVmIjoiSCJ9LCJzZWNyZXQiOnsiaW5jYXJuYXRpb24iOiIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDE0OSIsImtpbmQiOiJhZ2VudF9hcGlfa2V5IiwibmFtZSI6ImtleSJ9LCJ1c2UiOnsiaG9zdCI6IngudGVzdCIsImxvY2F0aW9uIjoiaGVhZGVyOlgtQXBpLUtleSIsInBhdGhfcHJlZml4IjoiL3JlcG9zL2EifSwidiI6ImNrLXNlY3JldC11c2Utc3RhdGVtZW50L3YxIn0"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "error": {
+          "code": "elicitation_invalid_request",
+          "message": "secret use agent_id must match the stamped agent_id"
+        }
+      }
+    },
+    {
+      "method": "consent.request",
+      "name": "non-canonical",
+      "params": {
+        "kind": "secret_use",
+        "secret_use": {
+          "items": [
+            {
+              "request_id": "01HF7YAT000000000000000001",
+              "statement_b64url": "ewogICJhZ2VudF9pZCI6ICJhZ2VudC1BIiwKICAiY292ZXJhZ2UiOiAic2NvcGUiLAogICJkdXJhdGlvbnMiOiBbCiAgICAib25jZSIsCiAgICAiaG91ciIsCiAgICAic2Vzc2lvbiIsCiAgICAicGVybWFuZW50IgogIF0sCiAgIm1lbWJlcl9pZCI6ICJmZWQtY29tcHV0ZXI6MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIiLAogICJyZXF1ZXN0X2V4cGlyZXNfYXRfbXMiOiAxNzAwMDAwNjAwMDAwLAogICJyZXF1ZXN0X2lkIjogIjAxSEY3WUFUMDAwMDAwMDAwMDAwMDAwMDAxIiwKICAic2NvcGUiOiB7CiAgICAiZXBvY2giOiA3LAogICAgImtpbmQiOiAiaGVhZCIsCiAgICAib3duZXIiOiAicmVzZXJ2ZWQ6cHJlZnJvbnRhbC1jb3JlIiwKICAgICJyZWYiOiAiSCIKICB9LAogICJzZWNyZXQiOiB7CiAgICAiaW5jYXJuYXRpb24iOiAiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAxNDkiLAogICAgImtpbmQiOiAiYWdlbnRfYXBpX2tleSIsCiAgICAibmFtZSI6ICJrZXkiCiAgfSwKICAidXNlIjogewogICAgImhvc3QiOiAieC50ZXN0IiwKICAgICJsb2NhdGlvbiI6ICJoZWFkZXI6WC1BcGktS2V5IiwKICAgICJwYXRoX3ByZWZpeCI6ICIvcmVwb3MvYSIKICB9LAogICJ2IjogImNrLXNlY3JldC11c2Utc3RhdGVtZW50L3YxIgp9"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "error": {
+          "code": "elicitation_invalid_request",
+          "message": "invalid secret approval statement or envelope"
+        }
+      }
+    },
+    {
+      "method": "consent.request",
+      "name": "request-conflict",
+      "params": {
+        "kind": "secret_use",
+        "secret_use": {
+          "items": [
+            {
+              "request_id": "01HF7YAT000000000000000001",
+              "statement_b64url": "eyJhZ2VudF9pZCI6ImFnZW50LUEiLCJjb3ZlcmFnZSI6InNjb3BlIiwiZHVyYXRpb25zIjpbIm9uY2UiLCJob3VyIiwic2Vzc2lvbiIsInBlcm1hbmVudCJdLCJtZW1iZXJfaWQiOiJmZWQtY29tcHV0ZXI6MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIiLCJyZXF1ZXN0X2V4cGlyZXNfYXRfbXMiOjE3MDAwMDA2MDAwMDAsInJlcXVlc3RfaWQiOiIwMUhGN1lBVDAwMDAwMDAwMDAwMDAwMDAwMSIsInNjb3BlIjp7ImVwb2NoIjo3LCJraW5kIjoiaGVhZCIsIm93bmVyIjoicmVzZXJ2ZWQ6cHJlZnJvbnRhbC1jb3JlIiwicmVmIjoiSCJ9LCJzZWNyZXQiOnsiaW5jYXJuYXRpb24iOiIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDE0OSIsImtpbmQiOiJhZ2VudF9hcGlfa2V5IiwibmFtZSI6ImtleSJ9LCJ1c2UiOnsiaG9zdCI6IngudGVzdCIsImxvY2F0aW9uIjoiaGVhZGVyOlgtQXBpLUtleSIsInBhdGhfcHJlZml4IjoiL3JlcG9zL2EifSwidiI6ImNrLXNlY3JldC11c2Utc3RhdGVtZW50L3YxIn0"
+            },
+            {
+              "request_id": "01HF7YAT000000000000000002",
+              "statement_b64url": "eyJhZ2VudF9pZCI6ImFnZW50LUEiLCJjb3ZlcmFnZSI6InNjb3BlIiwiZHVyYXRpb25zIjpbIm9uY2UiLCJob3VyIiwic2Vzc2lvbiIsInBlcm1hbmVudCJdLCJtZW1iZXJfaWQiOiJmZWQtY29tcHV0ZXI6MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIiLCJyZXF1ZXN0X2V4cGlyZXNfYXRfbXMiOjE3MDAwMDA2MDAwMDAsInJlcXVlc3RfaWQiOiIwMUhGN1lBVDAwMDAwMDAwMDAwMDAwMDAwMiIsInNjb3BlIjp7ImVwb2NoIjo3LCJraW5kIjoiaGVhZCIsIm93bmVyIjoicmVzZXJ2ZWQ6cHJlZnJvbnRhbC1jb3JlIiwicmVmIjoiSCJ9LCJzZWNyZXQiOnsiaW5jYXJuYXRpb24iOiIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDE0OSIsImtpbmQiOiJhZ2VudF9hcGlfa2V5IiwibmFtZSI6ImtleSJ9LCJ1c2UiOnsiaG9zdCI6IngudGVzdCIsImxvY2F0aW9uIjoiaGVhZGVyOlgtQXBpLUtleSIsInBhdGhfcHJlZml4IjoiL3JlcG9zL2EifSwidiI6ImNrLXNlY3JldC11c2Utc3RhdGVtZW50L3YxIn0"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "error": {
+          "code": "elicitation_request_conflict",
+          "message": "elicitation_request_conflict: secret request id is already used"
+        }
+      }
+    },
+    {
+      "method": "consent.request",
+      "name": "broca-refused",
+      "params": {
+        "kind": "secret_use",
+        "secret_use": {
+          "items": [
+            {
+              "request_id": "01HF7YAT000000000000000001",
+              "statement_b64url": "eyJhZ2VudF9pZCI6ImFnZW50LUEiLCJjb3ZlcmFnZSI6InNjb3BlIiwiZHVyYXRpb25zIjpbIm9uY2UiLCJob3VyIiwic2Vzc2lvbiIsInBlcm1hbmVudCJdLCJtZW1iZXJfaWQiOiJmZWQtY29tcHV0ZXI6MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIiLCJyZXF1ZXN0X2V4cGlyZXNfYXRfbXMiOjE3MDAwMDA2MDAwMDAsInJlcXVlc3RfaWQiOiIwMUhGN1lBVDAwMDAwMDAwMDAwMDAwMDAwMSIsInNjb3BlIjp7ImVwb2NoIjo3LCJraW5kIjoiaGVhZCIsIm93bmVyIjoicmVzZXJ2ZWQ6cHJlZnJvbnRhbC1jb3JlIiwicmVmIjoiSCJ9LCJzZWNyZXQiOnsiaW5jYXJuYXRpb24iOiIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDE0OSIsImtpbmQiOiJhZ2VudF9hcGlfa2V5IiwibmFtZSI6ImtleSJ9LCJ1c2UiOnsiaG9zdCI6IngudGVzdCIsImxvY2F0aW9uIjoiaGVhZGVyOlgtQXBpLUtleSIsInBhdGhfcHJlZml4IjoiL3JlcG9zL2EifSwidiI6ImNrLXNlY3JldC11c2Utc3RhdGVtZW50L3YxIn0"
+            }
+          ]
+        }
+      },
+      "reply": {
+        "error": {
+          "code": "elicitation_requester_refused",
+          "message": "requester reserved:broca is refused"
+        }
+      }
+    }
+  ]
+}

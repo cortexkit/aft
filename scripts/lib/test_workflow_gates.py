@@ -40,6 +40,62 @@ def workflow_job(job_id: str) -> str:
     return match.group(1)
 
 
+class ReleaseDebugArtifactWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"
+        self.jobs = workflow_gates.parse_workflow(str(path))["jobs"]
+
+    def test_linux_detaches_and_verifies_debug_before_shipping(self):
+        for arch, target in (("x64", "x86_64"), ("arm64", "aarch64")):
+            with self.subTest(arch=arch):
+                steps = self.jobs[f"build-linux-{arch}"]["steps"]
+                build = next(step for step in steps if step.get("name") == "Build")
+                self.assertIn(f"cross build --release --target {target}-unknown-linux-gnu", build["run"])
+                self.assertIn("profile.release.strip=false", build["run"])
+                self.assertIn('profile.release.split-debuginfo="off"', build["run"])
+                split_index = next(i for i, step in enumerate(steps) if step.get("name") == "Split and verify Linux debug symbols")
+                self.assertIn("scripts/release-debug-symbols.py linux", steps[split_index]["run"])
+                self.assertIn(f"aft-linux-{arch}-debug.zip", steps[split_index]["run"])
+                uploads = [(i, step["with"]) for i, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4"]
+                self.assertTrue(all(i > split_index for i, _ in uploads))
+                debug = next(config for _, config in uploads if config["name"] == f"linux-{arch}-debug")
+                self.assertEqual(debug["if-no-files-found"], "error")
+                binary = next(config for _, config in uploads if "debug" not in config["name"])
+                self.assertNotIn("debug", binary["path"])
+
+    def test_windows_verifies_pdb_identity_before_shipping(self):
+        for arch, target in (("x64", "x86_64"), ("arm64", "aarch64")):
+            with self.subTest(arch=arch):
+                steps = self.jobs[f"build-win32-{arch}"]["steps"]
+                builds = [step for step in steps if "cargo build --release" in step.get("run", "")]
+                self.assertTrue(builds)
+                self.assertTrue(all("profile.release.strip=false" in step["run"] for step in builds))
+                verify_index = next(i for i, step in enumerate(steps) if step.get("name") == "Verify and package Windows PDB")
+                command = steps[verify_index]["run"]
+                self.assertIn("scripts/release-debug-symbols.py windows", command)
+                self.assertIn(f"{target}-pc-windows-msvc/release/aft.exe", command)
+                self.assertIn(f"$env:AFT_CI_TARGET_DIR/{target}-pc-windows-msvc/release/aft.pdb", command)
+                self.assertIn(f"aft-windows-{arch}-pdb.zip", command)
+                uploads = [(i, step["with"]) for i, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4"]
+                self.assertTrue(all(i > verify_index for i, _ in uploads))
+                pdb = next(config for _, config in uploads if config["name"] == f"windows-{arch}-pdb")
+                self.assertEqual(pdb["if-no-files-found"], "error")
+
+    def test_debug_archives_go_only_to_github_release_not_npm(self):
+        steps = self.jobs["github-release"]["steps"]
+        downloads = [step["with"] for step in steps if step.get("uses") == "actions/download-artifact@v4"]
+        for pattern in ("linux-*-debug", "windows-*-pdb"):
+            config = next(config for config in downloads if config.get("pattern") == pattern)
+            self.assertEqual(config["path"], "release-assets")
+            self.assertTrue(config["merge-multiple"])
+        for job in ("publish-npm", "rehearse-publish"):
+            for step in self.jobs[job]["steps"]:
+                config = step.get("with", {})
+                if step.get("uses") == "actions/download-artifact@v4":
+                    self.assertNotIn("debug", config.get("name", ""))
+                    self.assertNotIn("pdb", config.get("name", ""))
+
+
 class CacheSaveRefGateTests(unittest.TestCase):
     """A main-only cache write is policy; a main-only check or job is dead code."""
 
@@ -331,7 +387,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
             for job in unit["jobs"].values()
             for step in job.get("steps", [])
         ]
-        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 15)
+        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 16)
         shard = workflow_gates.parse_workflow(str(github / "actions/integration-shard/action.yml"))
         self.assertEqual(
             sum(step.get("uses") == "./.github/actions/setup-nextest" for step in shard["runs"]["steps"]),
@@ -447,6 +503,74 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(__file__).resolve().parents[2]
         self.jobs = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))["jobs"]
+
+    def test_real_daemon_job_runs_ignored_tool_provider_tests_on_landing_events(self) -> None:
+        job = self.jobs["unit-linux-real-daemon"]
+        self.assertEqual(job["name"], "Real-daemon tool-provider tests (Linux)")
+        self.assertEqual(job["if"], "${{ github.event_name != 'pull_request' }}")
+        self.assertEqual(job["runs-on"], "ubuntu-24.04")
+        self.assertLess(int(job["timeout-minutes"]), 20)
+        self.assertNotIn("needs", job)
+        self.assertNotIn("continue-on-error", job)
+        self.assertIn({"uses": "./.github/actions/setup-nextest"}, job["steps"])
+        self.assertIn({"name": "Run ignored real-daemon tool-provider tests",
+                       "run": "bash scripts/ci-real-daemon-tests.sh"}, job["steps"])
+        root = Path(__file__).resolve().parents[2]
+        script = (root / "scripts/ci-real-daemon-tests.sh").read_text()
+        for required in (
+            "timeout 15m cargo nextest run -p agent-file-tools --test rest",
+            "--features test-hooks,test-scope-owner", "--run-ignored only",
+            "--no-fail-fast", "--failure-output final", "--status-level pass", "--final-status-level fail",
+            "-E 'test(/^tool_provider_subc_e2e::/)'",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=",
+            "scripts/ci-real-daemon-test-runner.sh", "while sleep 60", 'tail -n 60 "$log"',
+            'mktemp -d "$base/aft-real-daemon.XXXXXXXX"', 'export TMPDIR="$run_root/tmp"',
+            "stat -L -c '%a %u:%g %n'", "Insecure daemon fixture ancestor:", "trap cleanup EXIT",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, script)
+
+    def test_real_daemon_runner_isolates_each_test_process_and_cleans_up(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        runner = root / "scripts/ci-real-daemon-test-runner.sh"
+        keys = ("HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                "XDG_STATE_HOME", "XDG_CACHE_HOME", "TMPDIR")
+        with tempfile.TemporaryDirectory() as directory:
+            homes = []
+            for rc in (0, 7):
+                probe = "\n".join(f'printf \'%s\\n\' "${key}"' for key in keys)
+                probe += '\ntest "$(umask)" = "0077" || exit 99'
+                probe += f'\nmkdir -p "$TMPDIR/daemon-fixture/runtime"\nexit {rc}'
+                result = subprocess.run(
+                    ["bash", str(runner), "bash", "-c", probe],
+                    capture_output=True, text=True,
+                    env={**os.environ, "AFT_REAL_DAEMON_RUN_ROOT": directory},
+                )
+                self.assertEqual(result.returncode, rc, result.stderr)
+                paths = [Path(line) for line in result.stdout.splitlines()]
+                self.assertEqual(len(paths), len(keys))
+                self.assertEqual(len(set(paths)), len(keys))
+                fixture = paths[0].parent
+                self.assertEqual(fixture.parent, Path(directory))
+                self.assertTrue(all(path.parent == fixture for path in paths))
+                self.assertFalse(fixture.exists(), "runner must clean up even after a failure")
+                homes.append(paths[0])
+            self.assertNotEqual(*homes)
+
+    def test_real_daemon_gate_rejects_insecure_ancestors_before_running_tests(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "writable"
+            base.mkdir(mode=0o777)
+            base.chmod(0o777)
+            result = subprocess.run(
+                ["bash", str(root / "scripts/ci-real-daemon-tests.sh")],
+                capture_output=True, text=True, env={**os.environ, "RUNNER_TEMP": str(base)},
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(f"Insecure daemon fixture ancestor: {base} (mode 777)", result.stderr)
+            self.assertNotIn("Building and running", result.stdout)
+            self.assertEqual(list(base.iterdir()), [], "failed preflight must clean up its private directory")
 
     def test_linux_archive_covers_units_and_proves_the_uploaded_inventory(self) -> None:
         archive = self.jobs["unit-linux-nextest-archive"]

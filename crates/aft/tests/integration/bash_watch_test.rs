@@ -263,8 +263,11 @@ fn each_line_push_batches_all_lines_with_offsets() {
     fs::write(&payload, b"ERROR a\nERROR b\nERROR b\n").unwrap();
     let release_guard = ReleaseOnDrop::new(release.clone());
     let command = format!(
-        "while [ ! -f {} ]; do sleep 0.05; done; cat {}",
-        shell_quote(&release.display().to_string()),
+        "{}; cat {}",
+        crate::test_helpers::test_gate::gate(
+            &shell_quote(&release.display().to_string()),
+            "sleep 0.05"
+        ),
         shell_quote(&payload.display().to_string())
     );
     let task_id = spawn(&mut aft, &command);

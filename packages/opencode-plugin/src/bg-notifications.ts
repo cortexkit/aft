@@ -10,6 +10,7 @@ import {
   bashAckTargetFromKey,
   bashAckTargets,
   bashPatternAckTarget,
+  formatUnknownPtyExit,
   formatWatchLineBatch,
   mergeWatchLineBatches,
   resolveBridgeForNudge,
@@ -2500,7 +2501,9 @@ function shorten(value: string, limit: number): string {
 function formatCompletion(completion: BgCompletion): string {
   const status = formatStatus(completion);
   const duration = formatDuration(completion);
-  const header = `- task ${completion.task_id} (${status}${duration ? `, ${duration}` : ""})`;
+  const header =
+    formatUnknownPtyExit(completion.task_id, completion) ??
+    `- task ${completion.task_id} (${status}${duration ? `, ${duration}` : ""})`;
   const previewBlock = formatOutputPreview(completion);
   const descendantWarning = completion.live_descendants_summary
     ? `    ${completion.live_descendants_summary}`

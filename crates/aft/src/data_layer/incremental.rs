@@ -48,11 +48,17 @@ use super::callgraph::{
     CheckoutInputs, FileResolution, MethodCallInputs, Resolutions,
 };
 use super::graph_store::StoredSlices;
+use super::refresh_budget::{RefreshBudget, RefreshLimit};
 use super::subjects::{affected_by, subjects, Subject};
 
 /// What one update did, for measurement.
 #[derive(Clone, Debug, Default)]
 pub struct UpdateStats {
+    /// A broad incremental update was replaced by a stored-record cold build.
+    pub cold_build: bool,
+    /// Content records reused by the cold build, including extracted changes
+    /// handed over by the abandoned incremental update.
+    pub cold_reused_records: usize,
     pub changed_paths: usize,
     /// Recorded checkout reads asked again, and how many got a different
     /// answer.
@@ -82,6 +88,27 @@ pub struct UpdateStats {
     /// Files whose stored resolution changed: rebound, resolved, traced or
     /// re-sited again, or removed.
     pub touched: BTreeSet<String>,
+}
+
+pub(crate) enum UpdateError {
+    Resolve(ManifestJoinError),
+    Limit(RefreshLimit),
+}
+
+impl From<ManifestJoinError> for UpdateError {
+    fn from(error: ManifestJoinError) -> Self {
+        Self::Resolve(error)
+    }
+}
+
+fn admit<'a>(
+    budget: &mut Option<&mut RefreshBudget>,
+    files: impl IntoIterator<Item = &'a String>,
+) -> Result<(), UpdateError> {
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.include(files).map_err(UpdateError::Limit)?;
+    }
+    Ok(())
 }
 
 /// Which files recorded each input key, for one kind of recording: the
@@ -609,15 +636,34 @@ impl LiveCheckout {
         next: CheckoutInputs,
         changed: &BTreeSet<String>,
     ) -> Result<UpdateStats, ManifestJoinError> {
+        self.update_with_budget(next, changed, None)
+            .map_err(|error| match error {
+                UpdateError::Resolve(error) => error,
+                UpdateError::Limit(_) => {
+                    unreachable!("an unbounded update cannot hit a refresh limit")
+                }
+            })
+    }
+
+    /// A limit aborts before the newly invalidated pass runs. The caller must
+    /// drop this partly updated engine before rebuilding the checkout.
+    pub(crate) fn update_with_budget(
+        &mut self,
+        next: CheckoutInputs,
+        changed: &BTreeSet<String>,
+        budget: Option<&mut RefreshBudget>,
+    ) -> Result<UpdateStats, UpdateError> {
         let started = Instant::now();
         let pool = Arc::clone(&self.pool);
         let mut stats = crate::alloc_trace::install(&pool, || {
-            let stats = self.update_in_pool(next, changed)?;
+            let stats = self.update_in_pool(next, changed, budget)?;
+            #[cfg(feature = "test-hooks")]
+            super::refresh_probe::stage("encode");
             // Every resolution the update made or changed is encoded, so
             // that it can be let go between updates like a stored one.
             let parses = &self.inputs.parses;
             self.resolved.encode_changed(|path| parses.key(path));
-            Ok::<_, ManifestJoinError>(stats)
+            Ok::<_, UpdateError>(stats)
         })?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(stats)
@@ -708,12 +754,18 @@ impl LiveCheckout {
         &mut self,
         next: CheckoutInputs,
         changed: &BTreeSet<String>,
-    ) -> Result<UpdateStats, ManifestJoinError> {
+        mut budget: Option<&mut RefreshBudget>,
+    ) -> Result<UpdateStats, UpdateError> {
+        admit(&mut budget, changed)?;
         let mut stats = UpdateStats {
             changed_paths: changed.len(),
             ..UpdateStats::default()
         };
         let old = std::mem::replace(&mut self.inputs, next);
+        #[cfg(feature = "test-hooks")]
+        let mut profile_clock = Instant::now();
+        #[cfg(feature = "test-hooks")]
+        self.profile_refresh("start", &mut profile_clock);
         let inputs = &self.inputs;
         let membership = changed
             .iter()
@@ -759,6 +811,15 @@ impl LiveCheckout {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if budget.is_some() {
+            // A module move can invalidate thousands of method readers even
+            // when few paths changed. Admit those declaration readers before
+            // binding or resolving other files, rather than waiting until
+            // method-call sites are processed.
+            let keys = MethodCallInputs::changed_parse_method_keys(&old, inputs, &contents);
+            let readers = self.reverse.sites_of(&keys);
+            admit(&mut budget, &readers)?;
+        }
         // Configuration files added or removed. A content change of an
         // existing one reaches its readers through their recorded field
         // answers, which are asked again below. Adding or removing one
@@ -854,6 +915,8 @@ impl LiveCheckout {
         // read is asked again; a file any of whose answers differ is bound,
         // resolved or traced again. This needs no rule about which change can
         // affect which read.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("facts");
         let started = Instant::now();
         let stale = if membership.is_empty() && links.is_empty() && configs.is_empty() {
             StaleAnswers::default()
@@ -864,9 +927,13 @@ impl LiveCheckout {
         stats.answers_checked = stale.checked;
         stats.answers_changed = stale.changed;
         stats.facts_ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "test-hooks")]
+        self.profile_refresh("facts", &mut profile_clock);
 
         // Pass 1. A binding depends on the file's own parse, on which paths
         // exist, and on configuration it read.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("binding");
         let started = Instant::now();
         let mut binding_keys = membership.clone();
         binding_keys.extend(changed_packages.iter().cloned());
@@ -893,6 +960,7 @@ impl LiveCheckout {
         rebind.extend(contents.iter().cloned());
         rebind.extend(stale.binding.iter().cloned());
         rebind.retain(|path| inputs.parses.contains_key(path));
+        admit(&mut budget, rebind.iter().chain(&removed_parses))?;
         let rebind = rebind.into_iter().collect::<Vec<_>>();
         let rebind_refs = rebind.iter().collect::<Vec<_>>();
         let new_bound = bind_all(inputs, &rebind_refs)?;
@@ -986,6 +1054,8 @@ impl LiveCheckout {
             self.bound.set(path, bound);
         }
         stats.bind_ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "test-hooks")]
+        self.profile_refresh("bind", &mut profile_clock);
 
         // What a recorded answer can depend on that changed.
         let mut changed_keys = surface_keys.clone();
@@ -1007,6 +1077,8 @@ impl LiveCheckout {
         changed_keys.extend(changed_crates);
 
         // Pass 2.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("replay");
         let started = Instant::now();
         let facts = Rc::new(ViewBindingFacts::typed(Rc::new(CheckoutFacts { inputs })));
         let (index, files) = resolver_index(inputs, &self.bound, &facts);
@@ -1020,6 +1092,7 @@ impl LiveCheckout {
                 resolve.insert(path.clone());
             }
         }
+        admit(&mut budget, &resolve)?;
         // Resolving a Rust file reads the module tree, which the resolver
         // builds by binding every module-declaring file; bind those in
         // parallel first (see `BindCache::bind_module_declaring`).
@@ -1092,6 +1165,11 @@ impl LiveCheckout {
         }
         drop(answers);
         drop(trace_answers);
+        admit(&mut budget, &resolve)?;
+        #[cfg(feature = "test-hooks")]
+        self.profile_refresh("replay", &mut profile_clock);
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("resolution");
         // Files kept whose binding was redone carry their resolution over.
         for path in &rebind {
             if resolve.contains(path) {
@@ -1132,11 +1210,15 @@ impl LiveCheckout {
             self.resolved.insert(path, file);
         }
         stats.resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "test-hooks")]
+        self.profile_refresh("resolve", &mut profile_clock);
 
         // Pass 3, for files whose rows were kept: each trace was replayed
         // with its file's surface answers above. Resolving files again
         // changes no surface a trace reads, since every file whose binding
         // could change was bound again in pass 1.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("dispatch");
         let started = Instant::now();
         let mut recompute = Vec::new();
         // Stale answers were asked before this update removed files; a
@@ -1150,6 +1232,7 @@ impl LiveCheckout {
             }
         }
         recompute.extend(traces_changed);
+        admit(&mut budget, &recompute)?;
         for path in &recompute {
             let (_, parse) = &inputs.parses[path.as_str()];
             let dispatch = dispatch_targets(path, parse, &index, &facts)?;
@@ -1170,12 +1253,16 @@ impl LiveCheckout {
         // A file bound on first use inside passes 2 and 3 cannot return its
         // error there.
         if let Some(error) = files.take_error() {
-            return Err(error);
+            return Err(error.into());
         }
         drop(index);
         drop(facts);
+        #[cfg(feature = "test-hooks")]
+        self.profile_refresh("dispatch", &mut profile_clock);
 
         // Pass 4.
+        #[cfg(feature = "test-hooks")]
+        super::refresh_probe::stage("sites");
         let started = Instant::now();
         let mut site_keys = BTreeSet::new();
         let mut sites = contents.clone();
@@ -1197,6 +1284,7 @@ impl LiveCheckout {
         }
         sites.extend(self.reverse.sites_of(&site_keys));
         sites.retain(|path| inputs.parses.contains_key(path));
+        admit(&mut budget, &sites)?;
         let paths = sites.iter().collect::<Vec<_>>();
         for (path, kept, dependencies) in
             self.calls.resolve_sites(inputs, &self.resolved, &paths)?
@@ -1212,6 +1300,8 @@ impl LiveCheckout {
         }
         stats.sites_resolved = paths.len();
         stats.sites_ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(feature = "test-hooks")]
+        self.profile_refresh("sites", &mut profile_clock);
         stats.touched = rebind
             .into_iter()
             .chain(resolve)
@@ -1220,6 +1310,24 @@ impl LiveCheckout {
             .chain(removed)
             .collect();
         Ok(stats)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn profile_refresh(&self, stage: &str, clock: &mut Instant) {
+        if std::env::var_os("AFT_REFRESH_PROFILE").is_none() {
+            return;
+        }
+        let wall_ms = clock.elapsed().as_millis();
+        let cpu = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|line| {
+                let rest = line.get(line.rfind(')')? + 2..)?;
+                let fields = rest.split_whitespace().collect::<Vec<_>>();
+                Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
+            });
+        let parts = self.memory_parts(&mut aft_store::heap::Seen::new());
+        log::info!("refresh profile {stage}: wall_ms={wall_ms} cpu_ticks={cpu:?} decoded_parses={} decoded_resolutions={} parts={parts:?} resolution_parts={:?}", self.inputs.parses.decoded_count(), self.resolved.decoded_count(), self.resolved.profile_parts());
+        *clock = Instant::now();
     }
 }
 

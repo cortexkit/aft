@@ -240,8 +240,8 @@ fn promoted_foreground_completion_while_daemon_is_down_replays_once() {
         &mut first,
         json!({
             "command": format!(
-                "while [ ! -f '{}' ]; do sleep 0.05; done; printf promoted",
-                release.display()
+                "{}; printf promoted",
+                crate::test_helpers::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.05")
             ),
             "notify_on_completion": false,
         }),

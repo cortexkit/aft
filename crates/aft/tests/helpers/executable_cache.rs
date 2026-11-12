@@ -45,12 +45,7 @@ pub fn cached_executable_named(bytes: &[u8], name: &str) -> io::Result<PathBuf> 
 
 /// Cache an executable inside a fixture root that must remain visible to a sandbox.
 pub fn cached_executable_named_in(root: &Path, bytes: &[u8], name: &str) -> io::Result<PathBuf> {
-    if Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cached executable name must be one path component",
-        ));
-    }
+    validate_name(name)?;
     let result = publish_executable(root, bytes, name);
     match result {
         // Another language's cache pruner can claim an old identity between
@@ -62,6 +57,29 @@ pub fn cached_executable_named_in(root: &Path, bytes: &[u8], name: &str) -> io::
     }
 }
 
+/// Warm a new executable at its final path under the publication lock.
+/// Use a separate root from un-warmed publishers: a cache hit must mean the
+/// same warmup already succeeded. Warmup failure removes the new entry.
+pub fn cached_executable_named_in_with_warmup(
+    root: &Path,
+    bytes: &[u8],
+    name: &str,
+    warm: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    validate_name(name)?;
+    publish_with_pruner_and_warmup(root, bytes, name, image_cache::prune, warm)
+}
+
+fn validate_name(name: &str) -> io::Result<()> {
+    if Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cached executable name must be one path component",
+        ));
+    }
+    Ok(())
+}
+
 fn publish_executable(root: &Path, bytes: &[u8], name: &str) -> io::Result<PathBuf> {
     publish_with_pruner(root, bytes, name, image_cache::prune)
 }
@@ -71,6 +89,16 @@ fn publish_with_pruner(
     bytes: &[u8],
     name: &str,
     prune: impl Fn(&Path, &Path, std::time::SystemTime) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    publish_with_pruner_and_warmup(root, bytes, name, prune, |_| Ok(()))
+}
+
+fn publish_with_pruner_and_warmup(
+    root: &Path,
+    bytes: &[u8],
+    name: &str,
+    prune: impl Fn(&Path, &Path, std::time::SystemTime) -> io::Result<()>,
+    warm: impl Fn(&Path) -> io::Result<()>,
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(root)?;
     let lock = OpenOptions::new()
@@ -96,10 +124,10 @@ fn publish_with_pruner(
     let pending = pending_dir.path().join("executable");
     write_executable_with_mode(&pending, bytes, 0o755)?;
     #[cfg(target_os = "linux")]
-    OpenOptions::new().read(true).open(&pending)?.sync_all()?;
+    aft_store::sync::sync_all(&OpenOptions::new().read(true).open(&pending)?, &pending)?;
     // Windows requires a writable handle for FlushFileBuffers.
     #[cfg(not(target_os = "linux"))]
-    OpenOptions::new().write(true).open(&pending)?.sync_all()?;
+    aft_store::sync::sync_all(&OpenOptions::new().write(true).open(&pending)?, &pending)?;
 
     match fs::hard_link(&pending, &path) {
         Ok(()) => {}
@@ -107,6 +135,10 @@ fn publish_with_pruner(
         Err(error) => return Err(error),
     }
     verify_cached(&path, bytes)?;
+    if let Err(error) = warm(&path) {
+        fs::remove_file(&path)?;
+        return Err(error);
+    }
     image_cache::refresh(directory)?;
     prune(root, directory, std::time::SystemTime::now())?;
     Ok(path)
@@ -328,5 +360,66 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"#!/bin/sh\nexit 0\n");
         #[cfg(unix)]
         assert!(std::process::Command::new(path).status().unwrap().success());
+    }
+
+    #[test]
+    fn executable_cache_warms_once_at_final_owner_writable_path() {
+        let root = tempfile::tempdir().unwrap();
+        let warmed = std::cell::RefCell::new(Vec::new());
+        let bytes = b"private shim image bytes";
+        let daemon = root.path().join("daemon-image");
+        fs::write(&daemon, bytes).unwrap();
+        let image = cached_executable_named_in_with_warmup(root.path(), bytes, "aft", |path| {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+            assert_eq!(path.file_name().unwrap(), "aft");
+            assert_eq!(path.parent().unwrap().parent().unwrap(), root.path());
+            assert!(!fs::metadata(path).unwrap().permissions().readonly());
+            OpenOptions::new().write(true).open(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_ne!(
+                    fs::metadata(path).unwrap().ino(),
+                    fs::metadata(&daemon).unwrap().ino(),
+                    "a sandbox write regression must not corrupt the daemon image"
+                );
+            }
+            warmed.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*warmed.borrow(), vec![image.clone()]);
+        let cached = cached_executable_named_in_with_warmup(root.path(), bytes, "aft", |_| {
+            panic!("a cached executable must not be warmed again")
+        })
+        .unwrap();
+        assert_eq!(cached, image);
+    }
+
+    #[test]
+    fn executable_cache_failed_warmup_is_not_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"private shim image bytes";
+        let path = cache_path(root.path(), bytes, "aft");
+        let attempts = std::cell::Cell::new(0);
+        let error = cached_executable_named_in_with_warmup(root.path(), bytes, "aft", |_| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "injected warmup failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected warmup failure");
+        assert_eq!(attempts.get(), 1, "warmup errors must not be retried");
+        assert!(!path.exists(), "a failed warmup must not be cached");
+        let warmed = std::cell::Cell::new(false);
+        let retry = cached_executable_named_in_with_warmup(root.path(), bytes, "aft", |_| {
+            warmed.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retry, path);
+        assert!(warmed.get(), "the republished image must finish warmup");
     }
 }

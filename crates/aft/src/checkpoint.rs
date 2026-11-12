@@ -18,6 +18,69 @@ const CHECKPOINT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Named checkpoints are deliberately bounded per session so a busy session
 /// cannot grow an unbounded durable artifact store.
 const MAX_NAMED_CHECKPOINTS_PER_SESSION: usize = 20;
+
+// Status is a bounded observation, not hydration. Generous session budgets keep
+// normal stores numeric; larger or ambiguous stores report null and `list`
+// remains the authoritative, unbounded recovery/mutation path.
+const STATUS_DIRECTORY_ENTRIES: usize = 256;
+const STATUS_MANIFEST_BYTES: usize = 1024 * 1024;
+const STATUS_BLOB_CHECKS: usize = 4096;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StatusFileVersion {
+    identity: crate::file_identity::FileIdentity,
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    change_time: (i64, i64),
+}
+
+impl StatusFileVersion {
+    fn of_path(path: &Path) -> Option<Self> {
+        let (meta, identity) = crate::file_identity::metadata(path).ok()?;
+        Self::from_metadata(meta, identity)
+    }
+
+    fn of_file(file: &fs::File) -> Option<Self> {
+        Self::from_metadata(
+            file.metadata().ok()?,
+            crate::file_identity::FileIdentity::of_file(file),
+        )
+    }
+
+    fn from_metadata(
+        meta: fs::Metadata,
+        identity: crate::file_identity::FileIdentity,
+    ) -> Option<Self> {
+        if !matches!(identity, crate::file_identity::FileIdentity::Known { .. }) {
+            return None;
+        }
+        Some(Self {
+            identity,
+            modified: meta.modified().ok()?,
+            len: meta.len(),
+            #[cfg(unix)]
+            change_time: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.ctime(), meta.ctime_nsec())
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATUS_MUTATION_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STATUS_SCAN_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn status_read_counters_for_test() -> (usize, usize) {
+    (
+        STATUS_MUTATION_LOCKS.with(|count| count.replace(0)),
+        STATUS_SCAN_ENTRIES.with(|count| count.replace(0)),
+    )
+}
 /// Durable named checkpoints keep decisions long enough to survive ordinary
 /// work interruptions without becoming permanent storage.
 const NAMED_CHECKPOINT_RETENTION_DAYS: u64 = 14;
@@ -508,6 +571,8 @@ impl CheckpointStore {
     }
 
     fn acquire_mutation_lock(&self) -> Result<CheckpointLockGuard, AftError> {
+        #[cfg(test)]
+        STATUS_MUTATION_LOCKS.with(|count| count.set(count.get() + 1));
         let scope_dir = self.lock_path.parent().map(Path::to_path_buf);
         let deadline = Instant::now() + self.lock_timeout;
         let acquire_result = loop {
@@ -1134,6 +1199,134 @@ impl CheckpointStore {
             .values()
             .map(|checkpoints| checkpoints.len())
             .sum()
+    }
+
+    pub(crate) fn resident_session_count(&self, session: &str) -> usize {
+        self.checkpoints.get(session).map_or(0, HashMap::len)
+    }
+
+    /// A read-only, bounded observation of the durable session. `list` remains
+    /// authoritative: recovery, migration, retention or insufficient evidence
+    /// makes this observation unknown rather than repairing storage on a push.
+    pub(crate) fn status_count(&self, session: &str) -> Option<usize> {
+        use std::io::Read;
+        // Checkpoint commit records and blobs are published by replacement,
+        // so file identity detects a concurrent publication on Windows too.
+        use self::StatusFileVersion as DiskFileVersion;
+        if self.namespace_request.0.lock().ok()?.is_some()
+            || self.pending_unbound_migration.is_some()
+            || crate::backup::request_harness_segment()
+                .is_some_and(|harness| self.storage_harness.as_ref() != Some(&harness))
+        {
+            return None;
+        }
+        let Some(dir) = self.durable_session_dir(session) else {
+            return Some(self.checkpoints.get(session).map_or(0, HashMap::len));
+        };
+        let dir_version = match crate::file_identity::metadata(&dir) {
+            Ok((meta, identity)) => StatusFileVersion::from_metadata(meta, identity)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(0),
+            Err(_) => return None,
+        };
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => return None,
+        };
+        let mut evidence = vec![(dir.clone(), dir_version)];
+        let mut bytes_left = STATUS_MANIFEST_BYTES;
+        let mut blobs_left = STATUS_BLOB_CHECKS;
+        let mut count = 0;
+        let mut examined = 0;
+        for entry in entries.take(STATUS_DIRECTORY_ENTRIES) {
+            examined += 1;
+            #[cfg(test)]
+            STATUS_SCAN_ENTRIES.with(|count| count.set(count.get() + 1));
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(REPLACED_CHECKPOINT_SUFFIX) {
+                return None;
+            }
+            if !is_safe_checkpoint_name(&name) {
+                continue;
+            }
+            let checkpoint_dir = entry.path();
+            evidence.push((
+                checkpoint_dir.clone(),
+                DiskFileVersion::of_path(&checkpoint_dir)?,
+            ));
+            let meta_path = checkpoint_dir.join("meta.json");
+            let mut file = match fs::File::open(&meta_path) {
+                Ok(file) => file,
+                // A directory without its commit record may be a writer in flight.
+                Err(_) => return None,
+            };
+            let version = DiskFileVersion::of_file(&file)?;
+            let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+            bytes_left = bytes_left.checked_sub(len)?;
+            let mut bytes = vec![0; len];
+            file.read_exact(&mut bytes).ok()?;
+            if file.read(&mut [0]).ok()? != 0 {
+                return None;
+            }
+            evidence.push((meta_path, version));
+            let Ok(meta) = serde_json::from_slice::<DiskCheckpointMeta>(&bytes) else {
+                // Hydration omits corrupt JSON while retaining its neighbours.
+                continue;
+            };
+            if !matches!(
+                meta.schema_version,
+                CHECKPOINT_SCHEMA_VERSION | IMPORTED_CHECKPOINT_SCHEMA_VERSION
+            ) || meta.session_id != session
+                || meta.name != name
+                || meta.pending_drop
+                || !meta.pending_purge.is_empty()
+                || current_timestamp().saturating_sub(meta.created_at)
+                    >= NAMED_CHECKPOINT_RETENTION_SECS
+            {
+                return None;
+            }
+            let mut paths = HashSet::new();
+            for blob in &meta.files {
+                blobs_left = blobs_left.checked_sub(1)?;
+                if !is_safe_blob_name(&blob.blob) || !paths.insert(&blob.original_path) {
+                    return None;
+                }
+                let path = checkpoint_dir.join(&blob.blob);
+                let version = DiskFileVersion::of_path(&path)?;
+                let mut file = fs::File::open(&path).ok()?;
+                if DiskFileVersion::of_file(&file)? != version {
+                    return None;
+                }
+                if !file.metadata().ok()?.is_file() {
+                    return None;
+                }
+                if matches!(blob.kind, DiskCheckpointFileKind::Symlink) {
+                    let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+                    bytes_left = bytes_left.checked_sub(len)?;
+                    let mut bytes = vec![0; len];
+                    file.read_exact(&mut bytes).ok()?;
+                    String::from_utf8(bytes).ok()?;
+                } else {
+                    file.read(&mut [0]).ok()?;
+                }
+                evidence.push((path, version));
+            }
+            count += 1;
+            if count > MAX_NAMED_CHECKPOINTS_PER_SESSION {
+                return None;
+            }
+        }
+        // Hitting the allowance is not evidence that the iterator ended.
+        if examined == STATUS_DIRECTORY_ENTRIES {
+            return None;
+        }
+        evidence
+            .iter()
+            .all(|(path, version)| DiskFileVersion::of_path(path) == Some(*version))
+            .then_some(count)
     }
 
     /// Sweep checkpoints older than the fixed fourteen-day retention window.
@@ -4548,5 +4741,130 @@ mod tests {
         );
         let theirs_dir = reloaded.durable_checkpoint_dir("s2", "theirs").unwrap();
         assert_eq!(blob_contents(&theirs_dir), vec!["token=1".to_string()]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod status_count_tests {
+    use super::*;
+
+    const SESSION: &str = "status-count-session";
+
+    fn fixture() -> (tempfile::TempDir, CheckpointStore, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.rs");
+        fs::write(&file, "pub fn original() {}\n").unwrap();
+        let store = CheckpointStore::unbound_in_for_test(dir.path());
+        (dir, store, file)
+    }
+
+    fn authoritative(store: &mut CheckpointStore) -> Option<usize> {
+        store.list(SESSION).ok().map(|entries| entries.len())
+    }
+
+    #[test]
+    fn status_count_matches_list_without_mutation_lock_and_observes_external_writers() {
+        let (dir, mut store, file) = fixture();
+        let first = store
+            .create_for_files(SESSION, "first", vec![file.clone()])
+            .unwrap();
+        assert_eq!(store.status_count(SESSION), authoritative(&mut store));
+        let mut external = CheckpointStore::unbound_in_for_test(dir.path());
+        external
+            .create_for_files(SESSION, "external", vec![file.clone()])
+            .unwrap();
+        status_read_counters_for_test();
+        let held =
+            fs_lock::try_acquire(store.lock_path_for_test(), Duration::from_secs(1)).unwrap();
+        assert_eq!(store.status_count(SESSION), Some(2));
+        assert_eq!(status_read_counters_for_test().0, 0);
+        drop(held);
+        assert_eq!(store.status_count(SESSION), authoritative(&mut store));
+        assert!(external.delete(SESSION, "external"));
+        assert_eq!(store.status_count(SESSION), authoritative(&mut store));
+        let corrupt = store
+            .create_for_files(SESSION, "corrupt", vec![file])
+            .unwrap();
+        fs::write(corrupt.storage_path.unwrap().join("meta.json"), "{").unwrap();
+        assert_eq!(store.status_count(SESSION), Some(1));
+        assert_eq!(store.status_count(SESSION), authoritative(&mut store));
+        let path = first.storage_path.unwrap();
+        let meta: DiskCheckpointMeta =
+            serde_json::from_slice(&fs::read(path.join("meta.json")).unwrap()).unwrap();
+        fs::remove_file(path.join(&meta.files[0].blob)).unwrap();
+        assert_eq!(store.status_count(SESSION), None);
+        assert_eq!(authoritative(&mut store), None);
+    }
+
+    #[test]
+    fn status_count_caps_work_without_returning_a_partial_number() {
+        let (_dir, mut store, file) = fixture();
+        let mut dirs = Vec::new();
+        for index in 0..MAX_NAMED_CHECKPOINTS_PER_SESSION {
+            dirs.push(
+                store
+                    .create_for_files(SESSION, &format!("checkpoint_{index}"), vec![file.clone()])
+                    .unwrap()
+                    .storage_path
+                    .unwrap(),
+            );
+        }
+        let session_dir = dirs[0].parent().unwrap();
+        for index in 20..STATUS_DIRECTORY_ENTRIES - 1 {
+            fs::write(session_dir.join(format!("stray_{index}")), "ignored").unwrap();
+        }
+        // One immutable blob may back several distinct original paths. This
+        // exercises the validation budget without allocating thousands of blobs.
+        let meta_path = dirs[0].join("meta.json");
+        let mut meta: DiskCheckpointMeta =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let template = meta.files[0].clone();
+        meta.files = (0..STATUS_BLOB_CHECKS - 20)
+            .map(|index| {
+                let mut file = template.clone();
+                file.original_path = format!("original_{index}");
+                file
+            })
+            .collect();
+        let mut bytes = serde_json::to_vec(&meta).unwrap();
+        let other_bytes = dirs[1..]
+            .iter()
+            .map(|dir| fs::metadata(dir.join("meta.json")).unwrap().len() as usize)
+            .sum::<usize>();
+        bytes.resize(STATUS_MANIFEST_BYTES - other_bytes - 1, b' ');
+        fs::write(&meta_path, &bytes).unwrap();
+        assert_eq!(store.status_count(SESSION), Some(20));
+        assert_eq!(store.status_count(SESSION), authoritative(&mut store));
+        status_read_counters_for_test();
+        assert_eq!(store.status_count(SESSION), Some(20));
+        assert_eq!(
+            status_read_counters_for_test(),
+            (0, STATUS_DIRECTORY_ENTRIES - 1)
+        );
+        fs::write(session_dir.join("stray_extra_one"), "ignored").unwrap();
+        fs::write(session_dir.join("stray_extra_two"), "ignored").unwrap();
+        assert_eq!(store.status_count(SESSION), None);
+        assert_eq!(status_read_counters_for_test().1, STATUS_DIRECTORY_ENTRIES);
+        fs::remove_file(session_dir.join("stray_extra_one")).unwrap();
+        fs::remove_file(session_dir.join("stray_extra_two")).unwrap();
+        bytes.resize(bytes.len() + 2, b' ');
+        fs::write(&meta_path, bytes).unwrap();
+        assert_eq!(store.status_count(SESSION), None);
+    }
+
+    #[test]
+    fn status_count_never_recovers_replaced_entries() {
+        let (_dir, mut store, file) = fixture();
+        let checkpoint = store
+            .create_for_files(SESSION, "first", vec![file])
+            .unwrap()
+            .storage_path
+            .unwrap();
+        let aside = replaced_checkpoint_path(&checkpoint);
+        fs::rename(&checkpoint, &aside).unwrap();
+        assert_eq!(store.status_count(SESSION), None);
+        assert!(aside.exists());
+        assert!(!checkpoint.exists());
+        assert_eq!(authoritative(&mut store), Some(1));
     }
 }

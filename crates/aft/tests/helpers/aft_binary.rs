@@ -40,7 +40,7 @@ pub fn aft_binary() -> PathBuf {
 /// Pay macOS's first-exec cost before a command's own timeout starts. Production
 /// warms its startup pin too; the integration launcher override uses this copy.
 #[cfg(target_os = "macos")]
-fn warm_fixture_image(image: &Path) -> io::Result<()> {
+pub fn warm_fixture_image(image: &Path) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -227,7 +227,7 @@ fn deploy_with_pruner(
     if fs::metadata(&pending_image)?.len() != identity.size {
         return Err(io::Error::other("AFT fixture image copy was incomplete"));
     }
-    File::open(&pending_image)?.sync_all()?;
+    aft_store::sync::sync_all(&File::open(&pending_image)?, &pending_image)?;
     copied(&pending_image);
     let mut permissions = input.metadata()?.permissions();
     permissions.set_readonly(true);

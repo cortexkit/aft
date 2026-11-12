@@ -495,12 +495,14 @@ impl BaseWriter {
         if let Some(error) = self.failed.take() {
             return Err(error);
         }
-        self.out
+        let file = self
+            .out
             .take()
             .ok_or_else(|| std::io::Error::other("the kept graph was closed"))?
             .into_inner()
-            .map_err(|error| error.into_error())?
-            .sync_all()?;
+            .map_err(|error| error.into_error())?;
+        aft_store::sync::sync_all(&file, &self.temporary)?;
+        drop(file);
         std::fs::rename(&self.temporary, &self.path)?;
         Ok(self.position)
     }
@@ -852,7 +854,7 @@ pub(super) fn write_overlay(path: &Path, base: &str, overlay: &Overlay) -> std::
         out.write_all(&body)?;
         let file = out.into_inner().map_err(|error| error.into_error())?;
         let size = file.metadata()?.len();
-        file.sync_all()?;
+        aft_store::sync::sync_all(&file, &temporary)?;
         std::fs::rename(&temporary, path)?;
         Ok(size)
     })();

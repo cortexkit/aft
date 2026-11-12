@@ -2296,28 +2296,30 @@ pub(super) fn submit_deferred_bash(
             .and_then(crate::subc_translate::model_boolean)
             == Some(true)
     });
-    // A server-owned call normally owns its command until it ends. A head
-    // agent on one of Thalamus's runners is the exception for a `background`
-    // or `pty` launch: it gets the ordinary launch reply at once, and the
-    // task's completion reaches it later as a notice, which the runner turns
-    // into a message in the session. Its task is then an ordinary background
-    // task: a cancel or route close before the reply hands it off instead of
-    // killing it, and a slow startup hands back its task id. Workers, Broca's
-    // routes and every other carrier keep the hold.
+    // A PTY launch always hands back its task id so the caller can drive the
+    // interactive command with bash_write/bash_status.
+    // Other server-owned calls own their command until it ends, except a
+    // `background` launch by a top-level (head) agent on a Thalamus runner,
+    // where completion reaches the session later as a notice. Handed-back
+    // tasks are ordinary background tasks: a cancel or route close before
+    // the reply hands them off instead of killing them, and a slow startup
+    // hands back the task id.
     let hands_back_launch = server_completion
-        && !run_scoped
-        && !worker_session
-        && !worker_preset
-        && !worker_jail
-        && secret_identity
-            .as_ref()
-            .is_some_and(|identity| identity.session == session_id && runner_head_route(identity))
-        && ["background", "pty"].iter().any(|key| {
-            raw_args
-                .get(*key)
-                .and_then(crate::subc_translate::model_boolean)
-                == Some(true)
-        });
+        && (raw_args
+            .get("pty")
+            .and_then(crate::subc_translate::model_boolean)
+            == Some(true)
+            || (!run_scoped
+                && !worker_session
+                && !worker_preset
+                && !worker_jail
+                && secret_identity.as_ref().is_some_and(|identity| {
+                    identity.session == session_id && runner_head_route(identity)
+                })
+                && raw_args
+                    .get("background")
+                    .and_then(crate::subc_translate::model_boolean)
+                    == Some(true)));
     let owns_command = server_completion && !hands_back_launch;
     let capture_wait_mode = raw_args
         .get("wait")
@@ -4730,7 +4732,7 @@ mod grant_path_tests {
             1052,
             Flags::new(false, Priority::Interactive, false),
             PROTOCOL_VERSION,
-            json!({"command": "echo hello; while [ ! -f release ]; do sleep 0.1; done", "wait": true}),
+            json!({"command": format!("echo hello; {}", crate::test_gate::gate("release", "sleep 0.1")), "wait": true}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
                 keepalive: None,
@@ -4880,21 +4882,13 @@ mod grant_path_tests {
     }
 
     fn secret_bash_scope_probe(req: RawRequest, _: &AppContext) -> Response {
-        use crate::secret::{Material, MaterialError, Resolution, SecretScope, SecretVault};
+        use crate::secret::{ApiKeyTarget, SecretScope, SecretVault, UseAnswer};
         struct Vault(std::sync::atomic::AtomicUsize);
         impl SecretVault for Vault {
-            fn resolve(&self, scope: &SecretScope, _: &str) -> Resolution {
+            fn use_secret(&self, scope: &SecretScope, _: &str, _: &ApiKeyTarget) -> UseAnswer {
                 assert_eq!(scope.reference(), "secret-bash");
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Resolution::Unavailable
-            }
-            fn material(
-                &self,
-                _: &SecretScope,
-                _: &str,
-                _: &str,
-            ) -> Result<Material, MaterialError> {
-                panic!("launch must not request material")
+                UseAnswer::Unavailable
             }
             fn audit(
                 &self,
@@ -4904,7 +4898,16 @@ mod grant_path_tests {
             }
         }
         let vault = Vault(std::sync::atomic::AtomicUsize::new(0));
-        let decision = super::super::secret_consent::resolve_current_secret_label(&vault, "test");
+        let decision = super::super::secret_consent::use_current_secret_label(
+            &vault,
+            "test",
+            &ApiKeyTarget {
+                scheme: "https".into(),
+                host: "x.test".into(),
+                port: Some(443),
+                path: "/repos/a".into(),
+            },
+        );
         let super::super::secret_consent::LaunchDecision::Refuse(outcome) = decision else {
             panic!("unavailable vault must refuse");
         };
@@ -5244,9 +5247,12 @@ mod grant_path_tests {
         let marker_path = marker.to_string_lossy().replace('\\', "/");
         let release_path = release.to_string_lossy().replace('\\', "/");
         let command = if cfg!(windows) {
-            format!("Set-Content -Path '{marker_path}' -Value started; while (-not (Test-Path '{release_path}')) {{ Start-Sleep -Milliseconds 20 }}; Write-Output 'handoff-finished'")
+            format!("Set-Content -Path '{marker_path}' -Value started; {}; Write-Output 'handoff-finished'", crate::test_gate::powershell_gate(&release_path, 20))
         } else {
-            format!("printf started > '{marker_path}'; until [ -e '{release_path}' ]; do sleep 0.02; done; printf 'handoff-finished\\n'")
+            format!(
+                "printf started > '{marker_path}'; {}; printf 'handoff-finished\\n'",
+                crate::test_gate::gate_exists(&format!("'{release_path}'"), "sleep 0.02")
+            )
         };
         let session = "detach-log-session";
         let request = RawRequest {
@@ -5766,7 +5772,7 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn v1_server_completion_never_returns_a_promoted_or_background_launch() {
+    async fn v1_server_completion_holds_foreground_and_background_launches() {
         let ctx = super::super::test_support::test_ctx();
         let registry = ctx.bash_background().clone();
         let target = drain::BashDetachTarget {
@@ -5798,7 +5804,7 @@ mod grant_path_tests {
             detached["detail"],
             json!({"task_id":"bash-00000000000000aa","late_results":false})
         );
-        for (background, pty) in [(false, false), (true, false), (false, true)] {
+        for background in [false, true] {
             let (_dir, root) = super::super::test_support::test_root("v1-shell-completion");
             let ctx = super::super::test_support::test_ctx();
             ctx.update_config(|config| config.foreground_wait_window_ms = 10);
@@ -5826,7 +5832,7 @@ mod grant_path_tests {
                 1,
                 Flags::new(false, Priority::Interactive, false),
                 PROTOCOL_VERSION,
-                json!({"command":"sleep 0.2", "timeout":5000,"background":background,"pty":pty,"foreground_orchestrate":true,"block_to_completion":true}),
+                json!({"command":"sleep 0.2", "timeout":5000,"background":background,"foreground_orchestrate":true,"block_to_completion":true}),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
                     keepalive: None,
@@ -6475,7 +6481,7 @@ mod grant_path_tests {
             let release = dir.path().join("release");
             let _release = DeferredWaitReleaseGuard(vec![release.clone()]);
             let call = start(&executor, &root, &ctx, local_bash_stub,
-                json!({"command":format!("until [ -e '{}' ]; do sleep 0.02; done", release.display()), "timeout":60000}), true).await;
+                json!({"command":crate::test_gate::gate_exists(&format!("'{}'", release.display()), "sleep 0.02"), "timeout":60000}), true).await;
             answer_from_loop(&call, &root, true).await;
             assert_eq!(
                 settled(&ctx, &call.task_id).await.status,
@@ -8476,8 +8482,8 @@ mod grant_path_tests {
         let (identity, cancel, run, _) = codemode_run_call(&root);
         let release = dir.path().join("release");
         let command = format!(
-            "while [ ! -f '{}' ]; do sleep 0.05; done; echo finished",
-            release.display()
+            "{}; echo finished",
+            crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.05")
         );
         let task_id = codemode_background_launch(
             &executor,
@@ -11231,15 +11237,11 @@ mod grant_path_tests {
             // Each command polls for its release file. Windows runs bash commands
             // through PowerShell, so the loop is written in its syntax there.
             #[cfg(windows)]
-            let command = format!(
-                "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}",
-                releases.0[index].display()
-            );
+            let command =
+                crate::test_gate::powershell_gate(&releases.0[index].display().to_string(), 10);
             #[cfg(not(windows))]
-            let command = format!(
-                "while [ ! -f '{}' ]; do sleep 0.01; done",
-                releases.0[index].display()
-            );
+            let command =
+                crate::test_gate::gate(&format!("'{}'", releases.0[index].display()), "sleep 0.01");
             let connection = PersistentCancelSignal::new();
             let route = PersistentCancelSignal::new();
             submit_deferred_bash(

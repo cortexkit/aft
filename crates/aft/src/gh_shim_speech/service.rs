@@ -30,7 +30,7 @@ type EndNotice = Arc<dyn Fn(ScopeStamp) + Send + Sync>;
 
 pub(crate) fn binding_refusal(code: Code, reason: &str, detail: impl Into<String>) -> Refusal {
     let detail = detail.into();
-    log::warn!(
+    crate::slog_warn!(
         "gh speech binding verification refused: {}",
         serde_json::json!({"reason": reason, "detail": detail})
     );
@@ -41,6 +41,59 @@ pub(crate) fn binding_refusal(code: Code, reason: &str, detail: impl Into<String
 
 fn binding_unverifiable(detail: impl Into<String>) -> Refusal {
     binding_refusal(Code::AuthorityUnavailable, "binding_unverifiable", detail)
+}
+
+static UNCONFIGURED_BINDING_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn unconfigured_binding_refusals_total() -> u64 {
+    UNCONFIGURED_BINDING_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+const UNCONFIGURED_BINDING_LOG_CAP: usize = 4_096;
+
+fn unconfigured_binding_refusal(session: &str, agent: &str, detail: String) -> Refusal {
+    static LOGGED: std::sync::OnceLock<Mutex<HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    UNCONFIGURED_BINDING_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Ordinary sessions need not bind any repository to the launching agent.
+    // Keep the refusal intact and suppress repeats while the log key is retained.
+    log_unconfigured_binding_refusal(
+        &mut LOGGED
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        session,
+        agent,
+        &detail,
+        UNCONFIGURED_BINDING_LOG_CAP,
+    );
+    let mut refusal = Refusal::new(Code::AuthorityUnavailable, "binding_unverifiable");
+    refusal.detail = Some(detail);
+    refusal
+}
+
+fn log_unconfigured_binding_refusal(
+    logged: &mut HashSet<(String, String)>,
+    session: &str,
+    agent: &str,
+    detail: &str,
+    cap: usize,
+) {
+    let key = (session.to_owned(), agent.to_owned());
+    if logged.contains(&key) {
+        return;
+    }
+    // Bound history to 4,096 session/agent keys in the long-lived daemon.
+    // A new key clears a full set; an older session may log once more after that.
+    if logged.len() >= cap {
+        logged.clear();
+    }
+    logged.insert(key);
+    crate::slog_info!(
+        "gh speech binding verification refused: {}",
+        serde_json::json!({"reason": "binding_unverifiable", "detail": detail, "session": session, "agent": agent})
+    );
 }
 
 #[cfg(test)]
@@ -600,7 +653,7 @@ impl LaunchContext {
                             )
                         })
                         .await?;
-                    parse_bindings(&desired, &facade_reply(&reply), agent)
+                    parse_bindings(&desired, &facade_reply(&reply), agent, &self.seed.session)
                 },
             )
             .await
@@ -637,6 +690,7 @@ pub(crate) fn parse_bindings(
     desired: &BTreeMap<String, String>,
     reply: &Value,
     agent: &str,
+    session: &str,
 ) -> Result<BTreeMap<String, Binding>, Refusal> {
     let invalid = || binding_unverifiable("invalid_binding");
     let reply = reply
@@ -693,9 +747,12 @@ pub(crate) fn parse_bindings(
             .filter(|(_, owner)| owner.as_str() == agent)
             .map(|(repo, _)| repo.as_str())
             .collect();
-        return Err(binding_unverifiable(format!(
-            "no_binding_row: launch_agent={agent:?} repositories={expected:?}"
-        )));
+        let detail = format!("no_binding_row: launch_agent={agent:?} repositories={expected:?}");
+        return Err(if expected.is_empty() {
+            unconfigured_binding_refusal(session, agent, detail)
+        } else {
+            binding_unverifiable(detail)
+        });
     }
     Ok(found)
 }

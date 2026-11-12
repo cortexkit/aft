@@ -3,7 +3,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -459,9 +459,67 @@ impl DirectoryWatcher {
 
 struct FsEventsStream {
     stream: usize,
-    run_loop: usize,
-    join: Option<JoinHandle<()>>,
+    queue: usize,
     sender: NativeEventSender,
+    #[cfg(test)]
+    context_release_calls: Arc<AtomicU64>,
+}
+
+/// All streams deliver on one serial queue. Only native event translation runs
+/// here; topology probes, exclusion replanning and per-root backpressure remain
+/// on their existing workers. The queue lives for the process, not for a root.
+fn delivery_queue() -> notify::Result<usize> {
+    static QUEUE: OnceLock<usize> = OnceLock::new();
+    let queue = *QUEUE.get_or_init(|| unsafe {
+        dispatch_queue_create(c"aft-fsevents-delivery".as_ptr(), ptr::null()) as usize
+    });
+    if queue == 0 {
+        Err(notify::Error::generic(
+            "failed to create FSEvents delivery queue",
+        ))
+    } else {
+        Ok(queue)
+    }
+}
+
+struct StreamAction {
+    stream: usize,
+    start: bool,
+    started: bool,
+}
+
+extern "C" fn act_on_stream(context: *mut libc::c_void) {
+    unsafe {
+        let action = &mut *context.cast::<StreamAction>();
+        let stream = action.stream as fs::FSEventStreamRef;
+        if action.start {
+            action.started = fs::FSEventStreamStart(stream) != 0;
+        } else {
+            fs::FSEventStreamStop(stream);
+            fs::FSEventStreamInvalidate(stream);
+            fs::FSEventStreamRelease(stream);
+        }
+    }
+}
+
+fn stream_action(queue: usize, stream: usize, start: bool) -> bool {
+    let mut action = StreamAction {
+        stream,
+        start,
+        started: false,
+    };
+    // Serialize lifecycle changes with native delivery. Invalidation stops
+    // callbacks, but FSEvents may retain the stream until queued work drains,
+    // releasing its context after this synchronous call returns. Stream owners
+    // are backend/config workers, never native callbacks.
+    unsafe {
+        dispatch_sync_f(
+            queue as *mut _,
+            (&mut action as *mut StreamAction).cast(),
+            act_on_stream,
+        );
+    }
+    action.started
 }
 
 impl FsEventsStream {
@@ -510,8 +568,12 @@ impl FsEventsStream {
         counters: Arc<crate::context::WatcherCounters>,
     ) -> notify::Result<Self> {
         let watched_paths = create_cf_path_array(paths)?;
+        #[cfg(test)]
+        let context_release_calls = Arc::new(AtomicU64::new(0));
         let context_info = Box::into_raw(Box::new(CallbackContext {
             sender: sender.clone(),
+            #[cfg(test)]
+            release_calls: Arc::clone(&context_release_calls),
             last_delivered_id,
             nonrecursive_paths,
             #[cfg(test)]
@@ -579,50 +641,31 @@ impl FsEventsStream {
             ));
         }
 
-        let stream_address = stream as usize;
-        let (run_loop_tx, run_loop_rx) = mpsc::sync_channel(1);
-        let join = match thread::Builder::new()
-            .name("aft-fsevents-runloop".to_string())
-            .spawn(move || {
-                let stream = stream_address as fs::FSEventStreamRef;
-                unsafe {
-                    let run_loop = cf::CFRunLoopGetCurrent();
-                    fs::FSEventStreamScheduleWithRunLoop(
-                        stream,
-                        run_loop,
-                        cf::kCFRunLoopDefaultMode,
-                    );
-                    if fs::FSEventStreamStart(stream) == 0 {
-                        let _ = run_loop_tx.send(0);
-                    } else {
-                        let _ = run_loop_tx.send(run_loop as usize);
-                        cf::CFRunLoopRun();
-                    }
-                    fs::FSEventStreamStop(stream);
-                    fs::FSEventStreamInvalidate(stream);
-                    fs::FSEventStreamRelease(stream);
-                }
-            }) {
-            Ok(join) => join,
+        let queue = match delivery_queue() {
+            Ok(queue) => queue,
             Err(error) => {
                 unsafe {
                     fs::FSEventStreamInvalidate(stream);
                     fs::FSEventStreamRelease(stream);
                 }
-                return Err(notify::Error::io(error));
+                return Err(error);
             }
         };
-        let run_loop = run_loop_rx.recv().map_err(notify::Error::from)?;
-        if run_loop == 0 {
-            let _ = join.join();
+        unsafe {
+            FSEventStreamSetDispatchQueue(stream, queue as *mut _);
+        }
+        let stream_address = stream as usize;
+        if !stream_action(queue, stream_address, true) {
+            stream_action(queue, stream_address, false);
             return Err(notify::Error::generic("FSEventStreamStart failed"));
         }
 
         Ok(Self {
             stream: stream_address,
-            run_loop,
-            join: Some(join),
+            queue,
             sender,
+            #[cfg(test)]
+            context_release_calls,
         })
     }
 
@@ -633,21 +676,14 @@ impl FsEventsStream {
 
 impl Drop for FsEventsStream {
     fn drop(&mut self) {
-        let run_loop = self.run_loop as cf::CFRunLoopRef;
-        unsafe {
-            while CFRunLoopIsWaiting(run_loop) == 0 {
-                thread::yield_now();
-            }
-            cf::CFRunLoopStop(run_loop);
-        }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        stream_action(self.queue, self.stream, false);
     }
 }
 
 struct CallbackContext {
     sender: NativeEventSender,
+    #[cfg(test)]
+    release_calls: Arc<AtomicU64>,
     last_delivered_id: Arc<AtomicU64>,
     nonrecursive_paths: Option<Vec<PathBuf>>,
     #[cfg(test)]
@@ -656,7 +692,10 @@ struct CallbackContext {
 
 extern "C" fn release_context(info: *const libc::c_void) {
     unsafe {
-        drop(Box::from_raw(info as *mut CallbackContext));
+        let context = Box::from_raw(info as *mut CallbackContext);
+        #[cfg(test)]
+        context.release_calls.fetch_add(1, Ordering::SeqCst);
+        drop(context);
     }
 }
 
@@ -884,7 +923,16 @@ fn create_cf_path_array(paths: &[PathBuf]) -> notify::Result<cf::CFMutableArrayR
 }
 
 extern "C" {
-    fn CFRunLoopIsWaiting(run_loop: cf::CFRunLoopRef) -> cf::Boolean;
+    fn FSEventStreamSetDispatchQueue(stream: fs::FSEventStreamRef, queue: *mut libc::c_void);
+    fn dispatch_queue_create(
+        label: *const libc::c_char,
+        attr: *const libc::c_void,
+    ) -> *mut libc::c_void;
+    fn dispatch_sync_f(
+        queue: *mut libc::c_void,
+        context: *mut libc::c_void,
+        work: extern "C" fn(*mut libc::c_void),
+    );
 }
 
 #[cfg(test)]
@@ -1005,6 +1053,115 @@ mod tests {
                 return;
             }
         }
+    }
+
+    fn wait_for_context_release(rx: &mpsc::Receiver<notify::Result<Event>>, releases: &AtomicU64) {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "stream sender retained after five seconds; release_context calls={}",
+                releases.load(Ordering::SeqCst)
+            );
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "stream sender retained after five seconds; release_context calls={}",
+                    releases.load(Ordering::SeqCst)
+                ),
+            }
+        }
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "release_context must run exactly once per stream"
+        );
+        eprintln!(
+            "stream disconnected after {:?}; release_context calls=1",
+            start.elapsed()
+        );
+    }
+
+    fn prove_context_release_after_drop(deliver_events: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let stream = FsEventsStream::start(
+            &root,
+            &[],
+            tx,
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        let releases = Arc::clone(&stream.context_release_calls);
+        if deliver_events {
+            let path = root.join("before-drop.rs");
+            std::fs::write(&path, b"pub fn before() {}\n").unwrap();
+            wait_for_raw_path(&rx, &path);
+        } else {
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        drop(stream);
+        eprintln!(
+            "after drop: delivered_events={deliver_events}, release_context calls={}, channel={:?}",
+            releases.load(Ordering::SeqCst),
+            rx.try_recv()
+        );
+        wait_for_context_release(&rx, &releases);
+    }
+
+    #[test]
+    fn stream_context_released_once_after_eventful_drop() {
+        prove_context_release_after_drop(true);
+    }
+
+    #[test]
+    fn stream_context_released_once_after_eventless_drop() {
+        prove_context_release_after_drop(false);
+    }
+
+    #[test]
+    fn streams_share_delivery_queue_and_drop_independently() {
+        let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let mut streams = Vec::new();
+        let mut receivers = Vec::new();
+        let mut paths = Vec::new();
+        let mut releases = Vec::new();
+        for root in &roots {
+            let root = std::fs::canonicalize(root.path()).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let stream = FsEventsStream::start(
+                &root,
+                &[],
+                tx,
+                fs::kFSEventStreamEventIdSinceNow,
+                Arc::new(AtomicU64::new(0)),
+            )
+            .unwrap();
+            assert_eq!(stream.queue, delivery_queue().unwrap());
+            releases.push(Arc::clone(&stream.context_release_calls));
+            paths.push(root.join("before-drop.rs"));
+            streams.push(stream);
+            receivers.push(rx);
+        }
+        for (path, rx) in paths.iter().zip(&receivers) {
+            std::fs::write(path, b"pub fn before() {}\n").unwrap();
+            wait_for_raw_path(rx, path);
+        }
+        drop(streams.remove(0));
+        // FSEvents can retain a stream until queued work drains, so its context
+        // may be released after Drop returns. Bound that deferred release and
+        // verify that context release runs exactly once and drops its sender.
+        wait_for_context_release(&receivers[0], &releases[0]);
+        let survivor = paths[1].with_file_name("after-drop.rs");
+        std::fs::write(&survivor, b"pub fn after() {}\n").unwrap();
+        wait_for_raw_path(&receivers[1], &survivor);
+        drop(streams);
+        wait_for_context_release(&receivers[1], &releases[1]);
     }
 
     fn symlink_replacement_fixture(
@@ -1320,6 +1477,7 @@ mod tests {
         // Each acknowledged rescan republishes an unchanged matcher, as a real
         // overflow drain does, exercising the replacement-stream decision too.
         let mut context = CallbackContext {
+            release_calls: Arc::new(AtomicU64::new(0)),
             sender: NativeEventSender::Events(sender),
             last_delivered_id: Arc::new(AtomicU64::new(0)),
             nonrecursive_paths: None,
@@ -1439,6 +1597,7 @@ mod tests {
         let (sender, rx) = mpsc::channel();
         let cursor = Arc::new(AtomicU64::new(0));
         let mut context = CallbackContext {
+            release_calls: Arc::new(AtomicU64::new(0)),
             sender: NativeEventSender::Batches(sender),
             last_delivered_id: Arc::clone(&cursor),
             nonrecursive_paths: None,
@@ -1522,6 +1681,7 @@ mod tests {
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (sender, rx) = mpsc::channel();
         let mut context = CallbackContext {
+            release_calls: Arc::new(AtomicU64::new(0)),
             sender: NativeEventSender::Events(sender),
             last_delivered_id: Arc::new(AtomicU64::new(0)),
             nonrecursive_paths: Some(vec![root.clone()]),

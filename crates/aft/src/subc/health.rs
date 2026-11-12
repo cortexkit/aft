@@ -2003,6 +2003,7 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
                 )
             })
         && root["data_store"]["failure"].is_null()
+        && root["data_store"]["skipped_folders"].as_u64().unwrap_or(0) == 0
         && root["suspended_domains"]
             .as_array()
             .is_none_or(Vec::is_empty)
@@ -2096,8 +2097,28 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
             *path = abbreviated_health_path(path);
         }
     }
+    if let (Some(root_path), Some(count)) = (
+        row.get("project_root").and_then(Value::as_str),
+        row.get("data_store")
+            .and_then(|store| store["skipped_folders"].as_u64()),
+    ) {
+        if count > 0 {
+            let note = crate::data_layer::surfaces::skipped_folder_health_note(
+                Path::new(root_path),
+                count as usize,
+            );
+            row["data_store"]["skipped_folder_note"] = Value::String(note);
+        }
+    }
     if let Some(Value::String(refusal)) = row.get_mut("standing_refusal") {
         *refusal = abbreviated_health_refusal(refusal);
+    }
+    if let Some(store) = row.get_mut("data_store") {
+        for field in ["/error", "/failure/error"] {
+            if let Some(Value::String(error)) = store.pointer_mut(field) {
+                *error = abbreviated_health_refusal(error);
+            }
+        }
     }
     for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
         if let Some(Value::Object(component)) = row.get_mut(component) {
@@ -2210,23 +2231,39 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
                         .rposition(ordinary_ready_health_root)
                         .unwrap_or(roots.len() - 1)
                 });
-                let Some(index) = index else {
+                if let Some(index) = index {
+                    roots.remove(index);
+                    let omitted = metrics
+                        .get("root_details_omitted")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    metrics.insert("root_details_omitted".into(), json!(omitted));
+                    continue;
+                } else {
                     // Keep an identifiable status even when the last root is ready.
                     // Abbreviating the last row does not omit a root.
                     if abbreviate_health_root(&mut roots[0]) {
                         continue;
                     }
-                    return;
-                };
-                roots.remove(index);
-                let omitted = metrics
-                    .get("root_details_omitted")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                metrics.insert("root_details_omitted".into(), json!(omitted));
-                continue;
+                }
             }
+        }
+        // The failure count and last actionable root survive even when these
+        // additional names do not fit. Keep the longest prefix that fits, and
+        // account for every removed name in the existing omitted count.
+        if metrics
+            .get_mut("data_store_failed")
+            .and_then(Value::as_array_mut)
+            .is_some_and(|failed| failed.pop().is_some())
+        {
+            let omitted = metrics
+                .get("data_store_failed_omitted")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            metrics.insert("data_store_failed_omitted".into(), json!(omitted));
+            continue;
         }
         return;
     }
@@ -2242,6 +2279,9 @@ struct HealthDiagnosticRollup {
     generation: u64,
     stale_reason: Option<&'static str>,
     metrics: Value,
+    /// Compact evidence for every root, independent of the public report's
+    /// root-count and byte budgets. Freshness metadata travels with the evidence.
+    findings_metrics: Value,
     /// The full memory census `memory.census` serves. It is measured at its
     /// own cadence (see [`HEALTH_MEMORY_CENSUS_INTERVAL_MS`]), so a rollup may
     /// carry forward the census an earlier rollup measured; sharing it by
@@ -2304,6 +2344,7 @@ impl HealthDiagnosticRollup {
             generated_at_ms: None,
             generation: 0,
             stale_reason: Some("not_yet_sampled"),
+            findings_metrics: metrics.clone(),
             metrics,
             memory_census: Arc::new(placeholder_memory_census()),
             memory_census_at_ms: None,
@@ -2425,7 +2466,7 @@ impl HealthRollupCache {
             snapshot.stale_reason
         };
         super::diagnostics_findings::from_health(
-            &snapshot.metrics,
+            &snapshot.findings_metrics,
             age_ms,
             reason,
             now_ms,
@@ -2462,7 +2503,7 @@ impl HealthRollupCache {
         }
     }
 
-    fn allocator_observation(&self) -> crate::memory::AllocatorObservation {
+    fn allocator_observation(&self) -> (crate::memory::AllocatorObservation, u64) {
         let mut cached = self
             .allocator
             .lock()
@@ -2475,7 +2516,7 @@ impl HealthRollupCache {
                 let mut reused = observation.clone();
                 // Unsupported platforms keep a null age, not a measured zero.
                 reused.age_ms = observation.age_ms.map(|_| age_ms);
-                return reused;
+                return (reused, cached.reuse_ms);
             }
         }
         let walk_started = Instant::now();
@@ -2488,15 +2529,14 @@ impl HealthRollupCache {
         };
         // The observation already includes time spent walking the allocator.
         // Start the reuse clock after that walk so its duration is not counted twice.
+        let reuse_ms =
+            crate::memory::allocator_reuse_window_ms(HEALTH_ALLOCATOR_MIN_REUSE_MS, walk_ms);
         *cached = Some(CachedAllocatorObservation {
             cached_at_ms: self.now_ms(),
-            reuse_ms: crate::memory::allocator_reuse_window_ms(
-                HEALTH_ALLOCATOR_MIN_REUSE_MS,
-                walk_ms,
-            ),
+            reuse_ms,
             observation: observation.clone(),
         });
-        observation
+        (observation, reuse_ms)
     }
 
     fn step_log_due(&self) -> bool {
@@ -3477,6 +3517,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let mut embedding_backend_available = true;
     let mut embedding_backend_paused_until_ms: Option<u64> = None;
     let mut embedding_backend_down = false;
+    let mut embedding_backend_only_planned_pauses = true;
     let mut embedding_backend_last_error = None;
     let mut embedding_backend_since_ms = None;
     let mut task_storage_roots = std::collections::HashSet::new();
@@ -3551,6 +3592,8 @@ fn build_health_diagnostic_rollup_from_actors(
         let backend = ctx.semantic_backend_health_snapshot();
         if !backend.available {
             embedding_backend_available = false;
+            embedding_backend_only_planned_pauses &=
+                backend.pause_cause == Some(crate::synapse_embed::PauseCause::LanePaused);
             if let Some(until) = backend.paused_until_ms {
                 embedding_backend_paused_until_ms =
                     Some(embedding_backend_paused_until_ms.map_or(until, |old| old.max(until)));
@@ -3662,6 +3705,12 @@ fn build_health_diagnostic_rollup_from_actors(
             .cmp(&left.attributed_bytes)
             .then_with(|| left.root_label.cmp(&right.root_label))
     });
+    // Only fields used by diagnosis are copied for all roots. Rich health and
+    // memory rendering stays capped, without discarding evidence for diagnosis.
+    let diagnostics_roots = candidates
+        .iter()
+        .map(|candidate| root_findings_evidence(&candidate.health, &candidate.diagnostics_evidence))
+        .collect::<Vec<_>>();
     let root_details_omitted = candidates.len().saturating_sub(HEALTH_ROOT_DETAIL_CAP);
     let roots: Vec<(String, Value)> = candidates
         .into_iter()
@@ -3758,7 +3807,8 @@ fn build_health_diagnostic_rollup_from_actors(
 
     let root_count = root_details_omitted.saturating_add(roots.len());
     rollup_mark!(timer, "root JSON assembly");
-    let allocator = cache.allocator_observation();
+    let (allocator, allocator_reuse_ms) = cache.allocator_observation();
+    let allocator_age_ms = allocator.age_ms;
     rollup_mark!(timer, "allocator observation");
     // Shared bases and semantic arenas are measured once for the compact
     // rollup; a rollup that also measures the census reuses that measurement.
@@ -3873,6 +3923,7 @@ fn build_health_diagnostic_rollup_from_actors(
             "available": embedding_backend_available,
             "state": if embedding_backend_available { "available" } else if !embedding_backend_down && embedding_backend_paused_until_ms.is_some() { "paused" } else { "backend_unavailable" },
             "paused_until_ms": embedding_backend_paused_until_ms,
+            "pause_cause": if !embedding_backend_available && !embedding_backend_down && embedding_backend_only_planned_pauses { Some("lane_paused") } else { None },
             "last_error": embedding_backend_last_error,
             "since_ms": embedding_backend_since_ms,
         },
@@ -3887,6 +3938,15 @@ fn build_health_diagnostic_rollup_from_actors(
     });
     insert_lifecycle_metrics(&mut metrics, lifecycle);
     data_store_failures.insert_into(&mut metrics);
+    let findings_metrics = json!({
+        "roots": diagnostics_roots,
+        "embedding_backend": metrics["embedding_backend"],
+        "storage_retention": metrics["storage_retention"],
+        "memory": {
+            "allocator_observation_age_ms": allocator_age_ms,
+            "allocator_reuse_ms": allocator_reuse_ms,
+        },
+    });
     rollup_mark!(timer, "metrics JSON assembly");
     let tick = timer.metrics();
     if log::log_enabled!(log::Level::Debug) && cache.step_log_due() {
@@ -3915,10 +3975,22 @@ fn build_health_diagnostic_rollup_from_actors(
         generation: 0,
         stale_reason: None,
         metrics,
+        findings_metrics,
         memory_census,
         memory_census_at_ms,
         memory_census_answers,
     }
+}
+
+fn root_findings_evidence(health: &RootHealthSnapshot, evidence: &Value) -> Value {
+    json!({
+        "project_root": health.project_root,
+        "state": health.state,
+        "cache_unavailable_reason": health.cache_unavailable_reason,
+        "view_storage_reserve": health.view_storage_reserve,
+        "suspended_domains": health.suspended_domains,
+        "diagnostics_evidence": evidence,
+    })
 }
 
 /// How many roots with a failed index store the health summary names, in
@@ -4211,6 +4283,10 @@ fn assemble_health_report(
         None => cached_mutating_lanes.unwrap_or_else(|| json!({ "scheduler_busy": true })),
     };
     metrics.insert("snapshot_age_ms".to_string(), json!(snapshot_age_ms));
+    metrics.insert(
+        "manifest_sync".into(),
+        crate::gh_shim::manifest_sync::health(),
+    );
     metrics.insert("age_ms".to_string(), json!(snapshot_age_ms));
     metrics.insert("generated_at_ms".to_string(), json!(rollup.generated_at_ms));
     metrics.insert("stale".to_string(), json!(stale_reason.is_some()));
@@ -4218,6 +4294,14 @@ fn assemble_health_report(
     metrics.insert(
         "durable_log".to_string(),
         crate::logging::durable_log_health(),
+    );
+    metrics.insert(
+        "gh_speech".to_string(),
+        json!({"unconfigured_binding_refusals_total": crate::gh_shim_speech::service::unconfigured_binding_refusals_total()}),
+    );
+    metrics.insert(
+        "full_sync_fallbacks".to_string(),
+        json!(aft_store::sync::full_sync_fallbacks()),
     );
     metrics.insert(
         "runtime".to_string(),
@@ -4260,6 +4344,11 @@ fn assemble_health_report(
         );
         metrics.insert("bash_pty_spawn".to_string(), spawn["pty_backend"].clone());
     }
+    #[cfg(target_os = "linux")]
+    metrics.insert(
+        "bash_oom_priority_failures".to_string(),
+        crate::bash_background::process::oom_priority_failures().into(),
+    );
     metrics.insert(
         "cold_build_limiter".to_string(),
         render_cold_build_limiter_census(crate::cold_build_limiter::global_limiter().census()),
@@ -4862,6 +4951,68 @@ mod tests {
     }
 
     #[test]
+    fn health_budget_bounds_failed_store_names_with_long_roots() {
+        use crate::data_layer::surfaces::{reason, DataStoreHealth};
+        let paths = (0..50)
+            .map(|index| format!("/long-health-root/{}/{index:02}", "parent-".repeat(26)))
+            .collect::<Vec<_>>();
+        let store = DataStoreHealth {
+            skipped_folders: 0,
+            skipped_folder_note: None,
+            reason: Some(reason::BIND_FAILED),
+            error: Some(format!("could not bind {}", paths[0].repeat(3))),
+            pending_edits: 0,
+            unparsed_files: 0,
+            failure: None,
+        };
+        let failed =
+            DataStoreFailedRoots::collect(paths.iter().map(|path| (path.as_str(), &store)));
+        let mut metrics = json!({
+            "root_count": 50, "root_details_omitted": 49,
+            "roots": [{
+                "project_root": paths[0], "state": "degraded", "data_store": store
+            }],
+            // Fixed live counters already use most of the budget in a real
+            // report; failed-root names and error paths must yield before them.
+            "fresh_liveness": "x".repeat(11400)
+        });
+        failed.insert_into(&mut metrics);
+        let mut roomy = metrics.as_object().unwrap().clone();
+        roomy.insert("fresh_liveness".into(), json!("x".repeat(10000)));
+        budget_health_metrics(&mut roomy);
+        assert_eq!(roomy["data_store_failed"].as_array().unwrap().len(), 5);
+        assert_eq!(roomy["data_store_failed_omitted"], 45);
+        let metrics = metrics.as_object_mut().unwrap();
+        assert!(refresh_metrics_bytes(metrics) > HEALTH_METRICS_BUDGET_BYTES);
+        budget_health_metrics(metrics);
+        let bytes = serde_json::to_vec(metrics).unwrap().len();
+        assert!(bytes <= HEALTH_METRICS_BUDGET_BYTES, "{bytes}");
+        assert_eq!(metrics["metrics_bytes"], bytes);
+        assert_eq!(metrics["data_store_failed_roots"], 50);
+        let names = metrics["data_store_failed"].as_array().unwrap();
+        assert!(!names.is_empty() && names.len() < 5);
+        assert_eq!(
+            names.len() as u64 + metrics["data_store_failed_omitted"].as_u64().unwrap(),
+            50
+        );
+        for (entry, path) in names.iter().zip(&paths) {
+            assert_eq!(entry["reason"], reason::BIND_FAILED);
+            assert!(entry["project_root"]
+                .as_str()
+                .unwrap()
+                .contains(blake3::hash(path.as_bytes()).to_hex().as_str()));
+        }
+        assert_eq!(
+            metrics["roots"][0]["data_store"]["reason"],
+            reason::BIND_FAILED
+        );
+        assert_eq!(metrics["fresh_liveness"].as_str().unwrap().len(), 11400);
+        let once = metrics.clone();
+        budget_health_metrics(metrics);
+        assert_eq!(*metrics, once, "budgeting must be idempotent");
+    }
+
+    #[test]
     fn health_budget_drops_healthy_roots_before_degraded_refused_and_standing_rows() {
         for (detail_bytes, expected) in [
             (
@@ -5010,6 +5161,8 @@ mod tests {
         failure: Option<(&'static str, bool)>,
     ) -> crate::data_layer::surfaces::DataStoreHealth {
         crate::data_layer::surfaces::DataStoreHealth {
+            skipped_folders: 0,
+            skipped_folder_note: None,
             reason,
             error: None,
             pending_edits: 0,
@@ -5023,6 +5176,31 @@ mod tests {
                 },
             ),
         }
+    }
+
+    #[test]
+    fn data_store_unreadable_folders_are_informational_and_keep_budgeted_identity() {
+        let mut store = data_store_health(None, None);
+        store.skipped_folders = 2;
+        let root_path = format!("/work/{}/project", "long/".repeat(100));
+        store.skipped_folder_note = Some(crate::data_layer::surfaces::skipped_folder_health_note(
+            Path::new(&root_path),
+            2,
+        ));
+        assert_eq!(data_store_failure_reason(&store), None);
+        let failed = DataStoreFailedRoots::collect([(root_path.as_str(), &store)]);
+        let state = root_health_rollup_state(0, 0, 1, None);
+        assert_eq!(with_data_store_failures(state.clone(), &failed), state);
+        let mut root = json!({"project_root": root_path, "data_store": store});
+        assert!(abbreviate_health_root(&mut root));
+        assert_eq!(root["data_store"]["skipped_folders"], 2);
+        assert_eq!(
+            root["data_store"]["skipped_folder_note"],
+            format!(
+                "{}: index skipped 2 unreadable folders",
+                abbreviated_health_path(&root_path)
+            )
+        );
     }
 
     #[test]
@@ -5164,6 +5342,7 @@ mod tests {
             "project_root": "standing", "state": "ready", "standing": true,
             "standing_refusal": "resolved-path-drift refusal", "diagnostics_evidence": evidence
         }]);
+        rollup.findings_metrics["roots"] = rollup.metrics["roots"].clone();
         cache.publish(Some(rollup));
 
         let report = build_health_report(
@@ -7026,6 +7205,118 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_findings_allocator_window_travels_with_snapshot() {
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache
+            .allocator_walk_ms_for_test
+            .store(600, Ordering::Relaxed);
+        cache.publish(Some(allocator_rollup(&cache)));
+
+        cache.clock_ms.store(90_000, Ordering::Relaxed);
+        let rollup = allocator_rollup(&cache);
+        assert_eq!(
+            rollup.findings_metrics["memory"]["allocator_reuse_ms"],
+            120_000
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            rollup.findings_metrics["memory"]["allocator_observation_age_ms"]
+                .as_u64()
+                .unwrap()
+                >= 90_000
+        );
+        cache.publish(Some(rollup));
+        let has_snapshot_finding = || {
+            serde_json::to_value(cache.findings(1_000_000, 60_000))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["check"] == "health_snapshot")
+        };
+        assert!(!has_snapshot_finding());
+        cache.clock_ms.store(120_001, Ordering::Relaxed);
+        assert!(
+            has_snapshot_finding(),
+            "a stopped rollup must still be unknown"
+        );
+    }
+
+    #[test]
+    fn diagnostics_findings_200_roots_are_independent_of_report_trimming() {
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let context = test_ctx();
+        let roots = (0..200)
+            .map(|index| test_root(&format!("diagnostics-root-{index:03}")))
+            .collect::<Vec<_>>();
+        let actors = roots
+            .iter()
+            .map(|(_, root)| (root.clone(), Arc::clone(&context)))
+            .collect();
+        let mut rollup =
+            build_health_diagnostic_rollup_from_actors(&cache, &executor, &app, actors);
+        // Seed an empty retention measurement: no retention worker runs in this
+        // fixture, and missing cleanup evidence is independently unknown.
+        rollup.findings_metrics["storage_retention"] = json!({});
+        assert_eq!(
+            rollup.findings_metrics["roots"].as_array().unwrap().len(),
+            200
+        );
+        assert_eq!(
+            rollup.metrics["root_details_omitted"],
+            200 - HEALTH_ROOT_DETAIL_CAP
+        );
+        // Long cache paths also force the byte budget to omit cache entries.
+        rollup.metrics["cache_unavailable"] = json!((0..200)
+            .map(|index| {
+                (
+                    format!("/cache/{index:03}/{}", "segment/".repeat(30)),
+                    json!("unavailable"),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>());
+        cache.publish(Some(rollup));
+
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let metrics = report.metrics.unwrap();
+        assert!(metrics["root_details_omitted"].as_u64().unwrap() > 0);
+        assert!(metrics["cache_unavailable_omitted"].as_u64().unwrap() > 0);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
+        assert!(findings.as_array().unwrap().is_empty(), "{findings}");
+
+        // A failure beyond the rendered roots must not disappear with their detail.
+        let mut rollup = (*cache.snapshot().0).clone();
+        let hidden = rollup.findings_metrics["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|root| {
+                !rollup.metrics["roots"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|shown| shown["project_root"] == root["project_root"])
+            })
+            .unwrap();
+        rollup.findings_metrics["roots"][hidden]["diagnostics_evidence"]["database_open_failed"] =
+            json!(true);
+        cache.publish(Some(rollup));
+        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
+        assert_eq!(findings.as_array().unwrap().len(), 1, "{findings}");
+        assert_eq!(findings[0]["check"], "database_open");
+    }
+
+    #[test]
     fn rollup_allocator_both_surfaces_share_one_measurement() {
         let cache = HealthRollupCache::new();
         let before = crate::memory::allocator_snapshot_calls_for_test();
@@ -8231,6 +8522,42 @@ mod tests {
     }
 
     #[test]
+    fn health_report_exposes_unconfigured_binding_refusal_counter() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = App::default_shared();
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &app,
+        );
+        assert!(report.metrics.expect("health metrics")["gh_speech"]
+            ["unconfigured_binding_refusals_total"]
+            .is_u64());
+    }
+
+    #[test]
+    fn health_report_exposes_full_sync_fallbacks() {
+        let before = aft_store::sync::full_sync_fallbacks();
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &App::default_shared(),
+        );
+        let metrics = report.metrics.expect("health metrics");
+        let fallbacks = metrics["full_sync_fallbacks"]
+            .as_u64()
+            .expect("fallback count");
+        assert!(fallbacks >= before);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(fallbacks, 0);
+    }
+
+    #[test]
     fn health_report_lists_stopped_routes() {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
@@ -8605,7 +8932,8 @@ mod tests {
             let detail = report.detail.clone().expect("a degraded detail");
             let metrics = report.metrics.expect("health metrics");
 
-            let named = root_count.min(HEALTH_DATA_STORE_FAILED_NAMED);
+            let named = metrics["data_store_failed"].as_array().unwrap().len();
+            assert!(named <= root_count.min(HEALTH_DATA_STORE_FAILED_NAMED));
             assert_eq!(metrics["data_store_failed_roots"], json!(root_count));
             assert_eq!(
                 metrics["data_store_failed"],
@@ -8639,13 +8967,14 @@ mod tests {
                 names.len() <= HEALTH_DATA_STORE_FAILED_DETAIL_BYTES,
                 "{names}"
             );
-            let expected = paths[..named]
+            let detail_named = root_count.min(HEALTH_DATA_STORE_FAILED_NAMED);
+            let expected = paths[..detail_named]
                 .iter()
                 .map(|path| format!("{path} (bind_failed)"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let tail = if root_count > named {
-                format!(" and {} more", root_count - named)
+            let tail = if root_count > detail_named {
+                format!(" and {} more", root_count - detail_named)
             } else {
                 String::new()
             };
@@ -8679,6 +9008,55 @@ mod tests {
         let semantic = &report["roots"][0]["semantic_index"];
         assert_eq!(semantic["query_embed_timeouts"], 1);
         assert_eq!(semantic["query_embed_p50_ms"], 200);
+    }
+
+    #[test]
+    fn semantic_backend_planned_pause_is_information_but_does_not_hide_outages() {
+        let executor = Executor::new();
+        let (dir, root) = test_root("semantic-planned-pause-health");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("storage")),
+                project_root: Some(root.as_path().into()),
+                ..crate::config::Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        let until = crate::semantic_index::unix_millis_now() + 1_399_000;
+        crate::synapse_embed::share_lane_pause(
+            root.as_path(),
+            &crate::synapse_embed::LanePause {
+                lane_id: "health-planned-lane".into(),
+                fingerprint: None,
+                retry_after_ms: Some(1_399_000),
+                paused_until_ms: until,
+                reason: "Neural Engine maintenance".into(),
+                cause: crate::synapse_embed::PauseCause::LanePaused,
+                safe_to_retry_same_request: true,
+                record_id: 0,
+            },
+        );
+        assert!(executor.register_actor(root, ctx));
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        let report = refresh_until_root_count(&cache, &executor, &app, 1)
+            .metrics
+            .unwrap();
+        assert_eq!(report["embedding_backend"]["available"], false);
+        assert_eq!(report["embedding_backend"]["state"], "paused");
+        assert_eq!(report["embedding_backend"]["pause_cause"], "lane_paused");
+        assert_eq!(report["embedding_backend"]["paused_until_ms"], until);
+
+        let (_outage_dir, outage_root) = test_root("semantic-outage-with-pause-health");
+        let outage = test_ctx();
+        outage.trip_semantic_refresh_circuit(1, "connection refused");
+        assert!(executor.register_actor(outage_root, outage));
+        let report = refresh_until_root_count(&cache, &executor, &app, 2)
+            .metrics
+            .unwrap();
+        assert_eq!(report["embedding_backend"]["state"], "backend_unavailable");
+        assert!(report["embedding_backend"]["pause_cause"].is_null());
     }
 
     #[test]
@@ -8914,6 +9292,33 @@ mod tests {
                 .expect("ready progress timestamp")
                 > building_progress
         );
+    }
+
+    #[test]
+    fn manifest_sync_health_stays_inside_existing_budget() {
+        let sync = crate::gh_shim::manifest_sync::health();
+        for key in [
+            "active_version",
+            "newest_version_seen",
+            "last_report",
+            "last_report_outcome",
+            "last_refusal_code",
+        ] {
+            assert!(sync.get(key).is_some(), "missing manifest sync field {key}");
+        }
+        let mut metrics = json!({
+            "manifest_sync": sync,
+            "roots": (0..100).map(|i| json!({
+                "project_root": format!("/workspace/{i}/{}", "long-path".repeat(20)),
+                "health": "ready"
+            })).collect::<Vec<_>>()
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["manifest_sync"], sync);
+        assert!(encoded_health_metrics_len(&metrics) <= HEALTH_METRICS_BUDGET_BYTES);
     }
 
     #[test]

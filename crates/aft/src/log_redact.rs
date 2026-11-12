@@ -18,9 +18,9 @@
 //! - credential query parameters (`token=`, `access_token=`, `api_key=`,
 //!   `…secret=`, `password=`), and `key=` when its value looks like a secret.
 //!
-//! Deliberately NOT masked: bare `key=value` fields outside a URL query. AFT's
-//! own structured lines use `key=` for index keys, and masking them would
-//! destroy the forensic value of the log.
+//! Ordinary `key=value` fields stay readable: AFT's structured lines use them
+//! for index keys and session identifiers. Short password names are masked in
+//! every log line; value-shape assignment masking is limited to shell commands.
 //!
 //! Shell commands quoted in a log line additionally go through
 //! [`redact_command`], which masks credentials typed inline in a command
@@ -94,6 +94,16 @@ static CREDENTIAL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// `key=` is too generic to mask on its name alone; see [`looks_like_secret`].
 static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([^&\s#"'<>]+)"#));
+// Value-shape checks are restricted to explicit shell command text.
+static INLINE_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    compile(r#"\b(([A-Za-z_][A-Za-z0-9_]*)=)("[^"\r\n]+"|'[^'\r\n]+'|[^\s,;&|<>()'"]+)"#)
+});
+// Also protects log lines from older versions that recorded raw commands.
+static SHORT_PASSWORD_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"(?i)\b(((?:[A-Za-z_][A-Za-z0-9_]*_)?(?:PW|PASS))=)("[^"\r\n]+"|'[^'\r\n]+'|[^\s,;&|<>()'"]+)"#,
+    )
+});
 
 /// Mask credentials in `text`. Returns the input unchanged (borrowed) when it
 /// contains nothing to mask, so the common case allocates nothing.
@@ -124,6 +134,10 @@ const SHELL_FORMAT_TRIGGERS: &[&str] = &[
     "://",
     "?",
     "&",
+    // Short password assignments (`PW=`, `DB_PASS=`): the name must end in
+    // PW or PASS directly before `=`.
+    "pw=",
+    "pass=",
 ];
 
 /// A conservative prefilter, not a second masker. A complete capture with no
@@ -178,7 +192,7 @@ macro_rules! shell_word {
 /// `GIT_AUTHOR_NAME` and `GH_SHIM_BYPASS` stay.
 static COMMAND_SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     compile(concat!(
-        r#"(^|[^A-Za-z0-9_])((?:[A-Z][A-Z0-9_]*?)?(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY|_KEY|_PAT|_AUTH)(?:_[A-Z0-9]+)*=)("#,
+        r#"(^|[^A-Za-z0-9_])((?:(?:[A-Z][A-Z0-9_]*?)?(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY|_KEY|_PAT|_AUTH)(?:_[A-Z0-9]+)*|(?:[A-Z_][A-Z0-9_]*_)?(?:PW|PASS))=)("#,
         shell_word!(),
         ")"
     ))
@@ -830,6 +844,19 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
             },
             mapping,
         );
+        out = replace_in(
+            out,
+            None,
+            &INLINE_ASSIGNMENT,
+            |caps: &Captures<'_>| {
+                if looks_like_assignment_secret(caps[3].trim_matches(['\'', '"'])) {
+                    masked_assignment(caps)
+                } else {
+                    caps[0].to_string()
+                }
+            },
+            mapping,
+        );
     }
     if command.contains("--") {
         out = replace_in(
@@ -1152,7 +1179,39 @@ fn redact_with_range<'a>(
             mapping,
         );
     }
+    if text.contains('=') {
+        out = replace_in(
+            out,
+            range.as_deref_mut(),
+            &SHORT_PASSWORD_ASSIGNMENT,
+            |caps: &Captures<'_>| {
+                let raw = &caps[3];
+                let value = raw.trim_matches(['\'', '"']);
+                if is_short_password_name(&caps[2]) && !value.starts_with(['$', '<']) {
+                    masked_assignment(caps)
+                } else {
+                    caps[0].to_string()
+                }
+            },
+            mapping,
+        );
+    }
     out
+}
+
+fn masked_assignment(caps: &Captures<'_>) -> String {
+    let raw = &caps[3];
+    let quote = if raw.starts_with(['\'', '"']) {
+        &raw[..1]
+    } else {
+        ""
+    };
+    format!("{}{quote}{SECRET_PLACEHOLDER}{quote}", &caps[1])
+}
+
+fn is_short_password_name(key: &str) -> bool {
+    let suffix = key.rsplit('_').next().unwrap_or(key);
+    suffix.eq_ignore_ascii_case("PW") || suffix.eq_ignore_ascii_case("PASS")
 }
 
 /// A command's credential values, retained only with its live in-memory task.
@@ -1182,6 +1241,7 @@ pub fn is_secret_environment_key(key: &str) -> bool {
     ["TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "CREDENTIAL"]
         .iter()
         .any(|part| contains_ignore_ascii_case(key, part))
+        || is_short_password_name(key)
         || names_auth(key)
 }
 
@@ -1475,6 +1535,17 @@ fn looks_like_secret(value: &str) -> bool {
         && value.chars().any(|ch| ch.is_ascii_lowercase())
 }
 
+/// Paths and URLs in command assignments are useful diagnostics, not tokens.
+/// Keep this rule identical to the CLI sanitizer. Query keys instead use
+/// [`looks_like_secret`] without the path-prefix exclusions.
+fn looks_like_assignment_secret(value: &str) -> bool {
+    !["/", "~/", "./", "../"]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+        && !value.contains("://")
+        && looks_like_secret(value)
+}
+
 fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -1599,7 +1670,7 @@ mod tests {
 
     #[test]
     fn only_json_fields_and_private_keys_match_across_a_newline() {
-        let line_anchored: [(&str, &Regex); 12] = [
+        let line_anchored: [(&str, &Regex); 14] = [
             ("AUTHORIZATION_HEADER", &AUTHORIZATION_HEADER),
             ("API_KEY_HEADER", &API_KEY_HEADER),
             ("AWS_SECRET_FIELD", &AWS_SECRET_FIELD),
@@ -1612,6 +1683,8 @@ mod tests {
             ("URL_USERINFO", &URL_USERINFO),
             ("CREDENTIAL_QUERY", &CREDENTIAL_QUERY),
             ("KEY_QUERY", &KEY_QUERY),
+            ("INLINE_ASSIGNMENT", &INLINE_ASSIGNMENT),
+            ("SHORT_PASSWORD_ASSIGNMENT", &SHORT_PASSWORD_ASSIGNMENT),
         ];
         let samples = [
             "Authorization: Bearer opaque-auth-value".to_string(),
@@ -1626,6 +1699,7 @@ mod tests {
             "AKIAABCDEFGHIJKLMNOP".to_string(),
             "https://user:password@example.com/path".to_string(),
             "https://e.com/p?access_token=opaque&key=AbCdEfGh12345678Zz".to_string(),
+            "PW=opaque X=\"AbCdEfGh12345678Zz\"".to_string(),
         ];
         for sample in &samples {
             for (cut, _) in sample.char_indices().skip(1) {
@@ -1734,6 +1808,16 @@ mod tests {
     }
 
     #[test]
+    fn short_password_environment_names_do_not_include_pwd_or_bypass() {
+        for key in ["PW", "PASS", "DB_PW", "DB_PASS", "db_pw", "db_pass"] {
+            assert!(is_secret_environment_key(key), "missed {key}");
+        }
+        for key in ["PWD", "BYPASS", "COMPASS"] {
+            assert!(!is_secret_environment_key(key), "mangled {key}");
+        }
+    }
+
+    #[test]
     fn completion_non_secret_corpus_stays_borrowed() {
         for text in [
             "running 42 tests\ntest task::sk-settings ... ok\ntest result: ok. 42 passed; 0 failed\n",
@@ -1785,6 +1869,8 @@ mod tests {
     struct Fixture {
         masked: Vec<MaskedCase>,
         untouched: Vec<String>,
+        command_masked: Vec<MaskedCase>,
+        command_untouched: Vec<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -2284,6 +2370,12 @@ mod tests {
                 "input: {}",
                 case.input
             );
+            assert_eq!(
+                redact_command(&case.input),
+                case.expected,
+                "command: {}",
+                case.input
+            );
         }
     }
 
@@ -2294,6 +2386,25 @@ mod tests {
         for input in fixture.untouched {
             let out = aft_redactor(&input);
             assert!(matches!(out, Cow::Borrowed(_)), "mangled: {input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn shared_fixture_command_shapes_do_not_redact_structured_fields() {
+        let fixture = fixture();
+        assert!(!fixture.command_masked.is_empty());
+        for case in fixture.command_masked {
+            assert_eq!(aft_redactor(&case.input), case.input);
+            assert_eq!(
+                redact_command(&case.input),
+                case.expected,
+                "command: {}",
+                case.input
+            );
+        }
+        assert!(!fixture.command_untouched.is_empty());
+        for command in fixture.command_untouched {
+            assert_eq!(redact_command(&command), command);
         }
     }
 

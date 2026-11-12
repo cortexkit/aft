@@ -851,7 +851,7 @@ fn assert_background_artifact_search_access(command: &str) {
                     assert_eq!(
                         denied["message"],
                         format!(
-                            "path '{}' is denied by the access policy floor",
+                            "path '{}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.",
                             path.display()
                         )
                     );

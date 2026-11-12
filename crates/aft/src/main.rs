@@ -1454,6 +1454,9 @@ thread_local! {
     /// Runs inside `dispatch` after the request pinned its config snapshot.
     static DISPATCH_CONFIG_PROBE: std::cell::RefCell<Option<Box<dyn Fn(&AppContext)>>> =
         const { std::cell::RefCell::new(None) };
+    // Transferred to the next deferred worker on this test thread only.
+    static DEFERRED_DISPATCH_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(&AppContext) + Send>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1698,7 +1701,7 @@ fn deferred_tool_call_name(req: &RawRequest) -> Option<&str> {
     let bare_name = name.strip_prefix("aft_").unwrap_or(name);
     (matches!(
         bare_name,
-        "search" | "inspect" | "read" | "bash" | "powershell"
+        "search" | "grep" | "inspect" | "read" | "bash" | "powershell"
     ) || aft::commands::lsp_navigation::is_lsp_navigation_command(bare_name))
     .then_some(name)
 }
@@ -1732,10 +1735,16 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
     let (tx, rx) = mpsc::sync_channel(1);
     let admitted_config = ctx.config();
     let ask_route = aft::access_policy::capture_ask_route();
+    #[cfg(test)]
+    let probe = DEFERRED_DISPATCH_PROBE.with(|probe| probe.borrow_mut().take());
     thread::spawn(move || {
         let _ask_route = ask_route.install();
         let _cancellation = aft::executor::install_job_cancellation(worker_cancellation);
         let _config_pin = ctx.pin_config_to(admitted_config);
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe(&ctx);
+        }
         let command = req.command.clone();
         let id = req.id.clone();
         complete_deferred_dispatch(
@@ -1853,7 +1862,10 @@ fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> Dispatch
     // snapshot even if a live config reload publishes while it runs.
     let _config_pin = ctx.pin_config();
     aft::commands::tool_call::register_dispatch(dispatch);
-    if is_semantic_search_request(&req) || deferred_tool_call_name(&req).is_some() {
+    if is_semantic_search_request(&req)
+        || req.command == "grep"
+        || deferred_tool_call_name(&req).is_some()
+    {
         return handle_dispatch_deferred(req, Arc::clone(ctx));
     }
     if req.command == "inspect" {
@@ -3456,6 +3468,7 @@ mod deferred_semantic_search_tests {
     fn every_bare_deferred_route_has_a_deferred_tool_call_wrapper() {
         for name in [
             "search",
+            "grep",
             "inspect",
             "read",
             "bash",
@@ -3483,6 +3496,84 @@ mod deferred_semantic_search_tests {
             serde_json::json!({"name": "aft_inspect", "arguments": {}}),
         );
         assert_eq!(deferred_tool_call_name(&prefixed), Some("aft_inspect"));
+    }
+
+    #[test]
+    fn deferred_grep_preserves_bytes_and_admission_order_without_blocking_status() {
+        for name in ["grep", "tool_call", "aft_grep"] {
+            let root = tempfile::tempdir().expect("create grep project");
+            let file = root.path().join("fixture.txt");
+            std::fs::write(&file, "before\n").unwrap();
+            let ctx = Arc::new(
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::context_storage::isolate(Config {
+                        project_root: Some(root.path().to_path_buf()),
+                        ..Config::default()
+                    }),
+                )
+                .with_test_checkpoint_store(),
+            );
+            // An inline edit completes before the following grep is admitted.
+            let edited = dispatch(
+                request(
+                    "preceding-edit",
+                    "write",
+                    serde_json::json!({"file": file, "content": "after\n"}),
+                ),
+                &ctx,
+            );
+            assert!(edited.success, "{edited:?}");
+            let args = serde_json::json!({"path": file, "pattern": "after"});
+            let make_request = || {
+                if name == "grep" {
+                    request("parity-grep", "grep", args.clone())
+                } else {
+                    request(
+                        "parity-grep",
+                        "tool_call",
+                        serde_json::json!({
+                            "name": if name == "tool_call" { "grep" } else { name },
+                            "arguments": args
+                        }),
+                    )
+                }
+            };
+            aft::commands::tool_call::register_dispatch(dispatch);
+            let mut expected = dispatch(make_request(), &ctx);
+            assert_eq!(expected.success, name != "aft_grep", "{expected:?}");
+            let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            super::DEFERRED_DISPATCH_PROBE.with(|probe| {
+                *probe.borrow_mut() = Some(Box::new(move |ctx| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert!(!ctx.config().restrict_to_project_root);
+                }));
+            });
+            let mut pending = register_deferred(dispatch_outcome(make_request(), &ctx));
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let started = Instant::now();
+            let status = dispatch_outcome(
+                request("sibling-status", "status", serde_json::json!({})),
+                &ctx,
+            );
+            assert!(matches!(status, DispatchOutcome::Immediate(response) if response.success));
+            assert!(pending.poll_ready(&ctx).is_empty());
+            eprintln!("deferred {name} sibling status: {:?}", started.elapsed());
+            // A later configuration publication must not change this grep's pin.
+            ctx.update_config(|config| config.restrict_to_project_root = true);
+            release_tx.send(()).unwrap();
+            let mut actual = wait_for_response(&ctx, &mut pending);
+            // Native grep includes elapsed time; tool_call returns rendered text.
+            expected.data.as_object_mut().unwrap().remove("search_ms");
+            actual.data.as_object_mut().unwrap().remove("search_ms");
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert!(ctx.config().restrict_to_project_root);
+        }
     }
 
     #[test]

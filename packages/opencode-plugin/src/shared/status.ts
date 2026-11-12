@@ -143,12 +143,12 @@ export interface AftStatusSnapshot {
   };
   storage_dir: string | null;
   /** Total checkpoints across all sessions sharing this bridge. */
-  checkpoints_total: number;
+  checkpoints_total: number | null;
   /** Current session's own slice of undo/checkpoint state. */
   session: {
     id: string;
     tracked_files: number;
-    checkpoints: number;
+    checkpoints: number | null;
   };
   /** Compression aggregate passthrough; rendering is added separately. */
   compression?: StatusCompression;
@@ -403,11 +403,11 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       warm_entries: readNumber(symbolCache.warm_entries),
     },
     storage_dir: readNullableString(response.storage_dir),
-    checkpoints_total: readNumber(response.checkpoints_total),
+    checkpoints_total: readOptionalNumber(response.checkpoints_total),
     session: {
       id: readString(session.id, "__default__"),
       tracked_files: readNumber(session.tracked_files),
-      checkpoints: readNumber(session.checkpoints),
+      checkpoints: readOptionalNumber(session.checkpoints),
     },
     compression: readCompression(response.compression),
     status_bar: readStatusBar(response.status_bar),

@@ -18,6 +18,54 @@ const VECTORS: &str = include_str!("../../tests/fixtures/secret/secret-approval-
 /// The sha256 the campaign pinned for the vector file.
 const VECTORS_SHA256: &str = "efd4ba60641586e143bce81087e4f9f5aaf8a99ffede74190303da7d4495cc27";
 
+// The six agent-sender request/result examples in claustrum's
+// docs/wire-contract-v1.md, §15 "secret.use: the sender contract", in document
+// order. Keep their literal JSON bytes, including statement bytes.
+pub(super) const USE_GOLDENS: &str =
+    include_str!("../../tests/fixtures/secret/secret-use-v1.jsonl");
+
+#[test]
+fn every_sender_golden_round_trips_through_the_wire_types() {
+    let examples: Vec<_> = USE_GOLDENS.lines().collect();
+    assert_eq!(examples.len(), 6);
+    for (index, example) in examples.into_iter().enumerate() {
+        let value: Value = serde_json::from_str(example).unwrap();
+        let encoded = if index < 3 {
+            let request: SecretUseRequest = serde_json::from_value(value).unwrap();
+            serde_json::to_string(&request).unwrap()
+        } else {
+            let reply = parse_reply(&value).unwrap();
+            serde_json::to_string(&reply).unwrap()
+        };
+        assert_eq!(encoded, example, "sender golden {index}");
+    }
+}
+
+#[test]
+fn sender_refusals_preserve_the_contract_code_class_and_error_frame() {
+    use SecretUseRefusal::*;
+    for (code, class, refusal) in [
+        ("not_found", "permanent", NotFound),
+        ("limit_exceeded", "context_overflow", LimitExceeded),
+        ("secret_setup_incomplete", "permanent", SetupIncomplete),
+        ("pending_limit", "transient", PendingLimit),
+        ("store_error", "transient", StoreError),
+    ] {
+        let answer =
+            parse_answer(&json!({"result":{"error":{"code":code,"class":class}}})).unwrap();
+        assert_eq!(answer.refusal(), Some(refusal));
+        let SecretUseAnswer::Refused(error) = answer else {
+            panic!("result refusal")
+        };
+        assert_eq!(error.code, code);
+        assert_eq!(error.class.as_deref(), Some(class));
+    }
+    let answer =
+        parse_answer(&json!({"code":"invalid_params","message":"invalid params"})).unwrap();
+    assert_eq!(answer.refusal(), Some(InvalidParams));
+    assert!(matches!(answer, SecretUseAnswer::Rejected(_)));
+}
+
 fn vectors() -> Value {
     serde_json::from_str(VECTORS).expect("the pinned vector file is JSON")
 }
@@ -153,7 +201,10 @@ fn a_golden_released_login_reply_parses_with_and_without_totp() {
     };
     assert_eq!(login.username, "alice");
     assert_eq!(login.password(), b"correct horse");
-    assert_eq!(login.totp.as_deref(), Some("123456"));
+    assert_eq!(
+        login.totp.as_ref().map(|code| code.as_str()),
+        Some("123456")
+    );
 
     let without = parse_reply(&json!({
         "status": "released",
@@ -368,30 +419,37 @@ fn a_result_error_and_a_transport_error_read_as_the_contract_spells_them() {
 fn the_secret_use_client_sends_the_pinned_params_and_reads_a_release() {
     struct Recording(std::sync::Mutex<Vec<Value>>);
     impl SecretUseTransport for Recording {
-        fn secret_use(&self, params: Value) -> Result<Value, String> {
+        fn secret_use(&self, params: Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
             self.0.lock().unwrap().push(params);
-            Ok(json!({"result":{
-                "status": "released",
-                "kind": "agent_api_key",
-                "key_b64url": "c2stZXhhbXBsZQ",
-                "location": "header:X-Api-Key"
-            }}))
+            Ok(zeroize::Zeroizing::new(
+                serde_json::to_vec(&json!({"result":{
+                    "status": "released",
+                    "kind": "agent_api_key",
+                    "key_b64url": "c2stZXhhbXBsZQ",
+                    "location": "header:X-Api-Key"
+                }}))
+                .unwrap(),
+            ))
         }
     }
     let transport = std::sync::Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
     let vault = SubcSecretVault::new(transport.clone());
     let scope = SecretScope::from_stamp(&golden_stamp());
-    let resolution = vault.resolve(&scope, "key");
-    // A released key at resolution time is reported as a granted rule and the
-    // bytes themselves are dropped (zeroized), per the contract's material rule.
-    let Resolution::Granted { rule, .. } = resolution else {
-        panic!("a release at resolution time is a grant");
+    let answer = vault.use_secret(
+        &scope,
+        "key",
+        &ApiKeyTarget {
+            scheme: "https".into(),
+            host: "x.test".into(),
+            port: Some(443),
+            path: "/repos/a".into(),
+        },
+    );
+    let UseAnswer::Released(released) = answer else {
+        panic!("a release keeps material for this request only");
     };
-    assert_eq!(rule.label, "key");
-    assert!(matches!(
-        rule.location,
-        secret_rules::location::Location::Header(ref name) if name == "X-Api-Key"
-    ));
+    assert_eq!(released.location, "header:X-Api-Key");
+    assert_eq!(released.material(), b"sk-example");
     let sent = transport.0.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(keys(&sent[0]), set(&["name", "stamp", "target"]));
@@ -403,19 +461,31 @@ fn the_secret_use_client_sends_the_pinned_params_and_reads_a_release() {
 fn the_secret_use_client_reports_an_approval_as_pending() {
     struct Pending;
     impl SecretUseTransport for Pending {
-        fn secret_use(&self, _params: Value) -> Result<Value, String> {
+        fn secret_use(&self, _params: Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
             let file = vectors();
-            Ok(json!({"result":{
-                "status": "approval_required",
-                "request_id": file["vectors"][0]["statements"][0]["request_id"],
-                "statement_b64url": file["vectors"][0]["statements"][0]["statement_b64url"],
-                "expires_at_ms": 1700000600000u64,
-            }}))
+            Ok(zeroize::Zeroizing::new(
+                serde_json::to_vec(&json!({"result":{
+                    "status": "approval_required",
+                    "request_id": file["vectors"][0]["statements"][0]["request_id"],
+                    "statement_b64url": file["vectors"][0]["statements"][0]["statement_b64url"],
+                    "expires_at_ms": 1700000600000u64,
+                }}))
+                .unwrap(),
+            ))
         }
     }
     let vault = SubcSecretVault::new(std::sync::Arc::new(Pending));
     let scope = SecretScope::from_stamp(&golden_stamp());
-    let Resolution::ApprovalRequired(request) = vault.resolve(&scope, "key") else {
+    let UseAnswer::ApprovalRequired(request) = vault.use_secret(
+        &scope,
+        "key",
+        &ApiKeyTarget {
+            scheme: "https".into(),
+            host: "x.test".into(),
+            port: Some(443),
+            path: "/repos/a".into(),
+        },
+    ) else {
         panic!("an approval_required answer is a pending resolution");
     };
     assert_eq!(request.request_id, "01HF7YAT000000000000000001");
@@ -423,18 +493,32 @@ fn the_secret_use_client_reports_an_approval_as_pending() {
 }
 
 #[test]
-fn the_secret_use_client_maps_the_uniform_not_found_to_a_refusal() {
+fn the_secret_use_client_preserves_uniform_not_found_for_literal_forwarding() {
     struct NotFound;
     impl SecretUseTransport for NotFound {
-        fn secret_use(&self, _params: Value) -> Result<Value, String> {
-            Ok(json!({"result":{"error":{"code":"not_found","class":"permanent"}}}))
+        fn secret_use(&self, _params: Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+            Ok(zeroize::Zeroizing::new(
+                serde_json::to_vec(
+                    &json!({"result":{"error":{"code":"not_found","class":"permanent"}}}),
+                )
+                .unwrap(),
+            ))
         }
     }
     let vault = SubcSecretVault::new(std::sync::Arc::new(NotFound));
     let scope = SecretScope::from_stamp(&golden_stamp());
     assert!(matches!(
-        vault.resolve(&scope, "key"),
-        Resolution::Denied { .. }
+        vault.use_secret(
+            &scope,
+            "key",
+            &ApiKeyTarget {
+                scheme: "https".into(),
+                host: "x.test".into(),
+                port: Some(443),
+                path: "/repos/a".into()
+            }
+        ),
+        UseAnswer::NotFound
     ));
 }
 

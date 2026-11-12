@@ -75,9 +75,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::Mutex;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
-use secret_rules::location::{validate_header_name, LabelRule, Location};
 use secret_rules::scrub::{MatcherSet, Scrubber};
-use secret_rules::target::{canonical_host, ConnectAuthority};
+use secret_rules::target::ConnectAuthority;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use zeroize::Zeroizing;
@@ -90,19 +89,16 @@ pub(crate) type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io
 /// Constant agent-visible wording; labels and hosts are appended as data.
 pub const PROXY_REFUSAL: &str = "Secret proxy refused the request";
 
-/// A launch-time resolution, not a request-time material cache.
-#[derive(Clone, Debug)]
-pub struct GrantedLabel {
-    pub rule: LabelRule,
-    pub expires_at_ms: u64,
-}
-
 pub struct ProxyConfig {
     pub vault: Arc<dyn SecretVault>,
     pub authorization_scope: SecretScope,
     pub lifetime_scope: SecretScope,
     pub scanned_labels: Vec<String>,
-    pub grants: Vec<GrantedLabel>,
+    pub consent_context: Option<(std::path::PathBuf, String)>,
+    #[cfg(test)]
+    pub test_https_port: Option<u16>,
+    #[cfg(test)]
+    pub(crate) approval_clock: Option<Arc<dyn crate::secret::requests::ApprovalClock>>,
     pub origin: String,
 }
 
@@ -175,10 +171,11 @@ pub(crate) mod test_hardening {
 }
 
 pub(crate) struct State {
+    approvals: crate::secret::requests::RequestSecrets,
     config: ProxyConfig,
     session: AtomicI32,
     session_birth: std::sync::atomic::AtomicU64,
-    stopped: AtomicBool,
+    stopped: Arc<AtomicBool>,
     token: Zeroizing<String>,
     expected_auth: Zeroizing<Vec<u8>>,
     ca: rcgen::Certificate,
@@ -189,6 +186,8 @@ pub(crate) struct State {
     requests: Arc<tokio::sync::Semaphore>,
     // Keep each installed key as an exact-byte matcher for response scrubbers.
     // Rotation adds a matcher instead of replacing earlier key values.
+    // Retain these zeroizing patterns until the command ends solely to scrub
+    // echoed keys; they never authorize or supply another upstream request.
     patterns: Mutex<Vec<(String, Zeroizing<Vec<u8>>)>>,
     #[cfg(test)]
     headers_sensitive: AtomicBool,
@@ -196,9 +195,18 @@ pub(crate) struct State {
     test_identity_generation: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     test_idle_timeout_ms: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    test_upstream: Mutex<std::collections::HashMap<String, SocketAddr>>,
 }
 
 impl State {
+    fn is_https_port(&self, port: u16) -> bool {
+        #[cfg(test)]
+        if self.config.test_https_port == Some(port) {
+            return true;
+        }
+        port == 443
+    }
     fn idle_timeout(&self) -> Duration {
         #[cfg(test)]
         {
@@ -347,17 +355,11 @@ impl SecretProxy {
             return Err(ProxyError::UnsupportedPlatform);
         }
         let scanned: BTreeSet<_> = config.scanned_labels.iter().collect();
-        let resolved: BTreeSet<_> = config.grants.iter().map(|g| &g.rule.label).collect();
         if scanned.is_empty()
-            || scanned != resolved
-            || resolved.len() != config.grants.len()
-            || config.grants.iter().any(|g| {
-                let r = &g.rule;
-                !secret_rules::placeholder::is_label(&r.label)
-                    || canonical_host(&r.host).is_err()
-                    || secret_rules::target::normalize_path_prefix(&r.path_prefix).map_or(true, |p| p != r.path_prefix)
-                    || matches!(&r.location, Location::Header(name) if validate_header_name(name).is_err())
-            })
+            || scanned.len() != config.scanned_labels.len()
+            || scanned
+                .iter()
+                .any(|label| !secret_rules::placeholder::is_label(label))
         {
             return Err(ProxyError::InvalidRules);
         }
@@ -383,11 +385,22 @@ impl SecretProxy {
         let token =
             Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&random[..]));
         let expected_auth = basic_credentials(&token)?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let cancelled = stopped.clone();
+        let approvals = crate::secret::requests::RequestSecrets::new(
+            config.vault.clone(),
+            config.authorization_scope.clone(),
+            config.consent_context.clone(),
+        )
+        .with_request_cancellation(move || cancelled.load(Ordering::Acquire));
+        #[cfg(test)]
+        let approvals = approvals.with_clock(config.approval_clock.clone());
         let state = Arc::new(State {
+            approvals,
             config,
             session: AtomicI32::new(0),
             session_birth: std::sync::atomic::AtomicU64::new(0),
-            stopped: AtomicBool::new(false),
+            stopped,
             token,
             expected_auth,
             ca,
@@ -403,6 +416,8 @@ impl SecretProxy {
             test_identity_generation: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_idle_timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            test_upstream: Mutex::default(),
         });
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|_| ProxyError::Initialization)?;
@@ -439,6 +454,21 @@ impl SecretProxy {
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn approval_status(&self) -> Vec<String> {
+        self.state
+            .approvals
+            .status()
+            .into_iter()
+            .filter_map(|line| {
+                self.state
+                    .scrub(line.as_bytes())
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .collect()
     }
 
     /// Exec-time only: never persist the returned credential with a task request.
@@ -530,7 +560,7 @@ async fn serve(
                 connections.spawn(async move {
                     let session = state.session.load(Ordering::Acquire);
                     if session <= 0 || !state.generation_valid() || !peer::authorized(&socket, session) || !state.generation_valid() { return; }
-                    let socket = limits::IdleIo::new(socket, state.idle_timeout());
+                    let socket = limits::IdleIo::new(socket, state.idle_timeout()).with_approval_waits(state.approvals.activity());
                     let service = service_fn(move |request| connect(request, state.clone(), lease.clone()));
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(socket), service).with_upgrades().await;
@@ -572,11 +602,7 @@ async fn connect(
     }) {
         return Ok(refused());
     }
-    let intercepted = state
-        .config
-        .grants
-        .iter()
-        .any(|g| canonical_host(&g.rule.host).ok().as_ref() == Some(&authority.host));
+    let intercepted = state.is_https_port(authority.port);
     let tls = if intercepted {
         match state.tls_for(&authority.host) {
             Ok(tls) => Some(tls),

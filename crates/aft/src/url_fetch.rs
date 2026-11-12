@@ -27,13 +27,16 @@ use secret_rules::location::{
 };
 use secret_rules::material::{check_admissible, encode_for_location};
 use secret_rules::scrub::{MatcherSet, ScrubError, Scrubber};
-use secret_rules::target::{normalize_request_target, ConnectAuthority, RequestTarget, RuleTarget};
+use secret_rules::target::{normalize_request_target, ConnectAuthority};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::parser::detect_language;
+
+#[path = "url_fetch_sensitive.rs"]
+mod sensitive;
 
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -817,25 +820,80 @@ pub(crate) fn create_secret_fetch_dir(storage_dir: &Path) -> Result<PathBuf, Url
 }
 
 /// What a placeholder fetch may do with its secrets.
-pub struct SecretFetch<'a> {
-    /// The vault `material` and `audit` go to.
-    pub vault: &'a dyn crate::secret::SecretVault,
+pub struct SecretFetch {
+    /// The vault each addressed request and audit record go to.
+    pub vault: Arc<dyn crate::secret::SecretVault>,
     /// The call's authorization scope; `None` only when the URL holds no
     /// well-formed placeholder, in which case nothing is resolved or audited.
     pub authorization: Option<crate::secret::SecretScope>,
-    /// Every label found in the URL, in order. Each has a rule in `rules`.
+    /// Every label found in the URL, in order.
     pub labels: Vec<String>,
-    /// The rule the vault granted for each label, carrying its grant id.
-    pub rules: Vec<LabelRule>,
+    /// Map an ephemeral test upstream to the vault's HTTPS/443 target.
+    #[cfg(test)]
+    pub test_https_port: Option<u16>,
     /// The fetch call's id: audit records name it, plus the hop index.
     pub call_id: String,
+    /// The foreground call's cancellation and absolute reply deadline.
+    pub cancellation: SecretFetchCancellation,
+}
+
+#[derive(Clone, Default)]
+pub struct SecretFetchCancellation {
+    job: Option<crate::executor::JobCancellation>,
+    deadline: Option<Instant>,
+}
+impl SecretFetchCancellation {
+    pub(crate) fn for_current_call() -> Self {
+        Self {
+            job: crate::executor::current_job_cancellation(),
+            deadline: crate::subc::current_fetch_reply_deadline(),
+        }
+    }
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.reason().is_some()
+    }
+    pub(crate) fn reason(&self) -> Option<crate::secret::requests::UseError> {
+        self.job
+            .as_ref()
+            .is_some_and(|job| job.cancel_requested_before_commit())
+            .then_some(crate::secret::requests::UseError::Cancelled)
+            .or_else(|| {
+                self.deadline
+                    .is_some_and(|at| Instant::now() >= at)
+                    .then_some(crate::secret::requests::UseError::Expired)
+            })
+    }
+    pub(crate) fn expires_at_ms(&self) -> Option<u64> {
+        self.deadline.map(|deadline| {
+            now_ms().saturating_add(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64,
+            )
+        })
+    }
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let delay = self.deadline.map_or(Duration::from_millis(25), |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25))
+            });
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 /// Keys the vault released during one placeholder fetch. They are kept, wiped
 /// on drop, only until the fetch returns, so every header and body read after
 /// a key was sent is scrubbed of it.
+/// These retained bytes are scrub patterns, never authorization or material
+/// for another send; every request obtains its own release from the vault.
 #[derive(Default)]
-struct HeldKeys(Vec<(String, Zeroizing<Vec<u8>>)>);
+pub(crate) struct HeldKeys(Vec<(String, Zeroizing<Vec<u8>>)>);
 
 impl HeldKeys {
     fn matchers(&self) -> Result<Vec<MatcherSet>, ScrubError> {
@@ -847,7 +905,7 @@ impl HeldKeys {
 
     /// Hold `key` for `label`, refusing a key whose matcher would collide with
     /// one already held (the scrubber could then write one key into a reply).
-    fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
+    pub(crate) fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
         if self
             .0
             .iter()
@@ -878,7 +936,7 @@ impl HeldKeys {
     /// Error text from a library (reqwest, the decoders) with every held key
     /// replaced by its placeholder. Text that still spells a key after that,
     /// or that cannot be scrubbed, is dropped whole.
-    fn sanitize_detail(&self, detail: &str) -> String {
+    pub(crate) fn sanitize_detail(&self, detail: &str) -> String {
         let deadline = Instant::now() + DETAIL_CHECK_LIMIT;
         match self.scrub(detail.as_bytes()) {
             Ok(clean) if self.reveal(&clean, deadline).is_clean() => {
@@ -947,7 +1005,7 @@ pub fn fetch_url_with_secrets(
     logical_url: &str,
     document_dir: &Path,
     options: UrlFetchOptions,
-    secrets: &SecretFetch<'_>,
+    secrets: &SecretFetch,
 ) -> Result<PathBuf, UrlFetchError> {
     let key_sent = std::cell::Cell::new(false);
     let result = fetch_with_secrets(logical_url, document_dir, options, secrets, &key_sent)
@@ -970,7 +1028,7 @@ fn fetch_with_secrets(
     logical_url: &str,
     document_dir: &Path,
     options: UrlFetchOptions,
-    secrets: &SecretFetch<'_>,
+    secrets: &SecretFetch,
     key_sent: &std::cell::Cell<bool>,
 ) -> Result<PathBuf, UrlFetchError> {
     let mut current = Url::parse(logical_url)
@@ -978,27 +1036,45 @@ fn fetch_with_secrets(
     // A fragment never reaches a server, and a rule never matches one.
     current.set_fragment(None);
     let start = current.clone();
-    let deadline = FetchDeadline::for_current_call();
+    let mut deadline = FetchDeadline::for_current_call();
     let approved = Arc::new(ApprovedHosts::default());
     let progress = Arc::new(ConnectProgress::default());
-    let client = build_client(&options, Arc::clone(&approved), Arc::clone(&progress))?;
+    let client = build_client(
+        &options,
+        Arc::clone(&approved),
+        Arc::clone(&progress),
+        false,
+        Some(secrets.cancellation.clone()),
+    )?;
     let mut held = HeldKeys::default();
     let mut hop = 0;
     let response = loop {
-        validate_public_url(&current, &options, &deadline, &approved)?;
-        let outbound = secret_hop(&current, hop, secrets, &mut held)?;
-        if outbound.is_some() {
-            key_sent.set(true);
+        if secrets.cancellation.is_cancelled() {
+            return Err(secret_fetch_refused("missing_material", logical_url));
         }
+        validate_public_url(&current, &options, &deadline, &approved)?;
+        let waiting = Instant::now();
+        let outbound = secret_hop(&current, hop, secrets, &mut held)?;
+        // Approval is a separate person-wait budget, not network time.
+        let waited = waiting.elapsed();
+        deadline.at += waited;
+        crate::bounded_io::exclude_secret_approval_wait(waited);
         let sent = send_request(
             &client,
-            outbound.as_ref().unwrap_or(&current),
-            Some((current.as_str(), &held)),
+            &current,
+            Some(SecretSend {
+                shown: current.as_str(),
+                held: &held,
+                released: outbound.is_some(),
+                cancellation: &secrets.cancellation,
+                key_sent,
+                outbound: outbound.as_ref(),
+            }),
             &deadline,
             &progress,
         );
         // Wipe this function's copy of the key-bearing URL now that it is sent.
-        drop(outbound.map(|url| Zeroizing::new(String::from(url))));
+        drop(outbound);
         let response = sent?;
         if !response.status().is_redirection() {
             break response;
@@ -1102,7 +1178,6 @@ fn fetch_with_secrets(
         };
     let (raw, mut download_truncated) =
         read_response_body_with(response, logical_url, &deadline, &sanitize)?;
-    let raw = Zeroizing::new(raw);
     let decoded = decode_secret_body(&raw, &codings, &mut download_truncated, logical_url)?;
     let mut body = held.scrub(&decoded).map_err(scrub_refusal(logical_url))?;
     drop(decoded);
@@ -1316,11 +1391,11 @@ fn decode_secret_body(
     codings: &[SecretCoding],
     truncated: &mut bool,
     url: &str,
-) -> Result<Zeroizing<Vec<u8>>, UrlFetchError> {
+) -> Result<sensitive::Bytes, UrlFetchError> {
     use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
     use tokio::io::{AsyncRead, BufReader};
 
-    let mut data = Zeroizing::new(body.to_vec());
+    let mut data = sensitive::Factory::current().copy(body);
     for coding in codings.iter().rev() {
         let input: &[u8] = &data;
         let reader: std::pin::Pin<Box<dyn AsyncRead + Send + '_>> = match coding {
@@ -1352,14 +1427,15 @@ fn decode_secret_body(
 fn drain_decoder(
     mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + '_>>,
     input_truncated: bool,
-) -> Result<(Zeroizing<Vec<u8>>, bool), ()> {
+) -> Result<(sensitive::Bytes, bool), ()> {
     use std::future::Future;
     use tokio::io::AsyncReadExt;
 
-    let mut output = Zeroizing::new(Vec::new());
+    let factory = sensitive::Factory::current();
+    let mut output = factory.with_capacity(0);
     let polled = {
         let decoding = async {
-            let mut buffer = Zeroizing::new(vec![0u8; 16 * 1024]);
+            let mut buffer = factory.zeroed(16 * 1024);
             loop {
                 match reader.read(&mut buffer).await {
                     Ok(0) => return Ok(false),
@@ -1392,15 +1468,15 @@ fn drain_decoder(
 ///
 /// Returns the URL to send when a rule substitutes a key into this hop, or
 /// `None` to send `current` itself, whose placeholders then go out literally.
-/// Only `query` rules substitute; a rule with any other location leaves its
-/// placeholder literal. Each scanned label gets one audit record for the hop,
+/// Only `query` rules substitute; another location refuses before any card or
+/// releasing retry. Each scanned label gets one audit record for the hop,
 /// and a hop whose records cannot be written is not sent.
 fn secret_hop(
     current: &Url,
     hop: usize,
-    secrets: &SecretFetch<'_>,
+    secrets: &SecretFetch,
     held: &mut HeldKeys,
-) -> Result<Option<Url>, UrlFetchError> {
+) -> Result<Option<SecretOutboundUrl>, UrlFetchError> {
     let logical = current.as_str();
     let path = current.path();
     let target = match current.query() {
@@ -1417,45 +1493,91 @@ fn secret_hop(
                 .map(|host| ConnectAuthority { host, port })
         });
     let Some(authority) = authority else {
-        emit_hop_audit(secrets, held, hop, None, |_| {
+        emit_hop_audit(secrets, held, hop, None, &[], |_| {
             (Decision::Literal, AuditReason::OutOfScope)
         })
         .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
         return Ok(None);
     };
     let refused = |held: &HeldKeys, reason: &str| {
-        let _ = emit_hop_audit(secrets, held, hop, Some(&authority), |_| {
+        let _ = emit_hop_audit(secrets, held, hop, Some(&authority), &[], |_| {
             (Decision::Refused, AuditReason::Refused)
         });
         secret_fetch_refused(reason, logical)
     };
 
-    let rules: Vec<LabelRule> = secrets
-        .rules
-        .iter()
-        .filter(|rule| matches!(rule.location, Location::Query(_)))
-        .cloned()
-        .collect();
-    let request = RequestTarget {
+    let mut rules = Vec::new();
+    let mut materials = Vec::new();
+    let present = secret_labels_in_url(logical).unwrap_or_default();
+    let normalized = normalize_request_target(path).map_err(|_| refused(held, "malformed_path"))?;
+    let addressed = crate::secret::ApiKeyTarget {
+        scheme: "https".into(),
         host: authority.host.clone(),
-        port: authority.port,
-        scheme: "https",
-        target: &target,
+        port: Some(443),
+        path: String::from_utf8(normalized.wire).map_err(|_| refused(held, "malformed_path"))?,
     };
-    let matched: Vec<bool> = rules
-        .iter()
-        .map(|rule| {
-            request
-                .matches(&RuleTarget {
-                    host: &rule.host,
-                    port: rule.port,
-                    path_prefix: &rule.path_prefix,
-                })
-                .is_ok()
-        })
-        .collect();
+    let mut eligible = Vec::new();
+    for label in &secrets.labels {
+        let https_port = authority.port == 443;
+        #[cfg(test)]
+        let https_port = https_port || secrets.test_https_port == Some(authority.port);
+        if !https_port || !present.contains(label) {
+            continue;
+        }
+        eligible.push(label.clone());
+    }
+    let answers = crate::subc::use_current_secret_labels(
+        secrets.vault.clone(),
+        &eligible,
+        &addressed,
+        &target,
+        &secrets.cancellation,
+    );
+    for (label, answer) in eligible.iter().zip(answers) {
+        let answer = match answer {
+            crate::subc::LaunchDecision::InvalidPlan(reason) => return Err(refused(held, reason)),
+            crate::subc::LaunchDecision::Proceed(answer) => answer,
+            #[cfg(test)]
+            crate::subc::LaunchDecision::Pending(pending) => {
+                let _ = refused(held, "missing_material");
+                return Err(UrlFetchError::secret(
+                    crate::secret::SECRET_ACCESS_PENDING,
+                    pending.message,
+                ));
+            }
+            crate::subc::LaunchDecision::Refuse(crate::secret::LabelOutcome::Refuse {
+                code,
+                message,
+            }) => {
+                let _ = refused(held, "missing_material");
+                return Err(UrlFetchError::secret(code, message));
+            }
+            _ => return Err(refused(held, "missing_material")),
+        };
+        if let crate::secret::UseAnswer::Released(released) = answer {
+            let (location, material) = released.into_parts();
+            let location = secret_rules::location::parse_vault_location(&location)
+                .ok_or_else(|| refused(held, "missing_material"))?;
+            if !matches!(location, Location::Query(_)) {
+                return Err(refused(held, "missing_material"));
+            }
+            if check_admissible(material.expose(), label, &location).is_err() {
+                return Err(refused(held, "material_not_admissible"));
+            }
+            held.hold(label, material.expose())
+                .map_err(|_| refused(held, "replacement_discloses_key"))?;
+            rules.push(LabelRule {
+                label: label.clone(),
+                host: addressed.host.clone(),
+                port: authority.port,
+                path_prefix: addressed.path.clone(),
+                location,
+            });
+            materials.push(Some(material));
+        }
+    }
     // Plan with a stand-in key first: the rules decide where a key would go,
-    // and refuse an ambiguous request, before the vault releases anything.
+    // and refuse an ambiguous request before copying released bytes into a URL.
     let planning: Vec<(String, Vec<u8>)> = rules
         .iter()
         .map(|rule| (rule.label.clone(), SECRET_PLANNING_KEY.to_vec()))
@@ -1464,45 +1586,6 @@ fn secret_hop(
     let plan = evaluate_request_with_connect(&view, &authority, &rules, &planning);
     if let Some(refusal) = plan.refusal {
         return Err(refused(&*held, refusal.reason()));
-    }
-
-    // Material is asked only for a rule this hop actually substitutes. A
-    // rule whose host and path match while its placeholder is absent, not the
-    // whole value, or in another parameter needs no key, and asking anyway
-    // would spend a single-use grant on a request that sends none.
-    let mut materials = Vec::with_capacity(rules.len());
-    for ((rule, matched), planned) in rules.iter().zip(&matched).zip(&plan.labels) {
-        if !matched || !planned.is_substituted() {
-            materials.push(None);
-            continue;
-        }
-        let Some(scope) = secrets.authorization.as_ref() else {
-            return Err(refused(&*held, "missing_material"));
-        };
-        let material = match secrets.vault.material(scope, &rule.label, &rule.grant_id) {
-            Ok(material) => material,
-            Err(error) => {
-                let _ = emit_hop_audit(secrets, held, hop, Some(&authority), |_| {
-                    (Decision::Refused, AuditReason::Refused)
-                });
-                return Err(
-                    match crate::secret::outcome_for_material(&rule.label, &error) {
-                        crate::secret::LabelOutcome::Refuse { code, message } => {
-                            UrlFetchError::secret(code, message)
-                        }
-                        _ => secret_fetch_refused("missing_material", logical),
-                    },
-                );
-            }
-        };
-        if check_admissible(material.expose(), &rule.label, &rule.location).is_err() {
-            return Err(refused(&*held, "material_not_admissible"));
-        }
-        // The matcher is installed before any byte of this hop is sent.
-        if held.hold(&rule.label, material.expose()).is_err() {
-            return Err(refused(&*held, "replacement_discloses_key"));
-        }
-        materials.push(Some(material));
     }
 
     let query_start = path.len() + 1;
@@ -1538,21 +1621,15 @@ fn secret_hop(
         }
     };
     if edits.is_empty() {
-        emit_hop_audit(secrets, held, hop, Some(&authority), decide)
+        emit_hop_audit(secrets, held, hop, Some(&authority), &rules, decide)
             .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
         return Ok(None);
     }
 
     edits.sort_by_key(|(start, _, _)| *start);
     let query = current.query().unwrap_or_default().as_bytes();
-    let mut substituted = Zeroizing::new(Vec::with_capacity(query.len() + 64));
-    let mut cursor = 0;
-    for (start, end, replacement) in &edits {
-        substituted.extend_from_slice(&query[cursor..*start]);
-        substituted.extend_from_slice(replacement);
-        cursor = *end;
-    }
-    substituted.extend_from_slice(&query[cursor..]);
+    let substituted =
+        substitute_query(query, &edits).ok_or_else(|| refused(held, "malformed_query"))?;
     let Ok(substituted) = std::str::from_utf8(&substituted) else {
         return Err(refused(&*held, "malformed_query"));
     };
@@ -1564,21 +1641,91 @@ fn secret_hop(
     let Ok(wire_path) = std::str::from_utf8(&normalized.wire) else {
         return Err(refused(&*held, "malformed_path"));
     };
-    let mut outbound = current.clone();
-    outbound.set_path(wire_path);
-    outbound.set_query(Some(substituted));
-    emit_hop_audit(secrets, held, hop, Some(&authority), decide)
+    emit_hop_audit(secrets, held, hop, Some(&authority), &rules, decide)
         .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
-    Ok(Some(outbound))
+    secret_outbound_url(current, wire_path, substituted)
+        .map(Some)
+        .ok_or_else(|| refused(held, "malformed_query"))
+}
+
+#[cfg(test)]
+thread_local! { static SECRET_URL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+struct SecretOutboundUrl(sensitive::Bytes);
+impl std::ops::Deref for SecretOutboundUrl {
+    type Target = str;
+    fn deref(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("URL serialization is UTF-8")
+    }
+}
+impl SecretOutboundUrl {
+    fn as_str(&self) -> &str {
+        self
+    }
+}
+impl fmt::Debug for SecretOutboundUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProtectedOutboundUrl")
+    }
+}
+
+fn secret_outbound_url(
+    current: &Url,
+    wire_path: &str,
+    substituted: &str,
+) -> Option<SecretOutboundUrl> {
+    #[cfg(test)]
+    SECRET_URL_BUILDS.with(|n| n.set(n.get() + 1));
+    let prefix = &current[..url::Position::BeforePath];
+    let capacity = prefix
+        .len()
+        .checked_add(wire_path.len())?
+        .checked_add(1)?
+        .checked_add(substituted.len())?;
+    // Build the complete serialization in protected, pre-sized storage instead
+    // of reallocating a partially key-bearing Url with clone/set_query.
+    let mut serialized = sensitive::Factory::current().with_capacity(capacity);
+    serialized.extend_from_slice(prefix.as_bytes());
+    serialized.extend_from_slice(wire_path.as_bytes());
+    serialized.extend_from_slice(b"?");
+    serialized.extend_from_slice(substituted.as_bytes());
+    Some(SecretOutboundUrl(serialized))
+}
+
+fn substitute_query(
+    query: &[u8],
+    edits: &[(usize, usize, Zeroizing<Vec<u8>>)],
+) -> Option<Zeroizing<Vec<u8>>> {
+    let final_len = edits
+        .iter()
+        .try_fold(query.len(), |len, (start, end, value)| {
+            len.checked_sub(end.checked_sub(*start)?)?
+                .checked_add(value.len())
+        })?;
+    // Allocate the complete result before copying the first credential: growing
+    // a partially filled Vec would free an old, unwiped credential allocation.
+    let mut substituted = Zeroizing::new(Vec::with_capacity(final_len));
+    let mut cursor = 0;
+    for (start, end, replacement) in edits {
+        if *start < cursor || *end < *start || *end > query.len() {
+            return None;
+        }
+        substituted.extend_from_slice(&query[cursor..*start]);
+        substituted.extend_from_slice(replacement);
+        cursor = *end;
+    }
+    substituted.extend_from_slice(&query[cursor..]);
+    Some(substituted)
 }
 
 /// One audit record per scanned label for one hop. A record is handed to the
 /// vault only after the crate's writer checked it against every held key.
 fn emit_hop_audit(
-    secrets: &SecretFetch<'_>,
+    secrets: &SecretFetch,
     held: &HeldKeys,
     hop: usize,
     authority: Option<&ConnectAuthority>,
+    rules: &[LabelRule],
     decide: impl Fn(&str) -> (Decision, AuditReason),
 ) -> Result<(), ()> {
     let origin = format!("{}#{hop}", secrets.call_id);
@@ -1600,11 +1747,14 @@ fn emit_hop_audit(
                 .as_ref()
                 .map(crate::secret::SecretScope::to_scope_ref),
         );
-        let rule = secrets.rules.iter().find(|rule| &rule.label == label);
-        if let (Some(authority), Some(rule)) = (authority, rule) {
+        if let Some(authority) = authority {
+            record.host = Some(authority.host.clone());
+            record.port = Some(authority.port);
+        }
+        if let Some(rule) = rules.iter().find(|rule| &rule.label == label) {
             record = record.with_rule(
-                &authority.host,
-                authority.port,
+                &rule.host,
+                rule.port,
                 &rule.path_prefix,
                 location_kind_token(&rule.location),
             );
@@ -1915,7 +2065,13 @@ fn fetch_with_redirects(
     approved: Arc<ApprovedHosts>,
 ) -> Result<HttpResponse, UrlFetchError> {
     let progress = Arc::new(ConnectProgress::default());
-    let client = build_client(options, Arc::clone(&approved), Arc::clone(&progress))?;
+    let client = build_client(
+        options,
+        Arc::clone(&approved),
+        Arc::clone(&progress),
+        true,
+        None,
+    )?;
     let mut current_url = start_url.clone();
 
     for redirect_count in 0..=MAX_REDIRECTS {
@@ -1976,6 +2132,16 @@ fn send_with_transient_retries(
     send_request(client, target, None, deadline, progress)
 }
 
+#[derive(Clone, Copy)]
+struct SecretSend<'a> {
+    shown: &'a str,
+    held: &'a HeldKeys,
+    released: bool,
+    cancellation: &'a SecretFetchCancellation,
+    key_sent: &'a std::cell::Cell<bool>,
+    outbound: Option<&'a SecretOutboundUrl>,
+}
+
 /// [`send_with_transient_retries`] for one request. With `secret` set, the
 /// request belongs to a placeholder fetch: every message names the given
 /// placeholder URL instead of `target`, a failure is reported through
@@ -1984,7 +2150,7 @@ fn send_with_transient_retries(
 fn send_request(
     client: &Client,
     target: &Url,
-    secret: Option<(&str, &HeldKeys)>,
+    secret: Option<SecretSend<'_>>,
     deadline: &FetchDeadline,
     progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
@@ -2005,12 +2171,12 @@ fn send_request(
 fn send_request_attempts(
     client: &Client,
     target: &Url,
-    secret: Option<(&str, &HeldKeys)>,
+    secret: Option<SecretSend<'_>>,
     deadline: &FetchDeadline,
     progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
-    let named = secret.map_or(target.as_str(), |(shown, _)| shown);
-    let held = secret.map(|(_, held)| held);
+    let named = secret.map_or(target.as_str(), |secret| secret.shown);
+    let held = secret.map(|secret| secret.held);
     let mut attempt = 0;
     loop {
         let remaining = deadline.remaining();
@@ -2020,25 +2186,47 @@ fn send_request_attempts(
         // A per-request timeout replaces reqwest's default 30 s, which would
         // otherwise let one silent server hold each attempt for 30 s.
         progress.begin_attempt();
+        // Parse directly from protected serialization and move the Url into
+        // reqwest. AFT must not clone a key-bearing URL's ordinary String.
+        let outbound = match secret.and_then(|secret| secret.outbound) {
+            Some(outbound) => Url::parse(outbound.as_str())
+                .map_err(|_| secret_fetch_refused("malformed_query", named))?,
+            None => target.clone(),
+        };
         let mut request = client
-            .get(target.clone())
+            .get(outbound)
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, ACCEPT_HEADER)
             .timeout(remaining.min(HEADERS_TIMEOUT));
         if held.is_some() {
             request = request.header(ACCEPT_ENCODING, "identity");
         }
+        if secret.is_some_and(|secret| secret.cancellation.is_cancelled()) {
+            return Err(secret_fetch_refused("missing_material", named));
+        }
+        if let Some(secret) = secret.filter(|secret| secret.released) {
+            secret.key_sent.set(true);
+        }
         let error = match request.send() {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
+        if secret.is_some_and(|secret| secret.cancellation.is_cancelled()) {
+            // A cancelled secret request returns its existing refusal rather
+            // than exposing a transport error from connection setup.
+            return Err(secret_fetch_refused("missing_material", named));
+        }
         let phase = error
             .is_timeout()
             .then(|| timed_out_phase(&error, progress));
         // A server that accepted the request and stayed silent until the
         // headers limit is not a passing connection fault; retrying it would
         // only spend the rest of the deadline the same way.
-        let retryable = is_transient_reqwest_error(&error) && phase != Some(FetchPhase::Headers);
+        // One released key authorizes one send attempt, even if the peer received
+        // the credential and reset before its response reached this process.
+        let retryable = !secret.is_some_and(|secret| secret.released)
+            && is_transient_reqwest_error(&error)
+            && phase != Some(FetchPhase::Headers);
         let backoff = TRANSIENT_RETRY_BACKOFFS_MS
             .get(attempt)
             .map(|ms| Duration::from_millis(*ms))
@@ -2137,6 +2325,8 @@ fn build_client(
     options: &UrlFetchOptions,
     approved: Arc<ApprovedHosts>,
     progress: Arc<ConnectProgress>,
+    automatic_replays: bool,
+    cancellation: Option<SecretFetchCancellation>,
 ) -> Result<Client, UrlFetchError> {
     let resolver = GuardedResolver {
         approved,
@@ -2150,8 +2340,14 @@ fn build_client(
         .connector_layer(TrackConnect {
             progress,
             delay: options.connect_delay,
+            cancellation,
         })
         .dns_resolver(Arc::new(resolver));
+    let builder = if automatic_replays {
+        builder
+    } else {
+        builder.retry(reqwest::retry::never())
+    };
 
     let tls_config = match &options.tls_config {
         Some(config) => config.clone(),
@@ -2276,6 +2472,7 @@ impl ConnectProgress {
 struct TrackConnect {
     progress: Arc<ConnectProgress>,
     delay: Option<Duration>,
+    cancellation: Option<SecretFetchCancellation>,
 }
 
 impl<S> tower_layer::Layer<S> for TrackConnect {
@@ -2286,6 +2483,7 @@ impl<S> tower_layer::Layer<S> for TrackConnect {
             inner,
             progress: Arc::clone(&self.progress),
             delay: self.delay,
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -2295,6 +2493,7 @@ struct TrackedConnector<S> {
     inner: S,
     progress: Arc<ConnectProgress>,
     delay: Option<Duration>,
+    cancellation: Option<SecretFetchCancellation>,
 }
 
 impl<S, Target> tower_service::Service<Target> for TrackedConnector<S>
@@ -2302,24 +2501,26 @@ where
     S: tower_service::Service<Target>,
     S::Future: Send + 'static,
     S::Response: Send + 'static,
-    S::Error: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
 {
     type Response = S::Response;
-    type Error = S::Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<S::Response, Self::Error>> + Send>,
+    >;
 
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
+        self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, target: Target) -> Self::Future {
         let attempt = self.progress.connect_started();
         let progress = Arc::clone(&self.progress);
         let delay = self.delay;
+        let cancellation = self.cancellation.clone();
         let connecting = self.inner.call(target);
         Box::pin(async move {
             // Records on drop too, so a connect a timeout abandons still
@@ -2331,11 +2532,14 @@ where
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            let connection = connecting.await;
-            if connection.is_ok() {
-                progress.connected(attempt);
+            let connection = connecting.await.map_err(Into::into)?;
+            // The inner connector includes DNS, TCP and TLS. Check again at
+            // its handover boundary, before hyper can write request bytes.
+            if cancellation.is_some_and(|cancel| cancel.is_cancelled()) {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
             }
-            connection
+            progress.connected(attempt);
+            Ok(connection)
         })
     }
 }
@@ -3050,10 +3254,10 @@ fn element_attr_value<'a>(element: &'a Element<'_>, name: &str) -> Option<&'a st
 }
 
 enum BodyReadEvent {
-    Chunk(Vec<u8>),
+    Chunk(sensitive::Bytes),
     Done,
     /// A read failed after waiting this long for data.
-    Error(io::ErrorKind, String, Duration),
+    Error(io::ErrorKind, sensitive::Bytes, Duration),
 }
 
 /// Read at most [`MAX_RESPONSE_BYTES`] (plus one lookahead byte) of the body.
@@ -3075,6 +3279,7 @@ fn read_response_body(
     deadline: &FetchDeadline,
 ) -> Result<(Vec<u8>, bool), UrlFetchError> {
     read_response_body_with(response, url, deadline, &|detail: &str| detail.to_string())
+        .map(|(body, truncated)| (body.into_plain_vec(), truncated))
 }
 
 /// [`read_response_body`] with `detail` applied to the text of a failed read
@@ -3084,15 +3289,17 @@ fn read_response_body_with(
     url: &str,
     deadline: &FetchDeadline,
     detail: &dyn Fn(&str) -> String,
-) -> Result<(Vec<u8>, bool), UrlFetchError> {
+) -> Result<(sensitive::Bytes, bool), UrlFetchError> {
     // Bound the producer, not just its consumer: an unbounded channel can
     // queue the entire response before the caller notices the byte ceiling.
     let (tx, rx) = mpsc::sync_channel(1);
+    let factory = sensitive::Factory::current();
+    let worker = factory.clone();
     thread::spawn(move || {
         // One lookahead byte distinguishes an exact-size body from a cut,
         // including chunked responses without Content-Length.
         let mut response = response.take(MAX_RESPONSE_BYTES + 1);
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = worker.zeroed(16 * 1024);
         loop {
             let read_started = Instant::now();
             match response.read(&mut buffer) {
@@ -3101,13 +3308,16 @@ fn read_response_body_with(
                     break;
                 }
                 Ok(n) => {
-                    if tx.send(BodyReadEvent::Chunk(buffer[..n].to_vec())).is_err() {
+                    if tx
+                        .send(BodyReadEvent::Chunk(worker.copy(&buffer[..n])))
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 Err(error) => {
                     let kind = error.kind();
-                    let message = error.to_string();
+                    let message = worker.format(format_args!("{error}"));
                     let waited = read_started.elapsed();
                     let _ = tx.send(BodyReadEvent::Error(kind, message, waited));
                     break;
@@ -3135,7 +3345,7 @@ fn read_response_body_with(
         started: Instant::now(),
         bytes: 0,
     };
-    let mut chunks = Vec::new();
+    let mut chunks = factory.with_capacity(0);
     let mut total = 0u64;
     let slow_body_error = || {
         if deadline.expired() {
@@ -3165,7 +3375,7 @@ fn read_response_body_with(
                     deadline,
                     url,
                     kind,
-                    &detail(&message),
+                    &detail(std::str::from_utf8(&message).unwrap_or_default()),
                     waited,
                 ));
             }
@@ -4101,6 +4311,89 @@ mod fetch_times_tests {
         assert_eq!(
             times.render(),
             "url_fetch=fetches:2,cache_hits:1,remembered:0,lookup:2.10,connect:40.00,first_byte:5800.00,body:300.00,bytes:51234,convert:4.00,redirects:1,retries:0,error:url_fetch_failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod secret_audit_regressions {
+    use super::*;
+    #[test]
+    fn substituted_query_allocates_its_exact_complete_size_before_copying_any_key() {
+        let first = Zeroizing::new(vec![b'a'; 1001]);
+        let second = Zeroizing::new(vec![b'b'; 2103]);
+        let result = substitute_query(b"a=x&b=y", &[(2, 3, first), (6, 7, second)]).unwrap();
+        assert_eq!(result.len(), 5 + 1001 + 2103);
+        assert_eq!(
+            result.capacity(),
+            result.len(),
+            "a later key must not reallocate a buffer that already contains an earlier key"
+        );
+        assert_eq!(&result[..2], b"a=");
+        assert_eq!(&result[1003..1006], b"&b=");
+    }
+    #[test]
+    fn approval_wait_preserves_the_fetch_and_read_back_network_budget() {
+        let _scope = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
+            Duration::from_secs(25),
+        )));
+        let before = crate::bounded_io::current().unwrap().deadline;
+        let deadline = FetchDeadline::for_current_call();
+        let person_wait = Duration::from_secs(360);
+        crate::bounded_io::exclude_secret_approval_wait(person_wait);
+        assert_eq!(
+            crate::bounded_io::current().unwrap().deadline,
+            before + person_wait
+        );
+        assert_eq!(deadline.allowed, URL_FETCH_CEILING);
+    }
+    #[test]
+    fn failed_audit_does_not_create_an_ordinary_key_bearing_url() {
+        struct NoAudit;
+        impl crate::secret::SecretVault for NoAudit {
+            fn use_secret(
+                &self,
+                _: &crate::secret::SecretScope,
+                _: &str,
+                _: &crate::secret::ApiKeyTarget,
+            ) -> crate::secret::UseAnswer {
+                crate::secret::UseAnswer::Released(crate::secret::ReleasedApiKey::new(
+                    "query:key".into(),
+                    crate::secret::Material::new(b"released-test-key-123456".to_vec()),
+                ))
+            }
+            fn audit(&self, _: &AuditRecordV1) -> Result<(), crate::secret::AuditError> {
+                Err(crate::secret::AuditError::Unavailable {
+                    detail: "offline".into(),
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(serde_json::json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"audit-url","kind":"head","scope_epoch":1,"owner_authorized":true})).unwrap();
+        let scope = crate::secret::SecretScope::from_stamp(&stamp);
+        SECRET_URL_BUILDS.with(|n| n.set(0));
+        crate::subc::with_secret_identity_for_test(root.path(), stamp, || {
+            let secrets = SecretFetch {
+                vault: Arc::new(NoAudit),
+                authorization: Some(scope),
+                labels: vec!["test".into()],
+                test_https_port: None,
+                call_id: "audit-url".into(),
+                cancellation: Default::default(),
+            };
+            let mut held = HeldKeys::default();
+            assert!(secret_hop(
+                &Url::parse("https://example.test/doc.md?key={{ck-secret:test}}").unwrap(),
+                0,
+                &secrets,
+                &mut held
+            )
+            .is_err());
+        });
+        assert_eq!(
+            SECRET_URL_BUILDS.with(std::cell::Cell::get),
+            0,
+            "audit refusal must precede construction of any Url that owns a key"
         );
     }
 }

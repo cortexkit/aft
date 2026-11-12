@@ -365,6 +365,30 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Internal permission-error scan stops after 1,000 matching lines to select one explanatory note; it never truncates the command output or returns a result list.",
     },
     ExclusionEntry {
+        file: "gh_shim_speech/service.rs",
+        enclosing_item: "log_unconfigured_binding_refusal",
+        location_or_primitive: "UNCONFIGURED_BINDING_LOG_CAP, cap, clear",
+        reason: "Internal INFO-log deduplication history is cleared at capacity; older sessions may log again, but refusals and agent-visible result lists are unchanged.",
+    },
+    ExclusionEntry {
+        file: "subc/consent.rs",
+        enclosing_item: "DirectoryScopeProbes::note_fallback",
+        location_or_primitive: "DIRECTORY_SCOPE_MISSING_LOG_CAP, clear",
+        reason: "Internal vanished-directory INFO-log history is cleared at capacity; older scopes may log again, without changing the original file grant or any agent-visible result list.",
+    },
+    ExclusionEntry {
+        file: "checkpoint.rs",
+        enclosing_item: "status_count, STATUS_DIRECTORY_ENTRIES, STATUS_MANIFEST_BYTES, STATUS_BLOB_CHECKS",
+        location_or_primitive: "bounded status observation",
+        reason: "The checkpoint status reader caps directory entries, metadata bytes and blob validations; exhaustion returns unknown, never a truncated count or result list. Authoritative list and mutations retain full recovery semantics.",
+    },
+    ExclusionEntry {
+        file: "github_read/threads.rs",
+        enclosing_item: "fetch_review_threads",
+        location_or_primitive: "MAX_THREAD_PAGES, MAX_EXTRA_COMMENT_PAGES",
+        reason: "GitHub read renders a canonical document rather than a ListEnvelope; bounded thread and comment-ID pagination discloses omitted counts, marks partial thread totals, and leaves unmatched comments' thread state unknown.",
+    },
+    ExclusionEntry {
         file: "gh_shim_speech/start_view/sweep.rs",
         enclosing_item: "sweep_entries",
         location_or_primitive: "MAX_ENTRIES, MAX_PASS, max_entries, deadline",
@@ -570,9 +594,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "backup.rs",
-        enclosing_item: "read_session_disk_index_with_budget, merge_disk_stack_heads, run_operation_discard",
+        enclosing_item: "discovery_limits, merge_disk_stack_heads, run_operation_discard",
         location_or_primitive: "MAX_SESSION_DISCOVERY_ENTRIES, examined >= entry_limit, BackupIoBudget::check, ROLLBACK_CLEANUP_ALLOWANCE",
         reason: "internal durable undo-stack discovery stops at its entry or deadline budget and returns an error, never a partial path list or false no-history result; operation-scoped rollback stops before advancing its path iterator when the independent cleanup allowance expires, queues the remaining paths for retry, and logs one deferred-path count; per-file undo avoids the session scan",
+    },
+    ExclusionEntry {
+        file: "status_inventory.rs",
+        enclosing_item: "discover_into",
+        location_or_primitive: "examined >= limits.entry_limit, BackupIoBudget::check",
+        reason: "the shared durable undo-stack discovery pass (also behind status-push tracked-file counts) stops at its entry or deadline budget and returns an error, never a partial path list; the status count then falls back to resident keys exactly as tracked_files does",
     },
     ExclusionEntry {
         file: "runtime_drain.rs",
@@ -585,6 +615,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "join_storage_sweep_worker",
         location_or_primitive: "Option .take()",
         reason: "test-only handoff of the held storage sweep worker's join handle out of its gate, not a list",
+    },
+    ExclusionEntry {
+        file: "commands/url_resolution.rs",
+        enclosing_item: "drop",
+        location_or_primitive: "with_secret_fetch_for_test::Restore::drop self.0.take(), self.1.take()",
+        reason: "Option::take restores the previous test fetch vault and options when the scoped helper exits; neither call cuts a list",
     },
     ExclusionEntry {
         file: "commands/configure.rs",
@@ -667,8 +703,8 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "subc/health.rs",
         enclosing_item: "budget_health_metrics, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
-        location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row (including ready roots) are abbreviated with full identity digests and root status instead of omitted; omitted root, sweep, cache and retention rows are counted exactly and aggregate counters remain present",
+        location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row (including ready roots) are abbreviated with full identity digests and root status instead of omitted; omitted root, sweep, cache, retention and failed-store name rows are counted exactly and aggregate counters remain present",
     },
     ExclusionEntry {
         file: "subc/route_census.rs",
@@ -897,6 +933,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "evict_least_recent_v3_member, reclaim_v3_admission_family",
         location_or_primitive: "SQL LIMIT and take(max_examined), 64-removal loop and five-second admission deadline",
         reason: "internal LRU database reclamation, not result lists; every deletion rechecks references and live holds and insufficient reclaim preserves the device-space refusal",
+    },
+    ExclusionEntry {
+        file: "gh_shim/ticket_repository.rs",
+        enclosing_item: "Cache::insert",
+        location_or_primitive: "MAX_ROOTS",
+        reason: "internal repository snapshot LRU, not a result list; eviction recomputes the binding from Git on the next ticket rather than omitting a repository",
     },
     ExclusionEntry {
         file: "cache_location.rs",
@@ -1339,6 +1381,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "LineWindow",
         location_or_primitive: "SNIPPET_LINE_MAX_CHARS",
         reason: "incremental implementation of the existing per-line text window, with exactly the same ellipsis and truncation marker; bounds retained characters, not result rows",
+    },
+    ExclusionEntry {
+        file: "data_layer/surfaces.rs",
+        enclosing_item: "disclose_index_gaps",
+        location_or_primitive: "INDEX_GAP_PREVIEW",
+        reason: "coverage-gap preview, not a findings page; skipped_folders counts every relevant unreadable folder and skipped_folders_omitted counts names beyond the preview",
     },
 ];
 

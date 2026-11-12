@@ -31,6 +31,8 @@ const FAKE_DAEMON_VERSION: &str = "0.39.0";
 mod aft_binary;
 #[path = "helpers/executable_cache.rs"]
 mod executable_cache;
+#[path = "../src/test_gate.rs"]
+mod test_gate;
 #[path = "helpers/worker_gh_read.rs"]
 mod worker_gh_read;
 
@@ -297,10 +299,7 @@ fn worker_jail_teardown_kills_recorded_sandbox_process_groups() {
     let data = temp.path().join("data");
     let release = temp.path().join("release");
     let mut child = Command::new("/bin/sh")
-        .args([
-            "-c",
-            &format!("while ! test -f {}; do sleep .02; done", quote(&release)),
-        ])
+        .args(["-c", &test_gate::gate(&quote(&release), "sleep .02")])
         .process_group(0)
         .spawn()
         .unwrap();
@@ -344,10 +343,7 @@ fn worker_jail_teardown_skips_reused_process_group() {
     let data = temp.path().join("data");
     let release = temp.path().join("release");
     let mut child = Command::new("/bin/sh")
-        .args([
-            "-c",
-            &format!("while ! test -f {}; do sleep .02; done", quote(&release)),
-        ])
+        .args(["-c", &test_gate::gate(&quote(&release), "sleep .02")])
         .process_group(0)
         .spawn()
         .unwrap();
@@ -394,10 +390,7 @@ fn worker_jail_teardown_skips_terminal_process_group() {
     let data = temp.path().join("data");
     let release = temp.path().join("release");
     let mut child = Command::new("/bin/sh")
-        .args([
-            "-c",
-            &format!("while ! test -f {}; do sleep .02; done", quote(&release)),
-        ])
+        .args(["-c", &test_gate::gate(&quote(&release), "sleep .02")])
         .process_group(0)
         .spawn()
         .unwrap();
@@ -3154,7 +3147,7 @@ async fn worker_jail_temp_denies_other_task_directory() {
     // when its scratch is retained for its own session.
     let ready = jail.bash("true").await;
     let first_corr = jail.submit_tool("bash", json!({
-        "command": format!("printf original > \"$TMPDIR/sentinel\" && printf '%s' \"$TMPDIR\" > {}; while [ ! -f {} ]; do sleep 0.05; done", quote(&recorded), quote(&release)),
+        "command": format!("printf original > \"$TMPDIR/sentinel\" && printf '%s' \"$TMPDIR\" > {}; {}", quote(&recorded), test_gate::gate(&quote(&release), "sleep 0.05")),
         "timeout": 30_000,
     })).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -3496,9 +3489,9 @@ async fn worker_jail_teardown_kills_sandboxed_shell_groups_during_unwind() {
     let release = jail.worktree.join("teardown-release");
     jail.submit_held_bash(json!({
         "command": format!(
-            "printf '%s\\n' \"$TMPDIR\" > {}; while ! test -f {}; do sleep .02; done",
+            "printf '%s\\n' \"$TMPDIR\" > {}; {}",
             quote(&ready),
-            quote(&release),
+            test_gate::gate(&quote(&release), "sleep .02"),
         ),
         "background": true,
         "timeout": 60_000,
@@ -3688,7 +3681,12 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
     let ready = jail.worktree.join("broker-ready");
     let go = jail.worktree.join("broker-go");
     let outcome = jail.worktree.join("broker-outcome");
-    let command = format!("echo ready > {}; while ! test -f {}; do sleep 0.02; done; gh api repos/cortexkit/aft > /dev/null 2>&1; echo $? > {}", quote(&ready), quote(&go), quote(&outcome));
+    let command = format!(
+        "echo ready > {}; {}; gh api repos/cortexkit/aft > /dev/null 2>&1; echo $? > {}",
+        quote(&ready),
+        test_gate::gate(&quote(&go), "sleep 0.02"),
+        quote(&outcome)
+    );
     let corr = jail
         .submit_held_bash(json!({"command":command,"background":true,"timeout":30_000}))
         .await;
@@ -3841,8 +3839,8 @@ async fn cross_command_broker_isolation(profile: &str) {
     let paths = jail.worktree.join("broker-a-paths");
     let finish = jail.worktree.join("broker-a-finish");
     let corr = jail.submit_held_bash(json!({"command":format!(
-        "printf '%s\\n%s\\n%s\\n' \"$AFT_GH_READ_SOCKET\" \"$AFT_GH_READ_CAPABILITY_FILE\" \"$$\" > {}.tmp && mv {}.tmp {}; while ! test -f {}; do sleep 0.02; done",
-        quote(&paths), quote(&paths), quote(&paths), quote(&finish)),"background":true,"timeout":30_000})).await;
+        "printf '%s\\n%s\\n%s\\n' \"$AFT_GH_READ_SOCKET\" \"$AFT_GH_READ_CAPABILITY_FILE\" \"$$\" > {}.tmp && mv {}.tmp {}; {}",
+        quote(&paths), quote(&paths), quote(&paths), test_gate::gate(&quote(&finish), "sleep 0.02")),"background":true,"timeout":30_000})).await;
     // The file is renamed into place whole: the test polls for it and must
     // never read a partly written list of three lines.
     let paths = wait_test_file(&paths).await;
@@ -4190,8 +4188,8 @@ PY
         );
         if mode != "end" {
             command.push_str(&format!(
-                "while ! test -f {}; do sleep .02; done; echo finished > {}\n",
-                quote(&finish),
+                "{}; echo finished > {}\n",
+                test_gate::gate(&quote(&finish), "sleep .02"),
                 quote(&parent_done)
             ));
         }
@@ -4251,7 +4249,7 @@ async fn worker_gh_read_t12_malformed_peer_reply_and_endpoint_replacement_fail_c
         return;
     }
     let mut jail = gh_read_jail().await;
-    let reply = jail.bash(r#"set -eu
+    let reply = jail.bash(&r#"set -eu
 if rm "$AFT_GH_READ_SOCKET" 2>/dev/null; then echo ENDPOINT_REPLACED; exit 91; fi
 python3 - "$TMPDIR/malformed.sock" <<'PY' &
 import socket, struct, sys
@@ -4269,7 +4267,7 @@ if len(header) == 4:
 c.close(); s.close()
 PY
 peer=$!
-while ! test -S "$TMPDIR/malformed.sock"; do sleep .02; done
+__AFT_SOCKET_GATE__
 rm -f "$AFT_GH_SHIM_STATE_DIR/read-session-lookup.json"
 if AFT_GH_READ_SOCKET="$TMPDIR/malformed.sock" gh api repos/cortexkit/aft >/dev/null 2>&1; then exit 92; fi
 wait "$peer"
@@ -4279,7 +4277,7 @@ with open(sys.argv[1]) as f: record = json.load(f)
 assert record['outcome'] == 'unavailable' and record['reason'] == 'worker read broker reply malformed', record
 PY
 echo MALFORMED_BROKER_REPLY_REFUSED
-"#).await;
+"#.replace("__AFT_SOCKET_GATE__", &test_gate::gate_socket("\"$TMPDIR/malformed.sock\"", "sleep .02"))).await;
     assert!(reply.contains("MALFORMED_BROKER_REPLY_REFUSED"), "{reply}");
     assert!(jail.read_holder.lock().unwrap().calls.is_empty());
     assert!(!jail.worktree.join("native-gh.log").exists());
@@ -4342,7 +4340,7 @@ async fn gh_shim_router_host_v1_background_reply_is_terminal_and_model_only() {
         .tool_reply_on_channel(2, "bash", json!({"command":"true"}))
         .await;
     jail.assert_bash_completed("head-session", &warm);
-    let corr = jail.submit_tool_on_channel(2, "bash", json!({"command":format!("echo ready > {}; while ! test -f {}; do sleep .02; done", quote(&ready), quote(&release)),"background":true,"timeout":10_000})).await;
+    let corr = jail.submit_tool_on_channel(2, "bash", json!({"command":format!("echo ready > {}; {}", quote(&ready), test_gate::gate(&quote(&release), "sleep .02")),"background":true,"timeout":10_000})).await;
     wait_test_file(&ready).await;
     let frame = {
         let pending = jail.reply_frame(2, corr);
@@ -4390,7 +4388,7 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     let ready = jail.worktree.join("promotion-ready");
     let release = jail.worktree.join("promotion-release");
     let output = jail.worktree.join("promotion-read");
-    jail.submit_held_bash(json!({"command":format!("gh api repos/cortexkit/aft >/dev/null; printf '%s' \"$TMPDIR\" > {}; while ! test -f {}; do sleep .02; done; gh api repos/cortexkit/aft > {}", quote(&ready), quote(&release), quote(&output)),"background":false,"timeout":30_000})).await;
+    jail.submit_held_bash(json!({"command":format!("gh api repos/cortexkit/aft >/dev/null; printf '%s' \"$TMPDIR\" > {}; {}; gh api repos/cortexkit/aft > {}", quote(&ready), test_gate::gate(&quote(&release), "sleep .02"), quote(&output)),"background":false,"timeout":30_000})).await;
     let temp = wait_test_file(&ready).await;
     let (task, metadata) = worker_gh_read::observe_task(Path::new(&temp));
     assert!(
@@ -4606,7 +4604,7 @@ async fn worker_gh_read_revocation_suppresses_reply_to_surviving_observer() {
     jail.read_holder.lock().unwrap().hold_reads = Some(hold.clone());
     let ready = jail.worktree.join("observer-ready");
     let finish = jail.worktree.join("observer-finish");
-    let corr=jail.submit_held_bash(json!({"command":format!("printf '%s' \"$TMPDIR\" > {}; while ! test -f {}; do sleep .02; done",quote(&ready),quote(&finish)),"timeout":30_000})).await;
+    let corr=jail.submit_held_bash(json!({"command":format!("printf '%s' \"$TMPDIR\" > {}; {}",quote(&ready),test_gate::gate(&quote(&finish), "sleep .02")),"timeout":30_000})).await;
     let temp = wait_test_file(&ready).await;
     let socket = Path::new(&temp).with_file_name(format!(
         "{}.gh-read.sock",

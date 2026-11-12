@@ -337,6 +337,32 @@ jobs:
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
           SUBC_CORE_WIRE_VERSION: "2"
 
+  unit-linux-real-daemon:
+    name: Real-daemon tool-provider tests (Linux)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 19
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: unit-linux-real-daemon
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-nextest
+      - name: Run ignored real-daemon tool-provider tests
+        run: bash scripts/ci-real-daemon-tests.sh
+
   plugin-e2e-linux:
     name: Plugin e2e (${{ matrix.suite }}, Linux)
     if: ${{ github.event_name != 'pull_request' }}

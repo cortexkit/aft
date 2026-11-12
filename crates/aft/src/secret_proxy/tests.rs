@@ -10,7 +10,9 @@ use secret_rules::location::Location;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::secret::vault::{AuditError, Material, MaterialError, Resolution};
+use crate::secret::vault::{AuditError, Material, UseAnswer};
+use crate::secret::{ApiKeyTarget, ReleasedApiKey};
+use secret_rules::location::LabelRule;
 
 const K1: &[u8] = b"test-key-12345678";
 const K2: &[u8] = b"rotated-key-987654321";
@@ -18,6 +20,7 @@ const MARKER: &str = "{{ck-secret:test}}";
 const SPECIAL: &[u8] = b"alpha&percent%quote\"slash\\\r\nkey";
 
 struct Vault {
+    rules: Mutex<HashMap<String, LabelRule>>,
     calls: AtomicUsize,
     denied: AtomicBool,
     rotate: AtomicBool,
@@ -33,6 +36,7 @@ struct Vault {
 impl Vault {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            rules: Mutex::default(),
             calls: AtomicUsize::new(0),
             denied: AtomicBool::new(false),
             rotate: AtomicBool::new(false),
@@ -48,17 +52,19 @@ impl Vault {
 }
 
 impl SecretVault for Vault {
-    fn resolve(&self, _: &SecretScope, _: &str) -> Resolution {
-        panic!("proxy must not resolve or file consent")
-    }
-    fn material(
-        &self,
-        scope: &SecretScope,
-        label: &str,
-        _: &str,
-    ) -> Result<Material, MaterialError> {
+    fn use_secret(&self, scope: &SecretScope, label: &str, target: &ApiKeyTarget) -> UseAnswer {
         assert_eq!(scope.reference(), "head");
         let count = self.calls.fetch_add(1, Ordering::SeqCst);
+        let Some(rule) = self.rules.lock().get(label).cloned() else {
+            return UseAnswer::NotFound;
+        };
+        if rule.host != target.host
+            || !(target.path == rule.path_prefix
+                || target.path.starts_with(&format!("{}/", rule.path_prefix)))
+        {
+            return UseAnswer::NotFound;
+        }
+        let location = crate::secret::vault::fake::location_text(&rule.location);
         if self.block_material.load(Ordering::Acquire) {
             self.material_entered.notify_one();
             let mut released = self.material_released.lock().unwrap();
@@ -68,18 +74,24 @@ impl SecretVault for Vault {
         }
         if self.denied.load(Ordering::SeqCst) || self.refused_label.lock().as_deref() == Some(label)
         {
-            return Err(MaterialError::GrantLapsed);
+            return UseAnswer::Unavailable;
         }
         if self.special.load(Ordering::SeqCst) {
-            return Ok(Material::new(SPECIAL.to_vec()));
+            return UseAnswer::Released(ReleasedApiKey::new(
+                location,
+                Material::new(SPECIAL.to_vec()),
+            ));
         }
-        Ok(Material::new(
-            if self.rotate.load(Ordering::SeqCst) && count > 0 {
-                K2
-            } else {
-                K1
-            }
-            .to_vec(),
+        UseAnswer::Released(ReleasedApiKey::new(
+            location,
+            Material::new(
+                if self.rotate.load(Ordering::SeqCst) && count > 0 {
+                    K2
+                } else {
+                    K1
+                }
+                .to_vec(),
+            ),
         ))
     }
     fn audit(&self, record: &secret_rules::audit::AuditRecordV1) -> Result<(), AuditError> {
@@ -99,25 +111,29 @@ fn scope(reference: &str) -> SecretScope {
 }
 
 fn config(vault: Arc<Vault>, port: u16, locations: &[(&str, Location)]) -> ProxyConfig {
+    *vault.rules.lock() = locations
+        .iter()
+        .map(|(label, location)| {
+            (
+                (*label).to_owned(),
+                LabelRule {
+                    label: (*label).to_owned(),
+                    host: "localhost".into(),
+                    port: 443,
+                    path_prefix: "/approved".into(),
+                    location: location.clone(),
+                },
+            )
+        })
+        .collect();
     ProxyConfig {
         vault,
         authorization_scope: scope("head"),
         lifetime_scope: scope("run"),
         scanned_labels: locations.iter().map(|(l, _)| (*l).to_owned()).collect(),
-        grants: locations
-            .iter()
-            .map(|(label, location)| GrantedLabel {
-                rule: LabelRule {
-                    label: (*label).to_owned(),
-                    host: "localhost".into(),
-                    port,
-                    path_prefix: "/approved".into(),
-                    location: location.clone(),
-                    grant_id: "grant".into(),
-                },
-                expires_at_ms: u64::MAX,
-            })
-            .collect(),
+        consent_context: None,
+        test_https_port: Some(port),
+        approval_clock: None,
         origin: "test-task".into(),
     }
 }
@@ -149,7 +165,12 @@ impl Server {
         let names = if mode == "wrong-name" {
             vec!["wrong.invalid".into()]
         } else {
-            vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]
+            vec![
+                "localhost".into(),
+                "127.0.0.1".into(),
+                "::1".into(),
+                "other.test".into(),
+            ]
         };
         let mut params = CertificateParams::new(names).unwrap();
         if mode == "expired" {
@@ -259,6 +280,25 @@ impl Server {
                                 .lock()
                                 .push(json!({"target":parts.uri.to_string(),"headers":fields,
                                 "body":String::from_utf8_lossy(&data)}));
+                            if mode == "redirect"
+                                && parts
+                                    .headers
+                                    .get("host")
+                                    .is_some_and(|v| v.as_bytes().starts_with(b"localhost:"))
+                            {
+                                let host = parts.headers["host"].to_str().unwrap();
+                                let port = host.rsplit_once(':').unwrap().1;
+                                let mut response = Response::new(full(Bytes::new()));
+                                *response.status_mut() = StatusCode::FOUND;
+                                response.headers_mut().insert(
+                                    "location",
+                                    HeaderValue::from_str(&format!(
+                                        "https://other.test:{port}/approved"
+                                    ))
+                                    .unwrap(),
+                                );
+                                return Ok::<_, std::convert::Infallible>(response);
+                            }
                             if let Some(upgrade) = upgrade {
                                 let mut response = Response::new(full(Bytes::new()));
                                 *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -674,6 +714,9 @@ fn client_child() {
 #[path = "audit_tests.rs"]
 mod audit_tests;
 
+#[path = "vault_tests.rs"]
+mod vault_tests;
+
 fn child_reply(line: &str) -> Option<Value> {
     // With a single test thread, libtest prefixes uncaptured output with the
     // test name on the same line. Only the following JSON is our IPC reply.
@@ -745,11 +788,19 @@ async fn proxy_h1_h2_locations_keepalive_authority_and_scanned_set() {
             server.seen.lock().last().unwrap()["headers"]["authorization"],
             format!("Bearer {MARKER}")
         );
+        assert!(
+            !proxy.state.headers_sensitive.load(Ordering::Acquire),
+            "an empty edit list must not report a sensitive-header substitution"
+        );
         assert_eq!(client.request("/approved/two", json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}), "{}")["status"], 200);
         let response = client.command(json!({"op":"request", "authority":"other.invalid", "path":"/approved", "headers":{"authorization":format!("Bearer {MARKER}")}}));
         assert_eq!(response["status"], 403, "{response}");
     }
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 16);
+    assert_eq!(
+        vault.calls.load(Ordering::SeqCst),
+        12,
+        "every present label is asked, including the two NotFound targets"
+    );
     proxy.stop();
     assert!(proxy.state.patterns.lock().is_empty());
 }
@@ -839,9 +890,10 @@ async fn proxy_literal_responses_only_gain_matchers_after_material() {
     );
     assert!(!after.to_string().contains(std::str::from_utf8(K1).unwrap()));
     assert_eq!(
-        server.seen.lock().last().unwrap()["headers"]["authorization"],
-        "Bearer {{ck-secret:from-file}}"
+        after["status"], 403,
+        "an unscanned header label is refused before dispatch"
     );
+    assert_eq!(server.seen.lock().len(), 2);
     assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -865,12 +917,16 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
     proxy.arm_command(client.process.id()).unwrap();
     client.connect(false);
     for body in [
-        r#"{"key":4}"#,
+        r#"{"key":4,"other":"{{ck-secret:json}}"}"#,
         r#"{"key":"{{ck-secret:json}}","key":"{{ck-secret:json}}"}"#,
     ] {
         assert_eq!(client.request("/approved", json!({"authorization":format!("Bearer {MARKER}"),"content-type":"application/json"}), body)["status"], 403);
     }
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        vault.calls.load(Ordering::SeqCst),
+        2,
+        "duplicate JSON structure refuses before asking; the valid JSON request reveals each location with its release"
+    );
     assert!(server.seen.lock().is_empty());
     *vault.refused_label.lock() = Some("json".into());
     let refused = client.request(
@@ -883,7 +939,7 @@ async fn proxy_atomic_json_and_material_refusals_send_nothing_upstream() {
         refused["body"],
         "Secret proxy refused the request: json (localhost)\n"
     );
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 4);
     assert!(server.seen.lock().is_empty());
     *vault.refused_label.lock() = None;
     assert_eq!(
@@ -986,18 +1042,16 @@ async fn proxy_websocket_scrubs_fragments_and_refuses_extensions_and_rsv() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_non_rule_connect_is_tunnelled_without_interception() {
+async fn proxy_non_https443_connect_is_tunnelled_without_interception() {
     let server = Server::new("echo-request").await;
     let vault = Vault::new();
-    let proxy = SecretProxy::start_with_tls(
-        config(
-            vault.clone(),
-            server.address.port(),
-            &[("test", Location::Bearer)],
-        ),
-        server.client_tls.clone(),
-    )
-    .unwrap();
+    let mut cfg = config(
+        vault.clone(),
+        server.address.port(),
+        &[("test", Location::Bearer)],
+    );
+    cfg.test_https_port = None;
+    let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
     let mut client = Client::spawn(&proxy, &server);
     proxy.arm_command(client.process.id()).unwrap();
     assert_eq!(
@@ -1251,15 +1305,15 @@ async fn proxy_query_and_json_escape_material_without_partial_header_writes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_expired_grant_refuses_without_material_and_tunnel_closes_on_stop() {
+async fn proxy_unavailable_release_refuses_and_tunnel_closes_on_stop() {
     let server = Server::new("echo-request").await;
     let vault = Vault::new();
-    let mut cfg = config(
+    let cfg = config(
         vault.clone(),
         server.address.port(),
         &[("test", Location::Bearer)],
     );
-    cfg.grants[0].expires_at_ms = 0;
+    vault.denied.store(true, Ordering::SeqCst);
     let mut proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
     let mut client = Client::spawn(&proxy, &server);
     proxy.arm_command(client.process.id()).unwrap();
@@ -1272,20 +1326,13 @@ async fn proxy_expired_grant_refuses_without_material_and_tunnel_closes_on_stop(
         )["status"],
         403
     );
-    assert_eq!(vault.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
     assert!(server.seen.lock().is_empty());
     assert_eq!(
         client.command(json!({"op":"connect","authority":server.address.to_string()}))["ok"],
         true
     );
-    assert_eq!(
-        client.request(
-            "/approved",
-            json!({"authorization":format!("Bearer {MARKER}")}),
-            ""
-        )["status"],
-        200
-    );
+    assert_eq!(client.command(json!({"op":"request", "authority":server.address.to_string(), "path":"/approved", "headers":{"authorization":format!("Bearer {MARKER}")}}))["status"], 200);
     proxy.process_tree_ended();
     assert_post_stop_connect_is_not_served(&proxy, server.address).await;
     assert_eq!(client.request("/approved", json!({}), "")["error"], true);
@@ -1393,30 +1440,24 @@ async fn proxy_requires_armed_session_token_and_canonical_connect_authority() {
 }
 
 #[test]
-fn proxy_only_accepts_grants_for_the_exact_launch_scan() {
+fn proxy_only_accepts_a_nonempty_unique_valid_launch_scan() {
     let vault = Vault::new();
     let make = || config(vault.clone(), 443, &[("test", Location::Bearer)]);
     let tls = rustls::ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
-    let mut cfg = make();
-    cfg.scanned_labels.clear();
-    assert_eq!(
-        SecretProxy::start_with_tls(cfg, tls.clone()).err(),
-        Some(ProxyError::InvalidRules)
-    );
-    let mut cfg = make();
-    cfg.scanned_labels.push("file-label".into());
-    assert_eq!(
-        SecretProxy::start_with_tls(cfg, tls.clone()).err(),
-        Some(ProxyError::InvalidRules)
-    );
-    let mut cfg = make();
-    cfg.grants[0].rule.location = Location::Header("Accept-Encoding".into());
-    assert_eq!(
-        SecretProxy::start_with_tls(cfg, tls).err(),
-        Some(ProxyError::InvalidRules)
-    );
+    for labels in [
+        vec![],
+        vec!["test".into(), "test".into()],
+        vec!["bad label".into()],
+    ] {
+        let mut cfg = make();
+        cfg.scanned_labels = labels;
+        assert_eq!(
+            SecretProxy::start_with_tls(cfg, tls.clone()).err(),
+            Some(ProxyError::InvalidRules)
+        );
+    }
 }
 
 /// A stopped proxy's listener is closed before `stop()` returns, so a fresh

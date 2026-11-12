@@ -1,7 +1,6 @@
 use super::*;
 use crate::protocol::RawRequest;
-use crate::secret::{Material, MaterialError, Resolution};
-use secret_rules::location::{LabelRule, Location};
+use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -12,6 +11,7 @@ mod audit_followups;
 struct Vault {
     resolves: AtomicUsize,
     materials: AtomicUsize,
+    #[cfg(unix)]
     port: u16,
     audits: Mutex<Vec<secret_rules::audit::AuditRecordV1>>,
     resolve_kinds: Mutex<Vec<String>>,
@@ -20,11 +20,14 @@ struct Vault {
 }
 
 impl Vault {
-    fn new(port: u16) -> Arc<Self> {
+    fn new(_port: u16) -> Arc<Self> {
+        #[cfg(unix)]
+        TEST_HTTPS_PORT.with(|slot| slot.set((_port != 0).then_some(_port)));
         Arc::new(Self {
             resolves: AtomicUsize::new(0),
             materials: AtomicUsize::new(0),
-            port,
+            #[cfg(unix)]
+            port: _port,
             audits: Mutex::new(Vec::new()),
             resolve_kinds: Mutex::new(Vec::new()),
             material_kinds: Mutex::new(Vec::new()),
@@ -36,13 +39,14 @@ impl Vault {
 const KEY: &[u8] = b"s4-test-api-key-0123456789";
 
 impl SecretVault for Vault {
-    fn resolve(&self, scope: &crate::secret::SecretScope, label: &str) -> Resolution {
+    fn use_secret(
+        &self,
+        scope: &crate::secret::SecretScope,
+        label: &str,
+        target: &ApiKeyTarget,
+    ) -> UseAnswer {
         #[cfg(unix)]
         {
-            assert!(
-                crate::secret_proxy::test_hardening::hardened_on_this_thread(),
-                "hardening must precede vault resolution"
-            );
             // The real limits change only in the audit tests' isolated child
             // processes; a shared test process keeps its limits.
             if std::env::var_os(crate::secret_proxy::test_hardening::REAL_ENV).is_some() {
@@ -64,25 +68,13 @@ impl SecretVault for Vault {
             .lock()
             .unwrap()
             .push(scope.kind().to_owned());
-        Resolution::Granted {
-            rule: LabelRule {
-                label: label.into(),
-                host: "localhost".into(),
-                port: self.port,
-                path_prefix: "/api".into(),
-                location: Location::Bearer,
-                grant_id: "grant".into(),
-            },
-            grant_id: "grant".into(),
-            expires_at_ms: u64::MAX,
+        if target.scheme != "https"
+            || target.host != "localhost"
+            || target.port != Some(443)
+            || target.path != "/api"
+        {
+            return UseAnswer::NotFound;
         }
-    }
-    fn material(
-        &self,
-        scope: &crate::secret::SecretScope,
-        label: &str,
-        grant_id: &str,
-    ) -> Result<Material, MaterialError> {
         self.materials.fetch_add(1, Ordering::SeqCst);
         assert_eq!(scope.reference(), "secret-bash");
         assert_eq!(scope.owner(), "reserved:prefrontal-core");
@@ -91,12 +83,14 @@ impl SecretVault for Vault {
             self.expected_epoch.load(Ordering::SeqCst)
         );
         assert_eq!(label, "test");
-        assert_eq!(grant_id, "grant");
         self.material_kinds
             .lock()
             .unwrap()
             .push(scope.kind().to_owned());
-        Ok(Material::new(KEY.to_vec()))
+        UseAnswer::Released(ReleasedApiKey::new(
+            "authorization_bearer".into(),
+            Material::new(KEY.to_vec()),
+        ))
     }
     fn audit(
         &self,
@@ -654,7 +648,10 @@ fn secret_bash_real_plan_precedence_and_untrusted_request_scope() {
     let reply = crate::subc::with_secret_identity_for_test(root.path(), stamp("head"), || {
         crate::commands::bash::handle(&req, &ctx)
     });
-    assert_eq!(code(&reply), Some("secrets_unavailable"));
+    assert!(
+        reply.success,
+        "an eligible launch does not ask an unavailable vault: {reply:?}"
+    );
     for key in PROXY_KEYS.iter().chain(REMOVE_KEYS.iter()) {
         let mut conflict = req.clone();
         conflict.params["params"]["env"] = json!({*key: "conflict"});
@@ -865,7 +862,7 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
             config.sandbox.profile.worker = mode;
         });
         let gate = root.path().join(format!("go-{index}"));
-        let command = format!("while [ ! -f '{}' ]; do sleep 0.05; done; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", gate.display(), vault.port, vault.port);
+        let command = format!("{}; test -n \"$HTTPS_PROXY\" && test \"$HTTPS_PROXY\" = \"$https_proxy\" && test \"$HTTP_PROXY\" = \"$http_proxy\" && test -z \"${{NO_PROXY+x}}\" && test -z \"${{no_proxy+x}}\" && test -z \"${{ALL_PROXY+x}}\" && test -z \"${{all_proxy+x}}\" || exit 70; printf 'proxy-env-ok\\n' >&2; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; curl --connect-timeout 5 --max-time 10 --silent --show-error --fail -H 'Authorization: Bearer {{{{ck-secret:test}}}}' https://localhost:{}/api; sleep 30", crate::test_gate::gate(&format!("'{}'", gate.display()), "sleep 0.05"), vault.port, vault.port);
         let command = format!(
             "python3 '{}' {} '{}' || exit 71; printf 'memory-and-bundle-ok\\n' >&2; {command}",
             memory_probe.display(),
@@ -907,8 +904,8 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
             .unwrap();
         assert_eq!(
             vault.resolves.load(Ordering::SeqCst),
-            index + 1,
-            "one resolve per distinct label, never per occurrence"
+            index * 2,
+            "launch asks nothing; each previous outgoing request asked once"
         );
         assert_eq!(
             seen.load(Ordering::SeqCst),
@@ -1012,7 +1009,7 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
     assert_eq!(vault.materials.load(Ordering::SeqCst), expected_requests);
     assert_eq!(
         *vault.resolve_kinds.lock().unwrap(),
-        ["worker", "head"].repeat(expected_requests / 4)
+        ["worker", "worker", "head", "head"].repeat(expected_requests / 4)
     );
     assert_eq!(
         *vault.material_kinds.lock().unwrap(),

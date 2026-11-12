@@ -112,10 +112,31 @@ fn directory_is_system_tree(directory: &Path) -> bool {
 /// directory scopes, which also exclude root-level containers.
 /// Unknown protected-directory identities must not admit background work.
 pub(crate) fn project_root_is_narrow(directory: &Path, home: &Path, volume: &Path) -> Option<bool> {
-    if !project_root_path_is_narrow(directory, home, volume) {
+    if !project_root_path_is_narrow(directory, home, volume)
+        || project_root_is_shared_temp(directory)
+    {
         return Some(false);
     }
     protected_directory_alias(directory, home, volume).map(|protected| !protected)
+}
+
+/// Shared temporary roots hold other applications' files on any mount layout.
+/// Compare canonical paths, not prefixes, so projects below them stay enabled.
+fn project_root_is_shared_temp(directory: &Path) -> bool {
+    let directory = crate::access_policy::policy_path(directory);
+    let platform_temp = std::env::temp_dir();
+    let roots = std::iter::once(platform_temp.as_path());
+    #[cfg(unix)]
+    let roots = roots.chain([
+        Path::new("/tmp"),
+        Path::new("/var/tmp"),
+        Path::new("/private/tmp"),
+        Path::new("/private/var/tmp"),
+    ]);
+    let shared = roots
+        .filter_map(|root| ProjectRootId::from_path(root).ok())
+        .any(|root| crate::access_policy::policy_path(&root.into_path_buf()) == directory);
+    shared
 }
 
 fn project_root_path_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
@@ -435,6 +456,74 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn platform_temp_root_is_broad_but_tempdir_projects_are_narrow() {
+        let root = super::ProjectRootId::from_path(&std::env::temp_dir())
+            .unwrap()
+            .into_path_buf();
+        assert!(super::project_root_is_shared_temp(&root));
+        let project = tempfile::tempdir().unwrap();
+        let project = project.path().canonicalize().unwrap();
+        assert!(!super::project_root_is_shared_temp(&project));
+        assert_eq!(
+            super::project_root_is_narrow(&root, &project, root.ancestors().last().unwrap()),
+            Some(false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_shared_temp_roots_use_canonical_identities() {
+        for name in ["/tmp", "/var/tmp"] {
+            let root = super::ProjectRootId::from_path(std::path::Path::new(name))
+                .unwrap()
+                .into_path_buf();
+            assert!(super::project_root_is_shared_temp(&root), "{name}");
+            assert!(!super::project_root_is_shared_temp(
+                &root.join("my-scratch-project")
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_private_temp_forms_and_platform_temp_are_broad() {
+        for name in [
+            std::path::PathBuf::from("/private/tmp"),
+            std::path::PathBuf::from("/private/var/tmp"),
+            std::env::temp_dir(),
+        ] {
+            let root = super::ProjectRootId::from_path(&name)
+                .unwrap()
+                .into_path_buf();
+            assert!(
+                super::project_root_is_shared_temp(&root),
+                "{}",
+                name.display()
+            );
+            assert_eq!(
+                super::project_root_is_narrow(&root, &root.join("home"), std::path::Path::new("/")),
+                Some(false)
+            );
+            assert!(!super::project_root_is_shared_temp(
+                &root.join("my-scratch-project")
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_temp_root_uses_the_canonical_platform_identity() {
+        let temp = std::env::temp_dir();
+        let root = super::ProjectRootId::from_path(&temp)
+            .unwrap()
+            .into_path_buf();
+        assert!(super::project_root_is_shared_temp(&root));
+        assert!(!super::project_root_is_shared_temp(
+            &root.join("my-scratch-project")
+        ));
+    }
+
+    #[test]
     fn project_root_volume_children_are_not_permission_scopes() {
         let volume = tempfile::tempdir().unwrap();
         let volume = volume.path().canonicalize().unwrap();
@@ -576,7 +665,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod mount_table {
         use super::super::{
-            mount_root_in, project_root_path_is_narrow, project_root_volume_with, MountRoot,
+            mount_root_in, project_root_is_shared_temp, project_root_path_is_narrow,
+            project_root_volume_with, MountRoot,
         };
         use std::path::{Path, PathBuf};
 
@@ -589,7 +679,25 @@ mod tests {
                 project_root_volume_with(root, root.to_path_buf(), Some(home), read, |_| {
                     Some(PathBuf::from("/"))
                 });
-            volume.is_some_and(|volume| project_root_path_is_narrow(root, home, &volume))
+            volume.is_some_and(|volume| {
+                project_root_path_is_narrow(root, home, &volume)
+                    && !project_root_is_shared_temp(root)
+            })
+        }
+
+        #[test]
+        fn shared_temp_roots_are_broad_on_bind_and_tmpfs_mounts() {
+            for root in ["/tmp", "/var/tmp"] {
+                assert!(!narrow(
+                    root,
+                    &format!("1801 1748 8:1 /tmp {root} rw - ext4 /dev/sda1 rw")
+                ));
+                assert!(!narrow(
+                    root,
+                    &format!("1801 1748 0:45 / {root} rw - tmpfs tmpfs rw")
+                ));
+                assert!(narrow(&format!("{root}/my-scratch-project"), &format!("1801 1748 8:1 /tmp/project {root}/my-scratch-project rw - ext4 /dev/sda1 rw")));
+            }
         }
 
         fn narrow(root: &str, mount: &str) -> bool {

@@ -111,10 +111,11 @@ fn bench_semantic_refresh_persistence_writes() {
         fs::create_dir_all(&semantic_dir).expect("create copied artifact directory");
         let data_path = semantic_dir.join("semantic.bin");
         fs::write(&data_path, &artifact).expect("copy semantic artifact");
-        fs::File::open(&data_path)
-            .expect("open copied artifact")
-            .sync_all()
-            .expect("sync copied artifact");
+        aft_store::sync::sync_all(
+            &fs::File::open(&data_path).expect("open copied artifact"),
+            &data_path,
+        )
+        .expect("sync copied artifact");
 
         let mut index = SemanticIndex::read_from_disk(&storage, "measured", &root, false, None)
             .expect("load copied semantic artifact");

@@ -336,12 +336,19 @@ fn queue_gated_worker_wait(
         }
     };
     let command = if cfg!(windows) {
-        format!("Set-Content -Path '{}' -Value started; while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 10 }}; Write-Output done", quote(&marker), quote(&release.0))
+        format!(
+            "Set-Content -Path '{}' -Value started; {}; Write-Output done",
+            quote(&marker),
+            crate::test_helpers::test_gate::powershell_gate(&release.0.to_string_lossy(), 10)
+        )
     } else {
         format!(
-            "printf started > '{}'; until [ -e '{}' ]; do sleep 0.01; done; printf 'done\\n'",
+            "printf started > '{}'; {}; printf 'done\\n'",
             quote(&marker),
-            quote(&release.0)
+            crate::test_helpers::test_gate::gate_exists(
+                &format!("'{}'", quote(&release.0)),
+                "sleep 0.01"
+            )
         )
     };
     aft.send_silent(

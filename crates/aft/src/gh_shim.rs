@@ -32,9 +32,12 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+pub(crate) mod manifest_sync;
+mod manifest_wire;
 mod native_guard;
 pub(crate) mod read_contract;
 mod rename_guard;
+mod ticket_repository;
 mod v22_rows;
 mod v23_queue;
 mod worker_reads;
@@ -3507,44 +3510,7 @@ pub(crate) fn seed_worker_state(root: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn ticket_repository_snapshot(project_root: &Path) -> Option<String> {
-    if !project_root.is_dir() {
-        return None;
-    }
-    let git = which::which("git").ok()?;
-    let command = || {
-        let mut command = Command::new(&git);
-        command.env_clear().env("GIT_CONFIG_NOSYSTEM", "1");
-        #[cfg(windows)]
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            command.env("SystemRoot", root);
-        }
-        command
-    };
-    let output = command()
-        .arg("-C")
-        .arg(project_root)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let common = PathBuf::from(std::str::from_utf8(&output.stdout).ok()?.trim());
-    if !common.is_absolute() {
-        return None;
-    }
-    // Read the primary repository's config, not a worktree-specific override.
-    // The resulting name is saved in the daemon's ticket registry before exec.
-    let output = command()
-        .args(["config", "--no-includes", "--file"])
-        .arg(common.join("config"))
-        .args(["--get", "remote.origin.url"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    canonical_repository_key(std::str::from_utf8(&output.stdout).ok()?.trim())
+    ticket_repository::snapshot(project_root)
 }
 
 /// The target's binding, else the checkout's.
@@ -4307,9 +4273,46 @@ fn load_manifest_with_trust_set(
     now: u64,
     trust_set: &[Option<ManifestTrustKey>],
 ) -> Result<VerifiedManifest, ManifestProblem> {
+    if !paths.root.exists() {
+        return Err(ManifestProblem::Missing);
+    }
+    let _acceptance_lock = manifest_acceptance_lock(paths)
+        .map_err(|_| ManifestProblem::Invalid("manifest acceptance lock unavailable".into()))?;
     let bytes = fs::read(&paths.manifest).map_err(|_| ManifestProblem::Missing)?;
     let envelope: SignedManifest = serde_json::from_slice(&bytes)
         .map_err(|error| ManifestProblem::Invalid(error.to_string()))?;
+    let verified = validate_manifest_candidate(paths, &envelope, now, trust_set)?;
+    let manifest = &verified.manifest;
+    if manifest.manifest_version > version_high_water(paths) {
+        write_version_high_water(paths, manifest.manifest_version);
+    }
+    write_last_valid_manifest(paths, manifest, &bytes);
+    retain_manifest(paths, &envelope, manifest.manifest_version);
+    Ok(verified)
+}
+
+// The daemon publisher and short-lived shim processes share this OS lock so a
+// newer acceptance cannot race a publisher's high-water check and rename.
+fn manifest_acceptance_lock(paths: &StatePaths) -> io::Result<crate::fs_lock::AdvisoryLockGuard> {
+    crate::private_storage::open_root(&paths.root)?;
+    let file = crate::private_storage::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.root.join("manifest-acceptance.lock"))?;
+    file.lock()?;
+    Ok(crate::fs_lock::AdvisoryLockGuard::from_locked_file(file))
+}
+
+// Sync preflights a candidate without changing any accepted state. The shim's
+// status and execution paths use this same verifier before recording acceptance.
+fn validate_manifest_candidate(
+    paths: &StatePaths,
+    envelope: &SignedManifest,
+    now: u64,
+    trust_set: &[Option<ManifestTrustKey>],
+) -> Result<VerifiedManifest, ManifestProblem> {
     if envelope.artifact_id != MANIFEST_ARTIFACT_ID {
         return Err(ManifestProblem::Invalid("artifact id mismatch".to_string()));
     }
@@ -4323,7 +4326,7 @@ fn load_manifest_with_trust_set(
     let VerifiedManifest {
         manifest,
         verified_by_key_id,
-    } = verify_manifest_envelope(&envelope, trust_set)?;
+    } = verify_manifest_envelope(envelope, trust_set)?;
     manifest.validate().map_err(ManifestProblem::Invalid)?;
     if manifest.schema_floor < SCHEMA_FLOOR {
         return Err(ManifestProblem::BelowFloor {
@@ -4347,18 +4350,6 @@ fn load_manifest_with_trust_set(
             ISSUED_AT_FUTURE_SKEW.as_secs()
         )));
     }
-    // Accepted: advance the high-water mark and refresh the last-valid cache
-    // that the regressed-manifest arm classifies from. Both are local state
-    // under the dormancy-valve argument documented above.
-    if manifest.manifest_version > newest_accepted {
-        write_version_high_water(paths, manifest.manifest_version);
-    }
-    write_last_valid_manifest(paths, &manifest, &bytes);
-    // Retain the exact verified bytes for later reproducibility checks. The
-    // signature already verified above; the admission filter re-checks that the
-    // version inside the verified payload matches the filing name. This never
-    // affects activation.
-    retain_manifest(paths, &envelope, manifest.manifest_version);
     Ok(VerifiedManifest {
         manifest,
         verified_by_key_id,
@@ -7493,7 +7484,7 @@ fn write_seam_state(paths: &StatePaths, state: SeamState) -> io::Result<()> {
     // A governed result is visible only after its self-report transition is
     // durable enough to survive a process exit. Failure stays on the seam path
     // and is surfaced as a refusal instead of falling through to real `gh`.
-    file.sync_data()?;
+    aft_store::sync::sync_data(&file, &temporary)?;
     fs::rename(temporary, &paths.seam_state)
 }
 
@@ -7835,7 +7826,7 @@ fn append_bypass_audit_record(paths: &StatePaths, record: &Value) -> io::Result<
     file.write_all(&record)?;
     // An operator bypass is allowed only after the audit record is durable enough
     // to survive a process replacement. If this returns an error we do not exec.
-    file.sync_data()
+    aft_store::sync::sync_data(&file, &paths.bypass_audit)
 }
 
 #[derive(Serialize)]

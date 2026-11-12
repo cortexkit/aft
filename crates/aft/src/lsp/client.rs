@@ -3738,9 +3738,12 @@ mod tests {
     fn dropping_reaped_leader_still_cleans_live_descendant() {
         let tmp = tempfile::tempdir().unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let script = "sh -c \"trap '' TERM; echo \\$$ > desc.pid; touch ready; exec sleep 60\" & while [ ! -f ready ]; do sleep 0.02; done; exit 0";
+        let script = format!(
+            "sh -c \"trap '' TERM; echo \\$$ > desc.pid; touch ready; exec sleep 60\" & {}; exit 0",
+            crate::test_gate::gate("ready", "sleep 0.02")
+        );
         let mut client = spawn_long_lived_client(
-            script,
+            &script,
             tx,
             LspChildRegistry::new(),
             tmp.path().to_path_buf(),

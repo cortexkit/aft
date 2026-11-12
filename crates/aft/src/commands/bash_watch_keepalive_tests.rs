@@ -27,7 +27,7 @@ impl QuietWatch {
         ));
         let spawn: RawRequest = serde_json::from_value(json!({
             "id":"quiet-child", "command":"bash", "session_id":SESSION,
-            "params":{"command":"while [ ! -f release ]; do sleep 0.02; done; exit 7", "background":true, "timeout":30_000}
+            "params":{"command":format!("{}; exit 7", crate::test_gate::gate("release", "sleep 0.02")), "background":true, "timeout":30_000}
         })).unwrap();
         let launched = crate::commands::bash::handle(&spawn, &ctx);
         assert!(launched.success, "{launched:?}");

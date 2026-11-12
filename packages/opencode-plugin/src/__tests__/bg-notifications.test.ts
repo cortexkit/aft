@@ -115,6 +115,34 @@ function findTraceEvent(eventName: string): Record<string, unknown> | undefined 
 }
 
 describe("OpenCode background notifications", () => {
+  test("PTY lost exit completion uses the approved line and real kills stay killed", () => {
+    const text = formatSystemReminder([
+      {
+        task_id: "bash-lost",
+        command: "interactive",
+        status: "fate_unknown",
+        exit_code: null,
+        duration_ms: 1000,
+        status_reason: "AFT could not read how it ended",
+      },
+    ]);
+    expect(text.split("\n")).toContain(
+      "Task bash-lost: exit status unknown (AFT could not read how it ended)",
+    );
+    expect(text).not.toContain("exit 137");
+    expect(text).not.toContain("killed");
+    expect(
+      formatSystemReminder([
+        {
+          task_id: "bash-killed",
+          command: "interactive",
+          status: "killed",
+          exit_code: 137,
+        },
+      ]),
+    ).toContain("- task bash-killed (killed)");
+  });
+
   test("failed memory-cap completion shows its reason without a capture warning", () => {
     const reason = "Command stopped: exceeded the 64 MiB memory cap (test enforcement).";
     expect(

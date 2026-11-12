@@ -80,6 +80,7 @@ pub fn normalize_structured_document(
         files: Vec::new(),
         reviews: Vec::new(),
         review_comment_sections: Vec::new(),
+        review_threads: None,
         base_ref_name: None,
         head_ref_name: None,
         review_decision: None,
@@ -219,6 +220,7 @@ fn comments_from(value: Option<&Value>) -> Vec<GithubComment> {
 
 fn comment_from(value: &Value) -> GithubComment {
     GithubComment {
+        id: value_string(value, "id"),
         author: actor_login(value.get("author")).or_else(|| value_string(value, "author")),
         body: value_string(value, "body").unwrap_or_default(),
         url: value_string(value, "url"),

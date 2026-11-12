@@ -4250,6 +4250,61 @@ fn consent_scope_unknown_alias_answer_is_not_memoized() {
     );
 }
 
+#[test]
+fn consent_scope_vanished_directory_is_info_once_even_after_memo_pruning() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("removed-scratch");
+    let grant = AccessGrant {
+        path: parent.join("first.txt"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        assert_eq!(directory_scope_with(&grant, |_, _| Some(false)), grant);
+        let mut state = DIRECTORY_SCOPE_PROBES.lock().unwrap();
+        state.last_pruned = Some(Instant::now() - DIRECTORY_SCOPE_MEMO_TTL);
+        drop(state);
+        let sibling = AccessGrant {
+            path: parent.join("second.txt"),
+            ..grant.clone()
+        };
+        assert_eq!(directory_scope_with(&sibling, |_, _| Some(false)), sibling);
+    });
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("INFO "), "{lines:?}");
+    assert!(lines[0].contains("directory does not exist"), "{lines:?}");
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        log_directory_scope_fallback(&parent, "home identity unknown");
+        log_directory_scope_fallback(&parent, "directory probe timed out");
+    });
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines.iter().all(|line| line.starts_with("WARN ")),
+        "{lines:?}"
+    );
+
+    let mut probes = DirectoryScopeProbes::default();
+    for index in 0..DIRECTORY_SCOPE_MISSING_LOG_CAP {
+        assert!(probes.note_fallback(&parent.join(index.to_string()), "directory does not exist"));
+        assert_eq!(probes.missing_logged.len(), index + 1);
+    }
+    assert!(!probes.note_fallback(&parent.join("0"), "directory does not exist"));
+    assert_eq!(probes.missing_logged.len(), DIRECTORY_SCOPE_MISSING_LOG_CAP);
+    assert!(probes.note_fallback(&parent.join("next"), "directory does not exist"));
+    assert_eq!(
+        probes.missing_logged.len(),
+        1,
+        "a new scope clears the full set"
+    );
+    assert!(probes.note_fallback(&parent.join("0"), "directory does not exist"));
+    assert_eq!(
+        probes.missing_logged.len(),
+        2,
+        "an older scope may log again"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn consent_scope_memo_expires_and_unsafe_answers_keep_each_file() {
@@ -7783,3 +7838,6 @@ fn standalone_approval_deadline_leaves_the_rerun_margin() {
         now
     );
 }
+#[cfg(unix)]
+#[path = "secret_fetch_cancellation_tests.rs"]
+mod secret_fetch_cancellation;

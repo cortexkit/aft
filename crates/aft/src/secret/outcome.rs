@@ -8,7 +8,7 @@
 //! already return for a held or refused call, plus two of its own.
 
 use super::eligibility::Ineligibility;
-use super::vault::{MaterialError, Resolution};
+use super::vault::UseAnswer;
 
 /// The reply code for a launch refused because its scope is not eligible
 /// . It outranks every vault answer, because an ineligible call never
@@ -98,15 +98,14 @@ pub fn refuse_ineligible(label: &str, reason: Ineligibility) -> LabelOutcome {
 }
 
 /// The outcome for one `resolve` answer.
-pub fn outcome_for(label: &str, resolution: &Resolution) -> LabelOutcome {
+pub fn outcome_for(label: &str, resolution: &UseAnswer) -> LabelOutcome {
     match resolution {
-        Resolution::Granted { .. } => LabelOutcome::Proceed,
-        Resolution::ApprovalRequired(request) => LabelOutcome::FileConsent {
+        UseAnswer::Released(_) | UseAnswer::NotFound => LabelOutcome::Proceed,
+        UseAnswer::ApprovalRequired(request) => LabelOutcome::FileConsent {
             request_id: request.request_id.clone(),
             statement_b64url: request.statement_b64url.clone(),
         },
-        Resolution::Denied { reason } => refuse(SECRET_REFUSED, label, reason),
-        Resolution::Unavailable => refuse(
+        UseAnswer::Unavailable => refuse(
             SECRETS_UNAVAILABLE,
             label,
             "no vault is connected in this build",
@@ -117,34 +116,18 @@ pub fn outcome_for(label: &str, resolution: &Resolution) -> LabelOutcome {
 /// The outcome after Cingulate answered but the vault still has not granted
 /// . Cingulate's answer alone never grants: the caller resolves again, and
 /// this is what a second pending or refused answer leaves.
-pub fn outcome_for_second_resolve(label: &str, resolution: &Resolution) -> LabelOutcome {
+pub fn outcome_for_second_use(label: &str, resolution: &UseAnswer) -> LabelOutcome {
     match resolution {
         // The vault answered at resolution time, which a re-resolve turns into
         // either a grant or a refusal, never a second pending ask: a second
         // `ApprovalRequired` means the vault is still waiting and nothing may
         // be substituted this run.
-        Resolution::ApprovalRequired(_) => refuse(
+        UseAnswer::ApprovalRequired(_) => refuse(
             SECRETS_UNAVAILABLE,
             label,
             "the vault is still waiting after the consent answer",
         ),
         other => outcome_for(label, other),
-    }
-}
-
-/// The outcome for a `material` call that failed at request time.
-///
-/// A lapsed grant is a refusal with no consent filed, because the proxy is
-/// already live and a fresh consent would not make this request legal.
-pub fn outcome_for_material(label: &str, error: &MaterialError) -> LabelOutcome {
-    match error {
-        MaterialError::GrantLapsed => refuse(
-            SECRET_REFUSED,
-            label,
-            "the grant expired or its scope ended",
-        ),
-        MaterialError::Unavailable { detail } => refuse(SECRETS_UNAVAILABLE, label, detail),
-        MaterialError::Refused { reason } => refuse(SECRET_REFUSED, label, reason),
     }
 }
 

@@ -27,6 +27,8 @@ dependencies = [
  "content_inspector",
  "flate2",
  "ignore",
+ "libc",
+ "log",
  "rayon",
  "regex",
  "regex-syntax",

@@ -1810,6 +1810,9 @@ pub(crate) struct DbWriteOrder {
     /// the count while it holds `state`, then writes only if the count has
     /// not moved since (see [`BgTaskRegistry::persist_task_checkpoint`]).
     json_writes: Mutex<u64>,
+    /// Durability already completed for the current metadata bytes. Shared by
+    /// all registries holding this task, including direct acknowledgement writes.
+    pub(super) metadata_sync: Mutex<Option<super::persistence::MetadataSync>>,
     #[cfg(test)]
     before_fenced_change: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -1834,7 +1837,7 @@ fn db_write_orders() -> &'static Mutex<HashMap<DbWriteOrderKey, std::sync::Weak<
 impl DbWriteOrder {
     /// The shared write order for a task, created on first use. Entries whose
     /// tasks are all gone are swept as the map grows.
-    fn for_task(session_id: &str, task_id: &str) -> Arc<Self> {
+    pub(super) fn for_task(session_id: &str, task_id: &str) -> Arc<Self> {
         let mut orders = db_write_orders()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1850,7 +1853,7 @@ impl DbWriteOrder {
         order
     }
 
-    fn lookup(session_id: &str, task_id: &str) -> Option<Arc<Self>> {
+    pub(super) fn lookup(session_id: &str, task_id: &str) -> Option<Arc<Self>> {
         db_write_orders()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3140,6 +3143,25 @@ impl BgTaskRegistry {
             }
             append_remote_report(&mut snapshot.output_preview, &state.metadata);
         }
+        #[cfg(unix)]
+        if let Some(runtime) = self
+            .inner
+            .secret_proxies
+            .lock()
+            .ok()
+            .and_then(|proxies| proxies.get(&task.task_id).cloned())
+        {
+            for line in runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .approval_status()
+            {
+                if !snapshot.output_preview.is_empty() {
+                    snapshot.output_preview.push('\n');
+                }
+                snapshot.output_preview.push_str(&line);
+            }
+        }
         snapshot
     }
 
@@ -3250,6 +3272,22 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         #[cfg(unix)]
         self.stop_secret_proxy(&task.task_id);
+        #[cfg(target_os = "linux")]
+        {
+            let marker = task.lock_state().ok().and_then(|state| {
+                (state.metadata.remote.is_none() || state.metadata.local_fallback_started).then(
+                    || {
+                        super::process::oom_priority_marker(
+                            state.metadata.sandbox_temp_dir.as_deref(),
+                            &task.paths.io_dir,
+                        )
+                    },
+                )
+            });
+            if let Some(marker) = marker {
+                super::process::observe_oom_priority_failure(&marker);
+            }
+        }
         self.settle_memory_accounting(task)?;
         #[cfg(test)]
         {
@@ -17974,6 +18012,11 @@ fn terminal_metadata_from_marker(
             terminal_exit_code_for_status(&BgTaskStatus::Killed),
             reason,
         ),
+        ExitMarker::Unknown => metadata.mark_terminal(
+            BgTaskStatus::FateUnknown,
+            None,
+            Some(super::PTY_EXIT_STATUS_UNKNOWN_REASON.to_owned()),
+        ),
     }
     metadata
 }
@@ -18302,6 +18345,9 @@ fn spawn_detached_child(
                 LocalIdentityGate::Required => "wait-for-identity",
                 LocalIdentityGate::CommittedFallback => "",
             }),
+            #[cfg(target_os = "linux")]
+            super::process::oom_priority_marker(spawn_plan.temp_dir(), &paths.io_dir)
+                .into_os_string(),
         ];
         #[cfg(target_os = "linux")]
         let (executable, args) = if linux_scope && !memory_gated {
@@ -20340,7 +20386,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let release = dir.path().join("release");
         let original = BgTaskRegistry::default();
-        let task_id = original.spawn_with_shell(SpawnPlan::Unsandboxed, &format!("sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true", release.display()), crate::bash_background::BashShell::Bash, PathBuf::from("/bin/bash"), "session".into(), dir.path().into(), HashMap::new(), crate::bash_background::HardKill::After(Duration::from_secs(30)), None, dir.path().into(), 10, true, false, Some(dir.path().into())).unwrap();
+        let task_id = original
+            .spawn_with_shell(
+                SpawnPlan::Unsandboxed,
+                &format!(
+                    "sh -c '{}; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true",
+                    crate::test_gate::gate(&format!("\"{}\"", release.display()), "sleep 0.01")
+                ),
+                crate::bash_background::BashShell::Bash,
+                PathBuf::from("/bin/bash"),
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                dir.path().into(),
+                10,
+                true,
+                false,
+                Some(dir.path().into()),
+            )
+            .unwrap();
         let paths = original.task(&task_id).unwrap().paths.clone();
         original.detach();
         drop(original);
@@ -21399,6 +21465,47 @@ mod tests {
 
         assert_eq!(terminal.status, BgTaskStatus::Killed);
         assert_eq!(terminal.exit_code, Some(137));
+    }
+
+    #[test]
+    fn pty_unknown_exit_marker_has_no_exit_code_and_preserves_real_kills() {
+        let mut metadata = PersistedTask::starting(
+            "bash-lost".to_string(),
+            "session".to_string(),
+            "interactive".to_string(),
+            PathBuf::from("."),
+            None,
+            None,
+            true,
+            true,
+        );
+        metadata.mode = BgMode::Pty;
+        let terminal = terminal_metadata_from_marker(metadata.clone(), ExitMarker::Unknown, None);
+        assert_eq!(terminal.status, BgTaskStatus::FateUnknown);
+        assert_eq!(terminal.exit_code, None);
+        assert_eq!(
+            crate::subc_format::format_bash_task_status_header(
+                &terminal.task_id,
+                "fate_unknown",
+                terminal.exit_code,
+                terminal.status_reason.as_deref(),
+            ),
+            "Task bash-lost: exit status unknown (AFT could not read how it ended)"
+        );
+        let killed =
+            terminal_metadata_from_marker(metadata, ExitMarker::Killed, Some("bash_kill".into()));
+        assert_eq!(killed.status, BgTaskStatus::Killed);
+        assert_eq!(killed.exit_code, Some(137));
+        assert_eq!(killed.status_reason.as_deref(), Some("bash_kill"));
+        assert_eq!(
+            crate::subc_format::format_bash_task_status_header(
+                &killed.task_id,
+                "killed",
+                killed.exit_code,
+                killed.status_reason.as_deref(),
+            ),
+            "Task bash-lost: killed (exit 137)"
+        );
     }
 
     #[test]
@@ -25980,7 +26087,7 @@ mod tests {
             // deferred by bash, the sleep is born after the signal, and it
             // outlives the trapped shell as a survivor this TERM-only kill
             // then waits for.
-            "trap 'echo trapped > trapped; while [ ! -e release ]; do sleep 0.01; done; exit 0' TERM\nsleep 30 & sleeper=$!\necho ready > ready\nwait $sleeper\nwhile :; do sleep 30 & wait $!; done\n").unwrap();
+            format!("trap 'echo trapped > trapped; {}; exit 0' TERM\nsleep 30 & sleeper=$!\necho ready > ready\nwait $sleeper\nwhile :; do sleep 30 & wait $!; done\n", crate::test_gate::gate_exists("release", "sleep 0.01"))).unwrap();
         let task_id =
             spawn_unsandboxed_for_kill_test(&registry, dir.path(), "bash child.sh & wait");
         let ready_deadline = Instant::now() + Duration::from_secs(10);
@@ -26238,7 +26345,10 @@ mod tests {
         let task_id = registry
             .spawn_pty(
                 SpawnPlan::Unsandboxed,
-                "/bin/sh -c 'while [ ! -f ready ]; do sleep 0.01; done; printf done'",
+                &format!(
+                    "/bin/sh -c '{}; printf done'",
+                    crate::test_gate::gate("ready", "sleep 0.01")
+                ),
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
@@ -26300,7 +26410,10 @@ mod tests {
         let task_id = registry
             .spawn_pty(
                 SpawnPlan::Unsandboxed,
-                "/bin/sh -c 'while [ ! -f ready ]; do sleep 0.01; done'",
+                &format!(
+                    "/bin/sh -c '{}'",
+                    crate::test_gate::gate("ready", "sleep 0.01")
+                ),
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
@@ -26659,8 +26772,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let finish = dir.path().join("finish");
             let command = format!(
-                "while [ ! -f '{}' ]; do sleep 0.01; done; exit {code}",
-                finish.display()
+                "{}; exit {code}",
+                crate::test_gate::gate(&format!("'{}'", finish.display()), "sleep 0.01")
             );
             let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), &command);
             let task = registry.task_for_test(&task_id).unwrap();
@@ -26915,9 +27028,9 @@ mod tests {
         let quote =
             |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
         let command = format!(
-            "printf 'spawn\\n' >> {}; while [ ! -e {} ]; do sleep 0.05; done",
+            "printf 'spawn\\n' >> {}; {}",
             quote(&spawn_marker),
-            quote(&stop_marker)
+            crate::test_gate::gate_exists(&quote(&stop_marker), "sleep 0.05")
         );
 
         let original = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
@@ -27714,7 +27827,7 @@ mod tests {
         let root = Path::new("/project");
         let durable = |command: &str| -> String {
             let ((), lines) = crate::logging::capture_log_lines(|| {
-                log_bash_spawn("bgb_test", 1, "session", root, command)
+                log_bash_spawn("bgb_0123456789", 1, "ses_abcDEF0123456789", root, command)
             });
             assert_eq!(lines.len(), 1, "{lines:?}");
             crate::log_redact::aft_redactor(&lines[0]).into_owned()
@@ -27723,12 +27836,24 @@ mod tests {
         // cut, too few for the GitHub token pattern to recognise.
         let cut_token_body = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
         let cut_token_command = format!("#{} ghp_{cut_token_body}", "x".repeat(179));
+        let inline_password = "Ab3dEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe";
+        assert_eq!(inline_password.len(), 43);
+        let inline_command = format!(
+            "cd /work/x/opencode PW={inline_password} curl -s -u \"opencode:$PW\" http://127.0.0.1:4599/api/status"
+        );
+        // Only ten value characters would survive a cut made before masking.
+        let cut_assignment = format!("#{} X={inline_password}", "x".repeat(186));
         let mut problems = Vec::new();
         for (command, secret) in [
             ("GITHUB_TOKEN=plainvalue123 gh api /user", "plainvalue123"),
             ("export OPENAI_API_KEY=plainvalue123", "plainvalue123"),
             ("export DB_PASSWORD='plain value 123'", "plain value 123"),
             ("PGPASSWORD=plainvalue123 psql -h db", "plainvalue123"),
+            ("PASS=plainvalue123 ./run", "plainvalue123"),
+            ("DB_PW=plainvalue123 ./run", "plainvalue123"),
+            ("DB_PASS=plainvalue123 ./run", "plainvalue123"),
+            (inline_command.as_str(), inline_password),
+            (cut_assignment.as_str(), &inline_password[..10]),
             (
                 "docker login --password plainvalue123 -u me",
                 "plainvalue123",
@@ -27750,11 +27875,25 @@ mod tests {
             "GIT_AUTHOR_NAME=Someone GH_SHIM_BYPASS=1 git commit -m x",
             "export GITHUB_TOKEN=$GH_TOKEN",
             "gcloud secrets versions access latest --secret=prod-db",
+            "PWD=/tmp/x SHA=3f2c9a1b7e4d5c6a8b9f0e1d2c3b4a5968778695 ./run",
+            "COUNT=12345678901234567 URL=https://example.com/a ./run",
         ] {
             let line = durable(command);
             if !line.ends_with(&format!("cmd={command}")) {
                 problems.push(format!("mangled: {line}"));
             }
+        }
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/log_redaction_cases.json"
+        ))
+        .unwrap();
+        let command_logs = fixture["command_logs"].as_array().unwrap();
+        assert!(!command_logs.is_empty());
+        for case in command_logs {
+            let input = case["input"].as_str().unwrap();
+            let (_, command) = input.split_once(" cmd=").unwrap();
+            let line = durable(command);
+            assert!(line.ends_with(case["expected"].as_str().unwrap()), "{line}");
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
@@ -29319,7 +29458,10 @@ mod tests {
         let go = storage.join("go");
         // The line break keeps LATE's line within the watch preview's mask cap;
         // LATE still arrives in the fourth 64 KiB scan chunk.
-        let command = format!("while [ ! -e '{}' ]; do sleep 0.01; done; head -c 196608 /dev/zero; printf '\\nLATE'; sleep 30", go.display());
+        let command = format!(
+            "{}; head -c 196608 /dev/zero; printf '\\nLATE'; sleep 30",
+            crate::test_gate::gate_exists(&format!("'{}'", go.display()), "sleep 0.01")
+        );
         let id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,

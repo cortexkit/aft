@@ -245,7 +245,8 @@ pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;
 pub(crate) use secret_consent::{
-    current_call_scopes, current_secret_audit_scope, resolve_current_secret_label, LaunchDecision,
+    current_call_scopes, current_fetch_reply_deadline, current_secret_audit_scope,
+    current_secret_consent_context, use_current_secret_labels, LaunchDecision,
 };
 mod standalone;
 #[doc(hidden)]
@@ -5462,6 +5463,7 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    let _manifest_sync = crate::gh_shim::manifest_sync::start(connection_file_path.to_path_buf());
     // Withdraw the macOS access cards earlier builds filed. It runs beside the
     // route loop, never before it: each withdrawal waits on Cingulate, and a
     // slow or absent Cingulate must not delay route binds.
@@ -10730,6 +10732,7 @@ impl PlainToolRun {
         }
         let run_spec = self.clone();
         let runtime = tokio::runtime::Handle::current();
+        let secret_scopes = Some(secret_consent::call_scopes(&self.identity));
         Box::new(move |ctx| {
             let PlainToolRun {
                 progress,
@@ -10791,6 +10794,10 @@ impl PlainToolRun {
                 io_budget
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(reply_deadline);
+            let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes);
+            let _secret_identity =
+                secret_consent::SecretIdentityGuard::install(identity_for_run.clone());
             // Translation resolves tool paths before dispatch. Keep the agent's
             // spelling for messages about folders a walk could not read, without
             // changing the translated paths.
@@ -12294,8 +12301,10 @@ async fn handle_tool_call_with_capabilities(
         // reads them through `SecretScopeGuard`, so a background command keeps
         // them for its whole life.
         let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
+        let fetch_reply_deadline = reply_budget.deadline;
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(fetch_reply_deadline);
             let _deferred_wake_scope = completion_wake.install();
             let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes.clone());
             let _secret_identity =
@@ -14628,10 +14637,13 @@ pub(crate) mod test_support {
             .bash_background()
             .spawn(
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
-                if case == "completion" {
-                    "while [ ! -f exit-ready ]; do sleep 0.05; done; echo terminal"
+                &if case == "completion" {
+                    format!(
+                        "{}; echo terminal",
+                        crate::test_gate::gate("exit-ready", "sleep 0.05")
+                    )
                 } else {
-                    "sleep 30"
+                    "sleep 30".to_string()
                 },
                 "polled-bash-session".into(),
                 dir.path().to_path_buf(),

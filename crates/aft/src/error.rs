@@ -100,7 +100,7 @@ impl fmt::Display for AftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AftError::DeniedFloor { path } => {
-                write!(f, "path '{}' is denied by the access policy floor", path)
+                f.write_str(&crate::access_policy::aft_storage_denial_message(path))
             }
             AftError::SymbolNotFound { name, file } => {
                 write!(f, "symbol '{}' not found in {}", name, file)

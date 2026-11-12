@@ -65,6 +65,54 @@ fn wait_done(registry: &BgTaskRegistry, id: &str) {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn linux_oom_priority_local_pipes_and_pty_raise_children_not_aft() {
+    let before = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let command = "IFS= read -r value < /proc/self/oom_score_adj; printf '%s\\n' \"$value\"; /bin/sh -c 'cat /proc/self/oom_score_adj'";
+    for background in [false, true] {
+        let id = spawn(&registry, root.path(), command, background);
+        wait_done(&registry, &id);
+        let task = registry.task(&id).unwrap();
+        assert_eq!(std::fs::read(&task.paths.stdout).unwrap(), b"1000\n1000\n");
+        assert_eq!(std::fs::read(&task.paths.stderr).unwrap(), b"");
+    }
+    let id = registry
+        .spawn_pty_with_shell(
+            SpawnPlan::Unsandboxed,
+            command,
+            super::super::BashShell::Bash,
+            PathBuf::from("/bin/bash"),
+            "spawn-contract".into(),
+            root.path().to_owned(),
+            HashMap::new(),
+            super::super::HardKill::After(Duration::from_secs(30)),
+            None,
+            root.path().to_owned(),
+            4,
+            false,
+            false,
+            Some(root.path().to_owned()),
+            24,
+            80,
+        )
+        .unwrap();
+    wait_done(&registry, &id);
+    let task = registry.task(&id).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&task.paths.pty)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "1000\n1000\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string("/proc/self/oom_score_adj").unwrap(),
+        before
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn linux_scope_preserves_shell_dollar_expressions() {
     const FIXTURE: &str = "AFT_TEST_SYSTEMD_SCOPE_FIXTURE";
     if let Some(root) = std::env::var_os(FIXTURE) {
@@ -248,8 +296,8 @@ fn bash_posix_spawn_zero_daemon_forks() {
             let release = dir.path().join(format!("release-{iteration}"));
             let command = if mode == "promoted" {
                 format!(
-                    "while [ ! -f '{}' ]; do sleep 0.01; done; printf spawn-ok",
-                    release.display()
+                    "{}; printf spawn-ok",
+                    crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.01")
                 )
             } else {
                 "printf spawn-ok".into()

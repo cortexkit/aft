@@ -2406,9 +2406,9 @@ async fn restart_recovers_shell_once(hold_running_record: bool) {
     let gate = root.join("after-create-gate");
     let wait = if hold_running_record {
         std::fs::write(&gate, b"hold").unwrap();
-        format!(
-            "while [ ! -f '{}' ]; do sleep 0.01; done",
-            release.display().to_string().replace('\'', "'\\''")
+        crate::test_helpers::test_gate::gate(
+            &format!("'{}'", release.display().to_string().replace('\'', "'\\''")),
+            "sleep 0.01",
         )
     } else {
         "sleep 2".to_string()

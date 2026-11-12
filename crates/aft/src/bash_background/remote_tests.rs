@@ -1019,7 +1019,11 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
         let counter = dir.path().join("executions");
         let release = dir.path().join("release");
         let _release_on_failure = ReleaseOnDrop(release.clone());
-        let command = format!("printf x >> '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done; printf entrypoint-proof", counter.display(), release.display());
+        let command = format!(
+            "printf x >> '{}'; {}; printf entrypoint-proof",
+            counter.display(),
+            crate::test_gate::gate(&format!("'{}'", release.display()), "/bin/sleep 0.01")
+        );
         if entry == "deferred-wait" {
             crate::subc::test_support::assert_deferred_wait_entrypoint(&command, &release).await;
             assert_eq!(
@@ -1564,8 +1568,10 @@ async fn assert_new_remote_changed_files(fallback: bool) {
             storage.path().join("remote-output.txt").display()
         )
     };
-    let command =
-        format!("{write}; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done");
+    let command = format!(
+        "{write}; {}",
+        crate::test_gate::gate_exists("\"$CHANGED_FILES_RELEASE\"", "sleep 0.01")
+    );
     let task_id = {
         let _capture = crate::bash_changed_files::scope(Some(capture.clone()));
         ctx.bash_background()
@@ -5202,6 +5208,74 @@ async fn exec_remote_bash_terminal_gap_keeps_outcome_when_attach_is_unavailable(
 }
 
 #[test]
+fn exec_remote_bash_unchanged_metadata_saves_and_progress_skip_syncs_then_recover() {
+    use crate::bash_background::persistence::work_counts;
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let started = Started::new(0, 123, 1);
+    sink.started(&started).unwrap();
+    let saved = fs::read(&paths.json).unwrap();
+    work_counts::reset();
+    const RECORDS: u64 = 300;
+    for _ in 0..RECORDS {
+        // Repeated persistence requests must not sync the same durable state.
+        sink.started(&started).unwrap();
+    }
+    let unchanged = work_counts::get();
+    assert_eq!(
+        (
+            unchanged.metadata_writes,
+            unchanged.renames,
+            unchanged.syncs
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(fs::read(&paths.json).unwrap(), saved);
+
+    // Freeze the checkpoint deadline so this measures only in-memory progress.
+    sink.last_progress_persist = Instant::now() + Duration::from_secs(60);
+    work_counts::reset();
+    for seq in 1..=RECORDS {
+        sink.output(seq, OutputStream::Stdout, b"progress\n")
+            .unwrap();
+    }
+    let progress = work_counts::get();
+    eprintln!(
+        "remote metadata: {RECORDS} unchanged saves: writes={} renames={} syncs={}; {RECORDS} progress records: writes={} renames={} syncs={}",
+        unchanged.metadata_writes, unchanged.renames, unchanged.syncs,
+        progress.metadata_writes, progress.renames, progress.syncs,
+    );
+    assert_eq!(
+        (progress.metadata_writes, progress.renames, progress.syncs),
+        (0, 0, 0)
+    );
+    assert_eq!(fs::read(&paths.json).unwrap(), saved);
+    drop(sink);
+    drop(task);
+    drop(registry);
+
+    let restarted = self::registry();
+    let disk = read_task(&paths.json).unwrap();
+    let expected = serde_json::to_value(&disk).unwrap();
+    restarted
+        .insert_rehydrated_task(disk, paths.clone(), false)
+        .unwrap();
+    let task = restarted.task(&task_id).unwrap();
+    let sink = TaskSink::new(&restarted, task.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&task.state.lock().unwrap().metadata).unwrap(),
+        expected
+    );
+    assert_eq!(sink.output_progress.last_seq, Some(0));
+    assert_eq!(sink.output_progress.stdout_len, 0);
+    assert_eq!(fs::metadata(&paths.stdout).unwrap().len(), 0);
+    assert_eq!(fs::read(&paths.json).unwrap(), saved);
+}
+
+#[test]
 fn exec_remote_bash_plain_output_has_no_per_record_durable_io() {
     use crate::bash_background::persistence::work_counts;
     let dir = tempfile::tempdir().unwrap();
@@ -6894,9 +6968,9 @@ async fn exec_remote_bash_double_restart_starts_local_fallback_once() {
     let release = dir.path().join("release");
     let _release_on_failure = ReleaseOnDrop(release.clone());
     let command = format!(
-        "printf x >> '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done",
+        "printf x >> '{}'; {}",
         counter.display(),
-        release.display()
+        crate::test_gate::gate(&format!("'{}'", release.display()), "/bin/sleep 0.01")
     );
     let (original, task_id, paths) =
         persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);
@@ -7023,8 +7097,8 @@ async fn exec_remote_bash_refusal_queue_wait_is_not_local_run_time() {
     let release = dir.path().join("release");
     let _release_on_failure = ReleaseOnDrop(release.clone());
     let command = format!(
-        "while [ ! -f '{}' ]; do /bin/sleep 0.01; done; printf budget-proof",
-        release.display()
+        "{}; printf budget-proof",
+        crate::test_gate::gate(&format!("'{}'", release.display()), "/bin/sleep 0.01")
     );
     let (original, task_id, paths) =
         persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);

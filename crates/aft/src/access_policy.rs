@@ -612,6 +612,10 @@ pub(crate) struct PolicyFloor {
     pub(crate) rule: FloorRule,
 }
 
+pub(crate) fn aft_storage_denial_message(path: impl std::fmt::Display) -> String {
+    format!("path '{path}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.")
+}
+
 #[derive(Debug, Clone)]
 pub struct AccessPolicy {
     pub roots: Vec<PathBuf>,
@@ -963,6 +967,49 @@ impl AccessPolicy {
                 // Public floor vectors also accept programmatically supplied denies.
                 rule: FloorRule::PolicyFloor,
             })
+    }
+
+    pub(crate) fn floor_denial_message(
+        &self,
+        operation: AccessOperation,
+        identity: &Path,
+        original: &Path,
+        owned_artifact: bool,
+    ) -> String {
+        if let Some(mut floor) = self.floor_for_path(operation, identity, owned_artifact) {
+            // A connection credential can sit below the broader module-data floor.
+            if matches!(
+                floor.rule,
+                FloorRule::CortexkitModuleData | FloorRule::CortexkitModuleState
+            ) && self.floor_rules.iter().any(|candidate| {
+                matches!(candidate.rule, FloorRule::SubcConnection)
+                    && floor_contains(identity, &candidate.path)
+            }) {
+                floor.rule = FloorRule::SubcConnection;
+            }
+            match floor.rule {
+                FloorRule::AftStorage => return aft_storage_denial_message(original.display()),
+                FloorRule::CortexkitModuleData | FloorRule::CortexkitModuleState => {
+                    // The resolved identity names the target module even through an alias.
+                    // Shared CortexKit roots have no module name and keep the generic refusal.
+                    if let Some(std::path::Component::Normal(module)) =
+                        identity.components().nth(floor.path.components().count())
+                    {
+                        let module = module.to_string_lossy();
+                        let path = original.display();
+                        return match floor.rule {
+                            FloorRule::CortexkitModuleData => format!("path '{path}' is in the {module} module's data folder. AFT's file tools never open it, because it can hold live databases. Use the {module} module's own commands, or ask the agent that owns it."),
+                            _ => format!("path '{path}' is in the {module} module's state folder. AFT's file tools never open it. Use the {module} module's own commands, or ask the agent that owns it."),
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        format!(
+            "path '{}' is denied by the access policy floor",
+            original.display()
+        )
     }
 
     #[cfg(unix)]
@@ -1506,6 +1553,40 @@ fn resolve_policy_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protected_folder_refusal_words_match_approved_table() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let home = policy_path(dir.path());
+        let storage = home.join(".local/share/cortexkit/aft");
+        let mut config = Config::default();
+        config.sandbox.read_deny.push(home.join("denied"));
+        let policy = AccessPolicy::from_config(&config, &storage, vec![], &home);
+        for (relative, expected) in [
+            (".local/share/cortexkit/synapse/memory.db", "path '<path>' is in the synapse module's data folder. AFT's file tools never open it, because it can hold live databases. Use the synapse module's own commands, or ask the agent that owns it."),
+            (".local/state/cortexkit/alfonso/state.json", "path '<path>' is in the alfonso module's state folder. AFT's file tools never open it. Use the alfonso module's own commands, or ask the agent that owns it."),
+            (".local/share/cortexkit/aft/aft.db", "path '<path>' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status."),
+            ("denied", "path '<path>' is denied by the access policy floor"),
+            (".ssh/id_ed25519", "path '<path>' is denied by the access policy floor"),
+            (".local/share/cortexkit/run/subc-connection.json", "path '<path>' is denied by the access policy floor"),
+            (".local/share/cortexkit", "path '<path>' is denied by the access policy floor"),
+            (".local/state/cortexkit", "path '<path>' is denied by the access policy floor"),
+        ] {
+            let identity = home.join(relative);
+            for operation in [AccessOperation::Read, AccessOperation::Write] {
+                assert_eq!(policy.decide(operation, &identity, false), AccessDecision::Deny(AccessDenial::Floor));
+                assert_eq!(policy.floor_denial_message(operation, &identity, &identity, false), expected.replace("<path>", &identity.display().to_string()));
+            }
+        }
+        let storage_path = storage.join("aft.db");
+        let error = crate::error::AftError::DeniedFloor {
+            path: storage_path.display().to_string(),
+        }
+        .to_error_json();
+        assert_eq!(error["code"], "denied_floor");
+        assert_eq!(error["message"], format!("path '{}' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status.", storage_path.display()));
+    }
+
     #[test]
     fn carrier_scope_grants_guard_is_nested_thread_local_and_unwind_safe() {
         use super::{scope_grants_denial, scope_grants_guard, ScopeGrantsDenial};

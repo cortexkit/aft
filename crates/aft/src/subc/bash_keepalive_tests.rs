@@ -59,7 +59,7 @@ impl WaitHarness {
             clock.corr,
             control_flags(),
             PROTOCOL_VERSION,
-            json!({"command":"while [ ! -f release ]; do sleep 0.02; done; exit 7", "wait":true, "timeout":timeout}),
+            json!({"command":format!("{}; exit 7", crate::test_gate::gate("release", "sleep 0.02")), "wait":true, "timeout":timeout}),
             Default::default(),
             BashWaitCancel {
                 keepalive: progress,

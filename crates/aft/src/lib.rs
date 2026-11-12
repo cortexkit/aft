@@ -197,6 +197,7 @@ pub mod secret_proxy;
 pub mod semantic_admission;
 pub mod semantic_index;
 pub mod setup_plan;
+pub(crate) mod shared_timer;
 pub(crate) mod stage_timer;
 pub mod standing_roots;
 pub(crate) mod status_push;
@@ -243,6 +244,8 @@ pub(crate) mod search_hot_path_measurements;
 pub(crate) mod test_allocations;
 #[cfg(test)]
 pub(crate) mod test_env;
+#[cfg(test)]
+pub(crate) mod test_gate;
 #[cfg(all(test, windows))]
 pub(crate) mod test_read_denial;
 #[cfg(test)]

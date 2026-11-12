@@ -173,7 +173,7 @@ impl DataSemantic {
         Self::from_state(checkout.meaning_status())
     }
 
-    fn from_state(state: MeaningState) -> Option<Self> {
+    pub(crate) fn from_state(state: MeaningState) -> Option<Self> {
         Some(match state {
             MeaningState::Off => return None,
             MeaningState::Unpublished => Self::NotServing(building(DATA_LAYER_BUILD_STAGE, None)),

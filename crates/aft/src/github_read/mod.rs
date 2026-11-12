@@ -14,6 +14,8 @@ mod model;
 mod normalize;
 mod render;
 mod resource;
+mod thread_text;
+mod threads;
 
 pub use attachments::{
     discover_github_image_urls, download_github_image_attachments, is_allowed_github_image_url,
@@ -35,7 +37,8 @@ pub use fetch::{
 };
 pub use model::{
     GithubComment, GithubDocument, GithubDocumentKind, GithubPullRequestFile, GithubReaction,
-    GithubReview, GithubReviewCommentSection, GithubTimelineEvent,
+    GithubReview, GithubReviewCommentSection, GithubReviewThread, GithubReviewThreads,
+    GithubTimelineEvent,
 };
 pub use normalize::{normalize_structured_document, normalize_timeline_events, NormalizeError};
 pub use render::{

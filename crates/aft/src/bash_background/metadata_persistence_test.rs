@@ -122,6 +122,8 @@ fn metadata_persistence_equal_checkpoint_keeps_durability_upgrade() {
     let storage = tempfile::tempdir().unwrap();
     let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
     let metadata = metadata(&task);
+    let _owner =
+        super::super::registry::DbWriteOrder::for_task(&metadata.session_id, &metadata.task_id);
     write_task_at_with(&task, &metadata, ReplaceSync::File).unwrap();
     work_counts::reset();
     write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
@@ -132,6 +134,89 @@ fn metadata_persistence_equal_checkpoint_keeps_durability_upgrade() {
         counts.syncs, 2,
         "equal bytes must not elide a durability upgrade"
     );
+    work_counts::reset();
+    write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    assert_eq!(work_counts::get().syncs, 0);
+}
+
+#[test]
+fn metadata_persistence_changed_checkpoint_invalidates_durable_memo() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let mut metadata = metadata(&task);
+    let _owner =
+        super::super::registry::DbWriteOrder::for_task(&metadata.session_id, &metadata.task_id);
+    write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    let original = metadata.clone();
+    metadata.command.push_str(" checkpoint");
+    write_task_at_with(&task, &metadata, ReplaceSync::File).unwrap();
+    write_task_at_with(&task, &original, ReplaceSync::File).unwrap();
+    work_counts::reset();
+    write_task_at_with(&task, &original, ReplaceSync::FileAndDirectory).unwrap();
+    assert_eq!(work_counts::get().syncs, 2);
+    assert_eq!(work_counts::get().renames, 0);
+}
+
+#[test]
+fn metadata_persistence_durable_memo_observes_other_writers_and_directories() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let metadata = metadata(&task);
+    let _owner =
+        super::super::registry::DbWriteOrder::for_task(&metadata.session_id, &metadata.task_id);
+    write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    let mut acknowledged = metadata.clone();
+    acknowledged.completion_delivered = true;
+    write_task_at_with(&task, &acknowledged, ReplaceSync::FileAndDirectory).unwrap();
+    work_counts::reset();
+    write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    assert_eq!(work_counts::get().renames, 1);
+    assert_eq!(work_counts::get().syncs, 2);
+
+    let other_storage = tempfile::tempdir().unwrap();
+    let other = create_task_layout(
+        other_storage.path(),
+        &metadata.session_id,
+        &metadata.task_id,
+    )
+    .unwrap();
+    // An equal file in a different store has not inherited this directory's sync.
+    write_task_at_with(&other, &metadata, ReplaceSync::File).unwrap();
+    work_counts::reset();
+    write_task_at_with(&other, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    assert_eq!(work_counts::get().renames, 0);
+    assert_eq!(work_counts::get().syncs, 2);
+}
+
+#[test]
+fn metadata_persistence_failed_directory_sync_does_not_seed_memo() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let mut metadata = metadata(&task);
+    let owner =
+        super::super::registry::DbWriteOrder::for_task(&metadata.session_id, &metadata.task_id);
+    write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    metadata.command.push_str(" changed");
+    with_task_io_fault(TaskIoFault::SyncFailureAfter(1), || {
+        write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory)
+    })
+    .unwrap_err();
+    work_counts::reset();
+    write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    assert_eq!(
+        work_counts::get().syncs,
+        2,
+        "retry must finish the failed directory sync"
+    );
+    assert_eq!(work_counts::get().renames, 0);
+    drop(owner);
+    work_counts::reset();
+    write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    assert_eq!(
+        work_counts::get().syncs,
+        2,
+        "an unowned record has no durability memo"
+    );
 }
 
 #[test]
@@ -140,6 +225,8 @@ fn metadata_persistence_shortcut_sync_failure_retries_durable_replacement() {
         let storage = tempfile::tempdir().unwrap();
         let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
         let metadata = metadata(&task);
+        let _owner =
+            super::super::registry::DbWriteOrder::for_task(&metadata.session_id, &metadata.task_id);
         write_task_at_with(&task, &metadata, ReplaceSync::File).unwrap();
         work_counts::reset();
         with_task_io_fault(TaskIoFault::SyncFailureAfter(failed_sync), || {

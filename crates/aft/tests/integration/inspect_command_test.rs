@@ -2578,6 +2578,10 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
     assert_eq!(runs(), 1, "warm inspect must not run cargo twice");
     ctx.lsp().shutdown_all();
     drop(ctx);
+    // The inspection response can return before the disk-cache write finishes.
+    // A cold manager can reuse the record only after that write becomes visible.
+    wait_for_completed_rust_check(storage.path(), 1, || {})
+        .expect("persist the borrow-check report");
 
     let ctx = make_context();
     let restarted = crate::helpers::inspect_retrying_cold_deadline(|| {
@@ -2595,7 +2599,13 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
         "persisted report missing: {restarted:#}"
     );
     assert_eq!(runs(), 1, "cold manager must reuse the persisted check");
-    std::fs::write(&lib, "include!(concat!(\"\", \"borrow.rs\"));\n").unwrap();
+    // Direct concat! includes are fingerprinted. Forwarding a computed expr
+    // through a local macro still requires a provisional compiler report.
+    std::fs::write(
+        &lib,
+        "macro_rules! include_file { ($path:expr) => { include!($path); }; }\ninclude_file!(concat!(\"bor\", \"row.rs\"));\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("src/borrow.rs"),
         "pub fn f() { let s = String::new(); let moved = s; println!(\"{}\", s); drop(moved); }\n",

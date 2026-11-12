@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/external_disk_check.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "Remove the unused unbounded legacy trigram builder, capped lexical-ranking API, memory accounting, saved-index reconciliation and its semantic recorded-stat accessor. Published external repositories already use ExternalSearch's index-store checkout at this base. Preserve unpublished external plain-query walks and the bounded explicit-pattern/query+pattern corpus; specialize its disk collector to the empty corpus its sole production caller supplies. Candidate selection, score formulas, source-first admission, deadlines and public coverage fields remain unchanged. Remove constant-None legacy snapshot branches from ranking and glob. The 300-query interleaved cross-repository replay uses a frozen second AFT checkout; ranked paths and counts must remain identical. No ranking or count difference is waived. Full legacy module deletion is deferred because changing the unpublished pattern fallback requires a separate design decision."
+}

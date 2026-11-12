@@ -18,6 +18,7 @@ pub(super) struct IdleIo<T> {
     inner: T,
     timeout: Duration,
     timer: Pin<Box<Sleep>>,
+    approval_waits: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl<T> IdleIo<T> {
@@ -26,9 +27,28 @@ impl<T> IdleIo<T> {
             inner,
             timeout,
             timer: Box::pin(tokio::time::sleep(timeout)),
+            approval_waits: None,
         }
     }
+    pub(super) fn with_approval_waits(
+        mut self,
+        waits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.approval_waits = Some(waits);
+        self
+    }
     fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        // A held approval has its own ten-minute deadline. Quiet sockets must
+        // remain usable long enough to return the card's result to the client.
+        if self
+            .approval_waits
+            .as_ref()
+            .is_some_and(|waits| waits.load(std::sync::atomic::Ordering::Acquire) != 0)
+        {
+            let _ = self.timer.as_mut().poll(cx);
+            self.touch();
+            return false;
+        }
         self.timer.as_mut().poll(cx).is_ready()
     }
     fn touch(&mut self) {

@@ -15,7 +15,6 @@ fn rule(location: Location) -> LabelRule {
         port: 443,
         path_prefix: "/v1".to_string(),
         location,
-        grant_id: "grant-1".to_string(),
     }
 }
 

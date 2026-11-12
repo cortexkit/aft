@@ -209,7 +209,7 @@ fn spawn_io_load(
                 }
                 written.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
-            let _ = file.sync_data();
+            let _ = aft_store::sync::sync_data(&file, &path);
         }
         let _ = std::fs::remove_file(&path);
     })

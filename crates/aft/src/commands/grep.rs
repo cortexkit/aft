@@ -516,7 +516,16 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    Response::success(&req.id, body)
+    let mut response = Response::success(&req.id, body);
+    if matches!(result.index_status, crate::search_index::IndexStatus::Ready) {
+        let roots = scope
+            .roots
+            .iter()
+            .map(|root| root.search_root.clone())
+            .collect::<Vec<_>>();
+        crate::data_layer::surfaces::disclose_index_gaps(ctx, &roots, &mut response);
+    }
+    response
 }
 
 /// `{"trigram": {status, reason}}` for grep/glob responses, from the shared

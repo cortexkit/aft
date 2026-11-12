@@ -327,9 +327,103 @@ impl Runner {
 /// When a failed build is tried again.
 #[derive(Default)]
 struct BuildRetry {
-    /// No build starts before this; a waiting thread starts one then.
+    /// No build starts before this; a shared deadline starts one then.
     at: Option<Instant>,
     in_a_row: u32,
+    timer: Option<crate::shared_timer::Timer>,
+}
+
+/// A scheduled lane pause has one clock and one wakeup, regardless of how
+/// many checkouts are waiting for that embedding model.
+#[derive(Default)]
+struct FillPauses(std::collections::HashMap<String, FillPause>);
+
+struct FillPause {
+    pause: crate::synapse_embed::LanePause,
+    at: Instant,
+    waiters: std::collections::HashMap<PathBuf, Weak<Work>>,
+}
+
+impl FillPauses {
+    /// Returns true when the lane needs its first wakeup thread.
+    fn record(
+        &mut self,
+        mut pause: crate::synapse_embed::LanePause,
+        now_ms: u64,
+        now: Instant,
+    ) -> bool {
+        if pause.paused_until_ms == 0 {
+            if self.0.get(&pause.lane_id).is_some_and(|entry| {
+                now < entry.at
+                    && entry.pause.reason == pause.reason
+                    && entry.pause.retry_after_ms == pause.retry_after_ms
+            }) {
+                return false;
+            }
+            pause.paused_until_ms = now_ms.saturating_add(pause.retry_after_ms.unwrap_or(0));
+        }
+        let at = now + Duration::from_millis(pause.paused_until_ms.saturating_sub(now_ms));
+        let first = !self.0.contains_key(&pause.lane_id);
+        let entry = self
+            .0
+            .entry(pause.lane_id.clone())
+            .or_insert_with(|| FillPause {
+                pause: pause.clone(),
+                at,
+                waiters: Default::default(),
+            });
+        if first
+            || entry.pause.paused_until_ms != pause.paused_until_ms
+            || entry.pause.reason != pause.reason
+        {
+            crate::slog_info!(
+                "data layer meaning fill paused: lane={} until_ms={} reason={}",
+                pause.lane_id,
+                pause.paused_until_ms,
+                pause.reason
+            );
+            entry.at = at;
+            entry.pause = pause;
+        }
+        first
+    }
+
+    fn park(&mut self, lane: &str, root: &Path, work: Weak<Work>, now: Instant) -> bool {
+        let Some(entry) = self.0.get_mut(lane).filter(|entry| now < entry.at) else {
+            return false;
+        };
+        crate::synapse_embed::share_lane_pause(root, &entry.pause);
+        entry.waiters.insert(root.to_path_buf(), work);
+        true
+    }
+}
+
+fn fill_pauses() -> &'static parking_lot::Mutex<FillPauses> {
+    static PAUSES: OnceLock<parking_lot::Mutex<FillPauses>> = OnceLock::new();
+    PAUSES.get_or_init(Default::default)
+}
+
+static FILL_PAUSE_CHANGED: parking_lot::Condvar = parking_lot::Condvar::new();
+
+fn wake_paused_fills(lane: String) {
+    loop {
+        let waiters = {
+            let mut pauses = fill_pauses().lock();
+            let Some(entry) = pauses.0.get(&lane) else {
+                return;
+            };
+            let wait = entry.at.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                FILL_PAUSE_CHANGED.wait_for(&mut pauses, wait);
+                continue;
+            }
+            pauses.0.remove(&lane).unwrap().waiters
+        };
+        for work in waiters.into_values().filter_map(|work| work.upgrade()) {
+            work.start_fill();
+        }
+        return;
+    }
 }
 
 /// A checkout and the state of its background work, shared by the work
@@ -337,6 +431,7 @@ struct BuildRetry {
 struct Work {
     checkout: Arc<Checkout>,
     runner: Runner,
+    stopped: AtomicBool,
     /// A build is queued or running.
     building: Arc<AtomicBool>,
     /// A fold of the checkout's segments is queued or running.
@@ -357,6 +452,8 @@ struct Work {
     /// Told when a build, refresh or fill round ends (see
     /// [`DataCheckout::on_status_change`]).
     status_listener: std::sync::Mutex<Option<StatusListener>>,
+    #[cfg(test)]
+    status_summary_paused: std::sync::Mutex<bool>,
     /// Meaning search: its vector plane and the fill that embeds for it.
     meaning: Meaning,
     /// A fill round is queued or running.
@@ -400,9 +497,12 @@ impl Work {
     /// Starts a build unless one is queued or running, or a failed one is
     /// waiting to be tried again. A build that fails is tried again after a
     /// wait that doubles each time, until one succeeds or the checkout is
-    /// dropped; the wait is a sleeping thread, never an executor worker.
+    /// dropped; the wait uses the shared timer, never an executor worker.
     /// Returns whether this call queued a build, so its cause is logged once.
     fn start_build(self: &Arc<Self>) -> bool {
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
         {
             let retry = self
                 .retry
@@ -416,8 +516,14 @@ impl Work {
             return false;
         }
         let flag = ClearOnDrop(Arc::clone(&self.building));
+        let Some(reservation) = self.checkout.reserve_build() else {
+            return false;
+        };
         let work = Arc::clone(self);
         self.runner.run(BUILD_REQUEST, Pool::Build, move || {
+            if work.stopped.load(Ordering::Acquire) {
+                return;
+            }
             #[cfg(test)]
             while build_holds_for_test()
                 .lock()
@@ -426,7 +532,7 @@ impl Work {
             {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let result = work.checkout.build();
+            let result = work.checkout.build_reserved(false, reservation);
             drop(flag);
             work.checkout.notify_readiness_change();
             if !matches!(result, Err(DataError::Cancelled)) {
@@ -464,15 +570,16 @@ impl Work {
     }
 
     fn retry_build_later(self: &Arc<Self>, error: &DataError) {
-        let wait = {
+        let (wait, at) = {
             let mut retry = self
                 .retry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             retry.in_a_row += 1;
             let wait = backoff(BUILD_RETRY, BUILD_RETRY_MAX, retry.in_a_row);
-            retry.at = Some(Instant::now() + wait);
-            wait
+            let at = Instant::now() + wait;
+            retry.at = Some(at);
+            (wait, at)
         };
         crate::slog_warn!(
             "data layer build failed for {} (trying again in {} s): {error}",
@@ -480,14 +587,20 @@ impl Work {
             wait.as_secs()
         );
         let weak = Arc::downgrade(self);
-        let _ = std::thread::Builder::new()
-            .name("aft-data-build-retry".to_string())
-            .spawn(move || {
-                std::thread::sleep(wait);
-                if let Some(work) = weak.upgrade() {
-                    work.start_build();
-                }
-            });
+        let timer = crate::shared_timer::Timer::at(at, move || {
+            if let Some(work) = weak.upgrade() {
+                work.start_build();
+            }
+            None
+        })
+        .ok();
+        let mut retry = self
+            .retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.stopped.load(Ordering::Acquire) {
+            retry.timer = timer;
+        }
     }
 
     /// Resolves the call graph again until no recorded change is pending,
@@ -496,6 +609,9 @@ impl Work {
     /// ending, by the check after it lets go of the flag. A refresh that
     /// finds the stored call graph damaged starts a build, which replaces it.
     fn start_refresh(self: &Arc<Self>, publish: Publish) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         if !self.checkout.planes().callgraph {
             // Without a call graph there is nothing to resolve: the changes
             // laid over the text index are folded in by a text-only build,
@@ -515,6 +631,9 @@ impl Work {
             let mut requested = self.publish_requested.lock();
             *requested = (*requested).max(publish);
         }
+        if self.checkout.is_building() {
+            return;
+        }
         if self.refreshing.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -524,13 +643,28 @@ impl Work {
         // runs beside the root's reads and edits, one at a time per root
         // (the `refreshing` flag), in the refresh pool.
         self.runner.run(REFRESH_REQUEST, Pool::Refresh, move || {
+            if work.stopped.load(Ordering::Acquire) {
+                return;
+            }
             let mut flag = Some(flag);
             loop {
                 let result = work.checkout.refresh_callgraph();
+                if work.checkout.is_building() {
+                    return;
+                }
                 if !matches!(result, Ok(None) | Err(DataError::Cancelled)) {
                     work.notify_status_change();
                 }
                 if matches!(result, Ok(Some(_))) {
+                    if result
+                        .as_ref()
+                        .is_ok_and(|stats| stats.as_ref().is_some_and(|stats| stats.cold_build))
+                    {
+                        // A cold fallback already published its content, just
+                        // as start_build does, so semantic search can embed and
+                        // index the newly published content.
+                        work.start_fill();
+                    }
                     continue;
                 }
                 match &result {
@@ -838,7 +972,13 @@ impl Work {
     /// them. A failed round is tried again after a wait that doubles each
     /// time, as a failed build is.
     fn start_fill(self: &Arc<Self>) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         if !self.meaning.enabled() || self.meaning.reads_only() {
+            return;
+        }
+        if self.park_for_lane_pause() {
             return;
         }
         {
@@ -856,8 +996,17 @@ impl Work {
         let flag = ClearOnDrop(Arc::clone(&self.filling));
         let work = Arc::clone(self);
         self.runner.run(FILL_REQUEST, Pool::Fill, move || {
-            if crate::executor::current_job_cancelled() {
+            if work.stopped.load(Ordering::Acquire) || crate::executor::current_job_cancelled() {
                 // Runs again when the root is bound and a search asks.
+                return;
+            }
+            // Another root may have learned of the pause while this job
+            // waited for a place in the process-wide fill pool.
+            if work.park_for_lane_pause() {
+                drop(flag);
+                // If the pause ended just as this job parked, its wakeup
+                // may have seen the running flag. Recheck after releasing it.
+                work.start_fill();
                 return;
             }
             let round = work.meaning.round(&work.checkout);
@@ -886,15 +1035,44 @@ impl Work {
     }
 
     fn retry_fill_later(self: &Arc<Self>, error: &str) {
-        let wait = {
+        if let Some(pause) = crate::synapse_embed::LanePause::from_error(error)
+            .filter(|pause| pause.cause == crate::synapse_embed::PauseCause::LanePaused)
+        {
+            let lane = pause.lane_id.clone();
+            let first = {
+                let mut pauses = fill_pauses().lock();
+                let first = pauses.record(
+                    pause,
+                    crate::semantic_index::unix_millis_now(),
+                    Instant::now(),
+                );
+                // Also keep a waiter when an already-expired pause was returned:
+                // the lane's wakeup will start it immediately.
+                let entry = pauses.0.get_mut(&lane).unwrap();
+                crate::synapse_embed::share_lane_pause(self.checkout.root(), &entry.pause);
+                entry
+                    .waiters
+                    .insert(self.checkout.root().to_path_buf(), Arc::downgrade(self));
+                first
+            };
+            FILL_PAUSE_CHANGED.notify_all();
+            if first {
+                let _ = std::thread::Builder::new()
+                    .name("aft-data-lane-resume".to_string())
+                    .spawn(move || wake_paused_fills(lane));
+            }
+            return;
+        }
+        let (wait, at) = {
             let mut retry = self
                 .fill_retry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             retry.in_a_row += 1;
             let wait = backoff(BUILD_RETRY, BUILD_RETRY_MAX, retry.in_a_row);
-            retry.at = Some(Instant::now() + wait);
-            wait
+            let at = Instant::now() + wait;
+            retry.at = Some(at);
+            (wait, at)
         };
         crate::slog_warn!(
             "data layer meaning fill failed for {} (trying again in {} s): {error}",
@@ -902,19 +1080,49 @@ impl Work {
             wait.as_secs()
         );
         let weak = Arc::downgrade(self);
-        let _ = std::thread::Builder::new()
-            .name("aft-data-fill-retry".to_string())
-            .spawn(move || {
-                std::thread::sleep(wait);
-                if let Some(work) = weak.upgrade() {
-                    work.start_fill();
-                }
-            });
+        let timer = crate::shared_timer::Timer::at(at, move || {
+            if let Some(work) = weak.upgrade() {
+                work.start_fill();
+            }
+            None
+        })
+        .ok();
+        let mut retry = self
+            .fill_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.stopped.load(Ordering::Acquire) {
+            retry.timer = timer;
+        }
+    }
+
+    fn park_for_lane_pause(self: &Arc<Self>) -> bool {
+        self.meaning.synapse_lane().is_some_and(|lane| {
+            fill_pauses().lock().park(
+                &lane,
+                self.checkout.root(),
+                Arc::downgrade(self),
+                Instant::now(),
+            )
+        })
     }
 
     /// Tells the status listener, if any, that the checkout's status may
     /// have changed.
     fn notify_status_change(&self) {
+        // Build coverage on its producer, before announcing the new view. A
+        // push only consumes a cache entry for the exact view/generation pair.
+        #[cfg(test)]
+        let paused = self.status_summary_paused.lock().unwrap();
+        #[cfg(test)]
+        let prepare = !*paused;
+        #[cfg(not(test))]
+        let prepare = true;
+        if prepare {
+            self.meaning.state(self.checkout.view().as_ref());
+        }
+        #[cfg(test)]
+        drop(paused);
         self.checkout.notify_readiness_change();
         let listener = self
             .status_listener
@@ -944,16 +1152,30 @@ pub(crate) struct DataCheckout {
     /// The last memory figure the census walked for this checkout, and when
     /// (see [`Self::memory_figure`]).
     memory_figure: std::sync::Mutex<Option<(Instant, u64, super::surfaces::DataLayerMemory)>>,
+    disk_measurement: Arc<super::surfaces::DiskMeasurement>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
 }
 
 impl Drop for DataCheckout {
-    // An evicted checkout must not leave its quiet-timer thread asleep for
-    // up to `QUIET`: its refresh would find nothing to refresh anyway.
+    // An evicted checkout must not dispatch delayed work even if an in-flight
+    // pool job still holds Work alive.
     fn drop(&mut self) {
+        self.work.stopped.store(true, Ordering::Release);
         self.quiet.stop();
         self.work.settle.stop();
+        self.work
+            .retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .timer
+            .take();
+        self.work
+            .fill_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .timer
+            .take();
     }
 }
 
@@ -1061,6 +1283,7 @@ impl DataCheckout {
             }
         };
         let work = Arc::new_cyclic(|weak: &Weak<Work>| Work {
+            stopped: AtomicBool::new(false),
             runner: Runner {
                 root: checkout.root().to_path_buf(),
                 executor: parking_lot::Mutex::new(executor),
@@ -1086,6 +1309,8 @@ impl DataCheckout {
             rescanning: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),
             status_listener: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            status_summary_paused: std::sync::Mutex::new(false),
             meaning: Meaning::new(storage),
             filling: Arc::new(AtomicBool::new(false)),
             fill_retry: std::sync::Mutex::default(),
@@ -1113,6 +1338,9 @@ impl DataCheckout {
         // A bind may have recorded what changed while nothing watched.
         work.catch_up(Publish::WhenMany);
         let checkout = Arc::new(Self {
+            disk_measurement: super::surfaces::DiskMeasurement::for_family(
+                work.checkout.family_dir(),
+            ),
             work,
             quiet,
             bound_once: AtomicBool::new(false),
@@ -1137,6 +1365,11 @@ impl DataCheckout {
     #[must_use]
     pub(crate) fn checkout(&self) -> &Checkout {
         &self.work.checkout
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkout_arc_for_test(&self) -> Arc<Checkout> {
+        Arc::clone(&self.work.checkout)
     }
 
     /// Only a queued or running first text build warrants waiting. An old
@@ -1205,9 +1438,8 @@ impl DataCheckout {
 }
 
 /// Calls `fire` once a checkout has gone `quiet` without a recorded change
-/// (for the call graph, [`QUIET`], to refresh it). One timer thread runs per
-/// checkout at most, and only while a change is waiting: each change moves
-/// the deadline on, and the thread sleeps until the latest one.
+/// (for the call graph, [`QUIET`], to refresh it). Pending checkouts share the
+/// process timer; each change moves the deadline checked at its next wake.
 struct QuietTimer {
     quiet: Duration,
     /// When the last change was recorded, in milliseconds since `epoch`.
@@ -1215,10 +1447,9 @@ struct QuietTimer {
     armed: AtomicBool,
     epoch: Instant,
     fire: Box<dyn Fn() + Send + Sync>,
-    /// Set when the checkout is dropped: the waiting thread ends at once
-    /// instead of sleeping out its deadline.
+    /// Also fences dispatch against checkout shutdown.
     stopped: std::sync::Mutex<bool>,
-    wake: std::sync::Condvar,
+    timer: std::sync::Mutex<Option<crate::shared_timer::Timer>>,
     #[cfg(feature = "test-timing-hooks")]
     test_gate: bool,
 }
@@ -1232,33 +1463,22 @@ impl QuietTimer {
             epoch: Instant::now(),
             fire: Box::new(fire),
             stopped: std::sync::Mutex::new(false),
-            wake: std::sync::Condvar::new(),
+            timer: std::sync::Mutex::new(None),
             #[cfg(feature = "test-timing-hooks")]
             test_gate: false,
         }
     }
 
-    /// Ends the waiting thread, if any, without firing; later changes start
-    /// none.
+    /// Removes the pending callback without firing; later changes arm none.
     fn stop(&self) {
         *self
             .stopped
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        self.wake.notify_all();
-    }
-
-    /// Sleeps up to `duration`, or until [`Self::stop`]; true once stopped.
-    fn sleep(&self, duration: Duration) -> bool {
-        let stopped = self
-            .stopped
+        self.timer
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (stopped, _) = self
-            .wake
-            .wait_timeout_while(stopped, duration, |stopped| !*stopped)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *stopped
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     fn now_ms(&self) -> u64 {
@@ -1275,7 +1495,7 @@ impl QuietTimer {
     /// Changes continue moving its deadline while the integration test writes
     /// and removes a burst; the deadline is checked again after release.
     #[cfg(feature = "test-timing-hooks")]
-    fn hold_for_test(&self) -> Option<PathBuf> {
+    fn gate_for_test(&self) -> Option<PathBuf> {
         if !self.test_gate {
             return None;
         }
@@ -1284,16 +1504,10 @@ impl QuietTimer {
             return None;
         }
         std::fs::write(gate.with_extension("waiting"), b"waiting").expect("signal quiet gate");
-        while gate.exists() && !gate.with_extension("release").exists() {
-            if self.sleep(Duration::from_millis(10)) {
-                return None;
-            }
-        }
         Some(gate)
     }
 
-    /// Notes a recorded change, and starts the timer thread unless one is
-    /// waiting already.
+    /// Notes a recorded change, and arms a deadline unless one is pending.
     fn changed(self: &Arc<Self>) {
         self.note_change();
         self.arm();
@@ -1313,54 +1527,79 @@ impl QuietTimer {
 
     /// Wait from the last recorded change, not from the end of its refresh.
     fn arm(self: &Arc<Self>) {
-        if self.sleep(Duration::ZERO) || self.armed.swap(true, Ordering::AcqRel) {
+        let stopped = self
+            .stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *stopped || self.armed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let timer = Arc::clone(self);
+        let timer = Arc::downgrade(self);
         let quiet_ms = u64::try_from(self.quiet.as_millis()).unwrap_or(u64::MAX);
-        let spawned = std::thread::Builder::new()
-            .name("aft-data-quiet".to_string())
-            .spawn(move || {
-                #[cfg(feature = "test-timing-hooks")]
-                let gate = timer.hold_for_test();
-                if timer.sleep(Duration::ZERO) {
-                    return;
+        #[cfg(feature = "test-timing-hooks")]
+        let mut gate = None;
+        #[cfg(feature = "test-timing-hooks")]
+        let mut gate_checked = false;
+        let scheduled = crate::shared_timer::Timer::at(Instant::now(), move || {
+            let timer = timer.upgrade()?;
+            let stopped = timer
+                .stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *stopped {
+                return None;
+            }
+            #[cfg(feature = "test-timing-hooks")]
+            {
+                if !gate_checked {
+                    gate = timer.gate_for_test();
+                    gate_checked = true;
                 }
-                loop {
-                    let due = timer
-                        .last_change_ms
-                        .load(Ordering::Acquire)
-                        .saturating_add(quiet_ms);
-                    let now = timer.now_ms();
-                    if now < due {
-                        if timer.sleep(Duration::from_millis(due - now)) {
-                            break;
-                        }
-                        continue;
-                    }
-                    timer.armed.store(false, Ordering::Release);
-                    // A change recorded between the deadline check and letting
-                    // go of the flag found the timer armed and started none; if
-                    // there was one, this thread keeps waiting for it.
-                    if timer
-                        .last_change_ms
-                        .load(Ordering::Acquire)
-                        .saturating_add(quiet_ms)
-                        > timer.now_ms()
-                        && !timer.armed.swap(true, Ordering::AcqRel)
-                    {
-                        continue;
-                    }
-                    (timer.fire)();
-                    #[cfg(feature = "test-timing-hooks")]
-                    if let Some(gate) = &gate {
-                        std::fs::write(gate.with_extension("settled"), b"settled")
-                            .expect("signal quiet fire");
-                    }
-                    break;
+                if gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.exists() && !gate.with_extension("release").exists())
+                {
+                    return Some(Instant::now() + Duration::from_millis(10));
                 }
-            });
-        if spawned.is_err() {
+            }
+            let due = timer
+                .last_change_ms
+                .load(Ordering::Acquire)
+                .saturating_add(quiet_ms);
+            let now = timer.now_ms();
+            if now < due {
+                return Some(Instant::now() + Duration::from_millis(due - now));
+            }
+            timer.armed.store(false, Ordering::Release);
+            // A change recorded between the deadline check and letting
+            // go of the flag found the timer armed and started none; if
+            // there was one, keep the deadline armed for it.
+            if timer
+                .last_change_ms
+                .load(Ordering::Acquire)
+                .saturating_add(quiet_ms)
+                > timer.now_ms()
+                && !timer.armed.swap(true, Ordering::AcqRel)
+            {
+                return Some(Instant::now());
+            }
+            // The callback only admits/enqueues work; refreshes, builds and
+            // fills still execute in their existing data pools.
+            drop(stopped);
+            (timer.fire)();
+            #[cfg(feature = "test-timing-hooks")]
+            if let Some(gate) = &gate {
+                std::fs::write(gate.with_extension("settled"), b"settled")
+                    .expect("signal quiet fire");
+            }
+            None
+        });
+        if let Ok(timer) = scheduled {
+            *self
+                .timer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(timer);
+        } else {
             self.armed.store(false, Ordering::Release);
         }
     }
@@ -1552,11 +1791,16 @@ impl DataCheckout {
     /// round of this checkout ends, so status pushes follow the data layer.
     /// Replaces any earlier listener.
     pub(crate) fn on_status_change(&self, notify: StatusListener) {
+        self.disk_measurement.on_change(&notify);
         *self
             .work
             .status_listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify);
+    }
+
+    pub(crate) fn disk_measurement(&self) -> &Arc<super::surfaces::DiskMeasurement> {
+        &self.disk_measurement
     }
 
     /// Whether the checkout's TODO markers became readable since the last
@@ -1616,6 +1860,20 @@ impl DataCheckout {
         self.work.meaning.state(self.view().as_ref())
     }
 
+    pub(crate) fn cached_meaning_status(&self) -> MeaningState {
+        self.work.meaning.cached_state(self.view().as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_meaning_for_test(&self) {
+        self.work.meaning.refresh_for_test(self.view().as_ref());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_meaning_summary_for_test(&self) {
+        *self.work.status_summary_paused.lock().unwrap() = true;
+    }
+
     /// Makes this checkout's meaning search read only the vectors its
     /// repository's store already holds for `config`'s model (identified by
     /// `fingerprint`), and never fill: for a child repository of a parent
@@ -1631,7 +1889,9 @@ impl DataCheckout {
     ) -> Result<(), String> {
         self.work
             .meaning
-            .read_only(&self.work.checkout, config, fingerprint)
+            .read_only(&self.work.checkout, config, fingerprint)?;
+        self.meaning_status();
+        Ok(())
     }
 
     /// Whether a fill round is queued or running.
@@ -1708,6 +1968,115 @@ mod tests {
 
     use super::*;
 
+    fn planned_pause(until: u64) -> crate::synapse_embed::LanePause {
+        crate::synapse_embed::LanePause {
+            lane_id: "scheduled-embedding-lane".into(),
+            fingerprint: None,
+            retry_after_ms: Some(1_399_000),
+            paused_until_ms: until,
+            reason: "Neural Engine maintenance".into(),
+            cause: crate::synapse_embed::PauseCause::LanePaused,
+            safe_to_retry_same_request: true,
+            record_id: 0,
+        }
+    }
+
+    #[test]
+    fn planned_pause_deadline_and_log_are_shared_across_fill_roots() {
+        let mut pauses = FillPauses::default();
+        let now = Instant::now();
+        let now_ms = crate::semantic_index::unix_millis_now();
+        let pause = planned_pause(now_ms + 1_399_000);
+        let lane = pause.lane_id.clone();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            assert!(pauses.record(pause.clone(), now_ms, now));
+            assert!(pauses.park(&lane, first.path(), Weak::new(), now));
+            let mut duplicate = pause.clone();
+            duplicate.record_id = 17;
+            duplicate.retry_after_ms = Some(1_390_000);
+            assert!(!pauses.record(duplicate, now_ms + 9_000, now + Duration::from_secs(9)));
+            assert!(pauses.park(&lane, second.path(), Weak::new(), now));
+        });
+        assert_eq!(pauses.0.len(), 1, "one lane timer, not one per root");
+        let entry = &pauses.0[&lane];
+        assert_eq!(entry.at, now + Duration::from_millis(1_399_000));
+        assert_eq!(entry.waiters.len(), 2);
+        assert!(pauses.park(
+            &lane,
+            first.path(),
+            Weak::new(),
+            now + Duration::from_millis(1_398_999)
+        ));
+        assert!(!pauses.park(
+            &lane,
+            first.path(),
+            Weak::new(),
+            now + Duration::from_millis(1_399_000)
+        ));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("INFO "), "{lines:?}");
+        for value in [&lane, &pause.paused_until_ms.to_string(), &pause.reason] {
+            assert!(lines[0].contains(value), "{lines:?}");
+        }
+        for root in [first.path(), second.path()] {
+            assert_eq!(
+                crate::synapse_embed::lane_pause_for_root(root),
+                Some(pause.clone())
+            );
+        }
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            assert!(!pauses.record(planned_pause(now_ms + 2_000_000), now_ms, now));
+        });
+        assert_eq!(lines.len(), 1, "a changed pause is reported once");
+        assert_eq!(pauses.0[&lane].at, now + Duration::from_millis(2_000_000));
+    }
+
+    #[test]
+    fn planned_pause_without_absolute_end_uses_retry_hint() {
+        let mut pauses = FillPauses::default();
+        let now = Instant::now();
+        assert!(pauses.record(planned_pause(0), 1_000, now));
+        let entry = &pauses.0["scheduled-embedding-lane"];
+        assert_eq!(entry.pause.paused_until_ms, 1_400_000);
+        assert_eq!(entry.at, now + Duration::from_millis(1_399_000));
+        assert!(!pauses.record(planned_pause(0), 10_000, now + Duration::from_secs(9)));
+        assert_eq!(
+            pauses.0["scheduled-embedding-lane"].at,
+            now + Duration::from_millis(1_399_000)
+        );
+    }
+
+    #[test]
+    fn planned_pause_fill_errors_bypass_per_root_failure_backoff() {
+        let first = PublicationFixture::new(Duration::from_secs(60), QUIET);
+        let second = PublicationFixture::new(Duration::from_secs(60), QUIET);
+        let mut pause = planned_pause(crate::semantic_index::unix_millis_now() + 1_399_000);
+        pause.lane_id = format!("fill-error-{}", first.handle.root().display());
+        let error = format!("[lane_paused] {}", serde_json::to_string(&pause).unwrap());
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            first.handle.work.retry_fill_later(&error);
+            second.handle.work.retry_fill_later(&error);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("INFO "), "{lines:?}");
+        for fixture in [&first, &second] {
+            let retry = fixture.handle.work.fill_retry.lock().unwrap();
+            assert_eq!(retry.in_a_row, 0);
+            assert!(retry.at.is_none());
+            assert_eq!(
+                crate::synapse_embed::lane_pause_for_root(fixture.handle.root()),
+                Some(pause.clone())
+            );
+        }
+        let pauses = fill_pauses().lock();
+        assert_eq!(pauses.0[&pause.lane_id].waiters.len(), 2);
+        assert!(
+            pauses.0[&pause.lane_id].at.duration_since(Instant::now()) > Duration::from_secs(1_390)
+        );
+    }
+
     struct PublicationFixture {
         handle: Arc<DataCheckout>,
         _root: tempfile::TempDir,
@@ -1772,6 +2141,114 @@ mod tests {
         while !ready() {
             assert!(Instant::now() < deadline, "background work did not finish");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binding_many_roots_shares_waiting_threads_and_eviction_removes_deadlines() {
+        use crate::shared_timer::Timer;
+        const ROOTS: usize = 12;
+        let mut fixtures = Vec::new();
+        let mut managers = Vec::new();
+        let mut works = Vec::new();
+        for _ in 0..ROOTS {
+            let fixture = PublicationFixture::new(QUIET, QUIET);
+            fixture.handle.quiet.changed();
+            fixture.handle.work.settle.changed();
+            // Keep real retry registrations pending while all roots are bound.
+            fixture.handle.work.retry.lock().unwrap().in_a_row = 10;
+            fixture.handle.work.fill_retry.lock().unwrap().in_a_row = 10;
+            fixture.handle.work.retry_build_later(&DataError::Cancelled);
+            fixture
+                .handle
+                .work
+                .retry_fill_later("retry registration test");
+            let manager = Arc::new(crate::inspect::InspectManager::new());
+            manager.note_dead_code_request(Instant::now());
+            works.push(Arc::clone(&fixture.handle.work));
+            managers.push(manager);
+            fixtures.push(fixture);
+        }
+        // Initial checks run immediately, then register the actual idle deadline.
+        wait_until(|| {
+            managers.iter().all(|manager| {
+                manager
+                    .dead_code_timer_registration_for_test()
+                    .and_then(Timer::deadline_for_test)
+                    .is_some_and(|at| at > Instant::now() + Duration::from_secs(60))
+            })
+        });
+        let mut registrations = Vec::new();
+        for (fixture, manager) in fixtures.iter().zip(&managers) {
+            for timer in [&fixture.handle.quiet, &fixture.handle.work.settle] {
+                registrations.push(
+                    timer
+                        .timer
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .registration_for_test(),
+                );
+            }
+            for retry in [&fixture.handle.work.retry, &fixture.handle.work.fill_retry] {
+                registrations.push(
+                    retry
+                        .lock()
+                        .unwrap()
+                        .timer
+                        .as_ref()
+                        .unwrap()
+                        .registration_for_test(),
+                );
+            }
+            registrations.push(manager.dead_code_timer_registration_for_test().unwrap());
+        }
+        wait_until(|| {
+            registrations
+                .iter()
+                .all(|id| Timer::registered_for_test(*id))
+        });
+        let names = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .map(|entry| {
+                std::fs::read_to_string(entry.unwrap().path().join("comm")).unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let count = |name: &str| names.iter().filter(|comm| comm.trim_end() == name).count();
+        // Linux comm truncates thread names to fifteen bytes.
+        assert_eq!(
+            count("aft-shared-time"),
+            1,
+            "one deadline service for every root"
+        );
+        assert_eq!(
+            count("aft-dead-code-r"),
+            2,
+            "release workers grew with roots"
+        );
+        assert_eq!(count("aft-data-quiet"), 0);
+        assert_eq!(count("aft-data-fill-r"), 0);
+        assert_eq!(count("aft-data-build-"), 0);
+
+        let quiet = Arc::downgrade(&fixtures[0].handle.quiet);
+        let manager = Arc::downgrade(&managers[0]);
+        drop(fixtures);
+        drop(managers);
+        wait_until(|| quiet.upgrade().is_none() && manager.upgrade().is_none());
+        assert!(
+            registrations
+                .iter()
+                .all(|id| !Timer::registered_for_test(*id)),
+            "an evicted root left a timer registered"
+        );
+        // Even a pool job retaining Work cannot rearm an evicted checkout.
+        for work in &works {
+            work.retry_build_later(&DataError::Cancelled);
+            work.retry_fill_later("evicted root");
+            assert!(work.retry.lock().unwrap().timer.is_none());
+            assert!(work.fill_retry.lock().unwrap().timer.is_none());
         }
     }
 
@@ -2283,22 +2760,34 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_quiet_timer_ends_its_thread_without_firing() {
+    fn a_stopped_quiet_timer_cancels_its_deadline_without_firing() {
         let fired = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&fired);
         let timer = Arc::new(QuietTimer::new(Duration::from_secs(120), move || {
             count.fetch_add(1, Ordering::SeqCst);
         }));
         timer.changed();
-        // The waiting thread holds the timer.
-        assert_eq!(Arc::strong_count(&timer), 2);
+        let registration = timer
+            .timer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .registration_for_test();
         timer.stop();
         let deadline = Instant::now() + Duration::from_secs(10);
         while Arc::strong_count(&timer) > 1 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(Arc::strong_count(&timer), 1, "the thread is still waiting");
-        // Changes after the stop start no thread.
+        assert_eq!(
+            Arc::strong_count(&timer),
+            1,
+            "the callback retained its owner"
+        );
+        assert!(!crate::shared_timer::Timer::registered_for_test(
+            registration
+        ));
+        // Changes after the stop register no deadline.
         timer.changed();
         assert_eq!(Arc::strong_count(&timer), 1);
         assert_eq!(fired.load(Ordering::SeqCst), 0);

@@ -167,8 +167,7 @@ pub(super) fn handle(
     }
     // A bounded, ignore-aware walk reads the project's files into an
     // in-memory index; nothing is saved to the other project's storage.
-    let empty = SearchIndex::empty_ready_for_root(root);
-    let checked = external_disk_check::check_against_disk(&Arc::new(empty), None, root, None);
+    let checked = external_disk_check::collect_bounded_corpus(root);
     let generation = GenerationToken::new_with_str(&format!(
         "external:walk:{}",
         checked.applied_digest.as_deref().unwrap_or("empty"),

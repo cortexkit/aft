@@ -1,0 +1,17 @@
+{
+  "view": {"number":42,"url":"https://github.com/owner/repo/pull/42","title":"Thread fixture","state":"OPEN","body":"Fix review findings."},
+  "reviews": {"data":{"repository":{"nameWithOwner":"owner/repo","pullRequest":{"number":42,"reviews":{"nodes":[{"author":{"login":"reviewer"},"comments":{"totalCount":4,"nodes":[
+    {"id":"C1","author":{"login":"greptile[bot]"},"body":"Check the guard.\n\nHidden bot detail.","createdAt":"2026-01-01T00:00:00Z","path":"src/lib.rs","line":8},
+    {"id":"C2","author":{"login":"cubic[bot]"},"body":"Guard fixed.","createdAt":"2026-01-02T00:00:00Z","path":"src/lib.rs","line":8},
+    {"id":"C3","author":{"login":"reviewer"},"body":"Still open on the old diff.","createdAt":"2026-01-03T00:00:00Z","path":"src/lib.rs","line":8},
+    {"id":"C1_REPLY","author":{"login":"author"},"body":"Working on it.","createdAt":"2026-01-04T00:00:00Z","path":"src/lib.rs","line":8}
+  ]}}]}}}}},
+  "threadsPage1": {"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":3,"pageInfo":{"hasNextPage":true,"endCursor":"threads-1"},"nodes":[
+    {"id":"PRRT_open","isResolved":false,"isOutdated":false,"path":"src/lib.rs","line":8,"comments":{"totalCount":2,"pageInfo":{"hasNextPage":true,"endCursor":"comments-1"},"nodes":[{"id":"C1"}]}},
+    {"id":"PRRT_resolved","isResolved":true,"isOutdated":true,"path":"src/lib.rs","line":null,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"C2"}]}}
+  ]}}}}},
+  "threadCommentsPage2": {"data":{"node":{"comments":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"C1_REPLY"}]}}}},
+  "threadsPage2": {"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":3,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+    {"id":"PRRT_outdated_open","isResolved":false,"isOutdated":true,"path":"src/lib.rs","line":null,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"C3"}]}}
+  ]}}}}}
+}

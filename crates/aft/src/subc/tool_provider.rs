@@ -8281,7 +8281,7 @@ pub(in crate::subc) mod route_tests {
         let ctx = runner_restore_context(&root);
         let request: crate::protocol::RawRequest = serde_json::from_value(json!({
             "id": "runner-start", "command": "bash", "session_id": "runner-restore",
-            "params": { "command": "printf 'stdout before restart\\n'; printf 'stderr before restart\\n' >&2; while [ ! -f release ]; do sleep 0.05; done; printf 'stdout after restart\\n'; printf 'stderr after restart\\n' >&2; while [ ! -f finish ]; do sleep 0.05; done",
+            "params": { "command": format!("printf 'stdout before restart\\n'; printf 'stderr before restart\\n' >&2; {}; printf 'stdout after restart\\n'; printf 'stderr after restart\\n' >&2; {}", crate::test_gate::gate("release", "sleep 0.05"), crate::test_gate::gate("finish", "sleep 0.05")),
                 "background": true, "compressed": true },
         })).unwrap();
         let response = crate::sandbox_spawn::with_authenticated_principal(

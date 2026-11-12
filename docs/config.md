@@ -37,6 +37,8 @@ On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool sh
 
 `bash.memory_limit_mib` optionally caps aggregate memory for each local command, including foreground, background, and PTY commands. It is off by default; set a positive integer in MiB (for example, `4096` for 4 GiB; maximum `4294967295`) in user config. Projects may tighten the cap, never raise or remove it. Changes affect future commands; there is no per-call override. Remote `runon` jobs use the build server's own limits and are not covered.
 
+On Linux, local agent shells always raise their `oom_score_adj` to `1000` before running the command, so the kernel prefers them and their descendants over AFT and desktop processes during an out-of-memory event; this has no setting and does not change AFT's own value. If the adjustment cannot be verified, the command still runs, AFT logs one warning per process, and the `bash_oom_priority_failures` health counter records the failures.
+
 - **Linux:** cgroup v2 `memory.max` (using a delegated transient systemd user scope when needed); if unavailable, the result explicitly names the process-group RSS watcher fallback.
 - **Windows:** a job-object aggregate memory limit refuses allocations; AFT stops the job when a limit notification or peak accounting confirms the cap was hit.
 - **macOS:** a physical-footprint process-group watcher samples every 500 ms. Fast allocations can overshoot for a fraction of a second, and processes that leave the group are not counted. The Linux watcher has the same limits. Watcher scans are bounded to 4096 processes and stop the command explicitly if accounting cannot complete.
@@ -160,6 +162,53 @@ Top inclusive running symbols:
 ```
 
 Raw sampler output is withheld unless native `aft profile --raw` is explicitly requested.
+
+### Release symbols
+
+GitHub release assets include separate symbol archives for both `x64` and `arm64`:
+`aft-darwin-<arch>-dsym.zip` on macOS, `aft-linux-<arch>-debug.zip` on Linux, and
+`aft-windows-<arch>-pdb.zip` on Windows. Always use the archive from the **same
+release and architecture** as the executable that produced the stack or dump.
+These archives are not installed by npm and are not runtime dependencies. The
+executables retain only the small debuglink (Linux) or PDB reference (Windows),
+not the debug payload. The release build checks ELF build IDs and Windows PDB
+GUID/age pairs before uploading the archives.
+
+On Linux, unpack the archive and compare the `Build ID` printed for the shipped
+executable and `aft.debug`, then resolve an address with GNU binutils:
+
+```sh
+unzip aft-linux-x64-debug.zip -d symbols/linux-x64
+readelf -n ./aft-linux-x64
+readelf -n symbols/linux-x64/aft.debug
+addr2line -e symbols/linux-x64/aft.debug -f -C 0xADDRESS
+```
+
+Use an ELF-relative address, not an ASLR-relocated process address: subtract the
+image's load bias using the crash/core mappings first. For ARM64, use the ARM64
+archive and an architecture-capable tool such as `aarch64-linux-gnu-addr2line`.
+The shipped executable's optional `.gnu_debuglink` names `aft.debug`; the program
+still runs when the debug file is absent. A detached debug ELF may make some
+`readelf` versions warn about its absent program interpreter; its build ID remains
+readable and must match.
+
+On Windows, unpack `aft-windows-x64-pdb.zip` (or the ARM64 archive) into a symbol
+directory, retaining the PDB's archived filename. Cargo may name the original PDB
+with a hash; the archive preserves the name referenced by the executable. Open
+the crash dump in WinDbg with the matching release executable available, then:
+
+```text
+.sympath+ C:\symbols\aft
+.reload /f
+lmv m aft*
+kv
+```
+
+WinDbg checks the PDB GUID and age against the executable's CodeView reference;
+do not force-load a mismatched PDB. `lmv` shows symbol-loading status and `kv`
+prints the symbolized stack. In Visual Studio, the Modules window's **Load
+Symbols** command can point at the same extracted directory. Release symbols
+contain function names and line tables, not full local-variable/type information.
 
 ## Config Options
 

@@ -762,8 +762,8 @@ mod tests {
         let old = recovery_context(&root, &storage);
         let release = root.join("release");
         let command = format!(
-            "while [ ! -f '{}' ]; do sleep 0.02; done; echo restart-released",
-            release.display()
+            "{}; echo restart-released",
+            crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.02")
         );
         let req = serde_json::from_value(json!({"id":"launch", "command":"bash", "session_id":"restart-worker", "params":{"command":command,"background":true,"timeout":20000}})).unwrap();
         let launched = crate::commands::bash::handle(&req, &old);

@@ -2147,6 +2147,32 @@ describe("bash tool adapter", () => {
     expect(toolText(result)).toContain(reason);
   });
 
+  test("PTY lost exit status uses the approved line and real kills stay killed", async () => {
+    for (const [status, exitCode, reason, expected] of [
+      [
+        "fate_unknown",
+        null,
+        "AFT could not read how it ended",
+        "Task bash-lost: exit status unknown (AFT could not read how it ended)",
+      ],
+      ["killed", 137, "bash_kill", "Task bash-lost: killed (exit 137) 1s"],
+    ] as const) {
+      const tools = new Map<string, MockToolDef>();
+      const { bridge } = makeTrackableMockBridge({
+        status,
+        mode: "pty",
+        exit_code: exitCode,
+        duration_ms: 1000,
+        status_reason: reason,
+      });
+      registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+      const result = await tools
+        .get("bash_status")!
+        .execute("call", { task_id: "bash-lost" }, undefined, undefined, { cwd: projectRoot });
+      expect(toolText(result)).toBe(expected);
+    }
+  });
+
   test("running bash_status shows the full assigned remote job ID", async () => {
     const jobId = "0192a64a-1234-7000-8000-000000000001";
     const tools = new Map<string, MockToolDef>();

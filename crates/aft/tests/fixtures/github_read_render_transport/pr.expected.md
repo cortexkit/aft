@@ -2,6 +2,7 @@
 
 Repository: cortexkit/aft
 State: MERGED
+Review thread state couldn't be read; unresolved threads may still block the merge.
 Author: @author
 Created: 2026-08-23T09:00:00Z
 Updated: 2026-08-24T18:30:00Z

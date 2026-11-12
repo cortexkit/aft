@@ -8,9 +8,9 @@
 
 use super::*;
 use crate::secret::{
-    first_failure, outcome_for, outcome_for_second_resolve, refuse_ineligible, ApprovalRequest,
-    FakeVault, FakeVaultScript, LabelOutcome, Resolution, SecretConsentTransport, SecretVault,
-    SECRETS_UNAVAILABLE, SECRET_REFUSED,
+    first_failure, outcome_for, outcome_for_second_use, refuse_ineligible, ApiKeyTarget,
+    ApprovalRequest, FakeReply, FakeVault, FakeVaultScript, LabelOutcome, SecretConsentTransport,
+    SecretVault, UseAnswer, SECRETS_UNAVAILABLE, SECRET_REFUSED,
 };
 use serde_json::json;
 use std::sync::Mutex as StdMutex;
@@ -375,14 +375,14 @@ fn every_ineligible_form_refuses_with_secret_refused_and_never_resolves() {
         // grant the label is installed, so a launch that reached it would
         // proceed: the counts below are only zero if the seam refused first.
         let vault = FakeVault::new();
-        vault.set_resolution("repo", crate::secret::granted(rule(), "grant-1"));
+        vault.set_answer("repo", crate::secret::granted(rule()));
         vault.set_material("repo", vec![b"first-key-material-1".to_vec()]);
-        let decision = resolve_label_for_launch(&identity, &vault, "repo");
+        let decision = use_label_for_fetch(&identity, &vault, "repo", &target());
         let LaunchDecision::Refuse(outcome) = decision else {
             panic!("{name}: an ineligible scope must refuse, got {decision:?}");
         };
         assert_eq!(outcome.code(), Some(SECRET_REFUSED), "{name}");
-        assert_eq!(vault.resolve_calls(), 0, "{name}: no resolve may happen");
+        assert_eq!(vault.use_calls(), 0, "{name}: no resolve may happen");
         assert_eq!(
             vault.material_calls(),
             0,
@@ -400,15 +400,13 @@ struct RecordingTransport {
     filed: StdMutex<Vec<SecretConsentRequest>>,
 }
 
-static SECRET_TRANSPORT_LOCK: StdMutex<()> = StdMutex::new(());
-
 struct TransportGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl TransportGuard {
     fn install(transport: Option<Arc<dyn SecretConsentTransport>>) -> Self {
-        let guard = SECRET_TRANSPORT_LOCK
+        let guard = crate::secret::consent::TEST_TRANSPORT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::secret::consent::install_transport(transport);
@@ -433,8 +431,8 @@ impl SecretConsentTransport for RecordingTransport {
     }
 }
 
-fn approval(request_id: &str) -> Resolution {
-    Resolution::ApprovalRequired(ApprovalRequest {
+fn approval(request_id: &str) -> FakeReply {
+    FakeReply::ApprovalRequired(ApprovalRequest {
         request_id: request_id.into(),
         statement_b64url: "c3RhdGVtZW50".into(),
         expires_at_ms: crate::secret::now_ms() + 60_000,
@@ -444,11 +442,10 @@ fn approval(request_id: &str) -> Resolution {
 fn rule() -> secret_rules::location::LabelRule {
     secret_rules::location::LabelRule {
         label: "repo".into(),
-        host: "api.example.com".into(),
+        host: "x.test".into(),
         port: 443,
-        path_prefix: "/v1".into(),
+        path_prefix: "/repos/a".into(),
         location: secret_rules::location::Location::Bearer,
-        grant_id: "grant-1".into(),
     }
 }
 
@@ -457,7 +454,7 @@ fn a_head_call_goes_pending_then_resolves_again_then_substitutes() {
     let head = head();
     let (scopes, _) = call_scopes(&head).expect("a head call is eligible");
     let mut script = FakeVaultScript::default();
-    script.resolutions.insert("repo".into(), approval("req-1"));
+    script.answers.insert("repo".into(), approval("req-1"));
     script
         .material
         .insert("repo".into(), vec![b"first-key-material-1".to_vec()]);
@@ -470,7 +467,10 @@ fn a_head_call_goes_pending_then_resolves_again_then_substitutes() {
 
     // First resolve: the vault is waiting, so the call is held before a child,
     // a job or a proxy exists.
-    let first = outcome_for("repo", &vault.resolve(&scopes.authorization, "repo"));
+    let first = outcome_for(
+        "repo",
+        &vault.use_secret(&scopes.authorization, "repo", &target()),
+    );
     let LabelOutcome::FileConsent {
         request_id,
         statement_b64url,
@@ -494,21 +494,29 @@ fn a_head_call_goes_pending_then_resolves_again_then_substitutes() {
     // Cingulate's answer alone grants nothing: the vault still refuses until it
     // grants, and only the second resolve decides.
     assert_eq!(
-        outcome_for_second_resolve("repo", &vault.resolve(&scopes.authorization, "repo")).code(),
+        outcome_for_second_use(
+            "repo",
+            &vault.use_secret(&scopes.authorization, "repo", &target())
+        )
+        .code(),
         Some(SECRETS_UNAVAILABLE)
     );
-    vault.set_resolution("repo", crate::secret::granted(rule(), "grant-1"));
-    let second = outcome_for_second_resolve("repo", &vault.resolve(&scopes.authorization, "repo"));
+    vault.set_answer("repo", crate::secret::granted(rule()));
+    let second = outcome_for_second_use(
+        "repo",
+        &vault.use_secret(&scopes.authorization, "repo", &target()),
+    );
     assert!(second.proceeds(), "{second:?}");
 
     // The intercepted request takes its material once, under the lifetime
     // scope, from the grant the head's authorization allowed.
-    let material = vault
-        .material(&scopes.lifetime, "repo", "grant-1")
-        .expect("the grant hands out material");
-    assert_eq!(material.expose(), b"first-key-material-1");
-    assert_eq!(vault.resolve_calls(), 3);
-    assert_eq!(vault.material_calls(), 1);
+    let UseAnswer::Released(material) = vault.use_secret(&scopes.authorization, "repo", &target())
+    else {
+        panic!("addressed release");
+    };
+    assert_eq!(material.material(), b"first-key-material-1");
+    assert_eq!(vault.use_calls(), 4);
+    assert_eq!(vault.material_calls(), 2);
 }
 
 #[test]
@@ -568,60 +576,63 @@ fn approval_reply() -> serde_json::Value {
     }})
 }
 
-// The saved Cingulate 0.12.0 secret-use-approval-v1.1 responses live in
-// crates/aft/tests/fixtures/secret/cingulate-secret-use-v1.1/. These hashes pin
-// the reviewed response bytes independently of the decoder.
+// These requester records are vendored from Cingulate commit 56fa35f2.
+// Independent hashes pin their exact bytes, not a decoder's reconstruction.
 const FILER_VECTORS: &[(&str, &str, &str)] = &[
     (
         "request",
-        include_str!("../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-request.json"),
+        include_str!(
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-request.json"
+        ),
         "be75724519b10547d1baacdee20095f753130251b1519c10342ab19ed42364c9",
     ),
     (
         "request-repeat",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-request-repeat.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-request-repeat.json"
         ),
         "be75724519b10547d1baacdee20095f753130251b1519c10342ab19ed42364c9",
     ),
     (
         "pending",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-pending.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-pending.json"
         ),
         "db39e1458276124efd66694d39f64e0ce34f0811c860b3ac4af2be6e6afbd0e6",
     ),
     (
         "allowed",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-allowed.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-allowed.json"
         ),
         "e5e665b918c4cb19750a8217457497c068eb4fb098df694da5f6dbd18511b286",
     ),
     (
         "partial",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-partial.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-partial.json"
         ),
         "8ebc4ce81712071e97c1a53b471722c1ac83020ed468723b83fcb674785a6b99",
     ),
     (
         "declined",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-declined.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-declined.json"
         ),
         "f49061b64579f5601883bd466aea4d0951915fc4e121c3e1390830003acc0c84",
     ),
     (
         "expired",
         include_str!(
-            "../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-await-expired.json"
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-await-expired.json"
         ),
         "95eb5015d42f4e3d059729696f12ac0bfc2447a6f74b24c450bef36a39b0a6c4",
     ),
     (
         "refusals",
-        include_str!("../../tests/fixtures/secret/cingulate-secret-use-v1.1/filer-refusals.json"),
+        include_str!(
+            "../../../../test-vectors/cingulate-secret-use-approval-v1/filer-refusals.json"
+        ),
         "66740bda26d96c0abd25e22244965209fcdee04e120bcd4d7214644e0580fa65",
     ),
 ];
@@ -637,6 +648,14 @@ fn filer_vector(name: &str) -> serde_json::Value {
 fn decode_filer_reply(
     reply: &serde_json::Value,
 ) -> Result<serde_json::Value, super::super::consent::ConsentError> {
+    // These handler samples show refusals as error envelopes; the live SDK
+    // delivers them as module errors, not successful result bytes.
+    if let Some(error) = reply.get("error") {
+        return Err(super::super::consent::ConsentError::Refused {
+            code: error["code"].as_str().unwrap().into(),
+            message: error["message"].as_str().unwrap().into(),
+        });
+    }
     super::super::consent::decode_result(&serde_json::to_vec(reply).unwrap())
 }
 
@@ -662,21 +681,47 @@ fn secret_filer_vectors_are_pinned_and_decode_the_published_card_states() {
         decode_secret_elicitation(&filer_reply("request").unwrap()),
         Some("el_1")
     );
-    for name in ["allowed", "partial", "declined"] {
+    for name in ["allowed", "partial"] {
         assert_eq!(
-            decode_secret_record(&filer_reply(name).unwrap()),
+            decode_secret_record(&filer_reply(name).unwrap(), "01HF7YAT000000000000000001"),
             ConsentOutcome::Answered,
             "{name}"
         );
     }
+    let mut once = filer_reply("allowed").unwrap();
+    once["secret_use_answer"]["duration"] = json!("once");
     assert_eq!(
-        decode_secret_record(&filer_reply("pending").unwrap()),
+        decode_secret_record(&once, "01HF7YAT000000000000000001"),
+        ConsentOutcome::AnsweredOnce
+    );
+    assert_eq!(
+        decode_secret_record(
+            &filer_reply("pending").unwrap(),
+            "01HF7YAT000000000000000001"
+        ),
         ConsentOutcome::Pending
     );
     assert!(matches!(
-        decode_secret_record(&filer_reply("expired").unwrap()),
-        ConsentOutcome::Unavailable { .. }
+        decode_secret_record(
+            &filer_reply("expired").unwrap(),
+            "01HF7YAT000000000000000001"
+        ),
+        ConsentOutcome::Expired
     ));
+    assert_eq!(
+        decode_secret_record(
+            &filer_reply("partial").unwrap(),
+            "01HF7YAT000000000000000002"
+        ),
+        ConsentOutcome::Declined
+    );
+    assert_eq!(
+        decode_secret_record(
+            &filer_reply("declined").unwrap(),
+            "01HF7YAT000000000000000001"
+        ),
+        ConsentOutcome::Declined
+    );
 }
 
 #[derive(Default)]
@@ -713,6 +758,7 @@ impl super::super::consent::ConsentTransport for SecretCards {
                 assert_eq!(call.params["elicitation_id"], "el_1");
                 filer_reply(self.record)
             }
+            "consent.withdraw" => Ok(serde_json::json!({})),
             method => panic!("unexpected consent method: {method}"),
         };
         Box::pin(async move { reply })
@@ -725,14 +771,19 @@ struct ScriptedSecretUse {
 }
 
 impl crate::secret::SecretUseTransport for ScriptedSecretUse {
-    fn secret_use(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    fn secret_use(&self, params: serde_json::Value) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
         self.calls.lock().unwrap().push(params);
-        Ok(self
-            .replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("an expected secret.use retry"))
+        Ok(zeroize::Zeroizing::new(
+            serde_json::to_vec(
+                &self
+                    .replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("an expected secret.use retry"),
+            )
+            .unwrap(),
+        ))
     }
 }
 
@@ -755,6 +806,7 @@ fn install_cards(runtime: &tokio::runtime::Runtime, cards: Arc<SecretCards>) -> 
     TransportGuard::install(Some(Arc::new(SubcSecretConsent {
         transport: cards,
         runtime: runtime.handle().clone(),
+        cards: Default::default(),
     })))
 }
 
@@ -770,15 +822,19 @@ fn a_refiled_secret_launch_recovers_the_same_card_and_exact_statement() {
     let vault = crate::secret::SubcSecretVault::new(wire.clone());
     let identity = head();
     for decision in [
-        resolve_label_for_launch(&identity, &vault, "key"),
-        runtime.block_on(async { resolve_label_for_launch(&identity, &vault, "key") }),
+        use_label_for_fetch(&identity, &vault, "key", &target()),
+        runtime.block_on(async { use_label_for_fetch(&identity, &vault, "key", &target()) }),
     ] {
         assert!(matches!(decision, LaunchDecision::Pending(_)));
     }
     assert_eq!(cards.cards.lock().unwrap().len(), 1);
     assert_eq!(wire.calls.lock().unwrap().len(), 2);
     let calls = cards.calls.lock().unwrap();
-    assert_eq!(calls.len(), 4);
+    assert_eq!(
+        calls.len(),
+        3,
+        "resume awaits the existing card without filing it again"
+    );
     let item = phone_item();
     let expected = format!(
         r#"{{"method":"consent.request","params":{{"kind":"secret_use","secret_use":{{"items":[{{"request_id":"{}","statement_b64url":"{}"}}]}}}}}}"#,
@@ -806,7 +862,7 @@ fn a_refiled_secret_launch_recovers_the_same_card_and_exact_statement() {
 }
 
 #[test]
-fn secret_allow_partial_and_decline_retry_secret_use_and_only_the_vault_decides() {
+fn secret_allow_and_allowed_partial_retry_but_decline_never_retries() {
     let runtime = secret_consent_runtime();
     for state in ["allowed", "partial", "declined"] {
         for (reply, expected_code) in [
@@ -816,7 +872,7 @@ fn secret_allow_partial_and_decline_retry_secret_use_and_only_the_vault_decides(
             ),
             (
                 json!({"result": {"error": {"code": "not_found", "class": "permanent"}}}),
-                Some(SECRET_REFUSED),
+                None,
             ),
             (approval_reply(), Some(SECRETS_UNAVAILABLE)),
         ] {
@@ -828,7 +884,16 @@ fn secret_allow_partial_and_decline_retry_secret_use_and_only_the_vault_decides(
             let wire = secret_use_script(vec![approval_reply(), reply]);
             let vault = crate::secret::SubcSecretVault::new(wire.clone());
             let identity = head();
-            let decision = resolve_label_for_launch(&identity, &vault, "key");
+            let decision = use_label_for_fetch(&identity, &vault, "key", &target());
+            if state == "declined" {
+                assert!(matches!(decision, LaunchDecision::Refuse(_)));
+                assert_eq!(
+                    wire.calls.lock().unwrap().len(),
+                    1,
+                    "a decline is final, without another vault call"
+                );
+                continue;
+            }
             match expected_code {
                 None => assert!(
                     matches!(decision, LaunchDecision::Proceed { .. }),
@@ -878,7 +943,8 @@ fn expired_or_refused_secret_cards_end_the_launch_without_retrying_the_vault() {
         let _guard = install_cards(&runtime, cards.clone());
         let wire = secret_use_script(vec![approval_reply()]);
         let vault = crate::secret::SubcSecretVault::new(wire.clone());
-        let LaunchDecision::Refuse(outcome) = resolve_label_for_launch(&head(), &vault, "key")
+        let LaunchDecision::Refuse(outcome) =
+            use_label_for_fetch(&head(), &vault, "key", &target())
         else {
             panic!("an expired or refused card cannot start a launch")
         };
@@ -899,14 +965,13 @@ fn secret_cards_reject_unknown_or_permission_reply_shapes() {
     for record in [
         json!({"kind": "secret_use", "state": "granted"}),
         json!({"kind": "secret_use", "state": "declined"}),
-        json!({"kind": "secret_use", "state": "withdrawn"}),
         json!({"kind": "secret_use", "state": "settled", "outcome": "allow_once"}),
         json!({"kind": "tool_permission", "state": "granted"}),
         json!({"kind": "secret_use", "state": "future"}),
         json!({"state": "granted"}),
     ] {
         assert!(matches!(
-            decode_secret_record(&record),
+            decode_secret_record(&record, "01HF7YAT000000000000000001"),
             ConsentOutcome::Unavailable { .. }
         ));
     }
@@ -920,7 +985,7 @@ fn secret_cards_reject_unknown_or_permission_reply_shapes() {
 }
 
 #[test]
-fn withholding_a_secret_card_fails_closed_without_an_unsupported_method() {
+fn withholding_a_secret_card_withdraws_once_and_keeps_the_terminal_cancelled_outcome() {
     let runtime = secret_consent_runtime();
     let cards = Arc::new(SecretCards {
         record: "pending",
@@ -929,16 +994,19 @@ fn withholding_a_secret_card_fails_closed_without_an_unsupported_method() {
     let _guard = install_cards(&runtime, cards.clone());
     let wire = secret_use_script(vec![approval_reply()]);
     let vault = crate::secret::SubcSecretVault::new(wire);
-    let LaunchDecision::Pending(pending) = resolve_label_for_launch(&head(), &vault, "key") else {
+    let LaunchDecision::Pending(pending) = use_label_for_fetch(&head(), &vault, "key", &target())
+    else {
         panic!("the card is pending")
     };
     assert!(matches!(
         crate::secret::withhold_consent(&pending.request),
-        ConsentOutcome::Unavailable { .. }
+        ConsentOutcome::Cancelled
     ));
     withdraw_secret_consent(&pending);
     let calls = cards.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2].method, "consent.withdraw");
+    assert_eq!(calls[2].scope, calls[0].scope);
     assert_eq!(cards.cards.lock().unwrap().len(), 1);
 }
 
@@ -975,11 +1043,14 @@ fn the_production_vault_ends_an_eligible_launch_with_secrets_unavailable() {
     let (scopes, _) = call_scopes(&head()).expect("a head call is eligible");
     let vault = crate::secret::UnavailableVault;
     assert_eq!(
-        vault.resolve(&scopes.authorization, "repo"),
-        Resolution::Unavailable
+        matches!(
+            vault.use_secret(&scopes.authorization, "repo", &target()),
+            UseAnswer::Unavailable
+        ),
+        true
     );
     assert_eq!(
-        crate::secret::outcome_for("repo", &Resolution::Unavailable).code(),
+        crate::secret::outcome_for("repo", &UseAnswer::Unavailable).code(),
         Some(SECRETS_UNAVAILABLE)
     );
 }
@@ -990,7 +1061,7 @@ fn the_production_vault_never_hardens_the_process() {
     // own /proc counters. A vault that can never release a key must not
     // trigger it, even when an eligible launch names a placeholder.
     let LaunchDecision::Refuse(outcome) =
-        resolve_label_for_launch(&head(), &crate::secret::UnavailableVault, "repo")
+        use_label_for_fetch(&head(), &crate::secret::UnavailableVault, "repo", &target())
     else {
         panic!("the production vault refuses every launch")
     };
@@ -1122,12 +1193,447 @@ fn a_run_bound_to_an_unauthorized_head_stamp_is_ineligible() {
     assert_eq!(call_scopes(&run), Err(Ineligibility::HeadScopeNotAlfonso));
 
     let vault = FakeVault::new();
-    vault.set_resolution("repo", crate::secret::granted(rule(), "grant-1"));
-    let decision = resolve_label_for_launch(&run, &vault, "repo");
+    vault.set_answer("repo", crate::secret::granted(rule()));
+    let decision = use_label_for_fetch(&run, &vault, "repo", &target());
     let LaunchDecision::Refuse(outcome) = decision else {
         panic!("an unauthorized head stamp must refuse, got {decision:?}");
     };
     assert_eq!(outcome.code(), Some(SECRET_REFUSED));
-    assert_eq!(vault.resolve_calls(), 0);
+    assert_eq!(vault.use_calls(), 0);
     assert_eq!(vault.material_calls(), 0);
+}
+
+fn target() -> ApiKeyTarget {
+    ApiKeyTarget {
+        scheme: "https".into(),
+        host: "x.test".into(),
+        port: Some(443),
+        path: "/repos/a".into(),
+    }
+}
+
+#[test]
+fn every_vendored_secret_approval_sample_matches_its_source_checksum_and_decodes() {
+    use sha2::{Digest, Sha256};
+    let root = crate::test_support::manifest_dir()
+        .join("../../test-vectors/cingulate-secret-use-approval-v1");
+    let manifest =
+        include_str!("../../../../test-vectors/cingulate-secret-use-approval-v1/SHA256SUMS");
+    let mut count = 0;
+    for line in manifest.lines() {
+        let (hash, name) = line.split_once("  ").unwrap();
+        let bytes = std::fs::read(root.join(name)).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), hash, "{name}");
+        if name.ends_with(".json") {
+            let sample: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(sample.is_object(), "{name}");
+            if name.starts_with("filer-await-") {
+                let outcome =
+                    decode_secret_record(&sample["reply"]["result"], "01HF7YAT000000000000000001");
+                assert!(
+                    !matches!(outcome, ConsentOutcome::Unavailable { .. }),
+                    "{name}"
+                );
+            }
+        }
+        count += 1;
+    }
+    assert_eq!(count, 12);
+    let fallback = json!({"kind":"secret_use", "state":"answered", "answered_choice_id":"allow", "secret_use_answer":{"decision":"allow"}});
+    assert_eq!(
+        decode_secret_record(&fallback, "one"),
+        ConsentOutcome::Answered
+    );
+    let withdrawn = json!({"kind":"secret_use", "state":"withdrawn"});
+    assert_eq!(
+        decode_secret_record(&withdrawn, "one"),
+        ConsentOutcome::Cancelled
+    );
+}
+
+#[derive(Default)]
+struct HeldCardEndpoint {
+    calls: StdMutex<Vec<super::super::consent::ConsentCall>>,
+    awaits: std::sync::atomic::AtomicUsize,
+    allow_after: usize,
+    fail_withdraw: bool,
+    fail_await: bool,
+    pending_early: bool,
+}
+impl super::super::consent::ConsentTransport for HeldCardEndpoint {
+    fn call(
+        &self,
+        call: super::super::consent::ConsentCall,
+    ) -> super::super::consent::ConsentFuture {
+        self.calls.lock().unwrap().push(call.clone());
+        let attempt = self.awaits.fetch_add(
+            usize::from(call.method == "consent.await"),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let allow = self.allow_after > 0 && attempt + 1 >= self.allow_after;
+        let fail_withdraw = self.fail_withdraw;
+        let fail_await = self.fail_await;
+        let pending_early = self.pending_early;
+        Box::pin(async move {
+            match call.method {
+                "consent.request" => Ok(serde_json::json!({"elicitation_id":"el_held"})),
+                "consent.await" => {
+                    if fail_await {
+                        return Err(super::super::consent::ConsentError::Unavailable(
+                            "offline".into(),
+                        ));
+                    }
+                    if !pending_early {
+                        tokio::time::sleep(Duration::from_millis(
+                            call.params["timeout_ms"].as_u64().unwrap(),
+                        ))
+                        .await;
+                    }
+                    if allow {
+                        filer_reply("allowed")
+                    } else {
+                        filer_reply("pending")
+                    }
+                }
+                "consent.withdraw" if fail_withdraw => Err(
+                    super::super::consent::ConsentError::Unavailable("offline".into()),
+                ),
+                "consent.withdraw" => Ok(serde_json::json!({})),
+                method => panic!("unexpected secret consent operation {method}"),
+            }
+        })
+    }
+}
+fn held_request(expires_at_ms: u64) -> SecretConsentRequest {
+    SecretConsentRequest {
+        scope: SecretScope::from_stamp(&stamp("held-card", "head")),
+        project_root: head().project_root.clone(),
+        session: "held".into(),
+        label: "key".into(),
+        request_id: "01HF7YAT000000000000000001".into(),
+        statement_b64url: "c3RhdGVtZW50".into(),
+        expires_at_ms: Some(expires_at_ms),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_secret_cards_reawait_the_same_id_at_the_service_cap_and_keep_the_request_expiry(
+) {
+    let endpoint = Arc::new(HeldCardEndpoint {
+        allow_after: 3,
+        ..Default::default()
+    });
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let end = crate::secret::vault::now_ms() + 600_000;
+    let cancel = crate::secret::consent::Cancellation::default();
+    let waiter = tokio::spawn(transport.wait(held_request(end), cancel));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(20)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "the filesystem hold budget is not the person-wait deadline"
+    );
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(waiter.await.unwrap(), ConsentOutcome::Answered);
+    let calls = endpoint.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.method == "consent.request")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.method == "consent.await")
+            .count(),
+        3
+    );
+    for call in calls.iter().filter(|call| call.method == "consent.await") {
+        assert_eq!(call.params["elicitation_id"], "el_held");
+        assert!(call.params["timeout_ms"].as_u64().unwrap() <= 120_000);
+    }
+    assert_eq!(calls[0].params["expires_at_ms"].as_u64(), Some(end));
+    assert!(calls.iter().all(|call| call.scope == calls[0].scope));
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_secret_card_cancellation_withdraws_once_on_its_original_scope_even_if_withdrawal_fails(
+) {
+    for fail_withdraw in [false, true] {
+        let endpoint = Arc::new(HeldCardEndpoint {
+            fail_withdraw,
+            ..Default::default()
+        });
+        let transport = Arc::new(SubcSecretConsent {
+            transport: endpoint.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            cards: Default::default(),
+        });
+        let cancel = crate::secret::consent::Cancellation::default();
+        let waiter = tokio::spawn(transport.clone().wait(
+            held_request(crate::secret::vault::now_ms() + 600_000),
+            cancel.clone(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(endpoint
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.method == "consent.await"));
+        cancel.cancel();
+        let outcome = waiter.await.unwrap();
+        assert_eq!(
+            outcome,
+            ConsentOutcome::Cancelled,
+            "withdrawal failure does not turn a caller cancellation into a user answer"
+        );
+        let cached = transport
+            .file_cancellable(
+                &held_request(crate::secret::vault::now_ms() + 600_000),
+                Duration::ZERO,
+                None,
+            )
+            .await;
+        assert_eq!(
+            cached,
+            ConsentOutcome::Cancelled,
+            "the original requester cache retains cancellation, not expiry"
+        );
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let calls = endpoint.calls.lock().unwrap();
+        let withdraw: Vec<_> = calls
+            .iter()
+            .filter(|call| call.method == "consent.withdraw")
+            .collect();
+        assert_eq!(
+            withdraw.len(),
+            1,
+            "failed withdrawal is logged once, never retried"
+        );
+        assert_eq!(withdraw[0].scope, calls[0].scope);
+        assert_eq!(withdraw[0].params["elicitation_id"], "el_held");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_secret_card_await_withdraws_before_returning_cancelled_and_cancelled_filing_does_not_start(
+) {
+    let endpoint = Arc::new(HeldCardEndpoint {
+        fail_await: true,
+        ..Default::default()
+    });
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let answer = transport
+        .wait(
+            held_request(crate::secret::vault::now_ms() + 600_000),
+            Default::default(),
+        )
+        .await;
+    assert_eq!(answer, ConsentOutcome::Cancelled, "a filed card may already have reached the person; a failed await is not a failed filing or a user answer");
+    let calls = endpoint.calls.lock().unwrap();
+    assert_eq!(
+        calls.iter().map(|call| call.method).collect::<Vec<_>>(),
+        vec!["consent.request", "consent.await", "consent.withdraw"]
+    );
+    assert!(calls.iter().all(|call| call.scope == calls[0].scope));
+    drop(calls);
+    let endpoint = Arc::new(HeldCardEndpoint::default());
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let cancel = crate::secret::consent::Cancellation::default();
+    cancel.cancel();
+    assert_eq!(
+        transport
+            .wait(
+                held_request(crate::secret::vault::now_ms() + 600_000),
+                cancel
+            )
+            .await,
+        ConsentOutcome::Cancelled
+    );
+    assert!(
+        endpoint.calls.lock().unwrap().is_empty(),
+        "a worker scheduled after its last request disappeared must not file a card"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn early_pending_secret_answers_back_off_before_reawaiting_the_same_card() {
+    let endpoint = Arc::new(HeldCardEndpoint {
+        pending_early: true,
+        ..Default::default()
+    });
+    let transport = Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    });
+    let cancel = crate::secret::consent::Cancellation::default();
+    let waiter = tokio::spawn(transport.wait(
+        held_request(crate::secret::vault::now_ms() + 600_000),
+        cancel.clone(),
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.awaits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    tokio::time::advance(SECRET_PENDING_BACKOFF - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        endpoint.awaits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an early pending reply cannot spin on consent.await"
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.awaits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    cancel.cancel();
+    assert_eq!(waiter.await.unwrap(), ConsentOutcome::Cancelled);
+    let calls = endpoint.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.method == "consent.request")
+            .count(),
+        1
+    );
+    assert!(calls
+        .iter()
+        .filter(|call| call.method == "consent.await")
+        .all(|call| call.params["elicitation_id"] == "el_held"));
+}
+
+#[path = "secret_consent_outcome_tests.rs"]
+mod fetch_outcome_lines;
+
+#[path = "secret_consent_audit_tests.rs"]
+mod audit_followups;
+
+struct LostFilingEndpoint {
+    calls: StdMutex<Vec<super::super::consent::ConsentCall>>,
+    files: std::sync::atomic::AtomicUsize,
+    garbled_first: bool,
+    fail_recovery: bool,
+    fail_withdraw: bool,
+}
+impl super::super::consent::ConsentTransport for LostFilingEndpoint {
+    fn call(
+        &self,
+        call: super::super::consent::ConsentCall,
+    ) -> super::super::consent::ConsentFuture {
+        self.calls.lock().unwrap().push(call.clone());
+        let reply = match call.method {
+            "consent.request" => match self.files.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            {
+                0 if self.garbled_first => Ok(json!({"accepted":true})),
+                0 => Err(super::super::consent::ConsentError::Unavailable(
+                    "lost reply".into(),
+                )),
+                1 if self.fail_recovery => Err(super::super::consent::ConsentError::Unavailable(
+                    "recovery unavailable".into(),
+                )),
+                1 => Ok(json!({"elicitation_id":"el_recovered"})),
+                _ => panic!("filing recovery must be bounded to one identical retry"),
+            },
+            "consent.withdraw" if self.fail_withdraw => Err(
+                super::super::consent::ConsentError::Unavailable("withdraw unavailable".into()),
+            ),
+            "consent.withdraw" => Ok(json!({"state":"withdrawn"})),
+            other => panic!("a lost filing must be withdrawn, never awaited: {other}"),
+        };
+        Box::pin(async move { reply })
+    }
+}
+
+#[tokio::test]
+async fn lost_or_garbled_secret_filing_is_refiled_identically_once_then_withdrawn_on_the_original_scope(
+) {
+    for garbled_first in [false, true] {
+        for fail_recovery in [false, true] {
+            for fail_withdraw in [false, true] {
+                let endpoint = Arc::new(LostFilingEndpoint {
+                    calls: Default::default(),
+                    files: Default::default(),
+                    garbled_first,
+                    fail_recovery,
+                    fail_withdraw,
+                });
+                let transport = SubcSecretConsent {
+                    transport: endpoint.clone(),
+                    runtime: tokio::runtime::Handle::current(),
+                    cards: Default::default(),
+                };
+                let request = held_request(crate::secret::vault::now_ms() + 600_000);
+                let answer = transport
+                    .file_cancellable(&request, SECRET_AWAIT_CAP, Some(&Default::default()))
+                    .await;
+                if fail_recovery {
+                    assert!(matches!(answer, ConsentOutcome::Unavailable { .. }));
+                } else {
+                    assert_eq!(answer, ConsentOutcome::Cancelled, "a recovered known card was filed for the person and is cancelled, not expired");
+                }
+                let cached = transport
+                    .file_cancellable(&request, SECRET_AWAIT_CAP, None)
+                    .await;
+                assert_eq!(
+                    cached, answer,
+                    "a repeated caller cannot launch another recovery or withdrawal loop"
+                );
+                let calls = endpoint.calls.lock().unwrap();
+                assert_eq!(calls.len(), if fail_recovery { 2 } else { 3 });
+                assert_eq!(calls[0].method, "consent.request");
+                assert_eq!(calls[1].method, "consent.request");
+                assert_eq!(
+                    calls[0].params, calls[1].params,
+                    "the complete request body, including expiry, is replayed byte for byte"
+                );
+                assert!(calls.iter().all(|call| call.scope == calls[0].scope
+                    && call.project_root == calls[0].project_root
+                    && call.session == calls[0].session));
+                if !fail_recovery {
+                    assert_eq!(calls[2].method, "consent.withdraw");
+                    assert_eq!(calls[2].params, json!({"elicitation_id":"el_recovered"}));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn handler_refusal_samples_are_named_module_errors_not_lost_filing_replies() {
+    let vectors = filer_vector("refusals");
+    let cases = vectors["cases"].as_array().unwrap();
+    let expected = [
+        "elicitation_invalid_request",
+        "elicitation_invalid_request",
+        "elicitation_request_conflict",
+        "elicitation_requester_refused",
+    ];
+    assert_eq!(cases.len(), expected.len());
+    for (case, code) in cases.iter().zip(expected) {
+        let Err(super::super::consent::ConsentError::Refused { code: actual, .. }) =
+            decode_filer_reply(&case["reply"])
+        else {
+            panic!("a published named refusal is a module error, not Unavailable")
+        };
+        assert_eq!(actual, code);
+    }
 }

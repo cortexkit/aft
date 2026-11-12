@@ -906,3 +906,64 @@ fn a_checkout_state_payload_an_older_build_wrote_stays_unusable() {
         "a writer still starts"
     );
 }
+
+#[test]
+fn a_checkout_state_with_gaps_is_unusable_to_v064_without_refusing_its_family() {
+    use crate::checkout::CheckoutState;
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    let gap_free = CheckoutState::new(Vec::new(), Digest128::of(b""), Vec::new()).unwrap();
+    let gapped = gap_free.clone().with_skipped_directories(
+        [(
+            b"locked".to_vec(),
+            "permission denied (os error 13)".to_string(),
+        )]
+        .into(),
+    );
+    let mut writer = family.try_write().unwrap().unwrap();
+    let main = writer
+        .write_checkout_state(checkout("main"), &gapped)
+        .unwrap();
+    let sibling = writer
+        .write_checkout_state(checkout("sibling"), &gap_free)
+        .unwrap();
+    writer
+        .publish(&Publication {
+            add_segments: Vec::new(),
+            remove_segments: Vec::new(),
+            states: vec![main, sibling],
+            retire_checkouts: Vec::new(),
+        })
+        .unwrap();
+    drop(writer);
+    let snapshot = family.snapshot().unwrap();
+    assert_eq!(
+        snapshot.checkout_state(checkout("main")).unwrap().unwrap(),
+        gapped
+    );
+    let payload = snapshot.read_state(checkout("main")).unwrap().unwrap();
+    let error = CheckoutState::decode_as_v064(&payload).unwrap_err();
+    assert!(matches!(
+        error,
+        RecordError::Invalid("fragment section flag")
+    ));
+    let path = family.layout.state(
+        checkout("main"),
+        snapshot
+            .manifest()
+            .checkout(checkout("main"))
+            .unwrap()
+            .number,
+    );
+    let error = FamilyError::record(&path, error);
+    assert!(error.is_unusable_file(), "{error}");
+    assert_eq!(error.newer_format(), None);
+    let sibling = snapshot.read_state(checkout("sibling")).unwrap().unwrap();
+    assert_eq!(CheckoutState::decode_as_v064(&sibling).unwrap(), gap_free);
+    drop(snapshot);
+    family.check_formats().unwrap();
+    assert!(
+        family.try_write().unwrap().is_some(),
+        "an unusable checkout must not block its family writer"
+    );
+}

@@ -4148,9 +4148,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dispatcher_cancels_a_timer_that_ignores_term() {
-        let mut fixture = DispatcherProcessFixture::new(
-            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
-        );
+        let mut fixture = DispatcherProcessFixture::new(&format!(
+            "#!/bin/sh\n{}\n",
+            crate::test_gate::gate("\"$AFT_TEST_REPO/timer-ready\"", "/bin/sleep 0.01")
+        ));
         // TERM sent between fork and exec can be consumed by the timer child's
         // inherited shell trap. Model an equally unresponsive timer explicitly,
         // and let the probe finish only after that timer is known to be running.
@@ -4168,9 +4169,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dispatcher_timer_exec_leaves_no_intermediate_shell_child() {
-        let mut fixture = DispatcherProcessFixture::new(
-            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
-        );
+        let mut fixture = DispatcherProcessFixture::new(&format!(
+            "#!/bin/sh\n{}\n",
+            crate::test_gate::gate("\"$AFT_TEST_REPO/timer-ready\"", "/bin/sleep 0.01")
+        ));
         write_executable(
             &fixture.temp.path().join("sleep"),
             "#!/bin/sh\n: > \"$AFT_TEST_REPO/timer-ready\"\nexec /bin/sleep \"$@\"\n",
@@ -4194,9 +4196,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dispatcher_waits_for_timer_pid_before_cancelling() {
-        let mut fixture = DispatcherProcessFixture::new(
-            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
-        );
+        let mut fixture = DispatcherProcessFixture::new(&format!(
+            "#!/bin/sh\n{}\n",
+            crate::test_gate::gate("\"$AFT_TEST_REPO/timer-ready\"", "/bin/sleep 0.01")
+        ));
         write_executable(
             &fixture.temp.path().join("sleep"),
             "#!/bin/sh\n: > \"$AFT_TEST_REPO/timer-ready\"\nexec /bin/sleep \"$@\"\n",
@@ -4221,9 +4224,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dispatcher_cancellation_survives_term_suppressed_during_timer_fork() {
-        let mut fixture = DispatcherProcessFixture::new(
-            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
-        );
+        let mut fixture = DispatcherProcessFixture::new(&format!(
+            "#!/bin/sh\n{}\n",
+            crate::test_gate::gate("\"$AFT_TEST_REPO/timer-ready\"", "/bin/sleep 0.01")
+        ));
         write_executable(
             &fixture.temp.path().join("sleep"),
             "#!/bin/sh\n: > \"$AFT_TEST_REPO/timer-ready\"\nexec /bin/sleep \"$@\"\n",

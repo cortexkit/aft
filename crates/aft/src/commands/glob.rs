@@ -439,7 +439,11 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    Response::success(&req.id, body)
+    let mut response = Response::success(&req.id, body);
+    if source == "index" {
+        crate::data_layer::surfaces::disclose_index_gaps(ctx, &search_roots, &mut response);
+    }
+    response
 }
 
 fn named_ignored_root(
@@ -619,74 +623,32 @@ fn glob_root(
             }
         }
     }
-    let indexed_snapshot: Option<std::sync::Arc<crate::search_index::SearchIndexSnapshot>> = None;
-    let index_covers_root = indexed_snapshot
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.has_file_in_scope(&search_scope.root));
-    let indexed = indexed_snapshot.map(|snapshot| {
-        let (files, scope_has_files, entries_visited) =
-            snapshot.glob_profiled(pattern, &search_scope.root, false);
-        let indexed_mtimes = files
-            .iter()
-            .filter_map(|path| {
-                snapshot
-                    .file_modified(path)
-                    .map(|time| (path.clone(), time))
-            })
-            .collect();
-        GlobDiscovery {
-            entries_visited,
-            files,
-            indexed_mtimes,
-            walk_truncated: false,
-            walk_time_limit_reached: false,
-            source: "index",
-            walk_time: Duration::ZERO,
-            scope_has_files,
-            scope_probe: Duration::ZERO,
-            skipped_foreign_mounts: 0,
+    if !search_scope.use_index && !ignored_target {
+        let walk_started = Instant::now();
+        if let Some(outcome) = super::grep::ripgrep_glob(&search_scope.root, pattern, max_results) {
+            let walk_time = walk_started.elapsed();
+            let scope_started = Instant::now();
+            let scope_has_files = !outcome.files.is_empty() || outcome.walk_truncated;
+            return Ok(GlobDiscovery {
+                files: outcome.files,
+                indexed_mtimes: HashMap::new(),
+                walk_truncated: outcome.walk_truncated,
+                walk_time_limit_reached: outcome.walk_time_limit_reached,
+                source: "fallback",
+                entries_visited: outcome.entries_visited,
+                walk_time,
+                scope_has_files,
+                scope_probe: scope_started.elapsed(),
+                skipped_foreign_mounts: 0,
+            });
         }
-    });
-    Ok(match indexed {
-        Some(discovery)
-            if index_covers_root
-                || crate::grep_executor::is_same_directory(&search_scope.root, project_root) =>
-        {
-            discovery
-        }
-        // The index is ready but holds no file under this explicitly named
-        // subdirectory: an ignore rule keeps it out of the index (a gitignored
-        // `node_modules/pkg`, for example) or it is a symlinked directory the
-        // index walk never follows. Walk it rather than report zero files; the
-        // walk applies ignore rules only to entries nested inside the named
-        // root. A project-wide glob answers from the index even when empty.
-        Some(_) => fallback_glob(project_root, &search_scope.root, pattern, ignored_target),
-        None => {
-            if !search_scope.use_index && !ignored_target {
-                let walk_started = Instant::now();
-                if let Some(outcome) =
-                    super::grep::ripgrep_glob(&search_scope.root, pattern, max_results)
-                {
-                    let walk_time = walk_started.elapsed();
-                    let scope_started = Instant::now();
-                    let scope_has_files = !outcome.files.is_empty() || outcome.walk_truncated;
-                    return Ok(GlobDiscovery {
-                        files: outcome.files,
-                        indexed_mtimes: HashMap::new(),
-                        walk_truncated: outcome.walk_truncated,
-                        walk_time_limit_reached: outcome.walk_time_limit_reached,
-                        source: "fallback",
-                        entries_visited: outcome.entries_visited,
-                        walk_time,
-                        scope_has_files,
-                        scope_probe: scope_started.elapsed(),
-                        skipped_foreign_mounts: 0,
-                    });
-                }
-            }
-            fallback_glob(project_root, &search_scope.root, pattern, ignored_target)
-        }
-    })
+    }
+    Ok(fallback_glob(
+        project_root,
+        &search_scope.root,
+        pattern,
+        ignored_target,
+    ))
 }
 
 /// [`glob_root`] answered from the data layer's view of the checkout: the

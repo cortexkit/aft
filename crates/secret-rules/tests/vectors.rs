@@ -165,7 +165,6 @@ fn case_rule(value: &Value) -> Result<LabelRule, String> {
             .map(support::string)
             .unwrap_or_else(|| "/v1".to_string()),
         location,
-        grant_id: "grant".to_string(),
     })
 }
 

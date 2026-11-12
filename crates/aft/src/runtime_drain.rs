@@ -128,7 +128,7 @@ fn note_scoped_ignore_rule_refresh_for_test() {}
 #[cfg(not(test))]
 fn note_ignore_rule_refresh_for_test() {}
 
-fn ignore_rule_refresh_now() -> Instant {
+pub(crate) fn ignore_rule_refresh_now() -> Instant {
     #[cfg(test)]
     if let Some(now) = IGNORE_RULE_REFRESH_TEST_NOW.with(std::cell::Cell::get) {
         return now;
@@ -1578,7 +1578,6 @@ fn rebuild_gitignore_for_drain(
 }
 
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
-    let _in_flight = ctx.watcher_drain_guard();
     let started = watcher_drain_now();
     let configure_generation = ctx.configure_generation();
     let content_generation = ctx.configure_content_generation();
@@ -1598,6 +1597,14 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         return outcome;
     }
     ctx.record_checkout_pending_watcher_gap();
+    // Off-loop queries run concurrently with maintenance. An empty pass moves
+    // no events, so it must not mark their answer incomplete. Leave later
+    // arrivals in the channel for the next guarded pass.
+    if !ctx.watcher_drain_has_work_snapshot() {
+        ctx.tick_tier2_refresh_scheduler(0);
+        return outcome;
+    }
+    let _in_flight = ctx.watcher_drain_guard();
     let mut state = match ctx.watcher_drain_slice().lock().take() {
         Some(state) if state.configure_generation == configure_generation => state,
         // Lifecycle-only generation change (transient unbind + equivalent
@@ -1615,7 +1622,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     let mut root_deleted = false;
 
     {
-        let rx_ref = ctx.watcher_rx().lock();
+        // The slot protects receiver identity, not event application. Keep it
+        // available to pending-change snapshots while this guarded drain does I/O.
+        let rx_ref = ctx.watcher_rx().lock().clone();
         // Idle verification must also run when no watcher receiver is installed.
         while let Some(rx) = rx_ref.as_ref() {
             match rx.try_recv() {
@@ -2732,6 +2741,8 @@ mod tests {
     #[test]
     fn ignore_rule_refresh_armed_during_unbind_replays_after_rebind() {
         let _reset = begin_ignore_rule_refresh_test();
+        // Keep the injected deadline ahead of wall time even on a slow runner.
+        set_ignore_rule_refresh_now_for_test(Some(Instant::now() + Duration::from_secs(60)));
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (ctx, tx) = watcher_context(&root);
@@ -2750,6 +2761,27 @@ mod tests {
         let state = state.as_ref().expect("replayed watcher state");
         assert!(state.ignore_refresh_due.is_none());
         assert!(state.ignore_changed_paths.is_empty());
+    }
+
+    #[test]
+    fn healthy_root_metadata_probe_does_not_mark_queries_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, _tx) = watcher_context(&root);
+        assert!(!ctx.watcher_query_has_pending_changes());
+
+        let stopped = ctx.try_cleanup_deleted_root_with_probe(ctx.configure_generation(), |path| {
+            // A filesystem probe can be slow without moving any watcher events.
+            // Capture a query while the probe is running, not after it returns.
+            assert!(
+                !ctx.watcher_query_has_pending_changes(),
+                "checking an existing root must not manufacture pending changes"
+            );
+            std::fs::metadata(path)
+        });
+
+        assert!(!stopped);
+        assert!(!ctx.watcher_query_has_pending_changes());
     }
 
     #[test]

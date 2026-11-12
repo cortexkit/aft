@@ -1,0 +1,114 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/external_disk_check.rs",
+    "crates/aft/src/commands/semantic_search/external_pattern.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/snippet_bounds.rs",
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "rerank-line-prefilter",
+    "cross-repo-search-index-store",
+    "deferred-standalone-grep",
+    "status-push-cost"
+  ],
+  "note": "Combined post-0.64 batch 3 integration, based on batch 2's tip 398e5549aeaa (main 9b505ee5 has the same tree). Copied the engine_unwired descriptor class and the inherited reference pattern-count declarations from ci-speed-post064-batch-2.json. Ranking-fenced changes: semantic_search/mod.rs scans a phrase's first word in raw line bytes before normalizing a line during rerank (exact because normalization only collapses whitespace and ASCII-lowercases, proven on 400 random mixed-script sources); external_pattern.rs and external_disk_check.rs serve another repository's search from the index store instead of the deleted in-memory text index; search_index.rs and semantic_index.rs lose that in-memory index; telemetry.rs adds status-cost probes; lib.rs module declarations. No routing, candidate selection, score, range or ranked rendering change is intended. Evidence: the rerank change replayed all 6,897 recorded query lines with byte-identical rankings, scores, snippets and counts; the cross-repository change replayed 300 queries identically. The pattern_counts below remain only the pre-0.64 reference transitions already declared by batch 1 and batch 2; they grant no new difference.",
+  "pattern_counts": {
+    "followup-census:910002": {
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
+    },
+    "followup-census:910003": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910004": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910005": {
+      "candidate_files": {
+        "before": 194,
+        "after": 141
+      },
+      "files_examined": {
+        "before": 194,
+        "after": 141
+      }
+    },
+    "followup-census:910010": {
+      "candidate_files": {
+        "before": 6,
+        "after": 19
+      },
+      "files_examined": {
+        "before": 6,
+        "after": 19
+      }
+    },
+    "followup-census:910011": {
+      "candidate_files": {
+        "before": 942,
+        "after": 729
+      },
+      "files_examined": {
+        "before": 942,
+        "after": 729
+      }
+    },
+    "followup-census:910012": {
+      "candidate_files": {
+        "before": 1031,
+        "after": 730
+      },
+      "files_examined": {
+        "before": 1031,
+        "after": 730
+      }
+    },
+    "followup-census:910013": {
+      "candidate_files": {
+        "before": 908,
+        "after": 45
+      },
+      "files_examined": {
+        "before": 908,
+        "after": 45
+      }
+    },
+    "followup-census:910014": {
+      "candidate_files": {
+        "before": 1011,
+        "after": 24
+      },
+      "files_examined": {
+        "before": 1011,
+        "after": 24
+      }
+    }
+  }
+}

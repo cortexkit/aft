@@ -150,6 +150,8 @@ impl PlaneReport {
 /// surface.
 #[derive(Clone, Debug)]
 pub(crate) struct DataStoreReport {
+    pub(crate) skipped_folders: usize,
+    pub(crate) skipped_folder_note: Option<String>,
     pub(crate) text: PlaneReport,
     pub(crate) callgraph: PlaneReport,
     /// Paths of the checkout as last published; `None` before anything is.
@@ -172,6 +174,7 @@ pub(crate) struct DataStoreReport {
     pub(crate) refusal: Option<NewerFormat>,
     /// The family store's folder, for its disk use.
     pub(crate) family_dir: Option<PathBuf>,
+    disk_measurement: Option<Arc<DiskMeasurement>>,
     /// Meaning search's plane: the status tool's and each root's health
     /// `semantic_index`. `None` while semantic search is off for the
     /// checkout, or before anything gave it the root's semantic
@@ -182,6 +185,8 @@ pub(crate) struct DataStoreReport {
 impl DataStoreReport {
     fn both(plane: PlaneReport) -> Self {
         Self {
+            skipped_folders: 0,
+            skipped_folder_note: None,
             text: plane.clone(),
             callgraph: plane,
             files: None,
@@ -191,6 +196,7 @@ impl DataStoreReport {
             failure: None,
             refusal: None,
             family_dir: None,
+            disk_measurement: None,
             meaning: None,
         }
     }
@@ -221,6 +227,8 @@ impl DataStoreReport {
             .into_iter()
             .find(|plane| plane.reason.is_some());
         DataStoreHealth {
+            skipped_folders: self.skipped_folders,
+            skipped_folder_note: self.skipped_folder_note.clone(),
             reason: plane_reason.and_then(|plane| plane.reason),
             error: plane_reason.and_then(|plane| plane.error.clone()),
             pending_edits: self.pending_edits,
@@ -238,6 +246,10 @@ impl DataStoreReport {
 /// The `data_store` object of status and of each root's health.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DataStoreHealth {
+    #[serde(skip_serializing_if = "no_skipped_folders")]
+    pub skipped_folders: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_folder_note: Option<String>,
     /// Why a plane is off or unavailable; see [`reason`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -247,6 +259,10 @@ pub struct DataStoreHealth {
     pub unparsed_files: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<DataStoreFailure>,
+}
+
+fn no_skipped_folders(count: &usize) -> bool {
+    *count == 0
 }
 
 /// The last failed build or refresh of a checkout.
@@ -337,7 +353,120 @@ pub fn text_plane_ready(ctx: &AppContext) -> Option<bool> {
     }
 }
 
+const INDEX_GAP_NOTE: &str =
+    "(Index skipped {folders}; results may miss files in them:\n{paths}\n)";
+const INDEX_GAP_PREVIEW: usize = 3;
+
+fn folder_count(count: usize) -> String {
+    format!(
+        "{count} unreadable folder{}",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+pub(crate) fn skipped_folder_health_note(root: &Path, count: usize) -> String {
+    format!("{}: index skipped {}", root.display(), folder_count(count))
+}
+
+/// Report only gaps intersecting the request's scope, under its read policy.
+/// The preview is bounded independently of the number of skipped folders.
+pub(crate) fn disclose_index_gaps(
+    ctx: &AppContext,
+    roots: &[PathBuf],
+    response: &mut crate::protocol::Response,
+) {
+    if !response.success {
+        return;
+    }
+    let views = if let Some(session) = super::parent_session::session_for(ctx) {
+        let children = session.children();
+        let children = children
+            .iter()
+            .filter(|child| {
+                roots
+                    .iter()
+                    .any(|scope| child.root.starts_with(scope) || scope.starts_with(&child.root))
+            })
+            .map(|child| child.root.as_path())
+            .collect::<Vec<_>>();
+        super::parent::text_planes(ctx, session.root(), &children)
+            .into_iter()
+            .filter_map(|plane| match plane {
+                super::parent_session::Plane::Ready(view) => Some((*view).clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else if let Some(DataCheckoutProbe::Bound(checkout)) = ctx.probe_data_checkout() {
+        checkout.view().into_iter().collect::<Vec<_>>()
+    } else {
+        return;
+    };
+    let fence = crate::context::confinement::capture();
+    let mut count = 0;
+    let mut gaps = Vec::new();
+    let mut lines = Vec::new();
+    for view in &views {
+        for (path, reason) in view.current_state().skipped_directories() {
+            let path = if path.is_empty() {
+                view.root().to_path_buf()
+            } else {
+                view.root().join(String::from_utf8_lossy(path).as_ref())
+            };
+            if !roots
+                .iter()
+                .any(|scope| path.starts_with(scope) || scope.starts_with(&path))
+                || !fence.admits_walk_entry(&path)
+            {
+                continue;
+            }
+            count += 1;
+            if gaps.len() < INDEX_GAP_PREVIEW {
+                lines.push(format!("{}: {reason}", path.display()));
+                gaps.push(
+                serde_json::json!({"kind": "unreadable_folder", "path": path, "reason": reason}),
+            );
+            }
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    let omitted = count - gaps.len();
+    if omitted > 0 {
+        lines.push(format!("and {omitted} more"));
+    }
+    let note = INDEX_GAP_NOTE
+        .replace("{folders}", &folder_count(count))
+        .replace("{paths}", &lines.join("\n"));
+    let body = &mut response.data;
+    body["complete"] = Value::Bool(false);
+    body["skipped_folders"] = serde_json::json!(count);
+    body["skipped_folders_omitted"] = serde_json::json!(omitted);
+    let existing = body
+        .as_object_mut()
+        .expect("response body")
+        .entry("gaps")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(existing) = existing.as_array_mut() {
+        existing.extend(gaps);
+    }
+    let text = body["text"].as_str().unwrap_or_default();
+    body["text"] = Value::String(if text.is_empty() {
+        note
+    } else {
+        format!("{note}\n\n{text}")
+    });
+}
+
 pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
+    report_inner(ctx, false)
+}
+
+pub(crate) fn report_for_push(ctx: &AppContext) -> Option<DataStoreReport> {
+    report_inner(ctx, true)
+}
+
+fn report_inner(ctx: &AppContext, cached_only: bool) -> Option<DataStoreReport> {
     Some(match ctx.probe_data_checkout()? {
         DataCheckoutProbe::NotBound => {
             DataStoreReport::both(PlaneReport::because(OFF, reason::NOT_BOUND, None))
@@ -367,7 +496,7 @@ pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
         DataCheckoutProbe::Withheld(Withheld::IndexesOff) => {
             DataStoreReport::both(PlaneReport::of(OFF))
         }
-        DataCheckoutProbe::Bound(checkout) => report_of(&checkout),
+        DataCheckoutProbe::Bound(checkout) => report_of_inner(&checkout, cached_only),
     })
 }
 
@@ -375,7 +504,11 @@ pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
 /// at its last bind, build or refresh, without binding it; `None` when the
 /// data layer is off or nothing was refused.
 pub(crate) fn storage_refusal(ctx: &AppContext) -> Option<NewerFormat> {
-    report(ctx)?.refusal
+    match ctx.probe_data_checkout()? {
+        DataCheckoutProbe::BindFailed(error) => error.refusal().cloned(),
+        DataCheckoutProbe::Bound(checkout) => checkout.last_failure()?.refusal,
+        _ => None,
+    }
 }
 
 /// The degraded reason status gives a refused family store, in the form
@@ -399,6 +532,10 @@ pub(crate) fn refusal_json(refusal: &NewerFormat) -> Value {
 
 /// How a bound checkout stands.
 pub(crate) fn report_of(checkout: &DataCheckout) -> DataStoreReport {
+    report_of_inner(checkout, false)
+}
+
+fn report_of_inner(checkout: &DataCheckout, cached_only: bool) -> DataStoreReport {
     let status = checkout.checkout().status();
     let files = checkout.view().map(|view| view.state().paths().len());
     let mut report = report_from(
@@ -407,7 +544,17 @@ pub(crate) fn report_of(checkout: &DataCheckout) -> DataStoreReport {
         checkout.last_failure(),
         Some(checkout.checkout().family_dir().to_path_buf()),
     );
-    report.meaning = meaning_report(checkout);
+    report.meaning = meaning_report(checkout, cached_only);
+    report.disk_measurement = Some(Arc::clone(checkout.disk_measurement()));
+    report.skipped_folders = checkout
+        .view()
+        .map_or(0, |view| view.current_state().skipped_directories().len());
+    if report.skipped_folders > 0 {
+        report.skipped_folder_note = Some(skipped_folder_health_note(
+            checkout.checkout().root(),
+            report.skipped_folders,
+        ));
+    }
     report
 }
 
@@ -639,10 +786,14 @@ impl MeaningReport {
 
 /// How `checkout`'s meaning plane stands; `None` while semantic search is
 /// off for the checkout.
-fn meaning_report(checkout: &DataCheckout) -> Option<MeaningReport> {
+fn meaning_report(checkout: &DataCheckout, cached_only: bool) -> Option<MeaningReport> {
     use crate::context::SemanticIndexStatus;
     use crate::data_layer::tools::search::DataSemantic;
-    let semantic = DataSemantic::of_checkout(checkout)?;
+    let semantic = if cached_only {
+        DataSemantic::from_state(checkout.cached_meaning_status())?
+    } else {
+        DataSemantic::of_checkout(checkout)?
+    };
     let filling = checkout.filling();
     let plane = match semantic {
         DataSemantic::Serving(meaning) => MeaningPlane::Serving {
@@ -714,6 +865,8 @@ fn report_from(
         PlaneReport::of(READY)
     };
     DataStoreReport {
+        skipped_folders: 0,
+        skipped_folder_note: None,
         text,
         callgraph,
         files,
@@ -723,12 +876,15 @@ fn report_from(
         refusal: failure.as_ref().and_then(|failure| failure.refusal.clone()),
         failure,
         family_dir,
+        disk_measurement: None,
         meaning: None,
     }
 }
 
 /// The bytes of every file under `dir`; zero when it cannot be read.
 fn dir_bytes(dir: &Path) -> u64 {
+    #[cfg(test)]
+    STATUS_DISK_WALKS.with(|count| count.set(count.get() + 1));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -740,6 +896,134 @@ fn dir_bytes(dir: &Path) -> u64 {
             _ => 0,
         })
         .fold(0, u64::saturating_add)
+}
+
+const DISK_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct DiskSample {
+    bytes: Option<u64>,
+    completed: Option<std::time::Instant>,
+    started: Option<std::time::Instant>,
+    running: bool,
+    #[cfg(test)]
+    walks: usize,
+}
+
+/// Physical bytes are a timestamped measurement, not a generation invariant:
+/// temporary files can grow without publishing a generation. All checkouts of
+/// a family share one coalesced sampler; no push walks the family directory.
+#[derive(Default)]
+pub(crate) struct DiskMeasurement {
+    sample: std::sync::Mutex<DiskSample>,
+    listeners: std::sync::Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    gate: std::sync::Mutex<Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>>,
+}
+
+impl std::fmt::Debug for DiskMeasurement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskMeasurement").finish_non_exhaustive()
+    }
+}
+
+impl DiskMeasurement {
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&self) {
+        let mut sample = self.sample.lock().unwrap();
+        assert!(!sample.running);
+        sample.started = None;
+        sample.completed = None;
+    }
+    pub(crate) fn for_family(dir: &Path) -> Arc<Self> {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        static FAMILIES: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<DiskMeasurement>>>,
+        > = std::sync::LazyLock::new(Default::default);
+        let mut families = FAMILIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        families.retain(|_, sample| sample.strong_count() > 0);
+        if let Some(sample) = families.get(&dir).and_then(std::sync::Weak::upgrade) {
+            return sample;
+        }
+        let sample = Arc::new(Self::default());
+        families.insert(dir, Arc::downgrade(&sample));
+        sample
+    }
+
+    pub(crate) fn on_change(&self, listener: &super::runtime::StatusListener) {
+        let mut listeners = self
+            .listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listeners.retain(|old| old.strong_count() > 0);
+        listeners.push(Arc::downgrade(listener));
+    }
+
+    fn observe(self: &Arc<Self>, dir: &Path) -> (Option<u64>, bool) {
+        let mut sample = self
+            .sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sample.running
+            && sample
+                .started
+                .is_none_or(|at| at.elapsed() >= DISK_REFRESH_INTERVAL)
+        {
+            sample.running = true;
+            sample.started = Some(std::time::Instant::now());
+            let own = Arc::clone(self);
+            let dir = dir.to_path_buf();
+            if std::thread::Builder::new()
+                .name("aft-status-disk".into())
+                .spawn(move || {
+                    #[cfg(test)]
+                    if let Some(gate) = own.gate.lock().unwrap().clone() {
+                        let (held, changed) = &*gate;
+                        let mut held = held.lock().unwrap();
+                        while *held {
+                            held = changed.wait(held).unwrap();
+                        }
+                    }
+                    let bytes = dir_bytes(&dir);
+                    {
+                        let mut sample = own
+                            .sample
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        sample.bytes = Some(bytes);
+                        sample.completed = Some(std::time::Instant::now());
+                        sample.running = false;
+                        #[cfg(test)]
+                        {
+                            sample.walks += 1;
+                        }
+                    }
+                    let listeners = own
+                        .listeners
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .filter_map(std::sync::Weak::upgrade)
+                        .collect::<Vec<_>>();
+                    for listener in listeners {
+                        listener();
+                    }
+                })
+                .is_err()
+            {
+                sample.running = false;
+            }
+        }
+        (
+            sample.bytes,
+            sample.running
+                || sample
+                    .completed
+                    .is_none_or(|at| at.elapsed() >= DISK_REFRESH_INTERVAL),
+        )
+    }
 }
 
 /// The data layer's memory for one root's checkout, measured as the
@@ -992,6 +1276,14 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
 /// old call-graph store's refresh queue (`callgraph_refresh`) are dropped:
 /// neither describes what these planes answer from.
 pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
+    apply_to_status_inner(payload, report, false)
+}
+
+pub(crate) fn apply_to_status_push(payload: &mut Value, report: &DataStoreReport) {
+    apply_to_status_inner(payload, report, true)
+}
+
+fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bool) {
     payload["search_index"] = report.search_index_json();
     if let Some(meaning) = &report.meaning {
         let meaning = meaning.status_json();
@@ -1031,7 +1323,16 @@ pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
         &report.family_dir,
     ) {
         disk.insert("data_store_dir".into(), json!(dir.display().to_string()));
-        disk.insert("data_store_bytes".into(), json!(dir_bytes(dir)));
+        if push {
+            let (bytes, stale) = report
+                .disk_measurement
+                .as_ref()
+                .map_or((None, true), |measurement| measurement.observe(dir));
+            disk.insert("data_store_bytes".into(), json!(bytes));
+            disk.insert("data_store_bytes_stale".into(), json!(stale));
+        } else {
+            disk.insert("data_store_bytes".into(), json!(dir_bytes(dir)));
+        }
     }
     if let Some(object) = payload.as_object_mut() {
         object.remove("views");
@@ -1345,6 +1646,179 @@ mod tests {
     /// A configured context over a small Rust crate, with its own storage.
     fn context(root: &Path, storage: &Path) -> AppContext {
         context_with(root, storage, |_| {})
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_folders_publish_with_health_and_query_gaps_then_rescan_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = context_with(&root, storage.path(), |config| {
+            config.indexes.semantic = false
+        });
+        write(&root, "open.txt", "needle open\n");
+        write(&root, "locked/hidden.txt", "needle hidden\n");
+        let locked = root.join("locked");
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let restore = Restore(locked.clone());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&locked)
+                .err()
+                .expect("run without DAC override privileges")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        serve_text_index_for_test(&ctx);
+        let health = report(&ctx).unwrap().health();
+        assert_eq!(health.skipped_folders, 1);
+        assert_eq!(
+            health.skipped_folder_note,
+            Some(format!(
+                "{}: index skipped 1 unreadable folder",
+                root.display()
+            ))
+        );
+        assert_eq!(health.reason, None);
+        assert!(health.failure.is_none());
+        let request = |command: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("gap-{command}"), "command": command,
+                "pattern": if command == "glob" { "**/*.txt" } else { "needle" },
+                "query": "needle",
+            }))
+            .unwrap()
+        };
+        let grep = crate::commands::grep::handle_grep(&request("grep"), &ctx);
+        let glob = crate::commands::glob::handle_glob(&request("glob"), &ctx);
+        let search = crate::commands::semantic_search::handle_semantic_search(
+            &request("semantic_search"),
+            &ctx,
+        );
+        let expected = format!("(Index skipped 1 unreadable folder; results may miss files in them:\n{}: permission denied (os error 13)\n)", locked.display());
+        for response in [&grep, &glob, &search] {
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["complete"], false, "{:?}", response.data);
+            assert_eq!(response.data["skipped_folders"], 1);
+            assert_eq!(
+                response.data["gaps"][0],
+                serde_json::json!({"kind":"unreadable_folder", "path": locked, "reason":"permission denied (os error 13)"})
+            );
+            assert_eq!(
+                response.data["text"]
+                    .as_str()
+                    .unwrap()
+                    .split("\n\n")
+                    .next()
+                    .unwrap(),
+                expected
+            );
+            assert!(response.data["text"].as_str().unwrap().contains("open.txt"));
+        }
+        assert_eq!(grep.data["index_status"], "Ready");
+        let mut scoped = crate::protocol::Response::success(
+            "scope",
+            serde_json::json!({"text":"unchanged", "complete":true}),
+        );
+        disclose_index_gaps(&ctx, &[root.join("src")], &mut scoped);
+        assert_eq!(scoped.data["text"], "unchanged");
+        drop(restore);
+        ctx.data_checkout().unwrap().checkout().rescan().unwrap();
+        let recovered = crate::commands::grep::handle_grep(&request("grep"), &ctx);
+        assert!(recovered.success, "{:?}", recovered.data);
+        assert!(
+            recovered.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("hidden.txt"),
+            "{:?}",
+            recovered.data
+        );
+        assert!(recovered.data["skipped_folders"].is_null());
+        assert_eq!(report(&ctx).unwrap().health().skipped_folders, 0);
+    }
+
+    #[test]
+    fn unreadable_folder_notes_use_the_approved_plural_wording() {
+        assert_eq!(
+            skipped_folder_health_note(Path::new("/work"), 2),
+            "/work: index skipped 2 unreadable folders"
+        );
+        assert_eq!(INDEX_GAP_NOTE.replace("{folders}", &folder_count(2)).replace("{paths}", "a: permission denied\nb: operation not permitted"), "(Index skipped 2 unreadable folders; results may miss files in them:\na: permission denied\nb: operation not permitted\n)");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_root_publishes_a_named_gap_and_rescan_retries_after_access_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = context_with(&root, storage.path(), |config| {
+            config.indexes.semantic = false
+        });
+        write(&root, "readable-later.txt", "needle\n");
+        let hold = super::super::runtime::hold_builds_for_test(&root);
+        bind_for_test(&ctx);
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let restore = Restore(root.clone());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .err()
+                .expect("run without DAC override privileges")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        drop(hold);
+        serve_text_index_for_test(&ctx);
+        let checkout = ctx.data_checkout().unwrap();
+        assert!(checkout.view().unwrap().current_state().paths().is_empty());
+        let health = report(&ctx).unwrap().health();
+        assert_eq!(
+            health.skipped_folder_note,
+            Some(format!(
+                "{}: index skipped 1 unreadable folder",
+                root.display()
+            ))
+        );
+        assert_eq!(health.reason, None);
+        assert!(health.failure.is_none());
+        let req = serde_json::from_value(
+            serde_json::json!({"id":"root-gap", "command":"grep", "pattern":"needle"}),
+        )
+        .unwrap();
+        let response = crate::commands::grep::handle_grep(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["gaps"][0]["path"], serde_json::json!(root));
+        assert_eq!(response.data["text"].as_str().unwrap().split("\n\n").next().unwrap(), format!("(Index skipped 1 unreadable folder; results may miss files in them:\n{}: permission denied (os error 13)\n)", root.display()));
+        drop(restore);
+        checkout.checkout().rescan().unwrap();
+        let recovered = crate::commands::grep::handle_grep(&req, &ctx);
+        assert!(recovered.success, "{:?}", recovered.data);
+        assert!(
+            recovered.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("readable-later.txt"),
+            "{:?}",
+            recovered.data
+        );
+        assert!(recovered.data["skipped_folders"].is_null());
+        assert_eq!(report(&ctx).unwrap().health().skipped_folders, 0);
     }
 
     /// As [`context`], with `edit` applied to its configuration.
@@ -2460,5 +2934,65 @@ mod tests {
         for (path, bytes) in segments.iter().zip(&planted) {
             assert_eq!(&std::fs::read(path).unwrap(), bytes, "{}", path.display());
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATUS_DISK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn status_disk_walks_for_test() -> usize {
+    STATUS_DISK_WALKS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+mod status_disk_tests {
+    use super::*;
+
+    #[test]
+    fn status_disk_measurement_coalesces_bursts_and_marks_inflight_and_expired_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("growing.tmp");
+        std::fs::write(&temp, b"first").unwrap();
+        let sample = DiskMeasurement::for_family(dir.path());
+        assert!(Arc::ptr_eq(
+            &sample,
+            &DiskMeasurement::for_family(dir.path())
+        ));
+        let gate = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+        *sample.gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener: super::super::runtime::StatusListener = Arc::new(move || {
+            let _ = tx.send(());
+        });
+        sample.on_change(&listener);
+        for _ in 0..50 {
+            assert_eq!(sample.observe(dir.path()), (None, true));
+        }
+        *gate.0.lock().unwrap() = false;
+        gate.1.notify_all();
+        rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(sample.observe(dir.path()), (Some(5), false));
+        assert_eq!(sample.sample.lock().unwrap().walks, 1);
+        std::fs::write(&temp, b"a substantially larger temporary file").unwrap();
+        for _ in 0..50 {
+            assert_eq!(sample.observe(dir.path()), (Some(5), false));
+        }
+        assert_eq!(sample.sample.lock().unwrap().walks, 1, "60-second throttle");
+        sample.expire_for_test();
+        *gate.0.lock().unwrap() = true;
+        for _ in 0..50 {
+            assert_eq!(sample.observe(dir.path()), (Some(5), true));
+        }
+        *gate.0.lock().unwrap() = false;
+        gate.1.notify_all();
+        rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            sample.observe(dir.path()),
+            (Some(dir_bytes(dir.path())), false)
+        );
+        assert_eq!(sample.sample.lock().unwrap().walks, 2);
     }
 }

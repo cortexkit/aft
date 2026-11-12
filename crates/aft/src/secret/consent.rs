@@ -13,6 +13,9 @@
 
 use crate::secret::SecretScope;
 
+#[cfg(test)]
+pub(crate) static TEST_TRANSPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The consent kind a secret ask files under.
 pub const SECRET_CONSENT_KIND: &str = "secret_use";
 
@@ -31,6 +34,8 @@ pub struct SecretConsentRequest {
     pub request_id: String,
     /// The vault's statement bytes, base64url without padding.
     pub statement_b64url: String,
+    /// Bound the card by the HTTP request as well as the vault statement.
+    pub expires_at_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for SecretConsentRequest {
@@ -47,9 +52,19 @@ impl std::fmt::Debug for SecretConsentRequest {
 /// What happened to a filed secret consent.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ConsentOutcome {
-    /// Cingulate answered. Whatever it said, the caller must resolve again;
-    /// the answer alone grants nothing.
+    /// Cingulate allowed this request. Retry the vault once; only its release
+    /// authorizes substitution.
     Answered,
+    /// One-use approval. Preserve this distinction so a later card can be
+    /// announced as replacing a consumed one-use approval.
+    AnsweredOnce,
+    Declined,
+    Expired,
+    /// The caller left or the card was withdrawn; this is not a phone answer.
+    Cancelled,
+    /// The card was answered, but no trustworthy decision could be read.
+    /// This must not be retained as a person's answer or a filing failure.
+    Indeterminate,
     /// Still pending when the call's hold ended: the call ends
     /// `access_pending` and the retried call asks again.
     Pending,
@@ -65,6 +80,11 @@ impl std::fmt::Debug for ConsentOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConsentOutcome::Answered => f.write_str("Answered"),
+            ConsentOutcome::AnsweredOnce => f.write_str("AnsweredOnce"),
+            ConsentOutcome::Declined => f.write_str("Declined"),
+            ConsentOutcome::Expired => f.write_str("Expired"),
+            ConsentOutcome::Cancelled => f.write_str("Cancelled"),
+            ConsentOutcome::Indeterminate => f.write_str("Indeterminate"),
             ConsentOutcome::Pending => f.write_str("Pending"),
             ConsentOutcome::Unavailable { detail } => f
                 .debug_struct("Unavailable")
@@ -80,9 +100,57 @@ impl std::fmt::Debug for ConsentOutcome {
 /// the ask through the daemon's Cingulate client and reports what happened.
 /// The trait exists so the outcome table can be tested without a daemon, and
 /// so a later transport shape changes only the installed dispatcher.
-pub trait SecretConsentTransport: Send + Sync {
+pub trait SecretConsentTransport: Send + Sync + 'static {
+    /// Keep cleanup on the daemon runtime, not a command's short-lived proxy.
+    fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        None
+    }
+    /// Await one shared card. Production observes cancellation while awaiting
+    /// the Cingulate consent service and withdraws while the route is still
+    /// bound to the card's authorization scope.
+    fn wait(
+        self: std::sync::Arc<Self>,
+        request: SecretConsentRequest,
+        cancel: Cancellation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ConsentOutcome> + Send>> {
+        Box::pin(async move {
+            let worker = self.clone();
+            let ask = request.clone();
+            let held_cancel = cancel.clone();
+            let held = tokio::task::spawn_blocking(move || {
+                if held_cancel.is_cancelled() {
+                    ConsentOutcome::Cancelled
+                } else {
+                    worker.hold(&ask, &held_cancel)
+                }
+            });
+            let outcome = tokio::select! {
+                biased;
+                () = cancel.cancelled() => ConsentOutcome::Cancelled,
+                result = held => result.unwrap_or(ConsentOutcome::Unavailable { detail: "Cingulate could not settle the secret-use card".into() }),
+            };
+            if matches!(
+                outcome,
+                ConsentOutcome::Cancelled
+                    | ConsentOutcome::Unavailable { .. }
+                    | ConsentOutcome::Indeterminate
+            ) {
+                let _ = tokio::task::spawn_blocking(move || self.withhold(&request)).await;
+            }
+            outcome
+        })
+    }
     /// File `request` and wait for the answer, or for the hold to end.
     fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome;
+
+    /// File once and hold a proxy request for the full approval window.
+    fn hold(&self, request: &SecretConsentRequest, cancel: &Cancellation) -> ConsentOutcome {
+        if cancel.is_cancelled() {
+            ConsentOutcome::Cancelled
+        } else {
+            self.file(request)
+        }
+    }
 
     /// Settle a pending ask the call left behind.
     fn withhold(&self, request: &SecretConsentRequest) -> ConsentOutcome;
@@ -98,6 +166,10 @@ static TRANSPORT: std::sync::LazyLock<
 
 /// Install the secret consent transport.
 pub fn install_transport(transport: Option<std::sync::Arc<dyn SecretConsentTransport>>) {
+    CARDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     *TRANSPORT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = transport;
@@ -123,6 +195,192 @@ pub fn file_consent(request: &SecretConsentRequest) -> ConsentOutcome {
     }
 }
 
+/// Cancellation shared by a request's labels and its approval worker.
+#[derive(Clone)]
+pub struct Cancellation(tokio::sync::watch::Sender<bool>);
+impl Default for Cancellation {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+}
+impl Cancellation {
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+    pub async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+type CardKey = (SecretScope, String);
+struct SharedCard {
+    created: std::time::Instant,
+    statement: String,
+    expires: u64,
+    outcome: tokio::sync::watch::Sender<Option<ConsentOutcome>>,
+    cancel: Cancellation,
+    waiters: std::sync::atomic::AtomicUsize,
+}
+static CARDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<CardKey, std::sync::Arc<SharedCard>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+struct Waiter(std::sync::Arc<SharedCard>);
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        // Join increments use this same lock: a joining waiter must be counted
+        // before the last departure can cancel the shared phone card.
+        let _cards = CARDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .0
+            .waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+            && self.0.outcome.borrow().is_none()
+        {
+            self.0.cancel.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod waiter_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_last_waiter_cannot_decrement_or_cancel_while_a_join_holds_the_cards_lock() {
+        let card = Arc::new(SharedCard {
+            created: Instant::now(),
+            statement: "statement".into(),
+            expires: u64::MAX,
+            outcome: tokio::sync::watch::channel(None).0,
+            cancel: Default::default(),
+            waiters: AtomicUsize::new(1),
+        });
+        let cards = CARDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let leaving = card.clone();
+        let (started, start) = std::sync::mpsc::channel();
+        let (finished, finish) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            drop(Waiter(leaving));
+            finished.send(()).unwrap();
+        });
+        start.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                finish.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the decrement/cancel decision must wait for the joining critical section"
+        );
+        assert_eq!(card.waiters.load(Ordering::Acquire), 1);
+        assert!(!card.cancel.is_cancelled());
+        card.waiters.fetch_add(1, Ordering::AcqRel);
+        drop(cards);
+        finish.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(card.waiters.load(Ordering::Acquire), 1);
+        assert!(
+            !card.cancel.is_cancelled(),
+            "the already-counted join still owns the card"
+        );
+        drop(Waiter(card.clone()));
+        assert!(card.cancel.is_cancelled());
+    }
+}
+
+/// Every HTTP request joins the same recorded card outcome without locking
+/// another request's vault lookup or charging it another waiter's queue time.
+pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcome {
+    let Some(transport) = transport() else {
+        return ConsentOutcome::Unavailable {
+            detail: "no secret consent transport is connected".into(),
+        };
+    };
+    let card = {
+        let mut cards = CARDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cards.retain(|_, card| {
+            if card.waiters.load(std::sync::atomic::Ordering::Acquire) == 0
+                && matches!(
+                    &*card.outcome.borrow(),
+                    Some(ConsentOutcome::Unavailable { .. } | ConsentOutcome::Indeterminate)
+                )
+            {
+                return false;
+            }
+            card.created.elapsed() < std::time::Duration::from_secs(600)
+                || card.expires > super::vault::now_ms()
+                || card.waiters.load(std::sync::atomic::Ordering::Acquire) > 0
+        });
+        let card = cards
+            .entry((request.scope.clone(), request.request_id.clone()))
+            .or_insert_with(|| {
+                let card = std::sync::Arc::new(SharedCard {
+                    created: std::time::Instant::now(),
+                    statement: request.statement_b64url.clone(),
+                    expires: request.expires_at_ms.unwrap_or(u64::MAX),
+                    outcome: tokio::sync::watch::channel(None).0,
+                    cancel: Default::default(),
+                    waiters: Default::default(),
+                });
+                let worker = card.clone();
+                let request = request.clone();
+                transport
+                    .runtime()
+                    .unwrap_or_else(tokio::runtime::Handle::current)
+                    .spawn(async move {
+                        let answer = transport.wait(request, worker.cancel.clone()).await;
+                        worker.outcome.send_replace(Some(answer));
+                    });
+                card
+            })
+            .clone();
+        card.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        card
+    };
+    let _waiter = Waiter(card.clone());
+    if card.statement != request.statement_b64url {
+        return ConsentOutcome::Unavailable {
+            detail: "Cingulate could not file the secret-use card".into(),
+        };
+    }
+    let mut receiver = card.outcome.subscribe();
+    loop {
+        if let Some(answer) = receiver.borrow_and_update().clone() {
+            return answer;
+        }
+        if receiver.changed().await.is_err() {
+            return ConsentOutcome::Unavailable {
+                detail: "Cingulate could not settle the secret-use card".into(),
+            };
+        }
+    }
+}
+
 /// Settle a pending secret ask.
 pub fn withhold_consent(request: &SecretConsentRequest) -> ConsentOutcome {
     match transport() {
@@ -139,7 +397,7 @@ pub fn withhold_consent(request: &SecretConsentRequest) -> ConsentOutcome {
 /// exactly one item without decoding or re-encoding the statement; the daemon
 /// carries the authorization stamp outside this body.
 pub fn request_params(request: &SecretConsentRequest) -> serde_json::Value {
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "kind": SECRET_CONSENT_KIND,
         "secret_use": {
             "items": [{
@@ -147,5 +405,13 @@ pub fn request_params(request: &SecretConsentRequest) -> serde_json::Value {
                 "statement_b64url": request.statement_b64url,
             }],
         },
-    })
+    });
+    if let Some(expires) = request.expires_at_ms {
+        params["expires_at_ms"] = serde_json::json!(expires);
+    }
+    params
 }
+
+#[cfg(test)]
+#[path = "consent_cancel_tests.rs"]
+mod cancellation_cache_tests;

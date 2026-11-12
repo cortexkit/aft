@@ -16,6 +16,11 @@ mod json;
 
 pub use json::is_json_content_type;
 
+/// Validate JSON structure without selecting a deposit location or holding a key.
+pub fn validate_json_request(request: &RequestView<'_>) -> Result<(), RequestRefusal> {
+    json::evaluate(request, &[], &[]).map(|_| ())
+}
+
 use crate::material::{check_admissible, encode_for_location, MaterialRefusal};
 use crate::placeholder::{is_label, parse_exact, PLACEHOLDER_PREFIX};
 use crate::target::{authority_matches_connect, ConnectAuthority, RuleTarget, TargetRefusal};
@@ -71,7 +76,7 @@ pub fn location_kind_token(location: &Location) -> String {
     }
 }
 
-/// A label's rule, as resolved by the vault (V1).
+/// The location and concrete target authorized for one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelRule {
     pub label: String,
@@ -79,9 +84,6 @@ pub struct LabelRule {
     pub port: u16,
     pub path_prefix: String,
     pub location: Location,
-    /// Opaque grant identifier; the vault compares it, the crate never parses
-    /// it.
-    pub grant_id: String,
 }
 
 /// Why a request is refused (P2, P4, and the target rules it depends on).

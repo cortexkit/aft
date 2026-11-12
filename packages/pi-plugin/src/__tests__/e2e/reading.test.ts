@@ -9,10 +9,19 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
-import { createHarness, type Harness, prepareBinary } from "./helpers.js";
+import { createHarness, type Harness, prepareBinary, withoutTrailingStatusBar } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = initialBinary.binaryPath ? describe : describe.skip;
+
+test("content assertions strip only an optional trailing status bar", () => {
+  const body = "shown 200 of ≥200 files (walk) · narrow: path";
+  expect(withoutTrailingStatusBar(`${body}\n\n[AFT E? W? | T0]`)).toBe(body);
+  expect(withoutTrailingStatusBar(`${body}\n`)).toBe(`${body}\n`);
+  expect(withoutTrailingStatusBar(`${body}\n[AFT E? W? | T0]`, "\n")).toBe(`${body}\n`);
+  const internal = "[AFT E? W? | T0]\nsource content";
+  expect(withoutTrailingStatusBar(internal)).toBe(internal);
+});
 
 maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
   let harness: Harness;
@@ -97,7 +106,7 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
       // last saw it, for example when the background TODO count first arrives
       // mid-test. That is timing, not outline structure; the bar has its own
       // tests.
-      const text = harness.text(result).replace(/\n*\[AFT [^\]\n]*\]\s*$/, "\n");
+      const text = withoutTrailingStatusBar(harness.text(result), "\n");
       expect(text).toBe(golden);
       expect(result.details).toMatchObject({ success: true, complete: true });
     }
@@ -186,7 +195,7 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(response.walk_truncated).toBe(true);
     expect(Array.isArray(response.skipped_files)).toBe(true);
     expect(harness.text(result)).toContain("file-000.ts");
-    expect(harness.text(result).trimEnd().split("\n").at(-1)).toMatch(
+    expect(withoutTrailingStatusBar(harness.text(result)).trimEnd().split("\n").at(-1)).toMatch(
       /^shown \d+ of ≥200 files \(walk\) · narrow: path$/,
     );
   });

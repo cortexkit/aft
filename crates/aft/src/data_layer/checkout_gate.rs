@@ -162,6 +162,27 @@ impl EngineComparison {
     }
 }
 
+/// Compares every engine input, answer, recording and encoded fragment after a
+/// probe has forced a refresh to switch to cold. Unlike a query sample, this
+/// fails when any file differs or when no file was compared.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn compare_engines(checkout: &Checkout, cold: &Checkout) -> Result<EngineComparison, String> {
+    let mut examples = Vec::new();
+    let compared = cold
+        .inspect_engine(|cold| {
+            checkout.inspect_engine(|live| compare_engine(live, cold, &mut examples))
+        })
+        .map_err(|error| error.to_string())?
+        .ok_or("the cold build published no call graph")?;
+    let comparison = compared
+        .map_err(|error| error.to_string())?
+        .ok_or("the checkout published no call graph")?;
+    if comparison.failed() {
+        return Err(format!("{comparison:?}: {examples:?}"));
+    }
+    Ok(comparison)
+}
+
 /// A folder under the system's temporary folder, removed when dropped.
 struct Scratch(PathBuf);
 

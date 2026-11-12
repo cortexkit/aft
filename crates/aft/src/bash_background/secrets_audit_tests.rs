@@ -37,6 +37,7 @@ struct Fixture {
     server: Option<std::thread::JoinHandle<()>>,
     _launcher: Box<dyn std::any::Any>,
     tasks: Mutex<Vec<String>>,
+    echo_key: Arc<AtomicBool>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -90,6 +91,8 @@ impl Fixture {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (seen_server, stopping) = (seen.clone(), stop.clone());
+        let echo_key = Arc::new(AtomicBool::new(false));
+        let echo_response = echo_key.clone();
         let server = std::thread::spawn(move || {
             while !stopping.load(Ordering::SeqCst) {
                 let socket = match listener.accept() {
@@ -120,9 +123,13 @@ impl Fixture {
                             .lock()
                             .unwrap()
                             .push(String::from_utf8(bytes).unwrap());
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                        );
+                        let body: &[u8] = if echo_response.load(Ordering::SeqCst) {
+                            KEY
+                        } else {
+                            b"ok"
+                        };
+                        let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+                        let _ = stream.write_all(body);
                         let _ = stream.flush();
                         break;
                     }
@@ -140,6 +147,7 @@ impl Fixture {
             server: Some(server),
             _launcher: Box::new(launcher),
             tasks: Mutex::new(Vec::new()),
+            echo_key,
         }
     }
     fn curl(&self) -> String {
@@ -152,6 +160,15 @@ impl Fixture {
         serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"audit-run","kind":"ephemeral","scope_epoch":1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap()
     }
     fn launch(&self, command: &str, bound: bool, extra: serde_json::Value) -> Response {
+        self.launch_with_vault(self.vault.clone(), command, bound, extra)
+    }
+    fn launch_with_vault(
+        &self,
+        vault: Arc<dyn SecretVault>,
+        command: &str,
+        bound: bool,
+        extra: serde_json::Value,
+    ) -> Response {
         let mut req = request(command);
         req.params["params"]
             .as_object_mut()
@@ -163,7 +180,7 @@ impl Fixture {
                 crate::commands::bash::handle(&req, &self.ctx)
             })
         };
-        with_vault(self.vault.clone(), || {
+        with_vault(vault, || {
             if bound {
                 crate::subc::with_secret_bound_identity_for_test(
                     self.root.path(),
@@ -266,8 +283,9 @@ fn audit_authorizing_head_end_stops_run_proxy() {
     isolated("audit_authorizing_head_end_stops_run_proxy", || {
         let f = Fixture::new();
         let command = format!(
-            "{}; : > first; while [ ! -f next ]; do sleep 0.05; done; {}; : > second; sleep 30",
+            "{}; : > first; {}; {}; : > second; sleep 30",
             f.curl(),
+            crate::test_gate::gate("next", "sleep 0.05"),
             f.curl()
         );
         let id = f.task(&f.launch(&command, true, json!({})));
@@ -400,7 +418,11 @@ fn audit_arm_failure_cleans_transferred_scratch() {
 fn audit_killing_revokes_before_term_grace() {
     isolated("audit_killing_revokes_before_term_grace", || {
         let f = Fixture::new();
-        let command = format!("trap ':' TERM; : > ready; while [ ! -f during-kill ]; do sleep 0.05; done; {}; : > term-request; while :; do sleep 0.05; done", f.curl());
+        let command = format!(
+            "trap ':' TERM; : > ready; {}; {}; : > term-request; while :; do sleep 0.05; done",
+            crate::test_gate::gate("during-kill", "sleep 0.05"),
+            f.curl()
+        );
         let id = f.task(&f.launch(&command, false, json!({})));
         f.wait_file("ready");
         let address = f
@@ -495,7 +517,7 @@ fn audit_runtime_built_unscanned_label_is_refused() {
             std::fs::read_to_string(f.root.path().join("result")).unwrap(),
             "22"
         );
-        assert_eq!(f.vault.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(f.vault.resolves.load(Ordering::SeqCst), 0);
         assert_eq!(f.vault.materials.load(Ordering::SeqCst), 0);
         assert!(f.seen.lock().unwrap().is_empty());
     });
@@ -515,7 +537,11 @@ fn audit_timeout_removes_proxy() {
 
 fn completion_cleanup(timeout: bool) {
     let f = Fixture::new();
-    let command = format!("printf '%s' \"${{SSL_CERT_FILE%/*}}\" > scratch-path; {}; : > first; while [ ! -f finish ]; do sleep 0.05; done", f.curl());
+    let command = format!(
+        "printf '%s' \"${{SSL_CERT_FILE%/*}}\" > scratch-path; {}; : > first; {}",
+        f.curl(),
+        crate::test_gate::gate("finish", "sleep 0.05")
+    );
     let extra = if timeout {
         json!({"timeout":2500})
     } else {
@@ -552,8 +578,9 @@ fn audit_epoch_rebind_revokes_secret_not_ordinary_job() {
         let f = Fixture::new();
         let id = f.task(&f.launch(
             &format!(
-                "{}; : > first; while [ ! -f next ]; do sleep 0.05; done; {}; : > second; sleep 30",
+                "{}; : > first; {}; {}; : > second; sleep 30",
                 f.curl(),
+                crate::test_gate::gate("next", "sleep 0.05"),
                 f.curl()
             ),
             true,
@@ -632,4 +659,142 @@ fn audit_hardened_daemon_preserves_child_fd_aliases() {
             b"data"
         );
     });
+}
+
+#[test]
+fn audit_live_vault_key_never_reaches_task_logs_previews_or_status() {
+    isolated(
+        "audit_live_vault_key_never_reaches_task_logs_previews_or_status",
+        || {
+            use crate::secret::transport::fake::{FakeClaustrum, Record, NONCE};
+            use crate::secret::{
+                ConsentOutcome, SecretConsentRequest, SecretConsentTransport, SubcSecretVault,
+            };
+            struct Phone {
+                cards: std::sync::mpsc::Sender<SecretConsentRequest>,
+                answer: Mutex<std::sync::mpsc::Receiver<ConsentOutcome>>,
+            }
+            impl SecretConsentTransport for Phone {
+                fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+                    self.hold(request, &Default::default())
+                }
+                fn hold(
+                    &self,
+                    request: &SecretConsentRequest,
+                    cancel: &crate::secret::consent::Cancellation,
+                ) -> ConsentOutcome {
+                    if cancel.is_cancelled() {
+                        return ConsentOutcome::Cancelled;
+                    }
+                    self.cards.send(request.clone()).unwrap();
+                    self.answer
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap_or(ConsentOutcome::Expired)
+                }
+                fn withhold(&self, _: &SecretConsentRequest) -> ConsentOutcome {
+                    ConsentOutcome::Expired
+                }
+            }
+            let (cards, received_card) = std::sync::mpsc::channel();
+            let (answer, answered) = std::sync::mpsc::channel();
+            crate::secret::consent::install_transport(Some(Arc::new(Phone {
+                cards,
+                answer: Mutex::new(answered),
+            })));
+            let f = Fixture::new();
+            f.echo_key.store(true, Ordering::SeqCst);
+            let daemon = FakeClaustrum::start();
+            daemon.state.lock().unwrap().record = Some(Record {
+                name: "test".into(),
+                host: "localhost".into(),
+                path: "/api".into(),
+                location: "authorization_bearer".into(),
+                key: KEY.to_vec(),
+            });
+            let transport = crate::secret::transport::SubcSecretUseTransport::for_test(
+                daemon.path.clone(),
+                subc_protocol::BindIdentity::new("live-secret-bash", "secret-bash"),
+                Duration::from_secs(2),
+                subc_client_rs::ConsumerIdentity {
+                    module_id: "aft".into(),
+                    launch_nonce: NONCE.into(),
+                },
+            );
+            let vault = Arc::new(SubcSecretVault::new(Arc::new(transport)));
+            let curl = f.curl().replace("--max-time 2", "--max-time 20");
+            let command = format!("{curl}; printf '\\n'; {curl} >&2");
+            let response = f.launch_with_vault(vault, &command, false, json!({}));
+            let id = f.task(&response);
+            let pending = received_card
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the real request files its card");
+            assert_eq!(
+                pending.scope,
+                crate::secret::SecretScope::from_stamp(&stamp("worker"))
+            );
+            assert!(
+                f.seen.lock().unwrap().is_empty(),
+                "approval holds the request before upstream dispatch"
+            );
+            let status_request: RawRequest = serde_json::from_value(json!({"id":"waiting-vault-status", "command":"bash_status", "session_id":"secret-bash", "params":{"task_id":id}})).unwrap();
+            let waiting = crate::commands::bash_status::handle(&status_request, &f.ctx);
+            let waiting_json = serde_json::to_string(&waiting).unwrap();
+            assert!(waiting.success, "{waiting:?}");
+            assert!(waiting_json.contains("secret test: waiting for approval on the phone for localhost (requests wait up to 10 minutes)"));
+            assert!(!waiting_json.contains(std::str::from_utf8(KEY).unwrap()));
+            daemon
+                .state
+                .lock()
+                .unwrap()
+                .approve(&pending.statement_b64url);
+            answer.send(ConsentOutcome::Answered).unwrap();
+            f.wait_terminal(&id);
+            let snapshot = f
+                .ctx
+                .bash_background()
+                .status(
+                    &id,
+                    "secret-bash",
+                    Some(f.root.path()),
+                    Some(f._storage.path()),
+                    8192,
+                )
+                .unwrap();
+            assert_eq!(snapshot.exit_code, Some(0), "{}", f.diagnostics());
+            let key = std::str::from_utf8(KEY).unwrap();
+            let status_request: RawRequest = serde_json::from_value(json!({"id":"live-vault-status", "command":"bash_status", "session_id":"secret-bash", "params":{"task_id":id}})).unwrap();
+            let status_reply = crate::commands::bash_status::handle(&status_request, &f.ctx);
+            assert!(status_reply.success, "{status_reply:?}");
+            for text in [
+                serde_json::to_string(&response).unwrap(),
+                snapshot.output_preview.clone(),
+                serde_json::to_string(&snapshot).unwrap(),
+                f.diagnostics(),
+                serde_json::to_string(&status_reply).unwrap(),
+            ] {
+                assert!(
+                    !text.contains(key),
+                    "released material escaped into task observability"
+                );
+            }
+            assert!(snapshot.output_preview.contains("{{ck-secret:test}}"));
+            assert_eq!(f.seen.lock().unwrap().len(), 2);
+            assert!(
+                f.seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.contains(key)),
+                "the vault key actually reached the approved upstream"
+            );
+            assert_eq!(
+                daemon.state.lock().unwrap().calls,
+                3,
+                "one approval ask and one release per real request"
+            );
+            assert_eq!(daemon.state.lock().unwrap().connections, 1);
+        },
+    );
 }
