@@ -3549,6 +3549,10 @@ pub(crate) fn ticket_repository_snapshot(project_root: &Path) -> Option<String> 
     canonical_repository_key(std::str::from_utf8(&output.stdout).ok()?.trim())
 }
 
+#[cfg(test)]
+#[path = "gh_shim/ticket_repository_tests.rs"]
+mod ticket_repository_tests;
+
 /// The target's binding, else the checkout's.
 ///
 /// Speech is governed by the target alone. This wider answer serves the
