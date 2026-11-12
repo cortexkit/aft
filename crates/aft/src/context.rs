@@ -2164,6 +2164,12 @@ pub struct QueryPendingChanges {
 pub(crate) enum PendingCaptureBoundary {
     /// After the flush-window set, before the dispatch channel and drain.
     AfterFlushWindow,
+    /// After a contended intake-counter probe, before reading the snapshot.
+    AfterIntakeProbe,
+    /// After a contended cleanup-state probe, before reading the snapshot.
+    AfterCleanupProbe,
+    /// After a contended receiver-slot probe, before reading the snapshot.
+    AfterReceiverProbe,
     /// After probing the continuation mutex, before waiting for its metadata.
     AfterContinuationProbe,
 }
@@ -2218,6 +2224,20 @@ fn pending_capture_boundary_for_test(boundary: PendingCaptureBoundary) {
 pub(crate) struct WatcherDrainGuard<'a> {
     in_flight: &'a AtomicUsize,
     activity: &'a AtomicU64,
+}
+
+fn watcher_metadata_probe<'a, T>(
+    slot: &'a parking_lot::Mutex<T>,
+    wait_for_metadata: bool,
+    on_contention: impl FnOnce(),
+) -> Option<parking_lot::MutexGuard<'a, T>> {
+    let value = slot.try_lock();
+    if wait_for_metadata && value.is_none() {
+        on_contention();
+        Some(slot.lock())
+    } else {
+        value
+    }
 }
 
 impl Drop for WatcherDrainGuard<'_> {
@@ -5746,14 +5766,12 @@ impl AppContext {
                     else {
                         return false;
                     };
-                    // Pending-change queries count a contended cleanup lock as
-                    // watcher work. Probe metadata before taking that lock so a
-                    // slow existence check cannot make an idle query incomplete.
+                    // Keep the state lock limited to metadata: query capture
+                    // reads it without waiting for filesystem checks or cleanup.
                     let metadata = root_metadata(&root);
-                    let mut cleanup = self.deleted_root_cleanup.lock();
                     match metadata {
                         Ok(metadata) if metadata.is_dir() => {
-                            *cleanup = None;
+                            *self.deleted_root_cleanup.lock() = None;
                             return false;
                         }
                         Ok(_) => {}
@@ -5763,8 +5781,11 @@ impl AppContext {
                                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                             ) => {}
                         Err(error) => {
+                            let previous = self.deleted_root_cleanup.lock().replace(
+                                DeletedRootCleanup::Inconclusive(expected_generation),
+                            );
                             let already_logged = matches!(
-                                *cleanup,
+                                previous,
                                 Some(DeletedRootCleanup::Inconclusive(generation))
                                     if generation == expected_generation
                             );
@@ -5775,17 +5796,18 @@ impl AppContext {
                                     error
                                 );
                             }
-                            *cleanup = Some(DeletedRootCleanup::Inconclusive(expected_generation));
                             return true;
                         }
                     }
-                    if matches!(*cleanup, Some(DeletedRootCleanup::Complete(generation)) if generation == expected_generation) {
+                    if matches!(*self.deleted_root_cleanup.lock(), Some(DeletedRootCleanup::Complete(generation)) if generation == expected_generation) {
                         return true;
                     }
                     // Directory cleanup can modify the same cached state as
                     // event delivery, so guard it even without a receiver.
                     let _in_flight = self.watcher_drain_guard();
-                    *cleanup = Some(DeletedRootCleanup::Pending(expected_generation));
+                    // The lifecycle gate serializes cleanup operations. Publish
+                    // retry demand, then release the metadata lock before teardown.
+                    *self.deleted_root_cleanup.lock() = Some(DeletedRootCleanup::Pending(expected_generation));
                     // A concurrent drain may hold the receiver while awaiting
                     // lifecycle admission. Never wait for it under this gate.
                     if !self.try_stop_watcher_runtime_in_background() {
@@ -5799,7 +5821,7 @@ impl AppContext {
                     // Also invalidate starts that have not published a client yet.
                     let clients = lsp.take_all_clients();
                     drop(lsp);
-                    *cleanup = Some(DeletedRootCleanup::Complete(expected_generation));
+                    *self.deleted_root_cleanup.lock() = Some(DeletedRootCleanup::Complete(expected_generation));
                     let _ = self.add_degraded_reason("project_root_deleted".to_string());
                     crate::slog_warn!(
                         "project root deleted {}: shut down {} language server(s); dropping watcher",
@@ -5898,36 +5920,35 @@ impl AppContext {
         self.watcher_drain_has_work_inner(false)
     }
 
-    /// Confirm the continuation portion of query capture and drain admission:
-    /// another reader of that metadata is not evidence of unapplied changes.
-    /// Drains take the continuation out before doing I/O, so waiting for this
-    /// slot cannot wait for a drain to apply its files. Receiver and cleanup
-    /// locks can cover I/O and retain their conservative probes. The frame-loop
-    /// scheduler keeps the fully nonblocking probe above.
-    pub(crate) fn watcher_drain_has_work_waiting_for_continuation(&self) -> bool {
+    /// Query capture and drain admission inspect metadata instead of treating
+    /// contention as changes. These slots never cover I/O or applying events;
+    /// actual cleanup and drains publish pending state and an in-flight fence.
+    /// The frame-loop scheduler keeps its fully nonblocking probe above.
+    pub(crate) fn watcher_drain_has_work_snapshot(&self) -> bool {
         self.watcher_drain_has_work_inner(true)
     }
 
-    fn watcher_drain_has_work_inner(&self, wait_for_continuation: bool) -> bool {
-        let cleanup_pending = self.deleted_root_cleanup.try_lock().is_none_or(|cleanup| {
+    fn watcher_drain_has_work_inner(&self, wait_for_metadata: bool) -> bool {
+        let cleanup_pending = watcher_metadata_probe(&self.deleted_root_cleanup, wait_for_metadata, || {
+            #[cfg(test)]
+            pending_capture_boundary_for_test(PendingCaptureBoundary::AfterCleanupProbe);
+        }).is_none_or(|cleanup| {
             matches!(
                 *cleanup,
                 Some(DeletedRootCleanup::Pending(generation) | DeletedRootCleanup::Inconclusive(generation))
                     if generation == self.configure_generation()
             )
         });
-        let receiver_pending = self
-            .watcher_rx
-            .try_lock()
-            .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
-        cleanup_pending || receiver_pending || {
-            let slot = self.watcher_drain_slice.try_lock();
+        let receiver_pending = watcher_metadata_probe(&self.watcher_rx, wait_for_metadata, || {
             #[cfg(test)]
-            if wait_for_continuation {
+            pending_capture_boundary_for_test(PendingCaptureBoundary::AfterReceiverProbe);
+        })
+        .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
+        cleanup_pending || receiver_pending || {
+            let slot = watcher_metadata_probe(&self.watcher_drain_slice, wait_for_metadata, || {
+                #[cfg(test)]
                 pending_capture_boundary_for_test(PendingCaptureBoundary::AfterContinuationProbe);
-            }
-            let slot =
-                slot.or_else(|| wait_for_continuation.then(|| self.watcher_drain_slice.lock()));
+            });
             slot.is_none_or(|slot| {
                 slot.as_ref().is_some_and(|state| {
                     state.has_pending_work()
@@ -5962,16 +5983,24 @@ impl AppContext {
         // Directory discovery publishes children to the flush window before
         // ending its pending guard; dispatch publishes before clearing that
         // window or its backlog. Read these stages before the channel below.
-        let intake_pending = match self.watcher_counters.try_read() {
+        let counters = self.watcher_counters.try_read();
+        #[cfg(test)]
+        if matches!(&counters, Err(std::sync::TryLockError::WouldBlock)) {
+            pending_capture_boundary_for_test(PendingCaptureBoundary::AfterIntakeProbe);
+        }
+        let intake_pending = match counters {
             Ok(counters) => counters.query_delivery_pending(),
             Err(std::sync::TryLockError::Poisoned(counters)) => {
                 counters.into_inner().query_delivery_pending()
             }
-            // Contended: assume events may be held, as the probes below do.
-            Err(std::sync::TryLockError::WouldBlock) => true,
+            // Publication swaps only the Arc; root lookup and I/O happen before
+            // taking the write lock, so contention is not evidence of events.
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.watcher_counters().query_delivery_pending()
+            }
         };
         intake_pending
-            || self.watcher_drain_has_work_waiting_for_continuation()
+            || self.watcher_drain_has_work_snapshot()
             || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
             || self.watcher_drain_activity.load(Ordering::Acquire) != activity
     }
@@ -7533,14 +7562,15 @@ impl AppContext {
         self.reconcile_rerank_backend(&next);
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
-            *self
-                .watcher_counters
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = next
+            let counters = next
                 .project_root
                 .as_deref()
                 .map(watcher_counters_for_root)
                 .unwrap_or_else(|| Arc::new(WatcherCounters::default()));
+            *self
+                .watcher_counters
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = counters;
         }
         Some(next)
     }
@@ -13829,8 +13859,9 @@ mod callgraph_store_for_ops_tests {
         }
     }
 
-    fn with_contended_watcher_continuation<T>(
+    fn with_contended_watcher_metadata<T>(
         ctx: &Arc<AppContext>,
+        boundary: PendingCaptureBoundary,
         capture: impl FnOnce() -> T,
     ) -> T {
         let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
@@ -13838,23 +13869,39 @@ mod callgraph_store_for_ops_tests {
         let (unlocked_tx, unlocked_rx) = std::sync::mpsc::sync_channel(1);
         let reader_ctx = Arc::clone(ctx);
         let reader = std::thread::spawn(move || {
-            reader_ctx.hold_maintenance_probe_lock_for_test(
-                MaintenanceProbeLock::WatcherDrainSlice,
-                || {
-                    held_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                },
-            );
+            let hold = || {
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            };
+            match boundary {
+                PendingCaptureBoundary::AfterCleanupProbe => {
+                    let _held = reader_ctx.deleted_root_cleanup.lock();
+                    hold();
+                }
+                PendingCaptureBoundary::AfterReceiverProbe => {
+                    let _held = reader_ctx.watcher_rx.lock();
+                    hold();
+                }
+                PendingCaptureBoundary::AfterContinuationProbe => {
+                    let _held = reader_ctx.watcher_drain_slice.lock();
+                    hold();
+                }
+                PendingCaptureBoundary::AfterIntakeProbe => {
+                    let _held = reader_ctx.watcher_counters.write().unwrap();
+                    hold();
+                }
+                PendingCaptureBoundary::AfterFlushWindow => unreachable!(),
+            }
             unlocked_tx.send(()).unwrap();
         });
         held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(ctx.watcher_drain_has_work(), "the scheduler must not wait");
-        let probe_ctx = Arc::clone(ctx);
-        let hook = install_pending_capture_hook_for_test(move |boundary| {
-            if boundary == PendingCaptureBoundary::AfterContinuationProbe {
-                // The capture has already observed contention. Release only
-                // the reader; the parked continuation itself is unchanged.
-                assert!(probe_ctx.watcher_drain_slice().try_lock().is_none());
+        if boundary != PendingCaptureBoundary::AfterIntakeProbe {
+            assert!(ctx.watcher_drain_has_work(), "the scheduler must not wait");
+        }
+        let hook = install_pending_capture_hook_for_test(move |reached| {
+            if reached == boundary {
+                // Capture has observed contention, not a changed value. Release
+                // only the other reader; the pending metadata stays unchanged.
                 release_tx.send(()).unwrap();
                 unlocked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             }
@@ -13866,49 +13913,120 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn watcher_query_reads_contended_continuation_instead_of_inventing_changes() {
+    fn watcher_query_reads_contended_metadata_instead_of_inventing_changes() {
         let (_dirs, ctx) = cold_build_context();
-        for parked in [false, true] {
+        for boundary in [
+            PendingCaptureBoundary::AfterCleanupProbe,
+            PendingCaptureBoundary::AfterReceiverProbe,
+            PendingCaptureBoundary::AfterContinuationProbe,
+            PendingCaptureBoundary::AfterIntakeProbe,
+        ] {
             for pending in [false, true] {
-                if pending && !parked {
-                    continue;
-                }
-                let mut state = WatcherDrainSliceState::new(
-                    ctx.configure_generation(),
-                    ctx.configure_content_generation(),
-                );
+                *ctx.deleted_root_cleanup.lock() = None;
+                *ctx.watcher_drain_slice.lock() = None;
+                let (tx, rx) = crate::watcher_filter::watcher_dispatch_channel();
+                *ctx.watcher_rx.lock() = Some(rx);
+                ctx.watcher_counters().set_dispatch_backlog(0);
                 if pending {
-                    state.pending_paths.push_back(PathBuf::from("src/lib.rs"));
+                    match boundary {
+                        PendingCaptureBoundary::AfterCleanupProbe => {
+                            *ctx.deleted_root_cleanup.lock() =
+                                Some(DeletedRootCleanup::Pending(ctx.configure_generation()));
+                        }
+                        PendingCaptureBoundary::AfterReceiverProbe => {
+                            tx.send(WatcherDispatchEvent::Paths(vec![PathBuf::from(
+                                "src/lib.rs",
+                            )]))
+                            .unwrap();
+                        }
+                        PendingCaptureBoundary::AfterContinuationProbe => {
+                            let mut state = WatcherDrainSliceState::new(
+                                ctx.configure_generation(),
+                                ctx.configure_content_generation(),
+                            );
+                            state.pending_paths.push_back(PathBuf::from("src/lib.rs"));
+                            *ctx.watcher_drain_slice.lock() = Some(state);
+                        }
+                        PendingCaptureBoundary::AfterIntakeProbe => {
+                            ctx.watcher_counters().set_dispatch_backlog(1);
+                        }
+                        PendingCaptureBoundary::AfterFlushWindow => unreachable!(),
+                    }
                 }
-                *ctx.watcher_drain_slice().lock() = parked.then_some(state);
-                let actual = with_contended_watcher_continuation(&ctx, || {
+                let actual = with_contended_watcher_metadata(&ctx, boundary, || {
                     ctx.watcher_query_has_pending_changes()
                 });
-                assert_eq!(actual, pending, "parked={parked}, pending={pending}");
+                assert_eq!(actual, pending, "{boundary:?}, pending={pending}");
             }
         }
     }
 
     #[test]
-    fn watcher_drain_does_not_fence_contended_empty_continuation() {
+    fn watcher_drain_does_not_fence_contended_empty_metadata() {
         let (_dirs, ctx) = cold_build_context();
         ctx.set_canonical_cache_root(
             std::fs::canonicalize(ctx.config().project_root.as_ref().unwrap()).unwrap(),
         );
-        for parked in [false, true] {
-            *ctx.watcher_drain_slice().lock() = parked.then(|| {
-                WatcherDrainSliceState::new(
-                    ctx.configure_generation(),
-                    ctx.configure_content_generation(),
-                )
-            });
-            let activity = ctx.watcher_drain_activity.load(Ordering::Acquire);
-            let outcome = with_contended_watcher_continuation(&ctx, || {
-                crate::runtime_drain::drain_watcher_events_bounded(&ctx, 1)
-            });
-            assert_eq!(outcome, crate::runtime_drain::DrainBatchOutcome::default());
-            assert_eq!(ctx.watcher_drain_activity.load(Ordering::Acquire), activity);
-            assert!(!ctx.watcher_query_has_pending_changes());
+        for boundary in [
+            PendingCaptureBoundary::AfterCleanupProbe,
+            PendingCaptureBoundary::AfterReceiverProbe,
+            PendingCaptureBoundary::AfterContinuationProbe,
+        ] {
+            for parked in [false, true] {
+                *ctx.watcher_drain_slice().lock() = parked.then(|| {
+                    WatcherDrainSliceState::new(
+                        ctx.configure_generation(),
+                        ctx.configure_content_generation(),
+                    )
+                });
+                let activity = ctx.watcher_drain_activity.load(Ordering::Acquire);
+                with_contended_watcher_metadata(&ctx, boundary, || {
+                    if boundary == PendingCaptureBoundary::AfterCleanupProbe {
+                        // Root existence checks also publish cleanup metadata.
+                        // Exercise admission directly while that slot is held.
+                        assert!(!ctx.watcher_drain_has_work_snapshot());
+                    } else {
+                        assert_eq!(
+                            crate::runtime_drain::drain_watcher_events_bounded(&ctx, 1),
+                            crate::runtime_drain::DrainBatchOutcome::default(),
+                        );
+                    }
+                });
+                if boundary == PendingCaptureBoundary::AfterCleanupProbe {
+                    assert_eq!(
+                        crate::runtime_drain::drain_watcher_events_bounded(&ctx, 1),
+                        crate::runtime_drain::DrainBatchOutcome::default(),
+                    );
+                }
+                assert_eq!(ctx.watcher_drain_activity.load(Ordering::Acquire), activity);
+                assert!(!ctx.watcher_query_has_pending_changes());
+            }
+        }
+    }
+
+    #[test]
+    fn watcher_query_preserves_contended_cleanup_retry_states() {
+        let (_dirs, ctx) = cold_build_context();
+        let generation = ctx.configure_generation();
+        for (state, pending) in [
+            (Some(DeletedRootCleanup::Pending(generation)), true),
+            (Some(DeletedRootCleanup::Inconclusive(generation)), true),
+            (Some(DeletedRootCleanup::Complete(generation)), false),
+            (
+                Some(DeletedRootCleanup::Pending(generation.wrapping_add(1))),
+                false,
+            ),
+            (None, false),
+        ] {
+            *ctx.deleted_root_cleanup.lock() = state;
+            assert_eq!(
+                with_contended_watcher_metadata(
+                    &ctx,
+                    PendingCaptureBoundary::AfterCleanupProbe,
+                    || { ctx.watcher_query_has_pending_changes() }
+                ),
+                pending,
+            );
         }
     }
 

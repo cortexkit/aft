@@ -1600,7 +1600,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     // Off-loop queries run concurrently with maintenance. An empty pass moves
     // no events, so it must not mark their answer incomplete. Leave later
     // arrivals in the channel for the next guarded pass.
-    if !ctx.watcher_drain_has_work_waiting_for_continuation() {
+    if !ctx.watcher_drain_has_work_snapshot() {
         ctx.tick_tier2_refresh_scheduler(0);
         return outcome;
     }
@@ -1622,7 +1622,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     let mut root_deleted = false;
 
     {
-        let rx_ref = ctx.watcher_rx().lock();
+        // The slot protects receiver identity, not event application. Keep it
+        // available to pending-change snapshots while this guarded drain does I/O.
+        let rx_ref = ctx.watcher_rx().lock().clone();
         // Idle verification must also run when no watcher receiver is installed.
         while let Some(rx) = rx_ref.as_ref() {
             match rx.try_recv() {
