@@ -59,7 +59,8 @@ heartbeat=$!
 rc=0
 timeout 15m cargo nextest run -p agent-file-tools --test rest \
   --features test-hooks,test-scope-owner --profile gate --no-fail-fast \
-  --run-ignored only --test-threads 2 --failure-output final --final-status-level pass \
+  --run-ignored only --test-threads 2 --failure-output final \
+  --status-level pass --final-status-level fail \
   -E 'test(/^tool_provider_subc_e2e::tool_provider_subc_e2e_/)' > "$log" 2>&1 || rc=$?
 if (( rc != 0 )); then
   printf '==> Real-daemon gate FAILED (rc=%s); failing test names:\n' "$rc" >&2

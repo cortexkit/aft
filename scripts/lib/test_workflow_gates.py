@@ -520,7 +520,7 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
         for required in (
             "timeout 15m cargo nextest run -p agent-file-tools --test rest",
             "--features test-hooks,test-scope-owner", "--run-ignored only",
-            "--no-fail-fast", "--failure-output final", "--final-status-level pass",
+            "--no-fail-fast", "--failure-output final", "--status-level pass", "--final-status-level fail",
             "-E 'test(/^tool_provider_subc_e2e::tool_provider_subc_e2e_/)'",
             "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=",
             "scripts/ci-real-daemon-test-runner.sh", "while sleep 60", 'tail -n 60 "$log"',
