@@ -113,24 +113,26 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
     }
 
     /// Append the next step to `buffer`; the returned count is 0 at the end.
-    /// `buffer` grows geometrically but never past what the rest of the file
-    /// needs, so a long line never holds more than the whole file would.
+    /// `buffer` has room for two steps, which holds a step and the partial
+    /// line carried before it. A line longer than that grows it once, to
+    /// everything the rest of the file could need: one copy of the carried
+    /// bytes instead of one per doubling, and never more than a whole read
+    /// of the file would reserve. Only the bytes the line fills are touched.
     pub(crate) fn append(&mut self, buffer: &mut Vec<u8>) -> io::Result<usize> {
         if self.remaining == 0 {
             return Ok(0);
         }
-        let want = usize::try_from(self.remaining)
-            .unwrap_or(usize::MAX)
-            .min(self.step);
+        let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        let want = remaining.min(self.step);
         if buffer.capacity() - buffer.len() < want {
-            let limit = buffer
-                .len()
-                .saturating_add(usize::try_from(self.remaining).unwrap_or(usize::MAX));
-            let target = buffer
-                .capacity()
-                .saturating_mul(2)
-                .max(buffer.len() + want)
-                .min(limit);
+            let limit = buffer.len().saturating_add(remaining);
+            let needed = buffer.len() + want;
+            let two_steps = self.step.saturating_mul(2);
+            let target = if needed <= two_steps {
+                two_steps.min(limit)
+            } else {
+                limit
+            };
             buffer.reserve_exact(target - buffer.len());
         }
         let before = buffer.len();
