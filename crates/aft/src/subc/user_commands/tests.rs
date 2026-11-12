@@ -48,7 +48,7 @@ fn context() -> (tempfile::TempDir, Arc<AppContext>, Arc<Executor>) {
 }
 
 fn route(root: &ProjectRootId, principal: &str) -> RouteIdentity {
-    let mut route = super::super::tests::route_identity(root, "chat");
+    let mut route = crate::subc::test_support::route_identity(root, "chat");
     let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
         &mut Arc::get_mut(&mut route.0).unwrap().spawn_principal
     else {
