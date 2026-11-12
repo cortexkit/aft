@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +14,7 @@ import {
   formatWatchWaited,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
+  readShellToken,
   resolveWatchTimeoutMs,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
@@ -378,7 +379,17 @@ describe("commandInvokesCodeSearch", () => {
 });
 
 describe("maybeAppendGrepSearchHint", () => {
-  const projectRoot = "/some/proj";
+  let projectRoot: string;
+
+  beforeAll(() => {
+    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-"));
+    const src = path.join(projectRoot, "src");
+    fs.mkdirSync(src);
+    const old = new Date(Date.now() - 61_000);
+    fs.utimesSync(src, old, old);
+  });
+
+  afterAll(() => fs.rmSync(projectRoot, { recursive: true, force: true }));
 
   test("appends aft_search hint for a leading grep when aft_search is registered", () => {
     const result = maybeAppendGrepSearchHint("matches", "grep foo file.ts", true);
@@ -444,13 +455,13 @@ describe("maybeAppendGrepSearchHint", () => {
       ),
     ).toBe(output);
     expect(maybeAppendGrepSearchHint(output, "grep -rn foo $DIR", true, projectRoot)).toBe(output);
-    expect(maybeAppendGrepSearchHint("hits", "grep $PAT ./src/file.ts", true, projectRoot)).toBe(
+    expect(maybeAppendGrepSearchHint("hits", "grep $PAT ./src", true, projectRoot)).toBe(
       `hits\n\n${AFT_SEARCH_HINT}`,
     );
   });
 
   test("appends when grep includes an in-project relative path", () => {
-    const result = maybeAppendGrepSearchHint("hits", "grep foo ./src/file.ts", true, projectRoot);
+    const result = maybeAppendGrepSearchHint("hits", "grep foo ./src", true, projectRoot);
     expect(result).toBe(`hits\n\n${AFT_SEARCH_HINT}`);
   });
 
@@ -486,12 +497,7 @@ describe("maybeAppendGrepSearchHint", () => {
   });
 
   test("still appends when a cd stays inside the project, then greps a relative path", () => {
-    const result = maybeAppendGrepSearchHint(
-      "hits",
-      "cd src && grep -n foo file.ts",
-      true,
-      projectRoot,
-    );
+    const result = maybeAppendGrepSearchHint("hits", "cd src && grep -n foo .", true, projectRoot);
     expect(result).toBe(`hits\n\n${AFT_SEARCH_HINT}`);
   });
 
@@ -579,12 +585,13 @@ describe("maybeAppendGrepSearchHint", () => {
     }
   });
 
-  test("keeps the lecture for a piped grep targeting a nonexistent path", () => {
+  test("suppresses a piped grep targeting only a nonexistent in-project path", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-"));
     try {
+      expect(maybeAppendGrepSearchHint("hit", "rg -n foo missing.ts", true, root)).toBe("hit");
       expect(
         maybeAppendGrepSearchHint("hit", "grep -n foo src/missing.ts | head -5", true, root),
-      ).toContain(AFT_SEARCH_HINT);
+      ).toBe("hit");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -607,13 +614,121 @@ describe("maybeAppendGrepSearchHint", () => {
   });
 });
 
+describe("shell token backslashes", () => {
+  for (const platform of ["linux", "win32"] as const) {
+    describe(platform, () => {
+      test.each([
+        [String.raw`"a\b"`, String.raw`a\b`],
+        [String.raw`"a\"b"`, 'a"b'],
+        [String.raw`"a\$b"`, "a$b"],
+        ['"a\\`b"', "a`b"],
+        [String.raw`"a\\b"`, String.raw`a\b`],
+        ['"a\\\nb"', "ab"],
+      ])("decodes %s as %s inside double quotes", (command, expected) => {
+        expect(readShellToken(command, 0, platform)).toEqual({
+          token: expected,
+          end: command.length,
+        });
+      });
+    });
+  }
+
+  test("POSIX backslashes escape spaces outside quotes", () => {
+    expect(readShellToken(String.raw`a\ b`, 0, "linux")).toEqual({ token: "a b", end: 4 });
+    expect(commandInvokesCodeSearch(String.raw`r\g foo .`, "linux")).toBe(true);
+  });
+
+  test("Windows backslashes stay literal outside quotes, including a trailing separator", () => {
+    const command = "C:\\a\\b\\";
+    expect(readShellToken(command, 0, "win32")).toEqual({
+      token: command,
+      end: command.length,
+    });
+    expect(commandInvokesCodeSearch(String.raw`r\g foo .`, "win32")).toBe(false);
+  });
+});
+
+describe("maybeAppendGrepSearchHint — Windows path operands", () => {
+  test("matches the Windows path table with existing files and old directory controls", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-win32-"));
+    const projectRoot = String.raw`C:\Users\dev\proj`;
+    const src = path.join(root, "src");
+    const crateSrc = path.join(root, "crates/as-run/src");
+    const statSync = fs.statSync;
+    try {
+      fs.mkdirSync(src);
+      fs.mkdirSync(crateSrc, { recursive: true });
+      fs.mkdirSync(path.join(root, "app"));
+      fs.writeFileSync(path.join(root, "app/Cargo.toml"), "foo\n");
+      fs.writeFileSync(path.join(crateSrc, "zone.rs"), "foo\n");
+      const old = new Date(Date.now() - 61_000);
+      for (const dir of [src, crateSrc, root]) fs.utimesSync(dir, old, old);
+      expect(statSync(src).isDirectory()).toBe(true);
+      expect(statSync(crateSrc).isDirectory()).toBe(true);
+
+      // Map Windows paths to real host fixtures so directory existence and age
+      // are checked even when the test runs on macOS or Linux.
+      const stats = spyOn(fs, "statSync").mockImplementation((resolved) => {
+        const relative = path.win32.relative(projectRoot, String(resolved));
+        return statSync(path.join(root, ...relative.split("\\")));
+      });
+      try {
+        const cases = [
+          ["rg -n foo crates/as-run/src", true],
+          ["rg -n foo crates/as-run/src/zone.rs", false],
+          [String.raw`rg -n foo "C:\Users\dev\elsewhere\CHANGELOG.md"`, false],
+          [String.raw`rg -n foo C:\Users\dev\elsewhere\CHANGELOG.md`, false],
+          ["rg -n foo C:/Users/dev/elsewhere/CHANGELOG.md", false],
+          [String.raw`rg -n foo C:\Users\dev\proj\app\Cargo.toml`, false],
+          [String.raw`rg -n foo "C:\Users\dev\proj\app\Cargo.toml"`, false],
+          ["rg -n foo C:/Users/dev/proj/app/Cargo.toml", false],
+          ["cd C:/Users/dev/elsewhere && rg -n foo .", false],
+          [String.raw`cd C:\Users\dev\elsewhere && rg -n foo .`, false],
+          [String.raw`rg -n foo D:\elsewhere\f.md`, false],
+          [String.raw`rg -n foo C:\Users\dev\proj\missing.ts`, false],
+          [String.raw`rg -n foo C:\Users\dev\proj\src`, true],
+          [String.raw`rg -n foo "C:\Users\dev\proj\src"`, true],
+          [String.raw`rg -n foo C:\Users\dev\proj\src\| head -5`, true],
+          [String.raw`rg -n foo C:\Users\dev\proj\src\; echo done`, true],
+          [String.raw`rg -n foo C:\Users\dev\proj\src\&& echo done`, true],
+          ["rg -n foo missing.ts src\\", true],
+          ["cd src && rg -n foo .", true],
+          ["rg -n foo .", true],
+        ] as const;
+        for (const [command, nudges] of cases) {
+          expect(
+            maybeAppendGrepSearchHint("hit", command, false, projectRoot, "win32"),
+            command,
+          ).toBe(nudges ? `hit\n\n${GREP_TOOL_HINT}` : "hit");
+        }
+        expect(stats).toHaveBeenCalledWith(path.win32.join(projectRoot, "src"));
+        expect(stats).toHaveBeenCalledWith(path.win32.join(projectRoot, "app/Cargo.toml"));
+      } finally {
+        stats.mockRestore();
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("maybeAppendGrepSearchHint — redirection operand scan terminates", () => {
   // Regression: collectPathOperands looped forever when a grep statement
   // contained a redirection (`2>/dev/null`). readShellToken parks on `>` and
   // returns an empty token without advancing, so the operand `while` spun
   // without progress and blocked the event loop (hung the host). A reaching
   // value (not a timeout) here proves the scan now terminates.
-  const PROJECT_ROOT = "/Users/dev/proj";
+  let PROJECT_ROOT: string;
+
+  beforeAll(() => {
+    PROJECT_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-"));
+    const src = path.join(PROJECT_ROOT, "src");
+    fs.mkdirSync(src);
+    const old = new Date(Date.now() - 61_000);
+    fs.utimesSync(src, old, old);
+  });
+
+  afterAll(() => fs.rmSync(PROJECT_ROOT, { recursive: true, force: true }));
 
   test("the reported hang command returns instead of looping", () => {
     const command = [
@@ -629,7 +744,7 @@ describe("maybeAppendGrepSearchHint — redirection operand scan terminates", ()
   });
 
   test("grep with redirection still collects the in-project path operand (hint fires)", () => {
-    const command = "grep -rn foo src/index.ts 2>/dev/null";
+    const command = "grep -rn foo src 2>/dev/null";
     const out = maybeAppendGrepSearchHint("hit", command, true, PROJECT_ROOT);
     expect(out).toContain(AFT_SEARCH_HINT);
   });

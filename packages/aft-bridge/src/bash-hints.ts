@@ -426,14 +426,17 @@ export function maybeAppendConflictsHint(output: string): string {
  * stage of its statement. Ambiguous shell syntax (unbalanced quotes/backticks)
  * returns false so the nudge never fires spuriously.
  */
-export function commandInvokesCodeSearch(command: string): boolean {
-  const statements = splitTopLevelStatements(command);
+export function commandInvokesCodeSearch(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const statements = splitTopLevelStatements(command, platform);
   if (statements === null) return false;
 
   for (const statement of statements) {
-    const firstStage = firstPipelineStage(statement);
+    const firstStage = firstPipelineStage(statement, platform);
     if (firstStage === null) continue;
-    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0));
+    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0), platform);
     if (firstToken === null) continue;
     if (firstToken.token === "grep" || firstToken.token === "rg") return true;
   }
@@ -449,26 +452,32 @@ export function maybeAppendGrepSearchHint(
   command: string,
   aftSearchRegistered: boolean,
   projectRoot?: string,
+  platform: NodeJS.Platform = process.platform,
 ): string {
   if (output === "") return output;
-  if (!commandInvokesCodeSearch(command)) return output;
+  if (!commandInvokesCodeSearch(command, platform)) return output;
   if (output.includes(GREP_SEARCH_HINT_PREFIX)) return output;
-  if (shouldSuppressGrepSearchHint(command, projectRoot)) return output;
+  if (shouldSuppressGrepSearchHint(command, projectRoot, platform)) return output;
 
   const hint = aftSearchRegistered ? GREP_SEARCH_AFT_SEARCH_HINT : GREP_SEARCH_GREP_HINT;
   return `${output}\n\n${hint}`;
 }
 
-function shouldSuppressGrepSearchHint(command: string, projectRoot: string | undefined): boolean {
-  const statements = splitTopLevelStatements(command);
+function shouldSuppressGrepSearchHint(
+  command: string,
+  projectRoot: string | undefined,
+  platform: NodeJS.Platform,
+): boolean {
+  const statements = splitTopLevelStatements(command, platform);
   if (statements === null) return false;
 
-  if (allSearchPathOperandsAreDynamic(statements)) return true;
+  if (allSearchPathOperandsAreDynamic(statements, platform)) return true;
 
   const root = projectRoot?.trim();
   if (!root) return false;
 
-  const resolvedRoot = path.resolve(root);
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  const resolvedRoot = paths.resolve(root);
   // Track the effective cwd across top-level statements so a `cd` into another
   // repo before the grep is honored: aft_search only indexes THIS project, so a
   // grep that runs outside the project root must NOT be nudged toward it. `null`
@@ -478,14 +487,14 @@ function shouldSuppressGrepSearchHint(command: string, projectRoot: string | und
   let sawCodeSearchStatement = false;
 
   for (const statement of statements) {
-    const firstStage = firstPipelineStage(statement);
+    const firstStage = firstPipelineStage(statement, platform);
     if (firstStage === null) continue;
-    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0));
+    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0), platform);
     if (firstToken === null) continue;
     const head = firstToken.token;
 
     if (head === "cd") {
-      effectiveCwd = nextCwdAfterCd(effectiveCwd, firstStage, firstToken.end);
+      effectiveCwd = nextCwdAfterCd(effectiveCwd, firstStage, firstToken.end, platform);
       continue;
     }
 
@@ -495,37 +504,39 @@ function shouldSuppressGrepSearchHint(command: string, projectRoot: string | und
     // A grep whose effective cwd is unknown or outside the project is external —
     // don't fire for it. Keep scanning in case a later statement greps in-project.
     if (effectiveCwd === null) continue;
-    if (!isDirInsideProject(resolvedRoot, effectiveCwd)) continue;
+    if (!isDirInsideProject(resolvedRoot, effectiveCwd, platform)) continue;
 
-    const operands = collectPathOperands(firstStage, firstToken.end);
+    const operands = collectPathOperands(firstStage, firstToken.end, platform);
     // No path operands → grep reads stdin or searches the (in-project) cwd.
     if (operands.length === 0) return false;
     let sawInProjectOperand = false;
     for (const operand of operands) {
       if (isDynamicPathOperand(operand)) continue;
-      const resolvedOperand = resolvePathOperand(effectiveCwd, operand);
-      if (!isPathInsideProject(resolvedRoot, effectiveCwd, operand)) continue;
+      const resolvedOperand = resolvePathOperand(effectiveCwd, operand, platform);
+      if (!isPathInsideProject(resolvedRoot, effectiveCwd, operand, platform)) continue;
+      const suppress = shouldSuppressResolvedPath(resolvedOperand);
+      if (suppress === undefined) continue; // A missing operand cannot confirm an in-project search.
       sawInProjectOperand = true;
-      if (shouldSuppressResolvedPath(resolvedOperand)) return true;
+      if (suppress) return true;
     }
-    // All operands resolve outside the project → this grep is external.
+    // No existing in-project operands → this grep cannot confirm an in-project search.
     if (sawInProjectOperand) return false;
   }
 
   return sawCodeSearchStatement;
 }
 
-function allSearchPathOperandsAreDynamic(statements: string[]): boolean {
+function allSearchPathOperandsAreDynamic(statements: string[], platform: NodeJS.Platform): boolean {
   let sawDynamicOnlySearch = false;
   for (const statement of statements) {
-    const firstStage = firstPipelineStage(statement);
+    const firstStage = firstPipelineStage(statement, platform);
     if (firstStage === null) continue;
-    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0));
+    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0), platform);
     if (firstToken === null) continue;
     const head = firstToken.token;
     if (head !== "grep" && head !== "rg") continue;
 
-    const operands = collectPathOperands(firstStage, firstToken.end);
+    const operands = collectPathOperands(firstStage, firstToken.end, platform);
     if (operands.length === 0) return false;
     if (operands.some((operand) => !isDynamicPathOperand(operand))) return false;
     sawDynamicOnlySearch = true;
@@ -543,11 +554,13 @@ function nextCwdAfterCd(
   currentCwd: string | null,
   firstStage: string,
   afterCd: number,
+  platform: NodeJS.Platform,
 ): string | null {
+  const paths = platform === "win32" ? path.win32 : path.posix;
   let index = skipSpaces(firstStage, afterCd);
   let target: string | null = null;
   while (index < firstStage.length) {
-    const tokenResult = readShellToken(firstStage, index);
+    const tokenResult = readShellToken(firstStage, index, platform);
     if (tokenResult === null) break;
     const { token, end } = tokenResult;
     if (end <= index) break; // parked on an operator boundary
@@ -557,20 +570,25 @@ function nextCwdAfterCd(
     target = token;
     break;
   }
-  if (target === null) return path.resolve(os.homedir()); // bare `cd` → home
+  if (target === null) return paths.resolve(os.homedir()); // bare `cd` → home
   if (target.includes("$") || target.includes("`")) return null; // dynamic
-  const expanded = expandTilde(target);
-  if (path.isAbsolute(expanded)) return path.resolve(expanded);
+  const expanded = expandTilde(target, platform);
+  if (paths.isAbsolute(expanded)) return paths.resolve(expanded);
   if (currentCwd === null) return null;
-  return path.resolve(currentCwd, expanded);
+  return paths.resolve(currentCwd, expanded);
 }
 
-function isDirInsideProject(resolvedRoot: string, dir: string): boolean {
-  const rel = path.relative(resolvedRoot, path.resolve(dir));
-  return !relativePathEscapesRoot(rel);
+function isDirInsideProject(resolvedRoot: string, dir: string, platform: NodeJS.Platform): boolean {
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  const rel = paths.relative(resolvedRoot, paths.resolve(dir));
+  return !relativePathEscapesRoot(rel, platform);
 }
 
-function collectPathOperands(firstStage: string, startAfterCommand: number): string[] {
+function collectPathOperands(
+  firstStage: string,
+  startAfterCommand: number,
+  platform: NodeJS.Platform,
+): string[] {
   const operands: string[] = [];
   let index = skipSpaces(firstStage, startAfterCommand);
   // grep's first positional operand is the pattern, not a path (`grep PAT
@@ -583,7 +601,7 @@ function collectPathOperands(firstStage: string, startAfterCommand: number): str
   let optionValue: "pattern" | "file" | "other" | undefined;
 
   while (index < firstStage.length) {
-    const tokenResult = readShellToken(firstStage, index);
+    const tokenResult = readShellToken(firstStage, index, platform);
     if (tokenResult === null) break;
     const { token, end } = tokenResult;
     // No forward progress means readShellToken is parked on a redirection/
@@ -647,35 +665,49 @@ function isDynamicPathOperand(token: string): boolean {
   return token.startsWith("~") || token.includes("$") || token.includes("`");
 }
 
-function expandTilde(target: string): string {
+function expandTilde(target: string, platform: NodeJS.Platform): string {
   if (!target.startsWith("~")) return target;
   if (target === "~" || target.startsWith("~/")) {
-    return path.join(os.homedir(), target.slice(1));
+    const paths = platform === "win32" ? path.win32 : path.posix;
+    return paths.join(os.homedir(), target.slice(1));
   }
   return target;
 }
 
-function resolvePathOperand(projectRoot: string, operand: string): string {
-  const expanded = expandTilde(operand);
-  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(projectRoot, expanded);
+function resolvePathOperand(
+  projectRoot: string,
+  operand: string,
+  platform: NodeJS.Platform,
+): string {
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  const expanded = expandTilde(operand, platform);
+  return paths.isAbsolute(expanded)
+    ? paths.resolve(expanded)
+    : paths.resolve(projectRoot, expanded);
 }
 
-function isPathInsideProject(resolvedRoot: string, baseCwd: string, operand: string): boolean {
+function isPathInsideProject(
+  resolvedRoot: string,
+  baseCwd: string,
+  operand: string,
+  platform: NodeJS.Platform,
+): boolean {
   // Relative operands resolve against the grep's effective cwd (which may differ
   // from the project root after a `cd`), absolute/`~` operands against the FS.
-  const resolved = resolvePathOperand(baseCwd, operand);
-  const rel = path.relative(resolvedRoot, resolved);
-  return !relativePathEscapesRoot(rel);
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  const resolved = resolvePathOperand(baseCwd, operand, platform);
+  const rel = paths.relative(resolvedRoot, resolved);
+  return !relativePathEscapesRoot(rel, platform);
 }
 
-function shouldSuppressResolvedPath(resolved: string): boolean {
+function shouldSuppressResolvedPath(resolved: string): boolean | undefined {
   try {
     const stats = fs.statSync(resolved);
     if (stats.isFile()) return true;
     const ageMs = Date.now() - stats.mtimeMs;
     return ageMs >= 0 && ageMs < GREP_SEARCH_FRESHNESS_WINDOW_MS;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -687,7 +719,10 @@ function shouldSuppressResolvedPath(resolved: string): boolean {
  * the caller to inspect the first pipeline stage. Returns null when quoting is
  * unbalanced so the nudge never fires on ambiguous input.
  */
-function splitTopLevelStatements(command: string): string[] | null {
+function splitTopLevelStatements(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): string[] | null {
   const statements: string[] = [];
   let start = 0;
   let quote: Quote = "none";
@@ -706,7 +741,7 @@ function splitTopLevelStatements(command: string): string[] | null {
       continue;
     }
     if (quote === "double") {
-      if (ch === "\\") escaped = true;
+      if (ch === "\\" && backslashEscapesNext(command[index + 1], quote, platform)) escaped = true;
       else if (ch === '"') quote = "none";
       continue;
     }
@@ -714,7 +749,7 @@ function splitTopLevelStatements(command: string): string[] | null {
       if (ch === "`") inBacktick = false;
       continue;
     }
-    if (ch === "\\") {
+    if (ch === "\\" && backslashEscapesNext(command[index + 1], quote, platform)) {
       escaped = true;
       continue;
     }
@@ -756,7 +791,10 @@ function splitTopLevelStatements(command: string): string[] | null {
   return statements;
 }
 
-function firstPipelineStage(command: string): string | null {
+function firstPipelineStage(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
   let quote: Quote = "none";
   let firstPipeIndex: number | undefined;
 
@@ -769,7 +807,7 @@ function firstPipelineStage(command: string): string | null {
     if (quote === "double") {
       if (ch === '"') {
         quote = "none";
-      } else if (ch === "\\") {
+      } else if (ch === "\\" && backslashEscapesNext(command[index + 1], quote, platform)) {
         index++;
       } else if (ch === "`") {
         return null;
@@ -781,7 +819,7 @@ function firstPipelineStage(command: string): string | null {
       quote = "single";
     } else if (ch === '"') {
       quote = "double";
-    } else if (ch === "\\") {
+    } else if (ch === "\\" && backslashEscapesNext(command[index + 1], quote, platform)) {
       index++;
     } else if (ch === "`") {
       return null;
@@ -798,7 +836,11 @@ function firstPipelineStage(command: string): string | null {
   return command.slice(0, firstPipeIndex ?? command.length).trim();
 }
 
-function readShellToken(command: string, start: number): TokenResult | null {
+export function readShellToken(
+  command: string,
+  start: number,
+  platform: NodeJS.Platform = process.platform,
+): TokenResult | null {
   let quote: Quote = "none";
   let token = "";
   let index = start;
@@ -816,9 +858,9 @@ function readShellToken(command: string, start: number): TokenResult | null {
     if (quote === "double") {
       if (ch === '"') {
         quote = "none";
-      } else if (ch === "\\") {
+      } else if (ch === "\\" && backslashEscapesNext(command[index + 1], quote, platform)) {
         index++;
-        token += command[index] ?? "\\";
+        if (command[index] !== "\n") token += command[index];
       } else if (ch === "`") {
         return null;
       } else {
@@ -833,7 +875,7 @@ function readShellToken(command: string, start: number): TokenResult | null {
       quote = "single";
     } else if (ch === '"') {
       quote = "double";
-    } else if (ch === "\\") {
+    } else if (ch === "\\" && backslashEscapesNext(command[index + 1], quote, platform)) {
       index++;
       token += command[index] ?? "\\";
     } else if (ch === "`") {
@@ -845,6 +887,17 @@ function readShellToken(command: string, start: number): TokenResult | null {
 
   if (quote !== "none") return null;
   return { token, end: index };
+}
+
+function backslashEscapesNext(
+  next: string | undefined,
+  quote: Quote,
+  platform: NodeJS.Platform,
+): boolean {
+  // Bash only unescapes these characters inside double quotes. Outside quotes,
+  // Windows paths keep their separators because PowerShell escapes with a backtick.
+  if (quote === "double") return next !== undefined && '$`"\\\n'.includes(next);
+  return platform !== "win32";
 }
 
 function isTokenBoundary(ch: string): boolean {
