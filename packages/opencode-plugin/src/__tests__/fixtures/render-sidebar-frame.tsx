@@ -9,11 +9,15 @@
 // AFT_SIDEBAR_WIDTH the panel width in columns, AFT_SIDEBAR_COLLAPSED selects
 // the compact view, and AFT_SIDEBAR_PALETTE overrides the default theme roles.
 // AFT_SIDEBAR_CAPTURE=spans includes cell colors alongside the character frame.
+// AFT_SIDEBAR_PANEL_MODULE optionally selects a candidate module for comparisons.
 
 import { testRender } from "@opentui/solid";
 import { DEFAULT_PREFS } from "../../tui/preferences.ts";
 import { AftSidebarPanel } from "../../tui/sidebar-view.tsx";
 
+const Panel = process.env.AFT_SIDEBAR_PANEL_MODULE
+  ? (await import(process.env.AFT_SIDEBAR_PANEL_MODULE)).AftSidebarPanel
+  : AftSidebarPanel;
 const snapshot = JSON.parse(process.env.AFT_SIDEBAR_SNAPSHOT ?? "null");
 const width = Number(process.env.AFT_SIDEBAR_WIDTH ?? "38");
 const palette = {
@@ -30,7 +34,7 @@ const palette = {
 
 const setup = await testRender(
   () => (
-    <AftSidebarPanel
+    <Panel
       palette={palette}
       snapshot={snapshot}
       prefs={structuredClone(DEFAULT_PREFS)}

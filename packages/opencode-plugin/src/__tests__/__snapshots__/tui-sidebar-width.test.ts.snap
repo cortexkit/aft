@@ -1,0 +1,391 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`sidebar appearance baseline dark expanded 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status                         ready
+ Entries                           24
+ Disk                               —
+
+ Code Health
+ Errors                             0
+ Warnings                           0
+ TODOs                              0"
+`;
+
+exports[`sidebar appearance baseline dark collapsed 1`] = `
+"
+  ▶ AFT                       v0.58.0
+ Search Index                       ●
+ Semantic Index                     ●
+ Code Health                      ● ●"
+`;
+
+exports[`sidebar appearance baseline dark git warning 1`] = `
+"
+  ▼ AFT  ⚠ git features off   v0.58.0
+
+ ⚠ git features are off: macOS
+ developer tools are not installed,
+ and running /usr/bin/git would open
+ Apple's install dialog. Install
+ them with \`xcode-select --install\`,
+ or put another git (for example
+ Homebrew's) on PATH, then restart
+ AFT.
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status unavailable — ONNX Runtime
+        missing (npx @cortexkit/aft
+        doctor --fix)
+ Disk                               —"
+`;
+
+exports[`sidebar appearance baseline dark degraded 1`] = `
+"
+  ▼ AFT   DEGRADED            v0.58.0
+
+ ⚠ project root is your home
+ directory
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status unavailable — ONNX Runtime
+        missing (npx @cortexkit/aft
+        doctor --fix)
+ Disk                               —"
+`;
+
+exports[`sidebar appearance baseline dark collapsed degraded 1`] = `
+"
+  ▶ AFT   DEGRADED            v0.58.0
+
+ ⚠ project root is your home
+ directory
+ Search Index                       ●
+ Semantic Index                     ●"
+`;
+
+exports[`sidebar appearance baseline dark unknown values 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                             ?
+ Disk                          1000 B
+
+ Semantic Index
+ Status                             ?
+ Disk                               —
+
+ Code Health"
+`;
+
+exports[`sidebar appearance baseline dark not initialized 1`] = `
+"
+  AFT
+
+ Starts on the first tool call."
+`;
+
+exports[`sidebar appearance baseline dark config error 1`] = `
+"
+  AFT
+
+ ✖ Invalid configuration"
+`;
+
+exports[`sidebar appearance baseline dark compression 0% 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status                         ready
+ Entries                           24
+ Disk                               —
+
+ Code Health
+ Errors                             0
+ Warnings                           0
+ TODOs                              0
+
+ Compression
+ Session
+ Tokens Saved                       0
+ Compression Ratio                 0%
+ Project
+ Tokens Saved                       0
+ Compression Ratio                 0%"
+`;
+
+exports[`sidebar appearance baseline dark compression 50% 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status                         ready
+ Entries                           24
+ Disk                               —
+
+ Code Health
+ Errors                             0
+ Warnings                           0
+ TODOs                              0
+
+ Compression
+ Session
+ Tokens Saved                     500
+ Compression Ratio                50%
+ Project
+ Tokens Saved                     500
+ Compression Ratio                50%"
+`;
+
+exports[`sidebar appearance baseline dark compression 100% 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status                         ready
+ Entries                           24
+ Disk                               —
+
+ Code Health
+ Errors                             0
+ Warnings                           0
+ TODOs                              0
+
+ Compression
+ Session
+ Tokens Saved                   1,000
+ Compression Ratio               100%
+ Project
+ Tokens Saved                   1,000
+ Compression Ratio               100%"
+`;
+
+exports[`sidebar appearance baseline light expanded 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status                         ready
+ Entries                           24
+ Disk                               —
+
+ Code Health
+ Errors                             0
+ Warnings                           0
+ TODOs                              0"
+`;
+
+exports[`sidebar appearance baseline light collapsed 1`] = `
+"
+  ▶ AFT                       v0.58.0
+ Search Index                       ●
+ Semantic Index                     ●
+ Code Health                      ● ●"
+`;
+
+exports[`sidebar appearance baseline light git warning 1`] = `
+"
+  ▼ AFT  ⚠ git features off   v0.58.0
+
+ ⚠ git features are off: macOS
+ developer tools are not installed,
+ and running /usr/bin/git would open
+ Apple's install dialog. Install
+ them with \`xcode-select --install\`,
+ or put another git (for example
+ Homebrew's) on PATH, then restart
+ AFT.
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status unavailable — ONNX Runtime
+        missing (npx @cortexkit/aft
+        doctor --fix)
+ Disk                               —"
+`;
+
+exports[`sidebar appearance baseline light degraded 1`] = `
+"
+  ▼ AFT   DEGRADED            v0.58.0
+
+ ⚠ project root is your home
+ directory
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status unavailable — ONNX Runtime
+        missing (npx @cortexkit/aft
+        doctor --fix)
+ Disk                               —"
+`;
+
+exports[`sidebar appearance baseline light collapsed degraded 1`] = `
+"
+  ▶ AFT   DEGRADED            v0.58.0
+
+ ⚠ project root is your home
+ directory
+ Search Index                       ●
+ Semantic Index                     ●"
+`;
+
+exports[`sidebar appearance baseline light unknown values 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                             ?
+ Disk                          1000 B
+
+ Semantic Index
+ Status                             ?
+ Disk                               —
+
+ Code Health"
+`;
+
+exports[`sidebar appearance baseline light not initialized 1`] = `
+"
+  AFT
+
+ Starts on the first tool call."
+`;
+
+exports[`sidebar appearance baseline light config error 1`] = `
+"
+  AFT
+
+ ✖ Invalid configuration"
+`;
+
+exports[`sidebar appearance baseline light compression 0% 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status                         ready
+ Entries                           24
+ Disk                               —
+
+ Code Health
+ Errors                             0
+ Warnings                           0
+ TODOs                              0
+
+ Compression
+ Session
+ Tokens Saved                       0
+ Compression Ratio                 0%
+ Project
+ Tokens Saved                       0
+ Compression Ratio                 0%"
+`;
+
+exports[`sidebar appearance baseline light compression 50% 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status                         ready
+ Entries                           24
+ Disk                               —
+
+ Code Health
+ Errors                             0
+ Warnings                           0
+ TODOs                              0
+
+ Compression
+ Session
+ Tokens Saved                     500
+ Compression Ratio                50%
+ Project
+ Tokens Saved                     500
+ Compression Ratio                50%"
+`;
+
+exports[`sidebar appearance baseline light compression 100% 1`] = `
+"
+  ▼ AFT                       v0.58.0
+
+ Search Index
+ Status                         ready
+ Files                             12
+ Disk                          1000 B
+
+ Semantic Index
+ Status                         ready
+ Entries                           24
+ Disk                               —
+
+ Code Health
+ Errors                             0
+ Warnings                           0
+ TODOs                              0
+
+ Compression
+ Session
+ Tokens Saved                   1,000
+ Compression Ratio               100%
+ Project
+ Tokens Saved                   1,000
+ Compression Ratio               100%"
+`;
