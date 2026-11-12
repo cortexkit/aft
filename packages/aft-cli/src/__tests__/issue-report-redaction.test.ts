@@ -52,10 +52,16 @@ describe("issue report path privacy", () => {
       `root=/projects/bob/other cmd=cd ${root}/nested && cat src/main.ts`,
       `location%5Bdirectory%5D=${encoded(root)}`,
       `location%5bdirectory%5d=${lowerEncoded(root)}`,
+      `project root set: /projects/carol/a spaced repo`,
+      `watcher started: /projects/carol/a spaced repo/nested project`,
+      `location=${encoded("/projects/carol/a spaced repo")}`,
     ].join("\n");
     const output = sanitizeContent(input, context);
     expect(output).not.toContain("alice");
     expect(output).not.toContain("bob");
+    expect(output).not.toContain("carol");
+    expect(output).not.toContain("spaced");
+    expect(output).not.toContain("nested project");
     expect(output).not.toContain("<PROJECT>/nested");
     expect(output).toContain("Failure at <PROJECT>/src/main.ts");
     expect(output).toContain("cmd=cd <PROJECT> && cat src/main.ts");

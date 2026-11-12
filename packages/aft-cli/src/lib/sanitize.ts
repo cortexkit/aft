@@ -304,11 +304,12 @@ function replacePath(content: string, path: string, value: string): string {
 /** Root metadata is authoritative; arbitrary absolute paths in commands are not project roots. */
 function reportProjectRoots(content: string): string[] {
   return [
+    ...content.matchAll(/(?:project root set: |watcher started: )([^\r\n]+)/g),
     ...content.matchAll(
-      /(?:\broot=|project root set: |watcher started: |"(?:projectRoot|project_root|canonical_root)"\s*:\s*)("[^"]+"|'[^']+'|[^\s"'<>`,;]+)/g,
+      /(?:\broot=|"(?:projectRoot|project_root|canonical_root)"\s*:\s*)("[^"]+"|'[^']+'|[^\s"'<>`,;]+)/g,
     ),
   ]
-    .map((match) => match[1].replace(/^["']|["']$/g, ""))
+    .map((match) => match[1].trim().replace(/^["']|["']$/g, ""))
     .filter((root) => /^(?:\/|[A-Za-z]:\/)/.test(root));
 }
 
