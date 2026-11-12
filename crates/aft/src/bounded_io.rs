@@ -1994,6 +1994,12 @@ impl Reader {
     /// arrived or the file ended, with the same deadline and helper handling
     /// as [`Self::chunk`]. Unlike `chunk` it writes into spare capacity
     /// without zeroing it first.
+    ///
+    /// The buffer grows by at most `size` bytes: the reservation is exact, so
+    /// it never doubles, and `read_to_end` through `take(size)` only fills
+    /// the room already reserved. When that room is full it probes with a
+    /// stack buffer before growing (std's `default_read_to_end`), and the
+    /// probe of an exhausted `Take` reads nothing.
     pub(crate) fn append(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
         if Instant::now() >= deadline(self.at) {
             return Err(failure(
@@ -2008,7 +2014,7 @@ impl Reader {
             .ok_or_else(|| io::Error::other("file read already failed"))?;
         let read = move || {
             let before = buffer.len();
-            buffer.try_reserve(size).map_err(io::Error::other)?;
+            buffer.try_reserve_exact(size).map_err(io::Error::other)?;
             (&mut file).take(size as u64).read_to_end(&mut buffer)?;
             crate::io_accounting::WORK.content_read_bytes.fetch_add(
                 (buffer.len() - before) as u64,

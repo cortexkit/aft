@@ -3601,6 +3601,14 @@ fn literal_presence(
         Settled::Cancelled => return Ok(memo::LiteralPresence::Undetermined),
     };
     let presence = entry.presence;
+    // Nothing a cancelled request settled is kept, however its checks ended:
+    // a read the cancellation cut short can look like a binary or unreadable
+    // file, and a kept `Undetermined` would then stand for every later page.
+    // Checked here, at the one place an answer is kept, so it covers every
+    // way the checks can end. The cancelled request makes no claim.
+    if crate::executor::current_job_cancelled() {
+        return Ok(memo::LiteralPresence::Undetermined);
+    }
     store.store_literal_presence(key, entry);
     Ok(presence)
 }
@@ -3721,6 +3729,12 @@ enum Settled {
 /// for later phases; `deadline` and the request's cancellation are checked
 /// before each step.
 fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceCheck {
+    #[cfg(test)]
+    PRESENCE_CHECK_STARTED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
     let files = request_files::current();
     let kept = files.as_ref().and_then(|files| files.kept(path));
     let file = match kept {
@@ -3742,8 +3756,10 @@ fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceC
             );
         }
         None => {
-            // A large file is read in steps instead, outside the set: the
-            // set keeps no streamed file, as it keeps no file over its budget.
+            // A large file is read in steps instead, outside the request's
+            // file set, which never keeps it. The set's budget is 32 MiB, so
+            // a file of 4 to 32 MiB that a whole read would have left there
+            // is now read again by any later phase that wants it.
             let mut large = None;
             let fetched = request_files::read_through(files.as_deref(), path, |path| {
                 let stat = fs::metadata(path)
@@ -3847,6 +3863,9 @@ thread_local! {
     /// Makes the streamed presence check see its request as cancelled.
     static PRESENCE_CANCELLED_FOR_TEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Runs as each file's presence check starts on this thread.
+    static PRESENCE_CHECK_STARTED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Settle whether some file holds the literal, reading as little as
@@ -10837,6 +10856,56 @@ mod tests {
         assert!(second.starts_with(BASH_WAIT_DETACH_ABSENT), "{second}");
         let (reads, _) = take_literal_presence_counts();
         assert!(reads > 0, "{second}");
+    }
+
+    /// A request cancelled while its presence check runs keeps nothing in
+    /// the memo, whether the files it checks are read whole (the check runs
+    /// on to its end) or in steps (the check stops at the next step): the
+    /// next request settles the answer again.
+    #[test]
+    fn cancelled_request_keeps_no_presence_answer() {
+        for large in [false, true] {
+            let (_project, ctx) = presence_project(&[
+                ONLY_NAMES_IT,
+                ("tests/near_a_test.rs", NEAR_HOLDER_TEST_FILE),
+            ]);
+            let token = crate::executor::JobCancellation::new();
+            let first = {
+                let _installed = crate::executor::install_job_cancellation(token.clone());
+                let cancel = token.clone();
+                PRESENCE_CHECK_STARTED.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || cancel.request_cancel()));
+                });
+                let threshold = if large { 0 } else { u64::MAX };
+                // A cancelled request may fail, so its reply is not checked.
+                let request: RawRequest = serde_json::from_value(serde_json::json!({
+                    "id": "literal-presence-test",
+                    "command": "semantic_search",
+                    "query": "bash_wait_detach(",
+                    "top_k": 10,
+                    "offset": 0,
+                }))
+                .expect("request");
+                let reply = crate::large_read::with_test_steps(8, threshold, || {
+                    response_value(handle_semantic_search(&request, &ctx))
+                });
+                PRESENCE_CHECK_STARTED.with(|hook| *hook.borrow_mut() = None);
+                reply
+            };
+            assert!(token.cancel_already_requested(), "large {large}: {first}");
+            let (reads, _) = take_literal_presence_counts();
+            assert!(reads > 0, "large {large}: the check never ran: {first}");
+            let second = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+            assert!(
+                second.starts_with(BASH_WAIT_DETACH_ABSENT),
+                "large {large}: {second}"
+            );
+            let (reads, _) = take_literal_presence_counts();
+            assert!(
+                reads > 0,
+                "large {large}: the cancelled request's answer was kept: {second}"
+            );
+        }
     }
 
     /// Mark the semantic lane ready with an empty resident index, so a test

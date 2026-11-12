@@ -35,6 +35,41 @@ thread_local! {
     /// Replaces [`LARGE_READ_BYTES`] on this thread, so small generated files
     /// take the streamed paths.
     static LARGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Runs after every step a [`Steps`] reads on this thread, with the bytes
+    /// read so far, so a test can cancel or outrun a deadline mid-file.
+    static STEP_TAP: std::cell::RefCell<Option<Box<dyn FnMut(u64)>>> =
+        const { std::cell::RefCell::new(None) };
+    /// A [`Steps`] reservation that would grow its buffer past this many
+    /// bytes fails on this thread, as a refused allocation does.
+    static REFUSE_RESERVE_OVER: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Run `work` with `tap` called after every step read on this thread.
+#[cfg(test)]
+pub(crate) fn with_step_tap<T>(tap: impl FnMut(u64) + 'static, work: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STEP_TAP.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+    STEP_TAP.with(|cell| *cell.borrow_mut() = Some(Box::new(tap)));
+    let _reset = Reset;
+    work()
+}
+
+/// Run `work` with every step buffer reservation past `bytes` refused.
+#[cfg(test)]
+pub(crate) fn with_reserve_limit<T>(bytes: usize, work: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REFUSE_RESERVE_OVER.with(|cell| cell.set(usize::MAX));
+        }
+    }
+    REFUSE_RESERVE_OVER.with(|cell| cell.set(bytes));
+    let _reset = Reset;
+    work()
 }
 
 /// Run `work` with a different step size and large-file threshold on this
@@ -116,8 +151,16 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
     /// `buffer` has room for two steps, which holds a step and the partial
     /// line carried before it. A line longer than that grows it once, to
     /// everything the rest of the file could need: one copy of the carried
-    /// bytes instead of one per doubling, and never more than a whole read
-    /// of the file would reserve. Only the bytes the line fills are touched.
+    /// bytes instead of one per doubling. The carried bytes were read from
+    /// this file and are not yet dropped, so the buffer never holds more than
+    /// the file's size at open: no more than a whole read reserves. Only the
+    /// bytes the line fills are touched.
+    ///
+    /// The reservation is exact and fallible: an allocation the system
+    /// refuses is the same `io::Error::other` a whole read's
+    /// `try_reserve_exact` gives, and the caller skips the file as it skips
+    /// one whose whole read failed. The source then reads into the reserved
+    /// room only (see [`crate::bounded_io::Reader::append`]).
     pub(crate) fn append(&mut self, buffer: &mut Vec<u8>) -> io::Result<usize> {
         if self.remaining == 0 {
             return Ok(0);
@@ -133,10 +176,22 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
             } else {
                 limit
             };
-            buffer.reserve_exact(target - buffer.len());
+            #[cfg(test)]
+            if REFUSE_RESERVE_OVER.with(std::cell::Cell::get) < target {
+                return Err(io::Error::other("test refused the reservation"));
+            }
+            buffer
+                .try_reserve_exact(target - buffer.len())
+                .map_err(io::Error::other)?;
         }
         let before = buffer.len();
         *buffer = self.source.append(std::mem::take(buffer), want)?;
+        #[cfg(test)]
+        STEP_TAP.with(|tap| {
+            if let Some(tap) = tap.borrow_mut().as_mut() {
+                tap(self.read + (buffer.len() - before) as u64);
+            }
+        });
         let read = buffer.len() - before;
         self.read += read as u64;
         if read == 0 {
@@ -322,6 +377,12 @@ fn presence_steps<S: StepSource + ?Sized>(
 ) -> PresenceRead {
     let mut step = Vec::new();
     // The binary sniff sees the same first bytes a whole read's would.
+    // `is_binary_bytes` is `content_inspector::inspect`, which looks at the
+    // first 1,024 bytes only: content_inspector 0.2.4, src/lib.rs line 35
+    // (`MAX_SCAN_SIZE = 1024`) and line 120 (`min(buffer.len(),
+    // MAX_SCAN_SIZE)`); its byte-order marks and magic numbers are prefix
+    // checks of at most 4 bytes. So these bytes decide it as the whole file
+    // would.
     let sniff = usize::try_from(size_at_open.min(1024)).unwrap_or(1024);
     let mut ended = false;
     while step.len() < sniff {
@@ -422,7 +483,10 @@ pub(crate) struct WholeLines<'a> {
 }
 
 impl<'a> WholeLines<'a> {
-    /// Indexed grep's rules: only the CR of a CRLF ending is trimmed.
+    /// Indexed grep's rules: at most one CR is trimmed from the end of a
+    /// line's text. That is the CR of a CRLF ending, or, for an unterminated
+    /// last line, a bare CR at the very end of the file; a run of CRs keeps
+    /// all but its last one.
     pub(crate) fn indexed(content: &'a [u8]) -> Self {
         Self {
             content,
@@ -566,9 +630,10 @@ pub(crate) enum LineMatcher<'a> {
 pub(crate) enum ScanEnd {
     /// It reached the end of the file (or the size at open).
     Finished,
-    /// The per-match logic stopped it.
+    /// The per-match logic stopped it, or `step_hook` stopped it the way the
+    /// per-match logic would have at its next occurrence.
     Stopped,
-    /// `step_hook` stopped it.
+    /// `step_hook` interrupted it before the end of the file.
     Interrupted(Interrupted),
 }
 
@@ -580,14 +645,15 @@ pub(crate) enum ScanEnd {
 /// occurrences a whole-buffer search finds; a line longer than a step is
 /// carried until its LF. A zero-length match at the end of a run of lines is
 /// the next line's start and is handed over with that line. `step_hook` sees
-/// every byte once, in order, before it is searched, and can stop the scan.
+/// every byte once, in order, before it is searched, and can end the scan
+/// with [`ScanEnd::Stopped`] or [`ScanEnd::Interrupted`].
 pub(crate) fn scan_lines(
     source: &mut (impl StepSource + ?Sized),
     size_at_open: u64,
     head: Vec<u8>,
     matcher: &LineMatcher<'_>,
     trim_all_cr: bool,
-    mut step_hook: impl FnMut(&[u8]) -> Option<Interrupted>,
+    mut step_hook: impl FnMut(&[u8]) -> Option<ScanEnd>,
     mut visit: impl FnMut(&mut RegionLines<'_>, usize, usize) -> MatchVisit,
 ) -> io::Result<ScanEnd> {
     let mut steps = Steps::new(source, size_at_open.saturating_sub(head.len() as u64));
@@ -601,8 +667,8 @@ pub(crate) fn scan_lines(
     let mut lines_before = 0usize;
     let mut fresh_from = 0usize;
     loop {
-        if let Some(interrupted) = step_hook(&buffer[fresh_from..]) {
-            return Ok(ScanEnd::Interrupted(interrupted));
+        if let Some(end) = step_hook(&buffer[fresh_from..]) {
+            return Ok(end);
         }
         if let Some(last_lf) = memchr::memrchr(b'\n', &buffer[fresh_from..]) {
             let end = fresh_from + last_lf + 1;

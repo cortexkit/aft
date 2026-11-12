@@ -2661,8 +2661,10 @@ impl ScanLines for HeldLines<'_> {
 /// replayed, in order, through the same per-match logic the whole-buffer scan
 /// runs. At most `max_results + 1` line-first occurrences are held: the
 /// per-match logic always stops by then. A deadline, cancellation or read
-/// failure before the end of the file leaves the file without rows, as a
-/// whole read that failed does.
+/// failure before the end of the file leaves the file without rows and not
+/// counted as searched, as a whole read that failed does; a timeout or
+/// cancellation also flags the scan capped, as the whole read's timeout
+/// does. The same rule holds at the indexed grep sites.
 #[allow(clippy::too_many_arguments)]
 fn fallback_search_file_streamed(
     file: &Path,
@@ -2700,9 +2702,12 @@ fn fallback_search_file_streamed(
                 valid_utf8 = utf8.feed(bytes, |_| {});
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Some(crate::large_read::Interrupted::Deadline);
+                return Some(crate::large_read::ScanEnd::Interrupted(
+                    crate::large_read::Interrupted::Deadline,
+                ));
             }
             crate::search_index::cancelled(job_cancellation)
+                .map(crate::large_read::ScanEnd::Interrupted)
         },
         |lines, start, end| {
             if held.len() > max_results {
@@ -2728,35 +2733,34 @@ fn fallback_search_file_streamed(
             MatchVisit::Recorded { next_line_start }
         },
     );
-    crate::large_read::record(crate::large_read::Site::GrepFallback, size, read);
-    match scan {
-        Ok(crate::large_read::ScanEnd::Finished) => {}
-        // The scan stops once it holds more occurrences than the replay can
-        // use. The rest of the file still decides every column, so it is
-        // read for its UTF-8 validity alone.
+    // The scan stops once it holds more occurrences than the replay can
+    // use. The rest of the file still decides every column, so it is read
+    // for its UTF-8 validity alone, and the scan then counts as finished
+    // unless that read was interrupted.
+    let scan = match scan {
         Ok(crate::large_read::ScanEnd::Stopped) => {
-            let rest = validate_rest(
+            let remaining = size.saturating_sub(read);
+            validate_rest(
                 &mut large.reader,
-                size.saturating_sub(read),
+                remaining,
                 &mut utf8,
                 &mut valid_utf8,
                 deadline,
                 job_cancellation,
-            );
-            match rest {
-                Ok(None) => {}
-                Ok(Some(_)) => {
-                    engine_capped.store(true, Ordering::Relaxed);
-                    return Vec::new();
-                }
-                Err(error) => {
-                    if error.kind() == std::io::ErrorKind::TimedOut {
-                        engine_capped.store(true, Ordering::Relaxed);
-                    }
-                    return Vec::new();
-                }
-            }
+                &mut read,
+            )
+            .map(|rest| {
+                rest.map_or(crate::large_read::ScanEnd::Finished, |interrupted| {
+                    crate::large_read::ScanEnd::Interrupted(interrupted)
+                })
+            })
         }
+        other => other,
+    };
+    // Counted once every byte this file needed was read.
+    crate::large_read::record(crate::large_read::Site::GrepFallback, size, read);
+    match scan {
+        Ok(crate::large_read::ScanEnd::Finished | crate::large_read::ScanEnd::Stopped) => {}
         Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
             engine_capped.store(true, Ordering::Relaxed);
             return Vec::new();
@@ -2790,20 +2794,29 @@ fn fallback_search_file_streamed(
             deadline,
         )
     };
+    // The whole-buffer scan ends at the first occurrence its per-match logic
+    // stops at; nothing after it is visited.
+    let mut stopped = false;
     'replay: for occurrence in &held {
         // A same-line repeat lies on the line recorded last, so its offset is
         // below that line's end, as the recorded occurrence's own offset is.
         for _ in 0..occurrence.same_line_before {
             if matches!(visit(None, previous_start), MatchVisit::Stop) {
+                stopped = true;
                 break 'replay;
             }
         }
         if matches!(visit(Some(occurrence), occurrence.start), MatchVisit::Stop) {
+            stopped = true;
             break;
         }
         previous_start = occurrence.start;
     }
-    if held.len() <= max_results {
+    // The repeats on the last recorded line, which the scan saw after it.
+    // Holding more occurrences than `max_results` always ends the replay
+    // with a stop (the last one counts past the cap), so this runs only when
+    // the scan saw every occurrence.
+    if !stopped {
         for _ in 0..same_line {
             if matches!(visit(None, previous_start), MatchVisit::Stop) {
                 break;
@@ -2815,7 +2828,8 @@ fn fallback_search_file_streamed(
 
 /// Read the rest of a streamed file, `remaining` bytes up to its size at
 /// open, only to finish its UTF-8 check; stops as soon as the bytes are
-/// known invalid. `Some` when the deadline or cancellation stopped it.
+/// known invalid. `Some` when the deadline or cancellation stopped it. Adds
+/// the bytes it reads to `read`.
 fn validate_rest(
     reader: &mut crate::bounded_io::Reader,
     remaining: u64,
@@ -2823,6 +2837,7 @@ fn validate_rest(
     valid_utf8: &mut bool,
     deadline: Option<Instant>,
     job_cancellation: Option<&crate::executor::JobCancellation>,
+    read: &mut u64,
 ) -> std::io::Result<Option<crate::large_read::Interrupted>> {
     let mut steps = crate::large_read::Steps::new(reader, remaining);
     let mut step = Vec::new();
@@ -2834,7 +2849,9 @@ fn validate_rest(
             return Ok(Some(interrupted));
         }
         step.clear();
-        if steps.append(&mut step)? == 0 {
+        let count = steps.append(&mut step)?;
+        *read += count as u64;
+        if count == 0 {
             break;
         }
         *valid_utf8 = utf8.feed(&step, |_| {});
@@ -4554,6 +4571,22 @@ mod streamed_fallback_tests {
         pattern: &CompiledPattern,
         max_results: usize,
     ) -> (Vec<GrepMatch>, [usize; 3], [bool; 2]) {
+        scan_with(
+            path,
+            pattern,
+            max_results,
+            None,
+            Instant::now() + Duration::from_secs(600),
+        )
+    }
+
+    fn scan_with(
+        path: &Path,
+        pattern: &CompiledPattern,
+        max_results: usize,
+        job_cancellation: Option<&crate::executor::JobCancellation>,
+        deadline: Instant,
+    ) -> (Vec<GrepMatch>, [usize; 3], [bool; 2]) {
         let total = AtomicUsize::new(0);
         let searched = AtomicUsize::new(0);
         let with_matches = AtomicUsize::new(0);
@@ -4569,8 +4602,8 @@ mod streamed_fallback_tests {
             &with_matches,
             &truncated,
             &capped,
-            None,
-            Some(Instant::now() + Duration::from_secs(600)),
+            job_cancellation,
+            Some(deadline),
             false,
         );
         (
@@ -4620,6 +4653,164 @@ mod streamed_fallback_tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    fn foo_literal() -> CompiledPattern {
+        patterns().swap_remove(0)
+    }
+
+    /// Two matching lines in the first bytes, then lines without a match.
+    fn early_matches_file(directory: &Path) -> PathBuf {
+        let path = directory.join("early.txt");
+        let mut bytes = b"foo one\nfoo two\n".to_vec();
+        while bytes.len() < 4096 {
+            bytes.extend_from_slice(b"no match on this line\n");
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    /// A large file whose scan is interrupted part way, by its deadline or
+    /// by cancellation, gives what an interrupted whole read gives: no rows,
+    /// not counted as searched, the scan flagged capped.
+    #[test]
+    fn interrupted_fallback_scan_gives_what_an_interrupted_whole_read_gives() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = early_matches_file(directory.path());
+        let pattern = foo_literal();
+        let later = || Instant::now() + Duration::from_secs(600);
+        let interrupted = (Vec::new(), [0; 3], [false, true]);
+
+        let complete = crate::large_read::with_test_steps(64, 0, || {
+            scan_with(&path, &pattern, 1000, None, later())
+        });
+        assert_eq!(complete.0.len(), 2, "{complete:?}");
+
+        // The deadline passes part way through the file.
+        let whole = crate::large_read::with_test_steps(64, u64::MAX, || {
+            scan_with(&path, &pattern, 1000, None, Instant::now())
+        });
+        assert_eq!(whole, interrupted);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut slept = false;
+        let streamed = crate::large_read::with_test_steps(64, 0, || {
+            crate::large_read::with_step_tap(
+                move |read| {
+                    if read >= 512 && !slept {
+                        slept = true;
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                },
+                || scan_with(&path, &pattern, 1000, None, deadline),
+            )
+        });
+        assert_eq!(streamed, whole, "deadline");
+
+        // The request is cancelled part way through the file.
+        let cancelled_before = crate::executor::JobCancellation::new();
+        cancelled_before.request_cancel();
+        let whole = crate::large_read::with_test_steps(64, u64::MAX, || {
+            scan_with(&path, &pattern, 1000, Some(&cancelled_before), later())
+        });
+        assert_eq!(whole, interrupted);
+        let token = crate::executor::JobCancellation::new();
+        let cancel = token.clone();
+        let streamed = crate::large_read::with_test_steps(64, 0, || {
+            crate::large_read::with_step_tap(
+                move |read| {
+                    if read >= 512 {
+                        cancel.request_cancel();
+                    }
+                },
+                || scan_with(&path, &pattern, 1000, Some(&token), later()),
+            )
+        });
+        assert_eq!(streamed, whole, "cancellation");
+    }
+
+    /// Through the arrival-order walk, which shares its counters across
+    /// files: a file whose replay stops at the cap ends there, as the
+    /// whole-buffer scan does, without visiting the repeats left on its last
+    /// line (whose stop check would flag the engine capped).
+    #[test]
+    fn arrival_order_walk_matches_whole_read_when_a_replay_stops() {
+        let project = tempfile::tempdir().unwrap();
+        // Either file can come first: the first records its line, the
+        // second's line is the cap's overflow, with a repeat after it.
+        for name in ["a.txt", "b.txt"] {
+            let mut bytes = b"foo foo\n".to_vec();
+            while bytes.len() < 2048 {
+                bytes.extend_from_slice(b"padding line\n");
+            }
+            std::fs::write(project.path().join(name), bytes).unwrap();
+        }
+        let pattern = foo_literal();
+        // One worker thread, so the walk's scans run where the test step
+        // settings are.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let run = |step: usize, threshold: u64| {
+            pool.install(|| {
+                crate::large_read::with_test_steps(step, threshold, || {
+                    let result = fallback_grep_with_limits(
+                        project.path(),
+                        project.path(),
+                        project.path(),
+                        &pattern,
+                        &PathFilters::default(),
+                        1,
+                        IndexStatus::Building,
+                        None,
+                        10,
+                        FALLBACK_WALK_BUDGET,
+                    );
+                    (
+                        result.matches,
+                        result.total_matches,
+                        result.files_searched,
+                        result.files_with_matches,
+                        result.truncated,
+                        result.engine_capped,
+                    )
+                })
+            })
+        };
+        let whole = run(8, u64::MAX);
+        assert!(
+            whole.4 && !whole.5,
+            "the cap truncates without capping the engine: {whole:?}"
+        );
+        for step in [1, 3, 8, 64] {
+            assert_eq!(run(step, 0), whole, "step {step}");
+        }
+    }
+
+    /// At the real 1 MiB step, over a file of a few steps with a line longer
+    /// than a step and invalid UTF-8, the streamed scan finds what the whole
+    /// read finds.
+    #[test]
+    fn streamed_fallback_scan_matches_whole_read_at_the_real_step_size() {
+        let step = crate::large_read::STEP_BYTES;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("steps.txt");
+        let mut bytes = crate::large_read::generated_lines(11, step + 1000, false, true);
+        bytes.extend(std::iter::repeat_n(b'x', step + step / 2));
+        bytes.extend_from_slice("foo é Straße\n".as_bytes());
+        bytes.extend(crate::large_read::generated_lines(12, step, true, false));
+        std::fs::write(&path, &bytes).unwrap();
+        for pattern in patterns() {
+            for max_results in [100_000, 2] {
+                let whole = crate::large_read::with_test_steps(step, u64::MAX, || {
+                    scan(&path, &pattern, max_results)
+                });
+                let streamed = crate::large_read::with_test_steps(step, 0, || {
+                    scan(&path, &pattern, max_results)
+                });
+                assert_eq!(streamed, whole, "{pattern:?}, cap {max_results}");
             }
         }
     }

@@ -2068,8 +2068,10 @@ impl SearchIndexSnapshot {
                     }
                     let deadline = started.checked_add(limits.budget);
                     // A large file with a line-local pattern is scanned in
-                    // steps instead; the set never keeps it, as it keeps no
-                    // file over its budget.
+                    // steps instead, and the request's file set never keeps
+                    // it. The set's budget is 32 MiB, so a file of 4 to 32
+                    // MiB that a whole read would have left there is now
+                    // read again by any later phase that wants it.
                     let mut large = None;
                     let fetched = crate::commands::semantic_search::request_files::read_through(
                         request_files,
@@ -2085,7 +2087,6 @@ impl SearchIndexSnapshot {
                         },
                     );
                     if let Some(large) = large {
-                        files_examined.fetch_add(1, Ordering::Relaxed);
                         let line_matcher = matcher
                             .line_matcher()
                             .expect("a large grep read is opened only for a line-local pattern");
@@ -2097,17 +2098,23 @@ impl SearchIndexSnapshot {
                             keep_past_limit,
                             job_cancellation.as_ref(),
                         );
+                        // A file not read to its end gives no rows, as a
+                        // whole read that hit its deadline or failed. Such a
+                        // read still counted as examined here, and so does
+                        // this one.
+                        files_examined.fetch_add(1, Ordering::Relaxed);
                         match end {
                             Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
                                 stopped_early.store(true, Ordering::Relaxed);
                                 return None;
                             }
                             Ok(_) => {}
-                            // A read that fails part way counts as the read
-                            // failure a whole read would have been.
                             Err(error) => {
                                 if error.kind() == std::io::ErrorKind::TimedOut {
                                     stopped_early.store(true, Ordering::Relaxed);
+                                }
+                                if io_error_means_missing_on_disk(&error) {
+                                    missing_on_disk.fetch_add(1, Ordering::Relaxed);
                                 }
                                 return None;
                             }
@@ -2515,23 +2522,26 @@ fn search_candidate_file(
         return Vec::new();
     }
 
+    // A file that could not be read, wholly or (in steps) part way, is
+    // skipped; a timeout flags the scan capped.
+    let read_failed = |error: std::io::Error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            floor_disclosure.record_matched_source_exclusion(&file.path);
+        }
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            deadline.reached.store(true, Ordering::Relaxed);
+            engine_capped.store(true, Ordering::Relaxed);
+        }
+        if io_error_means_missing_on_disk(&error) {
+            missing_on_disk.fetch_add(1, Ordering::Relaxed);
+        }
+        Vec::new()
+    };
     let opened = match open_grep_file(&file.path, deadline.read_at, false, || {
         matcher.line_matcher().is_some()
     }) {
         Ok(opened) => opened,
-        Err(error) => {
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                floor_disclosure.record_matched_source_exclusion(&file.path);
-            }
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                deadline.reached.store(true, Ordering::Relaxed);
-                engine_capped.store(true, Ordering::Relaxed);
-            }
-            if io_error_means_missing_on_disk(&error) {
-                missing_on_disk.fetch_add(1, Ordering::Relaxed);
-            }
-            return Vec::new();
-        }
+        Err(error) => return read_failed(error),
     };
     let content = match opened {
         GrepFileRead::Whole(content) => content,
@@ -2554,7 +2564,8 @@ fn search_candidate_file(
                 stop_scan,
                 job_cancellation,
                 deadline,
-            );
+            )
+            .unwrap_or_else(read_failed);
         }
     };
     crate::large_read::record_whole(crate::large_read::Site::GrepIndexed, content.len());
@@ -2676,10 +2687,29 @@ impl CandidateScan {
 }
 
 /// [`search_candidate_file`] for a large file and a line-local pattern: the
-/// same per-match logic over the file read in steps. Matches are recorded as
-/// they are found, as in the whole-buffer scan; the request's cancellation
-/// is checked once per step, and a read that fails part way keeps the rows
-/// recorded before it.
+/// same per-match logic over the file read in steps.
+///
+/// The rule for a file that is not read to its end is the whole read's: a
+/// whole read that hit its deadline, or failed, contributed no rows and was
+/// not counted as searched or verified. So when cancellation, the read
+/// deadline or a read failure ends the scan part way, the rows already
+/// recorded are dropped and their matches taken back out of
+/// `total_matches`; a cancellation or a timed-out read also flags the result
+/// capped, as the whole read's timeout does, while any other read failure
+/// is returned for the caller to treat as the whole read's failure.
+/// `files_searched` and `bytes_verified` are credited only once the scan
+/// completes. The per-match logic's own stop (the result cap, another
+/// worker's stop flag, cancellation or the scan deadline seen at an
+/// occurrence) keeps the rows recorded before it, as in the whole-buffer
+/// scan, and the stop flag or a reached cap seen between steps ends the scan
+/// the same way. Other workers may have seen the dropped matches in
+/// `total_matches` in the meantime; that only happens in a scan that ends
+/// capped.
+///
+/// The read deadline is checked before every step, so time spent scanning
+/// earlier steps counts against it; a whole read checked it only while
+/// reading. A slow scan of a large file can therefore end capped where the
+/// whole read finished.
 #[allow(clippy::too_many_arguments)]
 fn search_candidate_file_streamed(
     file: &FileEntry,
@@ -2696,14 +2726,8 @@ fn search_candidate_file_streamed(
     stop_scan: Option<&Arc<AtomicBool>>,
     job_cancellation: Option<&crate::executor::JobCancellation>,
     deadline: &GrepScanDeadline,
-) -> Vec<SharedGrepMatch> {
+) -> std::io::Result<Vec<SharedGrepMatch>> {
     let size = large.reader.size_at_open();
-    bytes_verified.fetch_add(
-        usize::try_from(size).unwrap_or(usize::MAX),
-        Ordering::Relaxed,
-    );
-    files_searched.fetch_add(1, Ordering::Relaxed);
-
     let mut state = CandidateScan::new(file);
     let mut read = 0u64;
     let scan = crate::large_read::scan_lines(
@@ -2714,7 +2738,25 @@ fn search_candidate_file_streamed(
         false,
         |bytes| {
             read += bytes.len() as u64;
-            cancelled(job_cancellation)
+            if let Some(interrupted) = cancelled(job_cancellation) {
+                return Some(crate::large_read::ScanEnd::Interrupted(interrupted));
+            }
+            // Reading the next step is part of the file's read, so a passed
+            // deadline interrupts it as it interrupts a whole read.
+            if deadline.passed() {
+                return Some(crate::large_read::ScanEnd::Interrupted(
+                    crate::large_read::Interrupted::Deadline,
+                ));
+            }
+            // What the per-match logic's stop check would see at the next
+            // occurrence, so a file without one stops reading too.
+            if stop_scan.is_some_and(|flag| flag.load(Ordering::Relaxed))
+                || should_stop_search(truncated, total_matches, stop_after)
+            {
+                engine_capped.store(true, Ordering::Relaxed);
+                return Some(crate::large_read::ScanEnd::Stopped);
+            }
+            None
         },
         |lines, offset, end| {
             state.visit(
@@ -2733,19 +2775,28 @@ fn search_candidate_file_streamed(
         },
     );
     crate::large_read::record(crate::large_read::Site::GrepIndexed, size, read);
-    match scan {
-        Ok(crate::large_read::ScanEnd::Finished | crate::large_read::ScanEnd::Stopped) => {}
+    let failure = match scan {
+        Ok(crate::large_read::ScanEnd::Finished | crate::large_read::ScanEnd::Stopped) => {
+            bytes_verified.fetch_add(
+                usize::try_from(size).unwrap_or(usize::MAX),
+                Ordering::Relaxed,
+            );
+            files_searched.fetch_add(1, Ordering::Relaxed);
+            return Ok(state.finish(files_with_matches));
+        }
         Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
             engine_capped.store(true, Ordering::Relaxed);
+            None
         }
-        Err(error) => {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                deadline.reached.store(true, Ordering::Relaxed);
-            }
-            engine_capped.store(true, Ordering::Relaxed);
-        }
+        Err(error) => Some(error),
+    };
+    // Every match counted for this file was recorded: a count past the cap
+    // stops the scan, which then ends as `Stopped`.
+    total_matches.fetch_sub(state.matches.len(), Ordering::Relaxed);
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(Vec::new()),
     }
-    state.finish(files_with_matches)
 }
 
 /// `Some(Cancelled)` once the request's cancellation was requested; a
@@ -2847,7 +2898,7 @@ fn matching_lines_streamed(
         false,
         |bytes| {
             read += bytes.len() as u64;
-            cancelled(job_cancellation)
+            cancelled(job_cancellation).map(crate::large_read::ScanEnd::Interrupted)
         },
         |lines, start, end| state.record(lines, path, start, end, max_lines, keep_past_limit),
     );
@@ -6887,6 +6938,22 @@ mod streamed_scan_tests {
         matcher: &SearchMatcher,
         max_results: usize,
     ) -> (Rows, [usize; 5], [bool; 2]) {
+        candidate_scan_with(
+            path,
+            matcher,
+            max_results,
+            None,
+            &GrepScanDeadline::after_with_clock(Duration::from_secs(600), Instant::now),
+        )
+    }
+
+    fn candidate_scan_with(
+        path: &Path,
+        matcher: &SearchMatcher,
+        max_results: usize,
+        job_cancellation: Option<&crate::executor::JobCancellation>,
+        deadline: &GrepScanDeadline,
+    ) -> (Rows, [usize; 5], [bool; 2]) {
         let entry = FileEntry {
             path: path.to_path_buf(),
             size: 0,
@@ -6900,7 +6967,6 @@ mod streamed_scan_tests {
         let missing = AtomicUsize::new(0);
         let truncated = AtomicBool::new(false);
         let capped = AtomicBool::new(false);
-        let deadline = GrepScanDeadline::after_with_clock(Duration::from_secs(600), Instant::now);
         let rows = search_candidate_file(
             &entry,
             &Default::default(),
@@ -6915,8 +6981,8 @@ mod streamed_scan_tests {
             &capped,
             &missing,
             None,
-            None,
-            &deadline,
+            job_cancellation,
+            deadline,
         );
         (
             rows.into_iter()
@@ -7063,5 +7129,170 @@ mod streamed_scan_tests {
             open_grep_file(&path, None, false, || false).unwrap(),
             GrepFileRead::Large(_)
         )));
+    }
+
+    fn foo_literal() -> SearchMatcher {
+        SearchMatcher::Literal(LiteralSearch {
+            needle: b"foo".to_vec(),
+            case_insensitive_ascii: false,
+        })
+    }
+
+    /// Two matching lines in the first bytes, then lines without a match,
+    /// so rows are recorded before a later step is interrupted.
+    fn early_matches_file(directory: &Path) -> PathBuf {
+        let path = directory.join("early.txt");
+        let mut bytes = b"foo one\nfoo two\n".to_vec();
+        while bytes.len() < 4096 {
+            bytes.extend_from_slice(b"no match on this line\n");
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    /// A large file whose scan is interrupted part way, by its deadline or
+    /// by cancellation, gives what an interrupted whole read gives: no rows,
+    /// nothing counted, the scan flagged capped. The rows recorded from its
+    /// first steps are dropped and their matches taken back.
+    #[test]
+    fn interrupted_candidate_scan_gives_what_an_interrupted_whole_read_gives() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = early_matches_file(directory.path());
+        let matcher = foo_literal();
+        let fresh = || GrepScanDeadline::after_with_clock(Duration::from_secs(600), Instant::now);
+        let expired = || GrepScanDeadline::after_with_clock(Duration::ZERO, Instant::now);
+        let interrupted = (Vec::new(), [0; 5], [false, true]);
+
+        // Uninterrupted, the streamed scan finds both rows.
+        let complete = crate::large_read::with_test_steps(64, 0, || {
+            candidate_scan_with(&path, &matcher, 1000, None, &fresh())
+        });
+        assert_eq!(complete.0.len(), 2, "{complete:?}");
+
+        // The deadline passes after the scan recorded its rows.
+        let whole = crate::large_read::with_test_steps(64, u64::MAX, || {
+            candidate_scan_with(&path, &matcher, 1000, None, &expired())
+        });
+        assert_eq!(whole, interrupted);
+        let deadline = GrepScanDeadline::after_with_clock(Duration::from_millis(300), Instant::now);
+        let mut slept = false;
+        let streamed = crate::large_read::with_test_steps(64, 0, || {
+            crate::large_read::with_step_tap(
+                move |read| {
+                    if read >= 512 && !slept {
+                        slept = true;
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                },
+                || candidate_scan_with(&path, &matcher, 1000, None, &deadline),
+            )
+        });
+        assert_eq!(streamed, whole, "deadline");
+        assert!(deadline.reached());
+
+        // The request is cancelled after the scan recorded its rows.
+        let cancelled_before = crate::executor::JobCancellation::new();
+        cancelled_before.request_cancel();
+        let whole = crate::large_read::with_test_steps(64, u64::MAX, || {
+            candidate_scan_with(&path, &matcher, 1000, Some(&cancelled_before), &fresh())
+        });
+        assert_eq!(whole, interrupted);
+        let token = crate::executor::JobCancellation::new();
+        let cancel = token.clone();
+        let streamed = crate::large_read::with_test_steps(64, 0, || {
+            crate::large_read::with_step_tap(
+                move |read| {
+                    if read >= 512 {
+                        cancel.request_cancel();
+                    }
+                },
+                || candidate_scan_with(&path, &matcher, 1000, Some(&token), &fresh()),
+            )
+        });
+        assert_eq!(streamed, whole, "cancellation");
+    }
+
+    /// A step buffer the system refuses to grow skips the file as a whole
+    /// read that could not reserve its buffer does: no rows, nothing
+    /// counted, not capped. The process does not abort.
+    #[test]
+    fn refused_step_reservation_skips_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = early_matches_file(directory.path());
+        let streamed = crate::large_read::with_test_steps(64, 0, || {
+            crate::large_read::with_reserve_limit(1024, || {
+                candidate_scan(&path, &foo_literal(), 1000)
+            })
+        });
+        assert_eq!(streamed, (Vec::new(), [0; 5], [false, false]));
+    }
+
+    /// A line longer than a step grows the step buffer, never past the
+    /// file's size: with every larger reservation refused, the scan still
+    /// finds what the whole read finds. The steps are at least the 1,024
+    /// bytes the binary check reads first, so the buffer starts at two
+    /// steps and grows only for the long lines.
+    #[test]
+    fn long_line_never_reserves_past_the_file_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("long.txt");
+        let mut bytes = b"foo first\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 5000));
+        bytes.extend_from_slice(b"foo\nshort foo\n");
+        bytes.extend(std::iter::repeat_n(b'y', 3000));
+        bytes.extend_from_slice(b" foo");
+        std::fs::write(&path, &bytes).unwrap();
+        for matcher in matchers() {
+            let whole = crate::large_read::with_test_steps(1, u64::MAX, || {
+                candidate_scan(&path, &matcher, 1000)
+            });
+            for step in [1024, 1500, 2048] {
+                let streamed = crate::large_read::with_test_steps(step, 0, || {
+                    crate::large_read::with_reserve_limit(bytes.len(), || {
+                        candidate_scan(&path, &matcher, 1000)
+                    })
+                });
+                assert_eq!(streamed, whole, "{matcher:?}, step {step}");
+            }
+        }
+    }
+
+    /// At the real 1 MiB step, over a file of a few steps with a line
+    /// longer than a step, both indexed scans find what the whole read
+    /// finds.
+    #[test]
+    fn streamed_scans_match_whole_reads_at_the_real_step_size() {
+        let step = crate::large_read::STEP_BYTES;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("steps.txt");
+        let mut bytes = crate::large_read::generated_lines(11, step + 1000, true, true);
+        bytes.extend(std::iter::repeat_n(b'x', step + step / 2));
+        bytes.extend_from_slice("foo é Straße\n".as_bytes());
+        bytes.extend(crate::large_read::generated_lines(12, step, false, false));
+        std::fs::write(&path, &bytes).unwrap();
+        let keep_past_limit = |found: &GrepMatch| found.line % 5 == 0;
+        for matcher in matchers() {
+            for max_results in [100_000, 2] {
+                let whole = crate::large_read::with_test_steps(step, u64::MAX, || {
+                    candidate_scan(&path, &matcher, max_results)
+                });
+                let streamed = crate::large_read::with_test_steps(step, 0, || {
+                    candidate_scan(&path, &matcher, max_results)
+                });
+                assert_eq!(streamed, whole, "{matcher:?}, cap {max_results}");
+            }
+            let whole = matching_lines_in_content(&path, &bytes, &matcher, 3, &keep_past_limit);
+            let line_matcher = matcher.line_matcher().unwrap();
+            let streamed = crate::large_read::with_test_steps(step, 0, || {
+                let GrepFileRead::Large(large) =
+                    open_grep_file(&path, None, false, || true).unwrap()
+                else {
+                    panic!("a large read");
+                };
+                matching_lines_streamed(&path, large, &line_matcher, 3, &keep_past_limit, None)
+            });
+            assert_eq!(streamed.2.unwrap(), crate::large_read::ScanEnd::Finished);
+            assert_eq!((streamed.0, streamed.1), whole, "{matcher:?}");
+        }
     }
 }
