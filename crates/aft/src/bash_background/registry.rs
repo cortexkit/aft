@@ -22762,9 +22762,11 @@ mod tests {
         );
         let (id, task) =
             insert_terminal_piped_task(&registry, &dir, "printf output", &output, "", false);
-        *task.completion_secrets.lock().unwrap() = Some(
-            crate::log_redact::SecretValues::from_environment([("DEPLOY_TOKEN", secret)]),
-        );
+        *task.completion_secrets.lock().unwrap() =
+            Some(crate::log_redact::SecretValues::from_environment([(
+                std::ffi::OsStr::new("DEPLOY_TOKEN"),
+                std::ffi::OsStr::new(secret),
+            )]));
         let frame = registry.unknown_bash_result_for_task(&id, "session");
         let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
         let text = body["content"][0]["text"].as_str().unwrap();
@@ -22796,7 +22798,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
         let text = body["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains(super::super::completion_preview::RESTART_PREVIEW_WITHHELD),
+            text.contains(super::completion_preview::RESTART_PREVIEW_WITHHELD),
             "{text}"
         );
         assert!(!text.contains("opaque-deploy-credential"), "{text}");

@@ -609,7 +609,7 @@ impl BgTaskRegistry {
             completion_preview_pieces_for_cache(&safe_cache, metadata.exit_code)
         } else {
             (
-                super::output::PiecedText::whole(&safe_cache.output_preview),
+                super::super::output::PiecedText::whole(&safe_cache.output_preview),
                 safe_cache.output_truncated,
             )
         };
