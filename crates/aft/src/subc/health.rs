@@ -9252,6 +9252,85 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "explicit health counter byte-budget sizing measurement"]
+    fn measure_new_health_counter_budget() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("counter-health-budget");
+        let ctx = test_ctx();
+        assert!(executor.register_actor(root.clone(), ctx));
+        let app = App::default_shared();
+        let dispatch = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let report = assemble_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &dispatch,
+            &app,
+            |warming_roots| {
+                crate::cold_build_limiter::progress::snapshot_for_roots(
+                    &[root.as_path()],
+                    warming_roots,
+                )
+            },
+        );
+        let original = report.metrics.unwrap().as_object().unwrap().clone();
+        for (label, count, bytes) in [
+            ("empty", 0, 0),
+            ("active", 1, 5_000_000),
+            ("maximum", u64::MAX, u64::MAX),
+        ] {
+            let mut metrics = original.clone();
+            metrics.insert(
+                "large_reads".into(),
+                serde_json::Value::Object(
+                    crate::large_read::site_names()
+                        .filter(|_| count > 0)
+                        .map(|site| {
+                            (
+                                site.to_owned(),
+                                json!({"count": count, "bytes": bytes, "largest": bytes}),
+                            )
+                        })
+                        .collect(),
+                ),
+            );
+            let raw = refresh_metrics_bytes(&mut metrics);
+            let mut legacy = metrics.clone();
+            legacy.remove("large_reads");
+            legacy["dispatch_path"]
+                .as_object_mut()
+                .unwrap()
+                .remove("scope_background_tasks");
+            legacy["runner_notices"]
+                .as_object_mut()
+                .unwrap()
+                .remove("completions_idle_start_fallback");
+            let legacy_raw = refresh_metrics_bytes(&mut legacy);
+            for (name, parent) in [
+                ("large_reads", None),
+                ("scope_background_tasks", Some("dispatch_path")),
+                ("completions_idle_start_fallback", Some("runner_notices")),
+            ] {
+                let mut without = metrics.clone();
+                if let Some(parent) = parent {
+                    without[parent].as_object_mut().unwrap().remove(name);
+                } else {
+                    without.remove(name);
+                }
+                eprintln!(
+                    "counter-budget {label} field={name} added_bytes={}",
+                    raw - refresh_metrics_bytes(&mut without)
+                );
+            }
+            budget_health_metrics(&mut metrics);
+            budget_health_metrics(&mut legacy);
+            eprintln!("counter-budget {label} raw={raw} legacy_raw={legacy_raw} budget={} after={} legacy_after={} abbreviated={} legacy_abbreviated={} root_details_omitted={}", HEALTH_METRICS_BUDGET_BYTES, metrics["metrics_bytes"], legacy["metrics_bytes"], metrics["roots"][0]["abbreviated"], legacy["roots"][0]["abbreviated"], metrics["root_details_omitted"]);
+        }
+    }
+
+    #[test]
     fn completed_tier2_pass_returns_plane_to_ready_and_advances_progress() {
         let executor = Executor::new();
         let (_dir, root) = test_root("tier2-pass-health-transition");

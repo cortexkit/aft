@@ -712,7 +712,11 @@ pub(crate) mod tests {
             metadata.harness = Some("runner".into());
             write_task_at(&layout, &metadata).unwrap();
             if i < 2 {
-                held.push((root, hold_task(&ctx, &layout, &format!("held-{i}"))));
+                held.push((
+                    root,
+                    metadata.task_id.clone(),
+                    hold_task(&ctx, &layout, &format!("held-{i}")),
+                ));
             } else {
                 crate::db::bash_tasks::upsert_bash_task(
                     &ctx.db().unwrap().lock().unwrap(),
@@ -734,7 +738,7 @@ pub(crate) mod tests {
             .filter(|line| line.contains("held task startup recovery"))
             .collect();
         assert_eq!(recovery_logs.len(), 3, "{recovery_logs:?}");
-        for (root, key) in &held {
+        for (root, task, key) in &held {
             let expected = format!(
                 "WARN held task startup recovery reason=root_missing root={} settled_entries=1",
                 root.display()
@@ -750,7 +754,18 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.state, ledger::State::Settled);
-            assert_eq!(row.frame.unwrap().body, ledger::unknown_held_result().body);
+            let body: serde_json::Value = serde_json::from_slice(&row.frame.unwrap().body).unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Task {task}: outcome unknown (AFT restarted and this command's project folder no longer exists, so it can't tell whether the command ran)."),
+                    }],
+                    "isError": true,
+                    "errorCode": "outcome_unknown",
+                })
+            );
         }
         let summary = recovery_logs
             .iter()
