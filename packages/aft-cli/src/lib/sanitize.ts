@@ -388,10 +388,7 @@ export function redactUsername(content: string, username: string): string {
   if (!COMMON_ACCOUNT_NAMES.has(username.toLowerCase())) {
     return replaceDecoded(
       content,
-      new RegExp(
-        `(?<![\\p{L}\\p{N}_])${escapeRegex(username)}(?![\\p{L}\\p{N}_])`,
-        "gu",
-      ),
+      new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRegex(username)}(?![\\p{L}\\p{N}_])`, "gu"),
       () => ({ offset: 0, value: "<USER>" }),
     );
   }
