@@ -2410,6 +2410,9 @@ fn quiesce_connection_roots(
         }
     }
 
+    for route in routes.values() {
+        runner_notices::route_unbound(route);
+    }
     routes.clear();
     root_channels.clear();
     installed_route_epochs.clear();
