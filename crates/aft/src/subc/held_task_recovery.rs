@@ -11,34 +11,69 @@ struct Session {
     task_ids: Vec<String>,
 }
 
-fn sessions(db: &crate::db::TrackedConnection) -> rusqlite::Result<Vec<Session>> {
-    let mut stmt = db.prepare(
-        "SELECT t.harness,t.session_id,
-                COALESCE(json_extract(t.metadata,'$.project_root'),t.cwd),
-                t.task_id,t.metadata,
-                EXISTS(SELECT 1 FROM call_ledger c
-                       WHERE c.task_id=t.task_id AND c.recovered=1 AND c.state='DispatchStarted'
-                         AND json_extract(t.metadata,'$.call_key.requester')=c.carrier
-                         AND json_extract(t.metadata,'$.call_key.key')=c.call_key) AS keyed
-         FROM bash_tasks t
-         WHERE keyed OR t.status NOT IN ('completed','failed','killed','timed_out','fate_unknown')
-                     OR t.completion_delivered=0
-         ORDER BY 1,2,3,t.task_id",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, bool>(5)?,
-        ))
-    })?;
-    let mut pending = std::collections::BTreeMap::<_, Vec<String>>::new();
-    for row in rows {
-        let (harness, session, root, task, metadata, keyed) = row?;
+// Each page is an index seek, not an OFFSET scan. The existing replay index
+// includes legacy metadata/column disagreements, which are filtered after reading.
+const RECOVERY_CHUNK: usize = 64;
+const RUNNER_PAGE: &str = "SELECT harness,session_id,cwd,task_id,metadata,
+                                project_key,started_at,rowid,status,completion_delivered
+    FROM bash_tasks INDEXED BY idx_bash_tasks_project_replay
+    WHERE (status NOT IN ('completed','failed','killed','timed_out','fate_unknown')
+           OR completion_delivered=0
+           OR CASE WHEN json_valid(metadata)
+                   THEN json_type(metadata,'$.completion_delivered')='false' ELSE 0 END)
+      AND (harness,project_key,started_at,task_id,rowid)>(?1,?2,?3,?4,?5)
+    ORDER BY harness,project_key,started_at,task_id,rowid LIMIT ?6";
+
+#[cfg(test)]
+thread_local! {
+    // The offline benchmark starts cleanup only after recovery owns the mutex.
+    static FIRST_RECOVERY_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+struct RecoveryReader<'a> {
+    db: &'a Arc<StdMutex<crate::db::TrackedConnection>>,
+    #[cfg(test)]
+    on_chunk: &'a mut dyn FnMut(usize, Duration),
+}
+
+impl RecoveryReader<'_> {
+    fn read<T>(
+        &mut self,
+        query: impl FnOnce(&crate::db::TrackedConnection) -> rusqlite::Result<Vec<T>>,
+    ) -> rusqlite::Result<Vec<T>> {
+        let conn = self.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        #[cfg(test)]
+        let started = Instant::now();
+        #[cfg(test)]
+        FIRST_RECOVERY_LOCK.with(|probe| {
+            if let Some(observer) = probe.borrow_mut().take() {
+                observer();
+            }
+        });
+        let rows = query(&conn)?;
+        #[cfg(test)]
+        let held = started.elapsed();
+        drop(conn);
+        #[cfg(test)]
+        (self.on_chunk)(rows.len(), held);
+        Ok(rows)
+    }
+}
+
+fn sessions(
+    db: &Arc<StdMutex<crate::db::TrackedConnection>>,
+    #[cfg(test)] on_chunk: &mut dyn FnMut(usize, Duration),
+) -> rusqlite::Result<Vec<Session>> {
+    use rusqlite::params;
+    let mut reader = RecoveryReader {
+        db,
+        #[cfg(test)]
+        on_chunk,
+    };
+    let mut pending = std::collections::BTreeMap::<_, std::collections::BTreeSet<String>>::new();
+    let mut include = |harness: String, session, cwd: String, task, metadata: String, keyed| {
         let metadata: Value = serde_json::from_str(&metadata).unwrap_or(Value::Null);
+        let root = metadata["project_root"].as_str().unwrap_or(&cwd).to_owned();
         let runner = [
             metadata["launching_identity"]["principal"].as_str(),
             metadata["call_key"]["requester"].as_str(),
@@ -61,7 +96,133 @@ fn sessions(db: &crate::db::TrackedConnection) -> rusqlite::Result<Vec<Session>>
             pending
                 .entry((harness, session, root))
                 .or_default()
-                .push(task);
+                .insert(task);
+        }
+    };
+    let mut cursor = (
+        String::new(),
+        String::new(),
+        i64::MIN,
+        String::new(),
+        i64::MIN,
+    );
+    loop {
+        let rows = reader.read(|conn| {
+            conn.prepare(RUNNER_PAGE)?
+                .query_map(
+                    params![
+                        cursor.0,
+                        cursor.1,
+                        cursor.2,
+                        cursor.3,
+                        cursor.4,
+                        RECOVERY_CHUNK
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, bool>(9)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        if rows.is_empty() {
+            break;
+        }
+        for (harness, session, cwd, task, metadata, project, started, rowid, status, delivered) in
+            rows
+        {
+            cursor = (harness.clone(), project, started, task.clone(), rowid);
+            if !delivered
+                || !matches!(
+                    status.as_str(),
+                    "completed" | "failed" | "killed" | "timed_out" | "fate_unknown"
+                )
+            {
+                include(harness, session, cwd, task, metadata, false);
+            }
+        }
+    }
+    // Start with the small DispatchStarted range of the retention index. Walk
+    // NULL and non-NULL settled_at separately so every page has an index bound.
+    for null_settled in [true, false] {
+        let mut cursor = (i64::MIN, i64::MIN);
+        loop {
+            let keys = reader.read(|conn| {
+                let sql = if null_settled {
+                    "SELECT settled_at,rowid,carrier,call_key,task_id,recovered FROM call_ledger
+                     WHERE state='DispatchStarted' AND settled_at IS NULL AND rowid>?2
+                     ORDER BY settled_at,rowid LIMIT ?3"
+                } else {
+                    "SELECT settled_at,rowid,carrier,call_key,task_id,recovered FROM call_ledger
+                     WHERE state='DispatchStarted' AND (settled_at,rowid)>(?1,?2)
+                     ORDER BY settled_at,rowid LIMIT ?3"
+                };
+                let mut stmt = conn.prepare(sql)?;
+                let rows = stmt
+                    .query_map(params![cursor.0, cursor.1, RECOVERY_CHUNK], |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, bool>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                rows
+            })?;
+            if keys.is_empty() {
+                break;
+            }
+            for (settled, rowid, carrier, key, task, recovered) in keys {
+                cursor = (settled.unwrap_or(i64::MIN), rowid);
+                let Some(task) = task.filter(|_| recovered) else {
+                    continue;
+                };
+                let mut owner = (String::new(), String::new());
+                loop {
+                    let rows = reader.read(|conn| {
+                        conn.prepare(
+                            "SELECT harness,session_id,cwd,task_id,metadata FROM bash_tasks
+                            WHERE task_id=?1 AND (harness,session_id)>(?2,?3)
+                            ORDER BY harness,session_id LIMIT ?4",
+                        )?
+                        .query_map(params![task, owner.0, owner.1, RECOVERY_CHUNK], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                    })?;
+                    if rows.is_empty() {
+                        break;
+                    }
+                    for (harness, session, cwd, task, metadata) in rows {
+                        owner = (harness.clone(), session.clone());
+                        let parsed: Value = serde_json::from_str(&metadata).unwrap_or(Value::Null);
+                        if parsed["call_key"]["requester"].as_str() == Some(carrier.as_str())
+                            && parsed["call_key"]["key"].as_str() == Some(key.as_str())
+                        {
+                            include(harness, session, cwd, task, metadata, true);
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(pending
@@ -70,7 +231,7 @@ fn sessions(db: &crate::db::TrackedConnection) -> rusqlite::Result<Vec<Session>>
             harness,
             session_id,
             project_root: root.into(),
-            task_ids,
+            task_ids: task_ids.into_iter().collect(),
         })
         .collect())
 }
@@ -104,10 +265,12 @@ fn recover(
         .open_db(&storage.join("aft.db"))
         .map_err(|error| error.to_string())?;
     crate::db::call_ledger::recover_pool_once(&db).map_err(|error| error.to_string())?;
-    let pending = {
-        let conn = db.lock().map_err(|error| error.to_string())?;
-        sessions(&conn).map_err(|error| error.to_string())?
-    };
+    let pending = sessions(
+        &db,
+        #[cfg(test)]
+        &mut |_, _| {},
+    )
+    .map_err(|error| error.to_string())?;
     let mut replayed = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut missing_roots = std::collections::BTreeMap::<PathBuf, usize>::new();
     for session in pending {
@@ -256,6 +419,10 @@ fn replay(
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[cfg(test)]
+#[path = "held_task_recovery_benchmark.rs"]
+mod benchmark;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -580,6 +747,104 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn recovery_selection_uses_bounded_index_pages_and_releases_shared_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path(), &dir.path().join("storage"));
+        let db = ctx.db().unwrap();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch(r#"BEGIN;
+                WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<4095)
+                INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,
+                                       started_at,completion_delivered,metadata)
+                SELECT 'runner','history',printf('old-%05d',i),'root','done','/root','completed',0,1,'{}' FROM n;
+                WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<129)
+                INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,
+                                       started_at,completion_delivered,metadata)
+                SELECT 'runner',printf('active-%03d',i),'same-task','root','running','/root','running',0,1,'{}' FROM n;
+                INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,
+                                       started_at,completion_delivered,metadata) VALUES
+                ('runner','undelivered','undelivered','root','','/root','completed',0,0,'{}'),
+                ('opencode','keyed','keyed','root','','/root','completed',0,1,
+                    '{"project_root":"/project","call_key":{"requester":"direct","key":"held"}}'),
+                ('opencode','wrong-owner','keyed','root','','/root','completed',0,1,'{}'),
+                ('runner','legacy-disagreement','legacy','root','','/root','completed',0,1,'{"completion_delivered":false}'),
+                ('opencode','not-runner','not-runner','root','','/root','running',0,0,'{}'),
+                ('opencode','not-recovered','not-recovered','root','','/root','completed',0,1,
+                    '{"call_key":{"requester":"direct","key":"not-recovered"}}'),
+                ('opencode','settled','settled','root','','/root','completed',0,1,
+                    '{"call_key":{"requester":"direct","key":"settled"}}');
+                INSERT INTO call_ledger(carrier,call_key,digest,state,event_id,task_id,recovered) VALUES
+                ('direct','held','','DispatchStarted','','keyed',1),
+                ('direct','not-recovered','','DispatchStarted','','not-recovered',0),
+                ('direct','settled','','Settled','','settled',1);
+                WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<129)
+                INSERT INTO call_ledger(carrier,call_key,digest,state,event_id,settled_at,recovered)
+                SELECT 'direct',printf('unlinked-%03d',i),'','DispatchStarted','',
+                       CASE WHEN i<65 THEN NULL ELSE 1 END,1 FROM n;
+                COMMIT;"#).unwrap();
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {RUNNER_PAGE}"))
+                .unwrap()
+                .query_map(
+                    rusqlite::params!["", "", i64::MIN, "", i64::MIN, RECOVERY_CHUNK],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                plan.contains("SEARCH bash_tasks USING INDEX idx_bash_tasks_project_replay"),
+                "{plan}"
+            );
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+        let mut chunks = Vec::new();
+        let selected = sessions(&db, &mut |rows, held| {
+            assert!(
+                db.try_lock().is_ok(),
+                "chunk observer must run after unlocking"
+            );
+            assert!(rows <= RECOVERY_CHUNK, "read {rows} rows in one lock hold");
+            chunks.push((rows, held));
+        })
+        .unwrap();
+        let mut expected = (0..130)
+            .map(|i| Session {
+                harness: "runner".into(),
+                session_id: format!("active-{i:03}"),
+                project_root: "/root".into(),
+                task_ids: vec!["same-task".into()],
+            })
+            .collect::<Vec<_>>();
+        expected.insert(
+            0,
+            Session {
+                harness: "opencode".into(),
+                session_id: "keyed".into(),
+                project_root: "/project".into(),
+                task_ids: vec!["keyed".into()],
+            },
+        );
+        expected.push(Session {
+            harness: "runner".into(),
+            session_id: "undelivered".into(),
+            project_root: "/root".into(),
+            task_ids: vec!["undelivered".into()],
+        });
+        assert_eq!(selected, expected);
+        assert!(
+            chunks
+                .iter()
+                .filter(|(rows, _)| *rows == RECOVERY_CHUNK)
+                .count()
+                >= 4,
+            "both candidate sources must cross page boundaries: {chunks:?}"
+        );
+    }
+
+    #[test]
     fn runner_saved_selection_includes_carriers_and_parsed_harnesses_only() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path(), &dir.path().join("storage"));
@@ -630,7 +895,8 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
-        let selected = sessions(&conn).unwrap();
+        drop(conn);
+        let selected = sessions(&db, &mut |_, _| {}).unwrap();
         assert_eq!(
             selected
                 .iter()

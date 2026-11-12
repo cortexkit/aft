@@ -1156,6 +1156,57 @@ async fn shells_v1_output_pty_screen_uses_masked_renderer_and_cursor() {
     service.stop();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn shells_list_agent_db_contention_does_not_block_runtime_polling() {
+    let (_dir, ctx, executor, app) = status_context();
+    let db = ctx.db().unwrap();
+    {
+        let conn = db.lock().unwrap();
+        let key = ScopeKey::from_stamp(&stamp("head", false));
+        crate::db::access_grants::register_scope(&conn, &key, None, &Default::default()).unwrap();
+        crate::db::access_grants::register_agent(&conn, &key, "known-agent", true).unwrap();
+    }
+    let service = Service::new(app, executor);
+    let (release, released) = std::sync::mpsc::channel();
+    let (locked, acquired) = tokio::sync::oneshot::channel();
+    let holder_db = Arc::clone(&db);
+    let holder = std::thread::spawn(move || {
+        let _guard = holder_db.lock().unwrap();
+        locked.send(()).unwrap();
+        // The external deadline still runs if the current-thread runtime blocks.
+        released.recv_timeout(Duration::from_secs(2)).is_ok()
+    });
+    acquired.await.unwrap();
+    let list_service = Arc::clone(&service);
+    let mut list = tokio::spawn(async move {
+        list_service
+            .list(ListParams {
+                agent_ids: Some(vec!["unknown-agent".into(), "known-agent".into()]),
+                ..Default::default()
+            })
+            .await
+    });
+    let start = std::time::Instant::now();
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+        result = &mut list => panic!("list finished while db was held: {result:?}"),
+    }
+    let _ = release.send(());
+    assert!(
+        holder.join().unwrap(),
+        "runtime did not release the lock holder in time"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "runtime stopped polling while waiting for the database"
+    );
+    let reply = list.await.unwrap().unwrap();
+    assert!(reply.rows.is_empty());
+    assert!(reply.next_cursor.is_none());
+    assert_eq!(reply.unknown_agent_ids, Some(vec!["unknown-agent".into()]));
+    service.stop();
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn shells_v1_list_pages_fifty_running_first_and_cursor_is_filter_bound() {

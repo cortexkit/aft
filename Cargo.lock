@@ -84,6 +84,7 @@ dependencies = [
  "cortexkit-role-tool-display",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
+ "cortexkit-test-support",
  "cortexkit-tree-sitter-scss",
  "crc32fast",
  "crossbeam-channel",
@@ -930,6 +931,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-test-support"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50773b2a265a84af63d31ed52653cf07cf5690a85b0b23d65a3d8f1e776ef2e9"
+dependencies = [
+ "file-id",
+ "rustix",
+ "sha2",
+ "subc-os",
+ "tokio",
+]
+
+[[package]]
 name = "cortexkit-tree-sitter-scss"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1368,6 +1382,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "file-id"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1fc6a637b6dc58414714eddd9170ff187ecb0933d4c7024d1abbd23a3cc26e9"
+dependencies = [
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

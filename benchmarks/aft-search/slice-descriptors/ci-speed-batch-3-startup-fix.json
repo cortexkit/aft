@@ -1,0 +1,7 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "note": "Follow-up to post-0.64 batch 3: startup held-task recovery reads in bounded indexed pages, database sections of the permission-card and shells paths move off the subc runtime thread, and Rust 1.100 Cargo layout support for completed Rust checks and native test launchers. No ranking-fence file changes; search is untouched."
+}

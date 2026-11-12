@@ -5468,17 +5468,24 @@ where
     // route loop, never before it: each withdrawal waits on Cingulate, and a
     // slow or absent Cingulate must not delay route binds.
     #[cfg(target_os = "macos")]
-    match shared_app.open_db(&storage_dir.join("aft.db")) {
-        Ok(db) => {
-            tokio::spawn(async move {
-                if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
-                    log::warn!("macOS permission card startup cleanup failed: {error:?}");
+    {
+        let app = Arc::clone(&shared_app);
+        let path = storage_dir.join("aft.db");
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || app.open_db(&path)).await {
+                Ok(Ok(db)) => {
+                    if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
+                        log::warn!("macOS permission card startup cleanup failed: {error:?}");
+                    }
                 }
-            });
-        }
-        Err(error) => {
-            log::warn!("macOS permission card startup cleanup could not open database: {error}")
-        }
+                Ok(Err(error)) => log::warn!(
+                    "macOS permission card startup cleanup could not open database: {error}"
+                ),
+                Err(error) => {
+                    log::warn!("macOS permission card startup cleanup worker failed: {error}")
+                }
+            }
+        });
     }
     rich_ui::display::start(connection_file_path.to_path_buf());
     runner_notices::install(connection_file_path.to_path_buf());

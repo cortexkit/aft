@@ -4371,9 +4371,31 @@ fn main() {
             "{mode}: check artifacts at {check_out}, expected {}",
             analyzer_target.display()
         );
+        // Cargo's intermediate directory layout is not stable. Require this
+        // crate's compiler artifact under the isolated target, not a `deps` folder.
+        let mut directories = vec![analyzer_target.clone()];
+        let mut found_compiler_artifact = false;
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).expect("read analyzer artifacts") {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    directories.push(entry.path());
+                } else if kind.is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("liblock_isolation")
+                    && entry.path().extension().is_some_and(|ext| ext == "rmeta")
+                {
+                    found_compiler_artifact = true;
+                }
+            }
+        }
         assert!(
-            analyzer_target.join("debug/deps").is_dir(),
-            "check artifacts missing"
+            found_compiler_artifact,
+            "{mode}: check compiler artifacts missing under {}",
+            analyzer_target.display()
         );
         eprintln!(
             "{mode}: analyzer artifacts under {}; cargo build stderr:\n{stderr}",

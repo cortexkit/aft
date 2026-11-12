@@ -597,19 +597,27 @@ fn secret_bash_windows_refuses_all_profiles_without_a_job() {
 }
 
 #[cfg(unix)]
-fn native_launcher(root: &Path) -> impl Drop {
-    // The test executable runs from `<profile>/deps/`, and `aft` is built
-    // into `<profile>/`. With Cargo's `build.build-dir` set, test
-    // executables move under the build folder while binaries stay in the
-    // target folder, so the same profile folder there is looked in too.
-    let executable = std::env::current_exe().unwrap();
-    let profile_dir = executable.parent().unwrap().parent().unwrap();
+fn native_launcher_candidates(
+    executable: &Path,
+    provided: Option<std::path::PathBuf>,
+    target: Option<std::ffi::OsString>,
+    manifest: Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    if let Some(provided) = provided {
+        return vec![provided];
+    }
+    // Nextest only supplies BIN_EXE variables to integration tests and benches,
+    // not library tests. Locate the profile above Cargo's old `deps` or new
+    // `build/<package>/<unit>` intermediate tree in the extracted archive.
+    let Some(profile_dir) = cortexkit_test_support::cargo_profile_dir_of(executable) else {
+        return Vec::new();
+    };
     let profile = profile_dir.file_name().unwrap();
     let mut candidates = vec![profile_dir.join("aft")];
-    if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+    if let Some(target) = target {
         candidates.push(std::path::PathBuf::from(target).join(profile).join("aft"));
     }
-    if let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR") {
+    if let Some(manifest) = manifest {
         candidates.push(
             std::path::PathBuf::from(manifest)
                 .join("../../target")
@@ -617,6 +625,20 @@ fn native_launcher(root: &Path) -> impl Drop {
                 .join("aft"),
         );
     }
+    candidates
+}
+
+#[cfg(unix)]
+fn native_launcher(root: &Path) -> impl Drop {
+    let candidates = native_launcher_candidates(
+        &std::env::current_exe().unwrap(),
+        std::env::var_os("AFT_TEST_AFT_BINARY")
+            .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
+            .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
+            .map(std::path::PathBuf::from),
+        std::env::var_os("CARGO_TARGET_DIR"),
+        std::env::var_os("CARGO_MANIFEST_DIR"),
+    );
     let launcher = candidates
         .iter()
         .find(|path| path.is_file())
@@ -625,6 +647,48 @@ fn native_launcher(root: &Path) -> impl Drop {
             panic!("build the real aft binary before running native secret-bash tests; looked in {candidates:?}")
         });
     crate::sandbox_spawn::install_sandbox_launcher_for_test(root, launcher)
+}
+
+#[cfg(unix)]
+#[test]
+fn native_launcher_candidates_support_both_cargo_layouts() {
+    for executable in [
+        "/archive/target/debug/deps/agent_file_tools-hash",
+        "/archive/target/debug/build/agent-file-tools/hash/aft",
+        "/archive/target/debug/build/agent-file-tools/hash/out/aft",
+    ] {
+        let candidates = native_launcher_candidates(
+            Path::new(executable),
+            None,
+            Some("/custom-target".into()),
+            Some("/checkout/crates/aft".into()),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                std::path::PathBuf::from("/archive/target/debug/aft"),
+                std::path::PathBuf::from("/custom-target/debug/aft"),
+                std::path::PathBuf::from("/checkout/crates/aft/../../target/debug/aft"),
+            ],
+            "{executable}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_launcher_candidates_respect_explicit_binary_even_if_missing() {
+    let binary = std::path::PathBuf::from("/missing/explicit-aft");
+    assert_eq!(
+        native_launcher_candidates(
+            Path::new("/archive/target/debug/build/agent-file-tools/hash/aft"),
+            Some(binary.clone()),
+            Some("/custom-target".into()),
+            None,
+        ),
+        vec![binary],
+        "a missing explicit binary must fail rather than use a stale fallback"
+    );
 }
 
 #[cfg(unix)]
