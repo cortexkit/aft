@@ -509,6 +509,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 crate::page_collect::CAPABILITY.to_string(),
                 super::permissions::CAPABILITY.to_string(),
                 super::shells::CAPABILITY.to_string(),
+                cortexkit_role_user_commands::PROVIDES.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -678,6 +679,21 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                     ManagementOperation {
                         name: "aft.status".into(),
                         kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "commands.describe".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "commands.preview".into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: "commands.run".into(),
+                        kind: ManagementOperationKind::Mutate,
                         description: None,
                     },
                 ],
@@ -952,6 +968,7 @@ mod tests {
                 "page-collect/v1".to_string(),
                 "permissions/v1".to_string(),
                 "shells/v1".to_string(),
+                "user-commands/v1".to_string(),
             ]
         );
         assert!(capabilities.requires.is_empty());
@@ -971,7 +988,8 @@ mod tests {
                 "scope-workdir/v1",
                 "page-collect/v1",
                 "permissions/v1",
-                "shells/v1"
+                "shells/v1",
+                "user-commands/v1"
             ]))
         );
     }
@@ -1070,6 +1088,9 @@ mod tests {
                 ("shells.watch", &ManagementOperationKind::Query),
                 ("shells.output", &ManagementOperationKind::Query),
                 ("aft.status", &ManagementOperationKind::Query),
+                ("commands.describe", &ManagementOperationKind::Query),
+                ("commands.preview", &ManagementOperationKind::Query),
+                ("commands.run", &ManagementOperationKind::Mutate),
             ]
         );
         for operation in operations {
@@ -1283,7 +1304,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1", "shells/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "session-notices/v1", "scope-background-tasks/v1", "call-yield/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1", "permissions/v1", "shells/v1", "user-commands/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
@@ -1335,6 +1356,9 @@ mod tests {
             json!({"name": "shells.watch", "kind": "query"}),
             json!({"name": "shells.output", "kind": "query"}),
             json!({"name": "aft.status", "kind": "query"}),
+            json!({"name": "commands.describe", "kind": "query"}),
+            json!({"name": "commands.preview", "kind": "query"}),
+            json!({"name": "commands.run", "kind": "mutate"}),
         ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.

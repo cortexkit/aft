@@ -928,6 +928,19 @@ impl std::fmt::Debug for DiskMeasurement {
 }
 
 impl DiskMeasurement {
+    fn cached(&self) -> (Option<u64>, bool) {
+        let Ok(sample) = self.sample.try_lock() else {
+            return (None, true);
+        };
+        (
+            sample.bytes,
+            sample.running
+                || sample
+                    .completed
+                    .is_none_or(|at| at.elapsed() >= DISK_REFRESH_INTERVAL),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn expire_for_test(&self) {
         let mut sample = self.sample.lock().unwrap();
@@ -1276,14 +1289,19 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
 /// old call-graph store's refresh queue (`callgraph_refresh`) are dropped:
 /// neither describes what these planes answer from.
 pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
-    apply_to_status_inner(payload, report, false)
+    apply_to_status_inner(payload, report, false, false)
 }
 
 pub(crate) fn apply_to_status_push(payload: &mut Value, report: &DataStoreReport) {
-    apply_to_status_inner(payload, report, true)
+    apply_to_status_inner(payload, report, true, false)
 }
 
-fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bool) {
+/// Operator reads use only the last measurement, without scheduling a disk walk.
+pub(crate) fn apply_to_status_operator(payload: &mut Value, report: &DataStoreReport) {
+    apply_to_status_inner(payload, report, true, true)
+}
+
+fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bool, passive: bool) {
     payload["search_index"] = report.search_index_json();
     if let Some(meaning) = &report.meaning {
         let meaning = meaning.status_json();
@@ -1324,10 +1342,17 @@ fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bo
     ) {
         disk.insert("data_store_dir".into(), json!(dir.display().to_string()));
         if push {
-            let (bytes, stale) = report
-                .disk_measurement
-                .as_ref()
-                .map_or((None, true), |measurement| measurement.observe(dir));
+            let (bytes, stale) =
+                report
+                    .disk_measurement
+                    .as_ref()
+                    .map_or((None, true), |measurement| {
+                        if passive {
+                            measurement.cached()
+                        } else {
+                            measurement.observe(dir)
+                        }
+                    });
             disk.insert("data_store_bytes".into(), json!(bytes));
             disk.insert("data_store_bytes_stale".into(), json!(stale));
         } else {
@@ -1338,6 +1363,32 @@ fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bo
         object.remove("views");
         object.remove("callgraph_refresh");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn user_commands_operator_projection_never_starts_a_disk_measurement() {
+    let dir = tempfile::tempdir().unwrap();
+    let measurement = Arc::new(DiskMeasurement::default());
+    let mut report = DataStoreReport::both(PlaneReport::of(READY));
+    report.family_dir = Some(dir.path().to_path_buf());
+    report.disk_measurement = Some(measurement.clone());
+    let mut payload = json!({"disk":{}});
+    apply_to_status_operator(&mut payload, &report);
+    assert!(payload["disk"]["data_store_bytes"].is_null());
+    assert_eq!(payload["disk"]["data_store_bytes_stale"], true);
+    {
+        let mut sample = measurement.sample.lock().unwrap();
+        assert!(!sample.running);
+        assert!(sample.started.is_none());
+        sample.bytes = Some(123);
+        sample.completed = Some(std::time::Instant::now());
+    }
+    apply_to_status_operator(&mut payload, &report);
+    assert_eq!(payload["disk"]["data_store_bytes"], 123);
+    let sample = measurement.sample.lock().unwrap();
+    assert!(sample.started.is_none());
+    assert_eq!(sample.walks, 0);
 }
 
 /// zoom's `callgraph` field when the data layer is on: `Some(None)` while

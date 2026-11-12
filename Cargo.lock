@@ -84,6 +84,7 @@ dependencies = [
  "cortexkit-role-tool-display",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
+ "cortexkit-role-user-commands",
  "cortexkit-test-support",
  "cortexkit-tree-sitter-scss",
  "crc32fast",
@@ -919,6 +920,19 @@ dependencies = [
  "serde_json",
  "subc-protocol 0.35.0",
  "tokio",
+]
+
+[[package]]
+name = "cortexkit-role-user-commands"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10208a08b7ad82e82e182e68e33336e8915104647847eb345a3192393dffedc1"
+dependencies = [
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "subc-protocol 0.35.0",
 ]
 
 [[package]]

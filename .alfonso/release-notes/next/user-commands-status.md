@@ -1,0 +1,1 @@
+AFT now offers a read-only **AFT status** command for the desktop and phone command palette through Occipital. Its preview shows this session's search and code-map readiness, recorded errors and warnings, and running shells. Unknown measurements stay unavailable rather than appearing as zero. The command does not change anything and has no run action.

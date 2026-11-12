@@ -12,6 +12,12 @@ use subc_protocol::{scope::ScopeSelector, BindIdentity, RouteTarget};
 const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 const RUNNER_CARRIERS: &[&str] = &["reserved:thalamus-harness", "reserved:broca"];
+
+pub(super) fn known_runner(module_id: &str) -> bool {
+    RUNNER_CARRIERS
+        .iter()
+        .any(|principal| principal.strip_prefix("reserved:") == Some(module_id))
+}
 static CONNECTION: OnceLock<std::sync::RwLock<PathBuf>> = OnceLock::new();
 // These weak references are registered only for live runner routes. Closing a
 // route removes its reference; disconnected sessions are not harness evidence.

@@ -852,6 +852,17 @@ fn collect(
     )
 }
 
+/// Shared project facts for shell status and the person's status command. No
+/// database guard crosses this call while it reads language-server diagnostics.
+pub(in crate::subc) fn project_status(ctx: &crate::context::AppContext) -> (Value, Option<usize>) {
+    let snapshot = ctx.build_operator_status_snapshot();
+    let running = ctx
+        .bash_background()
+        .try_health_counts()
+        .map(|counts| counts.running);
+    (snapshot, running)
+}
+
 fn collect_at_revision(
     executor: &Executor,
     db: Option<&std::sync::Mutex<crate::db::TrackedConnection>>,
@@ -970,7 +981,7 @@ fn collect_at_revision(
     let mut degraded = false;
     let mut building = false;
     for ctx in contexts {
-        let snapshot = ctx.build_operator_status_snapshot();
+        let (snapshot, _) = project_status(&ctx);
         let Some(root) = snapshot["project_root"].as_str() else {
             continue;
         };
