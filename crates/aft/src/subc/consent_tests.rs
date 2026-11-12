@@ -4218,35 +4218,32 @@ fn consent_scope_unknown_alias_answer_is_not_memoized() {
     let parent = crate::access_policy::policy_path(&dir.path().join("nested"));
     std::fs::create_dir_all(&parent).unwrap();
     let probes = Arc::new(AtomicUsize::new(0));
-    for name in ["first.txt", "sibling.txt"] {
-        let grant = AccessGrant {
-            path: parent.join(name),
-            kind: GrantKind::File,
-            operation: AccessOperation::Read,
-        };
-        let counter = Arc::clone(&probes);
-        assert_eq!(
-            directory_scope_with(&grant, move |_, _| {
-                counter.fetch_add(1, Ordering::SeqCst);
-                None
-            }),
-            grant
-        );
-    }
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        for name in ["first.txt", "sibling.txt"] {
+            let grant = AccessGrant {
+                path: parent.join(name),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read,
+            };
+            let counter = Arc::clone(&probes);
+            assert_eq!(
+                directory_scope_with(&grant, move |_, _| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    None
+                }),
+                grant
+            );
+        }
+    });
     assert_eq!(
         probes.load(Ordering::SeqCst),
         2,
         "unknown answers must be retried"
     );
-    let state = DIRECTORY_SCOPE_PROBES.lock().unwrap();
-    assert_eq!(
-        state
-            .logged
-            .keys()
-            .filter(|(path, _)| path == &parent)
-            .count(),
-        1,
-        "repeat unknown fallbacks log only once per directory and reason"
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines.iter().all(|line| line.starts_with("WARN ")),
+        "{lines:?}"
     );
 }
 
@@ -4270,10 +4267,21 @@ fn consent_scope_vanished_directory_is_info_once_even_after_memo_pruning() {
             ..grant.clone()
         };
         assert_eq!(directory_scope_with(&sibling, |_, _| Some(false)), sibling);
+        let other = AccessGrant {
+            path: dir.path().join("another-removed-scratch/first.txt"),
+            ..grant.clone()
+        };
+        assert_eq!(directory_scope_with(&other, |_, _| Some(false)), other);
     });
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].starts_with("INFO "), "{lines:?}");
-    assert!(lines[0].contains("directory does not exist"), "{lines:?}");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.starts_with("INFO ") && line.contains("directory does not exist")),
+        "{lines:?}"
+    );
+    assert!(lines[0].contains("removed-scratch:"), "{lines:?}");
+    assert!(lines[1].contains("another-removed-scratch:"), "{lines:?}");
     let (_, lines) = crate::logging::capture_log_lines(|| {
         log_directory_scope_fallback(&parent, "home identity unknown");
         log_directory_scope_fallback(&parent, "directory probe timed out");

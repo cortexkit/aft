@@ -99,16 +99,16 @@ fn no_binding_row_preserves_main_refusal_wording_and_structured_detail() {
 }
 
 #[test]
-fn unconfigured_binding_refusal_is_info_once_per_session_and_agent() {
+fn unconfigured_binding_refusal_is_info_once_per_agent() {
     let desired = BTreeMap::from([("org/other".into(), "other-agent".into())]);
     let reply = serde_json::json!({"repo_binding_generation":36,"bindings":[]});
     let before = unconfigured_binding_refusals_total();
     let (_, lines) = crate::logging::capture_log_lines(|| {
         for (session, agent) in [
-            ("unconfigured-session-a", "agent-a"),
-            ("unconfigured-session-a", "agent-a"),
-            ("unconfigured-session-b", "agent-a"),
-            ("unconfigured-session-a", "agent-b"),
+            ("unconfigured-session-a", "unconfigured-log-test-agent-a"),
+            ("unconfigured-session-a", "unconfigured-log-test-agent-a"),
+            ("unconfigured-session-b", "unconfigured-log-test-agent-a"),
+            ("unconfigured-session-a", "unconfigured-log-test-agent-b"),
         ] {
             let refusal = parse_bindings(&desired, &reply, agent, session).unwrap_err();
             assert_eq!(refusal.code, Code::AuthorityUnavailable);
@@ -119,7 +119,14 @@ fn unconfigured_binding_refusal_is_info_once_per_session_and_agent() {
             );
         }
     });
-    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        lines[0],
+        format!(
+            "INFO gh speech binding verification refused: {}",
+            serde_json::json!({"reason": "binding_unverifiable", "detail": "no_binding_row: launch_agent=\"unconfigured-log-test-agent-a\" repositories=[]"})
+        )
+    );
     assert!(
         lines.iter().all(|line| line.starts_with("INFO ")),
         "{lines:?}"
@@ -131,45 +138,55 @@ fn unconfigured_binding_refusal_is_info_once_per_session_and_agent() {
 
     let mut logged = HashSet::new();
     let (_, lines) = crate::logging::capture_log_lines(|| {
-        for (session, expected_keys) in [
-            ("session-a", 1),
-            ("session-a", 1),
-            ("session-b", 2),
-            ("session-b", 2),
-            ("session-c", 1),
-            ("session-a", 2),
+        for (agent, expected_keys) in [
+            ("agent-a", 1),
+            ("agent-a", 1),
+            ("agent-b", 2),
+            ("agent-b", 2),
+            ("agent-c", 1),
+            ("agent-a", 2),
         ] {
-            log_unconfigured_binding_refusal(&mut logged, session, "agent", "no_binding_row", 2);
+            log_no_binding_row_refusal(&mut logged, agent, agent, 2);
             assert_eq!(logged.len(), expected_keys);
         }
     });
-    assert_eq!(lines.len(), 4, "a cleared session may log again: {lines:?}");
+    assert_eq!(lines.len(), 4, "a cleared agent may log again: {lines:?}");
     assert!(
         lines.iter().all(|line| line.starts_with("INFO ")),
         "{lines:?}"
     );
-    assert!(lines[0].contains("session-a"), "{lines:?}");
-    assert!(lines[2].contains("session-c"), "{lines:?}");
-    assert!(lines[3].contains("session-a"), "{lines:?}");
+    assert!(lines[0].contains("agent-a"), "{lines:?}");
+    assert!(lines[2].contains("agent-c"), "{lines:?}");
+    assert!(lines[3].contains("agent-a"), "{lines:?}");
 }
 
 #[test]
-fn configured_binding_absence_and_other_refusals_still_warn_each_time() {
-    let desired = BTreeMap::from([("org/repo".into(), "agent".into())]);
+fn configured_binding_absence_is_info_and_other_refusals_still_warn_each_time() {
+    let desired = BTreeMap::from([("org/repo".into(), "configured-log-test-agent".into())]);
     let reply = serde_json::json!({"repo_binding_generation":36,"bindings":[]});
     let (_, lines) = crate::logging::capture_log_lines(|| {
         for _ in 0..2 {
-            parse_bindings(&desired, &reply, "agent", "configured-session").unwrap_err();
+            parse_bindings(
+                &desired,
+                &reply,
+                "configured-log-test-agent",
+                "configured-session",
+            )
+            .unwrap_err();
+            binding_unverifiable("binding_read_timeout");
         }
-        binding_unverifiable("binding_read_timeout");
     });
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(
-        lines.iter().all(|line| line.starts_with("WARN ")),
+        lines[0].starts_with("INFO ") && lines[0].contains("org/repo"),
         "{lines:?}"
     );
-    assert!(lines[0].contains("org/repo"), "{lines:?}");
-    assert!(lines[2].contains("binding_read_timeout"), "{lines:?}");
+    assert!(
+        lines[1..]
+            .iter()
+            .all(|line| line.starts_with("WARN ") && line.contains("binding_read_timeout")),
+        "{lines:?}"
+    );
 }
 
 #[test]

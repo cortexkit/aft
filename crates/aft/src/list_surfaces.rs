@@ -366,9 +366,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "gh_shim_speech/service.rs",
-        enclosing_item: "log_unconfigured_binding_refusal",
+        enclosing_item: "log_no_binding_row_refusal",
         location_or_primitive: "UNCONFIGURED_BINDING_LOG_CAP, cap, clear",
-        reason: "Internal INFO-log deduplication history is cleared at capacity; older sessions may log again, but refusals and agent-visible result lists are unchanged.",
+        reason: "Internal INFO-log deduplication history is cleared at capacity; older agents may log again, but refusals and agent-visible result lists are unchanged.",
     },
     ExclusionEntry {
         file: "subc/consent.rs",
