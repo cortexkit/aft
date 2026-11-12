@@ -387,7 +387,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
             for job in unit["jobs"].values()
             for step in job.get("steps", [])
         ]
-        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 15)
+        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 16)
         shard = workflow_gates.parse_workflow(str(github / "actions/integration-shard/action.yml"))
         self.assertEqual(
             sum(step.get("uses") == "./.github/actions/setup-nextest" for step in shard["runs"]["steps"]),
