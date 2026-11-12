@@ -127,31 +127,16 @@ function canonicalV1Schema(name: string, args: Record<string, unknown>): Record<
 }
 
 describe("OpenCode V2 tool surface", () => {
-  test("registers exactly seven read-only tools for Code Mode and keeps all others direct", async () => {
+  test("registers every selected AFT definition as one non-CodeMode provider tool", async () => {
     const definitions = sharedDefinitions();
     const registration = await captureRegistration();
-    const codeModeTools = [
-      "read",
-      "grep",
-      "glob",
-      "aft_search",
-      "aft_outline",
-      "aft_zoom",
-      "aft_callgraph",
-    ];
 
     expect(registration.added.map((definition) => definition.name)).toEqual(
       Object.keys(definitions).map(v2HostToolName),
     );
-    expect(
-      registration.added
-        .filter((definition) => definition.options.codemode)
-        .map((definition) => definition.name)
-        .sort(),
-    ).toEqual([...codeModeTools].sort());
     for (const definition of registration.added) {
       expect(definition.name).toMatch(TOOL_NAME);
-      expect(definition.options.codemode).toBe(codeModeTools.includes(definition.name));
+      expect(definition.options?.codemode).toBe(false);
       const schema = jsonSchema(definition);
       expect(schema.type).toBe("object");
       expect(schema).not.toHaveProperty("anyOf");

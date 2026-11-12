@@ -47,7 +47,7 @@ const acceptanceMatrix: AcceptanceRow[] = [
   },
   {
     sliceId: "S4",
-    claim: "Only the seven read-only AFT tools enter Code Mode; other tools stay direct",
+    claim: "All AFT tools advertise options.codemode: false and match V1 projected definitions",
     governingSource: "pack §4, §5, delta §3a, rulings R4, R17",
     testFile: "tool-surface/v2-tool-surface.test.ts",
     testPattern: "codemode: false",
