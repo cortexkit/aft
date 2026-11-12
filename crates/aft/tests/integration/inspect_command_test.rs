@@ -7650,7 +7650,10 @@ fn start_fake_rust_after_unopened_first_check(
         lsp.set_extra_env("AFT_FAKE_LSP_PULL", "1");
         lsp.set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
         lsp.set_extra_env("AFT_FAKE_LSP_PULL_FROM_CONTENT", "1");
-        lsp.set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+        // A check begins 300 ms after it is asked for. Begun at once, the
+        // reader can count its announcement before AFT records the save it
+        // answers, and AFT then sends that save again.
+        lsp.set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "300");
         lsp.set_extra_env("AFT_FAKE_LSP_CHECK_LOG", check_log.to_str().unwrap());
         lsp.set_extra_env(
             "AFT_FAKE_LSP_CHECK_COMPLETED_SIGNAL",
