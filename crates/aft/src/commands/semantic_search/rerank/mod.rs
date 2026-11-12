@@ -579,7 +579,10 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
     let file = super::request_files::read_through(files.as_deref(), &result.path, |path| {
         #[cfg(test)]
         crate::search_hot_path_measurements::record_file_read_path(path);
-        super::request_files::read_whole_file(path)
+        crate::large_read::counted(
+            crate::large_read::Site::CandidateText,
+            super::request_files::read_whole_file(path),
+        )
     })
     .ok()
     .map(|fetched| fetched.file);

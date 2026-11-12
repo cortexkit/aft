@@ -2067,11 +2067,58 @@ impl SearchIndexSnapshot {
                         return None;
                     }
                     let deadline = started.checked_add(limits.budget);
+                    // A large file with a line-local pattern is scanned in
+                    // steps instead; the set never keeps it, as it keeps no
+                    // file over its budget.
+                    let mut large = None;
                     let fetched = crate::commands::semantic_search::request_files::read_through(
                         request_files,
                         &file.path,
-                        |path| Ok((read_indexed_file_bytes(path, deadline)?, None)),
+                        |path| match open_grep_file(path, deadline, false, || {
+                            matcher.line_matcher().is_some()
+                        })? {
+                            GrepFileRead::Whole(bytes) => Ok((bytes, None)),
+                            GrepFileRead::Large(opened) => {
+                                large = Some(opened);
+                                Err(std::io::Error::other("read in steps"))
+                            }
+                        },
                     );
+                    if let Some(large) = large {
+                        files_examined.fetch_add(1, Ordering::Relaxed);
+                        let line_matcher = matcher
+                            .line_matcher()
+                            .expect("a large grep read is opened only for a line-local pattern");
+                        let (matches, matched_lines, end) = matching_lines_streamed(
+                            &file.path,
+                            large,
+                            &line_matcher,
+                            limits.max_lines_per_file,
+                            keep_past_limit,
+                            job_cancellation.as_ref(),
+                        );
+                        match end {
+                            Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
+                                stopped_early.store(true, Ordering::Relaxed);
+                                return None;
+                            }
+                            Ok(_) => {}
+                            // A read that fails part way counts as the read
+                            // failure a whole read would have been.
+                            Err(error) => {
+                                if error.kind() == std::io::ErrorKind::TimedOut {
+                                    stopped_early.store(true, Ordering::Relaxed);
+                                }
+                                return None;
+                            }
+                        }
+                        return (matched_lines > 0).then(|| GrepFileMatches {
+                            path: file.path.clone(),
+                            modified: file.modified,
+                            matches,
+                            matched_lines,
+                        });
+                    }
                     let fetched = match fetched {
                         Ok(fetched) => fetched,
                         Err(error) => {
@@ -2087,6 +2134,12 @@ impl SearchIndexSnapshot {
                     };
                     files_examined.fetch_add(1, Ordering::Relaxed);
                     let content = fetched.file.bytes();
+                    if fetched.fresh {
+                        crate::large_read::record_whole(
+                            crate::large_read::Site::GrepCollect,
+                            content.len(),
+                        );
+                    }
                     let release = || {
                         // Read only for this check, and it found nothing:
                         // later phases are not expected to want the file.
@@ -2367,16 +2420,70 @@ fn posting_matches_filter(posting: &Posting, filter: Option<PostingFilter>) -> b
     true
 }
 
-/// What happened to one match occurrence handed to a candidate-file scan.
-enum MatchVisit {
-    /// The scan must end: a stop flag, the result cap, cancellation or the
-    /// deadline.
-    Stop,
-    /// The occurrence is on a line that already produced a match.
-    SameLine,
-    /// The occurrence was the first on its line; skipping to the next line
-    /// avoids searching the rest of that line again.
-    Recorded { next_line_start: usize },
+use crate::large_read::{MatchVisit, ScanLines};
+
+impl SearchMatcher {
+    /// The matcher a streamed scan may run, when the pattern is line-local
+    /// (see [`crate::large_read::regex_is_line_local`]); `None` keeps the
+    /// whole read.
+    fn line_matcher(&self) -> Option<crate::large_read::LineMatcher<'_>> {
+        match self {
+            SearchMatcher::Literal(literal) => crate::large_read::literal_is_line_local(
+                &literal.needle,
+            )
+            .then_some(crate::large_read::LineMatcher::Literal {
+                needle: &literal.needle,
+                case_insensitive_ascii: literal.case_insensitive_ascii,
+            }),
+            SearchMatcher::Regex(regex) => crate::large_read::regex_is_line_local(regex)
+                .then_some(crate::large_read::LineMatcher::Regex(regex)),
+        }
+    }
+
+    /// Run `visit` over every occurrence in `content`, in offset order, the
+    /// way the whole-buffer scans always have: a literal resumes after a
+    /// recorded line, a regex lets the engine pick the next match.
+    fn scan_whole(
+        &self,
+        content: &[u8],
+        lines: &mut dyn ScanLines,
+        mut visit: impl FnMut(&mut dyn ScanLines, usize, usize) -> MatchVisit,
+    ) {
+        match self {
+            SearchMatcher::Literal(literal) => {
+                let needle = &literal.needle;
+                if !needle.contains(&b'\n') {
+                    let lowered;
+                    let haystack: &[u8] = if literal.case_insensitive_ascii {
+                        lowered = content.to_ascii_lowercase();
+                        &lowered
+                    } else {
+                        content
+                    };
+                    let finder = memchr::memmem::Finder::new(needle);
+                    let mut start = 0;
+                    while start <= haystack.len() {
+                        let Some(position) = finder.find(&haystack[start..]) else {
+                            break;
+                        };
+                        let offset = start + position;
+                        start = match visit(lines, offset, offset + needle.len()) {
+                            MatchVisit::Stop => break,
+                            MatchVisit::SameLine => offset + 1,
+                            MatchVisit::Recorded { next_line_start } => {
+                                next_line_start.max(offset + 1)
+                            }
+                        };
+                    }
+                }
+            }
+            SearchMatcher::Regex(regex) => {
+                pattern_compile::for_each_line_match(regex, content, |start, end| {
+                    !matches!(visit(lines, start, end), MatchVisit::Stop)
+                });
+            }
+        }
+    }
 }
 
 fn search_candidate_file(
@@ -2408,8 +2515,10 @@ fn search_candidate_file(
         return Vec::new();
     }
 
-    let content = match read_indexed_file_bytes(&file.path, deadline.read_at) {
-        Ok(content) => content,
+    let opened = match open_grep_file(&file.path, deadline.read_at, false, || {
+        matcher.line_matcher().is_some()
+    }) {
+        Ok(opened) => opened,
         Err(error) => {
             if error.kind() == std::io::ErrorKind::PermissionDenied {
                 floor_disclosure.record_matched_source_exclusion(&file.path);
@@ -2424,6 +2533,31 @@ fn search_candidate_file(
             return Vec::new();
         }
     };
+    let content = match opened {
+        GrepFileRead::Whole(content) => content,
+        GrepFileRead::Large(large) => {
+            let line_matcher = matcher
+                .line_matcher()
+                .expect("a large grep read is opened only for a line-local pattern");
+            return search_candidate_file_streamed(
+                file,
+                large,
+                &line_matcher,
+                max_results,
+                stop_after,
+                total_matches,
+                files_searched,
+                files_with_matches,
+                bytes_verified,
+                truncated,
+                engine_capped,
+                stop_scan,
+                job_cancellation,
+                deadline,
+            );
+        }
+    };
+    crate::large_read::record_whole(crate::large_read::Site::GrepIndexed, content.len());
     bytes_verified.fetch_add(content.len(), Ordering::Relaxed);
     // Defense in depth: even though indexing tries to filter binaries via
     // The index classifies bytes at ingestion; we double-check at
@@ -2436,99 +2570,193 @@ fn search_candidate_file(
     }
     files_searched.fetch_add(1, Ordering::Relaxed);
 
-    let shared_path = Arc::new(file.path.clone());
-    let mut matches = Vec::new();
-    let mut line_starts = None;
+    let mut state = CandidateScan::new(file);
+    let mut lines = crate::large_read::WholeLines::indexed(&content);
+    matcher.scan_whole(&content, &mut lines, |lines, offset, end| {
+        state.visit(
+            lines,
+            offset,
+            end,
+            max_results,
+            stop_after,
+            total_matches,
+            truncated,
+            engine_capped,
+            stop_scan,
+            job_cancellation,
+            deadline,
+        )
+    });
+    state.finish(files_with_matches)
+}
+
+/// One candidate file's scan state in [`search_candidate_file`], shared by
+/// the whole-buffer and the streamed scan so both run the same per-match
+/// logic.
+struct CandidateScan {
+    shared_path: Arc<PathBuf>,
+    matches: Vec<SharedGrepMatch>,
     // Grep reports one match per line: the first one. Occurrences arrive in
     // increasing offset order, so any occurrence before the start of the line
     // after the last reported one is on that same line. Checking that offset
     // first means a line with many occurrences (minified code, single-line
     // JSON, lockfiles) costs one line lookup and one line text in total, not
     // one per occurrence.
-    let mut reported_line_end = 0usize;
-    let mut matched_this_file = false;
+    reported_line_end: usize,
+    matched_this_file: bool,
+}
 
-    {
-        let mut visit = |offset: usize, end: usize| -> MatchVisit {
-            if grep_scan_should_stop(
-                stop_scan,
-                truncated,
-                total_matches,
-                stop_after,
-                job_cancellation,
-                deadline,
-            ) {
-                engine_capped.store(true, Ordering::Relaxed);
-                return MatchVisit::Stop;
-            }
-            if offset < reported_line_end {
-                return MatchVisit::SameLine;
-            }
-
-            let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(&content));
-            let (line, column, line_text, next_line_start) =
-                line_details_bytes(&content, line_starts, offset);
-            reported_line_end = next_line_start;
-
-            matched_this_file = true;
-            let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
-            if match_number > max_results {
-                truncated.store(true, Ordering::Relaxed);
-                signal_grep_scan_cap(stop_scan, total_matches, stop_after);
-                return MatchVisit::Stop;
-            }
-
-            matches.push(SharedGrepMatch {
-                file: shared_path.clone(),
-                line,
-                column,
-                line_text,
-                match_text: String::from_utf8_lossy(&content[offset..end]).into_owned(),
-            });
-            MatchVisit::Recorded { next_line_start }
-        };
-
-        match matcher {
-            SearchMatcher::Literal(literal) => {
-                let needle = &literal.needle;
-                if !needle.contains(&b'\n') {
-                    let lowered;
-                    let haystack: &[u8] = if literal.case_insensitive_ascii {
-                        lowered = content.to_ascii_lowercase();
-                        &lowered
-                    } else {
-                        &content
-                    };
-                    let finder = memchr::memmem::Finder::new(needle);
-                    let mut start = 0;
-                    while start <= haystack.len() {
-                        let Some(position) = finder.find(&haystack[start..]) else {
-                            break;
-                        };
-                        let offset = start + position;
-                        start = match visit(offset, offset + needle.len()) {
-                            MatchVisit::Stop => break,
-                            MatchVisit::SameLine => offset + 1,
-                            MatchVisit::Recorded { next_line_start } => {
-                                next_line_start.max(offset + 1)
-                            }
-                        };
-                    }
-                }
-            }
-            SearchMatcher::Regex(regex) => {
-                pattern_compile::for_each_line_match(regex, &content, |start, end| {
-                    !matches!(visit(start, end), MatchVisit::Stop)
-                });
-            }
+impl CandidateScan {
+    fn new(file: &FileEntry) -> Self {
+        Self {
+            shared_path: Arc::new(file.path.clone()),
+            matches: Vec::new(),
+            reported_line_end: 0,
+            matched_this_file: false,
         }
     }
 
-    if matched_this_file {
-        files_with_matches.fetch_add(1, Ordering::Relaxed);
+    #[allow(clippy::too_many_arguments)]
+    fn visit(
+        &mut self,
+        lines: &mut dyn ScanLines,
+        offset: usize,
+        end: usize,
+        max_results: usize,
+        stop_after: usize,
+        total_matches: &AtomicUsize,
+        truncated: &AtomicBool,
+        engine_capped: &AtomicBool,
+        stop_scan: Option<&Arc<AtomicBool>>,
+        job_cancellation: Option<&crate::executor::JobCancellation>,
+        deadline: &GrepScanDeadline,
+    ) -> MatchVisit {
+        if grep_scan_should_stop(
+            stop_scan,
+            truncated,
+            total_matches,
+            stop_after,
+            job_cancellation,
+            deadline,
+        ) {
+            engine_capped.store(true, Ordering::Relaxed);
+            return MatchVisit::Stop;
+        }
+        if offset < self.reported_line_end {
+            return MatchVisit::SameLine;
+        }
+
+        let (line, column, line_text, next_line_start) = lines.line_details(offset);
+        self.reported_line_end = next_line_start;
+
+        self.matched_this_file = true;
+        let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
+        if match_number > max_results {
+            truncated.store(true, Ordering::Relaxed);
+            signal_grep_scan_cap(stop_scan, total_matches, stop_after);
+            return MatchVisit::Stop;
+        }
+
+        self.matches.push(SharedGrepMatch {
+            file: self.shared_path.clone(),
+            line,
+            column,
+            line_text,
+            match_text: lines.match_text(offset, end),
+        });
+        MatchVisit::Recorded { next_line_start }
     }
 
-    matches
+    fn finish(self, files_with_matches: &AtomicUsize) -> Vec<SharedGrepMatch> {
+        if self.matched_this_file {
+            files_with_matches.fetch_add(1, Ordering::Relaxed);
+        }
+        self.matches
+    }
+}
+
+/// [`search_candidate_file`] for a large file and a line-local pattern: the
+/// same per-match logic over the file read in steps. Matches are recorded as
+/// they are found, as in the whole-buffer scan; the request's cancellation
+/// is checked once per step, and a read that fails part way keeps the rows
+/// recorded before it.
+#[allow(clippy::too_many_arguments)]
+fn search_candidate_file_streamed(
+    file: &FileEntry,
+    mut large: LargeGrepFile,
+    matcher: &crate::large_read::LineMatcher<'_>,
+    max_results: usize,
+    stop_after: usize,
+    total_matches: &AtomicUsize,
+    files_searched: &AtomicUsize,
+    files_with_matches: &AtomicUsize,
+    bytes_verified: &AtomicUsize,
+    truncated: &AtomicBool,
+    engine_capped: &AtomicBool,
+    stop_scan: Option<&Arc<AtomicBool>>,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
+    deadline: &GrepScanDeadline,
+) -> Vec<SharedGrepMatch> {
+    let size = large.reader.size_at_open();
+    bytes_verified.fetch_add(
+        usize::try_from(size).unwrap_or(usize::MAX),
+        Ordering::Relaxed,
+    );
+    files_searched.fetch_add(1, Ordering::Relaxed);
+
+    let mut state = CandidateScan::new(file);
+    let mut read = 0u64;
+    let scan = crate::large_read::scan_lines(
+        &mut large.reader,
+        size,
+        std::mem::take(&mut large.head),
+        matcher,
+        false,
+        |bytes| {
+            read += bytes.len() as u64;
+            cancelled(job_cancellation)
+        },
+        |lines, offset, end| {
+            state.visit(
+                lines,
+                offset,
+                end,
+                max_results,
+                stop_after,
+                total_matches,
+                truncated,
+                engine_capped,
+                stop_scan,
+                job_cancellation,
+                deadline,
+            )
+        },
+    );
+    crate::large_read::record(crate::large_read::Site::GrepIndexed, size, read);
+    match scan {
+        Ok(crate::large_read::ScanEnd::Finished | crate::large_read::ScanEnd::Stopped) => {}
+        Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
+            engine_capped.store(true, Ordering::Relaxed);
+        }
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                deadline.reached.store(true, Ordering::Relaxed);
+            }
+            engine_capped.store(true, Ordering::Relaxed);
+        }
+    }
+    state.finish(files_with_matches)
+}
+
+/// `Some(Cancelled)` once the request's cancellation was requested; a
+/// streamed scan checks it before each step, from the token its caller
+/// captured (rayon threads do not carry the request's own).
+pub(crate) fn cancelled(
+    job_cancellation: Option<&crate::executor::JobCancellation>,
+) -> Option<crate::large_read::Interrupted> {
+    job_cancellation
+        .is_some_and(|token| token.cancel_requested_before_commit())
+        .then_some(crate::large_read::Interrupted::Cancelled)
 }
 
 /// Every line of `content` the matcher matches, in file order: the first
@@ -2543,68 +2771,88 @@ fn matching_lines_in_content(
     max_lines: usize,
     keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
 ) -> (Vec<GrepMatch>, usize) {
-    let mut matches = Vec::new();
-    let mut matched_lines = 0usize;
-    let mut line_starts: Option<Vec<usize>> = None;
+    let mut state = LineCollect::default();
+    let mut lines = crate::large_read::WholeLines::indexed(content);
+    matcher.scan_whole(content, &mut lines, |lines, start, end| {
+        state.record(lines, path, start, end, max_lines, keep_past_limit)
+    });
+    (state.matches, state.matched_lines)
+}
+
+/// [`matching_lines_in_content`]'s state, shared by the whole-buffer and
+/// the streamed scan so both run the same per-match logic.
+#[derive(Default)]
+struct LineCollect {
+    matches: Vec<GrepMatch>,
+    matched_lines: usize,
     // Start of the line after the last recorded one. Offsets arrive in
     // increasing order, so an offset before it is on the line just recorded;
     // only that line's first match is kept, as grep does, and the repeat is
     // dropped before any line text is built for it.
-    let mut reported_line_end = 0usize;
-    let mut record = |start: usize, end: usize| -> Option<usize> {
-        if start < reported_line_end {
-            return None;
+    reported_line_end: usize,
+}
+
+impl LineCollect {
+    fn record(
+        &mut self,
+        lines: &mut dyn ScanLines,
+        path: &Path,
+        start: usize,
+        end: usize,
+        max_lines: usize,
+        keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
+    ) -> MatchVisit {
+        if start < self.reported_line_end {
+            return MatchVisit::SameLine;
         }
-        let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(content));
-        let (line, column, line_text, next_line_start) =
-            line_details_bytes(content, line_starts, start);
-        reported_line_end = next_line_start;
-        matched_lines += 1;
+        let (line, column, line_text, next_line_start) = lines.line_details(start);
+        self.reported_line_end = next_line_start;
+        self.matched_lines += 1;
         let grep_match = GrepMatch {
             file: path.to_path_buf(),
             line,
             column,
             line_text,
-            match_text: String::from_utf8_lossy(&content[start..end]).into_owned(),
+            match_text: lines.match_text(start, end),
         };
-        if matched_lines <= max_lines || keep_past_limit(&grep_match) {
-            matches.push(grep_match);
+        if self.matched_lines <= max_lines || keep_past_limit(&grep_match) {
+            self.matches.push(grep_match);
         }
-        Some(next_line_start)
-    };
-    match matcher {
-        SearchMatcher::Literal(literal) => {
-            let needle = &literal.needle;
-            if !needle.contains(&b'\n') {
-                let lowered;
-                let haystack: &[u8] = if literal.case_insensitive_ascii {
-                    lowered = content.to_ascii_lowercase();
-                    &lowered
-                } else {
-                    content
-                };
-                let finder = memchr::memmem::Finder::new(needle);
-                let mut start = 0;
-                while start <= haystack.len() {
-                    let Some(position) = finder.find(&haystack[start..]) else {
-                        break;
-                    };
-                    let offset = start + position;
-                    start = record(offset, offset + needle.len())
-                        .map_or(offset + 1, |next_line_start| {
-                            next_line_start.max(offset + 1)
-                        });
-                }
-            }
-        }
-        SearchMatcher::Regex(regex) => {
-            pattern_compile::for_each_line_match(regex, content, |start, end| {
-                record(start, end);
-                true
-            });
-        }
+        MatchVisit::Recorded { next_line_start }
     }
-    (matches, matched_lines)
+}
+
+/// [`matching_lines_in_content`] for a large file and a line-local pattern,
+/// read in steps. The request's cancellation is checked once per step.
+fn matching_lines_streamed(
+    path: &Path,
+    mut large: LargeGrepFile,
+    matcher: &crate::large_read::LineMatcher<'_>,
+    max_lines: usize,
+    keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
+    job_cancellation: Option<&crate::executor::JobCancellation>,
+) -> (
+    Vec<GrepMatch>,
+    usize,
+    std::io::Result<crate::large_read::ScanEnd>,
+) {
+    let size = large.reader.size_at_open();
+    let mut state = LineCollect::default();
+    let mut read = 0u64;
+    let end = crate::large_read::scan_lines(
+        &mut large.reader,
+        size,
+        std::mem::take(&mut large.head),
+        matcher,
+        false,
+        |bytes| {
+            read += bytes.len() as u64;
+            cancelled(job_cancellation)
+        },
+        |lines, start, end| state.record(lines, path, start, end, max_lines, keep_past_limit),
+    );
+    crate::large_read::record(crate::large_read::Site::GrepCollect, size, read);
+    (state.matches, state.matched_lines, end)
 }
 
 fn should_stop_search(
@@ -2803,6 +3051,7 @@ pub(crate) fn read_request_corpus_file(
                 crate::project_content::open(path)?
                     .take(max_file_size.saturating_add(1))
                     .read_to_end(&mut bytes)?;
+                crate::large_read::record_whole(crate::large_read::Site::ExactCorpus, bytes.len());
                 if bytes.len() as u64 > max_file_size {
                     return Err(std::io::Error::other(CutAtSizeBound));
                 }
@@ -2884,6 +3133,7 @@ fn read_search_corpus_file_with_metadata(
     if read.is_err() {
         return SearchCorpusEligibility::Skipped;
     }
+    crate::large_read::record_whole(crate::large_read::Site::ExactCorpus, bytes.len());
     if bytes.len() as u64 > max_file_size || is_binary_bytes(&bytes) {
         return SearchCorpusEligibility::Unindexed(metadata);
     }
@@ -3410,6 +3660,37 @@ pub(crate) fn read_grep_file_bytes(
     deadline: Option<Instant>,
     authorized_task_artifact: bool,
 ) -> std::io::Result<Vec<u8>> {
+    match open_grep_file(path, deadline, authorized_task_artifact, || false)? {
+        GrepFileRead::Whole(bytes) => Ok(bytes),
+        GrepFileRead::Large(_) => unreachable!("a large read was not asked for"),
+    }
+}
+
+/// A grep input the way its scan will read it.
+pub(crate) enum GrepFileRead {
+    /// The whole file, as [`read_grep_file_bytes`] returns it.
+    Whole(Vec<u8>),
+    /// A large text file to read in steps.
+    Large(LargeGrepFile),
+}
+
+/// A large grep input opened through the grep opener, its first bytes read.
+pub(crate) struct LargeGrepFile {
+    pub(crate) reader: crate::bounded_io::Reader,
+    /// The bytes the binary check read; the scan starts with them.
+    pub(crate) head: Vec<u8>,
+}
+
+/// [`read_grep_file_bytes`], except that a text file whose size at open is a
+/// large read, when `stream` says the scan can read it in steps, is returned
+/// open instead of read whole. Admission, the binary check and the deadline
+/// are the same either way.
+pub(crate) fn open_grep_file(
+    path: &Path,
+    deadline: Option<Instant>,
+    authorized_task_artifact: bool,
+    stream: impl FnOnce() -> bool,
+) -> std::io::Result<GrepFileRead> {
     let mut reader =
         crate::project_content::reader_bounded(path, deadline, authorized_task_artifact)?;
     let prefix = reader.chunk(Vec::new(), 1024)?;
@@ -3420,9 +3701,15 @@ pub(crate) fn read_grep_file_bytes(
         ));
     }
     if prefix.len() < 1024 {
-        return Ok(prefix);
+        return Ok(GrepFileRead::Whole(prefix));
     }
-    reader.rest(prefix)
+    if crate::large_read::is_large(reader.size_at_open()) && stream() {
+        return Ok(GrepFileRead::Large(LargeGrepFile {
+            reader,
+            head: prefix,
+        }));
+    }
+    reader.rest(prefix).map(GrepFileRead::Whole)
 }
 
 #[cfg(test)]
@@ -4593,7 +4880,7 @@ pub(crate) fn bounded_grep_line_text(line: &str) -> String {
 /// in the whole line (only a sequence cut by the prefix end, at most its last
 /// 3 bytes, can decode differently). A line longer than that prefix therefore
 /// always has more than `GREP_MAX_LINE_CHARS` characters and is cut.
-fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
+pub(crate) fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
     const PREFIX_BYTES: usize = (crate::commands::grep::GREP_MAX_LINE_CHARS + 2) * 4;
     let prefix = &line[..line.len().min(PREFIX_BYTES)];
     bounded_grep_line_text(&String::from_utf8_lossy(prefix))
@@ -6547,3 +6834,241 @@ mod interactive_artifact_read_budget_tests {
 /// way in a plain folder as in a git repository.
 #[cfg(test)]
 mod project_ignore_rule_tests {}
+
+/// The streamed scans of large files give exactly what the whole-buffer
+/// scans give, at step edges anywhere.
+#[cfg(test)]
+mod streamed_scan_tests {
+    use super::*;
+
+    const STEPS: [usize; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 13, 300];
+
+    fn matchers() -> Vec<SearchMatcher> {
+        let literal = |needle: &str, case_insensitive_ascii: bool| {
+            SearchMatcher::Literal(LiteralSearch {
+                needle: needle.as_bytes().to_vec(),
+                case_insensitive_ascii,
+            })
+        };
+        let mut matchers = vec![
+            literal("foo", false),
+            literal("foo", true),
+            literal("é", false),
+            literal("ab", false),
+        ];
+        for pattern in [
+            "fo+",
+            "x*",
+            "[a-z]+\\d",
+            "(?i)straße",
+            "é+",
+            "\\d{2,}",
+            "a|ab",
+            "z?",
+        ] {
+            let regex = Regex::new(pattern).unwrap();
+            assert!(crate::large_read::regex_is_line_local(&regex), "{pattern}");
+            matchers.push(SearchMatcher::Regex(regex));
+        }
+        matchers
+    }
+
+    fn files() -> Vec<Vec<u8>> {
+        let mut files = Vec::new();
+        for seed in 1..=6u64 {
+            files.push(crate::large_read::generated_lines(
+                seed,
+                1500,
+                seed % 2 == 0,
+                seed % 3 != 0,
+            ));
+        }
+        files
+    }
+
+    type Rows = Vec<(u32, u32, String, String)>;
+
+    /// One `search_candidate_file` run: its rows and every counter it moves.
+    fn candidate_scan(
+        path: &Path,
+        matcher: &SearchMatcher,
+        max_results: usize,
+    ) -> (Rows, [usize; 5], [bool; 2]) {
+        let entry = FileEntry {
+            path: path.to_path_buf(),
+            size: 0,
+            modified: UNIX_EPOCH,
+            content_hash: blake3::hash(b""),
+        };
+        let total = AtomicUsize::new(0);
+        let searched = AtomicUsize::new(0);
+        let with_matches = AtomicUsize::new(0);
+        let verified = AtomicUsize::new(0);
+        let missing = AtomicUsize::new(0);
+        let truncated = AtomicBool::new(false);
+        let capped = AtomicBool::new(false);
+        let deadline = GrepScanDeadline::after_with_clock(Duration::from_secs(600), Instant::now);
+        let rows = search_candidate_file(
+            &entry,
+            &Default::default(),
+            matcher,
+            max_results,
+            max_results.saturating_mul(2),
+            &total,
+            &searched,
+            &with_matches,
+            &verified,
+            &truncated,
+            &capped,
+            &missing,
+            None,
+            None,
+            &deadline,
+        );
+        (
+            rows.into_iter()
+                .map(|row| (row.line, row.column, row.line_text, row.match_text))
+                .collect(),
+            [
+                total.into_inner(),
+                searched.into_inner(),
+                with_matches.into_inner(),
+                verified.into_inner(),
+                missing.into_inner(),
+            ],
+            [truncated.into_inner(), capped.into_inner()],
+        )
+    }
+
+    #[test]
+    fn streamed_candidate_scan_matches_whole_read() {
+        let directory = tempfile::tempdir().unwrap();
+        for (index, bytes) in files().into_iter().enumerate() {
+            let path = directory.path().join(format!("file{index}.txt"));
+            std::fs::write(&path, &bytes).unwrap();
+            for matcher in matchers() {
+                for max_results in [1000, 2] {
+                    let whole = crate::large_read::with_test_steps(1, u64::MAX, || {
+                        candidate_scan(&path, &matcher, max_results)
+                    });
+                    for step in STEPS {
+                        let streamed = crate::large_read::with_test_steps(step, 0, || {
+                            candidate_scan(&path, &matcher, max_results)
+                        });
+                        assert_eq!(
+                            streamed, whole,
+                            "file {index}, {matcher:?}, step {step}, cap {max_results}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_line_collection_matches_whole_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let keep_past_limit = |found: &GrepMatch| found.line % 5 == 0;
+        for (index, bytes) in files().into_iter().enumerate() {
+            let path = directory.path().join(format!("file{index}.txt"));
+            std::fs::write(&path, &bytes).unwrap();
+            for matcher in matchers() {
+                for max_lines in [1000, 3] {
+                    let whole = matching_lines_in_content(
+                        &path,
+                        &bytes,
+                        &matcher,
+                        max_lines,
+                        &keep_past_limit,
+                    );
+                    let line_matcher = matcher.line_matcher().unwrap();
+                    for step in STEPS {
+                        let streamed = crate::large_read::with_test_steps(step, 0, || {
+                            let GrepFileRead::Large(large) =
+                                open_grep_file(&path, None, false, || true).unwrap()
+                            else {
+                                panic!("a large read");
+                            };
+                            matching_lines_streamed(
+                                &path,
+                                large,
+                                &line_matcher,
+                                max_lines,
+                                &keep_past_limit,
+                                None,
+                            )
+                        });
+                        assert_eq!(streamed.2.unwrap(), crate::large_read::ScanEnd::Finished);
+                        assert_eq!(
+                            (streamed.0, streamed.1),
+                            whole,
+                            "file {index}, {matcher:?}, step {step}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The step reader tolerates reads shorter than asked, and a step of a
+    /// full 1 MiB: the scan of a generated buffer through short reads finds
+    /// what the whole-buffer scan finds.
+    #[test]
+    fn streamed_scan_matches_whole_scan_through_short_reads() {
+        let keep_all = |_: &GrepMatch| true;
+        for bytes in files() {
+            for matcher in matchers() {
+                let path = Path::new("short.txt");
+                let whole = matching_lines_in_content(path, &bytes, &matcher, 1000, &keep_all);
+                let line_matcher = matcher.line_matcher().unwrap();
+                for (step, short) in [(crate::large_read::STEP_BYTES, 1), (5, 3), (64, 7)] {
+                    let streamed = crate::large_read::with_test_steps(step, 0, || {
+                        let mut source = crate::large_read::source(&bytes, short);
+                        let mut state = LineCollect::default();
+                        let end = crate::large_read::scan_lines(
+                            &mut source,
+                            bytes.len() as u64,
+                            Vec::new(),
+                            &line_matcher,
+                            false,
+                            |_| None,
+                            |lines, start, end| {
+                                state.record(lines, path, start, end, 1000, &keep_all)
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(end, crate::large_read::ScanEnd::Finished);
+                        (state.matches, state.matched_lines)
+                    });
+                    assert_eq!(
+                        streamed, whole,
+                        "{matcher:?}, step {step}, reads of {short}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A file at the threshold is read whole; one byte more is streamed.
+    #[test]
+    fn only_files_over_the_threshold_are_streamed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("edge.txt");
+        std::fs::write(&path, vec![b'a'; 2048]).unwrap();
+        let opened = |threshold| {
+            crate::large_read::with_test_steps(4, threshold, || {
+                matches!(
+                    open_grep_file(&path, None, false, || true).unwrap(),
+                    GrepFileRead::Large(_)
+                )
+            })
+        };
+        assert!(!opened(2048));
+        assert!(opened(2047));
+        // A pattern that is not line-local keeps the whole read.
+        assert!(!crate::large_read::with_test_steps(4, 0, || matches!(
+            open_grep_file(&path, None, false, || false).unwrap(),
+            GrepFileRead::Large(_)
+        )));
+    }
+}

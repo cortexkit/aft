@@ -1055,7 +1055,9 @@ pub(crate) mod work_counters {
 pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
     #[cfg(test)]
     work_counters::SOURCE_READS.with(|count| count.set(count.get() + 1));
-    crate::bounded_io::read_to_string(path)
+    let source = crate::bounded_io::read_to_string(path)?;
+    crate::large_read::record_whole(crate::large_read::Site::ParseSource, source.len());
+    Ok(source)
 }
 
 /// Keep the completed read's allocation; an Arc<str> conversion copies its bytes.

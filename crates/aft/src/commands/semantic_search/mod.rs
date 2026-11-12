@@ -2800,7 +2800,12 @@ fn lexical_candidate_exactness(
     let _cost = telemetry::CostPhase::start("lexical_exactness");
     let files = request_files::current();
     let Ok(fetched) = waits::timed(waits::SearchWait::FileRead, || {
-        request_files::read_through(files.as_deref(), file, read_whole_source_file)
+        request_files::read_through(files.as_deref(), file, |path| {
+            crate::large_read::counted(
+                crate::large_read::Site::LexicalExactness,
+                read_whole_source_file(path),
+            )
+        })
     }) else {
         return (false, 0, None);
     };
@@ -3583,8 +3588,18 @@ fn literal_presence(
             return Ok(entry.presence);
         }
     }
-    let entry =
-        settle_literal_presence(index, project_root, phrase, &normalized, exact_candidates)?;
+    let entry = match settle_literal_presence(
+        index,
+        project_root,
+        phrase,
+        &normalized,
+        exact_candidates,
+    )? {
+        Settled::Entry(entry) => entry,
+        // A cancelled request makes no claim, and its answer is not kept:
+        // a later request has to settle it again.
+        Settled::Cancelled => return Ok(memo::LiteralPresence::Undetermined),
+    };
     let presence = entry.presence;
     store.store_literal_presence(key, entry);
     Ok(presence)
@@ -3628,21 +3643,27 @@ struct PresenceReads {
 }
 
 impl PresenceReads {
-    /// `Some(true)` when `path` holds the literal, `Some(false)` when it does
-    /// not (or was already read), `None` when the check cannot tell: its
-    /// bounds ran out or the file could not be read.
-    fn holds(&mut self, path: &Path) -> Option<bool> {
+    /// `Ok(Some(true))` when `path` holds the literal, `Ok(Some(false))` when
+    /// it does not (or was already read), `Ok(None)` when the check cannot
+    /// tell: its bounds ran out or the file could not be read. `Err` when
+    /// the request was cancelled.
+    fn holds(&mut self, path: &Path) -> Result<Option<bool>, PresenceCancelled> {
         if !self.seen.insert(path.to_path_buf()) {
-            return Some(false);
+            return Ok(Some(false));
         }
         if self.read.len() >= self.max_reads || Instant::now() >= self.deadline {
-            return None;
+            return Ok(None);
         }
         #[cfg(test)]
         LITERAL_PRESENCE_READS.with(|count| count.set(count.get() + 1));
-        let (stamp, holds) = presence_check(path, &self.normalized)?;
-        self.read.push((path.to_path_buf(), stamp));
-        Some(holds)
+        match presence_check(path, &self.normalized, self.deadline) {
+            PresenceCheck::Read(stamp, holds) => {
+                self.read.push((path.to_path_buf(), stamp));
+                Ok(Some(holds))
+            }
+            PresenceCheck::Unknown => Ok(None),
+            PresenceCheck::Cancelled => Err(PresenceCancelled),
+        }
     }
 
     fn entry(
@@ -3664,15 +3685,42 @@ impl PresenceReads {
     }
 }
 
+/// The request was cancelled during a presence check.
+struct PresenceCancelled;
+
+/// What one file's presence check found.
+enum PresenceCheck {
+    /// The file's stamp from before its bytes were read, and whether its
+    /// text holds the literal.
+    Read(memo::FileStamp, bool),
+    /// The file cannot be read, is binary or not UTF-8, or its check ran out
+    /// of time.
+    Unknown,
+    /// The request was cancelled while the file was read.
+    Cancelled,
+}
+
+/// How a presence check settled.
+enum Settled {
+    Entry(memo::LiteralPresenceEntry),
+    /// The request was cancelled; nothing was settled, and nothing may be
+    /// kept in the memo.
+    Cancelled,
+}
+
 /// Whether `path`'s text holds `normalized`, with the file's stamp from
-/// before its bytes were read; `None` when the file cannot be read or is
+/// before its bytes were read; `Unknown` when the file cannot be read or is
 /// binary or not UTF-8 (as `read_searchable_text`).
 ///
 /// The request's set serves bytes an earlier phase read only when that
 /// phase stamped them first. Bytes kept without a stamp are read again: a
 /// stamp taken now could be newer than those bytes, and the memo would then
 /// keep an answer about older text as if it described the current file.
-fn presence_check(path: &Path, normalized: &str) -> Option<(memo::FileStamp, bool)> {
+///
+/// A large file is read in steps (see [`crate::large_read`]) and not kept
+/// for later phases; `deadline` and the request's cancellation are checked
+/// before each step.
+fn presence_check(path: &Path, normalized: &str, deadline: Instant) -> PresenceCheck {
     let files = request_files::current();
     let kept = files.as_ref().and_then(|files| files.kept(path));
     let file = match kept {
@@ -3681,32 +3729,124 @@ fn presence_check(path: &Path, normalized: &str) -> Option<(memo::FileStamp, boo
             #[cfg(test)]
             request_files::record_disk_read(path);
             let stamp = file_stamp(path);
-            let text = crate::search_index::read_searchable_text(path)?;
-            return Some((
+            if stamp.is_some_and(|(size, _)| crate::large_read::is_large(size)) {
+                return stream_presence_check(path, stamp, normalized, deadline);
+            }
+            let Some(text) = crate::search_index::read_searchable_text(path) else {
+                return PresenceCheck::Unknown;
+            };
+            crate::large_read::record_whole(crate::large_read::Site::Presence, text.len());
+            return PresenceCheck::Read(
                 stamp,
                 exact_lane::normalize_exact_phrase(&text).contains(normalized),
-            ));
+            );
         }
         None => {
-            request_files::read_through(files.as_deref(), path, |path| {
+            // A large file is read in steps instead, outside the set: the
+            // set keeps no streamed file, as it keeps no file over its budget.
+            let mut large = None;
+            let fetched = request_files::read_through(files.as_deref(), path, |path| {
                 let stat = fs::metadata(path)
                     .ok()
                     .map(|metadata| request_files::FileStat::of(&metadata));
+                if let Some(stat) = stat.filter(|stat| crate::large_read::is_large(stat.size)) {
+                    large = Some(stat);
+                    return Err(std::io::Error::other("read in steps"));
+                }
                 Ok((crate::bounded_io::read(path, None)?, stat))
-            })
-            .ok()?
-            .file
+            });
+            if let Some(stat) = large {
+                return stream_presence_check(
+                    path,
+                    Some((stat.size, stat.modified)),
+                    normalized,
+                    deadline,
+                );
+            }
+            let Ok(fetched) = fetched else {
+                return PresenceCheck::Unknown;
+            };
+            if fetched.fresh {
+                crate::large_read::record_whole(
+                    crate::large_read::Site::Presence,
+                    fetched.file.bytes().len(),
+                );
+            }
+            fetched.file
         }
     };
     let stamp = file.stat().map(|stat| (stat.size, stat.modified));
     if crate::search_index::is_binary_bytes(file.bytes()) {
-        return None;
+        return PresenceCheck::Unknown;
     }
-    let text = file.utf8()?;
-    Some((
+    let Some(text) = file.utf8() else {
+        return PresenceCheck::Unknown;
+    };
+    PresenceCheck::Read(
         stamp,
         exact_lane::normalize_exact_phrase(text).contains(normalized),
-    ))
+    )
+}
+
+/// [`presence_check`] for a large file: opened as `bounded_io::read` opens
+/// it, then read in steps up to its size at open. The phase deadline is not
+/// handed to the reader, whose own deadline would mark the request's I/O
+/// budget as failed; it is checked here before each step instead.
+fn stream_presence_check(
+    path: &Path,
+    stamp: memo::FileStamp,
+    normalized: &str,
+    deadline: Instant,
+) -> PresenceCheck {
+    let Ok(mut reader) = crate::bounded_io::reader(path, None) else {
+        return PresenceCheck::Unknown;
+    };
+    let size = reader.size_at_open();
+    let token = crate::executor::current_job_cancellation();
+    let (read, bytes) =
+        crate::large_read::stream_presence(&mut reader, size, normalized.as_bytes(), || {
+            #[cfg(test)]
+            if PRESENCE_CANCELLED_FOR_TEST.with(std::cell::Cell::get) {
+                return Some(crate::large_read::Interrupted::Cancelled);
+            }
+            if token
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
+            {
+                return Some(crate::large_read::Interrupted::Cancelled);
+            }
+            (presence_test_now() >= deadline).then_some(crate::large_read::Interrupted::Deadline)
+        });
+    crate::large_read::record(crate::large_read::Site::Presence, size, bytes);
+    match read {
+        crate::large_read::PresenceRead::Holds(holds) => PresenceCheck::Read(stamp, holds),
+        crate::large_read::PresenceRead::Unreadable
+        | crate::large_read::PresenceRead::Interrupted(crate::large_read::Interrupted::Deadline) => {
+            PresenceCheck::Unknown
+        }
+        crate::large_read::PresenceRead::Interrupted(crate::large_read::Interrupted::Cancelled) => {
+            PresenceCheck::Cancelled
+        }
+    }
+}
+
+/// The presence check's clock, which tests can move forward.
+fn presence_test_now() -> Instant {
+    #[cfg(test)]
+    if let Some(advance) = PRESENCE_CLOCK_ADVANCE.with(std::cell::Cell::get) {
+        return Instant::now() + advance;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Moves the streamed presence check's clock forward on this thread.
+    static PRESENCE_CLOCK_ADVANCE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+    /// Makes the streamed presence check see its request as cancelled.
+    static PRESENCE_CANCELLED_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Settle whether some file holds the literal, reading as little as
@@ -3721,7 +3861,7 @@ fn settle_literal_presence(
     phrase: &str,
     normalized: &str,
     exact_candidates: &[CandidateResult],
-) -> std::io::Result<memo::LiteralPresenceEntry> {
+) -> std::io::Result<Settled> {
     use memo::LiteralPresence::{Absent, Present, Undetermined};
     let mut reads = PresenceReads {
         normalized: normalized.to_string(),
@@ -3732,24 +3872,26 @@ fn settle_literal_presence(
     };
     for candidate in exact_candidates {
         match reads.holds(&candidate.path) {
-            Some(true) => return Ok(reads.entry(Present, Vec::new())),
-            Some(false) => {}
-            None => return Ok(reads.entry(Undetermined, Vec::new())),
+            Ok(Some(true)) => return Ok(Settled::Entry(reads.entry(Present, Vec::new()))),
+            Ok(Some(false)) => {}
+            Ok(None) => return Ok(Settled::Entry(reads.entry(Undetermined, Vec::new()))),
+            Err(PresenceCancelled) => return Ok(Settled::Cancelled),
         }
     }
     #[cfg(test)]
     LITERAL_PRESENCE_CORPUS_SCANS.with(|count| count.set(count.get() + 1));
     let Some(candidates) = index.files_possibly_holding_phrase(phrase, project_root)? else {
-        return Ok(reads.entry(Undetermined, Vec::new()));
+        return Ok(Settled::Entry(reads.entry(Undetermined, Vec::new())));
     };
     for path in &candidates {
         match reads.holds(path) {
-            Some(true) => return Ok(reads.entry(Present, Vec::new())),
-            Some(false) => {}
-            None => return Ok(reads.entry(Undetermined, Vec::new())),
+            Ok(Some(true)) => return Ok(Settled::Entry(reads.entry(Present, Vec::new()))),
+            Ok(Some(false)) => {}
+            Ok(None) => return Ok(Settled::Entry(reads.entry(Undetermined, Vec::new()))),
+            Err(PresenceCancelled) => return Ok(Settled::Cancelled),
         }
     }
-    Ok(reads.entry(Absent, candidates))
+    Ok(Settled::Entry(reads.entry(Absent, candidates)))
 }
 
 /// What a request carrying both `query` and `pattern` adds to an engine run.
@@ -3853,7 +3995,12 @@ fn matching_line_from_source(
     let Some(files) = request_files::current() else {
         let read_cost = telemetry::CostPhase::start("matching_read");
         let source = waits::timed(waits::SearchWait::FileRead, || {
-            request_files::read_through(None, file, read_whole_source_file)
+            request_files::read_through(None, file, |path| {
+                crate::large_read::counted(
+                    crate::large_read::Site::MatchingLine,
+                    read_whole_source_file(path),
+                )
+            })
         })
         .ok()?;
         drop(read_cost);
@@ -3868,7 +4015,12 @@ fn matching_line_from_source(
         || {
             let read_cost = telemetry::CostPhase::start("matching_read");
             let fetched = waits::timed(waits::SearchWait::FileRead, || {
-                files.read(file, read_whole_source_file)
+                files.read(file, |path| {
+                    crate::large_read::counted(
+                        crate::large_read::Site::MatchingLine,
+                        read_whole_source_file(path),
+                    )
+                })
             })?;
             drop(read_cost);
             Ok(fetched
@@ -4298,7 +4450,12 @@ fn definition_line_from_source(
 fn request_source_file(path: &Path) -> std::io::Result<Arc<request_files::RequestFile>> {
     let files = request_files::current();
     waits::timed(waits::SearchWait::FileRead, || {
-        request_files::read_through(files.as_deref(), path, read_whole_source_file)
+        request_files::read_through(files.as_deref(), path, |path| {
+            crate::large_read::counted(
+                crate::large_read::Site::SourceFile,
+                read_whole_source_file(path),
+            )
+        })
     })
     .map(|fetched| fetched.file)
 }
@@ -7352,8 +7509,13 @@ fn execute_degraded_grep_fallback(
                 read_budget_reached.store(true, Ordering::Relaxed);
                 return None;
             }
-            crate::search_index::read_searchable_text(file)
-                .map(|content| (index, file.clone(), content))
+            crate::search_index::read_searchable_text(file).map(|content| {
+                crate::large_read::record_whole(
+                    crate::large_read::Site::DegradedGrep,
+                    content.len(),
+                );
+                (index, file.clone(), content)
+            })
         })
         .collect::<Vec<_>>();
     drop(rayon_wait);
@@ -8920,7 +9082,30 @@ fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<
     crate::search_hot_path_measurements::record_file_read_path(path);
     #[cfg(test)]
     request_files::record_disk_read(path);
-    bounded_snippet_lines_from(&mut std::io::BufReader::new(file), plan)
+    let size = file.metadata().map_or(0, |metadata| metadata.len());
+    let mut reader = std::io::BufReader::new(CountedRead { file, read: 0 });
+    let lines = bounded_snippet_lines_from(&mut reader, plan);
+    crate::large_read::record(
+        crate::large_read::Site::SnippetLines,
+        size,
+        reader.get_ref().read,
+    );
+    lines
+}
+
+/// A file read that counts the bytes it returned, for the large-read
+/// counters.
+struct CountedRead {
+    file: fs::File,
+    read: u64,
+}
+
+impl std::io::Read for CountedRead {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = std::io::Read::read(&mut self.file, buffer)?;
+        self.read += count as u64;
+        Ok(count)
+    }
 }
 
 fn bounded_snippet_lines_from(
@@ -10579,6 +10764,79 @@ mod tests {
         assert_eq!(corpus_scans, 1, "{text}");
         assert!(!text.contains("No file contains"), "{text}");
         assert!(!text.contains("[similar]"), "{text}");
+    }
+
+    /// A presence check that reads its files in steps gives the same answer
+    /// as the whole read: here, the absence claim.
+    #[test]
+    fn streamed_presence_check_gives_the_whole_read_answer() {
+        let files = [
+            ONLY_NAMES_IT,
+            ("tests/near_a_test.rs", NEAR_HOLDER_TEST_FILE),
+        ];
+        for step in [1, 3, 8, 64] {
+            let (_project, ctx) = presence_project(&files);
+            let text = crate::large_read::with_test_steps(step, 0, || {
+                presence_search(&ctx, "bash_wait_detach(", 10, 0)
+            });
+            assert!(
+                text.starts_with(BASH_WAIT_DETACH_ABSENT),
+                "step {step}: {text}"
+            );
+        }
+    }
+
+    /// A streamed check that runs out of time inside a file makes
+    /// no claim, and that answer is kept for the query like any deadline
+    /// answer: the next page reads nothing and still makes no claim.
+    #[test]
+    fn presence_deadline_inside_a_file_is_kept_as_undetermined() {
+        // The exact candidate is kept by the exact pass with its stamp and
+        // checked from those bytes; the near holder is read from disk.
+        let (_project, ctx) = presence_project(&[
+            ONLY_NAMES_IT,
+            ("tests/near_a_test.rs", NEAR_HOLDER_TEST_FILE),
+        ]);
+        let first = crate::large_read::with_test_steps(8, 0, || {
+            PRESENCE_CLOCK_ADVANCE.with(|clock| clock.set(Some(Duration::from_secs(60))));
+            let text = presence_search(&ctx, "bash_wait_detach(", 1, 0);
+            PRESENCE_CLOCK_ADVANCE.with(|clock| clock.set(None));
+            text
+        });
+        assert!(!first.contains("No file contains"), "{first}");
+        let (reads, _) = take_literal_presence_counts();
+        assert!(reads > 0, "{first}");
+        let second = crate::large_read::with_test_steps(8, 0, || {
+            presence_search(&ctx, "bash_wait_detach(", 1, 1)
+        });
+        assert!(!second.contains("No file contains"), "{second}");
+        assert_eq!(take_literal_presence_counts(), (0, 0), "{second}");
+    }
+
+    /// A check cancelled part way through a file makes no claim and is not
+    /// kept: the next request settles it again and gets the claim.
+    #[test]
+    fn cancelled_presence_check_is_not_kept() {
+        // The exact candidate is kept by the exact pass with its stamp and
+        // checked from those bytes; the near holder is read from disk.
+        let (_project, ctx) = presence_project(&[
+            ONLY_NAMES_IT,
+            ("tests/near_a_test.rs", NEAR_HOLDER_TEST_FILE),
+        ]);
+        let first = crate::large_read::with_test_steps(8, 0, || {
+            PRESENCE_CANCELLED_FOR_TEST.with(|cancelled| cancelled.set(true));
+            let text = presence_search(&ctx, "bash_wait_detach(", 1, 0);
+            PRESENCE_CANCELLED_FOR_TEST.with(|cancelled| cancelled.set(false));
+            text
+        });
+        assert!(!first.contains("No file contains"), "{first}");
+        take_literal_presence_counts();
+        let second = crate::large_read::with_test_steps(8, 0, || {
+            presence_search(&ctx, "bash_wait_detach(", 1, 1)
+        });
+        assert!(second.starts_with(BASH_WAIT_DETACH_ABSENT), "{second}");
+        let (reads, _) = take_literal_presence_counts();
+        assert!(reads > 0, "{second}");
     }
 
     /// Mark the semantic lane ready with an empty resident index, so a test

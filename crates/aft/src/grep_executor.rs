@@ -12,6 +12,7 @@ use crate::commands::multi_path::{
     canonical_key, dedupe_nested_paths, resolve_path_or_multi, SearchPathResolution,
 };
 use crate::context::AppContext;
+use crate::large_read::{MatchVisit, ScanLines};
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
@@ -2426,9 +2427,11 @@ fn fallback_search_file(
         return Vec::new();
     }
 
-    let bytes =
-        match crate::search_index::read_grep_file_bytes(file, deadline, authorized_task_artifact) {
-            Ok(bytes) => bytes,
+    let opened =
+        match crate::search_index::open_grep_file(file, deadline, authorized_task_artifact, || {
+            fallback_line_matcher(pattern).is_some()
+        }) {
+            Ok(opened) => opened,
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::TimedOut {
                     engine_capped.store(true, Ordering::Relaxed);
@@ -2436,185 +2439,407 @@ fn fallback_search_file(
                 return Vec::new();
             }
         };
+    let bytes = match opened {
+        crate::search_index::GrepFileRead::Whole(bytes) => bytes,
+        crate::search_index::GrepFileRead::Large(large) => {
+            return fallback_search_file_streamed(
+                file,
+                pattern,
+                large,
+                max_results,
+                stop_after,
+                total_matches,
+                files_searched,
+                files_with_matches,
+                truncated,
+                engine_capped,
+                job_cancellation,
+                deadline,
+            );
+        }
+    };
+    crate::large_read::record_whole(crate::large_read::Site::GrepFallback, bytes.len());
     if crate::search_index::is_binary_bytes(&bytes) {
         return Vec::new();
     }
     let content = bytes;
     files_searched.fetch_add(1, Ordering::Relaxed);
 
-    let mut line_starts = None;
-    let mut valid_utf8 = None;
-    // Start of the line after the last reported one; see `search_literal_in_text`.
-    let mut reported_line_end = 0usize;
-    let mut matched_this_file = false;
-    let mut matches = Vec::new();
-
-    match pattern {
-        CompiledPattern::Literal(literal) => search_literal_in_text(
+    let mut state = FallbackScan::default();
+    let mut lines = crate::large_read::WholeLines::fallback(&content);
+    let mut visit = |lines: &mut dyn ScanLines, start: usize, end: usize| {
+        state.visit(
+            lines,
             file,
-            &content,
-            &mut line_starts,
-            &mut valid_utf8,
-            literal,
+            start,
+            end,
             max_results,
             stop_after,
             total_matches,
-            &mut reported_line_end,
             truncated,
             engine_capped,
-            &mut matched_this_file,
-            &mut matches,
             job_cancellation,
             deadline,
-        ),
+        )
+    };
+    match pattern {
+        CompiledPattern::Literal(literal) => {
+            if !literal.needle.contains(&b'\n') {
+                let search_content;
+                let haystack = if literal.case_insensitive_ascii {
+                    search_content = content.to_ascii_lowercase();
+                    search_content.as_slice()
+                } else {
+                    content.as_slice()
+                };
+                let finder = memchr::memmem::Finder::new(&literal.needle);
+                let mut start = 0usize;
+                while start <= haystack.len() {
+                    let Some(position) = finder.find(&haystack[start..]) else {
+                        break;
+                    };
+                    let offset = start + position;
+                    start = match visit(&mut lines, offset, offset + literal.needle.len()) {
+                        MatchVisit::Stop => break,
+                        MatchVisit::SameLine => offset + 1,
+                        MatchVisit::Recorded { next_line_start } => next_line_start.max(offset + 1),
+                    };
+                }
+            }
+        }
         CompiledPattern::Regex { compiled, .. } => {
             crate::pattern_compile::for_each_line_match(
                 compiled,
                 &content,
                 |match_start, match_end| {
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline)
-                        || should_stop_fallback_search(
-                            truncated,
-                            total_matches,
-                            stop_after,
-                            job_cancellation,
-                        )
-                    {
-                        engine_capped.store(true, Ordering::Relaxed);
-                        return false;
-                    }
-
-                    // Regex matches are not skipped ahead within a line: the
-                    // engine still decides where the next non-overlapping match
-                    // starts, while only the first match on each line is reported.
-                    if match_start < reported_line_end {
-                        return true;
-                    }
-                    let (line, column, line_text, next_line_start) = fallback_line_details_bytes(
-                        &content,
-                        line_starts.get_or_insert_with(|| {
-                            crate::search_index::line_starts_bytes(&content)
-                        }),
-                        match_start,
-                        &mut valid_utf8,
-                    );
-                    reported_line_end = next_line_start;
-
-                    matched_this_file = true;
-                    let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
-                    if match_number > max_results {
-                        truncated.store(true, Ordering::Relaxed);
-                        return false;
-                    }
-
-                    matches.push(GrepMatch {
-                        file: file.clone(),
-                        line,
-                        column,
-                        line_text,
-                        match_text: String::from_utf8_lossy(&content[match_start..match_end])
-                            .into_owned(),
-                    });
-                    true
+                    !matches!(visit(&mut lines, match_start, match_end), MatchVisit::Stop)
                 },
             );
         }
     }
-
-    if matched_this_file {
-        files_with_matches.fetch_add(1, Ordering::Relaxed);
-    }
-
-    matches
+    state.finish(files_with_matches)
 }
 
-fn fallback_line_details_bytes<'a>(
-    content: &'a [u8],
-    starts: &[usize],
-    offset: usize,
-    valid_utf8: &mut Option<Option<&'a str>>,
-) -> (u32, u32, String, usize) {
-    // Byte regexes can start inside a Unicode character. Preserve character
-    // columns for valid UTF-8, validating only once after the first match.
-    let text = valid_utf8.get_or_insert_with(|| std::str::from_utf8(content).ok());
-    let column_offset = text.map_or(offset, |text| text.floor_char_boundary(offset));
-    crate::search_index::line_details_bytes_with_cr_policy(content, starts, column_offset, true)
+/// The matcher a streamed folder-walk scan may run, when the pattern is
+/// line-local; `None` keeps the whole read.
+fn fallback_line_matcher(pattern: &CompiledPattern) -> Option<crate::large_read::LineMatcher<'_>> {
+    match pattern {
+        CompiledPattern::Literal(literal) => crate::large_read::literal_is_line_local(
+            &literal.needle,
+        )
+        .then_some(crate::large_read::LineMatcher::Literal {
+            needle: &literal.needle,
+            case_insensitive_ascii: literal.case_insensitive_ascii,
+        }),
+        CompiledPattern::Regex { compiled, .. } => crate::large_read::regex_is_line_local(compiled)
+            .then_some(crate::large_read::LineMatcher::Regex(compiled)),
+    }
 }
 
-fn search_literal_in_text<'a>(
-    file: &Path,
-    content: &'a [u8],
-    line_starts: &mut Option<Vec<usize>>,
-    valid_utf8: &mut Option<Option<&'a str>>,
-    literal: &LiteralSearch,
-    max_results: usize,
-    stop_after: usize,
-    total_matches: &AtomicUsize,
-    reported_line_end: &mut usize,
-    truncated: &AtomicBool,
-    engine_capped: &AtomicBool,
-    matched_this_file: &mut bool,
-    matches: &mut Vec<GrepMatch>,
-    job_cancellation: Option<&crate::executor::JobCancellation>,
-    deadline: Option<Instant>,
-) {
-    if literal.needle.contains(&b'\n') {
-        return;
-    }
+/// One file's scan state in [`fallback_search_file`], shared by the
+/// whole-buffer scan and the replay of a streamed scan.
+#[derive(Default)]
+struct FallbackScan {
+    // Start of the line after the last reported one. Grep reports one match
+    // per line; once a line is recorded, a literal resumes at the next line
+    // start, while a regex engine still decides where its next
+    // non-overlapping match starts.
+    reported_line_end: usize,
+    matched_this_file: bool,
+    matches: Vec<GrepMatch>,
+}
 
-    let content_bytes = content;
-    let search_content;
-    let haystack = if literal.case_insensitive_ascii {
-        search_content = content_bytes.to_ascii_lowercase();
-        search_content.as_slice()
-    } else {
-        content_bytes
-    };
-    let finder = memchr::memmem::Finder::new(&literal.needle);
-    let mut start = 0usize;
-    while start <= haystack.len() {
-        let Some(position) = finder.find(&haystack[start..]) else {
-            break;
-        };
+impl FallbackScan {
+    #[allow(clippy::too_many_arguments)]
+    fn visit(
+        &mut self,
+        lines: &mut dyn ScanLines,
+        file: &Path,
+        match_start: usize,
+        match_end: usize,
+        max_results: usize,
+        stop_after: usize,
+        total_matches: &AtomicUsize,
+        truncated: &AtomicBool,
+        engine_capped: &AtomicBool,
+        job_cancellation: Option<&crate::executor::JobCancellation>,
+        deadline: Option<Instant>,
+    ) -> MatchVisit {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline)
             || should_stop_fallback_search(truncated, total_matches, stop_after, job_cancellation)
         {
             engine_capped.store(true, Ordering::Relaxed);
-            break;
+            return MatchVisit::Stop;
         }
-
-        let offset = start + position;
-        // Grep reports one match per line. Once a line is recorded, resume at
-        // the next line start instead of scanning its remaining occurrences.
-        if offset < *reported_line_end {
-            start = offset + 1;
-            continue;
+        if match_start < self.reported_line_end {
+            return MatchVisit::SameLine;
         }
-        let (line, column, line_text, next_line_start) = fallback_line_details_bytes(
-            content,
-            line_starts.get_or_insert_with(|| crate::search_index::line_starts_bytes(content)),
-            offset,
-            valid_utf8,
-        );
-        *reported_line_end = next_line_start;
-        start = next_line_start.max(offset + 1);
+        let (line, column, line_text, next_line_start) = lines.line_details(match_start);
+        self.reported_line_end = next_line_start;
 
-        *matched_this_file = true;
+        self.matched_this_file = true;
         let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
         if match_number > max_results {
             truncated.store(true, Ordering::Relaxed);
-            break;
+            return MatchVisit::Stop;
         }
 
-        let end = offset + literal.needle.len();
-        matches.push(GrepMatch {
+        self.matches.push(GrepMatch {
             file: file.to_path_buf(),
             line,
             column,
             line_text,
-            match_text: String::from_utf8_lossy(&content_bytes[offset..end]).into_owned(),
+            match_text: lines.match_text(match_start, match_end),
         });
+        MatchVisit::Recorded { next_line_start }
     }
+
+    fn finish(self, files_with_matches: &AtomicUsize) -> Vec<GrepMatch> {
+        if self.matched_this_file {
+            files_with_matches.fetch_add(1, Ordering::Relaxed);
+        }
+        self.matches
+    }
+}
+
+/// One line-first occurrence a streamed folder-walk scan found, with what
+/// [`FallbackScan::visit`] needs from it once the whole file's UTF-8
+/// validity, which decides its column, is known.
+struct HeldMatch {
+    /// Occurrences on the line before this one that the scan skipped as
+    /// same-line repeats; each still meets the stop checks on replay.
+    same_line_before: usize,
+    start: usize,
+    line: u32,
+    /// The column counted from the matched byte, used when the file is not
+    /// valid UTF-8.
+    column: u32,
+    /// The column counted from the start of the character holding the
+    /// matched byte, used when the file is valid UTF-8.
+    char_column: u32,
+    line_text: String,
+    match_text: String,
+    next_line_start: usize,
+}
+
+/// [`ScanLines`] for replaying held occurrences: it answers with the held
+/// occurrence's line and text.
+struct HeldLines<'a> {
+    held: Option<&'a HeldMatch>,
+    valid_utf8: bool,
+}
+
+impl ScanLines for HeldLines<'_> {
+    fn line_details(&mut self, _offset: usize) -> (u32, u32, String, usize) {
+        let held = self
+            .held
+            .expect("a same-line repeat never asks for its line");
+        let column = if self.valid_utf8 {
+            held.char_column
+        } else {
+            held.column
+        };
+        (
+            held.line,
+            column,
+            held.line_text.clone(),
+            held.next_line_start,
+        )
+    }
+
+    fn match_text(&self, _start: usize, _end: usize) -> String {
+        self.held
+            .expect("a same-line repeat never asks for its text")
+            .match_text
+            .clone()
+    }
+}
+
+/// [`fallback_search_file`] for a large file and a line-local pattern, read
+/// in steps. A match's column depends on whether the whole file is valid
+/// UTF-8, so the occurrences are held until the end of the file and then
+/// replayed, in order, through the same per-match logic the whole-buffer scan
+/// runs. At most `max_results + 1` line-first occurrences are held: the
+/// per-match logic always stops by then. A deadline, cancellation or read
+/// failure before the end of the file leaves the file without rows, as a
+/// whole read that failed does.
+#[allow(clippy::too_many_arguments)]
+fn fallback_search_file_streamed(
+    file: &Path,
+    pattern: &CompiledPattern,
+    mut large: crate::search_index::LargeGrepFile,
+    max_results: usize,
+    stop_after: usize,
+    total_matches: &AtomicUsize,
+    files_searched: &AtomicUsize,
+    files_with_matches: &AtomicUsize,
+    truncated: &AtomicBool,
+    engine_capped: &AtomicBool,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
+    deadline: Option<Instant>,
+) -> Vec<GrepMatch> {
+    let Some(matcher) = fallback_line_matcher(pattern) else {
+        return Vec::new();
+    };
+    let size = large.reader.size_at_open();
+    let mut read = 0u64;
+    let mut utf8 = crate::large_read::Utf8Check::default();
+    let mut valid_utf8 = true;
+    let mut held: Vec<HeldMatch> = Vec::new();
+    let mut same_line = 0usize;
+    let mut reported_line_end = 0usize;
+    let scan = crate::large_read::scan_lines(
+        &mut large.reader,
+        size,
+        std::mem::take(&mut large.head),
+        &matcher,
+        true,
+        |bytes| {
+            read += bytes.len() as u64;
+            if valid_utf8 {
+                valid_utf8 = utf8.feed(bytes, |_| {});
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Some(crate::large_read::Interrupted::Deadline);
+            }
+            crate::search_index::cancelled(job_cancellation)
+        },
+        |lines, start, end| {
+            if held.len() > max_results {
+                return MatchVisit::Stop;
+            }
+            if start < reported_line_end {
+                same_line += 1;
+                return MatchVisit::SameLine;
+            }
+            let (line, column, line_text, next_line_start) = lines.line_details(start);
+            let char_column = lines.floor_column(start);
+            reported_line_end = next_line_start;
+            held.push(HeldMatch {
+                same_line_before: std::mem::take(&mut same_line),
+                start,
+                line,
+                column,
+                char_column,
+                line_text,
+                match_text: lines.match_text(start, end),
+                next_line_start,
+            });
+            MatchVisit::Recorded { next_line_start }
+        },
+    );
+    crate::large_read::record(crate::large_read::Site::GrepFallback, size, read);
+    match scan {
+        Ok(crate::large_read::ScanEnd::Finished) => {}
+        // The scan stops once it holds more occurrences than the replay can
+        // use. The rest of the file still decides every column, so it is
+        // read for its UTF-8 validity alone.
+        Ok(crate::large_read::ScanEnd::Stopped) => {
+            let rest = validate_rest(
+                &mut large.reader,
+                size.saturating_sub(read),
+                &mut utf8,
+                &mut valid_utf8,
+                deadline,
+                job_cancellation,
+            );
+            match rest {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    engine_capped.store(true, Ordering::Relaxed);
+                    return Vec::new();
+                }
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::TimedOut {
+                        engine_capped.store(true, Ordering::Relaxed);
+                    }
+                    return Vec::new();
+                }
+            }
+        }
+        Ok(crate::large_read::ScanEnd::Interrupted(_)) => {
+            engine_capped.store(true, Ordering::Relaxed);
+            return Vec::new();
+        }
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                engine_capped.store(true, Ordering::Relaxed);
+            }
+            return Vec::new();
+        }
+    }
+    let valid_utf8 = valid_utf8 && utf8.finish();
+    // Counted where a whole read counts it: after the read, before the scan.
+    files_searched.fetch_add(1, Ordering::Relaxed);
+
+    let mut state = FallbackScan::default();
+    let mut previous_start = 0usize;
+    let mut visit = |held: Option<&HeldMatch>, start: usize| {
+        let mut lines = HeldLines { held, valid_utf8 };
+        state.visit(
+            &mut lines,
+            file,
+            start,
+            start,
+            max_results,
+            stop_after,
+            total_matches,
+            truncated,
+            engine_capped,
+            job_cancellation,
+            deadline,
+        )
+    };
+    'replay: for occurrence in &held {
+        // A same-line repeat lies on the line recorded last, so its offset is
+        // below that line's end, as the recorded occurrence's own offset is.
+        for _ in 0..occurrence.same_line_before {
+            if matches!(visit(None, previous_start), MatchVisit::Stop) {
+                break 'replay;
+            }
+        }
+        if matches!(visit(Some(occurrence), occurrence.start), MatchVisit::Stop) {
+            break;
+        }
+        previous_start = occurrence.start;
+    }
+    if held.len() <= max_results {
+        for _ in 0..same_line {
+            if matches!(visit(None, previous_start), MatchVisit::Stop) {
+                break;
+            }
+        }
+    }
+    state.finish(files_with_matches)
+}
+
+/// Read the rest of a streamed file, `remaining` bytes up to its size at
+/// open, only to finish its UTF-8 check; stops as soon as the bytes are
+/// known invalid. `Some` when the deadline or cancellation stopped it.
+fn validate_rest(
+    reader: &mut crate::bounded_io::Reader,
+    remaining: u64,
+    utf8: &mut crate::large_read::Utf8Check,
+    valid_utf8: &mut bool,
+    deadline: Option<Instant>,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
+) -> std::io::Result<Option<crate::large_read::Interrupted>> {
+    let mut steps = crate::large_read::Steps::new(reader, remaining);
+    let mut step = Vec::new();
+    while *valid_utf8 {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(Some(crate::large_read::Interrupted::Deadline));
+        }
+        if let Some(interrupted) = crate::search_index::cancelled(job_cancellation) {
+            return Ok(Some(interrupted));
+        }
+        step.clear();
+        if steps.append(&mut step)? == 0 {
+            break;
+        }
+        *valid_utf8 = utf8.feed(&step, |_| {});
+    }
+    Ok(None)
 }
 
 fn should_stop_fallback_search(
@@ -4280,5 +4505,121 @@ mod tests {
         eprintln!(
             "median: per-root={per_root_median}ns shared={shared_query_median}ns speedup={speedup:.2}x"
         );
+    }
+}
+
+/// The folder-walk grep's streamed scan of large files gives exactly what its
+/// whole-buffer scan gives, including character columns that depend on the
+/// whole file's UTF-8 validity.
+#[cfg(test)]
+mod streamed_fallback_tests {
+    use super::*;
+
+    const STEPS: [usize; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 13, 300];
+
+    fn patterns() -> Vec<CompiledPattern> {
+        let mut patterns = Vec::new();
+        for (pattern, literal, case_insensitive) in [
+            ("foo", true, false),
+            ("FOO", true, true),
+            ("é", true, false),
+            ("fo+", false, false),
+            ("x*", false, false),
+            ("[a-z]+\\d", false, false),
+            ("straße", false, true),
+            ("é+", false, false),
+            ("a|ab", false, false),
+            ("z?", false, false),
+        ] {
+            let compiled = crate::pattern_compile::compile(
+                pattern,
+                crate::pattern_compile::CompileOpts {
+                    literal,
+                    case_insensitive,
+                    ..crate::pattern_compile::CompileOpts::default()
+                },
+            );
+            let crate::pattern_compile::CompileResult::Ok(compiled) = compiled else {
+                panic!("{pattern} compiles");
+            };
+            assert!(fallback_line_matcher(&compiled).is_some(), "{pattern}");
+            patterns.push(compiled);
+        }
+        patterns
+    }
+
+    fn scan(
+        path: &Path,
+        pattern: &CompiledPattern,
+        max_results: usize,
+    ) -> (Vec<GrepMatch>, [usize; 3], [bool; 2]) {
+        let total = AtomicUsize::new(0);
+        let searched = AtomicUsize::new(0);
+        let with_matches = AtomicUsize::new(0);
+        let truncated = AtomicBool::new(false);
+        let capped = AtomicBool::new(false);
+        let rows = fallback_search_file(
+            &path.to_path_buf(),
+            pattern,
+            max_results,
+            max_results.saturating_mul(2),
+            &total,
+            &searched,
+            &with_matches,
+            &truncated,
+            &capped,
+            None,
+            Some(Instant::now() + Duration::from_secs(600)),
+            false,
+        );
+        (
+            rows,
+            [
+                total.into_inner(),
+                searched.into_inner(),
+                with_matches.into_inner(),
+            ],
+            [truncated.into_inner(), capped.into_inner()],
+        )
+    }
+
+    #[test]
+    fn streamed_fallback_scan_matches_whole_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for seed in 1..=6u64 {
+            files.push(crate::large_read::generated_lines(
+                seed,
+                1500,
+                seed % 2 == 0,
+                seed % 3 != 0,
+            ));
+        }
+        // An invalid byte after every match changes every column; one before
+        // them does too.
+        let valid = crate::large_read::generated_lines(7, 1500, false, true);
+        files.push([valid.as_slice(), &[0xFF]].concat());
+        files.push([&[0xFF], valid.as_slice()].concat());
+        files.push(valid);
+        for (index, bytes) in files.into_iter().enumerate() {
+            let path = directory.path().join(format!("file{index}.txt"));
+            std::fs::write(&path, &bytes).unwrap();
+            for pattern in patterns() {
+                for max_results in [1000, 2] {
+                    let whole = crate::large_read::with_test_steps(1, u64::MAX, || {
+                        scan(&path, &pattern, max_results)
+                    });
+                    for step in STEPS {
+                        let streamed = crate::large_read::with_test_steps(step, 0, || {
+                            scan(&path, &pattern, max_results)
+                        });
+                        assert_eq!(
+                            streamed, whole,
+                            "file {index}, {pattern:?}, step {step}, cap {max_results}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

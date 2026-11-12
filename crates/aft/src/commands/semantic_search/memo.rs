@@ -92,7 +92,12 @@ fn read_digest(
     #[cfg(test)]
     crate::search_hot_path_measurements::record_memo_file_read(path);
     super::waits::timed(super::waits::SearchWait::FileRead, || {
-        super::request_files::read_through(request_files, path, |path| Ok((fs::read(path)?, None)))
+        super::request_files::read_through(request_files, path, |path| {
+            crate::large_read::counted(
+                crate::large_read::Site::MemoDigest,
+                fs::read(path).map(|bytes| (bytes, None)),
+            )
+        })
     })
     .map(|fetched| compute_content_digest(fetched.file.bytes()))
     .map_err(|_| path.to_path_buf())
@@ -788,6 +793,7 @@ impl ExactMemoStore {
         file.read_to_end(&mut bytes)
             .map_err(|_| path.to_path_buf())?;
         drop(read_wait);
+        crate::large_read::record_whole(crate::large_read::Site::MemoDigest, bytes.len());
         #[cfg(test)]
         super::request_files::record_disk_read(path);
         let digest = compute_content_digest(&bytes);

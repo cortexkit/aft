@@ -4393,6 +4393,9 @@ fn assemble_health_report(
         "filesystem_helpers".to_string(),
         crate::bounded_io::helper_health(),
     );
+    // Reads of files over 4 MiB by search and grep, by site: count, bytes and
+    // the largest read. Only sites that had one are listed.
+    metrics.insert("large_reads".to_string(), crate::large_read::health());
     // Routes the fleet status dial stopped reopening after a terminal refusal,
     // each naming its target, session and refusal code. An empty list means
     // no route is stopped.
@@ -9355,6 +9358,14 @@ mod tests {
             "embedding_backend": { "available": true, "last_error": null, "since_ms": null },
             "write_ledger_top_10m": ledger,
             "roots": roots,
+            // Every large-read site at its widest, so the entry's worst
+            // size is part of the budget this test checks.
+            "large_reads": crate::large_read::site_names()
+                .map(|name| (
+                    name.to_string(),
+                    json!({ "count": u64::MAX, "bytes": u64::MAX, "largest": u64::MAX }),
+                ))
+                .collect::<serde_json::Map<_, _>>(),
         })
         .as_object()
         .expect("metrics object")
@@ -9369,6 +9380,10 @@ mod tests {
             encoded.len()
         );
         assert_eq!(metrics["actor_count"], 71);
+        assert_eq!(
+            metrics["large_reads"].as_object().map(serde_json::Map::len),
+            Some(crate::large_read::site_names().count())
+        );
         assert_eq!(metrics["root_count"], 71);
         assert!(metrics["embedding_backend"].is_object());
         assert_eq!(
