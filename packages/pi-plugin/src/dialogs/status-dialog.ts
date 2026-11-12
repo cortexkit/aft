@@ -254,8 +254,8 @@ function renderInner(
 
   right2.push(theme.fg("muted", "Current session"));
   right2.push(kv("tracked files", String(s.session.tracked_files), theme));
-  right2.push(kv("checkpoints", String(s.session.checkpoints), theme));
-  right2.push(kv("all-session", String(s.checkpoints_total), theme));
+  right2.push(kv("checkpoints", s.session.checkpoints?.toString() ?? "—", theme));
+  right2.push(kv("all-session", s.checkpoints_total?.toString() ?? "—", theme));
 
   for (const line of renderColumns(left2, right2, colWidth)) lines.push(line);
   lines.push("");

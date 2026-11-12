@@ -47,6 +47,37 @@ const baseResponse = Object.freeze({
 });
 
 describe("coerceAftStatus", () => {
+  test("preserves known checkpoint counts and keeps null or missing counts unknown", () => {
+    for (const [input, expected] of [
+      [7, 7],
+      [0, 0],
+      [null, null],
+      [undefined, null],
+    ] as const) {
+      const status = coerceAftStatus({
+        ...baseResponse,
+        checkpoints_total: input,
+        session: { checkpoints: input },
+      });
+      expect(status.checkpoints_total).toBe(expected);
+      expect(status.session.checkpoints).toBe(expected);
+    }
+    const missing = coerceAftStatus(baseResponse);
+    expect(missing.checkpoints_total).toBeNull();
+    expect(missing.session.checkpoints).toBeNull();
+  });
+
+  test("renders unknown checkpoint counts in the text dialog", () => {
+    const status = coerceAftStatus({
+      ...baseResponse,
+      checkpoints_total: null,
+      session: { checkpoints: null },
+    });
+    const dialog = formatStatusDialogMessage(status);
+    expect(dialog).toContain("- checkpoints: —");
+    expect(dialog).toContain("- project checkpoints (all sessions): —");
+  });
+
   test("off inspect categories survive status parsing and never show stale counts", () => {
     const status = coerceAftStatus({
       ...baseResponse,

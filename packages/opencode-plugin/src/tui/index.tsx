@@ -155,7 +155,7 @@ function statusAcceptGate(directory: string): (result: unknown) => boolean {
   };
 }
 
-const StatusDialog = (props: StatusDialogProps) => {
+export const StatusDialog = (props: StatusDialogProps) => {
   const theme = createMemo(() => (props.api as any).theme.current as TuiThemeCurrent);
   const t = () => theme();
 
@@ -426,11 +426,15 @@ const StatusDialog = (props: StatusDialogProps) => {
               </text>
             </box>
             <R theme={t()} label="Tracked files" value={String(status()!.session.tracked_files)} />
-            <R theme={t()} label="Checkpoints" value={String(status()!.session.checkpoints)} />
+            <R
+              theme={t()}
+              label="Checkpoints"
+              value={status()!.session.checkpoints?.toString() ?? "—"}
+            />
             <R
               theme={t()}
               label="All-session checkpoints"
-              value={String(status()!.checkpoints_total)}
+              value={status()!.checkpoints_total?.toString() ?? "—"}
               tone="muted"
             />
           </box>

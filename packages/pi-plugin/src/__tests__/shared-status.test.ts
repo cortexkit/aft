@@ -21,6 +21,22 @@ import {
 } from "../shared/status.js";
 
 describe("shared status helpers", () => {
+  test("preserves known checkpoint counts and keeps null or missing counts unknown", () => {
+    for (const [input, expected] of [
+      [7, 7],
+      [0, 0],
+      [null, null],
+      [undefined, null],
+    ] as const) {
+      const status = coerceAftStatus({ checkpoints_total: input, session: { checkpoints: input } });
+      expect(status.checkpoints_total).toBe(expected);
+      expect(status.session.checkpoints).toBe(expected);
+    }
+    const missing = coerceAftStatus({});
+    expect(missing.checkpoints_total).toBeNull();
+    expect(missing.session.checkpoints).toBeNull();
+  });
+
   test("off inspect categories survive status parsing and never show stale counts", () => {
     const status = coerceAftStatus({
       status_bar: null,
