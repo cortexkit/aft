@@ -10864,7 +10864,7 @@ mod transient_retry_tests {
         for durability in [FailureDurability::Permanent, FailureDurability::Transient] {
             let (mut manager, _) = manager_with_clock();
             let key = ServerKey {
-                kind: ServerKind::TypeScript,
+                kind: ServerKind::TypeScript(None),
                 ..key()
             };
             let def = crate::lsp::registry::builtin_servers()
@@ -10894,7 +10894,7 @@ mod transient_retry_tests {
             (ServerKind::Rust, LspError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))),
             (ServerKind::Rust, LspError::NotFound("rust-analyzer".into())),
             (ServerKind::Rust, LspError::ServerNotReady("server crashed during initialize: mise ERROR error parsing config file mise.toml".into())),
-            (ServerKind::TypeScript, LspError::ServerNotReady("TypeScript SDK unavailable: no tsserver.js".into())),
+            (ServerKind::TypeScript(None), LspError::ServerNotReady("TypeScript SDK unavailable: no tsserver.js".into())),
         ];
         let (mut manager, _) = manager_with_clock();
         for (kind, error) in cases {
