@@ -40,8 +40,8 @@
   "dependencies": {
     "@clack/prompts": "^1.6.0",
     "@cortexkit/aft-bridge": "0.64.0",
-    "@opentui/core": "0.4.3",
-    "@opentui/solid": "0.4.3",
+    "@opentui/core": "0.4.5",
+    "@opentui/solid": "0.4.5",
     "comment-json": "^4.6.2",
     "effect": "4.0.1",
     "solid-js": "1.9.12",
