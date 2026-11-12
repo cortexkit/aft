@@ -536,6 +536,13 @@ function buildSchema(): Record<string, unknown> {
       lsp: {
         type: "object",
         properties: {
+          max_servers: {
+            type: "integer",
+            minimum: 0,
+            default: 8,
+            description:
+              "Maximum live language servers process-wide, including starts in progress. Evicts the least recently used client with no pending requests before refusing a start. Project config may only lower the user value. Zero prevents new starts.",
+          },
           idle_minutes: {
             anyOf: [
               { type: "integer", minimum: 5, maximum: 1440 },

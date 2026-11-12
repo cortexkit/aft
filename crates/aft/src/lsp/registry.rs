@@ -7,7 +7,7 @@ use crate::lsp::roots::{
     find_rust_workspace_root_with_mode, find_workspace_root_with_mode,
     outermost_marker_root_with_mode, RootPathMode,
 };
-use crate::lsp::typescript_project::{native_typescript_for, NATIVE_SERVER_ARGS};
+use crate::lsp::typescript_project::{typescript_for_server, NATIVE_SERVER_ARGS};
 
 /// Resolve an LSP binary name to a full path.
 ///
@@ -196,19 +196,19 @@ fn probe_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
 ///
 /// IDs match OpenCode's `lsp/server.ts` registry where possible so users can
 /// refer to the same names in `lsp.disabled` config across both projects.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ServerKind {
     // --- Built-in (existing, pre-v0.17.0) ---
-    TypeScript,
+    /// The resolved tsserver version, or canonical SDK path if unreadable.
+    /// `None` is the static definition or server-managed SDK resolution.
+    TypeScript(Option<Arc<str>>),
     /// TypeScript 7 and later's own language server (`tsc --lsp --stdio`),
-    /// carrying the project's `node_modules/typescript` directory. It never
+    /// carrying the SDK version (or canonical binary path). It never
     /// appears in the static registry: [`servers_for_file`] swaps it in for
     /// the `typescript` server when the file's installed TypeScript is the
-    /// native compiler. The directory is part of the kind, and so of the
-    /// server key, so packages with different TypeScript installations under
-    /// one root get separate servers and a TypeScript 5 server never serves a
-    /// TypeScript 7 package's files (or the reverse).
-    TypeScriptNative(Arc<Path>),
+    /// native compiler. Identity belongs in the kind, not just the server key,
+    /// because child-process accounting also uses (kind, root).
+    TypeScriptNative(Arc<str>),
     Python, // pyright
     Rust,
     Go,
@@ -253,7 +253,7 @@ pub enum ServerKind {
 impl ServerKind {
     pub fn id_str(&self) -> &str {
         match self {
-            Self::TypeScript => "typescript",
+            Self::TypeScript(_) => "typescript",
             Self::TypeScriptNative(_) => "typescript-native",
             Self::Python => "python",
             Self::Rust => "rust",
@@ -328,7 +328,7 @@ pub struct ServerDef {
 
 impl ServerDef {
     pub(crate) fn has_configured_typescript_binary(&self, config: &Config) -> bool {
-        self.kind == ServerKind::TypeScript
+        matches!(self.kind, ServerKind::TypeScript(_))
             && config
                 .lsp_servers
                 .iter()
@@ -438,11 +438,10 @@ impl ServerDef {
             // it opens. Packages share a server as long as they see the same
             // TypeScript version, so a monorepo whose packages each install
             // the same TypeScript runs one server instead of one per package.
-            ServerKind::TypeScript => {
+            ServerKind::TypeScript(_) | ServerKind::TypeScriptNative(_) => {
                 Some(super::typescript_project::shared_typescript_server_root(
                     &nearest,
                     project_root,
-                    |dir| self.has_root_marker(dir),
                     mode,
                 ))
             }
@@ -513,7 +512,7 @@ pub fn builtin_servers() -> Vec<ServerDef> {
     BUILTIN_SERVER_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     vec![
         builtin_server(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             "TypeScript Language Server",
             &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
             "typescript-language-server",
@@ -1479,14 +1478,14 @@ const TYPESCRIPT_LANGUAGE_SERVER: &str = "typescript-language-server";
 /// the manager resolves it again at spawn and reports a named gap, without
 /// spawning anything, when it does not.
 fn select_typescript_server(
-    server: ServerDef,
+    mut server: ServerDef,
     path: &Path,
     config: &Config,
     mode: RootPathMode,
 ) -> ServerDef {
     // An explicit binary remains user-managed even when its name is the same
     // as the built-in default.
-    if server.kind != ServerKind::TypeScript
+    if !matches!(server.kind, ServerKind::TypeScript(_))
         || server.binary != TYPESCRIPT_LANGUAGE_SERVER
         || server.has_configured_typescript_binary(config)
     {
@@ -1500,17 +1499,21 @@ fn select_typescript_server(
         server.priority_root_markers.hash(&mut hasher);
         hasher.finish()
     };
-    let Some(native) = native_typescript_for(path, project_root, markers, mode, || {
+    let Some(native) = typescript_for_server(path, project_root, markers, mode, || {
         server.workspace_root_with_mode(path, project_root, mode)
     }) else {
         return server;
     };
+    if !native.project.is_native_compiler() {
+        server.kind = ServerKind::TypeScript(Some(native.identity));
+        return server;
+    }
     let binary = native
         .binary
         .map(|binary| binary.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tsc".into());
     ServerDef {
-        kind: ServerKind::TypeScriptNative(Arc::from(native.project.package_dir.as_path())),
+        kind: ServerKind::TypeScriptNative(native.identity),
         name: "TypeScript native language server".into(),
         extensions: server.extensions,
         binary,
@@ -1898,14 +1901,13 @@ mod tests {
         servers_for_file(file, config).into_iter().find(|server| {
             matches!(
                 server.kind,
-                ServerKind::TypeScript | ServerKind::TypeScriptNative(_)
+                ServerKind::TypeScript(_) | ServerKind::TypeScriptNative(_)
             )
         })
     }
 
     /// Packages that each install the same TypeScript share one server at the
-    /// highest root that still sees that version; a package with a different
-    /// version keeps its own server root.
+    /// repository root; a different version keeps its own server key there.
     #[test]
     fn typescript_packages_with_the_same_version_share_one_server_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -1935,14 +1937,21 @@ mod tests {
         let server_root = |package: &str| {
             let file = root.join("packages").join(package).join("src/index.ts");
             let server = typescript_server(&file, &config).unwrap();
-            assert_eq!(server.kind, ServerKind::TypeScript);
+            assert_eq!(
+                server.kind,
+                ServerKind::TypeScript(Some(Arc::from(if package == "old" {
+                    "5.4.5"
+                } else {
+                    "5.9.3"
+                })))
+            );
             server
                 .workspace_root_for_file_with_project_root(&file, Some(&root))
                 .unwrap()
         };
         assert_eq!(server_root("cli"), root);
         assert_eq!(server_root("plugin"), root);
-        assert_eq!(server_root("old"), root.join("packages/old"));
+        assert_eq!(server_root("old"), root);
     }
 
     #[test]
@@ -1981,11 +1990,42 @@ mod tests {
             };
             let file = nested.join("index.ts");
             let server = typescript_server(&file, &config).unwrap();
-            assert_eq!(server.kind, ServerKind::TypeScript);
+            let root_server = typescript_server(&root.join("index.ts"), &config).unwrap();
+            assert_eq!(server.kind == root_server.kind, share);
             assert_eq!(
                 server.workspace_root_for_file_with_project_root(&file, Some(&root)),
-                Some(if share { root } else { nested })
+                Some(root)
             );
+        }
+    }
+
+    #[test]
+    fn typescript_23_copied_sdks_share_a_key_without_repository_markers() {
+        for version in ["5.9.3", "7.0.2"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::inspect::job::canonicalize_normalized(temp.path());
+            let config = Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            };
+            let mut keys = std::collections::HashSet::new();
+            for index in 0..23 {
+                let package = root.join(format!("packages/p{index:02}"));
+                write_file(&package.join("package.json"), "{}");
+                install_typescript(&package, version);
+                let file = package.join("src/index.ts");
+                write_file(&file, "");
+                let server = typescript_server(&file, &config).unwrap();
+                let server_root = server
+                    .workspace_root_for_file_with_project_root(&file, Some(&root))
+                    .unwrap();
+                assert_eq!(server_root, root);
+                keys.insert(super::super::roots::ServerKey {
+                    kind: server.kind,
+                    root: server_root,
+                });
+            }
+            assert_eq!(keys.len(), 1, "{version}: {keys:?}");
         }
     }
 
@@ -2014,6 +2054,12 @@ mod tests {
         };
         let file = nested.join("index.ts");
         let server = typescript_server(&file, &config).unwrap();
+        assert_eq!(
+            server.kind,
+            typescript_server(&root.join("index.ts"), &config)
+                .unwrap()
+                .kind
+        );
         assert_eq!(
             server.workspace_root_for_file_with_project_root(&file, Some(&root)),
             Some(root)
@@ -2389,14 +2435,14 @@ mod tests {
     }
 
     /// One root can hold packages with different TypeScript installations.
-    /// The native kind carries its TypeScript directory, so the two files get
+    /// The native kind carries its SDK identity, so the two files get
     /// different server keys even though their workspace root is the same.
     #[test]
     fn typescript_7_files_get_the_native_server_keyed_by_their_typescript() {
         let temp = tempfile::tempdir().unwrap();
         let root = crate::inspect::job::canonicalize_normalized(temp.path());
         write_file(&root.join("tsconfig.json"), "{}");
-        let native_dir = install_typescript(&root.join("next"), "7.0.2");
+        install_typescript(&root.join("next"), "7.0.2");
         install_typescript(&root.join("legacy"), "5.9.3");
         let native_file = root.join("next").join("index.ts");
         let legacy_file = root.join("legacy").join("index.ts");
@@ -2410,13 +2456,16 @@ mod tests {
         let native = typescript_server(&native_file, &config).unwrap();
         assert_eq!(
             native.kind,
-            ServerKind::TypeScriptNative(Arc::from(native_dir.as_path()))
+            ServerKind::TypeScriptNative(Arc::from("7.0.2"))
         );
         assert_eq!(native.kind.id_str(), "typescript-native");
         assert_eq!(native.args, vec!["--lsp", "--stdio"]);
         assert_eq!(native.initialization_options, None);
         let legacy = typescript_server(&legacy_file, &config).unwrap();
-        assert_eq!(legacy.kind, ServerKind::TypeScript);
+        assert_eq!(
+            legacy.kind,
+            ServerKind::TypeScript(Some(Arc::from("5.9.3")))
+        );
         assert_eq!(legacy.binary, "typescript-language-server");
 
         // Same workspace root, different keys.
@@ -2476,7 +2525,7 @@ mod tests {
         };
         assert_eq!(
             typescript_server(&file, &config).unwrap().kind,
-            ServerKind::TypeScript
+            ServerKind::TypeScript(Some(Arc::from("5.9.3")))
         );
         install_typescript(&root, "7.0.2");
         let changed = package_dir.join("package.json");
@@ -2484,7 +2533,7 @@ mod tests {
         crate::lsp::typescript_project::invalidate_typescript_selection([changed.as_path()]);
         assert_eq!(
             typescript_server(&file, &config).unwrap().kind,
-            ServerKind::TypeScriptNative(Arc::from(package_dir.as_path()))
+            ServerKind::TypeScriptNative(Arc::from("7.0.2"))
         );
         // Editing a source file cannot change which TypeScript is installed,
         // so it does not empty the memo.
@@ -2542,7 +2591,7 @@ mod tests {
             ..Config::default()
         };
         let server = typescript_server(&file, &config).unwrap();
-        assert_eq!(server.kind, ServerKind::TypeScript);
+        assert_eq!(server.kind, ServerKind::TypeScript(None));
         assert_eq!(server.binary, "vtsls");
     }
 
@@ -2552,7 +2601,7 @@ mod tests {
         // asserted separately in `test_typescript_co_servers`.
         let kinds = matching_kinds("/tmp/file.ts", &Config::default());
         assert!(
-            kinds.contains(&ServerKind::TypeScript),
+            kinds.contains(&ServerKind::TypeScript(None)),
             "expected TypeScript in {kinds:?}",
         );
     }
@@ -2617,7 +2666,7 @@ mod tests {
         write_file(&temp.path().join("biome.json"), "{}");
         let file = temp.path().join("file.ts");
         let kinds = matching_kinds(file.to_str().unwrap(), &Config::default());
-        assert!(kinds.contains(&ServerKind::TypeScript));
+        assert!(kinds.contains(&ServerKind::TypeScript(None)));
         assert!(kinds.contains(&ServerKind::Biome));
         assert!(kinds.contains(&ServerKind::Oxlint));
     }
@@ -2639,7 +2688,7 @@ mod tests {
 
         assert_eq!(
             matching_kinds(file.to_str().unwrap(), &config),
-            vec![ServerKind::TypeScript]
+            vec![ServerKind::TypeScript(None)]
         );
     }
 
@@ -2702,7 +2751,7 @@ mod tests {
     fn test_tsx_matches_typescript() {
         let kinds = matching_kinds("/tmp/file.tsx", &Config::default());
         assert!(
-            kinds.contains(&ServerKind::TypeScript),
+            kinds.contains(&ServerKind::TypeScript(None)),
             "expected TypeScript in {kinds:?}",
         );
     }
@@ -2711,7 +2760,7 @@ mod tests {
     fn test_case_insensitive_extension() {
         let kinds = matching_kinds("/tmp/file.TS", &Config::default());
         assert!(
-            kinds.contains(&ServerKind::TypeScript),
+            kinds.contains(&ServerKind::TypeScript(None)),
             "expected TypeScript in {kinds:?}",
         );
     }
@@ -2881,7 +2930,7 @@ mod tests {
 
         // Unrelated server still works.
         let ts_kinds = matching_kinds("/tmp/a.ts", &config);
-        assert!(ts_kinds.contains(&ServerKind::TypeScript));
+        assert!(ts_kinds.contains(&ServerKind::TypeScript(None)));
     }
 
     #[test]
@@ -3504,7 +3553,7 @@ mod tests {
         };
         let server = builtin_servers()
             .into_iter()
-            .find(|server| server.kind == ServerKind::TypeScript)
+            .find(|server| server.kind == ServerKind::TypeScript(None))
             .unwrap();
 
         let resolved = resolve_server_binary(&server, Some(&backend), &config);
@@ -3524,7 +3573,7 @@ mod tests {
         let config = Config::default();
         let server = builtin_servers()
             .into_iter()
-            .find(|server| server.kind == ServerKind::TypeScript)
+            .find(|server| server.kind == ServerKind::TypeScript(None))
             .unwrap();
 
         // The generic ladder stays rooted at the configured project root only;

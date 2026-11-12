@@ -3582,6 +3582,7 @@ pub struct App {
     active_actor_roots: AtomicUsize,
     open_routes: AtomicUsize,
     lsp_child_registry: crate::lsp::child_registry::LspChildRegistry,
+    lsp_capacity: Arc<parking_lot::Mutex<crate::lsp::manager::ServerCapacity>>,
     stdout_writer: SharedStdoutWriter,
     provider_factory: LanguageProviderFactory,
     /// Weak actor references let status attribute process RSS across roots
@@ -3607,6 +3608,7 @@ impl App {
             active_actor_roots: AtomicUsize::new(0),
             open_routes: AtomicUsize::new(0),
             lsp_child_registry: crate::lsp::child_registry::LspChildRegistry::new(),
+            lsp_capacity: Arc::default(),
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
             provider_factory,
             memory_contexts: parking_lot::Mutex::new(BTreeMap::new()),
@@ -4581,6 +4583,7 @@ impl AppContext {
             .map(|provider| provider.symbol_cache())
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(SymbolCache::new())));
         let mut lsp_manager = LspManager::new();
+        lsp_manager.set_server_capacity(Arc::clone(&app.lsp_capacity));
         lsp_manager.set_child_registry(app.lsp_child_registry());
         lsp_manager.set_search_paths(config.lsp_paths_extra.clone());
         // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
@@ -15516,7 +15519,7 @@ mod status_bar_tests {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test().publish(
                 ServerKey {
-                    kind: ServerKind::TypeScript,
+                    kind: ServerKind::TypeScript(None),
                     root: std::path::PathBuf::from("/proj"),
                 },
                 file.clone(),
@@ -15637,7 +15640,7 @@ mod status_bar_tests {
         let file = root.join("aft.jsonc");
         std::fs::write(&file, "{}\n").unwrap();
         let key = ServerKey {
-            kind: ServerKind::TypeScript,
+            kind: ServerKind::TypeScript(None),
             root: root.clone(),
         };
         let env = StoredDiagnostic {

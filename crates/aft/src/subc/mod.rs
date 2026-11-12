@@ -19968,7 +19968,7 @@ mod tests {
         ));
         let _reap = ReapContextChildren(Arc::clone(&ctx));
         ctx.lsp()
-            .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
+            .override_binary(ServerKind::TypeScript(None), fake_lsp::fake_server_binary());
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
         ctx.lsp()
@@ -20159,7 +20159,7 @@ mod tests {
         let release = dir.path().join("resume");
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut client = LspClient::spawn(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             dir.path().to_path_buf(),
             &fake_lsp::fake_server_binary(),
             &[],
@@ -20339,7 +20339,7 @@ mod tests {
         std::fs::write(&file, "// original\n").unwrap();
         let ctx = test_ctx();
         ctx.lsp().override_binary(
-            crate::lsp::registry::ServerKind::TypeScript,
+            crate::lsp::registry::ServerKind::TypeScript(None),
             fake_lsp::fake_server_binary(),
         );
         let guard = ctx.lsp();
@@ -20379,7 +20379,7 @@ mod tests {
         std::fs::write(&file, "// original\n").unwrap();
         let ctx = test_ctx();
         ctx.lsp()
-            .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
+            .override_binary(ServerKind::TypeScript(None), fake_lsp::fake_server_binary());
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
         ctx.lsp()

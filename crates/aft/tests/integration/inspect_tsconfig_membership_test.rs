@@ -71,7 +71,7 @@ fn configured_context(root: &Path) -> AppContext {
 
 fn configure_fake_typescript_lsp(ctx: &AppContext) {
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
 }
 

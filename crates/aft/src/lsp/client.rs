@@ -3539,7 +3539,7 @@ mod tests {
         root: PathBuf,
     ) -> LspClient {
         LspClient::spawn(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             root,
             Path::new("sh"),
             &["-c".to_string(), script.to_string()],

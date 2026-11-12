@@ -70,7 +70,7 @@ fn build() -> BusyRoot {
     };
     // Views are gone; the fixture carries no checkout view or path status.
     for kind in [
-        crate::lsp::registry::ServerKind::TypeScript,
+        crate::lsp::registry::ServerKind::TypeScript(None),
         crate::lsp::registry::ServerKind::Rust,
         crate::lsp::registry::ServerKind::Python,
         crate::lsp::registry::ServerKind::Go,

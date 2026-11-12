@@ -130,6 +130,7 @@ export function aftLiveConfigKeys<C>(
     pathKey<C>("revision_reads"),
     pathKey<C>("inspect.diagnostics_timeout_ms"),
     pathKey<C>("lsp.idle_minutes"),
+    pathKey<C>("lsp.max_servers"),
     ...[
       "diagnostics",
       "todos",
@@ -582,6 +583,11 @@ export function aftLiveSecurityKeys<C>(keys: readonly LiveConfigKey<C>[]): LiveS
           value === "never" ? Infinity : typeof value === "number" ? value : 60;
         return minutes(next) > minutes(current);
       },
+    },
+    {
+      key: pick("lsp.max_servers"),
+      loosens: (current, next) =>
+        (typeof next === "number" ? next : 8) > (typeof current === "number" ? current : 8),
     },
     ...[
       "diagnostics",

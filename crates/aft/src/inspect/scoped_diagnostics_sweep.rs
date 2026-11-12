@@ -198,7 +198,7 @@ pub(crate) fn sweep_scoped_files(
             .into_iter()
             .filter(|key| {
                 producers.contains(key)
-                    && (key.kind != ServerKind::TypeScript
+                    && (!matches!(key.kind, ServerKind::TypeScript(_))
                         || !tsconfig_membership.should_skip_diagnostics(file))
             })
             .collect::<Vec<_>>();
@@ -346,7 +346,7 @@ pub(crate) fn sweep_scoped_files(
             // needs a report newer than whatever was stored before (a
             // `cargo check` result, or an older analysis).
             let pulls = lsp.server_supports_pull_for_file(&key, file);
-            if key.kind == ServerKind::TypeScript && !pulls {
+            if matches!(key.kind, ServerKind::TypeScript(_)) && !pulls {
                 to_pull.push((file.clone(), key, epoch_before));
                 continue;
             }
@@ -423,7 +423,9 @@ pub(crate) fn sweep_scoped_files(
                 continue;
             }
             let mut lsp = ctx.lsp();
-            if key.kind == ServerKind::TypeScript && !lsp.server_supports_pull_for_file(key, file) {
+            if matches!(key.kind, ServerKind::TypeScript(_))
+                && !lsp.server_supports_pull_for_file(key, file)
+            {
                 match lsp.begin_scoped_typescript_diagnostics(key, file, deadline) {
                     Ok(request) => typescript_in_flight.push((file.clone(), key.clone(), request)),
                     Err(error) => {

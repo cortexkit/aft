@@ -352,6 +352,7 @@ pub struct RawRerank {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct RawLsp {
     pub idle_minutes: Option<LspIdleMinutes>,
+    pub max_servers: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_lsp_servers")]
     pub servers: Option<BTreeMap<String, RawLspServerEntry>>,
     #[serde(
@@ -371,6 +372,7 @@ pub struct RawLsp {
 impl RawLsp {
     fn is_empty(&self) -> bool {
         self.idle_minutes.is_none()
+            && self.max_servers.is_none()
             && self.servers.is_none()
             && self.disabled.is_none()
             && self.python.is_none()
@@ -711,6 +713,7 @@ pub fn resolve_config_for_harness(
     harness: Option<&Harness>,
 ) -> ResolveResult {
     let mut merged = RawAftConfig::default();
+    let mut lsp_user_max_servers = 8;
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
 
@@ -838,6 +841,11 @@ pub fn resolve_config_for_harness(
 
         if is_user {
             merge_trusted_config(&mut merged, raw);
+            lsp_user_max_servers = merged
+                .lsp
+                .as_ref()
+                .and_then(|lsp| lsp.max_servers)
+                .unwrap_or(8);
         } else {
             record_project_drops(&raw, &tier.tier, &mut dropped);
             record_resource_loosening(&merged, &raw, &tier.tier, &mut dropped);
@@ -855,6 +863,7 @@ pub fn resolve_config_for_harness(
         };
     }
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
+    config.lsp_user_max_servers = Some(lsp_user_max_servers);
     if let Some(raw) = merged
         .storage
         .as_ref()
@@ -2059,6 +2068,7 @@ fn merge_semantic_config(
 fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Option<RawLsp> {
     let mut lsp = base.unwrap_or(RawLsp {
         idle_minutes: None,
+        max_servers: None,
         servers: None,
         disabled: None,
         python: None,
@@ -2069,6 +2079,11 @@ fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Optio
     });
 
     if let Some(project) = override_lsp {
+        if let Some(max_servers) = project.max_servers {
+            if max_servers <= lsp.max_servers.unwrap_or(8) {
+                lsp.max_servers = Some(max_servers);
+            }
+        }
         if let Some(idle) = project.idle_minutes {
             if idle.tightens(lsp.idle_minutes.unwrap_or_default()) {
                 lsp.idle_minutes = Some(idle);
@@ -2424,6 +2439,16 @@ fn record_resource_loosening(
         }
     }
     const REASON: &str = "resource: project settings may only tighten the user budget";
+    if let Some(next) = project.lsp.as_ref().and_then(|lsp| lsp.max_servers) {
+        let floor = base
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.max_servers)
+            .unwrap_or(8);
+        if next > floor {
+            push_drop(dropped, "lsp.max_servers", tier, REASON);
+        }
+    }
     let cap = |raw: &RawAftConfig| {
         raw.bash
             .as_ref()
@@ -3173,6 +3198,7 @@ fn resolve_remote_exec_config(raw: &RawAftConfig) -> RemoteExecConfig {
 fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     let lsp = raw.lsp.as_ref();
     config.lsp_idle_minutes = lsp.and_then(|lsp| lsp.idle_minutes).unwrap_or_default();
+    config.lsp_max_servers = lsp.and_then(|lsp| lsp.max_servers).unwrap_or(8);
     let mut disabled: HashSet<String> = lsp
         .and_then(|lsp| lsp.disabled.as_ref())
         .into_iter()
@@ -4116,6 +4142,35 @@ mod tests {
                 refused
             );
         }
+    }
+
+    #[test]
+    fn lsp_max_servers_defaults_and_project_can_only_lower() {
+        assert_eq!(resolve_config(&[]).config.lsp_max_servers, 8);
+        for (user, project, expected, refused) in [
+            (8, 3, 3, false),
+            (3, 8, 3, true),
+            (8, 0, 0, false),
+            (16, 12, 12, false),
+        ] {
+            let result = resolve_config(&[
+                tier("user", &format!(r#"{{"lsp":{{"max_servers":{user}}}}}"#)),
+                tier(
+                    "project",
+                    &format!(r#"{{"lsp":{{"max_servers":{project}}}}}"#),
+                ),
+            ]);
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.config.lsp_max_servers, expected);
+            assert_eq!(result.config.lsp_user_max_servers, Some(user));
+            assert_eq!(
+                drop_keys(&result).contains(&"lsp.max_servers".to_string()),
+                refused
+            );
+        }
+        let result = resolve_config(&[tier("project", r#"{"lsp":{"max_servers":23}}"#)]);
+        assert_eq!(result.config.lsp_max_servers, 8);
+        assert!(drop_keys(&result).contains(&"lsp.max_servers".to_string()));
     }
 
     #[test]

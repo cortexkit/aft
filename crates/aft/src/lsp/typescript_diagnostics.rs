@@ -265,7 +265,7 @@ mod tests {
             }])).unwrap();
             assert_eq!(
                 sync,
-                from_lsp_diagnostics(file.clone(), pushed, &ServerKind::TypeScript)
+                from_lsp_diagnostics(file.clone(), pushed, &ServerKind::TypeScript(None))
             );
             assert_eq!(
                 (
@@ -310,7 +310,7 @@ mod tests {
         .unwrap();
         let mut manager = LspManager::new();
         manager.override_binary(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             modules.join(".bin/typescript-language-server"),
         );
         let opened = crate::lsp::manager::settled_lsp(&mut manager, |startup_manager| {
@@ -320,7 +320,7 @@ mod tests {
         let key = opened
             .server_keys
             .iter()
-            .find(|key| key.kind == ServerKind::TypeScript)
+            .find(|key| key.kind == ServerKind::TypeScript(None))
             .unwrap();
         let request = manager
             .begin_scoped_typescript_diagnostics(

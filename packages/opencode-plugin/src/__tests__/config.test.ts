@@ -520,6 +520,25 @@ describe("loadAftConfig", () => {
     );
   });
 
+  test("lsp.max_servers can only be lowered by a project", () => {
+    const fixture = createConfigFixture();
+    const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
+    mkdirSync(env.HOME, { recursive: true });
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ lsp: { max_servers: 3 } }));
+    for (const [max_servers, expected] of [
+      [23, 3],
+      [2, 2],
+      [0, 0],
+    ]) {
+      writeFileSync(fixture.projectConfigPath, JSON.stringify({ lsp: { max_servers } }));
+      const merged = JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout);
+      expect(merged.lsp.max_servers).toBe(expected);
+    }
+    for (const max_servers of [-1, 1.5, "8"]) {
+      expect(AftConfigSchema.safeParse({ lsp: { max_servers } }).success).toBe(false);
+    }
+  });
+
   test("inspect categories use exact boolean keys and idle minutes clamp the new range", () => {
     expect(AftConfigSchema.parse({ lsp: { idle_minutes: 0 } }).lsp?.idle_minutes).toBe(5);
     expect(AftConfigSchema.parse({ lsp: { idle_minutes: 2000 } }).lsp?.idle_minutes).toBe(1440);

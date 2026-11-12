@@ -5500,7 +5500,7 @@ mod runtime_note_tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let ctx = context();
         let mut client = LspClient::spawn_with_reclaim_root(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             root.clone(),
             Path::new("/bin/sh"),
             &["-c".into(), "while read line; do :; done".into()],
@@ -5517,7 +5517,7 @@ mod runtime_note_tests {
             dir,
             ctx,
             ServerKey {
-                kind: ServerKind::TypeScript,
+                kind: ServerKind::TypeScript(None),
                 root,
             },
         )
@@ -7806,7 +7806,7 @@ mod inspect_freshness_progress_tests {
         ctx.lsp()
             .diagnostics_store_mut_for_test()
             .publish_with_kind(
-                crate::lsp::registry::ServerKind::TypeScript,
+                crate::lsp::registry::ServerKind::TypeScript(None),
                 file.clone(),
                 Vec::new(),
             );

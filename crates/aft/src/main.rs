@@ -4369,7 +4369,7 @@ mod watcher_filter_tests {
         ctx.update_status_bar_todos(Some(4));
         {
             let key = ServerKey {
-                kind: ServerKind::TypeScript,
+                kind: ServerKind::TypeScript(None),
                 root: root.clone(),
             };
             let file = root.join("known.ts");
@@ -4722,7 +4722,7 @@ mod watcher_filter_tests {
         ctx.update_status_bar_todos(Some(4));
         {
             let key = ServerKey {
-                kind: ServerKind::TypeScript,
+                kind: ServerKind::TypeScript(None),
                 root: root.clone(),
             };
             let mut lsp = ctx.lsp();

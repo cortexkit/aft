@@ -4182,7 +4182,7 @@ mod idle_lsp_tests {
         let registry = LspChildRegistry::new();
         ctx.lsp().set_child_registry(registry.clone());
         let client = LspClient::spawn_with_reclaim_root(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             root,
             Path::new("sh"),
             &["-c".to_string(), "exec sleep 60".to_string()],
