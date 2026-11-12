@@ -6296,6 +6296,9 @@ async fn macos_permission_cards_deduplicate_and_withdraw_on_readable_probe() {
     );
 }
 
+// macOS permission cards exist only on Unix hosts, and the fake Cingulate checks
+// folders as POSIX absolute paths, so these card tests do not run on Windows.
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn macos_permissions_db_contention_does_not_block_runtime_polling() {
     #[derive(Clone, Copy, Debug)]
@@ -6523,6 +6526,7 @@ async fn macos_permission_startup_db_contention_does_not_block_runtime_polling()
     }
 }
 
+#[cfg(unix)]
 struct StartupMacosWithdrawal {
     fake: Arc<FakeCingulate>,
     failed_id: String,
@@ -6531,6 +6535,7 @@ struct StartupMacosWithdrawal {
     calls: StdMutex<Vec<Value>>,
 }
 
+#[cfg(unix)]
 impl ConsentTransport for StartupMacosWithdrawal {
     fn call(&self, call: ConsentCall) -> ConsentFuture {
         assert_eq!(call.method, "consent.withdraw");
@@ -6557,6 +6562,7 @@ impl ConsentTransport for StartupMacosWithdrawal {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn macos_permission_startup_withdraws_ids_deletes_unpublished_and_keeps_failed_rows() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -6623,6 +6629,7 @@ async fn macos_permission_startup_withdraws_ids_deletes_unpublished_and_keeps_fa
 /// A card filed by a session that has since ended can't be withdrawn under its
 /// scope; Cingulate settles it, so startup drops the record instead of
 /// retrying it at every start.
+#[cfg(unix)]
 #[tokio::test]
 async fn macos_permission_startup_drops_cards_whose_scope_ended() {
     let _lock = CONSENT_TEST_LOCK.lock().await;

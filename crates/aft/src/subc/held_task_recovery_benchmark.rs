@@ -216,7 +216,9 @@ fn startup_recovery_snapshot_benchmark() {
     let Some(path) = std::env::var_os("AFT_RECOVERY_BENCH_DB") else {
         return;
     };
-    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+    // Read at run time so the compiled test does not embed this checkout's path.
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let scratch = PathBuf::from(manifest)
         .join("../../target/scratch")
         .canonicalize()
         .unwrap();
