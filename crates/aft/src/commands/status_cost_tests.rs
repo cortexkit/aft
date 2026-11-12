@@ -444,3 +444,119 @@ fn status_push_backup_inventory_cost_probe() {
         eprintln!("backup inventory (unchanged push call): paths=256, resident={resident}, calls=50, CPU/call={:?}, directory entries/call={}", cpu/50, (backup.status_discovery_entries_for_test() - before)/50);
     }
 }
+
+/// Compares the unchanged `tracked_files` call with listing-only alternatives
+/// over the same 256 durable stacks. The listing variants never open a
+/// `meta.json`: they read directory names (path-hash names are 16 lowercase hex
+/// digits) and union them with the hashed resident keys.
+#[test]
+#[ignore = "manual backup-inventory listing cost probe"]
+fn status_push_backup_listing_cost_probe() {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+    fn path_hash(key: &std::path::Path) -> String {
+        Sha256::digest(key.to_string_lossy().as_bytes())[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+    fn is_path_hash(name: &str) -> bool {
+        name.len() == 16 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+    fn find_session_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        if dir.join("session.json").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .find_map(|entry| find_session_dir(&entry.path()))
+    }
+
+    let fixture = Fixture::new(256);
+    let mut backup = fixture.ctx.backup().lock();
+    let storage = fixture._dir.path().join("storage");
+    backup.set_storage_dir_for_harness(storage.clone(), crate::harness::Harness::Opencode, 0);
+    for file in 0..256 {
+        assert!(backup
+            .snapshot(
+                DEFAULT_SESSION_ID,
+                &fixture.checkout.root().join(format!("file_{file}.rs")),
+                "status inventory probe"
+            )
+            .unwrap()
+            .is_some());
+    }
+    let session_dir = find_session_dir(&storage).unwrap();
+    let mut others = std::fs::read_dir(&session_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !is_path_hash(name))
+        .collect::<Vec<_>>();
+    others.sort();
+    let resident_keys = backup.tracked_files(DEFAULT_SESSION_ID);
+    eprintln!("session dir non-path-hash entries: {others:?}");
+
+    let names_only = |resident: &[std::path::PathBuf]| -> usize {
+        let mut names: HashSet<String> = resident.iter().map(|key| path_hash(key)).collect();
+        if !session_dir.exists() {
+            return names.len();
+        }
+        for entry in std::fs::read_dir(&session_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if is_path_hash(name) && entry.file_type().unwrap().is_dir() {
+                names.insert(name.to_string());
+            }
+        }
+        names.len()
+    };
+    let names_and_meta_stat = |resident: &[std::path::PathBuf]| -> usize {
+        let mut names: HashSet<String> = resident.iter().map(|key| path_hash(key)).collect();
+        if !session_dir.exists() {
+            return names.len();
+        }
+        for entry in std::fs::read_dir(&session_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_path_hash(name) || !entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            // Length and modification time are what a stat-keyed parse cache
+            // would compare; reading them costs one stat per stack.
+            if let Ok(meta) = std::fs::symlink_metadata(entry.path().join("meta.json")) {
+                std::hint::black_box((meta.len(), meta.modified().ok()));
+                names.insert(name.to_string());
+            }
+        }
+        names.len()
+    };
+
+    for resident in [true, false] {
+        if !resident {
+            backup.release_session_memory(DEFAULT_SESSION_ID);
+        }
+        let resident_now: Vec<std::path::PathBuf> = if resident {
+            resident_keys.clone()
+        } else {
+            Vec::new()
+        };
+        let measure = |label: &str, f: &dyn Fn() -> usize| {
+            let start = ThreadCpuSample::now();
+            for _ in 0..50 {
+                assert_eq!(std::hint::black_box(f()), 256);
+            }
+            let cpu = ThreadCpuSample::elapsed(start, ThreadCpuSample::now()).unwrap();
+            eprintln!("{label}: resident={resident}, calls=50, CPU/call={:?}", cpu / 50);
+        };
+        measure("tracked_files (unchanged)", &|| backup.tracked_files(DEFAULT_SESSION_ID).len());
+        measure("names only + hashed resident keys", &|| names_only(&resident_now));
+        measure("names + meta.json stat + hashed resident keys", &|| {
+            names_and_meta_stat(&resident_now)
+        });
+    }
+}
