@@ -886,43 +886,59 @@ impl Runtime {
                     profiles.push(triple.path().join("release/build"));
                 }
             }
-            let prefix = format!("{}-", config.get("name")?.as_str()?);
+            let package_name = config.get("name")?.as_str()?;
+            let prefix = format!("{package_name}-");
             let mut declared = false;
             for profile in profiles {
-                let mut entries = match fs::read_dir(profile) {
-                    Ok(entries) => entries,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => return None,
-                };
-                loop {
-                    expired(deadline)?;
-                    let Some(entry) = entries.next() else {
-                        break;
+                // Cargo 1.100 groups build units by package instead of keeping
+                // build-script runs in package-hash directories. Their captured
+                // stdout moved from `output` to `<package>/<unit>/run/stdout`.
+                let mut directories = vec![(profile, false)];
+                while let Some((directory, package_units)) = directories.pop() {
+                    let mut entries = match fs::read_dir(directory) {
+                        Ok(entries) => entries,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => return None,
                     };
-                    let entry = entry.ok()?;
-                    if !entry.file_name().to_str()?.starts_with(&prefix) {
-                        continue;
-                    }
-                    let output = entry.path().join("output");
-                    if !output.is_file() {
-                        continue;
-                    }
-                    let bytes = read_bounded(&output, deadline)?;
-                    for line in std::str::from_utf8(&bytes).ok()?.lines() {
+                    loop {
                         expired(deadline)?;
-                        if let Some(key) = line
-                            .strip_prefix("cargo:rerun-if-env-changed=")
-                            .or_else(|| line.strip_prefix("cargo::rerun-if-env-changed="))
-                        {
-                            declared = true;
-                            env_keys.push(key.to_string());
+                        let Some(entry) = entries.next() else {
+                            break;
+                        };
+                        let entry = entry.ok()?;
+                        let name = entry.file_name();
+                        let name = name.to_str()?;
+                        if !package_units && name == package_name {
+                            directories.push((entry.path(), true));
+                            continue;
                         }
-                        if let Some(path) = line
-                            .strip_prefix("cargo:rerun-if-changed=")
-                            .or_else(|| line.strip_prefix("cargo::rerun-if-changed="))
-                        {
-                            declared = true;
-                            outputs.push(canonical(&package.join(path))?);
+                        let output = if package_units {
+                            entry.path().join("run/stdout")
+                        } else if name.starts_with(&prefix) {
+                            entry.path().join("output")
+                        } else {
+                            continue;
+                        };
+                        if !output.is_file() {
+                            continue;
+                        }
+                        let bytes = read_bounded(&output, deadline)?;
+                        for line in std::str::from_utf8(&bytes).ok()?.lines() {
+                            expired(deadline)?;
+                            if let Some(key) = line
+                                .strip_prefix("cargo:rerun-if-env-changed=")
+                                .or_else(|| line.strip_prefix("cargo::rerun-if-env-changed="))
+                            {
+                                declared = true;
+                                env_keys.push(key.to_string());
+                            }
+                            if let Some(path) = line
+                                .strip_prefix("cargo:rerun-if-changed=")
+                                .or_else(|| line.strip_prefix("cargo::rerun-if-changed="))
+                            {
+                                declared = true;
+                                outputs.push(canonical(&package.join(path))?);
+                            }
                         }
                     }
                 }
@@ -1892,6 +1908,52 @@ mod tests {
 
     fn valid(cache: &CompletedRustCheck) -> Option<SavedCheck> {
         cache.validated_with_runtime("v1".into(), Instant::now() + BUDGET)
+    }
+
+    #[test]
+    fn build_inputs_support_legacy_and_unit_layouts() {
+        for profile in ["debug", "release", "some-target/debug"] {
+            for output in ["member-control/output", "member/control/run/stdout"] {
+                let (_temp, mut cache) = fixture();
+                cache.runtime.env.insert(
+                    "CARGO_TARGET_DIR".into(),
+                    cache.root.join("target").to_string_lossy().into_owned(),
+                );
+                cache.runtime.options = Some(serde_json::json!({"cargo": {"targetDir": true}}));
+                write(&cache.root, "member/input.txt", "build input");
+                let inputs = &cache.saved.as_ref().unwrap().fingerprint;
+                let collect = || {
+                    cache
+                        .runtime
+                        .build_inputs(&cache.root, inputs, Instant::now() + BUDGET)
+                };
+                assert!(
+                    collect().is_none(),
+                    "missing build output must not certify inputs"
+                );
+                write(
+                    &cache.root,
+                    &format!("target/rust-analyzer/{profile}/build/{output}"),
+                    "cargo:rerun-if-changed=input.txt\ncargo::rerun-if-env-changed=BUILD_INPUT\n",
+                );
+                // Other packages must not add declarations to this package's
+                // certificate, even when their names share its prefix.
+                write(
+                    &cache.root,
+                    &format!(
+                        "target/rust-analyzer/{profile}/build/member-other/control/run/stdout"
+                    ),
+                    "cargo:rerun-if-changed=nonexistent.txt\n",
+                );
+                let (paths, env) = collect().expect("discover declared build inputs");
+                assert_eq!(
+                    paths,
+                    vec![canonical(&cache.root.join("member/input.txt")).unwrap()],
+                    "{profile}/{output}"
+                );
+                assert_eq!(env, vec!["BUILD_INPUT"], "{profile}/{output}");
+            }
+        }
     }
 
     #[test]

@@ -4371,9 +4371,22 @@ fn main() {
             "{mode}: check artifacts at {check_out}, expected {}",
             analyzer_target.display()
         );
+        // Cargo's intermediate directory layout is not stable. Require this
+        // crate's compiler artifact under the isolated target, not a `deps` folder.
         assert!(
-            analyzer_target.join("debug/deps").is_dir(),
-            "check artifacts missing"
+            walkdir::WalkDir::new(&analyzer_target)
+                .into_iter()
+                .any(|entry| {
+                    let entry = entry.expect("read analyzer artifacts");
+                    entry.file_type().is_file()
+                        && entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("liblock_isolation")
+                        && entry.path().extension().is_some_and(|ext| ext == "rmeta")
+                }),
+            "{mode}: check compiler artifacts missing under {}",
+            analyzer_target.display()
         );
         eprintln!(
             "{mode}: analyzer artifacts under {}; cargo build stderr:\n{stderr}",
