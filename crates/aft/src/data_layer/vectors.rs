@@ -1186,7 +1186,7 @@ impl VectorPlane {
     /// A snapshot only if a producer already surveyed this exact text view and
     /// vector generation. Status must not rebuild members on the push thread.
     pub(crate) fn cached_snapshot(&self, view: &CheckoutView) -> Option<MeaningSnapshot> {
-        let loaded = Arc::clone(&self.loaded.try_lock().ok()?);
+        let loaded = Arc::clone(&*self.loaded.try_lock().ok()?);
         let cached = self.members.try_lock().ok()?;
         let members = cached.as_ref().filter(|members| {
             members.view == view.text_generation() && members.generation == loaded.generation
