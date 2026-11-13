@@ -1,0 +1,238 @@
+{
+  "base": "a0b9cdaae27a6d36dbd74303486ab6770d97e1af",
+  "candidate": "63fc832bed9437092191d86d5d901da5b4f6b2f5",
+  "queries_sha256": "fcd657449f7362b88dcdd513cd442dc5b15aaf898fae0c58d05cc492530f9525",
+  "profile": "ci-storm; default features; temporary identical instrumentation",
+  "normalization": "Only fresh-store publication identity and random process nonce in snapshot_generation; publication/overlay counters and all other fields must match (parent approved).",
+  "order": [
+    "baseline",
+    "candidate",
+    "candidate",
+    "baseline"
+  ],
+  "runs": {
+    "baseline-profile": {
+      "queries": 6897,
+      "process_cpu_seconds": 773.275529,
+      "wall_seconds": 775.605951831,
+      "cache": {
+        "distinct_contents_prepared": 4877,
+        "preparations": 251921,
+        "contents_prepared_again": 4211,
+        "repeat_preparations": 247044,
+        "entries": 1024,
+        "charged_bytes": 63964929
+      },
+      "raw_generation_tokens": [
+        "1:0964a6327601b33ef5a132b4ea893db4:0_52ba9dd5c5bcd65594a8c3afde0cb640",
+        "<absent>"
+      ],
+      "generation_metadata_differences": 0,
+      "p50_ms": 59.416574,
+      "p95_ms": 362.64900500000005,
+      "cpu_ms_per_query": 112.1176640568363,
+      "normalized_response_sha256": "d36a5df2767101a202c59d13979a8ee05ba861249600ac4286caf69ae0a6d1db",
+      "different_queries": [],
+      "hotspots_per_query": {
+        "PreparedExactText::new": {
+          "calls": 36.52617079889807,
+          "wall_ms": 4.3476500034797745,
+          "cpu_ms": 4.351821181673191
+        },
+        "scan_symbols_in_text": {
+          "calls": 38.56372335798173,
+          "wall_ms": 2.8471266817456864,
+          "cpu_ms": 2.8575674976076555
+        },
+        "candidates_for": {
+          "calls": 12.73249238799478,
+          "wall_ms": 6.026928526895752,
+          "cpu_ms": 6.020826560243584
+        },
+        "get_or_verify": {
+          "calls": 3.608960417572858,
+          "wall_ms": 42.66425408162969,
+          "cpu_ms": 42.36877473785704
+        }
+      },
+      "prepared_totals": {
+        "hits": 1266121,
+        "misses": 251921,
+        "evicted_by_count": 249330,
+        "evicted_by_bytes": 1567
+      }
+    },
+    "candidate-profile": {
+      "queries": 6897,
+      "process_cpu_seconds": 618.3443950000001,
+      "wall_seconds": 618.41585034,
+      "cache": {
+        "distinct_contents_prepared": 4877,
+        "preparations": 190004,
+        "contents_prepared_again": 4211,
+        "repeat_preparations": 185127,
+        "entries": 1153,
+        "charged_bytes": 67085301
+      },
+      "raw_generation_tokens": [
+        "1:8ba3649aca7a17a269bf78801b1acf7d:0_da3a0bac9ced6cead2bd0c1c906361cd",
+        "<absent>"
+      ],
+      "generation_metadata_differences": 6896,
+      "p50_ms": 46.466162999999995,
+      "p95_ms": 292.032752,
+      "cpu_ms_per_query": 89.65410975786574,
+      "normalized_response_sha256": "d36a5df2767101a202c59d13979a8ee05ba861249600ac4286caf69ae0a6d1db",
+      "different_queries": [],
+      "hotspots_per_query": {
+        "PreparedExactText::new": {
+          "calls": 27.548789328693633,
+          "wall_ms": 1.8545955892416994,
+          "cpu_ms": 1.8594704406263594
+        },
+        "scan_symbols_in_text": {
+          "calls": 29.586341887777294,
+          "wall_ms": 1.454809610845295,
+          "cpu_ms": 1.462719363926345
+        },
+        "candidates_for": {
+          "calls": 12.759170653907496,
+          "wall_ms": 4.7013806118602295,
+          "cpu_ms": 4.71032158938669
+        },
+        "get_or_verify": {
+          "calls": 3.608960417572858,
+          "wall_ms": 31.845867570682906,
+          "cpu_ms": 31.719893392199506
+        }
+      },
+      "prepared_totals": {
+        "hits": 1338633,
+        "misses": 190004,
+        "evicted_by_count": 0,
+        "evicted_by_bytes": 188851
+      }
+    },
+    "0-baseline": {
+      "queries": 6897,
+      "process_cpu_seconds": 625.878201,
+      "wall_seconds": 626.039261589,
+      "cache": {
+        "distinct_contents_prepared": 0,
+        "preparations": 0,
+        "contents_prepared_again": 0,
+        "repeat_preparations": 0,
+        "entries": 0,
+        "charged_bytes": 0
+      },
+      "raw_generation_tokens": [
+        "1:0eed56a4c0fc39d53f821264afca4fcb:0_5121be76154f228cc8d40426de2007e9",
+        "<absent>"
+      ],
+      "generation_metadata_differences": 6896,
+      "p50_ms": 47.357298,
+      "p95_ms": 298.505218,
+      "cpu_ms_per_query": 90.74644062635929,
+      "normalized_response_sha256": "d36a5df2767101a202c59d13979a8ee05ba861249600ac4286caf69ae0a6d1db",
+      "different_queries": []
+    },
+    "1-candidate": {
+      "queries": 6897,
+      "process_cpu_seconds": 604.8470490000001,
+      "wall_seconds": 605.124156121,
+      "cache": {
+        "distinct_contents_prepared": 0,
+        "preparations": 0,
+        "contents_prepared_again": 0,
+        "repeat_preparations": 0,
+        "entries": 0,
+        "charged_bytes": 0
+      },
+      "raw_generation_tokens": [
+        "1:7321c3975629cd2a0d8763590311ee0e:0_394c4f35b8af57b4853796ca0b697b74",
+        "<absent>"
+      ],
+      "generation_metadata_differences": 6896,
+      "p50_ms": 45.388108,
+      "p95_ms": 288.081308,
+      "cpu_ms_per_query": 87.69712179208354,
+      "normalized_response_sha256": "d36a5df2767101a202c59d13979a8ee05ba861249600ac4286caf69ae0a6d1db",
+      "different_queries": []
+    },
+    "2-candidate": {
+      "queries": 6897,
+      "process_cpu_seconds": 596.968383,
+      "wall_seconds": 597.060500502,
+      "cache": {
+        "distinct_contents_prepared": 0,
+        "preparations": 0,
+        "contents_prepared_again": 0,
+        "repeat_preparations": 0,
+        "entries": 0,
+        "charged_bytes": 0
+      },
+      "raw_generation_tokens": [
+        "1:9359c76ff4a6017761a81d127bb0ca68:0_b1ad418da0c1518a05d613c8f53b2691",
+        "<absent>"
+      ],
+      "generation_metadata_differences": 6896,
+      "p50_ms": 45.107414,
+      "p95_ms": 288.685046,
+      "cpu_ms_per_query": 86.55478947368421,
+      "normalized_response_sha256": "d36a5df2767101a202c59d13979a8ee05ba861249600ac4286caf69ae0a6d1db",
+      "different_queries": []
+    },
+    "3-baseline": {
+      "queries": 6897,
+      "process_cpu_seconds": 613.27759,
+      "wall_seconds": 613.369850254,
+      "cache": {
+        "distinct_contents_prepared": 0,
+        "preparations": 0,
+        "contents_prepared_again": 0,
+        "repeat_preparations": 0,
+        "entries": 0,
+        "charged_bytes": 0
+      },
+      "raw_generation_tokens": [
+        "1:6ee610c07863a954a734cb90fac51587:0_515634ca9e7ee626af35e09e9ccc6272",
+        "<absent>"
+      ],
+      "generation_metadata_differences": 6896,
+      "p50_ms": 46.498915000000004,
+      "p95_ms": 293.104455,
+      "cpu_ms_per_query": 88.91947078439902,
+      "normalized_response_sha256": "d36a5df2767101a202c59d13979a8ee05ba861249600ac4286caf69ae0a6d1db",
+      "different_queries": []
+    }
+  },
+  "schema": "aft-exact-lane-cache-parity-v1",
+  "host": {
+    "machine": "ck-motor",
+    "job": "linux,8c,24gb",
+    "concurrency": 1
+  },
+  "frozen_corpus_ref": "a0b9cdaae27a6d36dbd74303486ab6770d97e1af",
+  "working_set_inventory": {
+    "distinct_contents_prepared": 4877,
+    "distinct_source_bytes": 75478475,
+    "distinct_prepared_bytes": 107311378,
+    "working_set_charged_bytes": 108559890,
+    "preparations": 190415,
+    "contents_prepared_again": 4211,
+    "repeat_preparations": 185538,
+    "entries": 1153,
+    "charged_bytes": 67085301
+  },
+  "scope_notes": [
+    "All six runs contain 6897 recorded requests; profile counters are off in ABBA timing runs (zero cache counters there mean uncollected, not an empty cache).",
+    "Only approved fresh-store publication identity and random process nonce are normalized; all remaining response fields and reply text are identical.",
+    "Timing profile is ci-storm by explicit parent approval after cancelling the uncompleted fat-LTO release build.",
+    "Inventory is a separate profiling-only replay to sum distinct content charges, not a repeated performance trial."
+  ],
+  "interleaved_cpu_summary": {
+    "base_ms_per_query": 89.83295570537916,
+    "candidate_ms_per_query": 87.12595563288387,
+    "reduction_percent": 3.0133708183590318
+  }
+}
