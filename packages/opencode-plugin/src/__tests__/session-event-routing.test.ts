@@ -80,6 +80,9 @@ async function setup() {
       onBgEventsNudge() {},
     });
     pools.push(pool);
+    // An idle replay drain is allowed only after a project bridge exists.
+    // Construct it without opening any session route or subscription.
+    pool.getBridge(directory);
     spyOn(bridge, "createAftTransportPool").mockResolvedValue(pool);
     const instanceHooks = (await plugin({ directory, client } as Parameters<Plugin>[0])) as Hooks;
     hooks.push(instanceHooks);
@@ -138,6 +141,7 @@ describe.serial("session events route only to their owning location", () => {
     const entry = await instance(first, {
       session: { get: async () => ({ data: { directory: second } }) },
     });
+    entry.pool.getBridge(second);
     await entry.hooks.event({
       event: { type: "session.idle", properties: { sessionID: "resumed-v1" } },
     });
