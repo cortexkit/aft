@@ -593,18 +593,7 @@ pub fn settle_with_tool_result_source(
     now: i64,
     source: Option<&[u8]>,
 ) -> rusqlite::Result<bool> {
-    if source.is_some_and(|source| {
-        source.is_empty()
-            || source.len() >= MAX_TOOL_RESULT_SOURCE_BYTES
-            || frame.ty != FrameType::Response
-    }) {
-        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "tool result source requires a Response and must be nonempty and under 3 MiB",
-            ),
-        )));
-    }
+    validate_tool_result_source(frame, source)?;
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let Some(row) = get(&tx, key)? else {
         return Ok(false);
@@ -617,6 +606,25 @@ pub fn settle_with_tool_result_source(
     settle_row(&tx, &row, frame, outcome, reason, now, source)?;
     tx.commit()?;
     Ok(true)
+}
+
+fn validate_tool_result_source(
+    frame: &RecordedFrame,
+    source: Option<&[u8]>,
+) -> rusqlite::Result<()> {
+    if source.is_some_and(|source| {
+        source.is_empty()
+            || source.len() >= MAX_TOOL_RESULT_SOURCE_BYTES
+            || frame.ty != FrameType::Response
+    }) {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "tool result source requires a Response and must be nonempty and under 3 MiB",
+            ),
+        )));
+    }
+    Ok(())
 }
 
 /// Atomically settle Prepared and Authorized calls as scope-ended.
@@ -1012,6 +1020,18 @@ pub fn withdraw(
         }
         State::DispatchStarted => {
             kill_task = row.task_id.clone();
+            if has_held_reply(&row) {
+                let mut held: Value = serde_json::from_slice(&row.frame.as_ref().unwrap().body)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                // Record loss of the result consumer before the task's kill
+                // can publish a terminal state. Keep kill retries independent
+                // of the answer that is frozen only after the kill succeeds.
+                held["_aft_withdrawn"] = json!(true);
+                tx.execute(
+                    "UPDATE call_ledger SET frame_body=?3 WHERE carrier=?1 AND call_key=?2",
+                    params![key.carrier, key.call_key, held.to_string().into_bytes()],
+                )?;
+            }
             WithdrawAnswer::AlreadyStarted {
                 outcome: StartedOutcome::Unknown,
             }
@@ -1430,6 +1450,12 @@ pub fn observe_task(
     observe_task_with_tool_result_source(
         conn, carrier, call_key, task_id, result, outcome, None, None,
     )
+    .map(|observation| observation.recovered)
+}
+
+pub struct TaskObservation {
+    pub recovered: bool,
+    pub delivered_held_result: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1442,12 +1468,13 @@ pub fn observe_task_with_tool_result_source(
     outcome: &str,
     body: Option<&[u8]>,
     unknown_result: Option<&RecordedFrame>,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<TaskObservation> {
     let key = Key {
         carrier: carrier.into(),
         call_key: call_key.into(),
     };
-    let recovered: bool = conn
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let recovered: bool = tx
         .query_row(
             "SELECT recovered=1 AND state='DispatchStarted' AND task_id=?3 FROM call_ledger WHERE carrier=?1 AND call_key=?2",
             params![carrier, call_key, task_id],
@@ -1456,7 +1483,7 @@ pub fn observe_task_with_tool_result_source(
         .optional()?
         .unwrap_or(false);
     if let Some(frame) = result.filter(|_| recovered) {
-        let row = get(conn, &key)?;
+        let row = get(&tx, &key)?;
         if row.as_ref().is_some_and(has_held_reply) {
             let frame = if outcome == "unknown" {
                 unknown_result
@@ -1476,20 +1503,46 @@ pub fn observe_task_with_tool_result_source(
                     },
                 )?
             };
-            return settle_with_tool_result_source(
-                conn,
-                &key,
+            let row = row.unwrap();
+            validate_tool_result_source(&frame, body)?;
+            let withdrawn = row.frame.as_ref().is_some_and(|frame| {
+                serde_json::from_slice::<Value>(&frame.body)
+                    .is_ok_and(|held| held["_aft_withdrawn"] == true)
+            });
+            let delivered_held_result = row.withdraw_answer.is_none() && !withdrawn;
+            settle_row(
+                &tx,
+                &row,
                 &frame,
                 &self::outcome(&frame),
                 None,
                 now_ms(),
                 body,
-            )
-            .map(|_| true);
+            )?;
+            if delivered_held_result {
+                // Commit the late call result and its completion acknowledgement
+                // together, so restart cannot replay a second delivery lane.
+                tx.execute(
+                    "UPDATE bash_tasks SET completion_delivered=1 WHERE task_id=?1",
+                    [task_id],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(TaskObservation {
+                recovered,
+                delivered_held_result,
+            });
         }
-        settle_with_tool_result_source(conn, &key, frame, outcome, None, now_ms(), body)?;
+        if let Some(row) = row {
+            validate_tool_result_source(frame, body)?;
+            settle_row(&tx, &row, frame, outcome, None, now_ms(), body)?;
+        }
     }
-    Ok(recovered)
+    tx.commit()?;
+    Ok(TaskObservation {
+        recovered,
+        delivered_held_result: false,
+    })
 }
 
 #[cfg(feature = "test-timing-hooks")]

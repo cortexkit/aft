@@ -1105,7 +1105,15 @@ fn offer(
                             return retry(FailureClass::Persistence, error);
                         }
                     }
-                    let outcome = runtime.block_on(send(&path, &address, &request));
+                    let send_request = |request: &SendRequest| {
+                        if completion {
+                            registry.send_runner_completion(&task_id, || runtime.block_on(send(&path, &address, request)))
+                                .unwrap_or(Outcome::Accepted)
+                        } else {
+                            runtime.block_on(send(&path, &address, request))
+                        }
+                    };
+                    let outcome = send_request(&request);
                     if completion && !address.worker {
                         if let Some(request) = idle_start_fallback(&request, &outcome) {
                             // A delivery refusal records no send_id on the runner, so the
@@ -1122,7 +1130,7 @@ fn offer(
                                 "runner notice task={task_id} session={} retrying without idle_start after delivery refusal",
                                 owner.session
                             );
-                            return runtime.block_on(send(&path, &address, &request));
+                            return send_request(&request);
                         }
                     }
                     outcome

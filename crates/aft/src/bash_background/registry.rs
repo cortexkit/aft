@@ -1798,6 +1798,10 @@ impl Drop for ForegroundWaitGuard {
 /// actor receiving the ack) still finds it.
 #[derive(Default)]
 pub(crate) struct DbWriteOrder {
+    /// Serializes recovered call settlement with the final runner notice send.
+    /// A failed settlement chooses the notice lane instead of losing the result.
+    recovered_delivery: Mutex<Option<bool>>,
+    recovered_reply_delivered: AtomicBool,
     captured: AtomicU64,
     /// The newest captured row not yet written.
     pending: Mutex<Option<PendingDbWrite>>,
@@ -3946,6 +3950,14 @@ impl BgTaskRegistry {
         let Some(pool) = self.inner.db_pool.read().ok().and_then(|pool| pool.clone()) else {
             return;
         };
+        let order = DbWriteOrder::for_task(&metadata.session_id, &metadata.task_id);
+        let mut delivery = order
+            .recovered_delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if delivery.is_some() {
+            return;
+        }
         let recovered = pool
             .lock()
             .ok()
@@ -3964,6 +3976,9 @@ impl BgTaskRegistry {
         if !recovered {
             return;
         }
+        // Every attempted recovery releases a waiting notice, including render
+        // and database failures. Only a committed held result suppresses it.
+        *delivery = Some(false);
         // Output rendering may read artifacts and take registry locks. Keep it
         // outside the database mutex and never take a task-state lock here.
         crate::slog_info!("recovered bash reply phase=render_started task={} status={:?} mode={:?} captured_bytes={:?} stdout={} stderr={}",
@@ -4009,7 +4024,7 @@ impl BgTaskRegistry {
                 frame.body.len()
             );
             if let Ok(conn) = pool.lock() {
-                if let Err(error) = crate::db::call_ledger::observe_task_with_tool_result_source(
+                match crate::db::call_ledger::observe_task_with_tool_result_source(
                     &conn,
                     &key.requester,
                     &key.key,
@@ -4019,7 +4034,16 @@ impl BgTaskRegistry {
                     tool_result_body.as_deref(),
                     unknown_result.as_ref(),
                 ) {
-                    crate::slog_warn!("call ledger recovered settlement failed: {error}");
+                    Ok(observation) if observation.delivered_held_result => {
+                        *delivery = Some(true);
+                        order
+                            .recovered_reply_delivered
+                            .store(true, Ordering::Release);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        crate::slog_warn!("call ledger recovered settlement failed: {error}")
+                    }
                 }
             }
         }
@@ -9103,8 +9127,33 @@ impl BgTaskRegistry {
 
     pub(crate) fn notice_metadata(&self, task_id: &str) -> Option<PersistedTask> {
         let task = self.task(task_id)?;
-        let state = task.lock_state().ok()?;
-        Some(state.metadata.clone())
+        let mut metadata = task.lock_state().ok()?.metadata.clone();
+        metadata.completion_delivered |= task
+            .db_write_order
+            .recovered_reply_delivered
+            .load(Ordering::Acquire);
+        Some(metadata)
+    }
+
+    /// Resolve a terminal hold even when no persistence callback reaches it,
+    /// then keep the delivery decision fenced through the actual notice send.
+    pub(crate) fn send_runner_completion<T>(
+        &self,
+        task_id: &str,
+        send: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.settle_detached_call(task_id);
+        let task = self.task(task_id)?;
+        let mut delivery = task
+            .db_write_order
+            .recovered_delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *delivery == Some(true) || task.drain_reply.snapshot().completion_delivered {
+            return None;
+        }
+        *delivery = Some(false);
+        Some(send())
     }
 
     fn task_watch_state(&self, task_id: &str) -> (bool, bool) {
@@ -15186,6 +15235,11 @@ impl BgTaskRegistry {
         // can fence any late snapshot instead of restoring a notification.
         let ack_state = owner.as_ref().and_then(|task| task.lock_state().ok());
         if metadata.completion_delivered
+            || owner.as_ref().is_some_and(|task| {
+                task.db_write_order
+                    .recovered_reply_delivered
+                    .load(Ordering::Acquire)
+            })
             || ack_state
                 .as_ref()
                 .is_some_and(|state| state.metadata.completion_delivered)
