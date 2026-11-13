@@ -23,7 +23,12 @@ fn shells_v1_operation_logs_are_once_per_event_and_content_free() {
             let dir = tempfile::tempdir().unwrap();
             let (snapshot, reader, _task) = captured(dir.path(), b"private output bytes", false, true);
             let task_id = snapshot.metadata.task_id.clone();
-            let service = Service::new(App::default_shared(), Arc::new(Executor::new()));
+            let app = App::default_shared();
+            app.open_db(&dir.path().join("aft.db")).unwrap();
+            let db = app.db().unwrap();
+            // A busy database makes refresh retain the seeded rows and readers.
+            let _database = db.lock().unwrap();
+            let service = Service::new(app, Arc::new(Executor::new()));
             let sample = super::super::samples::row(&task_id, "background", false);
             for index in 0..51 {
                 let mut row = sample.clone();
