@@ -1,1 +1,0 @@
-Shared temporary folders no longer start project watchers, indexing, or language-server discovery, regardless of how they are mounted. Projects in their subfolders still work normally. Index builds now skip unreadable folders, report the coverage gap, and retry them on the next rescan instead of failing the whole build.

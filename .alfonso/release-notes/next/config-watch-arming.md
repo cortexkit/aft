@@ -1,1 +1,0 @@
-- A config edit made while AFT was still starting its watch on the config folder is now picked up within about two seconds instead of being missed until the next edit.

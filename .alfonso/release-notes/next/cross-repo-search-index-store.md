@@ -1,1 +1,0 @@
-Cross-repository search keeps published index-store reads and the bounded unpublished-pattern fallback while removing unused unbounded trigram builds and comparisons of saved trigram indexes against files on disk.
