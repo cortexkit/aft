@@ -34,6 +34,8 @@ pub mod reuse;
 pub(crate) mod runtime;
 #[cfg(test)]
 mod rust_bin_targets_tests;
+#[cfg(feature = "callgraph-shape-census")]
+pub(crate) mod shape_census;
 pub(crate) mod slice;
 pub(crate) mod slice_cache;
 pub mod standing;

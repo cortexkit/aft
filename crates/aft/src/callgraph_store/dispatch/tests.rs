@@ -49,6 +49,172 @@ fn parse(source: &str, language: &str) -> ParseBlob {
     }
 }
 
+#[cfg(feature = "callgraph-shape-census")]
+#[test]
+fn shape_census_exact_exits_groups_and_memo_replay() {
+    use crate::data_layer::shape_census::Census;
+    use serde_json::json;
+
+    let mut census = Census::default();
+    let base = SiteHint {
+        ordinal: 0,
+        caller: Some("caller".into()),
+        line: 1,
+        member: Some("m".into()),
+        receiver: None,
+        dynamic: false,
+    };
+    let mut ts = parse(
+        "interface I { m(): void; } class A implements I { m() {} }",
+        "typescript",
+    );
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), &ts)]));
+    let memo = MemoizedResolver::new(&resolver);
+    let first = memo.resolve("fixture", &base);
+    assert_eq!(first.targets.len(), 2);
+    census.record("typescript", &base, resolver.census_exit.get(), &first);
+    // Interleave a different exit so merely keeping the last miss's exit
+    // would misclassify the following memo hit.
+    let dynamic = SiteHint {
+        dynamic: true,
+        ..base.clone()
+    };
+    let answer = memo.resolve("fixture", &dynamic);
+    census.record("typescript", &dynamic, resolver.census_exit.get(), &answer);
+    let repeated = SiteHint {
+        ordinal: 1,
+        line: 2,
+        ..base.clone()
+    };
+    let hit = memo.resolve("fixture", &repeated);
+    assert!(
+        std::rc::Rc::ptr_eq(&first, &hit),
+        "must exercise an actual memo hit"
+    );
+    census.record("typescript", &repeated, resolver.census_exit.get(), &hit);
+    drop(memo);
+    drop(resolver);
+
+    let mut check = |parsed: &ParseBlob, site: SiteHint, exit: &str| {
+        let resolver = Resolver::new(BTreeMap::from([("fixture".into(), parsed)]));
+        let answer = resolver.resolve("fixture", &site);
+        assert_eq!(resolver.census_exit.get(), exit);
+        census.record(&parsed.language, &site, resolver.census_exit.get(), &answer);
+    };
+    check(
+        &ts,
+        SiteHint {
+            member: None,
+            ..base.clone()
+        },
+        "missing_member",
+    );
+    check(
+        &ts,
+        SiteHint {
+            receiver: Some("missing".into()),
+            ..base.clone()
+        },
+        "missing_type",
+    );
+    check(
+        &ts,
+        SiteHint {
+            receiver: Some("A".into()),
+            ..base.clone()
+        },
+        "open_type",
+    );
+    ts.dispatch.types.iter_mut().for_each(|ty| ty.closed = true);
+    check(
+        &ts,
+        SiteHint {
+            receiver: Some("A".into()),
+            ..base.clone()
+        },
+        "exact",
+    );
+    let cpp = parse("class A { public: void m(); };", "cpp");
+    check(
+        &cpp,
+        SiteHint {
+            receiver: Some("A".into()),
+            ..base.clone()
+        },
+        "cpp_type_match",
+    );
+    let python = parse("class A:\n    def m(self): pass\n", "python");
+    check(
+        &python,
+        SiteHint {
+            receiver: Some("@super:A".into()),
+            ..base.clone()
+        },
+        "python_super",
+    );
+    check(&python, base.clone(), "unknown");
+    let mut go = parse("package p\ntype A struct{}\nfunc (a A) m() {}", "go");
+    go.dispatch.go_package = None;
+    check(&go, base.clone(), "unknown_go_package");
+    let go = parse("package p\ntype A struct{}\nfunc (a A) m() {}\ntype B struct{}\nfunc (b B) m() {}\ntype T struct{ A; B }", "go");
+    check(
+        &go,
+        SiteHint {
+            receiver: Some("T".into()),
+            ..base.clone()
+        },
+        "unknown_go_ambiguous",
+    );
+    let rust = parse("trait I { fn m(&self) {} } trait J { fn m(&self) {} } struct T; impl I for T {} impl J for T {}", "rust");
+    check(
+        &rust,
+        SiteHint {
+            receiver: Some("T".into()),
+            ..base.clone()
+        },
+        "unknown_rust_ambiguous",
+    );
+    check(
+        &rust,
+        SiteHint {
+            receiver: Some(format!("{TEMPLATE_SELF_RECEIVER}m")),
+            ..base.clone()
+        },
+        "rust_template_self",
+    );
+    let mut rust = parse("struct T; impl T { fn m(&self) {} }", "rust");
+    rust.dispatch.methods[0].shape = "legacy".into();
+    check(
+        &rust,
+        SiteHint {
+            receiver: Some("T".into()),
+            ..base
+        },
+        "rust_legacy_shape",
+    );
+
+    assert_eq!(
+        census.into_json(),
+        json!({
+            "schema_version": 1,
+            "groups": [
+                {"language":"go", "member":"m", "sites":2, "targets":0},
+                {"language":"python", "member":"m", "sites":1, "targets":0},
+                {"language":"rust", "member":"m", "sites":1, "targets":2},
+                {"language":"typescript", "member":"m", "sites":2, "targets":2}
+            ],
+            "language_totals": [
+                {"language":"cpp", "sites":1, "exits":{"cpp_type_match":1}},
+                {"language":"go", "sites":2, "exits":{"unknown_go_ambiguous":1,"unknown_go_package":1}},
+                {"language":"python", "sites":2, "exits":{"python_super":1,"unknown":1}},
+                {"language":"rust", "sites":3, "exits":{"rust_legacy_shape":1,"rust_template_self":1,"unknown_rust_ambiguous":1}},
+                {"language":"typescript", "sites":7, "exits":{"dynamic":1,"exact":1,"missing_member":1,"missing_type":1,"open_type":1,"unknown":2}}
+            ],
+            "top_callers": []
+        })
+    );
+}
+
 #[test]
 fn perf_audit2_dispatch_repeated_sites_do_not_rescan_the_project() {
     let parses = (0..128)

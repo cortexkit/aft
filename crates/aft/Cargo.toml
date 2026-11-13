@@ -110,6 +110,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 [features]
 # Source builds need CMake 3.18+ only when downloaded grammars are enabled.
 wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl"]
+# Offline call-graph measurements only; never enabled by production builds.
+callgraph-shape-census = []
 test-scope-owner = []
 # Explicit opt-in for cross-process timing controls used by integration tests.
 test-timing-hooks = []

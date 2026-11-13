@@ -1744,7 +1744,7 @@ impl Checkout {
             true,
             Some(encoded),
         );
-        super::callgraph::resolve_checkout_into(
+        let _census = super::callgraph::resolve_checkout_into(
             &mut inputs,
             self.layer.threads,
             measure.then_some(&mut report.memory),
@@ -1841,6 +1841,15 @@ impl Checkout {
             .map(|entry| entry.len)
             .sum();
         self.serve_new(snapshot, covered)?;
+        #[cfg(feature = "callgraph-shape-census")]
+        _census
+            .write_if_requested(
+                self.view()
+                    .expect("build published a checkout")
+                    .graph
+                    .as_ref(),
+            )
+            .map_err(DataError::Store)?;
         Ok(report)
     }
 

@@ -358,6 +358,13 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    #[cfg(feature = "callgraph-shape-census")]
+    ExclusionEntry {
+        file: "data_layer/shape_census.rs",
+        enclosing_item: "top_callers",
+        location_or_primitive: "truncate(10)",
+        reason: "Opt-in measurement export of the ten highest exact caller counts, not an agent-facing list.",
+    },
     ExclusionEntry {
         file: "exec_remote/read_only_note.rs",
         enclosing_item: "source_read_only_note",

@@ -1966,6 +1966,17 @@ pub struct Resolution {
     pub dynamic: usize,
 }
 
+// Keep classifications at the actual return sites. The annotation and its
+// storage disappear entirely in ordinary builds.
+macro_rules! census_exit {
+    ($resolver:expr, $exit:literal, $answer:expr) => {{
+        let answer = $answer;
+        #[cfg(feature = "callgraph-shape-census")]
+        $resolver.census_exit.set($exit);
+        answer
+    }};
+}
+
 /// Same-named methods in path order, each file's in file order.
 type NamedMethods<'a> = std::rc::Rc<Vec<(String, view::MethodGroup<'a>, &'a MethodHint)>>;
 
@@ -2013,6 +2024,8 @@ pub struct Resolver<'a> {
     /// Inputs read since the last [`Resolver::take_dependencies`], as
     /// [`dependency`] keys. A resolution can change only when one of them does.
     dependencies: std::cell::RefCell<BTreeSet<String>>,
+    #[cfg(feature = "callgraph-shape-census")]
+    pub(crate) census_exit: std::cell::Cell<&'static str>,
     #[cfg(test)]
     file_visits: std::cell::Cell<usize>,
 }
@@ -2087,6 +2100,8 @@ impl<'a> Resolver<'a> {
             methods_by_name: std::cell::OnceCell::new(),
             methods_loaded: Default::default(),
             dependencies: Default::default(),
+            #[cfg(feature = "callgraph-shape-census")]
+            census_exit: Default::default(),
             #[cfg(test)]
             file_visits: std::cell::Cell::new(0),
         }
@@ -2112,6 +2127,8 @@ impl<'a> Resolver<'a> {
             methods_by_name: std::cell::OnceCell::new(),
             methods_loaded: Default::default(),
             dependencies: Default::default(),
+            #[cfg(feature = "callgraph-shape-census")]
+            census_exit: Default::default(),
             #[cfg(test)]
             file_visits: std::cell::Cell::new(0),
         }
@@ -2743,45 +2760,61 @@ impl<'a> Resolver<'a> {
     pub fn resolve(&self, file: &str, site: &SiteHint) -> Resolution {
         let parse = self.lookup(file).expect("resolved file has facts");
         if site.dynamic {
-            return Resolution {
-                dynamic: 1,
-                ..Resolution::default()
-            };
+            return census_exit!(
+                self,
+                "dynamic",
+                Resolution {
+                    dynamic: 1,
+                    ..Resolution::default()
+                }
+            );
         }
         let Some(member) = &site.member else {
-            return Resolution::default();
+            return census_exit!(self, "missing_member", Resolution::default());
         };
         if parse.language == "go" && parse.dispatch.go_package.is_none() {
-            return self.unknown("go", member);
+            return census_exit!(self, "unknown_go_package", self.unknown("go", member));
         }
         let Some(receiver) = &site.receiver else {
-            return self.unknown(&parse.language, member);
+            return census_exit!(self, "unknown", self.unknown(&parse.language, member));
         };
         if parse.language == "rust" {
             if let Some(symbol) = receiver.strip_prefix(TEMPLATE_SELF_RECEIVER) {
-                return Resolution {
-                    targets: BTreeSet::from([Target {
-                        file: file.to_string(),
-                        symbol: symbol.to_string(),
-                        provenance: "name_match",
-                    }]),
-                    ..Resolution::default()
-                };
+                return census_exit!(
+                    self,
+                    "rust_template_self",
+                    Resolution {
+                        targets: BTreeSet::from([Target {
+                            file: file.to_string(),
+                            symbol: symbol.to_string(),
+                            provenance: "name_match",
+                        }]),
+                        ..Resolution::default()
+                    }
+                );
             }
         }
         if parse.language == "cpp" {
-            return self.cpp_type_match(file, site.caller.as_deref(), receiver, member);
+            return census_exit!(
+                self,
+                "cpp_type_match",
+                self.cpp_type_match(file, site.caller.as_deref(), receiver, member)
+            );
         }
         if parse.language == "python" {
             if let Some(owner) = receiver.strip_prefix("@super:") {
-                return self.python_super(file, owner, member);
+                return census_exit!(self, "python_super", self.python_super(file, owner, member));
             }
         }
         let Some((type_file, ty)) = self.project_type(file, receiver) else {
-            return Resolution {
-                external: 1,
-                ..Resolution::default()
-            };
+            return census_exit!(
+                self,
+                "missing_type",
+                Resolution {
+                    external: 1,
+                    ..Resolution::default()
+                }
+            );
         };
         let associated = parse.language == "rust" && self.associated_site(file, site.ordinal);
         let mut exact = self.nearest(&type_file, ty, member, &mut BTreeSet::new(), associated);
@@ -2797,16 +2830,20 @@ impl<'a> Resolver<'a> {
                         .is_some_and(|method| rust_receiver_shape(&method.shape).is_none())
                 })
             {
-                return Resolution {
-                    unresolved: 1,
-                    protected: self
-                        .methods_named(member)
-                        .iter()
-                        .filter(|(_, parse, _)| parse.language() == "rust")
-                        .map(|(file, _, method)| (file.clone(), method.symbol.clone()))
-                        .collect(),
-                    ..Resolution::default()
-                };
+                return census_exit!(
+                    self,
+                    "rust_legacy_shape",
+                    Resolution {
+                        unresolved: 1,
+                        protected: self
+                            .methods_named(member)
+                            .iter()
+                            .filter(|(_, parse, _)| parse.language() == "rust")
+                            .map(|(file, _, method)| (file.clone(), method.symbol.clone()))
+                            .collect(),
+                        ..Resolution::default()
+                    }
+                );
             }
             let methods = self
                 .known_file(&type_file)
@@ -2864,12 +2901,20 @@ impl<'a> Resolver<'a> {
                     )
                 });
                 if exact.len() > 1 {
-                    return self.unknown(&parse.language, member);
+                    return census_exit!(
+                        self,
+                        "unknown_rust_ambiguous",
+                        self.unknown(&parse.language, member)
+                    );
                 }
             }
         }
         if parse.language == "go" && exact.len() > 1 {
-            return self.unknown(&parse.language, member);
+            return census_exit!(
+                self,
+                "unknown_go_ambiguous",
+                self.unknown(&parse.language, member)
+            );
         }
         let mut targets = exact
             .into_iter()
@@ -2930,11 +2975,20 @@ impl<'a> Resolver<'a> {
             }
         }
         let external = usize::from(targets.is_empty());
-        Resolution {
+        let answer = Resolution {
             targets,
             external,
             ..Resolution::default()
-        }
+        };
+        #[cfg(feature = "callgraph-shape-census")]
+        self.census_exit.set(
+            if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
+                "open_type"
+            } else {
+                "exact"
+            },
+        );
+        answer
     }
 }
 
@@ -2948,7 +3002,12 @@ pub struct MemoizedResolver<'r, 'a> {
 
 /// A memoized answer with the dependency keys computing it recorded, which a
 /// later hit records again.
-type MemoizedResolution = (std::rc::Rc<Resolution>, std::rc::Rc<BTreeSet<String>>);
+struct MemoizedResolution {
+    resolved: std::rc::Rc<Resolution>,
+    dependencies: std::rc::Rc<BTreeSet<String>>,
+    #[cfg(feature = "callgraph-shape-census")]
+    census_exit: &'static str,
+}
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 struct ResolutionKey {
@@ -2994,12 +3053,15 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
                 _ => None,
             },
         };
-        if let Some((resolved, dependencies)) = self.resolved.borrow().get(&key) {
+        if let Some(answer) = self.resolved.borrow().get(&key) {
             self.resolver
                 .dependencies
                 .borrow_mut()
-                .extend(dependencies.iter().cloned());
-            return resolved.clone();
+                .extend(answer.dependencies.iter().cloned());
+            // Count every site, not just cache misses, under the original exit.
+            #[cfg(feature = "callgraph-shape-census")]
+            self.resolver.census_exit.set(answer.census_exit);
+            return answer.resolved.clone();
         }
         let outer = self.resolver.take_dependencies();
         let resolved = std::rc::Rc::new(self.resolver.resolve(file, site));
@@ -3012,9 +3074,15 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
         // Large projects can have almost one distinct receiver expression per
         // site. Retain the hot set, not every answer for the whole manifest.
         if self.resolved.borrow().len() < 4096 {
-            self.resolved
-                .borrow_mut()
-                .insert(key, (resolved.clone(), std::rc::Rc::new(dependencies)));
+            self.resolved.borrow_mut().insert(
+                key,
+                MemoizedResolution {
+                    resolved: resolved.clone(),
+                    dependencies: std::rc::Rc::new(dependencies),
+                    #[cfg(feature = "callgraph-shape-census")]
+                    census_exit: self.resolver.census_exit.get(),
+                },
+            );
         }
         resolved
     }
