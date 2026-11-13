@@ -780,7 +780,12 @@ fn drain_with_live_lsp_servers_and_writer(
         std::fs::write(
             config_dir.join("aft.jsonc"),
             serde_json::to_vec(&json!({
-                "storage_dir": storage.path(), "indexes": { "trigram": false, "semantic": false, "callgraph": false }
+                "storage_dir": storage.path(),
+                // Exercise shutdown of every fixture server, not capacity eviction
+                // of older roots before the exit phase begins. Only the user tier
+                // may raise the process-wide budget above the default.
+                "lsp": { "max_servers": server_count },
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))
             .unwrap(),
         )

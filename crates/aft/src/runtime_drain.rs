@@ -4455,7 +4455,12 @@ mod idle_lsp_tests {
             !worker.is_finished(),
             "initialize delay must still hold the server"
         );
-        assert_eq!(ctx.lsp().server_count(), 0);
+        assert_eq!(ctx.lsp().active_client_count(), 0);
+        assert_eq!(
+            ctx.lsp().server_count(),
+            1,
+            "initialization reserves one slot"
+        );
         let pids = ctx.lsp_child_registry().pids();
         assert_eq!(pids.len(), 1);
 
