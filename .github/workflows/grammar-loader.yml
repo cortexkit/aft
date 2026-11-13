@@ -58,6 +58,18 @@ jobs:
           cargo test --locked -p agent-file-tools --features test-hooks --lib -- grammar_
       - name: Process restart and concurrent publication
         run: cargo test --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
+      - name: Hardened Pulley smoke without executable-memory entitlements
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked -p agent-file-tools --bin aft
+          smoke="$PWD/target/grammar-hardened-smoke"
+          mkdir -p "$smoke/storage/grammars" "$smoke/home" "$smoke/config" "$smoke/cache" "$smoke/state" "$smoke/data" "$smoke/tmp"
+          hash="$(python3 -c 'import json; print(json.load(open("crates/aft/src/grammar/manifest.json"))["sha256"])')"
+          cp "crates/aft/tests/fixtures/grammars/$hash.wasm" "$smoke/storage/grammars/"
+          cp target/debug/aft "$smoke/aft"
+          codesign --force --sign - --identifier ck-aft -o runtime --entitlements scripts/ck-aft.entitlements.plist "$smoke/aft"
+          sandbox-exec -p '(version 1) (allow default) (deny network*)' env -u AFT_STORAGE_DIR -u AFT_CACHE_DIR HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" XDG_CACHE_HOME="$smoke/cache" XDG_STATE_HOME="$smoke/state" XDG_DATA_HOME="$smoke/data" TMPDIR="$smoke/tmp" "$smoke/aft" grammar-smoke --storage-dir "$smoke/storage" --file "$PWD/grammars/corpus/features.luau" > "$smoke/result.json"
+          python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["engine_target"] == "pulley64"; assert not v["test_seams"]; assert v["tree"].startswith("(chunk ")' "$smoke/result.json"
       - name: Fixed Pulley engine and no native cache
         run: |
           cargo tree --locked -p agent-file-tools -e features > grammar-features.txt
