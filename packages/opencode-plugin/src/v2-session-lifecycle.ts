@@ -2,7 +2,7 @@ import { Cause, Effect, Stream } from "effect";
 import { markHeldBgCompletions } from "./bg-notifications.js";
 import { error as logError, warn } from "./logger.js";
 import { releaseSessionState } from "./shared/session-cleanup.js";
-import { clearSessionDirectory } from "./shared/session-directory.js";
+import { clearSessionDirectory, getSessionDirectoryForEvent } from "./shared/session-directory.js";
 import { resolveSubagentStatus } from "./shared/subagent-detect.js";
 import { callBashBridge } from "./tools/_shared.js";
 import type { PluginContext } from "./types.js";
@@ -179,12 +179,21 @@ async function killStoppedBackgroundTasks(
       dispatch(taskId, kill);
     }
   }
-  if (ctx) {
+  const directory = ctx
+    ? await getSessionDirectoryForEvent(
+        client,
+        sessionID,
+        (client as { location: { directory: string } }).location.directory,
+      )
+    : null;
+  if (ctx && directory) {
     // Persisted tasks survive a plugin reload. Bind the query and each kill
     // as the stopped owner; task records do not prove parent-child links.
+    // A deleted session may no longer be resolvable. Do not bind it to this
+    // Location merely because a location-less event reached its subscription.
     const runtime = {
       sessionID,
-      directory: (client as { location: { directory: string } }).location.directory,
+      directory,
       directoryIsSessionRoot: true,
     };
     try {
