@@ -1385,7 +1385,7 @@ pub(crate) fn with_memory_walk_clock_for_test<T>(now: Instant, refresh: impl FnO
 }
 
 #[cfg(test)]
-fn memory_walk_now_for_test() -> Instant {
+pub(crate) fn memory_walk_now_for_test() -> Instant {
     MEMORY_WALK_CLOCK.with(|clock| clock.get().unwrap_or_else(Instant::now))
 }
 

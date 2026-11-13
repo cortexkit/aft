@@ -1947,19 +1947,35 @@ impl DataCheckout {
         // Read before the walk: a change during it moves the epoch, so the
         // next ask walks again.
         let epoch = self.checkout().memory_epoch();
+        #[cfg(not(test))]
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = crate::context::memory_walk_now_for_test();
         if let Some((at, walked_at, figure)) = slot.as_ref() {
-            if *walked_at == epoch && at.elapsed() < MEMORY_FIGURE_MAX_AGE {
+            if *walked_at == epoch && now.saturating_duration_since(*at) < MEMORY_FIGURE_MAX_AGE {
                 return figure.clone();
             }
         }
+        #[cfg(test)]
+        MEMORY_FIGURE_WALKS.with(|walks| walks.set(walks.get() + 1));
         let figure = walk();
-        *slot = Some((Instant::now(), epoch, figure.clone()));
+        *slot = Some((now, epoch, figure.clone()));
         figure
     }
 
     pub(crate) fn meaning_memory(&self, seen: &mut aft_store::heap::Seen) -> Option<usize> {
         self.work.meaning.memory(seen)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MEMORY_FIGURE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn memory_figure_walks_for_test() -> usize {
+    MEMORY_FIGURE_WALKS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

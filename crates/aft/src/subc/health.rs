@@ -3532,6 +3532,10 @@ mod rollup_bench;
 #[path = "health/rollup_stage_profile.rs"]
 mod rollup_stage_profile;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "health/memory_engine_profile.rs"]
+mod memory_engine_profile;
+
 macro_rules! rollup_mark {
     ($timer:ident, $step:literal) => {
         $timer.mark($step);
