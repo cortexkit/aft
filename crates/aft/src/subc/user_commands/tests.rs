@@ -721,19 +721,48 @@ async fn user_commands_real_management_routes_admit_only_occipital_and_keep_bodi
     )
     .unwrap();
     write_frame(&mut daemon, &ack).await.unwrap();
-    for (channel, principal) in [(41, occipital()), (42, Principal::Direct)] {
+    for (channel, principal, target, harness, session, role_versions) in [
+        (
+            41,
+            occipital(),
+            RouteTarget::ManagementSurface {
+                module_id: "aft".into(),
+            },
+            "operator",
+            "commands:41",
+            None,
+        ),
+        (
+            42,
+            Principal::Direct,
+            RouteTarget::ManagementSurface {
+                module_id: "aft".into(),
+            },
+            "operator",
+            "commands:42",
+            None,
+        ),
+        (
+            43,
+            occipital(),
+            RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            "occipital",
+            "display-views",
+            Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+        ),
+    ] {
         let bind = serde_json::to_value(ModuleControlRequest::RouteBind {
             route_channel: channel,
             epoch: 1,
-            target: RouteTarget::ManagementSurface {
-                module_id: "aft".into(),
-            },
-            identity: subc_protocol::BindIdentity::new("operator", format!("commands:{channel}")),
+            target,
+            identity: subc_protocol::BindIdentity::new(harness, session),
             principal: Some(principal),
             consumer_capabilities: None,
             admission_facts: Default::default(),
             scope: None,
-            role_versions: None,
+            role_versions,
             call_mode: None,
         })
         .unwrap();
@@ -824,6 +853,86 @@ async fn user_commands_real_management_routes_admit_only_occipital_and_keep_bodi
             .unwrap()
             .code,
         "route_not_admitted"
+    );
+    let pins: Vec<_> = tool_views::SHIPPED.keys().cloned().collect();
+    for channel in [41, 43] {
+        for body in [
+            json!({"op":"role.describe"}),
+            json!({"op":"tool.catalog","preset":"reader"}),
+            json!({"op":"tool.views","pins":pins}),
+            request("commands.describe"),
+        ] {
+            let reply = exchange(&mut daemon, FrameType::Request, channel, 7, body.clone()).await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "{channel}: {body}: {:?}",
+                reply.body
+            );
+            let answer: Value = serde_json::from_slice(&reply.body).unwrap();
+            match body["op"].as_str() {
+                Some("role.describe") => assert_eq!(answer, tool_provider::describe()),
+                Some("tool.views") => {
+                    assert_eq!(answer["views"].as_object().unwrap().len(), pins.len());
+                    for pin in &pins {
+                        assert_eq!(answer["views"][pin]["template_revision"], 1);
+                    }
+                }
+                Some("tool.catalog") => assert!(answer["tools"].is_array()),
+                _ => assert_eq!(answer["commands"][0]["id"], "status"),
+            }
+        }
+        for body in [
+            json!({"op":"health.digest","params":{}}),
+            json!({"op":"tool.call","name":"read","arguments":{"path":"Cargo.toml"}}),
+            json!({"op":"tool.withdraw","call_key":"not-a-call"}),
+        ] {
+            let refused = exchange(&mut daemon, FrameType::Request, channel, 8, body.clone()).await;
+            assert_eq!(refused.header.ty, FrameType::Error, "{channel}: {body}");
+            let error: ErrorBody = serde_json::from_slice(&refused.body).unwrap();
+            assert_eq!(
+                error.code,
+                if channel == 41 {
+                    "route_not_admitted"
+                } else {
+                    PROJECT_REQUIRED_CODE
+                }
+            );
+        }
+    }
+    for op in ["late_results", "late_results.ack"] {
+        let refused = exchange(&mut daemon, FrameType::Request, 41, 9, json!({"op":op})).await;
+        assert_eq!(refused.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::from_slice::<ErrorBody>(&refused.body)
+                .unwrap()
+                .code,
+            "route_not_admitted"
+        );
+    }
+    let custody = exchange(
+        &mut daemon,
+        FrameType::Request,
+        43,
+        10,
+        json!({"op":"late_results","since":null}),
+    )
+    .await;
+    assert_eq!(custody.header.ty, FrameType::Response, "{:?}", custody.body);
+    let invalid_ack = exchange(
+        &mut daemon,
+        FrameType::Request,
+        43,
+        11,
+        json!({"op":"late_results.ack"}),
+    )
+    .await;
+    assert_eq!(invalid_ack.header.ty, FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<ErrorBody>(&invalid_ack.body)
+            .unwrap()
+            .code,
+        "invalid_request"
     );
     drop(daemon);
     thread.join().unwrap().unwrap();

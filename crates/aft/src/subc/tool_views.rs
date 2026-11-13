@@ -108,13 +108,15 @@ mod tests {
                 "first served definition changed for {pin}"
             );
             for old in kept.history {
+                assert_ne!(
+                    fetched.template, old.template,
+                    "catalog refresh must change the published template bytes for {pin}"
+                );
                 assert_eq!(fetched.template_revision, old.template_revision + 1);
-                assert!(
-                    matches!(
-                        fetched.compare_with_kept(&old),
-                        ViewChange::Same | ViewChange::NewerTemplate
-                    ),
-                    "changed frozen view: {pin}"
+                assert_eq!(
+                    fetched.compare_with_kept(&old),
+                    ViewChange::NewerTemplate,
+                    "changed template must be accepted as a newer revision for {pin}"
                 );
                 let mut expected_template = old.template;
                 for slot in ["row", "page"] {
