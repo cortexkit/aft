@@ -9086,15 +9086,20 @@ mod tests {
             .and_then(|metrics| metrics.get("dispatch_liveness"))
             .expect("dispatch_liveness metric");
         assert_eq!(dispatch.get("scheduler_busy"), None);
-        assert_eq!(
-            report
-                .metrics
-                .as_ref()
-                .and_then(
-                    |metrics| metrics["dispatch_path"]["deferred_bash_waits_in_flight"].as_u64()
-                ),
-            Some(0)
-        );
+        let report_metrics = report.metrics.as_ref().unwrap();
+        // Ancillary dispatch-path telemetry may yield before the queued roots' diagnostics.
+        if report_metrics["dispatch_path"]["omitted"] == true {
+            assert!(report_metrics["metrics_fields_omitted"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("dispatch_path")));
+            assert!(report_metrics["dispatch_path"]["bytes"].as_u64().unwrap() > 0);
+        } else {
+            assert_eq!(
+                report_metrics["dispatch_path"]["deferred_bash_waits_in_flight"],
+                0
+            );
+        }
         assert_eq!(dispatch["interactive"]["queued"].as_u64(), Some(1));
         assert_eq!(
             dispatch["running"]["phantom"]["interactive"].as_u64(),
@@ -9290,11 +9295,13 @@ mod tests {
                     .expect("omitted cache root count"),
             50
         );
-        assert_eq!(report_metrics["memory"]["roots_total"].as_u64(), Some(50));
+        // Ancillary memory detail yields before root diagnostics in the bounded reply.
+        assert_eq!(report_metrics["memory"]["omitted"], true);
+        let (snapshot, _) = fifty_cache.snapshot();
+        let memory = &snapshot.metrics["memory"];
+        assert_eq!(memory["roots_total"].as_u64(), Some(50));
         assert_eq!(
-            report_metrics["memory"]["roots"]
-                .as_object()
-                .map(serde_json::Map::len),
+            memory["roots"].as_object().map(serde_json::Map::len),
             Some(8)
         );
         assert!(
@@ -9876,7 +9883,11 @@ mod tests {
         .unwrap()
         .clone();
         budget_health_metrics(&mut metrics);
-        assert_eq!(metrics["manifest_sync"], sync);
+        // Ancillary manifest telemetry yields before any of the hundred root rows.
+        assert_eq!(
+            metrics["manifest_sync"],
+            json!({"omitted": true, "bytes": serde_json::to_vec(&sync).unwrap().len()})
+        );
         assert!(encoded_health_metrics_len(&metrics) <= HEALTH_METRICS_BUDGET_BYTES);
     }
 
@@ -10292,8 +10303,8 @@ mod tests {
         let parent = tempfile::tempdir().expect("standing fixture parent");
         let mut base = parent.path().to_path_buf();
         if long_paths {
-            // Repeated directory paths must force abbreviation under the health
-            // metrics byte budget, even with a short system temp directory.
+            // Repeated directory paths force budget pressure even with a short
+            // system temp directory, so ancillary telemetry must yield.
             // Each component stays below NAME_MAX and complete paths stay below
             // macOS's PATH_MAX.
             while base.as_os_str().len() < 700 {
@@ -10366,10 +10377,12 @@ mod tests {
             assert_eq!(root_row["standing_entry"], literal_path);
         }
         if long_paths {
-            assert_eq!(
-                root_row["abbreviated"], true,
-                "fixture must exhaust the budget"
-            );
+            // Ancillary telemetry yields first so the full standing refusal remains readable.
+            assert!(root_row.get("abbreviated").is_none());
+            assert!(!metrics["metrics_fields_omitted"]
+                .as_array()
+                .unwrap()
+                .is_empty());
         }
         assert_eq!(metrics["root_details_omitted"], 0);
         assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
