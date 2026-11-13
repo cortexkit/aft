@@ -1372,6 +1372,98 @@ fn v22_review_reply_carries_the_thread_from_the_path_and_one_body() {
 }
 
 #[test]
+fn v22_api_writes_explain_why_output_filters_are_unsupported() {
+    for (method, endpoint) in [
+        ("POST", "repos/cortexkit/aft/pulls/7/comments/99/replies"),
+        ("PATCH", "repos/cortexkit/aft/pulls/7"),
+    ] {
+        for (suffix, flag) in [
+            (vec!["--jq", ".user.login"], "--jq"),
+            (vec!["--jq=.user.login"], "--jq"),
+            (vec!["-q", ".user.login"], "-q"),
+            (vec!["-q=.user.login"], "-q"),
+            (vec!["-q.user.login"], "-q.user.login"),
+            (vec!["-q.user.login==\"bot\""], "-q.user.login==\"bot\""),
+            (vec!["--template", "{{.user.login}}"], "--template"),
+            (vec!["--template={{.user.login}}"], "--template"),
+            (vec!["-t", "{{.user.login}}"], "-t"),
+            (vec!["-t={{.user.login}}"], "-t"),
+            (vec!["-t{{.user.login}}"], "-t{{.user.login}}"),
+        ] {
+            let mut raw = vec!["api", "-X", method, endpoint, "-f", "body=Fixed"];
+            raw.extend(suffix);
+            let error = api_request(&raw, "").unwrap_err();
+            assert_eq!(error.code, RefusalCode::UnsupportedFlag, "{raw:?}");
+            assert_eq!(
+                refusal_line(error.code, &error.text),
+                format!(
+                    "gh-shim: gh_shim_unsupported_flag: {flag}: a post as the bot prints only the link to what it posted, so there is nothing for --jq/-q or --template/-t to filter; read the item back with a gh api GET, which accepts them"
+                ),
+                "{raw:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn v22_api_writes_keep_other_undeclared_flag_refusals() {
+    for flag in ["--paginate", "--jqish", "--templateish"] {
+        let error = api_request(
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/cortexkit/aft/pulls/7/comments/99/replies",
+                "-f",
+                "body=Fixed",
+                flag,
+            ],
+            "",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RefusalCode::Unclassified, "{flag}");
+        assert_eq!(
+            refusal_line(error.code, &error.text),
+            format!("gh-shim: gh_shim_unclassified: undeclared flag {flag}"),
+            "{flag}"
+        );
+    }
+}
+
+#[test]
+fn v22_api_get_with_short_jq_delegates_unchanged() {
+    let manifest = manifest();
+    let argv = args(&[
+        "api",
+        "-X",
+        "GET",
+        "repos/cortexkit/aft/pulls/comments/99",
+        "-q",
+        ".user.login",
+    ]);
+    let classification = classify(&argv, &manifest, "linux");
+    assert!(matches!(classification, Classification::Mechanical));
+    let root = tempfile::tempdir().unwrap();
+    let mut delegated = false;
+    let status = dispatch_r3(
+        &argv,
+        classification,
+        &manifest,
+        &StatePaths::from_root(root.path().to_path_buf()),
+        &rung(),
+        &binding(),
+        1_700_000_000,
+        |actual| {
+            assert_eq!(actual, argv);
+            delegated = true;
+            0
+        },
+    );
+    assert!(delegated);
+    assert_eq!(status, 0);
+}
+
+#[test]
 fn v22_review_thread_mutations_route_the_thread_node_id() {
     let _lock = crate::test_env::process_env_lock();
     let _repo = EnvGuard::set("GH_REPO", Some("cortexkit/aft"));
