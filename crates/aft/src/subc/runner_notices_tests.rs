@@ -442,11 +442,14 @@ impl HeldCompletion {
         });
         let paths =
             crate::bash_background::persistence::resolve_task(task.storage.path(), id, id).unwrap();
-        std::fs::write(&paths.stdout, "recovered held output\n").unwrap();
+        std::fs::write(&paths.paths.stdout, "recovered held output\n").unwrap();
         let conn = db.lock().unwrap();
         crate::db::bash_tasks::upsert_bash_task(
             &conn,
-            &state.metadata.to_bash_task_row("runner", &paths).unwrap(),
+            &state
+                .metadata
+                .to_bash_task_row("runner", &paths.paths)
+                .unwrap(),
         )
         .unwrap();
         let scope = ledger::ScopeIdentity {
@@ -482,7 +485,24 @@ impl HeldCompletion {
             .unwrap()
             .unwrap();
         assert_eq!(row.state, crate::db::call_ledger::State::Settled);
-        serde_json::from_str(&row.late_entry.unwrap()).unwrap()
+        let page: serde_json::Value = serde_json::from_slice(
+            &crate::db::call_ledger::late_results(
+                &conn,
+                &self.key.carrier,
+                "held-notice-test",
+                None,
+                None,
+                crate::db::call_ledger::now_ms(),
+                1_000_000,
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["call_key"], self.key.call_key);
+        entries[0].clone()
     }
 
     fn offer(&self, scheduler: &Scheduler) {
@@ -499,7 +519,14 @@ fn runner_notices_recovered_held_call_after_route_reopens_delivers_only_call_res
     // Retain an already-queued completion across the runner's route restart.
     held.offer(&scheduler);
     route_unbound(&held.task.route);
-    let reopened = held.task.route.clone();
+    let mut reopened = super::super::test_support::route_identity_with_harness(
+        &held.task.route.root,
+        &held.task.task,
+        BindTrust::FirstParty,
+        "opencode2",
+    );
+    Arc::get_mut(&mut reopened.0).unwrap().spawn_principal =
+        held.task.route.spawn_principal.clone();
     route_bound(held.task.registry.clone(), &reopened);
     held.task.registry.settle_detached_call(&held.task.task);
     assert!(held.result()["result"]["content"]
@@ -517,7 +544,7 @@ fn runner_notices_recovered_held_call_after_route_reopens_delivers_only_call_res
 }
 
 #[test]
-fn runner_notices_recovered_held_call_cancelled_before_completion_keeps_notice() {
+fn runner_notices_recovered_held_call_withdrawn_before_completion_keeps_notice() {
     let held = HeldCompletion::new("bash-00000000000b0102");
     let capture = test_endpoint::capture(&held.task.task, false);
     let scheduler = Scheduler::default();
@@ -553,6 +580,33 @@ fn runner_notices_recovered_held_call_cancelled_before_completion_keeps_notice()
         1,
         "withdrawn calls need their completion notice"
     );
+}
+
+#[test]
+fn runner_notices_recovered_held_call_cancelled_before_completion_keeps_notice() {
+    let held = HeldCompletion::new("bash-00000000000b0106");
+    let capture = test_endpoint::capture(&held.task.task, false);
+    let scheduler = Scheduler::default();
+    held.offer(&scheduler);
+    let cancelled = crate::db::call_ledger::RecordedFrame {
+        ty: FrameType::Error,
+        body: br#"{"code":"cancelled","message":"call cancelled by runner"}"#.to_vec(),
+    };
+    crate::db::call_ledger::settle(
+        &held.db.lock().unwrap(),
+        &held.key,
+        &cancelled,
+        "cancelled",
+        None,
+        crate::db::call_ledger::now_ms(),
+    )
+    .unwrap();
+    held.task.registry.settle_detached_call(&held.task.task);
+    assert!(matches!(
+        step(&scheduler, std::time::Instant::now()),
+        Next::Done
+    ));
+    assert_eq!(capture.receiver.try_iter().count(), 1);
 }
 
 #[test]

@@ -1775,6 +1775,12 @@ impl Drop for ForegroundWaitGuard {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveredDelivery {
+    CallResult,
+    Notice,
+}
+
 /// Sequencing for a task's aft.db mirror.
 ///
 /// The JSON metadata is written while `BgTask::state` is held, so the file
@@ -1800,7 +1806,7 @@ impl Drop for ForegroundWaitGuard {
 pub(crate) struct DbWriteOrder {
     /// Serializes recovered call settlement with the final runner notice send.
     /// A failed settlement chooses the notice lane instead of losing the result.
-    recovered_delivery: Mutex<Option<bool>>,
+    recovered_delivery: Mutex<Option<RecoveredDelivery>>,
     recovered_reply_delivered: AtomicBool,
     captured: AtomicU64,
     /// The newest captured row not yet written.
@@ -3978,7 +3984,7 @@ impl BgTaskRegistry {
         }
         // Every attempted recovery releases a waiting notice, including render
         // and database failures. Only a committed held result suppresses it.
-        *delivery = Some(false);
+        *delivery = Some(RecoveredDelivery::Notice);
         // Output rendering may read artifacts and take registry locks. Keep it
         // outside the database mutex and never take a task-state lock here.
         crate::slog_info!("recovered bash reply phase=render_started task={} status={:?} mode={:?} captured_bytes={:?} stdout={} stderr={}",
@@ -4035,7 +4041,7 @@ impl BgTaskRegistry {
                     unknown_result.as_ref(),
                 ) {
                     Ok(observation) if observation.delivered_held_result => {
-                        *delivery = Some(true);
+                        *delivery = Some(RecoveredDelivery::CallResult);
                         order
                             .recovered_reply_delivered
                             .store(true, Ordering::Release);
@@ -9149,10 +9155,12 @@ impl BgTaskRegistry {
             .recovered_delivery
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if *delivery == Some(true) || task.drain_reply.snapshot().completion_delivered {
+        if *delivery == Some(RecoveredDelivery::CallResult)
+            || task.drain_reply.snapshot().completion_delivered
+        {
             return None;
         }
-        *delivery = Some(false);
+        *delivery = Some(RecoveredDelivery::Notice);
         Some(send())
     }
 
