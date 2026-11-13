@@ -385,6 +385,7 @@ const GREP_SEARCH_GREP_HINT =
 
 const GREP_SEARCH_HINT_PREFIX = "DO NOT search code by running grep/rg in bash —";
 const GREP_SEARCH_FRESHNESS_WINDOW_MS = 60_000;
+const MTIME_CLOCK_SLACK_MS = 1;
 
 type Quote = "none" | "single" | "double";
 
@@ -708,8 +709,11 @@ function shouldSuppressResolvedPath(resolved: string): boolean | undefined {
   try {
     const stats = fs.statSync(resolved);
     if (stats.isFile()) return true;
+    // mtimeMs keeps sub-millisecond precision while Date.now() is whole
+    // milliseconds, so a directory changed in this same millisecond reads as
+    // slightly in the future. Allow that much; a later mtime is not fresh.
     const ageMs = Date.now() - stats.mtimeMs;
-    return ageMs >= 0 && ageMs < GREP_SEARCH_FRESHNESS_WINDOW_MS;
+    return ageMs > -MTIME_CLOCK_SLACK_MS && ageMs < GREP_SEARCH_FRESHNESS_WINDOW_MS;
   } catch {
     return undefined;
   }

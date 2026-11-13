@@ -806,3 +806,23 @@ describe("maybeAppendGrepSearchHint — redirection operand scan terminates", ()
     expect(out).toContain(AFT_SEARCH_HINT);
   });
 });
+
+describe("maybeAppendGrepSearchHint — directory changed this millisecond", () => {
+  test("a sub-millisecond-newer mtime counts as fresh, a later one does not", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-hint-mtime-"));
+    const dir = path.join(root, "app");
+    fs.mkdirSync(dir);
+    const now = 1_800_000_000_000;
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    try {
+      // The filesystem keeps sub-millisecond mtimes; Date.now() is whole ms.
+      fs.utimesSync(dir, new Date(now), (now + 0.6) / 1000);
+      expect(maybeAppendGrepSearchHint("hit", "rg foo app", false, root)).toBe("hit");
+      fs.utimesSync(dir, new Date(now), (now + 5_000) / 1000);
+      expect(maybeAppendGrepSearchHint("hit", "rg foo app", false, root)).not.toBe("hit");
+    } finally {
+      clock.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
