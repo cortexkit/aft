@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Reproduce the linked-worktree RAM-overlay search gaps (issues #337, #338).
+"""Check linked-worktree search startup and watcher-rescan coverage.
 
-A linked worktree with `worktree.ram_overlay: true` borrows the home checkout's
-shared trigram `cache.bin` read-only and layers watcher events on top in RAM.
-This harness checks two ways that overlay can miss content:
+Every checkout has its own index state. This harness checks two ways it can
+miss local content:
 
 * startup: everything that already differs from the shared snapshot when the
   worktree's AFT process starts (branch commits, new files, uncommitted edits,
   untracked files) must be searchable once search reports `Ready`;
 * rescan: after a watcher overflow rescan, an edit made earlier in the session
-  must still be searchable once the borrowed snapshot is reloaded.
+  must still be searchable once the checkout index is ready again.
 
 Every AFT process runs with an isolated `AFT_STORAGE_DIR`, HOME, and XDG roots.
 The rescan phase forces an FSEvents overflow by stopping the process, touching
@@ -159,11 +158,10 @@ def build_fixture(base: Path, env: dict[str, str], filler: int) -> tuple[Path, P
     return home, worktree
 
 
-def configure(client: AftClient, root: Path, storage: Path, ram_overlay: bool) -> JsonObject:
+def configure(client: AftClient, root: Path, storage: Path) -> JsonObject:
     doc = {
         "indexes": {"trigram": True, "semantic": False, "callgraph": False},
         "inspect": {"enabled": False},
-        "worktree": {"ram_overlay": ram_overlay},
     }
     response = client.call(
         "configure",
@@ -200,7 +198,7 @@ def startup_phase(args: argparse.Namespace, base: Path, env: dict[str, str]) -> 
 
     owner = AftClient(args.binary, env, base / "owner.log")
     try:
-        configure(owner, home, storage, ram_overlay=False)
+        configure(owner, home, storage)
         wait_ready(owner, "HOME_BASE_TOKEN")
         # Give the owner time to persist the shared snapshot, then stop it.
         time.sleep(2.0)
@@ -210,7 +208,7 @@ def startup_phase(args: argparse.Namespace, base: Path, env: dict[str, str]) -> 
     borrower = AftClient(args.binary, env, base / "worktree.log")
     rows: list[JsonObject] = []
     try:
-        response = configure(borrower, worktree, storage, ram_overlay=True)
+        response = configure(borrower, worktree, storage)
         ready_after = wait_ready(borrower, "HOME_BASE_TOKEN")
         time.sleep(2.0)
         for token, where in STARTUP_TOKENS:
@@ -292,7 +290,7 @@ def cost_phase(args: argparse.Namespace, base: Path, env: dict[str, str]) -> lis
     rows: list[JsonObject] = []
     owner = AftClient(args.binary, env, base / "owner.log")
     try:
-        configure(owner, home, storage, ram_overlay=False)
+        configure(owner, home, storage)
         rows.append({"owner_ready_s": round(wait_ready(owner, "fn main", timeout=900), 3)})
         time.sleep(2.0)
     finally:
@@ -300,7 +298,7 @@ def cost_phase(args: argparse.Namespace, base: Path, env: dict[str, str]) -> lis
     for run_index in range(args.repeats):
         borrower = AftClient(args.binary, env, base / f"worktree-{run_index}.log")
         try:
-            configure(borrower, worktree, storage, ram_overlay=True)
+            configure(borrower, worktree, storage)
             ready = wait_ready(borrower, "fn main", timeout=900)
             line = next(
                 (

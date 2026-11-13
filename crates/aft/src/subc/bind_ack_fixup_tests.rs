@@ -90,7 +90,11 @@ async fn retracted_bind(tool: bool, trigger: &str, expected_code: &str) {
         assert!(executor.register_actor(root.clone(), ctx));
     }
     let user = dir.path().join("user.jsonc");
-    std::fs::write(&user,r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#).unwrap();
+    std::fs::write(
+        &user,
+        r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false}}"#,
+    )
+    .unwrap();
     let (mut daemon, module) = tokio::io::duplex(128 * 1024);
     let (read, write) = tokio::io::split(module);
     let armed = Arc::new(AtomicBool::new(false));

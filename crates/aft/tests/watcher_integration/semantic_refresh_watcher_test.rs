@@ -348,16 +348,6 @@ fn configure_semantic_openai(
     storage_dir: &Path,
     base_url: &str,
 ) -> Value {
-    configure_semantic_openai_with_overlay(aft, root, storage_dir, base_url, false)
-}
-
-fn configure_semantic_openai_with_overlay(
-    aft: &mut AftProcess,
-    root: &Path,
-    storage_dir: &Path,
-    base_url: &str,
-    ram_overlay: bool,
-) -> Value {
     send(
         aft,
         json!({
@@ -368,9 +358,6 @@ fn configure_semantic_openai_with_overlay(
             "storage_dir": storage_dir.display().to_string(),
             "config": user_config(serde_json::json!({
                 "indexes": { "trigram": false, "semantic": true },
-                "worktree": {
-                    "ram_overlay": ram_overlay
-                },
                 "semantic": semantic_backend_config(base_url)
             })),
         }),
@@ -675,7 +662,7 @@ fn refreshing_status_keeps_repeated_same_file_invalidations_until_last_completio
 
 #[cfg(feature = "test-timing-hooks")]
 #[test]
-fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
+fn linked_worktree_semantic_refresh_respects_quiet_window() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     let original = "pub fn shared_owner_baseline() -> bool { true }\n";
     let (_fixture, main, worktree) = setup_linked_worktree(original);
@@ -700,96 +687,37 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     server.reset_requests();
 
     let quiet_ms = std::ffi::OsStr::new("2000");
-    let mut borrower =
-        AftProcess::spawn_with_real_watcher_env(&[("AFT_TEST_DATA_QUIET_MS", quiet_ms)]);
-    let configured = configure_semantic_openai_with_overlay(
-        &mut borrower,
-        &worktree,
-        storage.path(),
-        &server.base_url,
-        false,
-    );
-    assert_eq!(
-        configured["success"], true,
-        "borrow configure: {configured:?}"
-    );
-    wait_for_semantic_status(&mut borrower, "borrowed semantic index", |response| {
-        response["cache_role"] == "worktree" && response["semantic_index"]["status"] == "ready"
-    });
-    assert!(
-        server.non_probe_requests().is_empty(),
-        "borrow-only bind must not call the embedder"
-    );
-
     let source = worktree.join("src/lib.rs");
-    fs::write(
-        &source,
-        "pub fn borrow_only_edit_is_masked() -> bool { false }\n",
-    )
-    .expect("edit borrow-only source");
-    wait_for_semantic_status(&mut borrower, "borrow-only semantic mask", |response| {
-        // Masking the sole borrowed file leaves no vectors to serve. The
-        // index store reports the semantic index's stage as filling, without
-        // scheduling a fill for a borrow-only checkout.
-        response["semantic_index"]["status"] == "building"
-            && response["semantic_index"]["stage"] == "filling"
-            && response["semantic_index"]["entries_done"] == 0
-            && response["semantic_index"]["entries_total"] == 1
-            && response["semantic_index"]["filling"] == false
-    });
-
     let storm = worktree.join("storm");
-    fs::create_dir_all(&storm).expect("create borrow-only storm");
-    for index in 0..1_470 {
-        fs::write(
-            storm.join(format!("appeared_{index}.rs")),
-            format!("pub fn borrow_storm_{index}() {{}}\n"),
-        )
-        .expect("write borrow-only storm file");
-    }
-    fs::remove_dir_all(&storm).expect("remove borrow-only storm");
-    assert!(borrower.shutdown().success());
-    assert!(
-        server.non_probe_requests().is_empty(),
-        "borrow-only edit and appear/vanish storm must not call the embedder"
-    );
-
-    fs::write(&source, original).expect("restore shared baseline before overlay bind");
-    server.reset_requests();
     let gate = storage.path().join("semantic-quiet-gate");
-    let mut overlay = AftProcess::spawn_with_real_watcher_env(&[
+    let mut checkout = AftProcess::spawn_with_real_watcher_env(&[
         ("AFT_TEST_DATA_QUIET_MS", quiet_ms),
         ("AFT_TEST_DATA_QUIET_GATE", gate.as_os_str()),
     ]);
-    let configured = configure_semantic_openai_with_overlay(
-        &mut overlay,
-        &worktree,
-        storage.path(),
-        &server.base_url,
-        true,
-    );
+    let configured =
+        configure_semantic_openai(&mut checkout, &worktree, storage.path(), &server.base_url);
     assert_eq!(
         configured["success"], true,
-        "overlay configure: {configured:?}"
+        "checkout configure: {configured:?}"
     );
-    wait_for_semantic_status(&mut overlay, "overlay semantic index", |response| {
+    wait_for_semantic_status(&mut checkout, "checkout semantic index", |response| {
         response["cache_role"] == "worktree" && response["semantic_index"]["status"] == "ready"
     });
     assert!(
         server.non_probe_requests().is_empty(),
-        "RAM-overlay bind must not run a corpus catch-up"
+        "checkout bind must not run a corpus catch-up"
     );
 
-    let overlay_contents =
-        "pub fn overlay_changed_file_only() -> &'static str { \"overlay delta\" }\n";
-    fs::write(&source, overlay_contents).expect("edit overlay source");
+    let checkout_contents =
+        "pub fn checkout_changed_file_only() -> &'static str { \"checkout delta\" }\n";
+    fs::write(&source, checkout_contents).expect("edit checkout source");
     let expected_inputs = semantic_inputs_for_file(&worktree, &source);
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while server.non_probe_requests().is_empty() && std::time::Instant::now() < deadline {
-        let _ = status(&mut overlay);
+        let _ = status(&mut checkout);
         thread::sleep(Duration::from_millis(100));
     }
-    wait_for_semantic_status(&mut overlay, "overlay semantic refresh", |response| {
+    wait_for_semantic_status(&mut checkout, "checkout semantic refresh", |response| {
         response["semantic_index"]["status"] == "ready"
             && response["semantic_index"]["refreshing_count"] == 0
     });
@@ -800,19 +728,19 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
         .collect::<Vec<_>>();
     assert_eq!(
         actual_inputs, expected_inputs,
-        "overlay refresh must embed exactly the changed file's chunks"
+        "checkout refresh must embed exactly the changed file's chunks"
     );
 
     server.reset_requests();
     fs::write(&gate, b"hold").expect("hold quiet window");
     let release_gate = crate::helpers::ReleaseOnDrop::new(gate.with_extension("release"));
-    fs::create_dir_all(&storm).expect("create overlay storm");
+    fs::create_dir_all(&storm).expect("create checkout storm");
     for index in 0..1_470 {
         fs::write(
             storm.join(format!("appeared_{index}.rs")),
-            format!("pub fn overlay_storm_{index}() {{}}\n"),
+            format!("pub fn checkout_storm_{index}() {{}}\n"),
         )
-        .expect("write overlay storm file");
+        .expect("write checkout storm file");
         if index == 0 {
             let cap = std::time::Instant::now() + Duration::from_secs(60);
             while !gate.with_extension("waiting").exists() {
@@ -820,7 +748,7 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
                     std::time::Instant::now() < cap,
                     "refresh never observed quiet gate"
                 );
-                let _ = status(&mut overlay);
+                let _ = status(&mut checkout);
                 thread::sleep(Duration::from_millis(10));
             }
             // Deliberately exceed the real quiet interval while the first storm
@@ -828,7 +756,7 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
             thread::sleep(Duration::from_millis(2_500));
         }
     }
-    fs::remove_dir_all(&storm).expect("remove overlay storm");
+    fs::remove_dir_all(&storm).expect("remove checkout storm");
     fs::remove_file(&gate).expect("release quiet window");
     drop(release_gate);
     let cap = std::time::Instant::now() + Duration::from_secs(60);
@@ -837,20 +765,20 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
             std::time::Instant::now() < cap,
             "held refresh never completed"
         );
-        let _ = status(&mut overlay);
+        let _ = status(&mut checkout);
         thread::sleep(Duration::from_millis(10));
     }
-    wait_for_semantic_status(&mut overlay, "storm fill completed", |response| {
+    wait_for_semantic_status(&mut checkout, "storm fill completed", |response| {
         response["semantic_index"]["status"] == "ready"
             && response["semantic_index"]["filling"] == false
             && response["data_store"]["pending_edits"] == 0
     });
     assert!(
         server.non_probe_requests().is_empty(),
-        "overlay storm files gone inside the quiet window must not be embedded"
+        "checkout storm files gone inside the quiet window must not be embedded"
     );
 
-    assert!(overlay.shutdown().success());
+    assert!(checkout.shutdown().success());
 }
 
 #[test]

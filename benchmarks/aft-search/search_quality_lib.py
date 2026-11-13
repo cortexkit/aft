@@ -605,10 +605,6 @@ def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, 
     if duplicates or missing or foreign:
         raise InputFault(f"scored_population_mismatch:duplicate={duplicates}:missing={missing}:foreign={foreign}")
     not_applicable = semantic_building_rows_not_applicable(score)
-    if not_applicable and score.get("views_enabled") is not True:
-        raise InputFault(
-            "semantic_building_rows_not_applicable_requires_views_enabled:true"
-        )
     not_applicable_ids = set(not_applicable["rows"]) if not_applicable else set()
     building_ids = {
         str(row["episode_id"])

@@ -119,7 +119,7 @@ fn prepared_bind_watches_keep_the_captured_source() {
     }
     let _git_env = crate::test_env::hermetic_git_env_guard();
     let fixture = Fixture::new(
-        r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#,
+        r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false}}"#,
         None,
     );
     let legacy = fixture.root.join(".pi/aft.jsonc");

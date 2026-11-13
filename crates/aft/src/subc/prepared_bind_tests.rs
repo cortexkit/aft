@@ -80,7 +80,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
     let user = dir.path().join("user.jsonc");
     let project = root.as_path().join(".pi/aft.jsonc");
     std::fs::create_dir_all(project.parent().unwrap()).unwrap();
-    std::fs::write(&user, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false},"url_fetch_allow_private":true}"#).unwrap();
+    std::fs::write(&user, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"url_fetch_allow_private":true}"#).unwrap();
     std::fs::write(&project, r#"{"callgraph_chunk_size":7}"#).unwrap();
     let app = App::default_shared();
     let ctx = Arc::new(crate::context::AppContext::from_app(

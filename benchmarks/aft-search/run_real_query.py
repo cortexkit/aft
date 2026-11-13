@@ -105,31 +105,26 @@ class NdjsonClient:
         storage_dir: Path,
         stderr_path: Path,
         model_env: Optional[Mapping[str, str]] = None,
-        *,
-        views_enabled: bool = False,
     ):
         env = os.environ.copy()
-        # With views on, startup and configure must select the same store without
-        # an environment override. Separate home/data roots keep the client whose
+        # Startup and configure must select the same store without an environment
+        # override. Separate home/data roots keep the client whose
         # corpus embeddings are deliberately paused from borrowing the primary
-        # client's stored vectors. Views-off setup is unchanged for reference replay.
-        if views_enabled:
-            env.pop("AFT_STORAGE_DIR", None)
-            env.pop("AFT_CACHE_DIR", None)
-            for name, directory in {
-                "HOME": storage_dir / "home",
-                "XDG_CONFIG_HOME": storage_dir / "config",
-                "XDG_DATA_HOME": storage_dir / "data",
-                "XDG_CACHE_HOME": storage_dir / "cache",
-                "XDG_STATE_HOME": storage_dir / "state",
-                "XDG_RUNTIME_DIR": storage_dir / "runtime",
-            }.items():
-                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                env[name] = str(directory)
-            env["USERPROFILE"] = env["HOME"]
-            storage_dir = storage_dir / "data" / "cortexkit" / "aft"
-        else:
-            env["AFT_STORAGE_DIR"] = str(storage_dir)
+        # client's stored vectors.
+        env.pop("AFT_STORAGE_DIR", None)
+        env.pop("AFT_CACHE_DIR", None)
+        for name, directory in {
+            "HOME": storage_dir / "home",
+            "XDG_CONFIG_HOME": storage_dir / "config",
+            "XDG_DATA_HOME": storage_dir / "data",
+            "XDG_CACHE_HOME": storage_dir / "cache",
+            "XDG_STATE_HOME": storage_dir / "state",
+            "XDG_RUNTIME_DIR": storage_dir / "runtime",
+        }.items():
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            env[name] = str(directory)
+        env["USERPROFILE"] = env["HOME"]
+        storage_dir = storage_dir / "data" / "cortexkit" / "aft"
         # An empty model cache by default: the pack replay must never find a
         # local model to fall back on. The live-model replay passes the
         # pre-provisioned cache and runtime instead; the proxy below still
@@ -141,9 +136,8 @@ class NdjsonClient:
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = env["ALL_PROXY"] = "http://127.0.0.1:9"
         env["NO_PROXY"] = "127.0.0.1,localhost,::1"
         env.setdefault("RUST_LOG", "warn")
-        if views_enabled:
-            env.pop("AFT_STORAGE_DIR", None)
-            env.pop("AFT_CACHE_DIR", None)
+        env.pop("AFT_STORAGE_DIR", None)
+        env.pop("AFT_CACHE_DIR", None)
         self.project_root = project_root
         self.storage_dir = storage_dir
         self._stderr = stderr_path.open("w+", encoding="utf-8")
@@ -215,8 +209,6 @@ class NdjsonClient:
         endpoint: Optional[str],
         model_id: str,
         timeout: float,
-        *,
-        views_enabled: bool = False,
     ) -> None:
         semantic: JsonObject = {
             "backend": "openai_compatible" if endpoint else "fastembed",
@@ -232,8 +224,6 @@ class NdjsonClient:
             "indexes": {"trigram": True, "semantic": True, "callgraph": False},
             "semantic": semantic,
         })
-        if views_enabled:
-            doc["views"] = {"enabled": True}
         response = self.call(
             "configure",
             {
@@ -244,7 +234,6 @@ class NdjsonClient:
             },
             timeout,
         )
-        self.views_enabled = views_enabled
         if response.get("success") is not True:
             raise AftProtocolError(f"configure_failed:{response}")
 
@@ -256,18 +245,10 @@ class NdjsonClient:
         }
 
     def wait_ready(self, timeout: float, *, readiness_request: Optional[Mapping[str, Any]] = None) -> None:
-        if self.views_enabled:
-            if readiness_request is None:
-                raise AftProtocolError("views_readiness_requires_public_request")
+        if readiness_request is not None:
             deadline = time.monotonic() + timeout
             last: JsonObject = {}
             while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                status = self.call("status", timeout=remaining, cap_timeout=False)
-                if "views" not in status:
-                    raise AftProtocolError("views_runtime_not_enabled")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -275,7 +256,9 @@ class NdjsonClient:
                 if full_views_coverage(last):
                     return
                 time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
-            raise AftProtocolError(f"views_runtime_not_ready:timeout={timeout}:reply={last}")
+            raise AftProtocolError(f"checkout_runtime_not_ready:timeout={timeout}:reply={last}")
+        # Other recall harnesses ask only for resident-index readiness, without
+        # supplying a recorded query whose coverage can be checked.
         deadline = time.monotonic() + timeout
         last: JsonObject = {}
         while time.monotonic() < deadline:
@@ -315,7 +298,7 @@ class NdjsonClient:
         bench_rerank.observe("search", arguments, response, (time.perf_counter() - started) * 1000.0)
         allowed_statuses = {"ready", "building"} if self.allow_building else {"ready"}
         if response.get("success") is not True or response.get("status") not in allowed_statuses:
-            if getattr(self, "views_enabled", False) and response.get("status") == "partial":
+            if response.get("status") == "partial":
                 try:
                     status_at_failure: JsonObject = self.call("status")
                 except (AftProtocolError, OSError) as error:
@@ -325,7 +308,7 @@ class NdjsonClient:
                     "status_at_failure": status_at_failure,
                 }
                 raise AftProtocolError(
-                    f"aft_search_failed:views_partial:{json.dumps(detail, sort_keys=True)}"
+                    f"aft_search_failed:checkout_partial:{json.dumps(detail, sort_keys=True)}"
                 )
             raise AftProtocolError(f"aft_search_failed:success={response.get('success')}:status={response.get('status')}:code={response.get('code')}")
         if not isinstance(response.get("results"), list):
@@ -810,13 +793,12 @@ def load_inputs(
 
 
 @contextmanager
-def runtime_evidence_tree(tree: Path, *, views_enabled: bool = False) -> Iterator[Path]:
+def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
     """Copy the verified tree outside its parent checkout before starting AFT."""
     with tempfile.TemporaryDirectory(prefix="aft-real-query-tree-") as directory:
         root = Path(directory) / "tree"
         shutil.copytree(tree, root, ignore=shutil.ignore_patterns(".git"))
-        if views_enabled:
-            attach_pinned_git_metadata(root)
+        attach_pinned_git_metadata(root)
         copy_answer_key_ignore(root)
         copy_evidence_root_ignore(root)
         yield root
@@ -868,8 +850,8 @@ def attach_pinned_git_metadata(root: Path) -> None:
 # a projection of this repository and so has the same relative layout.
 BENCH_IGNORE_RELATIVE = "benchmarks/aft-search/.aftignore"
 
-# First line of the copy's root .aftignore. The default evidence copy has no .git;
-# views-enabled copies attach the pinned commit's metadata. AFT applies .gitignore
+# First line of the copy's root .aftignore. Evidence copies attach the pinned
+# commit's metadata. AFT applies .gitignore
 # files and the machine's global git excludes file whether or not the copy is a
 # Git repository. The benchmark's candidate pool is the tracked tree, including
 # files that were force-added despite matching a .gitignore (plans and reports
@@ -986,7 +968,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--reference", default=str(HERE / "real-query-baseline.json"))
     result.add_argument("--output", default=str(HERE / ".bench/search-quality/score.json"))
     result.add_argument("--ready-timeout", type=float, default=600.0)
-    result.add_argument("--views", action="store_true", help="Enable content-addressed views and record AFT views-work counters.")
     result.add_argument(
         "--live-model",
         action="store_true",
@@ -1020,9 +1001,9 @@ def run(args: argparse.Namespace) -> int:
     capability = load_capability(Path(args.schema).resolve())
     exact_report = json.loads(Path(args.exact_score).read_text())
     concept_report = json.loads(Path(args.concept_score).read_text())
-    readiness_request = make_readiness_request(manifest) if args.views else None
+    readiness_request = make_readiness_request(manifest)
     with tempfile.TemporaryDirectory(prefix="aft-real-query-run-") as run_dir, runtime_evidence_tree(
-        provisioned_tree, views_enabled=args.views
+        provisioned_tree
     ) as project_root:
         runtime = Path(run_dir)
         log_path = runtime / "embedding-requests.log"
@@ -1038,10 +1019,10 @@ def run(args: argparse.Namespace) -> int:
             client_env = None
             configured_model = FIXTURE_PROVIDER_MODEL
         with endpoint_context as endpoint:
-            client = NdjsonClient(binary, project_root, runtime / "storage", stderr_path, client_env, views_enabled=args.views)
+            client = NdjsonClient(binary, project_root, runtime / "storage", stderr_path, client_env)
             views_work: JsonObject = {}
             try:
-                client.configure(endpoint, configured_model, args.ready_timeout, views_enabled=args.views)
+                client.configure(endpoint, configured_model, args.ready_timeout)
                 client.wait_ready(args.ready_timeout, readiness_request=readiness_request)
                 bench_rerank.report_warm_up("real_query", bench_rerank.warm_up(
                     lambda query: client.search({"query": query, "topK": 50, "includeTests": False}),
@@ -1059,33 +1040,26 @@ def run(args: argparse.Namespace) -> int:
                 not_applicable_building_rows: list[JsonObject] = []
                 if has_building_rows:
                     with fixture_endpoint(pack, runtime / "building-embeddings.log", threading.Event()) as building_endpoint:
-                        building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr", views_enabled=args.views)
+                        building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr")
                         building.allow_building = True
                         try:
                             building.configure(
                                 building_endpoint,
                                 FIXTURE_PROVIDER_MODEL,
                                 args.ready_timeout,
-                                views_enabled=args.views,
                             )
                             deadline = time.monotonic() + args.ready_timeout
                             status: JsonObject = {}
                             while time.monotonic() < deadline:
-                                if args.views:
-                                    assert readiness_request is not None
-                                    status = building.readiness_reply(readiness_request, deadline - time.monotonic())
-                                    semantic_status = status.get("semantic_status")
-                                    lexical_status = status.get("lanes", {}).get("trigram", {}).get("status")
-                                else:
-                                    status = building.call("status", timeout=120.0, cap_timeout=True)
-                                    semantic_status = status.get("semantic_index", {}).get("status")
-                                    lexical_status = status.get("search_index", {}).get("status")
+                                assert readiness_request is not None
+                                status = building.readiness_reply(readiness_request, deadline - time.monotonic())
+                                semantic_status = status.get("semantic_status")
                                 if semantic_status in {"failed", "unavailable"}:
                                     raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
                                 if semantic_status == "ready":
-                                    if args.views and full_views_coverage(status):
+                                    if full_views_coverage(status):
                                         reason = (
-                                            "views-enabled semantic index was ready before the held-embedding "
+                                            "per-checkout semantic index was ready before the held-embedding "
                                             "fixture reached the building state"
                                         )
                                         not_applicable_building_rows = [
@@ -1097,31 +1071,22 @@ def run(args: argparse.Namespace) -> int:
                                             for row in building_rows
                                         ]
                                         break
-                                    if not args.views:
-                                        raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
-                                if (args.views and building_views_lexical_ready(status)) or (
-                                    not args.views and lexical_status == "ready" and (
-                                        semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")
-                                    )
-                                ):
+                                if building_views_lexical_ready(status):
                                     break
-                                time.sleep(1.0 if args.views else 0.1)
+                                time.sleep(1.0)
                             else:
-                                if args.views:
-                                    reason = (
-                                        "views-enabled semantic-building fixture did not reach the building "
-                                        "state before its readiness timeout"
-                                    )
-                                    not_applicable_building_rows = [
-                                        {
-                                            "episode_id": str(row["episode_id"]),
-                                            "semantic_state": "building",
-                                            "not_applicable_reason": reason,
-                                        }
-                                        for row in building_rows
-                                    ]
-                                else:
-                                    raise InputFault(f"semantic_building_fixture_timeout:lexical={status.get('search_index', {}).get('status')}:semantic={status.get('semantic_index', {}).get('status')}:stage={status.get('semantic_index', {}).get('stage')}")
+                                reason = (
+                                    "per-checkout semantic-building fixture did not reach the building "
+                                    "state before its readiness timeout"
+                                )
+                                not_applicable_building_rows = [
+                                    {
+                                        "episode_id": str(row["episode_id"]),
+                                        "semantic_state": "building",
+                                        "not_applicable_reason": reason,
+                                    }
+                                    for row in building_rows
+                                ]
                             if not_applicable_building_rows:
                                 scoring_manifest = dict(manifest)
                                 scoring_manifest["rows"] = [
@@ -1133,21 +1098,18 @@ def run(args: argparse.Namespace) -> int:
                                 )
                             else:
                                 rows = score_manifest_rows(manifest, args.profile, capability, client, project_root, building)
-                            if args.views:
-                                views_work["building"] = building.views_work()
+                            views_work["building"] = building.views_work()
                         finally:
-                            if args.views and "building" not in views_work:
+                            if "building" not in views_work:
                                 views_work["building"] = building.views_work()
                             building.close()
                 else:
                     rows = score_manifest_rows(manifest, args.profile, capability, client, project_root)
-                if args.views:
-                    views_work["primary"] = client.views_work()
+                views_work["primary"] = client.views_work()
             finally:
-                if args.views:
-                    if "primary" not in views_work:
-                        views_work["primary"] = client.views_work()
-                    print(f"views_work:{json.dumps(views_work, sort_keys=True)}")
+                if "primary" not in views_work:
+                    views_work["primary"] = client.views_work()
+                print(f"views_work:{json.dumps(views_work, sort_keys=True)}")
                 client.close()
     score = assemble_score(
         manifest,
@@ -1161,9 +1123,7 @@ def run(args: argparse.Namespace) -> int:
         binary,
         Path(args.reference).resolve(),
     )
-    if args.views:
-        score["views_enabled"] = True
-        score["views_work"] = views_work
+    score["views_work"] = views_work
     if not_applicable_building_rows:
         score["rows"].extend(not_applicable_building_rows)
         manifest_order = {

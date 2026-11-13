@@ -107,7 +107,7 @@ fn synthetic_bound_roots() {
             "project_root":root, "storage_dir":storage, "session_id":format!("initial-{n}"),
             "config":[{"tier":"user", "source":dir.path().join("aft.jsonc"),
                 "doc":json!({"indexes":{"trigram":true,"semantic":false,"callgraph":true},
-                    "views":{"enabled":true}, "inspect":{"enabled":false},
+                    "inspect":{"enabled":false},
                     "format_on_edit":false,"diagnostics_on_edit":false,
                     "lsp":{"auto_install":false,"disabled":["rust","typescript","python","go","bash","yaml","ty"]},
                     "disabled_tools":[]}).to_string()}]

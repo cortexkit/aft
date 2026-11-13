@@ -320,32 +320,26 @@ class ProfileSelectionTests(unittest.TestCase):
         validate_profile_score({"profile": profile, "capability": capability, "rows": []})
 
 
-class ViewsOptionPropagationTests(unittest.TestCase):
-    def test_views_flag_is_forwarded_to_real_query_only_when_enabled(self) -> None:
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                argv = [
-                    "--corpus", str(root / "corpus.toml"),
-                    "--binary", str(root / "aft"),
-                    "--profile", "single_page",
-                    "--score-output", str(root / "score.json"),
-                ]
-                if enabled:
-                    argv.append("--views")
-                args = quality_runner_parser().parse_args(argv)
-                commands: list[list[str]] = []
-
-                with (
-                    mock.patch("run_search_quality.parse_corpus_toml", return_value=({}, [])),
-                    mock.patch("run_search_quality.clone_root_for", return_value=root / "clones"),
-                    mock.patch("run_search_quality.ensure_binary"),
-                    mock.patch("run_search_quality.command", side_effect=lambda arguments, **kwargs: commands.append(list(arguments))),
-                ):
-                    quality_runner_run(args)
-
-                real_query = next(command for command in commands if command[1].endswith("run_real_query.py"))
-                self.assertEqual("--views" in real_query, enabled)
+class CheckoutReplayTests(unittest.TestCase):
+    def test_real_query_replay_has_no_obsolete_views_option(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = quality_runner_parser().parse_args([
+                "--corpus", str(root / "corpus.toml"),
+                "--binary", str(root / "aft"),
+                "--profile", "single_page",
+                "--score-output", str(root / "score.json"),
+            ])
+            commands: list[list[str]] = []
+            with (
+                mock.patch("run_search_quality.parse_corpus_toml", return_value=({}, [])),
+                mock.patch("run_search_quality.clone_root_for", return_value=root / "clones"),
+                mock.patch("run_search_quality.ensure_binary"),
+                mock.patch("run_search_quality.command", side_effect=lambda arguments, **kwargs: commands.append(list(arguments))),
+            ):
+                quality_runner_run(args)
+            real_query = next(command for command in commands if command[1].endswith("run_real_query.py"))
+            self.assertNotIn("--views", real_query)
 
 
 class SemanticBuildingNotApplicableTests(unittest.TestCase):
@@ -396,7 +390,6 @@ class SemanticBuildingNotApplicableTests(unittest.TestCase):
                 "schema": "aft-search-score-v1",
                 "model_id": "fixture",
                 "profile": "single_page",
-                "views_enabled": True,
                 "capability": {
                     "schema_path": "fixture.json",
                     "schema_sha256": "0" * 64,
@@ -431,7 +424,7 @@ class SemanticBuildingNotApplicableTests(unittest.TestCase):
         placeholder = {
             "episode_id": building_manifest_row["episode_id"],
             "semantic_state": "building",
-            "not_applicable_reason": "views-enabled semantic index was ready before the held-embedding fixture reached the building state",
+            "not_applicable_reason": "per-checkout semantic index was ready before the held-embedding fixture reached the building state",
         }
         candidate["rows"].append(placeholder)
         candidate[SEMANTIC_BUILDING_NOT_APPLICABLE_FIELD] = {
@@ -446,27 +439,16 @@ class SemanticBuildingNotApplicableTests(unittest.TestCase):
         }
         return manifest, reference, candidate, descriptor
 
-    def test_views_score_with_building_not_applicable_rows_is_accepted(self) -> None:
+    def test_score_with_declared_building_not_applicable_rows_is_accepted(self) -> None:
         manifest, reference, candidate, descriptor = self.documents()
-        self.assertIs(candidate["views_enabled"], True)
         result = total_gate(reference, candidate, manifest, descriptor, [])
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(
             result.notes,
             (
                 "semantic_building_rows_skipped:followup-census:2:"
-                "views-enabled semantic index was ready before the held-embedding fixture reached the building state",
+                "per-checkout semantic index was ready before the held-embedding fixture reached the building state",
             ),
-        )
-
-    def test_non_views_score_with_building_not_applicable_rows_is_refused(self) -> None:
-        manifest, reference, candidate, descriptor = self.documents()
-        candidate.pop("views_enabled")
-        result = total_gate(reference, candidate, manifest, descriptor, [])
-        self.assertEqual(result.exit_code, 2)
-        self.assertEqual(
-            result.reasons,
-            ("semantic_building_rows_not_applicable_requires_views_enabled:true",),
         )
 
     def test_non_building_rows_cannot_be_excluded_as_not_applicable(self) -> None:

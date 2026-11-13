@@ -8198,7 +8198,6 @@ mod deferred_terminal_tests {
                 "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
                 "config": {
                     "indexes": {"trigram": false, "semantic": false, "callgraph": true},
-                    "views": {"enabled": false},
                 },
             }),
         };

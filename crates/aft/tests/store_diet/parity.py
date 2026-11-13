@@ -104,7 +104,7 @@ def prepare_cache(cache, prepared):
         cache.mkdir(parents=True)
 
 
-def capture(binary, root, cache, requests, output, timeout, views=False, prepared=False, overrides=None, require_borrowed=False):
+def capture(binary, root, cache, requests, output, timeout, prepared=False, overrides=None, require_borrowed=False):
     prepare_cache(cache, prepared)
     output.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, AFT_CACHE_DIR=str(cache.resolve()), AFT_STORAGE_DIR=str(cache.resolve()),
@@ -128,14 +128,12 @@ def capture(binary, root, cache, requests, output, timeout, views=False, prepare
         reader.start()
         try:
             with (output / 'push.ndjson').open('wb') as pushes:
-                config = {'indexes': {'trigram': True, 'semantic': False, 'callgraph': True},
-                          'views': {'enabled': views}, 'worktree': {'ram_overlay': False}}
+                config = {'indexes': {'trigram': True, 'semantic': False, 'callgraph': True}}
                 for key, value in (overrides or {}).items():
                     if isinstance(value, dict) and isinstance(config.get(key), dict):
                         config[key].update(value)
                     else:
                         config[key] = value
-                assert config.get('views', {}).get('enabled') == views, '--config must not override --views'
                 configure = {'id': 'configure-parity', 'command': 'configure', 'harness': 'opencode',
                              'project_root': str(root.resolve()), 'storage_dir': str(cache.resolve()),
                              'config': [{'tier': 'user', 'source': str(cache.resolve() / 'user.jsonc'), 'doc': json.dumps(config)}]}
@@ -176,7 +174,7 @@ def capture(binary, root, cache, requests, output, timeout, views=False, prepare
     baseline = load_json((HERE / 'baseline.json'))['code_revision']
     dump(output / 'capture.json', {'baseline': baseline, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                                   'manifest_sha256': hashlib.sha256(json.dumps(requests, sort_keys=True).encode()).hexdigest(),
-                                  'normalised_fields': [], 'requests': len(requests), 'views': views, 'successful_queries': successes,
+                                  'normalised_fields': [], 'requests': len(requests), 'successful_queries': successes,
                                   'config_sha256': hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
                                   'prepared_cache': prepared, 'required_borrowed': require_borrowed})
 
@@ -277,10 +275,9 @@ def main():
     for arg in ['binary', 'root', 'cache', 'manifest', 'output']:
         run.add_argument(arg, type=pathlib.Path)
     run.add_argument('--timeout', type=int, default=300)
-    run.add_argument('--views', action='store_true')
     run.add_argument('--prepared-cache', action='store_true')
     run.add_argument('--require-borrowed', action='store_true')
-    run.add_argument('--config', type=pathlib.Path, help='user config overrides, including copy/overlay policy')
+    run.add_argument('--config', type=pathlib.Path, help='current user config overrides')
     diff = sub.add_parser('compare')
     diff.add_argument('baseline', type=pathlib.Path)
     diff.add_argument('candidate', type=pathlib.Path)
@@ -301,7 +298,7 @@ def main():
     elif args.command == 'capture':
         overrides = load_json(args.config) if args.config else None
         assert overrides is None or isinstance(overrides, dict), '--config must contain an object'
-        capture(args.binary, args.root, args.cache, load_json(args.manifest), args.output, args.timeout, args.views, args.prepared_cache, overrides, args.require_borrowed)
+        capture(args.binary, args.root, args.cache, load_json(args.manifest), args.output, args.timeout, args.prepared_cache, overrides, args.require_borrowed)
     elif args.command == 'compare':
         fields = []
         if args.normalisation:

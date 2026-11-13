@@ -29,25 +29,15 @@ fn search(aft: &mut AftProcess, marker: &str) -> Value {
 
 #[test]
 fn windows_moved_directory_reaches_ready_grep_and_search() {
-    directory_move(false, false);
-}
-
-#[test]
-fn windows_views_on_moved_directory_reaches_ready_grep_and_search() {
-    directory_move(true, false);
+    directory_move(false);
 }
 
 #[test]
 fn windows_large_moved_directory_reaches_ready_grep_and_search() {
-    directory_move(false, true);
+    directory_move(true);
 }
 
-#[test]
-fn windows_views_on_large_moved_directory_reaches_ready_grep_and_search() {
-    directory_move(true, true);
-}
-
-fn directory_move(views: bool, large: bool) {
+fn directory_move(large: bool) {
     let _serial = crate::helpers::watcher_serial_lock();
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("project");
@@ -76,7 +66,7 @@ fn directory_move(views: bool, large: bool) {
         }
     }
 
-    let mut aft = start(&root, views);
+    let mut aft = start(&root);
     let absent = search(&mut aft, "moved_windows_marker");
     assert_eq!(absent["success"], true, "{absent}");
 
@@ -100,9 +90,7 @@ fn directory_move(views: bool, large: bool) {
             && grep["total_matches"] == 1
             && found
         {
-            if views {
-                assert_eq!(grep["files_read_directly"], 0, "{grep}");
-            }
+            assert_eq!(grep["files_read_directly"], 0, "{grep}");
             break;
         }
         assert!(
@@ -125,11 +113,13 @@ fn directory_move(views: bool, large: bool) {
         assert_eq!(fallbacks, 0, "{after}");
         assert_eq!(corpus_rescans, 0, "{after}");
     }
-    println!("directory_move views={views} large={large} corpus_rescans={corpus_rescans} walk_fallbacks={fallbacks}");
+    println!(
+        "directory_move large={large} corpus_rescans={corpus_rescans} walk_fallbacks={fallbacks}"
+    );
     assert!(aft.shutdown().success());
 }
 
-fn start(root: &Path, views: bool) -> AftProcess {
+fn start(root: &Path) -> AftProcess {
     let mut aft = AftProcess::spawn_with_real_watcher();
     let configured = aft.send(
         &json!({
@@ -137,7 +127,6 @@ fn start(root: &Path, views: bool) -> AftProcess {
             "harness": "opencode", "project_root": root,
             "config": user_config(json!({
                 "indexes": {"trigram": true, "semantic": false, "callgraph": false},
-                "views": {"enabled": views}
             }))
         })
         .to_string(),
@@ -190,7 +179,7 @@ fn windows_directory_arrival_cost_200() {
         "// initial_windows_marker\n",
     )
     .unwrap();
-    let mut aft = start(root, false);
+    let mut aft = start(root);
     let before = counters(&mut aft);
     for i in 0..200 {
         let directory = root.join(format!("crates/measure/arrival-{i:03}"));
@@ -238,7 +227,7 @@ fn windows_empty_directory_needs_no_walk_or_rescan() {
         "// initial_windows_marker\n",
     )
     .unwrap();
-    let mut aft = start(root, false);
+    let mut aft = start(root);
     let before = counters(&mut aft);
     let directory = root.join("crates/empty");
     fs::create_dir(&directory).unwrap();

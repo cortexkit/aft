@@ -1,5 +1,5 @@
 //! Characterization of how separate `aft` processes share one legacy
-//! (views-off) call-graph store on the same project root and storage folder.
+//! call-graph store on the same project root and storage folder.
 //!
 //! A cold build writes a brand-new generation file named
 //! `<key>.g<nanos>.<pid>.sqlite` and points `<key>.current` at it, so the
@@ -101,7 +101,6 @@ fn configure(aft: &mut AftProcess, root: &Path, storage: &Path) {
         "storage_dir": storage,
         "config": crate::test_helpers::user_config(json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": true },
-            "views": { "enabled": false }
         }))
     });
     let response = aft.send(&request.to_string());

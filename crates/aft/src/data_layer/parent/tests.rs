@@ -79,9 +79,8 @@ fn request(value: Value) -> RawRequest {
     serde_json::from_value(value).unwrap()
 }
 
-/// A session bound to `root` through configure, with views and the call
-/// graph on or off.
-fn configure(root: &Path, storage: &Path, views: bool, callgraph: bool) -> Arc<AppContext> {
+/// A session bound to `root` through configure, with the call graph on or off.
+fn configure(root: &Path, storage: &Path, callgraph: bool) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
@@ -91,7 +90,6 @@ fn configure(root: &Path, storage: &Path, views: bool, callgraph: bool) -> Arc<A
     ));
     let doc = json!({
         "indexes": {"trigram": true, "semantic": false, "callgraph": callgraph},
-        "views": {"enabled": views},
     });
     let response = crate::commands::configure::handle_configure(
         &request(json!({
@@ -254,7 +252,7 @@ fn with_loading_child(run: impl FnOnce(&AppContext, &Path, &Path)) {
     }
     let parent = {
         let _git = crate::test_env::hermetic_git_env_guard();
-        configure(&root, &storage, true, false)
+        configure(&root, &storage, false)
     };
     let session = parent_session(&parent);
     session.pause_refresh(true);
@@ -428,7 +426,7 @@ fn a_parent_folder_answers_from_its_childrens_checkouts() {
 
     let parent = {
         let _git = crate::test_env::hermetic_git_env_guard();
-        configure(&root, &storage, true, true)
+        configure(&root, &storage, true)
     };
     let session = parent_session(&parent);
     assert_eq!(session.children().len(), 64);
@@ -606,7 +604,7 @@ fn a_parent_folders_todo_count_names_the_repositories_not_indexed_yet() {
     }
     let parent = {
         let _git = crate::test_env::hermetic_git_env_guard();
-        configure(&root, &storage, true, true)
+        configure(&root, &storage, true)
     };
     let session = parent_session(&parent);
     assert_eq!(session.children().len(), 2);
@@ -708,7 +706,7 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     }
     let parent = {
         let _git = crate::test_env::hermetic_git_env_guard();
-        configure(&root, &storage, true, true)
+        configure(&root, &storage, true)
     };
     let _session = parent_session(&parent);
     parent.mark_subc_bound();
@@ -797,7 +795,6 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
         ));
         let doc = json!({
             "indexes": {"trigram": true, "semantic": true, "callgraph": false},
-            "views": {"enabled": true},
             "semantic": {
                 "backend": "openai_compatible",
                 "model": "test-hashed",

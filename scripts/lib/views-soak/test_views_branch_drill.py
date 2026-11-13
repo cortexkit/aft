@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake-subject checks for views-off branch-drill row close conditions."""
+"""Fake AFT client checks for checkout publication after correct branch probes."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ PROBE = SwitchProbe(path="src/foo.ts", symbol="alphaProbe", token="alphaProbe")
 FAKE_PID = 4242
 
 
-class FakeLegacyClient:
+class FakeCheckoutClient:
     """Standalone-shaped subject that answers probes and appends stderr on demand."""
 
     def __init__(
@@ -27,11 +27,13 @@ class FakeLegacyClient:
         *,
         log_path: Path,
         probe: SwitchProbe,
-        refresh_delay_s: float | None,
+        checkout: Path,
+        publication_delay_s: float,
     ) -> None:
         self.log_path = log_path
         self.probe = probe
-        self.refresh_delay_s = refresh_delay_s
+        self.checkout = checkout
+        self.publication_delay_s = publication_delay_s
         self.correct_at: float | None = None
         self._emitted = False
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,19 +73,20 @@ class FakeLegacyClient:
         return {"success": True}
 
     def _maybe_emit(self) -> None:
-        if self.refresh_delay_s is None or self._emitted or self.correct_at is None:
+        if self._emitted or self.correct_at is None:
             return
-        if time.monotonic() < self.correct_at + self.refresh_delay_s:
+        if time.monotonic() < self.correct_at + self.publication_delay_s:
             return
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(
-                f"{stamp} [aft] semantic refresh: 3 changed, 0 new, 0 deleted, 3 total processed\n"
+                f"{stamp} index_event kind=view_publication plane=views root={self.checkout} "
+                "outcome=no_op candidates=0 blob_puts=0 pending_paths=0\n"
             )
         self._emitted = True
 
 
-class LegacyArmRowTests(unittest.TestCase):
+class CheckoutRowTests(unittest.TestCase):
     def _roots(self) -> tuple[Path, Path, Path]:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -95,12 +98,12 @@ class LegacyArmRowTests(unittest.TestCase):
         source.mkdir()
         (source / ".cortexkit").mkdir()
         (source / ".cortexkit" / "aft.jsonc").write_text(
-            '{"views": {"enabled": true}}\n', encoding="utf-8"
+            '{"indexes": {"semantic": true}}\n', encoding="utf-8"
         )
         (storage / "logs").mkdir(parents=True)
         return checkout, source, storage
 
-    def _run_legacy_row(self, client: FakeLegacyClient, checkout: Path, source: Path, storage: Path):
+    def _run_checkout_row(self, client: FakeCheckoutClient, checkout: Path, source: Path, storage: Path):
         origin = time.monotonic()
 
         def fake_git_text(_repo: Path, *args: str, **_kwargs: Any) -> str:
@@ -111,69 +114,63 @@ class LegacyArmRowTests(unittest.TestCase):
 
         with patch.object(branch_drill, "git_text", fake_git_text), patch.object(
             branch_drill, "sample_process", fake_sample
+        ), patch.object(branch_drill, "current_generation", return_value="head"), patch.object(
+            branch_drill, "manifest_fingerprint", return_value="head-fp"
         ):
             return branch_drill.perform_switch(
-                mode="views-off",
+                mode="independent-clone",
                 checkout=checkout,
-                source_root=source,
                 target_sha="abc123def",
                 changed_files=10,
                 label="HEAD→abc123def",
                 probe=PROBE,
                 client=client,
-                views_on=False,
                 view_dir=storage / "views",
                 storage=storage,
-                expected_manifest_fingerprint=None,
+                expected_manifest_fingerprint="head-fp",
                 standalone_pid=FAKE_PID,
                 cold_work_timeout_s=20.0,
             )
 
-    def test_legacy_row_waits_for_semantic_refresh_after_callgraph_correct(self) -> None:
+    def test_row_waits_for_publication_after_callgraph_correct(self) -> None:
         checkout, source, storage = self._roots()
-        client = FakeLegacyClient(
+        client = FakeCheckoutClient(
             log_path=storage / "logs" / f"aft-{FAKE_PID}.log",
             probe=PROBE,
-            refresh_delay_s=3.0,
+            checkout=checkout,
+            publication_delay_s=3.0,
         )
-        row = self._run_legacy_row(client, checkout, source, storage)
+        row = self._run_checkout_row(client, checkout, source, storage)
         self.assertEqual(
             row["row_close_reason"],
-            "semantic_refresh_complete",
-            "legacy row must close on semantic refresh, not callgraph-correct alone",
+            "pending_paths=0",
+            "row must wait for publication, not callgraph-correct alone",
         )
         self.assertEqual(row["correctness"], "correct")
         self.assertIsNotNone(row["time_to_correct_ms"])
-        self.assertIsNotNone(row["semantic_settle_ms"])
-        self.assertGreaterEqual(
-            row["semantic_settle_ms"] - row["time_to_correct_ms"],
-            2500,
-            "row must stay open for the post-correctness semantic refresh interval",
-        )
         self.assertGreaterEqual(
             row["cpu_s"],
             3.0,
-            "CPU attribution must include the post-correctness semantic refresh interval",
+            "CPU attribution must include the post-correctness publication interval",
         )
 
-    def test_legacy_row_without_embeddable_change_closes_on_quiet_window(self) -> None:
+    def test_row_without_embeddable_change_closes_on_no_op_publication(self) -> None:
         checkout, source, storage = self._roots()
-        client = FakeLegacyClient(
+        client = FakeCheckoutClient(
             log_path=storage / "logs" / f"aft-{FAKE_PID}.log",
             probe=PROBE,
-            refresh_delay_s=None,
+            checkout=checkout,
+            publication_delay_s=0.0,
         )
-        with patch.object(branch_drill, "SEMANTIC_QUIET_WINDOW_S", 1.0):
-            row = self._run_legacy_row(client, checkout, source, storage)
+        row = self._run_checkout_row(client, checkout, source, storage)
         self.assertEqual(
             row["row_close_reason"],
-            "quiet_window_elapsed",
-            "legacy row with no embeddable change must close on quiet-window elapse",
+            "pending_paths=0",
+            "a no-op publication still confirms that checkout work is complete",
         )
         self.assertEqual(row["correctness"], "correct")
-        self.assertIsNotNone(row["semantic_settle_ms"])
-        self.assertGreaterEqual(row["semantic_settle_ms"], 900)
-        self.assertFalse(client._emitted)
+        self.assertEqual(row["publication"], "no_op")
+        self.assertEqual(row["embeds"], 0)
 
 
 if __name__ == "__main__":

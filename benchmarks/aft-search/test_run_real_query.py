@@ -391,10 +391,9 @@ class CapabilitySchemaTests(unittest.TestCase):
                 self.assertNotEqual(original, self.digest(json.dumps(changed)))
 
 
-class ViewsOptionTests(unittest.TestCase):
-    def test_real_query_views_flag_is_opt_in(self) -> None:
-        self.assertFalse(real_query_parser().parse_args([]).views)
-        self.assertTrue(real_query_parser().parse_args(["--views"]).views)
+class CheckoutRuntimeTests(unittest.TestCase):
+    def test_real_query_has_no_views_variant_option(self) -> None:
+        self.assertNotIn("views", vars(real_query_parser().parse_args([])))
 
     def test_views_runtime_metadata_points_to_the_pinned_evidence_head(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -411,7 +410,7 @@ class ViewsOptionTests(unittest.TestCase):
         self.assertEqual(head.stdout.strip(), EVIDENCE_SHA)
         self.assertIn(b"crates/aft/src/config.rs", entries.stdout)
 
-    def configure_document(self, views_enabled: bool) -> str:
+    def configure_document(self) -> str:
         captured: dict[str, Any] = {}
         client = object.__new__(NdjsonClient)
         client.project_root = Path("/fixture/project")
@@ -430,11 +429,11 @@ class ViewsOptionTests(unittest.TestCase):
             mock.patch.dict("os.environ", {bench_rerank.CONFIG_ENV: ""}),
             mock.patch.object(client, "call", side_effect=call),
         ):
-            client.configure(None, "fixture-model", 4.5, views_enabled=views_enabled)
+            client.configure(None, "fixture-model", 4.5)
         return str(captured["config"][0]["doc"])
 
-    def test_default_configure_document_is_byte_identical_and_views_adds_only_its_key(self) -> None:
-        default = self.configure_document(False)
+    def test_configure_document_uses_only_current_keys(self) -> None:
+        default = self.configure_document()
         self.assertEqual(
             default,
             '{"indexes": {"trigram": true, "semantic": true, "callgraph": false}, '
@@ -442,11 +441,8 @@ class ViewsOptionTests(unittest.TestCase):
             '"timeout_ms": 4500, "query_timeout_ms": 4500, "max_batch_size": 64, "max_files": 20000}}',
         )
 
-        enabled = self.configure_document(True)
-        default_value = json.loads(default)
-        enabled_value = json.loads(enabled)
-        self.assertEqual(set(enabled_value) - set(default_value), {"views"})
-        self.assertEqual(enabled_value["views"], {"enabled": True})
+        self.assertNotIn("views", json.loads(default))
+        self.assertNotIn("worktree", json.loads(default))
 
     def test_missing_views_work_counters_are_unavailable_not_zero(self) -> None:
         client = object.__new__(NdjsonClient)
@@ -468,20 +464,27 @@ class ViewsOptionTests(unittest.TestCase):
 
     def test_wait_ready_requires_a_complete_public_reply_not_resident_status(self) -> None:
         client = object.__new__(NdjsonClient)
-        client.views_enabled = True
-        resident = {"search_index": {"status": "ready"}, "semantic_index": {"status": "ready"}, "views": None}
         pending = {**self.full_reply(), "complete": False, "semantic_gap": {"pending": ["known.rs"]}}
         request = {"query": "known", "topK": 50, "includeTests": True}
         with (
-            mock.patch.object(client, "call", side_effect=[resident, pending, resident, self.full_reply()]) as call,
+            mock.patch.object(client, "call", side_effect=[pending, self.full_reply()]) as call,
             mock.patch("run_real_query.time.sleep") as sleep,
             mock.patch("run_real_query.bench_rerank.settle", side_effect=AssertionError("views readiness requires public coverage")),
         ):
             client.wait_ready(5.0, readiness_request=request)
-        self.assertEqual(call.call_count, 4)
-        self.assertEqual(call.call_args_list[1].args[0], "tool_call")
-        self.assertEqual(call.call_args_list[1].args[1]["arguments"], request)
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_args_list[0].args[0], "tool_call")
+        self.assertEqual(call.call_args_list[0].args[1]["arguments"], request)
         sleep.assert_called_once_with(1.0)
+
+    def test_other_recall_harnesses_can_wait_for_resident_indexes_without_a_query(self) -> None:
+        client = object.__new__(NdjsonClient)
+        resident = {"search_index": {"status": "ready"}, "semantic_index": {"status": "ready"}}
+        with mock.patch.object(client, "call", return_value=resident) as call, mock.patch(
+            "run_real_query.bench_rerank.settle", return_value=None
+        ):
+            client.wait_ready(5.0)
+        self.assertEqual(call.call_args.args[0], "status")
 
     def test_views_readiness_rejects_every_partial_or_omitted_lane(self) -> None:
         self.assertTrue(full_views_coverage(self.full_reply()))
@@ -521,7 +524,7 @@ class ViewsOptionTests(unittest.TestCase):
                 mock.patch("run_real_query.subprocess.Popen", return_value=proc) as popen,
                 mock.patch("run_real_query.NdjsonStream"),
             ):
-                client = NdjsonClient(root / "aft", root, root / "storage", root / "stderr", views_enabled=True)
+                client = NdjsonClient(root / "aft", root, root / "storage", root / "stderr")
                 try:
                     env = popen.call_args.kwargs["env"]
                     self.assertNotIn("AFT_STORAGE_DIR", env)
@@ -532,21 +535,6 @@ class ViewsOptionTests(unittest.TestCase):
                 finally:
                     client.close()
 
-    def test_views_off_client_preserves_its_explicit_storage_environment(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            proc = mock.Mock()
-            proc.poll.return_value = 0
-            with (
-                mock.patch("run_real_query.subprocess.Popen", return_value=proc) as popen,
-                mock.patch("run_real_query.NdjsonStream"),
-            ):
-                client = NdjsonClient(root / "aft", root, root / "storage", root / "stderr")
-                try:
-                    self.assertEqual(client.storage_dir, root / "storage")
-                    self.assertEqual(popen.call_args.kwargs["env"]["AFT_STORAGE_DIR"], str(root / "storage"))
-                finally:
-                    client.close()
 
 
 class RealQueryRunnerTests(unittest.TestCase):

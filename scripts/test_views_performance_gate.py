@@ -49,16 +49,16 @@ class MeasurementContractTests(unittest.TestCase):
     def test_inactive_prototype_arms_reject_active_metric(self):
         for requested in ["0", "1"]:
             with patch.dict(gate.os.environ, {"AFT_VIEWS_BASE_REF_PROTOTYPE": requested}):
-                for views, semantic in [(False, False), (False, True), (True, False), (True, True)]:
-                    if requested == "1" and views and semantic:
+                for semantic in [False, True]:
+                    if requested == "1" and semantic:
                         continue
-                    with self.subTest(requested=requested, views=views, semantic=semantic):
+                    with self.subTest(requested=requested, semantic=semantic):
                         for counters in [{}, {"base_ref_prototype": False}]:
-                            gate.require_base_ref_prototype(counters, views=views, semantic=semantic)
+                            gate.require_base_ref_prototype(counters, semantic=semantic)
                         with self.assertRaisesRegex(gate.MeasurementError, "inactive arm"):
-                            gate.require_base_ref_prototype({"base_ref_prototype": True}, views=views, semantic=semantic)
+                            gate.require_base_ref_prototype({"base_ref_prototype": True}, semantic=semantic)
 
-    def run_prototype_pair(self, semantic, force_active):
+    def run_prototype_case(self, semantic, force_active):
         """Exercise run_arm and its witness logic with a fake transport."""
         configurations = {}
 
@@ -84,7 +84,7 @@ class MeasurementContractTests(unittest.TestCase):
                 self.ticks = 0
 
             def health(self):
-                enabled = self.config["views"]["enabled"] and self.config["indexes"]["semantic"]
+                enabled = self.config["indexes"]["semantic"]
                 counters = dict.fromkeys(gate.COUNTERS, self.ticks)
                 counters.update(pid=self.pid, base_ref_prototype=enabled or force_active)
                 return {"metrics": {"views_work": counters}}
@@ -137,22 +137,19 @@ class MeasurementContractTests(unittest.TestCase):
                     patch.object(gate, "Acquisition", BindOnlyAcquisition), \
                     patch.object(gate, "git", return_value=""), \
                     patch("sys.stdout", new=io.StringIO()):
-                results = [gate.run_arm(args, {"commit": "fixture"}, 1, views,
-                                       directory / ("views-on" if views else "views-off"))
-                           for views in [False, True]]
-            return results
+                result = gate.run_arm(args, {"commit": "fixture"}, 1, directory / "checkout")
+            return result
 
-    def test_prototype_paired_views_matrix_succeeds(self):
+    def test_prototype_semantic_matrix_succeeds(self):
         with patch.dict(gate.os.environ, {"AFT_VIEWS_BASE_REF_PROTOTYPE": "1"}):
             for semantic in [True, False]:
                 with self.subTest(semantic=semantic, force_active=False):
-                    results = self.run_prototype_pair(semantic, False)
-                    self.assertEqual([row["views"] for row in results], [False, True])
-                    self.assertEqual([row["status"] for row in results], ["measured", "measured"])
+                    result = self.run_prototype_case(semantic, False)
+                    self.assertNotIn("views", result["config"])
+                    self.assertEqual(result["status"], "measured")
                 with self.subTest(semantic=semantic, force_active=True):
-                    results = self.run_prototype_pair(semantic, True)
-                    self.assertEqual([row["status"] for row in results],
-                                     ["failed", "measured" if semantic else "failed"])
+                    result = self.run_prototype_case(semantic, True)
+                    self.assertEqual(result["status"], "measured" if semantic else "failed")
 
     def test_bad_pid_is_rejected(self):
         with self.assertRaisesRegex(gate.MeasurementError, "PID"):
@@ -344,7 +341,7 @@ class MeasurementContractTests(unittest.TestCase):
             args.subjects.mkdir()
             out = tmp / "out" / "arm"
             with patch.object(gate, "provision", side_effect=gate.MeasurementError("clone failed")):
-                result = gate.run_arm(args, {"commit": "abc"}, 1, True, out)
+                result = gate.run_arm(args, {"commit": "abc"}, 1, out)
             self.assertEqual(result["status"], "failed")
             self.assertIn("clone failed", result["failure"])
             written = json.loads((out / "result.json").read_text())
