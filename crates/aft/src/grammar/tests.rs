@@ -100,14 +100,14 @@ fn settled(registry: &GrammarRegistry) {
 #[test]
 fn grammar_state_messages_are_pinned() {
     for (state, expected) in [
-        (GrammarState::NotDownloaded, "The luau grammar isn't downloaded yet; AFT downloads it on first use."),
-        (GrammarState::Downloading, "The luau grammar is downloading; retry in a few seconds."),
-        (GrammarState::NetworkRetry, "The luau grammar download failed; AFT tries again after a short wait."),
-        (GrammarState::StorageRetry, "AFT can't save the luau grammar right now; it tries again after a short wait."),
-        (GrammarState::AttemptsExhausted, "The luau grammar couldn't be downloaded after five attempts; restarting AFT tries again."),
-        (GrammarState::VerificationFailed, "The downloaded luau grammar didn't match its expected hash, so AFT didn't use it; restarting AFT tries again."),
-        (GrammarState::LoadFailed, "The luau grammar failed to load; restarting AFT tries again."),
-        (GrammarState::UnsupportedPlatform, "luau files aren't supported on this platform yet."),
+        (GrammarState::NotDownloaded, "The Luau grammar isn't stored yet."),
+        (GrammarState::Downloading, "The Luau grammar is being prepared; retry in a few seconds."),
+        (GrammarState::NetworkRetry, "The Luau grammar download failed; AFT tries again after a short wait."),
+        (GrammarState::StorageRetry, "AFT can't save the Luau grammar right now; it tries again after a short wait."),
+        (GrammarState::AttemptsExhausted, "The Luau grammar couldn't be downloaded after five attempts; restarting AFT tries again."),
+        (GrammarState::VerificationFailed, "The downloaded Luau grammar didn't match its expected hash, so AFT didn't use it; restarting AFT tries again."),
+        (GrammarState::LoadFailed, "The Luau grammar failed to load; AFT won't use it in this process."),
+        (GrammarState::UnsupportedPlatform, "The Luau grammar engine is unavailable on this platform."),
     ] {
         assert_eq!(GrammarUnavailable::new("luau", state).message, expected);
     }
@@ -558,6 +558,14 @@ fn grammar_engine_is_fixed_to_pulley_on_every_platform() {
         .as_ref()
         .expect("Pulley engine must be available")
         .is_pulley());
+}
+
+#[test]
+fn grammar_engine_failure_is_not_reported_as_a_restartable_load() {
+    let error = engine_failure("injected unsupported Pulley target");
+    assert_eq!(error.state, GrammarState::UnsupportedPlatform);
+    assert!(!error.message.contains("restart"));
+    assert_eq!(error.retry_after_ms, None);
 }
 
 #[test]

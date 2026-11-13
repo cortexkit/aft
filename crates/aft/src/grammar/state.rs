@@ -3,17 +3,18 @@ use serde::Serialize;
 use crate::error::AftError;
 
 // Keep wording separate from the wire codes: callers branch on the codes, not prose.
-pub const NOT_DOWNLOADED: &str =
-    "The <language> grammar isn't downloaded yet; AFT downloads it on first use.";
-pub const DOWNLOADING: &str = "The <language> grammar is downloading; retry in a few seconds.";
+pub const NOT_DOWNLOADED: &str = "The <language> grammar isn't stored yet.";
+pub const DOWNLOADING: &str = "The <language> grammar is being prepared; retry in a few seconds.";
 pub const NETWORK_RETRY: &str =
     "The <language> grammar download failed; AFT tries again after a short wait.";
 pub const STORAGE_RETRY: &str =
     "AFT can't save the <language> grammar right now; it tries again after a short wait.";
 pub const ATTEMPTS_EXHAUSTED: &str = "The <language> grammar couldn't be downloaded after five attempts; restarting AFT tries again.";
 pub const VERIFICATION_FAILED: &str = "The downloaded <language> grammar didn't match its expected hash, so AFT didn't use it; restarting AFT tries again.";
-pub const LOAD_FAILED: &str = "The <language> grammar failed to load; restarting AFT tries again.";
-pub const UNSUPPORTED_PLATFORM: &str = "<language> files aren't supported on this platform yet.";
+pub const LOAD_FAILED: &str =
+    "The <language> grammar failed to load; AFT won't use it in this process.";
+pub const UNSUPPORTED_PLATFORM: &str =
+    "The <language> grammar engine is unavailable on this platform.";
 pub const SUPPORT_DISABLED: &str = "This AFT build has no downloaded-grammar support, so <language> files can't be parsed. Use a released AFT build, or rebuild with cargo install agent-file-tools --features wasm-grammars (needs CMake 3.18 or later).";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -66,11 +67,7 @@ impl GrammarUnavailable {
             state,
             message: message.replace(
                 "<language>",
-                if state == GrammarState::SupportDisabled && language == "luau" {
-                    "Luau"
-                } else {
-                    language
-                },
+                if language == "luau" { "Luau" } else { language },
             ),
             cause: None,
             retry_after_ms: None,

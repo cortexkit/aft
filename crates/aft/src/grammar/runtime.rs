@@ -30,14 +30,17 @@ static ENGINE: LazyLock<Result<tree_sitter::wasmtime::Engine, String>> = LazyLoc
 /// Report the target family from Wasmtime's actual engine, not the requested
 /// configuration. Wasmtime's public query distinguishes Pulley from native.
 pub fn engine_target() -> Result<&'static str, GrammarUnavailable> {
-    let engine = ENGINE.as_ref().map_err(|_| {
-        GrammarUnavailable::new(&manifest().language, GrammarState::UnsupportedPlatform)
-    })?;
+    let engine = ENGINE.as_ref().map_err(|error| engine_failure(error))?;
     Ok(if engine.is_pulley() {
         "pulley"
     } else {
         "native"
     })
+}
+
+fn engine_failure(error: &str) -> GrammarUnavailable {
+    log::warn!("Pulley grammar engine unavailable: {error}");
+    GrammarUnavailable::new(&manifest().language, GrammarState::UnsupportedPlatform)
 }
 
 pub trait Clock: Send + Sync {
@@ -258,6 +261,11 @@ impl GrammarRegistry {
     }
 
     fn load(&self, entry: &mut Entry, bytes: Vec<u8>) {
+        if let Err(error) = ENGINE.as_ref() {
+            entry.state = engine_failure(error).state;
+            self.changed.notify_all();
+            return;
+        }
         let result = (|| {
             let engine = ENGINE.as_ref().map_err(Clone::clone)?;
             let mut store = tree_sitter::WasmStore::new(engine).map_err(|e| e.to_string())?;
@@ -303,14 +311,15 @@ impl GrammarRegistry {
 
 pub fn prepare_parser(parser: &mut tree_sitter::Parser) -> Result<(), GrammarUnavailable> {
     {
-        let engine = ENGINE
-            .as_ref()
-            .map_err(|_| GrammarUnavailable::new(&manifest().language, GrammarState::LoadFailed))?;
-        let store = tree_sitter::WasmStore::new(engine)
-            .map_err(|_| GrammarUnavailable::new(&manifest().language, GrammarState::LoadFailed))?;
-        parser
-            .set_wasm_store(store)
-            .map_err(|_| GrammarUnavailable::new(&manifest().language, GrammarState::LoadFailed))?;
+        let engine = ENGINE.as_ref().map_err(|error| engine_failure(error))?;
+        let store = tree_sitter::WasmStore::new(engine).map_err(|error| {
+            log::warn!("grammar parser store failed: {error}");
+            GrammarUnavailable::new(&manifest().language, GrammarState::LoadFailed)
+        })?;
+        parser.set_wasm_store(store).map_err(|error| {
+            log::warn!("grammar parser store assignment failed: {error}");
+            GrammarUnavailable::new(&manifest().language, GrammarState::LoadFailed)
+        })?;
         Ok(())
     }
 }
