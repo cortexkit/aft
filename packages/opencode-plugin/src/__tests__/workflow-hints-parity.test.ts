@@ -10,7 +10,7 @@ const APPROVED_TEXT = `# Agent Foundational Toolkit
 **Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.
 **Parallel calls**: send independent read-only calls in one response.
 **After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check.
-**Status bar**: \`[AFT E.. W.. | D.. U.. C.. | T..]\` appears when a count changes. E above 0 usually means your last edit broke something; \`?\` means unknown, not zero.
+**Status bar**: \`[AFT E.. W.. | T..]\` appears when a count changes. E above 0 usually means your last edit broke something; \`?\` means unknown, not zero.
 **Commands**: don't pipe test or build output into tail, grep or head; AFT already shortens it. Pass wait: true when you need a long command's result before anything else; a new message from the user detaches the wait. Otherwise a long command moves to the background and a reminder brings its result. Block on it with bash_watch only when nothing else is left; bash_watch with background: true and a pattern tells you when a line appears. Never loop bash_status.`;
 
 const WITHOUT_SEARCH_OR_BASH = `# Agent Foundational Toolkit
@@ -20,7 +20,7 @@ const WITHOUT_SEARCH_OR_BASH = `# Agent Foundational Toolkit
 **Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.
 **Parallel calls**: send independent read-only calls in one response.
 **After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check.
-**Status bar**: \`[AFT E.. W.. | D.. U.. C.. | T..]\` appears when a count changes. E above 0 usually means your last edit broke something; \`?\` means unknown, not zero.`;
+**Status bar**: \`[AFT E.. W.. | T..]\` appears when a count changes. E above 0 usually means your last edit broke something; \`?\` means unknown, not zero.`;
 
 const defaults = { bashBackgroundEnabled: true, bashCompressionEnabled: true };
 const builders = {

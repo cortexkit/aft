@@ -94,7 +94,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
       ? "**After edits**: run aft_inspect for diagnostics; the project's typecheck and tests are the final check."
       : "",
     has("aft_inspect")
-      ? "**Status bar**: `[AFT E.. W.. | D.. U.. C.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero."
+      ? "**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero."
       : "",
     commands.length ? `**Commands**: ${commands.join(" ")}` : "",
   ];
