@@ -1,0 +1,1 @@
+AFT status now finds a working head's project through routes opened by core on the session's behalf, including Broca routes using the legacy `runner` harness label. It still refuses unknown runners, unrelated sessions, direct plugin routes, and ambiguous project bindings.

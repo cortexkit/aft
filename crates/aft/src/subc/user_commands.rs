@@ -112,7 +112,32 @@ fn runner_matches(identity: &RouteIdentity, runner: &str) -> bool {
         .principal
         .as_deref()
         .and_then(|id| id.strip_prefix("reserved:"))
-        == Some(runner)
+        .is_some_and(|module| module == runner || module == "prefrontal-core")
+}
+
+fn route_harness(identity: &RouteIdentity) -> Option<&str> {
+    // RouteIdentity.harness is canonicalized to `runner`; the authenticated
+    // bind retains the concrete wire label (for example, `opencode2`).
+    match &identity.spawn_principal {
+        AuthenticatedPrincipal::RouteBind { harness, .. } => Some(harness),
+        AuthenticatedPrincipal::FirstParty => None,
+    }
+}
+
+fn concrete_session_harness<'a>(
+    routes: impl Iterator<Item = &'a RouteIdentity>,
+) -> Option<&'a str> {
+    let mut found = None;
+    for harness in routes
+        .filter_map(route_harness)
+        .filter(|raw| *raw != "runner")
+    {
+        if found.is_some_and(|previous| previous != harness) {
+            return None;
+        }
+        found = Some(harness);
+    }
+    found
 }
 
 fn resolve_session(
@@ -123,13 +148,26 @@ fn resolve_session(
     if !runner_notices::known_runner(&session.runner) {
         return Err(ErrorBody::new(contract::UNKNOWN_SUBJECT, "unknown subject"));
     }
+    let routes = routes.values().filter(|identity| {
+        identity.session == session.session && runner_matches(identity, &session.runner)
+    });
+    let concrete_harness = concrete_session_harness(routes.clone());
     let mut found = None;
-    for identity in routes.values() {
-        // Match the harness, session and runner regardless of whether tools
-        // execute as classic calls or through codemode.
-        if identity.harness != session.harness
-            || identity.session != session.session
-            || !runner_matches(identity, &session.runner)
+    for identity in routes {
+        let Some(harness) = route_harness(identity) else {
+            continue;
+        };
+        // Core keeps routes for the session even between runner tool calls.
+        // Occipital's admitted subject identifies Broca, whose legacy `runner`
+        // label means `broca`, as in runner notices. Thalamus carries several
+        // harnesses, so its alias needs one concrete harness in the live binds.
+        let alias = if session.runner == "broca" {
+            Some("broca")
+        } else {
+            concrete_harness
+        };
+        if harness != session.harness
+            && !(harness == "runner" && alias == Some(session.harness.as_str()))
         {
             continue;
         }
