@@ -17,11 +17,15 @@ import { join } from "node:path";
 import {
   ADAPTER_UNIMPLEMENTED_TOOLS,
   CANONICAL_TOOLS,
-  REMOVED_DATA_LAYER_NOTES,
   SEMANTIC_COST_NOTICE,
 } from "@cortexkit/aft-bridge";
 
-import { type AftConfig, getConfigLoadNotices, loadAftConfig } from "../config.js";
+import {
+  type AftConfig,
+  getConfigLoadNotices,
+  getConfigValidationErrors,
+  loadAftConfig,
+} from "../config.js";
 import { registerPiToolSurface, resolvePiToolSurface } from "../tool-registration.js";
 import { makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
@@ -166,24 +170,22 @@ describe("Pi/OMP feature-config registration", () => {
     expect(readFileSync(projectFile, "utf8")).toBe(text);
   });
 
-  test("idle.checkout_hours loads and merges per key; a user file's removed keys get one notice naming only them", () => {
+  test("an older user key still translates and idle.checkout_hours merges per key", () => {
     const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
     mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
     writeFileSync(projectFile, JSON.stringify({ idle: { root_ttl_minutes: 15 } }));
     const user = {
       idle: { root_ttl_minutes: 20 },
-      views: { idle_checkout_hours: 9000, callgraph_copies: 1 },
+      views: { idle_checkout_hours: 9000 },
     };
     const config = loadWithUserConfig(user);
     expect(config.idle).toEqual({ root_ttl_minutes: 15, checkout_hours: 8760 });
-    expect(config.views).toEqual({ callgraph_copies: 1 });
+    expect(config).not.toHaveProperty("views");
     const userPath = join(root, "xdg", "cortexkit", "aft.jsonc");
     const notices = getConfigLoadNotices().filter(
       (notice) => notice.configPath === userPath && notice.message !== SEMANTIC_COST_NOTICE,
     );
-    expect(notices.map((notice) => notice.message)).toEqual([
-      `${userPath} sets removed keys (views.callgraph_copies); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
-    ]);
+    expect(notices).toEqual([]);
   });
 });
 
@@ -226,4 +228,57 @@ describe("semantic default-on cost notice", () => {
       expect(costNotices()).toHaveLength(0);
     }
   });
+});
+
+describe("removed data-layer config keys", () => {
+  const cases = [
+    {
+      key: "views.enabled",
+      doc: { views: { enabled: true } },
+      notice:
+        "views.enabled is gone because AFT now keeps one index store per repository and always uses it.",
+    },
+    {
+      key: "views.callgraph_copies",
+      doc: { views: { callgraph_copies: 2 } },
+      notice:
+        "views.callgraph_copies is gone because no checkout borrows another checkout's call graph any more.",
+    },
+    {
+      key: "worktree.ram_overlay",
+      doc: { worktree: { ram_overlay: false } },
+      notice:
+        "worktree.ram_overlay is gone because every worktree now has its own index state, so there is no borrowed index to patch in memory.",
+    },
+  ];
+  for (const { key, doc, notice } of cases) {
+    for (const harness of [false, true]) {
+      const input = harness ? { harnesses: { pi: doc } } : doc;
+      const keyPath = harness ? `harnesses.pi.${key}` : key;
+      test(`user config refuses ${keyPath}`, () => {
+        expect(() => loadWithUserConfig(input)).toThrow(
+          `removed_config_key:${keyPath}; run npx @cortexkit/aft doctor --fix`,
+        );
+        expect(readFileSync(join(root, "xdg", "cortexkit", "aft.jsonc"), "utf8")).toBe(
+          JSON.stringify(input),
+        );
+      });
+      test(`project config drops ${keyPath} with its existing notice`, () => {
+        const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+        mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+        writeFileSync(projectFile, JSON.stringify(input));
+        const config = loadWithUserConfig({ format_on_edit: true });
+        expect(getConfigValidationErrors()).toEqual([]);
+        expect(config.format_on_edit).toBe(true);
+        expect(config).not.toHaveProperty("views");
+        expect(config).not.toHaveProperty("worktree");
+        expect(
+          getConfigLoadNotices()
+            .filter((item) => item.configPath === projectFile)
+            .map((item) => item.message),
+        ).toEqual([notice]);
+        expect(readFileSync(projectFile, "utf8")).toBe(JSON.stringify(input));
+      });
+    }
+  }
 });

@@ -723,8 +723,7 @@ const CASES: ParityCase[] = [
     project: { worktree: { ram_overlay: true } },
   },
   {
-    // `ram_overlay` defaults on; `false` is the escape hatch, and the
-    // TypeScript plugins and the Rust resolver must both keep it.
+    // Project files keep loading, but neither boolean value reaches the engine.
     name: "worktree_ram_overlay_escape_hatch_project_safe",
     project: { worktree: { ram_overlay: false } },
   },
@@ -1125,12 +1124,11 @@ const CASES: ParityCase[] = [
   },
   { name: "retired_max_items_user", user: { inspect: { max_drill_down_items: 20 } } },
   // --- Data-layer keys: views.idle_checkout_hours is translated to
-  //     idle.checkout_hours (clamped); the removed views.enabled,
-  //     views.callgraph_copies and worktree.ram_overlay still reach the engine
-  //     until the code that reads them is deleted. ---
+  //     idle.checkout_hours (clamped). The removed no-effect keys refuse user
+  //     config while project config loads with a notice and drops them. ---
   {
     name: "retired_idle_checkout_hours_user",
-    user: { views: { idle_checkout_hours: 72, enabled: true } },
+    user: { views: { idle_checkout_hours: 72 } },
   },
   {
     name: "retired_idle_checkout_hours_project_clamped",
@@ -1150,6 +1148,7 @@ const CASES: ParityCase[] = [
     },
   },
   {
+    // Keep the historical fixture ID; its expectation now proves refusal.
     name: "removed_data_layer_keys_still_apply",
     user: { views: { enabled: true, callgraph_copies: 2 }, worktree: { ram_overlay: false } },
   },

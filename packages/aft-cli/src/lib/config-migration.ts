@@ -107,7 +107,7 @@ export function previewConfigMigration(targets: ConfigMigrationTarget[]): Config
     if (!raw) continue;
     const translated = structuredClone(raw);
     const translation = translateConfigDocument(translated, target.tier);
-    if (!translation.legacyInput && translation.removedKeys.length === 0) continue;
+    if (!translation.legacyInput) continue;
     dropRemovedDataLayerKeys(translated);
     const changes = diffConfig(raw, translated);
     previews.push({ ...target, changes });

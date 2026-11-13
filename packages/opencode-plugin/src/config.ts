@@ -22,11 +22,10 @@ import {
   noticeProjection,
   PI_ONLY_KEYS,
   partitionProjectDisables,
+  REMOVED_DATA_LAYER_PATHS,
   type ResolvedIndexesConfig,
   readConfigTiers,
   removedConfigKeyErrors,
-  removedConfigKeysNoticeDigest,
-  removedConfigKeysNoticeMessage,
   resolveCortexKitConfigPaths,
   resolveIndexes,
   resolveLegacyAftConfigSources,
@@ -39,7 +38,6 @@ import {
   translateConfigDocument,
   unionDisabledTools,
   validateResolvedConfig,
-  viewsForConfigure,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 import { z } from "zod";
@@ -584,22 +582,6 @@ const IdleConfigSchema = z.object({
     .transform((value) => (value === undefined ? undefined : clampIdleCheckoutHours(value))),
 });
 
-/**
- * Removed keys. AFT keeps one index store per repository, so these no longer
- * do anything; a file that sets them gets a notice, `aft doctor --fix`
- * deletes them, and from 0.65.0 a config that sets them is refused. They stay
- * in the schema, undocumented, only so such a file still loads until then.
- */
-const ViewsConfigSchema = z.object({
-  enabled: z.boolean().optional(),
-  callgraph_copies: z.number().int().optional(),
-});
-
-/** Removed key, like the `views` keys above. Kept only so an old file still loads. */
-const WorktreeConfigSchema = z.object({
-  ram_overlay: z.boolean().optional(),
-});
-
 const BackupConfigSchema = z.object({
   /** Master switch for agent-facing undo backups. Defaults to true. */
   enabled: z.boolean().optional(),
@@ -685,8 +667,6 @@ const AftConfigFieldsSchema = z.object({
   index: IndexConfigSchema.optional(),
   /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
   storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
-  /** Removed: see `ViewsConfigSchema`. */
-  views: ViewsConfigSchema.optional(),
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
   callgraph_chunk_size: z.number().optional(),
   /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
@@ -699,8 +679,6 @@ const AftConfigFieldsSchema = z.object({
   idle: IdleConfigSchema.optional(),
   /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
   backup: BackupConfigSchema.optional(),
-  /** Removed: see `WorktreeConfigSchema`. */
-  worktree: WorktreeConfigSchema.optional(),
   /** Native first-party bash sandbox. Write allowances are user-only; a project may enable but never disable. */
   sandbox: SandboxConfigSchema.optional(),
   /**
@@ -988,10 +966,6 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   // Background index switches, always resolved (default on).
   overrides.indexes = resolvedIndexes(config);
   if (config.index !== undefined) overrides.index = config.index;
-  // views.enabled does nothing any more; only the views keys the engine
-  // still reads are sent.
-  const views = viewsForConfigure(config.views);
-  if (views !== undefined) overrides.views = views;
   if (config.callgraph_chunk_size !== undefined)
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
@@ -1059,7 +1033,6 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
-  if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
   if (config.github !== undefined) overrides.github = resolveGithubConfig(config);
   if (config.bash === false) overrides.bash = { enabled: false };
@@ -1498,13 +1471,22 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
 
   // Retired keys are translated on the raw document, before schema
-  // validation, so they never reach Zod. Names retired in 0.62 or earlier are
-  // translated here in both files, never refused. The AFT binary rewrites the
+  // validation, so they never reach Zod. Older retired names still translate
+  // in both files; removed data-layer keys refuse only user config. The binary rewrites the
   // user file to current keys when it loads it (with a backup and a notice).
   // A project file belongs to its repository, and refusing it would leave
   // everyone who opens the repository without AFT until a tracked file is
   // edited, so it loads with a notice instead.
   const removed = removedConfigKeyErrors(cleanConfig, undefined, false);
+  if (tier === "user") {
+    removed.push(
+      ...removedConfigKeyErrors(cleanConfig).filter((error) =>
+        REMOVED_DATA_LAYER_PATHS.some((path) =>
+          error.endsWith(`${path}; run npx @cortexkit/aft doctor --fix`),
+        ),
+      ),
+    );
+  }
   if (removed.length) {
     throw new ConfigRejectedError(removed);
   }
@@ -1538,16 +1520,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
         `Config ${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); applied their current equivalents in memory`,
       );
     }
-    if (translation.removedKeys.length > 0) {
-      // That rewrite leaves removed keys in the user file, so its notice never
-      // names them; this one does, once per file identity.
-      configLoadNotices.push({
-        configPath,
-        digest: removedConfigKeysNoticeDigest(translation),
-        message: removedConfigKeysNoticeMessage(configPath, translation),
-      });
-    }
-  } else if (translation.legacyInput || translation.removedKeys.length > 0) {
+  } else if (translation.legacyInput) {
     configLoadNotices.push({
       configPath,
       digest: noticeDigest(projection),
@@ -1674,16 +1647,6 @@ function mergeLspConfig(
   return Object.fromEntries(
     Object.entries(lsp).filter(([, value]) => value !== undefined),
   ) as AftConfig["lsp"];
-}
-
-function mergeWorktreeConfig(
-  baseWorktree: AftConfig["worktree"],
-  overrideWorktree: AftConfig["worktree"],
-): AftConfig["worktree"] {
-  if (baseWorktree === undefined && overrideWorktree === undefined) return undefined;
-  if (overrideWorktree === undefined) return baseWorktree;
-  if (baseWorktree === undefined) return overrideWorktree;
-  return { ...baseWorktree, ...overrideWorktree };
 }
 
 /** Each tier or harness block sets only the idle keys it names. */
@@ -1930,11 +1893,9 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "validate_on_edit",
   "configure_warnings_delivery",
   // "indexes" handled separately — a project can only switch an index off.
-  "views",
   "callgraph_chunk_size",
   "inspect",
   "idle",
-  "worktree",
   // Git attribution only changes commit metadata; it grants no capabilities and
   // does not select an executable, so project configuration may override it.
   "git",
@@ -1949,7 +1910,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "disabled_tools" handled separately — unioned via array merge.
   // "formatter"/"checker" handled separately — deep-merged.
   // "semantic"/"lsp" handled separately — strict field-level merge.
-  // "inspect"/"worktree" handled separately — deep-merged.
+  // "inspect" is handled separately — deep-merged.
   // "backup" — USER ONLY (project config cannot disable or shrink undo backups).
   // "index" — USER ONLY (a repository must not mint machine standing roots).
   // "restrict_to_project_root" — USER ONLY (security boundary).
@@ -2101,17 +2062,11 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     (bash as Record<string, unknown>).project_env = projectEnv;
   }
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
-  const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const idle = mergeIdleConfig(base.idle, override.idle);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
   const remoteExec = mergeRemoteExecConfig(base.remote_exec, override.remote_exec);
   const backup = mergeProjectBackupConfig(base.backup, override.backup);
   const pi = mergePiConfig(base.pi, override.pi);
-  // Each tier sets only the views keys it names.
-  const views =
-    base.views !== undefined || override.views !== undefined
-      ? { ...base.views, ...override.views }
-      : undefined;
   const bridge = base.bridge;
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
@@ -2122,10 +2077,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   delete safeOverride.indexes;
   delete safeOverride.bash;
   delete safeOverride.inspect;
-  delete safeOverride.worktree;
   delete safeOverride.idle;
   delete safeOverride.pi;
-  delete safeOverride.views;
 
   return {
     ...base,
@@ -2136,13 +2089,11 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(lsp ? { lsp } : {}),
     ...(bash !== undefined ? { bash } : {}),
     ...(inspect !== undefined ? { inspect } : {}),
-    ...(worktree !== undefined ? { worktree } : {}),
     ...(idle !== undefined ? { idle } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(remoteExec !== undefined ? { remote_exec: remoteExec } : {}),
     ...(backup !== undefined ? { backup } : {}),
     ...(pi !== undefined ? { pi } : {}),
-    ...(views !== undefined ? { views } : {}),
     experimental,
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.
@@ -2249,8 +2200,8 @@ export function buildConfigTierConfigureParams(
  *
  * The result always carries a sorted `disabled_tools` list (absent user base
  * defaults to aft_move/aft_delete) and fully resolved `indexes`. Retired keys
- * are translated, except that a project file naming one retired in 0.62 or
- * earlier is refused. Throws {@link ConfigRejectedError} when the
+ * are translated, except that removed data-layer keys refuse user config.
+ * Throws {@link ConfigRejectedError} when the
  * document or security settings are invalid, or the resolved configuration is
  * incomplete; callers must then publish nothing
  * (startup) or keep their last-good config (reload).

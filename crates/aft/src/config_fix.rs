@@ -146,8 +146,8 @@ fn repair_github_aliases(
 
 /// Whether a rewrite also deletes the removed data-layer keys
 /// ([`feature_config::REMOVED_DATA_LAYER_PATHS`]). `doctor --fix` deletes
-/// them; the automatic rewrite of the user file keeps them, because until the
-/// code that reads them is deleted their values still take effect.
+/// them; the automatic rewrite keeps them so loading can refuse them until
+/// the user explicitly runs `doctor --fix`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemovedKeys {
     Delete,
@@ -502,8 +502,19 @@ fn retired_key_translation(text: &str) -> Option<feature_config::DocumentTransla
     let Value::Object(mut map) = value else {
         return None;
     };
-    let translation =
+    let mut translation =
         feature_config::translate_document(&mut map, feature_config::DocumentTier::User);
+    // The automatic rewrite leaves these keys untouched. Its notice must name
+    // only the keys it actually rewrites, not claim refused keys were migrated.
+    translation.retired_keys.retain(|key| {
+        !feature_config::REMOVED_DATA_LAYER_PATHS.iter().any(|path| {
+            key == path
+                || key
+                    .strip_suffix(path)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+    });
+    translation.legacy_input = !translation.retired_keys.is_empty();
     translation.legacy_input.then_some(translation)
 }
 

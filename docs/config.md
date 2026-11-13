@@ -820,11 +820,14 @@ retires the settings that chose between the old index routes:
 | `views.callgraph_copies` | Removed: no checkout borrows another checkout's call graph. |
 | `worktree.ram_overlay` | Removed: every worktree has its own index state, so there is no borrowed index to patch in memory. |
 
-The removed keys no longer do anything. AFT ignores them and shows a notice
-naming the file once, for the user file and for a project file alike; it never
-rewrites a file on its own for them. `npx @cortexkit/aft doctor --fix` deletes
-them. From v0.65.0 a config file that still sets any of these four keys is
-refused with `removed_config_key:<key>; run aft doctor --fix`.
+From v0.65.0, `views.enabled`, `views.callgraph_copies` and
+`worktree.ram_overlay` are refused in user config with
+`removed_config_key:<key>; run npx @cortexkit/aft doctor --fix`.
+Project config still loads: AFT ignores these keys and shows the existing
+notice explaining why each no longer does anything, without editing the file.
+`npx @cortexkit/aft doctor --fix` removes them from either file.
+`views.idle_checkout_hours` keeps its existing translation and release-gated
+refusal policy; use `idle.checkout_hours` instead.
 
 `indexes.trigram`, `indexes.semantic` and `indexes.callgraph` stay. With
 `indexes.trigram: false` no text index is built, and grep and glob walk the

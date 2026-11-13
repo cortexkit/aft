@@ -943,7 +943,6 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("indexes.semantic", indexes.semantic);
     later!("indexes.callgraph", indexes.callgraph);
     later!("index.roots", index.roots);
-    later!("views.enabled", views.enabled);
     live!("callgraph_chunk_size", callgraph_chunk_size);
     // Inspect.
     live!("inspect.enabled", inspect.enabled);
@@ -963,7 +962,6 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("lsp.idle_minutes", lsp_idle_minutes);
     live!("lsp.max_servers", lsp_max_servers);
     live!("lsp.max_servers", lsp_user_max_servers);
-    live!("worktree.ram_overlay", worktree.ram_overlay);
     later!("backup.enabled", backup.enabled);
     later!("backup.max_depth", backup.max_depth);
     live!("backup.max_file_size", backup.max_file_size);

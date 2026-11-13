@@ -49,7 +49,7 @@
       "errors": []
     },
     {
-      "name": "data-layer keys before the refusing release",
+      "name": "removed data-layer keys refuse independently of the idle rename release",
       "release": "0.64.9",
       "doc": {
         "opencode": {
@@ -75,7 +75,12 @@
         }
       },
       "errors": [
-        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix"
+        "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.callgraph_copies; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:worktree.ram_overlay; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.views.enabled; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.worktree.ram_overlay; run npx @cortexkit/aft doctor --fix"
       ]
     },
     {
@@ -108,8 +113,8 @@
         "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:views.callgraph_copies; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:views.enabled; run npx @cortexkit/aft doctor --fix",
-        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:worktree.ram_overlay; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:harnesses.pi.views.enabled; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:harnesses.pi.worktree.ram_overlay; run npx @cortexkit/aft doctor --fix"
       ]
@@ -144,8 +149,8 @@
         "removed_config_key:opencode.server_url; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:views.callgraph_copies; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:views.enabled; run npx @cortexkit/aft doctor --fix",
-        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:worktree.ram_overlay; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:harnesses.pi.views.enabled; run npx @cortexkit/aft doctor --fix",
         "removed_config_key:harnesses.pi.worktree.ram_overlay; run npx @cortexkit/aft doctor --fix"
       ]

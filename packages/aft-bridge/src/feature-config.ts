@@ -87,14 +87,9 @@ export const REMOVED_OPENCODE_PATHS = [
 ] as const;
 
 /**
- * Keys the per-repository data store leaves with nothing to do. A config file
- * that sets one gets a notice saying it no longer does anything, and
- * `doctor --fix` deletes it, but the automatic rewrite of the user file
- * leaves it in place. Until the engine code that reads them (index views, and
- * the path that serves a worktree from another checkout's indexes) is deleted,
- * the values a file supplies still reach the engine, so translation keeps them in
- * the document. From `DATA_LAYER_KEYS_REFUSED_FROM` a config that sets one is
- * refused. Mirrors `REMOVED_DATA_LAYER_PATHS` in
+ * Keys the per-repository data store leaves with nothing to do. User config
+ * refuses them; project config drops them with their existing no-effect notice.
+ * Mirrors `REMOVED_DATA_LAYER_PATHS` in
  * `crates/aft/src/feature_config.rs`.
  */
 export const REMOVED_DATA_LAYER_PATHS = [
@@ -120,27 +115,8 @@ export const RETIRED_IDLE_CHECKOUT_HOURS = [
  */
 export const DATA_LAYER_KEYS_REFUSED_FROM: readonly [number, number] = [0, 65];
 
-/** Every key the data-layer cutover retires, refused from `DATA_LAYER_KEYS_REFUSED_FROM`. */
-export const DATA_LAYER_RETIRED_PATHS = [
-  "views.callgraph_copies",
-  "views.enabled",
-  "views.idle_checkout_hours",
-  "worktree.ram_overlay",
-] as const;
-
-/**
- * The `views` block a plugin sends to configure: the resolved block without
- * `enabled`, or `undefined` when nothing else is left. `views.enabled` does
- * nothing from 0.64; the file that sets it still gets the removed-key notice,
- * but the key never reaches the resolved config, as in the Rust resolver.
- */
-export function viewsForConfigure<T extends { enabled?: unknown }>(
-  views: T | undefined,
-): Omit<T, "enabled"> | undefined {
-  if (views === undefined) return undefined;
-  const { enabled: _enabled, ...rest } = views;
-  return Object.keys(rest).length > 0 ? rest : undefined;
-}
+/** The remaining version-gated rename; removed no-effect keys refuse only user config. */
+export const DATA_LAYER_RETIRED_PATHS = ["views.idle_checkout_hours"] as const;
 
 /** `idle.checkout_hours` default and range; mirrors `crates/aft/src/config.rs`. */
 export const IDLE_CHECKOUT_HOURS_DEFAULT = 168;
@@ -250,7 +226,7 @@ function removedBlockKeyErrors(
  * lists them. A config that still sets one is refused with
  * `removed_config_key`; `doctor --fix` (or the automatic rewrite of the user
  * file) replaces it with its current equivalent or deletes it. Names retired
- * more recently (`bridge.hang_threshold` and the data-layer keys) are not
+ * more recently (`bridge.hang_threshold`) are not
  * listed: they are still translated, with a notice. Mirrors
  * `REFUSED_RETIRED_PATHS` in `crates/aft/src/feature_config.rs`.
  */
@@ -275,6 +251,9 @@ export const REFUSED_RETIRED_PATHS = [
   "idle.lsp_ttl_minutes",
   "inspect.tier2_soft_deadline_ms",
   "inspect.max_drill_down_items",
+  "views.callgraph_copies",
+  "views.enabled",
+  "worktree.ram_overlay",
 ] as const;
 
 /**
@@ -381,14 +360,6 @@ export interface DocumentTranslation {
    * tool name inside `disabled_tools` is listed by that name.
    */
   retiredKeys: string[];
-  /**
-   * Every removed data-layer key (`REMOVED_DATA_LAYER_PATHS`) the document
-   * supplied, sorted and de-duplicated, with the same harness prefix as
-   * `retiredKeys`. Translation keeps these keys in the document and they never
-   * set `legacyInput`, so the automatic rewrite of the user file leaves them
-   * alone; they get their own notice instead.
-   */
-  removedKeys: string[];
   /**
    * True when some block set the retired top-level `enabled: false`. It is
    * translated into a disabled_tools list only, so indexes keep building;
@@ -585,8 +556,7 @@ export function retiredIdleCheckoutHours(value: unknown): number {
  * Translate the keys the data-layer cutover retires in one block:
  * `views.idle_checkout_hours` becomes `idle.checkout_hours` (clamped to its
  * range) unless that is already set, exactly as `doctor --fix` rewrites it.
- * The removed keys (`REMOVED_DATA_LAYER_PATHS`) are only listed: their values
- * stay in the document until the code that reads them is deleted.
+ * Removed no-effect keys are dropped before strict schema validation.
  */
 function translateDataLayerPaths(map: JsonRecord, prefix: string, out: DocumentTranslation): void {
   const [retired, replacement] = RETIRED_IDLE_CHECKOUT_HOURS;
@@ -601,14 +571,16 @@ function translateDataLayerPaths(map: JsonRecord, prefix: string, out: DocumentT
     }
   }
   for (const path of REMOVED_DATA_LAYER_PATHS) {
-    if (hasPath(map, path)) out.removedKeys.push(`${prefix}${path}`);
+    const [container, leaf] = path.split(".");
+    if (container && leaf && takeNested(map, container, leaf).found)
+      recordRetired(out, prefix, path);
   }
 }
 
 /**
  * Delete the removed data-layer keys from a translated document, base and
  * harness blocks alike, emptying containers as `doctor --fix` does. Used to
- * preview what `doctor --fix` will remove; load-time translation keeps them.
+ * preview what `doctor --fix` will remove. Load-time translation also drops them.
  */
 export function dropRemovedDataLayerKeys(map: JsonRecord): void {
   const blocks: JsonRecord[] = [map];
@@ -934,7 +906,9 @@ export const NO_EFFECT_RETIRED_NOTES: ReadonlyArray<readonly [string, string]> =
 
 /** The no-effect sentence for a retired key, which may carry a `harnesses.<id>.` prefix. */
 function noEffectNote(key: string): string | undefined {
-  return NO_EFFECT_RETIRED_NOTES.find(([path]) => namesPath(key, path))?.[1];
+  return [...NO_EFFECT_RETIRED_NOTES, ...REMOVED_DATA_LAYER_NOTES].find(([path]) =>
+    namesPath(key, path),
+  )?.[1];
 }
 
 /** Whether `key`, which may carry a `harnesses.<id>.` prefix, is `path`. */
@@ -973,53 +947,16 @@ export function retiredIdleCheckoutHoursNote(): string {
 }
 
 /**
- * The once-per-identity notice for a config file, user or project, that still
- * sets removed data-layer keys. Empty when it sets none. The file is never
- * rewritten for them automatically; `doctor --fix` deletes them. Mirrors
- * `removed_keys_notice` in `crates/aft/src/feature_config.rs`.
- */
-export function removedConfigKeysNoticeMessage(
-  configPath: string,
-  translation: Partial<Pick<DocumentTranslation, "removedKeys">>,
-): string {
-  const removed = translation.removedKeys ?? [];
-  if (removed.length === 0) return "";
-  const parts = [
-    `${configPath} sets removed keys (${removed.join(", ")}); AFT ignores them, and from ${refusedFromVersion()} it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them.`,
-  ];
-  for (const [path, note] of REMOVED_DATA_LAYER_NOTES) {
-    if (removed.some((key) => namesPath(key, path))) parts.push(note);
-  }
-  return parts.join(" ");
-}
-
-/**
- * Identity of the user-file notice for removed data-layer keys: the set of
- * keys it names. The rewrite of other retired keys in the same file then does
- * not repeat it, and adding another removed key does.
- */
-export function removedConfigKeysNoticeDigest(
-  translation: Pick<DocumentTranslation, "removedKeys">,
-): string {
-  return noticeDigest({
-    notice: "removed_data_layer_keys_v1",
-    keys: sortedUnique(translation.removedKeys),
-  });
-}
-
-/**
  * The once-per-identity notice for a project config file whose retired keys
  * were translated in memory. The file itself is never written: it is shared
  * through its repository. Keys that no longer do anything get only their own
  * sentence, after the sentence about the keys whose current equivalents were
- * applied (omitted when there are none); removed data-layer keys the file
- * sets follow with their own notice. Mirrors `project_retired_keys_notice` in
+ * applied (omitted when there are none). Mirrors `project_retired_keys_notice` in
  * `crates/aft/src/feature_config.rs`.
  */
 export function legacyConfigNoticeMessage(
   configPath: string,
-  translation: Pick<DocumentTranslation, "retiredEnabledFalse" | "retiredKeys"> &
-    Partial<Pick<DocumentTranslation, "removedKeys">>,
+  translation: Pick<DocumentTranslation, "retiredEnabledFalse" | "retiredKeys">,
 ): string {
   const equivalents = translation.retiredKeys.filter((key) => noEffectNote(key) === undefined);
   const noEffect = new Set(translation.retiredKeys.map(noEffectNote));
@@ -1033,11 +970,9 @@ export function legacyConfigNoticeMessage(
       parts.push(retiredIdleCheckoutHoursNote());
     }
   }
-  for (const [, note] of NO_EFFECT_RETIRED_NOTES) {
+  for (const [, note] of [...NO_EFFECT_RETIRED_NOTES, ...REMOVED_DATA_LAYER_NOTES]) {
     if (noEffect.has(note)) parts.push(note);
   }
-  const removed = removedConfigKeysNoticeMessage(configPath, translation);
-  if (removed) parts.push(removed);
   return parts.join(" ");
 }
 
@@ -1063,7 +998,6 @@ export function translateConfigDocument(
     warnings: [],
     legacyInput: false,
     retiredKeys: [],
-    removedKeys: [],
     retiredEnabledFalse: false,
   };
   translateBlock(map, tier === "user", "base", out);
@@ -1073,7 +1007,6 @@ export function translateConfigDocument(
     }
   }
   out.retiredKeys = sortedUnique(out.retiredKeys);
-  out.removedKeys = sortedUnique(out.removedKeys);
   return out;
 }
 
@@ -1125,6 +1058,7 @@ function projectBlock(block: JsonRecord): JsonRecord {
     ...RETIRED_PATHS.map(([retired]) => retired),
     ...REMOVED_NO_EFFECT_PATHS,
     ...DATA_LAYER_RETIRED_PATHS,
+    ...REMOVED_DATA_LAYER_PATHS,
   ]) {
     const dot = path.indexOf(".");
     if (dot < 0) {
@@ -1316,7 +1250,8 @@ export const DEFAULT_INDEXES: ResolvedIndexesConfig = {
  * Whole-load rejection: the candidate config must not be used at all. Raised
  * for malformed input documents or security-sensitive sections, or when a
  * resolved configuration lacks its registration list or index switches.
- * Retired keys are translated before validation and never raise it.
+ * Older retired keys translate before validation; removed data-layer keys
+ * raise it in user config.
  */
 export class ConfigRejectedError extends Error {
   readonly errors: string[];

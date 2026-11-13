@@ -17,7 +17,7 @@ use crate::config::{
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
     InspectCategories, InspectConfig, LspIdleMinutes, RemoteExecConfig, RerankBackendKind,
     RerankConfig, SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+    UserServerDef, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
     DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
     MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
     MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS,
@@ -127,13 +127,11 @@ pub struct RawAftConfig {
     pub restrict_to_project_root: Option<bool>,
     pub indexes: Option<RawIndexes>,
     pub index: Option<RawIndex>,
-    pub views: Option<RawViews>,
     #[serde(deserialize_with = "deserialize_opt_usize")]
     pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
     pub idle: Option<RawIdle>,
     pub backup: Option<RawBackup>,
-    pub worktree: Option<RawWorktree>,
     pub github: Option<RawGithub>,
     pub gh_shim: Option<RawGhShim>,
     pub git: Option<RawGit>,
@@ -548,45 +546,6 @@ pub struct RawSubc {
     pub client_reaper: Option<bool>,
 }
 
-/// The removed `views` keys. A config file that sets them gets a removal
-/// notice, but until the views code is deleted their values still reach
-/// [`crate::config::ViewsConfig`]. `views.idle_checkout_hours` never arrives
-/// here: translation moves it to `idle.checkout_hours` first.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct RawViews {
-    pub enabled: Option<bool>,
-    pub callgraph_copies: Option<Value>,
-}
-
-/// Each tier sets only the views keys it names; a project that sets
-/// `views.enabled` keeps the user's copy limit.
-fn merge_views(base: Option<RawViews>, over: Option<RawViews>) -> Option<RawViews> {
-    let Some(over) = over else {
-        return base;
-    };
-    let mut views = base.unwrap_or_default();
-    if over.enabled.is_some() {
-        views.enabled = over.enabled;
-    }
-    if over.callgraph_copies.is_some() {
-        views.callgraph_copies = over.callgraph_copies;
-    }
-    Some(views)
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct RawWorktree {
-    pub ram_overlay: Option<bool>,
-}
-
-impl RawWorktree {
-    fn is_empty(&self) -> bool {
-        self.ram_overlay.is_none()
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawGithub {
@@ -761,7 +720,7 @@ pub fn resolve_config_for_harness(
             }
         };
         let (raw, translation) = outcome;
-        if translation.legacy_input || !translation.removed_keys.is_empty() {
+        if translation.legacy_input {
             log_retired_keys_once(tier, &translation);
         }
         for warning in translation.warnings {
@@ -1089,7 +1048,6 @@ fn log_retired_keys_once(tier: &ConfigTier, translation: &feature_config::Docume
     let keys = translation
         .retired_keys
         .iter()
-        .chain(&translation.removed_keys)
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
@@ -1105,10 +1063,6 @@ fn log_retired_keys_once(tier: &ConfigTier, translation: &feature_config::Docume
                 translation.retired_keys.join(", ")
             ));
         }
-        parts.push(feature_config::removed_keys_notice(
-            &tier.source,
-            translation,
-        ));
         parts.retain(|part| !part.is_empty());
         parts.join(". ")
     } else {
@@ -1715,7 +1669,6 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.index.is_some() {
         base.index = override_config.index;
     }
-    base.views = merge_views(base.views.take(), override_config.views);
     if override_config.callgraph_chunk_size.is_some() {
         base.callgraph_chunk_size = override_config.callgraph_chunk_size;
     }
@@ -1729,9 +1682,6 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.backup.is_some() {
         base.backup = override_config.backup;
-    }
-    if override_config.worktree.is_some() {
-        base.worktree = override_config.worktree;
     }
     if override_config.github.is_some() {
         base.github = override_config.github;
@@ -1830,7 +1780,6 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     // A project may switch an index off but never back on.
     base.indexes = merge_indexes(base.indexes, project.indexes, true);
-    base.views = merge_views(base.views.take(), project.views);
     if project.callgraph_chunk_size.is_some() {
         base.callgraph_chunk_size = project.callgraph_chunk_size;
     }
@@ -1856,7 +1805,6 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.bash = merge_bash_config(base.bash.take(), project_bash);
     base.inspect = merge_inspect_config(base.inspect.take(), project.inspect);
     base.idle = merge_idle_config(base.idle.take(), project.idle);
-    base.worktree = merge_worktree_config(base.worktree.take(), project.worktree);
     base.backup = merge_project_backup_config(base.backup.take(), project.backup);
     if project.git.is_some() {
         base.git = project.git;
@@ -2363,19 +2311,6 @@ fn merge_inspect_config(
     (!inspect.is_empty()).then_some(inspect)
 }
 
-fn merge_worktree_config(
-    base: Option<RawWorktree>,
-    override_worktree: Option<RawWorktree>,
-) -> Option<RawWorktree> {
-    let Some(override_worktree) = override_worktree else {
-        return base;
-    };
-
-    let mut worktree = base.unwrap_or_default();
-    worktree.ram_overlay = override_worktree.ram_overlay.or(worktree.ram_overlay);
-    (!worktree.is_empty()).then_some(worktree)
-}
-
 /// Merge a project tier's `pi` block. `external_access_ask: false` is ignored
 /// there: a repository must not silence a protection the user has, so a
 /// project may only turn the outside-access prompt on. `record_project_drops`
@@ -2752,19 +2687,6 @@ fn apply_resolved_config(
     if let Some(value) = raw.restrict_to_project_root {
         config.restrict_to_project_root = value;
     }
-    // `views.enabled` is a removed key: the data layer replaces today's
-    // views, so a file that sets it gets the removed-key notice and the
-    // value reaches nothing.
-    if let Some(views) = raw.views.as_ref() {
-        config.views.callgraph_copies = resolve_clamped_views_setting(
-            views.callgraph_copies.as_ref(),
-            "views.callgraph_copies",
-            crate::config::DEFAULT_VIEWS_CALLGRAPH_COPIES,
-            0,
-            crate::config::MAX_VIEWS_CALLGRAPH_COPIES,
-            warnings,
-        );
-    }
     if let Some(value) = raw.callgraph_chunk_size {
         config.callgraph_chunk_size = value;
     }
@@ -2775,7 +2697,6 @@ fn apply_resolved_config(
     config.search = resolve_search_config(raw.search.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
     config.backup = resolve_backup_config(raw.backup.as_ref());
-    config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.github = resolve_github_config(raw.github.as_ref(), warnings);
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
 
@@ -2995,40 +2916,6 @@ fn resolve_clamped_minutes(
     clamped
 }
 
-fn resolve_clamped_views_setting(
-    raw: Option<&Value>,
-    key: &'static str,
-    default: u32,
-    min: u32,
-    max: u32,
-    warnings: &mut Vec<ConfigWarning>,
-) -> u32 {
-    let Some(value) = raw else {
-        return default;
-    };
-    let Some(parsed) = json_integer(value) else {
-        warnings.push(ConfigWarning {
-            code: "invalid_views_setting",
-            key,
-            tier: "config".to_string(),
-            value: value.to_string(),
-            message: format!("{key} must be an integer; using default {default}"),
-        });
-        return default;
-    };
-    let clamped = parsed.clamp(i64::from(min), i64::from(max)) as u32;
-    if i64::from(clamped) != parsed {
-        warnings.push(ConfigWarning {
-            code: "clamped_views_setting",
-            key,
-            tier: "config".to_string(),
-            value: parsed.to_string(),
-            message: format!("{key}={parsed} is outside {min}..={max}; clamped to {clamped}"),
-        });
-    }
-    clamped
-}
-
 fn resolve_clamped_bash_watch_sync_max_ms(
     raw: Option<u64>,
     warnings: &mut Vec<ConfigWarning>,
@@ -3106,14 +2993,6 @@ fn resolve_backup_config(raw: Option<&RawBackup>) -> BackupConfig {
         }
     }
     backup
-}
-
-fn resolve_worktree_config(raw: Option<&RawWorktree>) -> WorktreeConfig {
-    let mut worktree = WorktreeConfig::default();
-    if let Some(value) = raw.and_then(|raw| raw.ram_overlay) {
-        worktree.ram_overlay = value;
-    }
-    worktree
 }
 
 fn resolve_github_config(
@@ -5416,38 +5295,100 @@ mod tests {
         assert!(at_max.warnings.is_empty());
     }
 
-    /// `views.callgraph_copies` and `views.enabled` are removed keys: a file
-    /// that sets them gets a notice. `views.enabled` reaches nothing, since
-    /// the data layer replaces today's views; until the views code is
-    /// deleted, the copy setting still reaches `ViewsConfig`, merged per key.
     #[test]
-    fn removed_views_settings_still_apply_and_merge_per_key_until_cutover() {
-        let default = resolve_config(&[tier("user", r#"{}"#)]);
-        assert_eq!(default.config.views.callgraph_copies, 4);
-        assert!(!default.config.views.enabled);
-
-        // A project that turns views on changes nothing, and keeps the
-        // user's copy setting.
-        let merged = resolve_config(&[
-            tier("user", r#"{"views":{"callgraph_copies":0}}"#),
-            tier("project", r#"{"views":{"enabled":true}}"#),
-        ]);
-        assert!(merged.errors.is_empty(), "{:?}", merged.errors);
-        assert!(!merged.config.views.enabled);
-        assert_eq!(merged.config.views.callgraph_copies, 0);
-        assert!(merged.warnings.is_empty(), "{:?}", merged.warnings);
-
-        let clamped = resolve_config(&[tier("user", r#"{"views":{"callgraph_copies":1000}}"#)]);
-        assert_eq!(clamped.config.views.callgraph_copies, 256);
-        assert!(
-            clamped
-                .warnings
-                .iter()
-                .any(|warning| warning.code == "clamped_views_setting"
-                    && warning.key == "views.callgraph_copies"),
-            "{:?}",
-            clamped.warnings
+    fn removed_views_enabled_refused_for_user_and_noticed_for_project() {
+        let doc = r#"{"views":{"enabled":true}}"#;
+        let user = resolve_config(&[tier("user", doc)]);
+        assert_eq!(
+            user.errors,
+            vec!["removed_config_key:views.enabled; run npx @cortexkit/aft doctor --fix"]
         );
+        let project = resolve_config(&[tier("project", doc)]);
+        assert!(project.errors.is_empty(), "{:?}", project.errors);
+        assert!(project.warnings.is_empty(), "{:?}", project.warnings);
+        assert_eq!(
+            serde_json::to_value(project.config).unwrap(),
+            serde_json::to_value(resolve_config(&[]).config).unwrap()
+        );
+        let mut map = serde_json::from_str::<Value>(doc)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        let translation =
+            feature_config::translate_document(&mut map, feature_config::DocumentTier::Project);
+        let notice =
+            feature_config::project_retired_keys_notice("/project/aft.jsonc", &translation);
+        let expected = feature_config::REMOVED_DATA_LAYER_NOTES
+            .iter()
+            .find(|(path, _)| *path == "views.enabled")
+            .unwrap()
+            .1;
+        assert_eq!(notice, expected);
+    }
+
+    #[test]
+    fn removed_views_callgraph_copies_refused_for_user_and_noticed_for_project() {
+        let doc = r#"{"views":{"callgraph_copies":2}}"#;
+        let user = resolve_config(&[tier("user", doc)]);
+        assert_eq!(
+            user.errors,
+            vec!["removed_config_key:views.callgraph_copies; run npx @cortexkit/aft doctor --fix"]
+        );
+        let project = resolve_config(&[tier("project", doc)]);
+        assert!(project.errors.is_empty(), "{:?}", project.errors);
+        assert!(project.warnings.is_empty(), "{:?}", project.warnings);
+        assert_eq!(
+            serde_json::to_value(project.config).unwrap(),
+            serde_json::to_value(resolve_config(&[]).config).unwrap()
+        );
+        let mut map = serde_json::from_str::<Value>(doc)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        let translation =
+            feature_config::translate_document(&mut map, feature_config::DocumentTier::Project);
+        let notice =
+            feature_config::project_retired_keys_notice("/project/aft.jsonc", &translation);
+        let expected = feature_config::REMOVED_DATA_LAYER_NOTES
+            .iter()
+            .find(|(path, _)| *path == "views.callgraph_copies")
+            .unwrap()
+            .1;
+        assert_eq!(notice, expected);
+    }
+
+    #[test]
+    fn removed_worktree_ram_overlay_refused_for_user_and_noticed_for_project() {
+        let doc = r#"{"worktree":{"ram_overlay":false}}"#;
+        let user = resolve_config(&[tier("user", doc)]);
+        assert_eq!(
+            user.errors,
+            vec!["removed_config_key:worktree.ram_overlay; run npx @cortexkit/aft doctor --fix"]
+        );
+        let project = resolve_config(&[tier("project", doc)]);
+        assert!(project.errors.is_empty(), "{:?}", project.errors);
+        assert!(project.warnings.is_empty(), "{:?}", project.warnings);
+        assert_eq!(
+            serde_json::to_value(project.config).unwrap(),
+            serde_json::to_value(resolve_config(&[]).config).unwrap()
+        );
+        let mut map = serde_json::from_str::<Value>(doc)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        let translation =
+            feature_config::translate_document(&mut map, feature_config::DocumentTier::Project);
+        let notice =
+            feature_config::project_retired_keys_notice("/project/aft.jsonc", &translation);
+        let expected = feature_config::REMOVED_DATA_LAYER_NOTES
+            .iter()
+            .find(|(path, _)| *path == "worktree.ram_overlay")
+            .unwrap()
+            .1;
+        assert_eq!(notice, expected);
     }
 
     /// `idle.checkout_hours` replaces `views.idle_checkout_hours` with the
@@ -5637,22 +5578,6 @@ mod tests {
             Some(&Harness::Pi),
         );
         assert!(user_harness.config.indexes.trigram);
-    }
-
-    #[test]
-    fn worktree_ram_overlay_resolves_at_user_and_project_tiers() {
-        assert!(resolve_config(&[]).config.worktree.ram_overlay);
-
-        let user = resolve_config(&[tier("user", r#"{ "worktree": { "ram_overlay": false } }"#)]);
-        assert!(!user.config.worktree.ram_overlay);
-        assert!(user.dropped.is_empty());
-
-        let project = resolve_config(&[
-            tier("user", r#"{ "worktree": { "ram_overlay": false } }"#),
-            tier("project", r#"{ "worktree": { "ram_overlay": true } }"#),
-        ]);
-        assert!(project.config.worktree.ram_overlay);
-        assert!(project.dropped.is_empty());
     }
 
     #[test]
