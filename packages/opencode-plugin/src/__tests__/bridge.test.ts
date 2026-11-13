@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { BinaryBridge, compareSemver } from "@cortexkit/aft-bridge";
 import { cachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
+import { ManualClock } from "../../../aft-bridge/src/__tests__/test-utils/manual-clock.js";
 import { isolatedAftEnvironment } from "../../../aft-bridge/src/test-child-environment.js";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
@@ -671,38 +672,47 @@ describe("BinaryBridge lifecycle", () => {
     }
   });
 
-  test("per-request transportTimeoutMs override sets the bridge timer", async () => {
+  test("per-request transportTimeoutMs override sets the request deadline", async () => {
     const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
-
-    const originalSetTimeout = globalThis.setTimeout;
-    const delays: unknown[] = [];
-    globalThis.setTimeout = ((
-      handler: Parameters<typeof setTimeout>[0],
-      timeout?: number,
-      ...args: unknown[]
-    ) => {
-      delays.push(timeout);
-      return originalSetTimeout(handler, Math.min(Number(timeout ?? 0), 1), ...args);
-    }) as typeof setTimeout;
+    // Advance wall time, awake time and timer delivery together: compressing
+    // only setTimeout callbacks does not consume the request's elapsed budget.
+    const clock = new ManualClock();
 
     try {
       bridge = new BinaryBridge(
         fakeBin,
         projectRoot,
         isolatedBridgeOptions({
+          clock,
           timeoutMs: 30_000,
           maxRestarts: 0,
         }),
         { harness: "opencode" },
       );
 
-      const err = await bridge.send("version", {}, { transportTimeoutMs: 60_000 }).catch((e) => e);
+      let settled = false;
+      const outcome = bridge.send("version", {}, { transportTimeoutMs: 60_000 }).catch((error) => {
+        settled = true;
+        return error;
+      });
+      const pending = (bridge as unknown as { pending: Map<string, unknown> }).pending;
+      await waitUntil(() => pending.size === 1, TEST_TIMEOUT_MS, "version request registration");
+
+      clock.advance(30_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(pending.size).toBe(1);
+      clock.advance(29_999);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(pending.size).toBe(1);
+      clock.advance(1);
+      const err = await outcome;
 
       expect(err).toBeInstanceOf(Error);
       expect((err as Error).message).toContain("timed out after 60000ms");
-      expect(delays).toContain(60_000);
+      expect(pending.size).toBe(0);
     } finally {
-      globalThis.setTimeout = originalSetTimeout;
       await bridge?.shutdown();
     }
   });

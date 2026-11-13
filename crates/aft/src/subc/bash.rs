@@ -6181,12 +6181,17 @@ mod grant_path_tests {
                         done = rx.recv() => panic!("{mode}: answered before reply watchdog: {:?}", done.map(|done| copy_response(done.response_for_test()))),
                         _ = timing.reply.armed.notified() => {},
                     }
+                    let armed_at = tokio::time::Instant::now();
                     timing.reply.fire.notify_one();
                     tokio::time::advance(Duration::from_millis(1499)).await;
+                    let early_reply = rx.try_recv();
                     assert!(matches!(
-                        rx.try_recv(),
+                        &early_reply,
                         Err(mpsc::error::TryRecvError::Empty)
-                    ));
+                    ), "{mode}: reply before deadline; armed after {:?}, now {:?}: {:?}",
+                        armed_at - started,
+                        tokio::time::Instant::now() - started,
+                        early_reply.map(|done| copy_response(done.response_for_test())));
 
                     let cutoff = started + Duration::from_millis(2500);
                     // A running blocking job inhibits Tokio's automatic clock
