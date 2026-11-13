@@ -1,0 +1,34 @@
+{
+  "name": "search-issues",
+  "reply": {
+    "content": [
+      {
+        "text": "{\n  \"result\": {\n    \"incomplete_results\": false,\n    \"items\": [\n      {\n        \"number\": 7,\n        \"title\": \"Crash on start\"\n      }\n    ],\n    \"next_page\": 3,\n    \"total_count\": 31\n  }\n}",
+        "type": "text"
+      }
+    ],
+    "isError": false,
+    "result": {
+      "incomplete_results": false,
+      "items": [
+        {
+          "number": 7,
+          "title": "Crash on start"
+        }
+      ],
+      "next_page": 3,
+      "total_count": 31
+    },
+    "structuredContent": {
+      "incomplete_results": false,
+      "items": [
+        {
+          "number": 7,
+          "title": "Crash on start"
+        }
+      ],
+      "next_page": 3,
+      "total_count": 31
+    }
+  }
+}

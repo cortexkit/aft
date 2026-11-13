@@ -1,0 +1,22 @@
+{
+  "name": "repo-get-diff",
+  "reply": {
+    "content": [
+      {
+        "text": "{\n  \"result\": {\n    \"body\": \"diff --git a/src/lib.rs b/src/lib.rs\\n\",\n    \"next_page\": null,\n    \"status\": 200\n  }\n}",
+        "type": "text"
+      }
+    ],
+    "isError": false,
+    "result": {
+      "body": "diff --git a/src/lib.rs b/src/lib.rs\n",
+      "next_page": null,
+      "status": 200
+    },
+    "structuredContent": {
+      "body": "diff --git a/src/lib.rs b/src/lib.rs\n",
+      "next_page": null,
+      "status": 200
+    }
+  }
+}

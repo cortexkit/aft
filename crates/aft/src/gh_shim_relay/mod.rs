@@ -47,6 +47,8 @@ pub const READ_REQUEST_OPERATION: &str = "gh_shim.read_request";
 
 pub(crate) const PLEXUS_MODULE_ID: &str = "plexus";
 const AGENT_BINDINGS_READ_OPERATION: &str = "bindings.read_for_agent";
+const READ_BULK_OPERATION: &str = "github.read.bulk";
+const READ_BULK_CAPABILITY: &str = "plexus:github.read.bulk/v1";
 const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 // Plexus admits writes for a 120 s receipt claim lease. A write begun just
 // before that lease expires can use its full 30 s vendor HTTP timeout, so
@@ -774,18 +776,7 @@ pub(crate) async fn read_validated_request<T: RelayTransport>(
     // Plexus receives its own target-specific stamp, including worker delegation;
     // AFT neither reads nor reconstructs the bot identity in that stamp.
     let selector = scope_selector(stamp);
-    let body = serde_json::to_value(subc_protocol::tool_call::ToolCallRequest {
-        name: "github_read".into(),
-        arguments: serde_json::to_value(parsed).expect("a validated read request serializes"),
-        tool_call_id: None,
-        progress_token: None,
-        call_key: None,
-        schema_pin: None,
-        origin: None,
-        preset: None,
-        output_refs: None,
-    })
-    .expect("a read tool call serializes to JSON");
+    let body = read_call(parsed, false);
     let reply = match transport
         .plexus(
             &redeemed.project_root,
@@ -799,6 +790,54 @@ pub(crate) async fn read_validated_request<T: RelayTransport>(
         Err(error) => transport_refusal("plexus", error),
     };
     (reply, PATH_STAMP)
+}
+
+pub(crate) fn read_call(parsed: &crate::gh_shim::read_contract::Request, bulk: bool) -> Value {
+    let arguments = serde_json::to_value(parsed).expect("a read request serializes");
+    if bulk {
+        return read_bulk_call(arguments);
+    }
+    serde_json::to_value(subc_protocol::tool_call::ToolCallRequest {
+        name: "github_read".into(),
+        arguments,
+        tool_call_id: None,
+        progress_token: None,
+        call_key: None,
+        schema_pin: None,
+        origin: None,
+        preset: None,
+        output_refs: None,
+    })
+    .expect("a read tool call serializes to JSON")
+}
+
+fn read_bulk_call(mut arguments: Value) -> Value {
+    // The bulk contract omits the default JSON Accept value. Keep the
+    // legacy tool encoding unchanged for providers without the operation.
+    if arguments.pointer("/args/accept").and_then(Value::as_str)
+        == Some("application/vnd.github+json")
+    {
+        arguments["args"].as_object_mut().unwrap().remove("accept");
+    }
+    json!({"method": READ_BULK_OPERATION, "params": arguments})
+}
+
+fn advertises_read_bulk(description: &Value) -> bool {
+    description["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|value| value == READ_BULK_CAPABILITY)
+        })
+        || description["majors"].as_array().is_some_and(|majors| {
+            majors.iter().any(|major| {
+                major["version"] == "tool-provider/v1"
+                    && major["ops"]
+                        .as_array()
+                        .is_some_and(|ops| ops.iter().any(|value| value == READ_BULK_OPERATION))
+            })
+        })
 }
 
 /// Read plexus's repository-to-agent bindings for the shim's version check.
@@ -1691,6 +1730,13 @@ async fn route_request(
         error: TransportError::UnavailableNoRetry(error.to_string()),
         reconnect: false,
     })?;
+    let read_bulk = (body["name"] == "github_read")
+        .then(|| serde_json::to_vec(&read_bulk_call(body["arguments"].clone())))
+        .transpose()
+        .map_err(|error| CallFailure {
+            error: TransportError::UnavailableNoRetry(error.to_string()),
+            reconnect: false,
+        })?;
     let key =
         route_lease_key(consumer, &target, &identity, scope).map_err(|error| CallFailure {
             error: TransportError::UnavailableNoRetry(error.to_string()),
@@ -1744,6 +1790,7 @@ async fn route_request(
                 options,
                 reply_timeout,
                 bytes,
+                read_bulk,
                 &mut opened,
                 &mut canceled,
             )
@@ -1777,7 +1824,8 @@ async fn open_and_send(
     scope: Option<&ScopeSelector>,
     options: subc_client_rs::CallOptions,
     reply_timeout: Duration,
-    bytes: Vec<u8>,
+    mut bytes: Vec<u8>,
+    read_bulk: Option<Vec<u8>>,
     opened_handles: &mut Vec<subc_client_rs::RouteHandle>,
     canceled: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<Value, CallFailure> {
@@ -1832,6 +1880,23 @@ async fn open_and_send(
             error: TransportError::Unavailable("relay requester canceled".into()),
             reconnect: false,
         });
+    }
+    if let Some(read_bulk) = read_bulk {
+        // Probe this exact scoped route, not a process-wide catalog cache:
+        // restarts and rollbacks must discard the old provider's advertisement.
+        // A closed route is never reopened between the probe and the read.
+        let description = tokio::select! {
+            biased;
+            _ = canceled.changed() => return Err(CallFailure { error:TransportError::Unavailable("relay requester canceled".into()), reconnect:false }),
+            reply = consumer.request(&route, br#"{"method":"role.describe","params":{}}"#.to_vec(), CallOptions { timeout:reply_timeout, ..CallOptions::default() }) => reply,
+        };
+        if description
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|description| advertises_read_bulk(&description))
+        {
+            bytes = read_bulk;
+        }
     }
     let reply = tokio::select! {
         biased;

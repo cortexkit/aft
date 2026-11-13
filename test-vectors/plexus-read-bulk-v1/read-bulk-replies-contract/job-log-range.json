@@ -1,0 +1,24 @@
+{
+  "name": "job-log-range",
+  "reply": {
+    "content": [
+      {
+        "text": "{\n  \"result\": {\n    \"body\": \"test parser::rejects_bad_input ... FAILED\\n\",\n    \"length\": 42,\n    \"offset\": 1024,\n    \"total_bytes\": 9000\n  }\n}",
+        "type": "text"
+      }
+    ],
+    "isError": false,
+    "result": {
+      "body": "test parser::rejects_bad_input ... FAILED\n",
+      "length": 42,
+      "offset": 1024,
+      "total_bytes": 9000
+    },
+    "structuredContent": {
+      "body": "test parser::rejects_bad_input ... FAILED\n",
+      "length": 42,
+      "offset": 1024,
+      "total_bytes": 9000
+    }
+  }
+}
