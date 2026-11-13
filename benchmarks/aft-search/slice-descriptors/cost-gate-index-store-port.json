@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Nightly OSS cost gate ported to the 0.64 index store: readiness and first-query latency read from the current status surface, call-graph refresh timed from the edit reply (edit time is a diagnostic), peak memory from the kernel's VmHWM, a fresh baseline verified by two independent passes, and a smaller artifact. Only scripts/telemetry and the cost-gate workflow change; search is untouched."
+}
