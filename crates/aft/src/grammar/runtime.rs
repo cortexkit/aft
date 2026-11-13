@@ -168,8 +168,10 @@ impl GrammarRegistry {
         }
         {
             if entry.state == GrammarState::NotDownloaded {
-                if let Some(bytes) = self.storage().read(&self.manifest) {
-                    self.load(&mut entry, bytes);
+                match self.storage().read(&self.manifest) {
+                    Ok(Some(bytes)) => self.load(&mut entry, bytes),
+                    Ok(None) => {}
+                    Err(_) => self.failed_attempt(&mut entry, FailureCause::Storage),
                 }
             }
             entry

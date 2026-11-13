@@ -422,37 +422,78 @@ fn grammar_storage_faults_discard_bytes_then_retry() {
 }
 
 #[test]
-fn grammar_altered_and_unreadable_stored_files_count_as_missing() {
-    for unreadable in [false, true] {
-        let (directory, registry, _, transport) = setup([success()]);
-        stored(directory.path());
-        if unreadable {
-            registry.set_storage_fault(StorageFault::Read);
-        } else {
-            std::fs::write(
-                stored_path(directory.path(), &PRODUCTION_MANIFEST),
-                vec![0; WASM.len()],
-            )
-            .unwrap();
-        }
-        assert_eq!(
-            registry.stored().unwrap_err().state,
-            GrammarState::NotDownloaded
-        );
-        if !unreadable {
-            assert!(!stored_path(directory.path(), &PRODUCTION_MANIFEST).exists());
-        }
-        registry.set_storage_fault(StorageFault::None);
-        // An unreadable file is absent to the loader; removing it keeps that
-        // condition after the injected read failure is lifted.
-        if unreadable {
-            std::fs::remove_file(stored_path(directory.path(), &PRODUCTION_MANIFEST)).unwrap();
-        }
-        registry.request().unwrap_err();
-        settled(&registry);
-        registry.stored().unwrap();
-        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
-    }
+fn grammar_altered_stored_file_is_replaced_without_deleting_it_first() {
+    let (directory, registry, _, transport) = setup([success()]);
+    stored(directory.path());
+    let path = stored_path(directory.path(), &PRODUCTION_MANIFEST);
+    let bad = vec![0; WASM.len()];
+    std::fs::write(&path, &bad).unwrap();
+    assert_eq!(
+        registry.stored().unwrap_err().state,
+        GrammarState::NotDownloaded
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bad);
+    registry.request().unwrap_err();
+    settled(&registry);
+    registry.stored().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), WASM);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn grammar_transient_stored_open_error_preserves_the_file() {
+    let (directory, registry, _, _) = setup([]);
+    stored(directory.path());
+    registry.set_storage_fault(StorageFault::Read);
+    assert_eq!(
+        registry.stored().unwrap_err().state,
+        GrammarState::StorageRetry
+    );
+    assert_eq!(
+        std::fs::read(stored_path(directory.path(), &PRODUCTION_MANIFEST)).unwrap(),
+        WASM
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn grammar_verified_publication_replaces_a_symlink_without_touching_its_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage::Storage {
+        root: directory.path().into(),
+        fault: StorageFault::None,
+    };
+    std::fs::create_dir(directory.path().join("grammars")).unwrap();
+    let target = directory.path().join("untouched");
+    std::fs::write(&target, b"do not change").unwrap();
+    let path = stored_path(directory.path(), &PRODUCTION_MANIFEST);
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(storage.read(&PRODUCTION_MANIFEST).unwrap().is_none());
+    assert!(std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(storage.publish(&PRODUCTION_MANIFEST, WASM).unwrap(), WASM);
+    assert_eq!(std::fs::read(&target).unwrap(), b"do not change");
+    assert!(!std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn grammar_replacing_publication_reports_a_directory_path_without_removing_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage::Storage {
+        root: directory.path().into(),
+        fault: StorageFault::None,
+    };
+    let path = stored_path(directory.path(), &PRODUCTION_MANIFEST);
+    std::fs::create_dir_all(&path).unwrap();
+    assert!(storage.read(&PRODUCTION_MANIFEST).unwrap().is_none());
+    let error = storage.publish(&PRODUCTION_MANIFEST, WASM).unwrap_err();
+    assert!(error.to_string().contains(&path.display().to_string()));
+    assert!(path.is_dir());
 }
 
 #[test]
