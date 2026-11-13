@@ -113,7 +113,7 @@ drift test, in `docs/investigations/gh-shim-wire-goldens/requests/`.
 
 `plexus-github-read-bot/` holds byte-for-byte copies of Plexus's own
 github_read contract vectors, so the shim's reply decoder is tested against
-exactly what Plexus emits. Source: plexus commit `019f6bbd`,
+exactly what Plexus emits. Source: plexus commit `8d8aff87`,
 `crates/plexus-module/tests/fixtures/github-read-bot/`. Do not edit or
 re-format them; copy a new revision from Plexus instead.
 
