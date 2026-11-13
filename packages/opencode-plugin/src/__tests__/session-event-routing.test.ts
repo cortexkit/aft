@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import * as bridge from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
-import { __resetBgNotificationStateForTests } from "../bg-notifications.js";
+import * as notifications from "../bg-notifications.js";
 import * as bootstrap from "../bridge-bootstrap.js";
 import * as reload from "../config-live-reload.js";
 import * as updater from "../hooks/auto-update-checker/index.js";
@@ -31,7 +31,7 @@ afterEach(async () => {
   await Promise.all(hooks.splice(0).map((instance) => instance.dispose()));
   await Promise.all(pools.splice(0).map((pool) => pool.shutdown()));
   mock.restore();
-  __resetBgNotificationStateForTests();
+  notifications.__resetBgNotificationStateForTests();
   _resetSessionDirectoryCacheForTest();
   if (sandbox) rmSync(sandbox, { recursive: true, force: true });
   sandbox = undefined;
@@ -80,9 +80,6 @@ async function setup() {
       onBgEventsNudge() {},
     });
     pools.push(pool);
-    // An idle replay drain is allowed only after a project bridge exists.
-    // Construct it without opening any session route or subscription.
-    pool.getBridge(directory);
     spyOn(bridge, "createAftTransportPool").mockResolvedValue(pool);
     const instanceHooks = (await plugin({ directory, client } as Parameters<Plugin>[0])) as Hooks;
     hooks.push(instanceHooks);
@@ -98,12 +95,17 @@ describe.serial("session events route only to their owning location", () => {
     const owner = await instance(first, { location: { directory: first }, session: { get } });
     const other = await instance(second, { location: { directory: second }, session: { get } });
     const idle = { event: { type: "session.idle", properties: { sessionID: "owned" } } };
+    // Tracking background work permits an idle completion check before a bridge connects.
+    notifications.trackBgTask("owned", "background-task");
+    const observed = spyOn(notifications, "observeOpenCodeBgNotificationEvent");
 
     // Deliver to the non-owner first so shared session state cannot hide an
     // incorrect drain there after the owner's successful drain.
     await other.hooks.event(idle);
+    expect(observed).not.toHaveBeenCalled();
     await owner.hooks.event(idle);
 
+    expect(observed).toHaveBeenCalledTimes(1);
     expect(other.routeOpen).not.toHaveBeenCalled();
     expect(other.subscribe).not.toHaveBeenCalled();
     expect(owner.routeOpen).toHaveBeenCalledTimes(1);
@@ -117,18 +119,22 @@ describe.serial("session events route only to their owning location", () => {
     for (const directory of [first, second]) {
       instances.push(await instance(directory, { location: { directory }, session: { get } }));
     }
+    notifications.trackBgTask("removed-child", "background-task");
+    const observed = spyOn(notifications, "observeOpenCodeBgNotificationEvent");
     for (const entry of instances) {
-      await entry.hooks.event({
-        event: { type: "session.idle", properties: { sessionID: "removed-child" } },
-      });
+      for (const type of ["session.idle", "session.status"]) {
+        await entry.hooks.event({ event: { type, properties: { sessionID: "removed-child" } } });
+      }
       expect(entry.routeOpen).not.toHaveBeenCalled();
       expect(entry.subscribe).not.toHaveBeenCalled();
     }
+    expect(observed).not.toHaveBeenCalled();
   });
 
   test("V1 does not open a route or subscription when the idle lookup fails", async () => {
     const { first, instance } = await setup();
     const entry = await instance(first, { session: { get: async () => undefined } });
+    notifications.trackBgTask("unknown-v1", "background-task");
     await entry.hooks.event({
       event: { type: "session.idle", properties: { sessionID: "unknown-v1" } },
     });
@@ -141,7 +147,7 @@ describe.serial("session events route only to their owning location", () => {
     const entry = await instance(first, {
       session: { get: async () => ({ data: { directory: second } }) },
     });
-    entry.pool.getBridge(second);
+    notifications.trackBgTask("resumed-v1", "background-task");
     await entry.hooks.event({
       event: { type: "session.idle", properties: { sessionID: "resumed-v1" } },
     });

@@ -868,19 +868,26 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     event: async (eventInput: { event: { type: string; properties?: unknown } }) => {
       await autoUpdateEventHook(eventInput);
       const eventType = eventInput.event.type;
-      observeOpenCodeBgNotificationEvent(eventInput.event);
       const sessionID = extractSessionID(eventInput.event.properties);
+      let sessionDir: string | null = null;
+      if (
+        sessionID &&
+        (eventType === "session.created" ||
+          eventType === "session.idle" ||
+          eventType === "session.status")
+      ) {
+        // V2 can deliver location-less events to every Location. A missing
+        // lookup does not establish that this instance owns the session.
+        // Guard before notification observation can deliver pending background completions.
+        sessionDir = await getSessionDirectoryForEvent(input.client, sessionID, input.directory);
+        if (!sessionDir) return;
+      }
+      observeOpenCodeBgNotificationEvent(eventInput.event);
       if (eventType === "session.moved" && sessionID) {
         clearSessionDirectory(sessionID);
         return;
       }
-      if (eventType === "session.created" && sessionID) {
-        const sessionDir = await getSessionDirectoryForEvent(
-          input.client,
-          sessionID,
-          input.directory,
-        );
-        if (!sessionDir) return;
+      if (eventType === "session.created" && sessionID && sessionDir) {
         observeFreshSessionStart(pool, sessionDir, sessionID, "new");
       }
       // OpenCode's lifecycle vocabulary publishes session.deleted for explicit
@@ -897,15 +904,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         return;
       }
       if (eventType !== "session.idle") return;
-      if (!sessionID) return;
-      // V2 can deliver location-less events to every Location. A missing
-      // lookup does not establish that this instance owns the session.
-      const sessionDir = await getSessionDirectoryForEvent(
-        input.client,
-        sessionID,
-        input.directory,
-      );
-      if (!sessionDir) return;
+      if (!sessionID || !sessionDir) return;
       if (!isProjectEnabled(sessionDir)) return;
       await handleIdleBgCompletions({
         ctx,
