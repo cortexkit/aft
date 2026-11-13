@@ -824,6 +824,27 @@ fn read_bulk_call(mut arguments: Value) -> Value {
     body
 }
 
+/// The capability probe sent on a read's scoped route before choosing the
+/// bulk op.
+const READ_BULK_PROBE: &[u8] = br#"{"name":"role.describe","arguments":{}}"#;
+
+/// Whether the probe's reply advertises the bulk op, or why it could not be
+/// read. A reply that parses but does not advertise is a plain `false`.
+fn read_bulk_probe_outcome(
+    reply: Result<Vec<u8>, subc_client_rs::CallError>,
+) -> Result<bool, String> {
+    let bytes = match reply {
+        Ok(bytes) => bytes,
+        Err(subc_client_rs::CallError::Module(body)) => {
+            return Err(format!("refused: {}", body.code))
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let description = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|_| "the reply was not JSON".to_string())?;
+    Ok(advertises_read_bulk(&description))
+}
+
 fn advertises_read_bulk(description: &Value) -> bool {
     description["capabilities"]
         .as_array()
@@ -1887,17 +1908,23 @@ async fn open_and_send(
         // Probe this exact scoped route, not a process-wide catalog cache:
         // restarts and rollbacks must discard the old provider's advertisement.
         // A closed route is never reopened between the probe and the read.
+        // On a route frame plexus treats any body with a `method` key as a
+        // management call and refuses `role.describe` there; the metadata op
+        // takes the facade's `{name, arguments}` form, like a tool call.
         let description = tokio::select! {
             biased;
             _ = canceled.changed() => return Err(CallFailure { error:TransportError::Unavailable("relay requester canceled".into()), reconnect:false }),
-            reply = consumer.request(&route, br#"{"method":"role.describe","params":{}}"#.to_vec(), CallOptions { timeout:reply_timeout, ..CallOptions::default() }) => reply,
+            reply = consumer.request(&route, READ_BULK_PROBE.to_vec(), CallOptions { timeout:reply_timeout, ..CallOptions::default() }) => reply,
         };
-        if description
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|description| advertises_read_bulk(&description))
-        {
-            bytes = read_bulk;
+        match read_bulk_probe_outcome(description) {
+            Ok(true) => bytes = read_bulk,
+            Ok(false) => {}
+            // The read still goes out as the tool call, but a probe that
+            // could not tell must say so: a silent fallback hid a wrong probe
+            // shape for every read on a live provider.
+            Err(reason) => crate::slog_warn!(
+                "gh_shim relay: plexus read-bulk probe failed ({reason}); sending github_read as a tool call"
+            ),
         }
     }
     let reply = tokio::select! {

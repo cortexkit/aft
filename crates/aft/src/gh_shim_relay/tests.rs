@@ -1930,7 +1930,9 @@ async fn read_bulk_selection_follows_each_routes_live_advertisement() {
     let expected_reply = reply["reply"].clone();
     let daemon = fake_daemon(DaemonScript {
         reply: Some(Arc::new(move |body, _| {
-            if body["method"] == "role.describe" {
+            if let Some(refusal) = plexus_management_refusal(body) {
+                refusal
+            } else if body["name"] == "role.describe" {
                 advertised.lock().unwrap().clone()
             } else {
                 reply["reply"].clone()
@@ -1980,7 +1982,7 @@ async fn read_bulk_selection_follows_each_routes_live_advertisement() {
         assert_eq!(requests.len(), (index + 1) * 2);
         assert_eq!(
             requests[index * 2],
-            json!({"method":"role.describe","params":{}})
+            json!({"name":"role.describe","arguments":{}})
         );
         assert_eq!(
             requests[index * 2 + 1],
@@ -2549,10 +2551,24 @@ pub(crate) async fn fake_daemon_with_reply(
     .await
 }
 
+/// What plexus answers a route body that names a `method` other than the bulk
+/// read: its management surface serves only admin and status ops, so a
+/// `{"method":"role.describe"}` probe gets `unknown_method` there. The fake
+/// must refuse it the same way, or a probe in that shape passes here and
+/// never advertises in production.
+fn plexus_management_refusal(body: &Value) -> Option<Value> {
+    let method = body.get("method")?.as_str()?;
+    (method != READ_BULK_OPERATION).then(|| {
+        json!({"isError": true, "error": {"code": "unknown_method", "message": format!("'{method}' is not a plexus management operation")}})
+    })
+}
+
 pub(crate) async fn fake_daemon_with_read_reply(reply: Value, bulk: bool) -> FakeDaemon {
     fake_daemon(DaemonScript {
         reply: Some(Arc::new(move |body, _| {
-            if body["method"] == "role.describe" {
+            if let Some(refusal) = plexus_management_refusal(body) {
+                refusal
+            } else if body["name"] == "role.describe" {
                 json!({"capabilities": if bulk { vec![READ_BULK_CAPABILITY] } else { vec![] }})
             } else {
                 reply.clone()
