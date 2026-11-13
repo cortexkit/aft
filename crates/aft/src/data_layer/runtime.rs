@@ -2731,18 +2731,39 @@ mod tests {
 
     #[test]
     fn the_quiet_timer_fires_once_after_a_burst_of_changes() {
-        let fired = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&fired);
-        let timer = Arc::new(QuietTimer::new(Duration::from_millis(200), move || {
-            count.fetch_add(1, Ordering::SeqCst);
-        }));
+        let window = Duration::from_millis(500);
         // Changes closer together than the quiet window never fire in
-        // between.
-        for _ in 0..5 {
-            timer.changed();
-            std::thread::sleep(Duration::from_millis(60));
-        }
-        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        // between. That claim needs every gap to be shorter than the window,
+        // and a loaded machine can oversleep a 60 ms sleep past it (macOS CI
+        // did). When a gap runs long, the timer is right to fire, so retry the
+        // burst on a fresh timer instead of blaming it.
+        let mut attempts = 0;
+        let (fired, timer) = loop {
+            attempts += 1;
+            let fired = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&fired);
+            let timer = Arc::new(QuietTimer::new(window, move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            }));
+            let mut longest = Duration::ZERO;
+            let mut last = Instant::now();
+            for _ in 0..5 {
+                timer.changed();
+                longest = longest.max(last.elapsed());
+                last = Instant::now();
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            longest = longest.max(last.elapsed());
+            if longest < window {
+                assert_eq!(fired.load(Ordering::SeqCst), 0);
+                break (fired, timer);
+            }
+            timer.stop();
+            assert!(
+                attempts < 5,
+                "every burst had a gap of at least {window:?}; the machine is too loaded to test this"
+            );
+        };
         let deadline = Instant::now() + Duration::from_secs(30);
         while fired.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -2755,7 +2776,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(fired.load(Ordering::SeqCst), 2);
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(window * 2);
         assert_eq!(fired.load(Ordering::SeqCst), 2, "fired without a change");
     }
 
