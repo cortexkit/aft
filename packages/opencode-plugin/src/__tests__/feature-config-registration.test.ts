@@ -330,7 +330,7 @@ describe("OpenCode feature-config registration", () => {
     expect(config.idle?.checkout_hours).toBe(24);
     const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
     expect(notices.map((notice) => notice.message)).toEqual([
-      `${projectFile} uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
+      `${projectFile} uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a user config file that still sets views.idle_checkout_hours. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
     ]);
   });
 });

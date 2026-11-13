@@ -1175,12 +1175,12 @@ pub const REMOVED_DATA_LAYER_NOTES: [(&str, &str); 3] = [
     ),
 ];
 
-/// The sentence saying a file that still names `views.idle_checkout_hours`
+/// The sentence saying a user file that still names `views.idle_checkout_hours`
 /// will be refused. Mirrors the TypeScript `retiredIdleCheckoutHoursNote`.
 pub fn retired_idle_checkout_hours_note() -> String {
     let (retired, replacement) = RETIRED_IDLE_CHECKOUT_HOURS;
     format!(
-        "{retired} is now {replacement}; from {} AFT refuses a config file that still sets {retired}.",
+        "{retired} is now {replacement}; from {} AFT refuses a user config file that still sets {retired}.",
         refused_from_version()
     )
 }

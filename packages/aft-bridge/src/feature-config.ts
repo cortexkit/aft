@@ -944,13 +944,13 @@ export const REMOVED_DATA_LAYER_NOTES: ReadonlyArray<readonly [string, string]> 
 ];
 
 /**
- * The sentence saying a file that still names `views.idle_checkout_hours` will
+ * The sentence saying a user file that still names `views.idle_checkout_hours` will
  * be refused. Mirrors `retired_idle_checkout_hours_note` in
  * `crates/aft/src/feature_config.rs`.
  */
 export function retiredIdleCheckoutHoursNote(): string {
   const [retired, replacement] = RETIRED_IDLE_CHECKOUT_HOURS;
-  return `${retired} is now ${replacement}; from ${refusedFromVersion()} AFT refuses a config file that still sets ${retired}.`;
+  return `${retired} is now ${replacement}; from ${refusedFromVersion()} AFT refuses a user config file that still sets ${retired}.`;
 }
 
 /**

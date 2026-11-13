@@ -640,7 +640,7 @@ describe("data-layer keys", () => {
       "project",
     );
     const idleNote =
-      "views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours.";
+      "views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a user config file that still sets views.idle_checkout_hours.";
     expect(retiredIdleCheckoutHoursNote()).toBe(idleNote);
     expect(legacyConfigNoticeMessage("/p", both)).toBe(
       `/p uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${idleNote} ${REMOVED_DATA_LAYER_NOTES[1]?.[1]}`,
