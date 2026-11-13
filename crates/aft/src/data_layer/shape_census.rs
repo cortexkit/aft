@@ -7,13 +7,15 @@ use serde::Serialize;
 
 use super::query::SliceSource;
 
-use crate::callgraph_store::dispatch::{Resolution, SiteHint};
+use crate::callgraph_store::join::dispatch::{Resolution, SiteHint};
 
 #[derive(Default)]
 pub(crate) struct Census {
     groups: BTreeMap<(String, String), (u64, usize)>,
     languages: BTreeMap<String, BTreeMap<String, u64>>,
 }
+
+aft_store::heap_bytes_of_fields!(Census { groups, languages });
 
 impl Census {
     #[cfg(test)]

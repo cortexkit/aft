@@ -2474,6 +2474,17 @@ aft_store::heap_bytes_of_fields!(SiteFile {
     parse,
     ordinary,
 });
+#[cfg(feature = "callgraph-shape-census")]
+aft_store::heap_bytes_of_fields!(MethodCallInputs {
+    census,
+    files,
+    stored,
+    own,
+    methods,
+    go_required,
+    computed_while_resolving,
+});
+#[cfg(not(feature = "callgraph-shape-census"))]
 aft_store::heap_bytes_of_fields!(MethodCallInputs {
     files,
     stored,
