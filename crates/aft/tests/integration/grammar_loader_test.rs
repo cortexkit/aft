@@ -44,7 +44,6 @@ fn command(root: &Path, download: bool) -> Command {
     command
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_loader_retained_file_parsers_compile_once_and_never_download() {
     let root = tempfile::tempdir().unwrap();
@@ -94,7 +93,6 @@ fn result(output: Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_loader_restart_compiles_stored_bytes_and_missing_next_process_downloads() {
     let root = tempfile::tempdir().unwrap();
@@ -127,7 +125,6 @@ fn grammar_loader_restart_compiles_stored_bytes_and_missing_next_process_downloa
     assert_eq!(names, [std::ffi::OsString::from(format!("{HASH}.wasm"))]);
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_loader_two_processes_publish_without_storage_retry() {
     let root = tempfile::tempdir().unwrap();

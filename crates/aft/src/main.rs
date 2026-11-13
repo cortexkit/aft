@@ -201,7 +201,7 @@ mod rayon_thread_tests {
 }
 
 fn main() {
-    #[cfg(feature = "test-grammar-seams")]
+    #[cfg(feature = "test-hooks")]
     aft::grammar::initialize_test_identity();
     // The subc daemon hands a supervised module its launch nonce through an
     // inherited pipe (and, for now, an environment copy). Take it before

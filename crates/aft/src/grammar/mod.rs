@@ -5,7 +5,6 @@ mod manifest;
 mod state;
 mod storage;
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -13,16 +12,25 @@ use std::time::Instant;
 use parking_lot::{Condvar, Mutex, RwLock};
 use tree_sitter::Language;
 
-#[cfg(feature = "test-grammar-seams")]
+#[cfg(feature = "test-hooks")]
 pub use manifest::initialize_test_identity;
 pub use manifest::{extractor_version, manifest, GrammarManifest, PRODUCTION_MANIFEST};
 pub use state::{FailureCause, GrammarState, GrammarUnavailable};
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 static ENGINE: LazyLock<Result<tree_sitter::wasmtime::Engine, String>> = LazyLock::new(|| {
     let mut config = tree_sitter::wasmtime::Config::new();
     config.parallel_compilation(false);
-    tree_sitter::wasmtime::Engine::new(&config).map_err(|e| e.to_string())
+    // Cranelift translates source Wasm to Pulley bytecode only. A grammar must
+    // never fall back to native code, including when this target is unavailable.
+    config
+        .target("pulley64")
+        .map_err(|e| format!("Pulley target unavailable: {e}"))?;
+    let engine = tree_sitter::wasmtime::Engine::new(&config)
+        .map_err(|e| format!("Pulley engine unavailable: {e}"))?;
+    if !engine.is_pulley() {
+        return Err("grammar engine refused a non-Pulley target".into());
+    }
+    Ok(engine)
 });
 
 pub trait Clock: Send + Sync {
@@ -75,9 +83,8 @@ pub struct GrammarRegistry {
 static REGISTRY: OnceLock<Arc<GrammarRegistry>> = OnceLock::new();
 
 /// Set the artifact location from the handling context, without reading or
-/// compiling a grammar. Call only when the handling context's
-/// `views_route_root()` enables the views pipeline; other contexts retain
-/// built-in-only parsing and must not consult grammar storage.
+/// compiling a grammar. Call only when the handling context opts into dynamic
+/// parsing; built-in-only contexts must not consult grammar storage.
 pub fn configure(config: &crate::config::Config) -> Arc<GrammarRegistry> {
     let root = crate::root_cache::cache_root(config);
     let registry = REGISTRY.get_or_init(|| GrammarRegistry::new(root.clone()));
@@ -95,7 +102,7 @@ pub fn registry() -> &'static Arc<GrammarRegistry> {
 
 impl GrammarRegistry {
     fn new(root: std::path::PathBuf) -> Arc<Self> {
-        #[cfg(feature = "test-grammar-seams")]
+        #[cfg(feature = "test-hooks")]
         let root = std::env::var_os("AFT_TEST_GRAMMAR_STORAGE")
             .map(std::path::PathBuf::from)
             .unwrap_or(root);
@@ -110,9 +117,9 @@ impl GrammarRegistry {
             fault: RwLock::new(storage::StorageFault::None),
             listeners: Mutex::new(Vec::new()),
         });
-        #[cfg(feature = "test-grammar-seams")]
+        #[cfg(feature = "test-hooks")]
         return test_seams::from_environment(registry);
-        #[cfg(not(feature = "test-grammar-seams"))]
+        #[cfg(not(feature = "test-hooks"))]
         registry
     }
 
@@ -152,12 +159,6 @@ impl GrammarRegistry {
         if let Some(language) = &entry.language {
             return Ok(language.clone());
         }
-        #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-        {
-            entry.state = GrammarState::UnsupportedPlatform;
-            return Err(self.unavailable(&entry));
-        }
-        #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
         {
             if entry.state == GrammarState::NotDownloaded {
                 if let Some(bytes) = self.storage().read(&self.manifest) {
@@ -244,7 +245,6 @@ impl GrammarRegistry {
         self.changed.notify_all();
     }
 
-    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
     fn load(&self, entry: &mut Entry, bytes: Vec<u8>) {
         let result = (|| {
             let engine = ENGINE.as_ref().map_err(Clone::clone)?;
@@ -277,11 +277,6 @@ impl GrammarRegistry {
         self.changed.notify_all();
     }
 
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    fn load(&self, entry: &mut Entry, _bytes: Vec<u8>) {
-        entry.state = GrammarState::UnsupportedPlatform;
-    }
-
     /// Subscribe before discovery; a ready grammar immediately emits its hash.
     pub fn subscribe(&self) -> std::sync::mpsc::Receiver<String> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -295,7 +290,6 @@ impl GrammarRegistry {
 }
 
 pub fn prepare_parser(parser: &mut tree_sitter::Parser) -> Result<(), GrammarUnavailable> {
-    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
     {
         let engine = ENGINE
             .as_ref()
@@ -307,17 +301,9 @@ pub fn prepare_parser(parser: &mut tree_sitter::Parser) -> Result<(), GrammarUna
             .map_err(|_| GrammarUnavailable::new(&manifest().language, GrammarState::LoadFailed))?;
         Ok(())
     }
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    {
-        let _ = parser;
-        Err(GrammarUnavailable::new(
-            &manifest().language,
-            GrammarState::UnsupportedPlatform,
-        ))
-    }
 }
 
-#[cfg(feature = "test-grammar-seams")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod test_seams;
 
 #[cfg(test)]

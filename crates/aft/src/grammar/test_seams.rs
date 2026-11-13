@@ -32,6 +32,7 @@ pub struct TestOptions {
     pub fault: StorageFault,
 }
 
+#[cfg(feature = "test-hooks")]
 pub(crate) fn from_environment(mut registry: Arc<GrammarRegistry>) -> Arc<GrammarRegistry> {
     let inner = Arc::get_mut(&mut registry).expect("new test registry is unshared");
     if let Some(path) = std::env::var_os("AFT_TEST_GRAMMAR_CLOCK_FILE") {

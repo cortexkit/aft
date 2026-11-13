@@ -189,6 +189,9 @@ pub fn add_config_markers(
 /// # Errors
 ///
 /// When the extractor fails on the source.
+/// A missing dynamic grammar is a typed `GrammarUnavailable` error, not a
+/// successful empty record. Discovery and persisted record identities remain
+/// unchanged until dynamic-language indexing is enabled.
 pub fn extract(source: &[u8], language: &str) -> Result<ContentRecord, ManifestJoinError> {
     extract_with_tree(source, language).map(|(record, _)| record)
 }
@@ -810,6 +813,37 @@ fn blob_ref_kind(kind: RefKind) -> BlobRefKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grammar_unavailable_survives_the_content_record_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            storage_dir: Some(directory.path().into()),
+            ..Default::default()
+        };
+        let registry = crate::grammar::configure(&config);
+        let source = b"local function f() return 1 end";
+        let classified = super::language_for("f.luau", source);
+        assert_ne!(
+            classified.as_deref(),
+            Some("luau"),
+            "S2 must not enable dynamic discovery"
+        );
+        let error = super::extract_with_tree(source, "luau")
+            .err()
+            .expect("no record without a grammar");
+        let super::ManifestJoinError::GrammarUnavailable(error) = error else {
+            panic!("grammar availability was flattened")
+        };
+        assert_eq!(error.state, crate::grammar::GrammarState::NotDownloaded);
+        assert_eq!(error.language, "luau");
+        assert_eq!(error.retry_after_ms, None);
+        assert_eq!(error.cause, None);
+        assert!(registry.stored().is_err());
+        assert!(
+            !directory.path().join("grammars").exists(),
+            "index extraction must not download"
+        );
+    }
     use super::*;
 
     /// The record's version names the call-graph producer it extracts with,

@@ -22,7 +22,7 @@ pub static PRODUCTION_MANIFEST: LazyLock<GrammarManifest> = LazyLock::new(|| {
 pub const LUAU_EXTRACTOR_VERSION: u32 = 1;
 
 pub fn manifest() -> &'static GrammarManifest {
-    #[cfg(feature = "test-grammar-seams")]
+    #[cfg(feature = "test-hooks")]
     {
         static OVERRIDE: LazyLock<Option<GrammarManifest>> = LazyLock::new(|| {
             let path = std::env::var_os("AFT_TEST_GRAMMAR_MANIFEST")?;
@@ -39,7 +39,7 @@ pub fn manifest() -> &'static GrammarManifest {
 }
 
 pub fn extractor_version() -> u32 {
-    #[cfg(feature = "test-grammar-seams")]
+    #[cfg(feature = "test-hooks")]
     {
         static VERSION: LazyLock<u32> = LazyLock::new(|| {
             std::env::var("AFT_TEST_GRAMMAR_EXTRACTOR_VERSION")
@@ -49,7 +49,7 @@ pub fn extractor_version() -> u32 {
         });
         return *VERSION;
     }
-    #[cfg(not(feature = "test-grammar-seams"))]
+    #[cfg(not(feature = "test-hooks"))]
     LUAU_EXTRACTOR_VERSION
 }
 
@@ -57,7 +57,7 @@ pub fn extractor_version() -> u32 {
 /// their process-wide LazyLocks. The binary calls this before handling any
 /// requests, so later environment changes cannot change its grammar identity.
 /// Production has no environment-controlled manifest or extractor version.
-#[cfg(feature = "test-grammar-seams")]
+#[cfg(feature = "test-hooks")]
 pub fn initialize_test_identity() {
     let _ = manifest();
     let _ = extractor_version();

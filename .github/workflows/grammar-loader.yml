@@ -55,10 +55,10 @@ jobs:
         run: rustup update stable && rustup default stable
       - name: Loader state and compile tests
         run: |
-          cargo test --locked -p agent-file-tools --lib -- grammar::tests::
+          cargo test --locked -p agent-file-tools --features test-hooks --lib -- grammar_
       - name: Process restart and concurrent publication
-        run: cargo test --locked -p agent-file-tools --test integration -- grammar_
-      - name: No native disk cache and one Wasmtime version
+        run: cargo test --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
+      - name: Fixed Pulley engine and no native cache
         run: |
           cargo tree --locked -p agent-file-tools -e features > grammar-features.txt
           cargo tree --locked -p agent-file-tools --prefix none > grammar-dependencies.txt
@@ -69,8 +69,8 @@ jobs:
           assert 'wasmtime feature "cache"' not in features
           assert 'wasmtime feature "component-model"' not in features
           dependencies = Path('grammar-dependencies.txt').read_text()
-          assert set(re.findall(r'^wasmtime v(\S+)', dependencies, re.M)) == {'36.0.19'}
-          print('Wasmtime 36.0.19 only; cache and component-model features absent')
+          assert set(re.findall(r'^wasmtime v(\S+)', dependencies, re.M)) == {'36.0.20'}
+          print('Wasmtime 36.0.20 only; cache and component-model features absent')
           PY
 
   windows-arm64:
@@ -85,13 +85,13 @@ jobs:
           persist-credentials: false
       - name: Target toolchain
         run: rustup target add aarch64-pc-windows-msvc
-      - name: ARM64 compile without runtime dependency
+      - name: ARM64 compile with Pulley
         run: |
-          cargo check --locked -p agent-file-tools --tests --target aarch64-pc-windows-msvc
+          cargo check --locked -p agent-file-tools --features test-hooks --tests --target aarch64-pc-windows-msvc
           cargo tree --locked -p agent-file-tools --target aarch64-pc-windows-msvc --edges normal,build --prefix none > grammar-arm-dependencies.txt
           python3 - <<'PY'
           from pathlib import Path
           dependencies = Path('grammar-arm-dependencies.txt').read_text()
-          assert 'wasmtime' not in dependencies
-          print('Windows ARM64: no Wasmtime dependency')
+          assert 'wasmtime v36.0.20' in dependencies
+          print('Windows ARM64: Pulley runtime included; no native execution fallback')
           PY

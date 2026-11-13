@@ -217,7 +217,6 @@ fn grammar_detection_golden_builtins_and_opt_in() {
     }
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_stored_first_single_compile_rayon_and_lifetime() {
     let (directory, registry, _, transport) = setup([]);
@@ -268,7 +267,6 @@ fn grammar_stored_first_single_compile_rayon_and_lifetime() {
     eprintln!("Luau cold compile: {:.3} ms", registry.compile_ms());
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_backoff_shared_failures_and_no_sixth_attempt() {
     let (_directory, registry, clock, transport) =
@@ -313,7 +311,6 @@ fn grammar_backoff_shared_failures_and_no_sixth_attempt() {
     assert_eq!(transport.calls.load(Ordering::SeqCst), 5);
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_download_redirect_status_and_verification_table() {
     let cases = vec![
@@ -383,7 +380,6 @@ fn grammar_download_redirect_status_and_verification_table() {
     assert_eq!(transport.urls.lock()[1], "https://second.example/grammar");
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_storage_faults_discard_bytes_then_retry() {
     for fault in [
@@ -424,7 +420,6 @@ fn grammar_storage_faults_discard_bytes_then_retry() {
     }
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_altered_and_unreadable_stored_files_count_as_missing() {
     for unreadable in [false, true] {
@@ -459,7 +454,6 @@ fn grammar_altered_and_unreadable_stored_files_count_as_missing() {
     }
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_load_and_query_failures_are_terminal_without_readiness() {
     use sha2::{Digest, Sha256};
@@ -499,20 +493,14 @@ fn grammar_load_and_query_failures_are_terminal_without_readiness() {
     }
 }
 
-#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
 #[test]
-fn grammar_windows_arm64_is_unsupported_without_storage_or_transport() {
-    let (directory, registry, _, transport) = setup([]);
-    assert_eq!(
-        registry.request().unwrap_err().state,
-        GrammarState::UnsupportedPlatform
-    );
-    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(registry.compile_count(), 0);
-    assert!(!directory.path().join("grammars").exists());
+fn grammar_engine_is_fixed_to_pulley_on_every_platform() {
+    assert!(ENGINE
+        .as_ref()
+        .expect("Pulley engine must be available")
+        .is_pulley());
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_concurrent_requests_share_one_background_attempt() {
     struct Gated {
@@ -628,7 +616,6 @@ fn grammar_deadline_and_partial_transport_errors_are_network_failures() {
     );
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_configured_cache_uses_flat_artifact_domain_without_durable_fallback() {
     let directory = tempfile::tempdir().unwrap();
@@ -667,7 +654,6 @@ fn grammar_configured_cache_uses_flat_artifact_domain_without_durable_fallback()
     assert!(crate::root_cache::CACHE_DOMAINS.contains(&"grammars"));
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_storage_exhaustion_reports_last_storage_cause() {
     let (_directory, registry, clock, transport) = setup((0..5).map(|_| success()));

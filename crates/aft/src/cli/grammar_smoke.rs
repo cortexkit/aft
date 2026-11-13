@@ -16,7 +16,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         return Err("grammar smoke storage directory must be absolute".into());
     }
     let mut file = None;
-    #[cfg(feature = "test-grammar-seams")]
+    #[cfg(feature = "test-hooks")]
     let (mut download, mut parallel) = (false, false);
     while let Some(flag) = args.next() {
         match flag.to_str() {
@@ -25,14 +25,14 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
                     args.next().ok_or("missing grammar smoke file")?,
                 ));
             }
-            #[cfg(feature = "test-grammar-seams")]
+            #[cfg(feature = "test-hooks")]
             Some("--download") => download = true,
-            #[cfg(feature = "test-grammar-seams")]
+            #[cfg(feature = "test-hooks")]
             Some("--parallel") => parallel = true,
             _ => return Err("unexpected grammar smoke argument".into()),
         }
     }
-    #[cfg(feature = "test-grammar-seams")]
+    #[cfg(feature = "test-hooks")]
     if parallel && file.is_none() {
         return Err("parallel grammar smoke requires --file".into());
     }
@@ -45,7 +45,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         return Err(warning.message);
     }
     let registry = aft::grammar::configure(&config);
-    #[cfg(feature = "test-grammar-seams")]
+    #[cfg(feature = "test-hooks")]
     if download {
         let _ = registry.request();
         if !registry.wait_until_settled(std::time::Duration::from_secs(40)) {
@@ -53,7 +53,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         }
     }
     let tree = if let Some(file) = file {
-        #[cfg(feature = "test-grammar-seams")]
+        #[cfg(feature = "test-hooks")]
         if parallel {
             use rayon::prelude::*;
             let trees = rayon::ThreadPoolBuilder::new()
@@ -87,14 +87,14 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         return Err("grammar smoke parse failed".into());
     }
     let mut result = serde_json::json!({
-        "language": "luau", "hash": registry.identity(), "compile_ms": registry.compile_ms(),
-        "tree": tree.root_node().to_sexp(), "test_seams": cfg!(feature = "test-grammar-seams"),
+        "language": "luau", "engine_target": "pulley64", "hash": registry.identity(), "compile_ms": registry.compile_ms(),
+        "tree": tree.root_node().to_sexp(), "test_seams": cfg!(feature = "test-hooks"),
     });
-    #[cfg(feature = "test-grammar-seams")]
+    #[cfg(feature = "test-hooks")]
     {
         result["compile_count"] = registry.compile_count().into();
     }
-    #[cfg(not(feature = "test-grammar-seams"))]
+    #[cfg(not(feature = "test-hooks"))]
     let _ = &mut result;
     println!("{result}");
     Ok(())

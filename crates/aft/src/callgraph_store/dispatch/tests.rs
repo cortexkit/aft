@@ -4,7 +4,7 @@ use super::*;
 fn rust_receiver_index_slices_preserve_local_preorder() {
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(&crate::parser::grammar_for(LangId::Rust))
+        .set_language(&crate::parser::grammar_for(LangId::Rust).unwrap())
         .unwrap();
     let mut checked = 0;
     for source in [

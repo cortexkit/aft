@@ -505,7 +505,7 @@ mod tests {
 
     fn parse(lang: LangId, source: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&grammar_for(lang)).unwrap();
+        parser.set_language(&grammar_for(lang).unwrap()).unwrap();
         parser.parse(source, None).unwrap()
     }
 

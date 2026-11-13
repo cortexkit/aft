@@ -5481,6 +5481,7 @@ pub(crate) fn lang_label(lang: LangId) -> &'static str {
         LangId::Swift => "swift",
         LangId::Php => "php",
         LangId::Lua => "lua",
+        LangId::Luau => "luau",
         LangId::Perl => "perl",
         LangId::Yaml => "yaml",
         LangId::Pascal => "pascal",

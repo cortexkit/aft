@@ -321,8 +321,13 @@ fn with_parser(
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let mut parser = Parser::new();
+                let grammar = grammar_for(lang).map_err(super::join::extraction_error)?;
+                if lang == LangId::Luau {
+                    crate::grammar::prepare_parser(&mut parser)
+                        .map_err(ManifestJoinError::GrammarUnavailable)?;
+                }
                 parser
-                    .set_language(&grammar_for(lang))
+                    .set_language(&grammar)
                     .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
                 entry.insert(parser)
             }

@@ -421,7 +421,7 @@ mod tests {
     fn index(source: &str) -> RustBindings {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&crate::parser::grammar_for(crate::parser::LangId::Rust))
+            .set_language(&crate::parser::grammar_for(crate::parser::LangId::Rust).unwrap())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         RustBindings::new(source, tree.root_node())

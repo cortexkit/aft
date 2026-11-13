@@ -1,1 +1,1 @@
-Added the verified, on-demand Luau grammar loader and explicit availability states; tool integration follows separately. Windows ARM64 reports the grammar as unsupported.
+Added the verified, on-demand Luau grammar loader and explicit availability states, using Pulley bytecode interpretation without native JIT execution. Tool and index-store integration follows separately.

@@ -35,14 +35,14 @@ impl Storage {
 
     fn directory(&self, create: bool) -> io::Result<PinnedDir> {
         let folder = self.folder();
-        crate::root_cache::refuse_durable_cache_write(&folder)?;
+        crate::cache_location::refuse_durable_cache_write(&folder)?;
         if self.fault == StorageFault::Admit || (create && self.fault == StorageFault::Create) {
             return Err(io::Error::other("injected grammar storage failure"));
         }
         if create {
             crate::private_storage::create_dir_all(&folder)?;
         }
-        if let Some(access) = crate::root_cache::pin_cache_path(&folder)? {
+        if let Some(access) = crate::cache_location::pin_cache_path(&folder)? {
             access.directory(false)
         } else {
             PinnedDir::repair_open_path(&folder)
@@ -141,7 +141,7 @@ impl Storage {
     }
 }
 
-#[cfg(feature = "test-grammar-seams")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn stored_path(root: &std::path::Path, manifest: &GrammarManifest) -> PathBuf {
     root.join("grammars")
         .join(format!("{}.wasm", manifest.sha256))
