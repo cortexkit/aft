@@ -6304,8 +6304,9 @@ impl LspManager {
                 if let Some(key) = keys_by_pid.get(pid) {
                     if crate::bash_background::process::is_process_alive(*pid) {
                         slog_error!(
-                            "error shutting down {:?}: timed out waiting for shutdown",
-                            key
+                            "error shutting down language server {:?} at {}: timed out waiting for shutdown",
+                            key.kind,
+                            key.root.display()
                         );
                     }
                 }
