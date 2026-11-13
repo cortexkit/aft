@@ -5,6 +5,7 @@ import {
   type AftConfigFileMigrationResult,
   ConfigRejectedError,
   type ConfigTier,
+  DATA_LAYER_RETIRED_PATHS,
   DEFAULT_DISABLED_TOOLS,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
@@ -1545,7 +1546,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   if (tier === "user") {
     removed.push(
       ...removedConfigKeyErrors(cleanConfig).filter((error) =>
-        REMOVED_DATA_LAYER_PATHS.some((path) =>
+        [...REMOVED_DATA_LAYER_PATHS, ...DATA_LAYER_RETIRED_PATHS].some((path) =>
           error.endsWith(`${path}; run npx @cortexkit/aft doctor --fix`),
         ),
       ),

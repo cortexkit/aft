@@ -209,7 +209,7 @@ fn removed_block_key_errors(
             }),
         );
     }
-    if release >= DATA_LAYER_KEYS_REFUSED_FROM {
+    if refuse_retired && release >= DATA_LAYER_KEYS_REFUSED_FROM {
         for path in DATA_LAYER_RETIRED_PATHS {
             if has_path(map, path) {
                 errors.push(format!(
@@ -2014,6 +2014,9 @@ mod tests {
                 1,
                 "{path}"
             );
+            for doc in [&base, &harness] {
+                assert!(removed_errors(doc.as_object().unwrap(), (0, 65), false).is_empty());
+            }
         }
     }
 

@@ -216,7 +216,7 @@ function removedBlockKeyErrors(
 ): string[] {
   const paths: string[] = REMOVED_OPENCODE_PATHS.filter((path) => hasPath(value, path));
   if (refuseRetired) paths.push(...refusedRetiredNames(value));
-  if (releaseAtLeast(release, DATA_LAYER_KEYS_REFUSED_FROM))
+  if (refuseRetired && releaseAtLeast(release, DATA_LAYER_KEYS_REFUSED_FROM))
     paths.push(...DATA_LAYER_RETIRED_PATHS.filter((path) => hasPath(value, path)));
   return paths.map((path) => `removed_config_key:${path}; run npx @cortexkit/aft doctor --fix`);
 }
