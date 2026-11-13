@@ -208,12 +208,12 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.64.0";
+const ANNOUNCEMENT_VERSION = "0.65.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "A new index store makes AFT much faster: call graphs build 26x faster, edits reach the call graph about 9x faster, dead-code checks run 4x faster, and the index takes 4x less disk and 3x less memory.",
-  "All worktrees of a repository share one index, so a new worktree is ready in under a second. `npx @cortexkit/aft cache prune-legacy` lists the old index folders and can remove them.",
-  "`trace_to` labels each root it reaches: main, test, attribute, public API, or no caller found.",
-  "Dead code, unused exports, duplicates, cycles and complexity run only when `aft_inspect` is called; the status bar shows errors, warnings and TODOs.",
+  "OpenCode 2: AFT's read-only tools also work inside Code Mode as `tools.aft.code.*`.",
+  "TypeScript monorepos run one language server per TypeScript version instead of one per package; `lsp.max_servers` caps the total.",
+  "Search and grep stay light on large growing files, and shell waits survive the computer going to sleep.",
+  "`views.enabled`, `views.callgraph_copies` and `worktree.ram_overlay` are now refused in user config; `npx @cortexkit/aft doctor --fix` removes them.",
 ];
 
 /**
