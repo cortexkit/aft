@@ -170,6 +170,7 @@ impl Server {
                 "127.0.0.1".into(),
                 "::1".into(),
                 "other.test".into(),
+                "api.hetzner.cloud".into(),
             ]
         };
         let mut params = CertificateParams::new(names).unwrap();
@@ -682,7 +683,7 @@ fn client_child() {
                 let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
                 let path = value["path"].as_str().unwrap_or("/approved");
                 let uri = if matches!(sender, Sender::H2(_)) { format!("https://{authority}{path}") } else { path.to_owned() };
-                let mut request = Request::builder().uri(uri).method("POST").header("te", "trailers");
+                let mut request = Request::builder().uri(uri).method(value["method"].as_str().unwrap_or("POST")).header("te", "trailers");
                 if value["omit_host"] != true { request = request.header("host", value["host_override"].as_str().unwrap_or(&authority)); }
                 if let Some(headers) = value["headers"].as_object() {
                     for (key, val) in headers { request = request.header(key, val.as_str().unwrap()); }
@@ -716,6 +717,9 @@ mod audit_tests;
 
 #[path = "vault_tests.rs"]
 mod vault_tests;
+
+#[path = "diagnostic_tests.rs"]
+mod diagnostic_tests;
 
 fn child_reply(line: &str) -> Option<Value> {
     // With a single test thread, libtest prefixes uncaptured output with the
