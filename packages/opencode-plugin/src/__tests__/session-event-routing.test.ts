@@ -4,7 +4,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import * as bridge from "@cortexkit/aft-bridge";
-import { Effect } from "effect";
+import { Effect, Exit, PubSub, Scope, Stream } from "effect";
 import * as notifications from "../bg-notifications.js";
 import * as bootstrap from "../bridge-bootstrap.js";
 import * as reload from "../config-live-reload.js";
@@ -12,6 +12,8 @@ import * as updater from "../hooks/auto-update-checker/index.js";
 import { AftRpcServer } from "../shared/rpc-server.js";
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
 import * as registration from "../tool-registration.js";
+import type { PluginContext } from "../types.js";
+import { registerV2SessionLifecycle } from "../v2-session-lifecycle.js";
 
 type Plugin = typeof import("../index.js").default;
 type Hooks = {
@@ -25,9 +27,13 @@ type SubcClient = Awaited<
 let sandbox: string | undefined;
 const hooks: Hooks[] = [];
 const pools: bridge.SubcTransportPool[] = [];
+const scopes: Array<Parameters<typeof Scope.close>[0]> = [];
 let importCounter = 0;
 
 afterEach(async () => {
+  await Promise.all(
+    scopes.splice(0).map((scope) => Effect.runPromise(Scope.close(scope, Exit.void))),
+  );
   await Promise.all(hooks.splice(0).map((instance) => instance.dispose()));
   await Promise.all(pools.splice(0).map((pool) => pool.shutdown()));
   mock.restore();
@@ -61,11 +67,23 @@ async function setup() {
 
   const plugin = (await import(`../index.js?session-events=${importCounter++}`)).default as Plugin;
   async function instance(directory: string, client: unknown) {
+    let nextChannel = 0;
     const routeOpen = mock(async (_target: unknown, _identity: { project_root: string }) => ({
-      channel: 1,
+      channel: ++nextChannel,
       epoch: 1,
     }));
-    const subscribe = mock(() => ({ unsubscribe() {} }));
+    let markSubscribed!: () => void;
+    const subscribed = new Promise<void>((resolve) => {
+      markSubscribed = resolve;
+    });
+    const subscribe = mock(() => {
+      let close!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        close = resolve;
+      });
+      markSubscribed();
+      return { unsubscribe: () => close(), closed };
+    });
     const pool = new bridge.SubcTransportPool({
       connectionFile: "/unused/session-events.json",
       harness: "opencode",
@@ -73,19 +91,45 @@ async function setup() {
         ({
           routeOpen,
           subscribe,
-          request: async () => ({ structuredContent: { success: true, completions: [] } }),
+          request: async () => ({ structuredContent: { success: true, bg_completions: [] } }),
           closeRouteChannel: async () => {},
           close() {},
         }) as SubcClient,
       onBgEventsNudge() {},
     });
     pools.push(pool);
+    // Model an already-connected project transport without prebinding this session.
+    spyOn(pool, "getActiveBridgeForRoot").mockImplementation((root) => pool.getBridge(root));
     spyOn(bridge, "createAftTransportPool").mockResolvedValue(pool);
     const instanceHooks = (await plugin({ directory, client } as Parameters<Plugin>[0])) as Hooks;
     hooks.push(instanceHooks);
-    return { hooks: instanceHooks, routeOpen, subscribe, pool };
+    return { hooks: instanceHooks, routeOpen, subscribe, subscribed, pool };
   }
-  return { first, second, instance };
+  async function nativeInstance(directory: string, session: unknown) {
+    const bus = await Effect.runPromise(
+      PubSub.unbounded<{ type: string; data: { sessionID: string } }>(),
+    );
+    const scope = await Effect.runPromise(Scope.make());
+    scopes.push(scope);
+    const host = {
+      location: { directory },
+      session: { get: () => Effect.succeed(session) },
+      event: { subscribe: () => Stream.fromPubSub(bus) },
+    };
+    const entry = await instance(directory, host);
+    const ctx = { pool: entry.pool, client: host, config: {} } as unknown as PluginContext;
+    await Effect.runPromise(
+      registerV2SessionLifecycle(host, ctx).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    return {
+      ...entry,
+      async event(type: string, sessionID: string) {
+        await Effect.runPromise(PubSub.publish(bus, { type, data: { sessionID } }));
+        await Bun.sleep(20);
+      },
+    };
+  }
+  return { first, second, instance, nativeInstance };
 }
 
 describe.serial("session events route only to their owning location", () => {
@@ -104,11 +148,12 @@ describe.serial("session events route only to their owning location", () => {
     await other.hooks.event(idle);
     expect(observed).not.toHaveBeenCalled();
     await owner.hooks.event(idle);
+    await owner.subscribed;
 
     expect(observed).toHaveBeenCalledTimes(1);
     expect(other.routeOpen).not.toHaveBeenCalled();
     expect(other.subscribe).not.toHaveBeenCalled();
-    expect(owner.routeOpen).toHaveBeenCalledTimes(1);
+    expect(owner.routeOpen).toHaveBeenCalledTimes(2);
     expect(owner.subscribe).toHaveBeenCalledTimes(1);
   });
 
@@ -151,7 +196,8 @@ describe.serial("session events route only to their owning location", () => {
     await entry.hooks.event({
       event: { type: "session.idle", properties: { sessionID: "resumed-v1" } },
     });
-    expect(entry.routeOpen).toHaveBeenCalledTimes(1);
+    await entry.subscribed;
+    expect(entry.routeOpen).toHaveBeenCalledTimes(2);
     expect(entry.routeOpen.mock.calls[0][1].project_root).toBe(second);
     expect(entry.subscribe).toHaveBeenCalledTimes(1);
   });
@@ -172,5 +218,35 @@ describe.serial("session events route only to their owning location", () => {
     expect(ownerStart).toHaveBeenCalledTimes(1);
     expect(ownerStart).toHaveBeenCalledWith(first, "new-owned");
     expect(otherStart).not.toHaveBeenCalled();
+  });
+
+  test("native V2 deletion cleanup binds only the session's owning Location", async () => {
+    const { first, second, nativeInstance } = await setup();
+    const session = { location: { directory: first }, parentID: "parent" };
+    const owner = await nativeInstance(first, session);
+    const other = await nativeInstance(second, session);
+
+    await other.event("session.deleted", "native-owned");
+    await owner.event("session.deleted", "native-owned");
+    await owner.subscribed;
+
+    expect(other.routeOpen).not.toHaveBeenCalled();
+    expect(other.subscribe).not.toHaveBeenCalled();
+    expect(owner.routeOpen).toHaveBeenCalledTimes(2);
+    expect(owner.routeOpen.mock.calls.every((call) => call[1].project_root === first)).toBe(true);
+    expect(owner.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  test("native V2 cleanup opens nothing for a removed child whose lookup has no answer", async () => {
+    const { first, second, nativeInstance } = await setup();
+    const instances = [
+      await nativeInstance(first, undefined),
+      await nativeInstance(second, undefined),
+    ];
+    for (const entry of instances) {
+      await entry.event("session.deleted", "native-removed-child");
+      expect(entry.routeOpen).not.toHaveBeenCalled();
+      expect(entry.subscribe).not.toHaveBeenCalled();
+    }
   });
 });

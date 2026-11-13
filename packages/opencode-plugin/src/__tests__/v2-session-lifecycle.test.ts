@@ -60,7 +60,7 @@ async function rig(parentID: string | undefined = "parent", persistedTaskIds?: s
   const host = {
     location: { directory: process.cwd() },
     event: { subscribe: () => Stream.fromPubSub(bus) },
-    session: { get: () => Effect.succeed({ parentID }) },
+    session: { get: () => Effect.succeed({ parentID, location: { directory: process.cwd() } }) },
   };
   const bridge = {
     send: async (name: string, args: Record<string, unknown>) => {
@@ -465,7 +465,9 @@ test("V2 session deletion after a reload kills only the tasks the bridge says th
   const host = {
     location: { directory: process.cwd() },
     event: { subscribe: () => Stream.fromPubSub(bus) },
-    session: { get: () => Effect.succeed({ parentID: "parent" }) },
+    session: {
+      get: () => Effect.succeed({ parentID: "parent", location: { directory: process.cwd() } }),
+    },
   };
   const ctx = {
     client: host,
