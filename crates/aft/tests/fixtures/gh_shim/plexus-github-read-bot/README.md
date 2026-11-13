@@ -1,6 +1,6 @@
 # Plexus github_read vectors (copied)
 
-Byte-for-byte copies from the plexus repository, commit `019f6bbd`, path
+Byte-for-byte copies from the plexus repository, commit `8d8aff87`, path
 `crates/plexus-module/tests/fixtures/github-read-bot/`. Do not edit or
 re-format these files; copy a new revision from Plexus instead.
 
