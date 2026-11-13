@@ -100,6 +100,7 @@ async function setup() {
             return {
               structuredContent: {
                 success: true,
+                text: "",
                 bg_completions: [],
                 ...(body.name === "bash_owned_tasks" ? { task_ids: ownedTaskIds } : {}),
               },
