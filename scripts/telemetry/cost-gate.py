@@ -29,7 +29,7 @@ from typing import Any
 from unittest.mock import patch
 
 SCHEMA_VERSION = 1
-MEASUREMENT_PROFILE = "index-store-no-inspect-refresh-v4"
+MEASUREMENT_PROFILE = "index-store-no-inspect-post-edit-refresh-v5"
 SYNTHETIC_FILE_COUNT = 24_000
 SYNTHETIC_VERSION = "synthetic-v2"
 REPO_ORDER = ("redox", "typescript-eslint", "jupyterlab", "hugo", "synthetic-24k")
@@ -890,6 +890,10 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
     sampled = [run.row.get("peak_rss_sampled_mb", "n/a") or "n/a" for run in runs if run.ready]
     if any(value != "n/a" for value in sampled):
         parts.append(f"peak_rss_sampled_mb(ungated)={'/'.join(sampled)}")
+    for diagnostic in ("edit_apply_ms", "edit_backup_ms", "edit_write_ms"):
+        values = [run.row.get(diagnostic, "n/a") or "n/a" for run in runs if run.ready]
+        if any(value != "n/a" for value in values):
+            parts.append(f"{diagnostic}(ungated)={'/'.join(values)}")
     # The resolution share stays visible as a description of where build time
     # went, but it is not a budget: it cannot tell a slower resolution stage
     # from faster stages around it.
@@ -995,6 +999,7 @@ def self_test() -> int:
         csv_path = temporary / "synthetic.csv"
         fields = [
             "callgraph_store_build_ready_ms", "search_first_query_latency_ms", "callgraph_first_query_latency_ms",
+            "edit_apply_ms", "edit_backup_ms", "edit_write_ms",
             "index_store_build_ready_ms", "callgraph_refresh_ms",
             "repo", "outcome", "search_wall_ms", "callgraph_wall_ms",
             "callgraph_resolution_share_pct", "callgraph_resolution_ms", "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s",
@@ -1003,6 +1008,7 @@ def self_test() -> int:
         rows = [
             {
                 "callgraph_store_build_ready_ms": "126", "search_first_query_latency_ms": "126", "callgraph_first_query_latency_ms": "90",
+                "edit_apply_ms": "521", "edit_backup_ms": "276", "edit_write_ms": "133",
                 "index_store_build_ready_ms": "140", "callgraph_refresh_ms": "110",
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/140/140",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
@@ -1012,6 +1018,7 @@ def self_test() -> int:
             },
             {
                 "callgraph_store_build_ready_ms": "126", "search_first_query_latency_ms": "127", "callgraph_first_query_latency_ms": "91",
+                "edit_apply_ms": "510", "edit_backup_ms": "n/a", "edit_write_ms": "n/a",
                 "index_store_build_ready_ms": "130", "callgraph_refresh_ms": "110",
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/130/130",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
@@ -1089,6 +1096,9 @@ def self_test() -> int:
         # The current profile supplies the kernel HWM through peak_rss_mb.
         assert "peak_rss_hwm_mb(ungated)=171/170" in line, line
         blessed = repo_metrics_from_runs("fixture", baseline_from_file, runs)
+        assert "edit_apply_ms(ungated)=521/510" in line, line
+        assert "edit_backup_ms(ungated)=276/n/a" in line, line
+        assert not {"edit_apply_ms", "edit_backup_ms", "edit_write_ms"}.intersection(blessed), sorted(blessed)
         assert "peak_rss_hwm_mb" not in blessed, sorted(blessed)
         assert "peak_rss_mb" not in row_metrics({"peak_rss_mb": "n/a", "peak_rss_sampled_mb": "450"})
         assert not RETIRED_METRICS.intersection(blessed), sorted(blessed)

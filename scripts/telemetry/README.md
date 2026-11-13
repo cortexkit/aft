@@ -75,7 +75,7 @@ measure and print, but it will not gate, because it cannot.
 
 ## What is measured
 
-The current profile is `index-store-no-inspect-refresh-v4`, introduced for the
+The current profile is `index-store-no-inspect-post-edit-refresh-v5`, introduced for the
 repository-wide index store in AFT 0.64. The older store's trigram build,
 SQLite callgraph resolution, and ready-to-first-query lifecycle events no
 longer exist on the production path. Their measurements are retired, not
@@ -97,13 +97,21 @@ into the new baseline.
   readiness and the first query, including harness polling and intentional waits.
   Their new names prevent that gap from being mistaken for query latency; the
   existing 25% tolerance and 3,000 ms floor carry forward, not the old values.
-- `callgraph_refresh_ms` measures one real source edit through AFT's edit tool
-  and an exact call-graph read. Before configure, the harness creates an isolated
-  Rust probe containing two targets and one caller. The edit moves the call
-  from the first target to the second. Both the new edge's presence and the old
-  edge's absence must be verified before a duration is accepted. The probe is
+- `callgraph_refresh_ms` measures **after the edit reply returns** until exact
+  call-graph reads verify the new edge is present and the old edge is absent.
+  It excludes the edit tool's backup, durable write and response time, recorded
+  separately as diagnostic `edit_apply_ms`. Before configure, the harness creates
+  an isolated Rust probe with two targets and one caller, then edits the call
+  from the first target to the second. The probe is
   removed after AFT exits; pinned source files are never edited. Each corpus
   therefore contains its pinned files plus this same small probe during capture.
+  Profile v4 timed the edit and graph catch-up together; its values are not
+  compatible with this post-edit definition. No warm-up edit is performed.
+- Diagnostic `edit_backup_ms` / `edit_write_ms` and their `*_phases` CSV columns
+  retain the probe's slow-edit log durations and phase breakdowns where emitted.
+  Missing slow-edit records are `n/a`, not zero. These and `edit_apply_ms` never
+  become baseline budgets. CPU and kernel peak still cover the entire process,
+  including edit work.
 - `peak_rss_mb` now uses the Linux kernel's `VmHWM` for the same AFT process
   sampled by `ps` and `/proc/<pid>/stat`. A final read before AFT shuts down is
   required; a missing kernel peak is missing data, never zero or a fallback to
