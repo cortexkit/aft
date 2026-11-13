@@ -1107,7 +1107,10 @@ fn offer(
                     }
                     let send_request = |request: &SendRequest| {
                         if completion {
-                            registry.send_runner_completion(&task_id, || runtime.block_on(send(&path, &address, request)))
+                            registry
+                                .send_runner_completion(&task_id, || {
+                                    runtime.block_on(send(&path, &address, request))
+                                })
                                 .unwrap_or(Outcome::Accepted)
                         } else {
                             runtime.block_on(send(&path, &address, request))
