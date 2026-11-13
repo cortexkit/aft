@@ -188,7 +188,6 @@ jobs:
         # with no consumers in workspace until `agent-file-tools` resolves it
         # from crates.io after publish settles).
         run: |
-          bash scripts/check-cmake.sh
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           CARGO_VERSION=$(grep '^version' crates/aft/Cargo.toml | head -1 | sed -E 's/version = "([^"]+)"/\1/')
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
@@ -212,8 +211,8 @@ jobs:
           # otherwise the verify step in the second publish can race against
           # index propagation and fail with "no matching package found".
           sleep 30
-          cargo publish --package agent-file-tools --features wasm-grammars \
-            || { ec=$?; cargo publish --package agent-file-tools --features wasm-grammars --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+          cargo publish --package agent-file-tools \
+            || { ec=$?; cargo publish --package agent-file-tools --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
