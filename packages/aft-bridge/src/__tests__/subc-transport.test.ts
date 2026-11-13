@@ -582,6 +582,25 @@ function withoutStructuredText(envelopeResponse: Record<string, unknown>): Recor
 }
 
 describe("SubcTransport.toolCall", () => {
+  test("the SDK client uses the same ten-second sleep grace as the bridge", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+    let sleepGraceMs: number | undefined;
+    const pool = new SubcTransportPool({
+      connectionFile: "/fake/connection.json",
+      harness: "opencode",
+      connect: async (options) => {
+        sleepGraceMs = options.sleepGraceMs;
+        return client;
+      },
+    });
+    try {
+      await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sleep-grace", "bash", {});
+      expect(sleepGraceMs).toBe(10_000);
+      expect(client.requests[0]?.options?.sleepGraceMs).toBeUndefined();
+    } finally {
+      await pool.shutdown();
+    }
+  });
   for (const stage of ["connect", "route"]) {
     for (const timerFirst of [true, false]) {
       test(`suspend during ${stage} accepts wake delivery with ${timerFirst ? "timer" : "I/O"} first`, async () => {
@@ -619,6 +638,7 @@ describe("SubcTransport.toolCall", () => {
           expect(await call).toMatchObject({ task_id: "bash-wake" });
           expect(connects).toBe(1);
           expect(client.requests).toHaveLength(1);
+          expect(client.requests[0]?.options?.sleepGraceMs).toBe(0);
         } finally {
           release();
           await pool.shutdown();

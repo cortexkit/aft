@@ -70,7 +70,7 @@ import {
   PRESET_FIELD,
   WORKER_SESSION_FIELD,
 } from "./transport.js";
-import { deadlineTimer, RequestDeadline, WaitClock } from "./wait-clock.js";
+import { deadlineTimer, RESUME_ALLOWANCE_MS, RequestDeadline, WaitClock } from "./wait-clock.js";
 
 /** The subc pool is closing and cannot carry another request. */
 export class SubcTransportShuttingDownError extends SubcCallError {
@@ -578,6 +578,7 @@ export interface SubcTransportPoolOptions {
   connect?: (opts: {
     connectionFile: string;
     handshakeTimeoutMs?: number;
+    sleepGraceMs?: number;
     onControlPush?: (push: ControlPush) => void;
   }) => Promise<SubcClientLike>;
   /**
@@ -1523,6 +1524,7 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly connectFn: (opts: {
     connectionFile: string;
     handshakeTimeoutMs?: number;
+    sleepGraceMs?: number;
     onControlPush?: (push: ControlPush) => void;
   }) => Promise<SubcClientLike>;
 
@@ -2648,11 +2650,13 @@ export class SubcTransportPool implements AftTransportPool {
           entry.inflight += 1;
           let request: Promise<unknown>;
           try {
-            // The pinned SDK owns the dispatched correlation and its plain timer.
-            // It has no re-arm hook yet; only our connect/route races can grant
-            // the resume allowance without discarding or replaying a request.
+            // The SDK re-arms an expired request once across sleep, retaining
+            // its correlation while a wake-delayed reply is delivered.
             request = client.request(route, body, {
               timeoutMs: Math.ceil(requestTimeoutMs),
+              // Disable SDK sleep grace if admission already granted the call
+              // its one resume allowance.
+              ...(deadline.resumed ? { sleepGraceMs: 0 } : {}),
               onProgress,
             });
           } catch (error) {
@@ -2813,6 +2817,7 @@ export class SubcTransportPool implements AftTransportPool {
     this.connecting = this.connectFn({
       connectionFile: this.connectionFile,
       handshakeTimeoutMs: this.handshakeTimeoutMs,
+      sleepGraceMs: RESUME_ALLOWANCE_MS,
       onControlPush: (push) => {
         if (owner && this.client === owner) this.onScopeRouteClose(push);
       },

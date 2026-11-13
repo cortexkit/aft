@@ -5,7 +5,7 @@
     "": {
       "devDependencies": {
         "@biomejs/biome": "^2.4.7",
-        "@cortexkit/subc-client": "^0.21.2",
+        "@cortexkit/subc-client": "^0.24.5",
         "@types/node": "^25.8.0",
         "bun-types": "^1.3.13",
         "typescript": "^5.8.0",
@@ -22,7 +22,7 @@
       "name": "@cortexkit/aft-bridge",
       "version": "0.64.0",
       "dependencies": {
-        "@cortexkit/subc-client": "^0.21.2",
+        "@cortexkit/subc-client": "^0.24.5",
         "undici": "^7.25.0",
       },
       "devDependencies": {
@@ -289,7 +289,7 @@
 
     "@cortexkit/opencode-sidebar": ["@cortexkit/opencode-sidebar@0.3.0", "", { "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" } }, "sha512-jyVL2kKOS2IXEdJYrmKhNpNMyKgf3WRske5sbzPkVhzYJ53vFFV0CAqvect9JTR2pG4gTmKJIOU+WcRC9Qiruw=="],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.21.2", "", {}, "sha512-xQLfwFBOigFRF1VMgta7Dr/640H34EHexRtFLDkH42yAAMvtXJFmQ4bsjin6CDmfXiKeItsuQqjYFRMEZs4Aaw=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.24.5", "", {}, "sha512-quPMUUXjj6RG8Ns3EJcNV7rbFyCLP5MVoaOSSBAwD6deY8Rxg77Y/4GA5bKdr5WAO/JTQT9aLz53fTvuzNF9Sg=="],
 
     "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@0.80.2", "", { "dependencies": { "@earendil-works/pi-ai": "^0.80.2", "ignore": "7.0.5", "typebox": "1.1.38", "yaml": "2.9.0" } }, "sha512-BF9WPhixIFjT6Kp3Iz3H6ugkU+4AWotM8py96XE5pIK0arJbQKMWbR+dXSWWDEmR5yc/aFQODnuyowOEzMGO7Q=="],
 
