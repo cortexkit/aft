@@ -1,6 +1,6 @@
 use super::*;
 use crate::bash_background::buffer::ARTIFACT_OPENS;
-use crate::bash_background::persistence::{read_task_at, write_task_at};
+use crate::bash_background::persistence::read_task_at;
 
 #[test]
 fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
@@ -61,21 +61,21 @@ fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
                     .unwrap();
             }
             5 => {
-                let mut metadata = read_task_at(&tasks[0]).unwrap();
-                metadata.status = BgTaskStatus::Running;
-                metadata.finished_at = None;
-                metadata.exit_code = None;
-                write_task_at(&tasks[0], &metadata).unwrap();
                 ctx.bash_background()
-                    .insert_shell_fixture(metadata, tasks[0].paths.clone())
+                    .update_shell_fixture(&tasks[0].paths.task_id, |metadata| {
+                        metadata.status = BgTaskStatus::Running;
+                        metadata.finished_at = None;
+                        metadata.exit_code = None;
+                        metadata.status_reason = None;
+                        metadata.duration_ms = None;
+                    })
                     .unwrap();
             }
             6 => {
-                let mut metadata = read_task_at(&tasks[0]).unwrap();
-                metadata.mark_terminal(BgTaskStatus::Completed, Some(7), None);
-                write_task_at(&tasks[0], &metadata).unwrap();
                 ctx.bash_background()
-                    .insert_shell_fixture(metadata, tasks[0].paths.clone())
+                    .update_shell_fixture(&tasks[0].paths.task_id, |metadata| {
+                        metadata.mark_terminal(BgTaskStatus::Completed, Some(7), None);
+                    })
                     .unwrap();
             }
             7 => {
@@ -89,6 +89,19 @@ fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
         ARTIFACT_OPENS.with(|count| count.set(0));
         let actual = collect_at_revision(&executor, Some(&db), true, cached, step);
         let opens = ARTIFACT_OPENS.with(|count| count.get());
+        if step == 5 || step == 6 {
+            let live = actual
+                .rows
+                .iter()
+                .find(|row| row.task_id == tasks[0].paths.task_id)
+                .unwrap();
+            assert_eq!(live.state, if step == 5 { "running" } else { "ended" });
+            assert_eq!(
+                live.exit.as_ref().and_then(|exit| exit.code),
+                if step == 5 { None } else { Some(7) }
+            );
+            assert_eq!(live.ended_at_ms.is_some(), step == 6);
+        }
         if step == 1 {
             assert_eq!(opens, 0, "unchanged retained tasks were reopened");
         }

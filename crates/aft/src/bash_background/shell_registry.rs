@@ -433,6 +433,22 @@ impl BgTaskRegistry {
         self.insert_rehydrated_task(metadata, paths, false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn update_shell_fixture(
+        &self,
+        task_id: &str,
+        update: impl FnOnce(&mut PersistedTask),
+    ) -> Result<(), String> {
+        let task = self
+            .task(task_id)
+            .ok_or("shell fixture is not registered")?;
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task.lock_state().map_err(|_| "task lock poisoned")?;
+        update(&mut state.metadata);
+        self.persist_task_locked(&task, &state.metadata, &mut db)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn shell_reader(&self, task_id: &str) -> Option<ShellReader> {
         let task = self.task(task_id)?;
         let state = task.lock_state().ok()?;
