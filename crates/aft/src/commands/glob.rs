@@ -742,8 +742,13 @@ fn fallback_glob(
     // match. The `ripgrep_glob` path already passes `search_root` as both
     // arguments, so this keeps the two fallback routes in agreement.
     let walk_started = Instant::now();
-    let outcome =
-        bounded_fallback_walk_files_for_target(search_root, search_root, &filters, ignored_target);
+    let outcome = bounded_fallback_walk_files_for_target(
+        search_root,
+        search_root,
+        &filters,
+        ignored_target,
+        "glob",
+    );
     let walk_time = walk_started.elapsed();
     let scope_started = Instant::now();
     // Reuse the filtered walk; an incomplete walk cannot prove an empty scope.

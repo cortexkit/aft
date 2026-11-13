@@ -182,7 +182,7 @@ fn grep_fallback_walk_skips_nested_worktrees() {
     let (_dir, fixture) = fixture();
     let root = &fixture.root;
     let filters = crate::search_index::PathFilters::default();
-    let outcome = crate::grep_executor::bounded_fallback_walk_files(root, root, &filters);
+    let outcome = crate::grep_executor::bounded_fallback_walk_files(root, root, &filters, "grep");
     assert!(!outcome.walk_truncated, "fixture walk must complete");
     let walked = relative_set(root, outcome.files);
     assert!(
@@ -214,6 +214,7 @@ fn explicitly_named_worktree_target_still_walks_like_an_ignored_target() {
         &fixture.worktree,
         &fixture.worktree,
         &filters,
+        "grep",
     );
     assert!(!outcome.walk_truncated, "fixture walk must complete");
     let walked = relative_set(&fixture.worktree, outcome.files);

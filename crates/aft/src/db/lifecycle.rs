@@ -19,6 +19,8 @@ use serde::Serialize;
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 /// A warning watermark, not permission to run a checkpoint on a writer.
 pub const WAL_LAG_THRESHOLD_PAGES: i32 = 8_000;
+// About 32 MiB of outstanding page data with SQLite's usual 4 KiB pages.
+const WAL_LAG_WARN_BYTES: u64 = 32 * 1024 * 1024;
 static WAL_CHECKPOINT_LAG_EVENTS: AtomicU64 = AtomicU64::new(0);
 static WAL_HIGH_WATER_FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -373,6 +375,7 @@ struct WalHookState {
     residual_counter: WriteCounter,
     owner: OnceLock<Arc<super::deferred_checkpoint::Request>>,
     lag_reported: AtomicBool,
+    lag_warned: AtomicBool,
     checkpoint_stats: Arc<CheckpointStats>,
     #[cfg(test)]
     inline_for_attribution_test: AtomicBool,
@@ -380,9 +383,20 @@ struct WalHookState {
 
 impl WalHookState {
     fn note_checkpoint_lag(&self) {
-        if !self.lag_reported.swap(true, Ordering::Relaxed) {
+        let first = !self.lag_reported.swap(true, Ordering::Relaxed);
+        if first {
             WAL_CHECKPOINT_LAG_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
+        let large = self.bytes_for_frames(self.outstanding_frames()) >= WAL_LAG_WARN_BYTES;
+        if large && !self.lag_warned.swap(true, Ordering::Relaxed) {
             crate::slog_warn!(
+                "background WAL checkpoint lag: root={} log_frames={} checkpointed_frames={}; no inline fallback",
+                self.checkpoint_counter.root_id(),
+                self.last_log_frames.load(Ordering::Relaxed),
+                self.last_checkpointed_frames.load(Ordering::Relaxed),
+            );
+        } else if first && !large {
+            crate::slog_debug!(
                 "background WAL checkpoint lag: root={} log_frames={} checkpointed_frames={}; no inline fallback",
                 self.checkpoint_counter.root_id(),
                 self.last_log_frames.load(Ordering::Relaxed),
@@ -753,6 +767,7 @@ impl TrackedConnection {
             residual_counter,
             owner: OnceLock::new(),
             lag_reported: AtomicBool::new(false),
+            lag_warned: AtomicBool::new(false),
             checkpoint_stats: Arc::new(CheckpointStats {
                 attempts: AtomicU64::new(0),
                 mutex_hold_ns: AtomicU64::new(0),
@@ -888,6 +903,7 @@ impl TrackedConnection {
             if let Some(state) = weak.upgrade() {
                 if finished {
                     state.lag_reported.store(false, Ordering::Relaxed);
+                    state.lag_warned.store(false, Ordering::Relaxed);
                 } else {
                     state.note_checkpoint_lag();
                 }
@@ -902,6 +918,7 @@ impl TrackedConnection {
         match self.checkpoint_wal_as(WalCheckpointMode::Passive, domain) {
             Ok(result) if result.busy == 0 && result.checkpointed_frames >= result.log_frames => {
                 self.wal_hook.lag_reported.store(false, Ordering::Relaxed);
+                self.wal_hook.lag_warned.store(false, Ordering::Relaxed);
                 true
             }
             _ => {
@@ -1046,6 +1063,24 @@ impl Drop for TrackedConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observability_checkpoint_lag_logs_small_as_debug_and_large_as_warn() {
+        let conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphGeneration).unwrap();
+        let state = &conn.wal_hook;
+        state.last_log_frames.store(85, Ordering::Relaxed);
+        let (_, small) = crate::logging::capture_log_lines(|| state.note_checkpoint_lag());
+        assert_eq!(small.len(), 1, "{small:?}");
+        assert!(small[0].starts_with("DEBUG "), "{small:?}");
+        assert!(small[0].contains("log_frames=85 checkpointed_frames=0"));
+
+        assert_eq!(state.page_size, 4096);
+        state.last_log_frames.store(8192 + 100, Ordering::Relaxed);
+        state.last_checkpointed_frames.store(100, Ordering::Relaxed);
+        let (_, large) = crate::logging::capture_log_lines(|| state.note_checkpoint_lag());
+        assert_eq!(large.len(), 1, "{large:?}");
+        assert!(large[0].starts_with("WARN "), "{large:?}");
+    }
 
     /// Windows refuses ordinary paths of 260 characters or more, and SQLite
     /// opens each sidecar by appending to the database path. Through a
