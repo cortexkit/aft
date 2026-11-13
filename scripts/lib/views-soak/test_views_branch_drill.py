@@ -101,6 +101,10 @@ class CheckoutRowTests(unittest.TestCase):
             '{"indexes": {"semantic": true}}\n', encoding="utf-8"
         )
         (storage / "logs").mkdir(parents=True)
+        (storage / "views").mkdir()
+        (storage / "views" / "manifest-head.json").write_text(
+            '{"path_identity_version":1,"entries":[{"rel_path":"src/foo.ts"}]}'
+        )
         return checkout, source, storage
 
     def _run_checkout_row(self, client: FakeCheckoutClient, checkout: Path, source: Path, storage: Path):
