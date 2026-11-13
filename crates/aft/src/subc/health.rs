@@ -3350,7 +3350,7 @@ fn insert_lifecycle_metrics(
     let census = json!({
         "lsp": health_lsp_metrics(snapshot.lsp),
         "threads": snapshot.threads,
-        "sqlite": snapshot.sqlite,
+        "sqlite": health_sqlite_metrics(snapshot.sqlite),
         "children": snapshot.children,
         "fds": snapshot.fds,
     });
@@ -3363,6 +3363,25 @@ fn insert_lifecycle_metrics(
     for (key, value) in census {
         target.insert(key.clone(), value.clone());
     }
+}
+
+/// Health names the unattributed SQLite openers by seam only. Their reasons are
+/// a fixed, documented list (`db::lifecycle::SQLITE_UNINSTRUMENTED_OPENERS`,
+/// shown in full by status reads), and repeating that prose in every report
+/// pushed even a one-root report over the health budget, which then replaced
+/// the whole section, connection counts included, with a gap.
+fn health_sqlite_metrics(sqlite: crate::db::SqliteConnectionSnapshot) -> Value {
+    let seams = crate::db::lifecycle::SQLITE_UNINSTRUMENTED_OPENERS
+        .iter()
+        .map(|opener| opener.seam)
+        .collect::<Vec<_>>();
+    json!({
+        "open_connections": sqlite.open_connections,
+        "open_by_store": sqlite.open_by_store,
+        "uninstrumented_openers": seams,
+        "wal_checkpoint_lag_events": sqlite.wal_checkpoint_lag_events,
+        "wal_high_water_frames": sqlite.wal_high_water_frames,
+    })
 }
 
 const HEALTH_LSP_APPLICABILITY_ROOT_CAP: usize = 6;
