@@ -475,6 +475,19 @@ fn api_payload_items<R: Read>(
             index += consumed;
             continue;
         }
+        let flag = match value.split_once('=') {
+            Some((flag, _)) if matches!(flag, "--jq" | "-q" | "--template" | "-t") => flag,
+            _ => value,
+        };
+        if matches!(flag, "--jq" | "--template") || flag.starts_with("-q") || flag.starts_with("-t")
+        {
+            return Err(CanonicalizeError::typed(
+                RefusalCode::UnsupportedFlag,
+                format!(
+                    "{flag}: a post as the bot prints only the link to what it posted, so there is nothing for --jq/-q or --template/-t to filter; read the item back with a gh api GET, which accepts them"
+                ),
+            ));
+        }
         if value.starts_with('-') {
             return Err(CanonicalizeError::unclassified(format!(
                 "undeclared flag {value}"
