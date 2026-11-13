@@ -41,6 +41,49 @@ fn fixture(
     (metadata, resolved.paths)
 }
 
+#[test]
+fn watchdog_cost_gc_teardown_does_not_enumerate_or_resolve_sibling_history() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    for _ in 0..300 {
+        fixture(storage.path(), "history", true, 2);
+    }
+    work_counts::reset();
+    let deleted = registry.maybe_gc_persisted(storage.path()).unwrap();
+    let counts = work_counts::get();
+    assert!(deleted > 0);
+    assert!(deleted <= super::super::gc_cursor::GC_ENTRY_BUDGET);
+    assert!(counts.gc_entries <= super::super::gc_cursor::GC_ENTRY_BUDGET);
+    assert!(
+        counts.gc_teardown_directory_entries <= deleted * 8,
+        "teardown enumerated saved siblings instead of only the selected bundles: {counts:?}"
+    );
+    assert!(
+        counts.gc_teardown_metadata_reads <= deleted,
+        "teardown re-resolved metadata already pinned by GC: {counts:?}"
+    );
+}
+
+#[test]
+fn watchdog_cost_idle_cleanup_does_not_lock_retained_history() {
+    let registry = BgTaskRegistry::default();
+    // No queued candidate needs the task map. Holding it must not delay cleanup.
+    let held = registry.inner.tasks.lock().unwrap();
+    let worker_registry = registry.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        worker_registry.cleanup_finished(Duration::from_secs(24 * 60 * 60));
+        tx.send(()).unwrap();
+    });
+    let completed = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+    drop(held);
+    worker.join().unwrap();
+    assert!(
+        completed,
+        "idle cleanup tried to rebuild the history indexes"
+    );
+}
+
 fn metadata_persistence_running_task(storage: &Path, registry: &BgTaskRegistry) -> Arc<BgTask> {
     let (mut metadata, paths) = fixture(storage, "metadata-persistence", false, 0);
     metadata.status = BgTaskStatus::Running;

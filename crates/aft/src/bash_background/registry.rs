@@ -10793,7 +10793,12 @@ impl BgTaskRegistry {
                     self.forget_task_read_record(&resolved.paths.dir);
                     #[cfg(test)]
                     let before_teardown = super::persistence::work_counts::get();
-                    let removal = delete_task_bundle(&resolved.paths);
+                    // Validated directory handles already hold the bundle open.
+                    // Resolving it again would
+                    // also search every sibling for an interrupted deletion's
+                    // tombstone; a tombstoned bundle has no resolvable task path.
+                    // Deletion still checks the current directory's identity.
+                    let removal = super::persistence::delete_resolved_task(&resolved);
                     #[cfg(test)]
                     super::persistence::work_counts::record_gc_teardown_since(before_teardown);
                     match removal {
@@ -11658,6 +11663,7 @@ impl BgTaskRegistry {
             let paths = task.paths.clone();
             if self.finished_delete_attempt_count(&task_id) >= FINISHED_DELETE_MAX_ATTEMPTS {
                 self.retire_watchdog_task(&task_id);
+                self.remove_cleanup_task(&task);
                 continue;
             }
             let delete_result = if handles_released {
@@ -11731,10 +11737,13 @@ impl BgTaskRegistry {
                                 .push_back(task_id);
                         }
                         Err(lock_error) => {
+                            let lock_message = lock_error.to_string();
+                            drop(lock_error);
                             self.retire_watchdog_task(&task_id);
+                            self.remove_cleanup_task(&task);
                             self.note_finished_delete_abandoned(&task_id);
                             crate::slog_warn!(
-                                "giving up deleting background task bundle {task_id}; leftover path {} could not be retained for retry because the registry lock failed: {error}; {lock_error}. Persisted-task GC can reclaim it on a later replay after its grace period",
+                                "giving up deleting background task bundle {task_id}; leftover path {} could not be retained for retry because the registry lock failed: {error}; {lock_message}. Persisted-task GC can reclaim it on a later replay after its grace period",
                                 paths.dir.display()
                             );
                         }
@@ -11743,7 +11752,6 @@ impl BgTaskRegistry {
             }
         }
         image_cleanup.report();
-        self.prune_session_harnesses();
     }
 
     fn remove_cleanup_task(&self, task: &BgTask) {

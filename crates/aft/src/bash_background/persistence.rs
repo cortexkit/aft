@@ -1354,7 +1354,11 @@ impl PinnedDir {
         {
             self.ensure_current_identity()?;
             let names = fs::read_dir(&self.path)?
-                .map(|entry| entry.map(|entry| entry.file_name()))
+                .map(|entry| {
+                    #[cfg(test)]
+                    work_counts::record_directory_entry();
+                    entry.map(|entry| entry.file_name())
+                })
                 .collect::<io::Result<Vec<_>>>()?;
             self.ensure_current_identity()?;
             Ok(names)
@@ -3989,6 +3993,7 @@ impl Iterator for DirectoryEntries {
             #[cfg(test)]
             {
                 self.emitted += 1;
+                work_counts::record_directory_entry();
             }
             let kind = unsafe { (*entry).d_type };
             return Some(Ok((
@@ -5059,6 +5064,8 @@ pub(crate) mod work_counts {
         pub gc_teardown_opens: usize,
         pub gc_teardown_metadata_reads: usize,
         pub gc_teardown_stats: usize,
+        pub directory_entries: usize,
+        pub gc_teardown_directory_entries: usize,
         pub artifact_bytes: usize,
         pub artifact_opens: usize,
         pub syncs: usize,
@@ -5126,11 +5133,16 @@ pub(crate) mod work_counts {
     pub(crate) fn record_gc_deadline() {
         record(|counts| counts.gc_deadlines += 1);
     }
+    pub(crate) fn record_directory_entry() {
+        record(|counts| counts.directory_entries += 1);
+    }
     pub(crate) fn record_gc_teardown_since(before: Counts) {
         record(|counts| {
             counts.gc_teardown_opens += counts.opens - before.opens;
             counts.gc_teardown_metadata_reads += counts.metadata_reads - before.metadata_reads;
             counts.gc_teardown_stats += counts.stats - before.stats;
+            counts.gc_teardown_directory_entries +=
+                counts.directory_entries - before.directory_entries;
         });
     }
     pub(crate) fn record_parse() {
@@ -8116,6 +8128,25 @@ mod tests {
             "task metadata must remain available so a later sweep can resolve and retry deletion"
         );
         assert_eq!(read_task_at(&task).unwrap().task_id, task.paths.task_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_directory_cleanup_refuses_a_replacement_identity() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, metadata) = counted_task(storage.path());
+        write_task_at(&task, &metadata).unwrap();
+        let displaced = task.paths.session_dir.join("displaced");
+        fs::rename(&task.paths.dir, &displaced).unwrap();
+        let replacement = allocate_task_layout(storage.path(), "counted").unwrap();
+        fs::write(&replacement.paths.stdout, b"keep replacement").unwrap();
+        fs::rename(&replacement.paths.dir, &task.paths.dir).unwrap();
+
+        let error = delete_resolved_task(&task).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(displaced.exists());
+        assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"keep replacement");
     }
 
     #[cfg(unix)]
