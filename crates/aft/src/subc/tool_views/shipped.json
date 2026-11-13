@@ -34,7 +34,7 @@
           }
         },
         "reads": [],
-        "template_revision": 0,
+        "template_revision": 1,
         "template": {
           "row": {
             "schema": "occipital.template/1",
@@ -42,7 +42,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT apply_patch\" maxLines={1} />"
@@ -53,7 +53,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT apply_patch\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
@@ -156,7 +156,7 @@
           }
         },
         "reads": [],
-        "template_revision": 0,
+        "template_revision": 1,
         "template": {
           "row": {
             "schema": "occipital.template/1",
@@ -164,7 +164,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT bash\" maxLines={1} />"
@@ -175,7 +175,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT bash\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
@@ -266,7 +266,7 @@
           }
         },
         "reads": [],
-        "template_revision": 0,
+        "template_revision": 1,
         "template": {
           "row": {
             "schema": "occipital.template/1",
@@ -274,7 +274,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT bash\" maxLines={1} />"
@@ -285,7 +285,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT bash\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
@@ -385,7 +385,7 @@
           }
         },
         "reads": [],
-        "template_revision": 0,
+        "template_revision": 1,
         "template": {
           "row": {
             "schema": "occipital.template/1",
@@ -393,7 +393,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT edit\" maxLines={1} />"
@@ -404,7 +404,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT edit\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
@@ -453,7 +453,7 @@
           }
         },
         "reads": [],
-        "template_revision": 0,
+        "template_revision": 1,
         "template": {
           "row": {
             "schema": "occipital.template/1",
@@ -461,7 +461,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT write\" maxLines={1} />"
@@ -472,7 +472,7 @@
             "executionDialect": "1.0",
             "catalog": {
               "version": "1.1",
-              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+              "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
             },
             "reads": [],
             "source": "<TextContent text=\"AFT write\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
