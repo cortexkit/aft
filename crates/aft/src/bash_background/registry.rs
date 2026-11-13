@@ -3962,6 +3962,16 @@ impl BgTaskRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if delivery.is_some() {
+            if *delivery == Some(RecoveredDelivery::Notice) {
+                crate::subc::retry_held_notice_fallback(
+                    self.clone(),
+                    metadata.task_id.clone(),
+                    crate::db::call_ledger::Key {
+                        carrier: key.requester.clone(),
+                        call_key: key.key.clone(),
+                    },
+                );
+            }
             return;
         }
         let recovered = pool
@@ -4011,6 +4021,7 @@ impl BgTaskRegistry {
             carrier: key.requester.clone(),
             call_key: key.key.clone(),
         };
+        let mut fallback_error = Some("recovered result projection unavailable".to_string());
         if let Some((frame, outcome, tool_result_body)) = crate::subc::recovered_bash_frame(
             snapshot,
             &ledger_key,
@@ -4041,17 +4052,66 @@ impl BgTaskRegistry {
                     unknown_result.as_ref(),
                 ) {
                     Ok(observation) if observation.delivered_held_result => {
+                        fallback_error = None;
                         *delivery = Some(RecoveredDelivery::CallResult);
                         order
                             .recovered_reply_delivered
                             .store(true, Ordering::Release);
                     }
-                    Ok(_) => {}
+                    Ok(observation) if observation.settled_notice_fallback => {
+                        fallback_error = None;
+                        crate::slog_info!(
+                            "recovered bash notice fallback settled task={} call_key={}",
+                            metadata.task_id,
+                            key.key
+                        );
+                    }
+                    Ok(_) => {
+                        fallback_error = None;
+                    }
                     Err(error) => {
-                        crate::slog_warn!("call ledger recovered settlement failed: {error}")
+                        fallback_error = Some(error.to_string());
                     }
                 }
             }
+        }
+        if let Some(error) = fallback_error {
+            crate::slog_warn!("recovered bash notice fallback chosen task={} call_key={} settlement_error={error}", metadata.task_id, key.key);
+            if !self.retry_held_notice_fallback(&metadata.task_id, &ledger_key) {
+                crate::subc::retry_held_notice_fallback(
+                    self.clone(),
+                    metadata.task_id.clone(),
+                    ledger_key,
+                );
+            }
+        }
+    }
+
+    /// Finish only the unknown-outcome hold after the real result chose the
+    /// notice lane. The notice scheduler retries failures without delaying send.
+    pub(crate) fn retry_held_notice_fallback(
+        &self,
+        task: &str,
+        key: &crate::db::call_ledger::Key,
+    ) -> bool {
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(pool) = self.inner.db_pool.read().ok().and_then(|pool| pool.clone()) else {
+            return false;
+        };
+        let Ok(conn) = pool.lock() else { return false };
+        match crate::db::call_ledger::settle_task_notice_fallback(&conn, key, task) {
+            Ok(settled) => {
+                if settled {
+                    crate::slog_info!(
+                        "recovered bash notice fallback settled task={task} call_key={}",
+                        key.call_key
+                    );
+                }
+                true
+            }
+            Err(_) => false,
         }
     }
 

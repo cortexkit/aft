@@ -662,11 +662,53 @@ fn deliver(
                 log::warn!("runner notice {send_id} retired: retry budget exhausted");
                 return Next::Done;
             }
-            Next::Retry(Duration::from_millis(
-                (250u64 << attempt.min(8)).min(60_000),
-            ))
+            Next::Retry(retry_delay(attempt))
         }
     }
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis((250u64 << attempt.min(8)).min(60_000))
+}
+
+pub(crate) fn retry_held_notice_fallback(
+    registry: crate::bash_background::BgTaskRegistry,
+    task: String,
+    key: crate::db::call_ledger::Key,
+) {
+    let Some(scheduler) = scheduler() else {
+        log::warn!(
+            "held notice fallback retry scheduler unavailable task={task} call_key={}",
+            key.call_key
+        );
+        return;
+    };
+    let mut attempt = 0;
+    let id = format!("aft:bash-recovery:{task}");
+    let work: Work = Box::new(move || {
+        if registry.retry_held_notice_fallback(&task, &key) {
+            Next::Done
+        } else {
+            let delay = retry_delay(attempt);
+            attempt = attempt.saturating_add(1);
+            Next::Retry(delay)
+        }
+    });
+    // A durable held call must not lose its only terminal retry when the
+    // best-effort notice queue is full. Keep one retry per persisted task.
+    scheduler
+        .entries
+        .lock()
+        .unwrap()
+        .entry(id)
+        .or_insert_with(|| Scheduled {
+            work: Some(work),
+            due: std::time::Instant::now(),
+            completion: false,
+            retrying: false,
+            expedite: false,
+        });
+    scheduler.wake.notify_all();
 }
 
 #[cfg(test)]
