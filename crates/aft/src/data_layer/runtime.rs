@@ -1970,6 +1970,25 @@ impl DataCheckout {
         counted_elsewhere: Option<usize>,
         walk: impl FnOnce() -> super::surfaces::DataLayerMemory,
     ) -> super::surfaces::DataLayerMemory {
+        self.memory_figure_with(counted_elsewhere, true, walk)
+    }
+
+    /// Explicit censuses refresh invalidated figures immediately. Only the
+    /// background health rollup may defer a dirty walk to protect its CPU budget.
+    pub(crate) fn current_memory_figure(
+        &self,
+        counted_elsewhere: Option<usize>,
+        walk: impl FnOnce() -> super::surfaces::DataLayerMemory,
+    ) -> super::surfaces::DataLayerMemory {
+        self.memory_figure_with(counted_elsewhere, false, walk)
+    }
+
+    fn memory_figure_with(
+        &self,
+        counted_elsewhere: Option<usize>,
+        reuse_dirty: bool,
+        walk: impl FnOnce() -> super::surfaces::DataLayerMemory,
+    ) -> super::surfaces::DataLayerMemory {
         // Another thread walking it now holds the slot: report it busy
         // rather than wait.
         let Ok(mut slot) = self.memory_figure.try_lock() else {
@@ -1991,9 +2010,11 @@ impl DataCheckout {
             let complete =
                 !previous.incomplete_attempt && previous.figure.shared.not_estimated.is_empty();
             let reuse = (previous.version == epoch && complete)
-                || now.saturating_duration_since(previous.attempted_at) < MEMORY_FIGURE_MAX_AGE;
+                || (reuse_dirty
+                    && now.saturating_duration_since(previous.attempted_at)
+                        < MEMORY_FIGURE_MAX_AGE);
             #[cfg(all(test, target_os = "linux"))]
-            let reuse = if MEMORY_FIGURE_BASELINE.with(std::cell::Cell::get) {
+            let reuse = if reuse_dirty && MEMORY_FIGURE_BASELINE.with(std::cell::Cell::get) {
                 previous.version == epoch && age < MEMORY_FIGURE_MAX_AGE
             } else {
                 reuse
@@ -2589,6 +2610,53 @@ mod tests {
         fixture.refresh();
         assert_eq!(fixture.publications(), 1);
         assert_eq!(fixture.handle.checkout().changed_paths(), 0);
+    }
+
+    #[test]
+    fn memory_figure_explicit_census_refreshes_edits_inside_the_health_window() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let handle = &fixture.handle;
+        let walk = || {
+            let mut seen = aft_store::heap::Seen::new();
+            let memory = handle.checkout().memory(&mut seen);
+            super::super::surfaces::checkout_estimate(memory, Some(0), seen.contended())
+        };
+        let now = Instant::now();
+        crate::context::with_memory_walk_clock_for_test(now, || {
+            let original = handle.memory_figure(None, walk);
+            assert_eq!(original.shared.counts["changed_paths"], 0);
+            assert_eq!(original.shared.counts["callgraph_engine_started"], 0);
+            let epoch = handle.checkout().memory_epoch();
+            fixture.add("edited", 1);
+            let noted_epoch = handle.checkout().memory_epoch();
+            assert!(
+                noted_epoch > epoch,
+                "noted paths and their text overlay invalidate memory"
+            );
+            fixture.refresh();
+            assert!(
+                handle.checkout().memory_epoch() > noted_epoch,
+                "the refreshed engine invalidates memory"
+            );
+            let aged = handle.memory_figure(None, walk);
+            assert_eq!(aged.shared.counts["changed_paths"], 0);
+            assert_eq!(aged.shared.bytes_status, "partial");
+            let walks = memory_figure_walks_for_test();
+            let current = handle.current_memory_figure(None, walk);
+            assert_eq!(memory_figure_walks_for_test(), walks + 1);
+            assert_eq!(current.shared.counts["changed_paths"], 1);
+            assert!(current.shared.counts["text_overlay_bytes"] > 0);
+            assert_eq!(current.shared.counts["callgraph_engine_started"], 1);
+            assert!(current.shared.counts["callgraph_engine_bytes"] > 0);
+            assert_eq!(current.shared.bytes_status, "estimated");
+            let reused = handle.memory_figure(None, walk);
+            assert_eq!(reused, current);
+            assert_eq!(
+                memory_figure_walks_for_test(),
+                walks + 1,
+                "health reuses the current census"
+            );
+        });
     }
 
     #[test]

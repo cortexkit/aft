@@ -1010,6 +1010,7 @@ impl Checkout {
             live.graph = None;
             live.refreshed = None;
             live.generation += 1;
+            self.touch_memory();
             live.generation
         };
         let applied = self.apply_scan(
@@ -1427,6 +1428,7 @@ impl Checkout {
                 return false;
             }
             live.state = Some(Arc::new(state));
+            self.touch_memory();
             return true;
         }
         let mut entries = Vec::with_capacity(changed.len());
@@ -1538,18 +1540,29 @@ impl Checkout {
     ) -> Result<BuildReport, DataError> {
         // A refresh already inside the engine finishes first. The reservation
         // blocks new refreshes, so no decoded engine overlaps the cold scan.
-        let mut engine = self
-            .engine
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *engine = None;
-        drop(engine);
+        self.clear_engine_for_build();
         let _alloc_label =
             crate::alloc_trace::scope(crate::alloc_trace::Label::INDEX_BUILD, Some(&self.root));
         let result = self.build_inner(measure);
         drop(reservation);
         self.note_outcome("build", &result);
         result
+    }
+
+    fn clear_engine_for_build(&self) {
+        let mut engine = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.clear_engine_slot(&mut engine);
+    }
+
+    fn clear_engine_slot(&self, engine: &mut Option<GraphEngine>) {
+        if engine.take().is_some() {
+            // A refresh or cold scan can run long before its next publication;
+            // released engine bytes must invalidate the census immediately.
+            self.touch_memory();
+        }
     }
 
     fn build_inner(&self, measure: bool) -> Result<BuildReport, DataError> {
@@ -2697,7 +2710,7 @@ impl Checkout {
         let mut slot = self.engine.lock().unwrap_or_else(|poisoned| {
             self.engine.clear_poison();
             let mut slot = poisoned.into_inner();
-            *slot = None;
+            self.clear_engine_slot(&mut slot);
             slot
         });
         if self.is_building() && !by_build {
@@ -2720,7 +2733,7 @@ impl Checkout {
             Ok(Ok(EngineUpdate::Cold(limit))) => {
                 // No incremental engine or its decoded state overlaps the cold
                 // builder. Watcher events keep recording over the publication.
-                *slot = None;
+                self.clear_engine_slot(&mut slot);
                 let reservation = if by_build { None } else { self.reserve_build() };
                 drop(slot);
                 drop(changes);
@@ -2752,11 +2765,11 @@ impl Checkout {
                 }));
             }
             Ok(Err(error)) => {
-                *slot = None;
+                self.clear_engine_slot(&mut slot);
                 return Err(error);
             }
             Err(panic) => {
-                *slot = None;
+                self.clear_engine_slot(&mut slot);
                 let message = panic
                     .downcast_ref::<&str>()
                     .map(|message| (*message).to_string())
@@ -2852,16 +2865,7 @@ impl Checkout {
         if let Err(limit) = budget.include(&changed_members) {
             return Ok(EngineUpdate::Cold(limit));
         }
-        if slot
-            .as_ref()
-            .is_some_and(|engine| !Arc::ptr_eq(&engine.published, &published))
-        {
-            *slot = None;
-        }
-        if slot.is_none() {
-            *slot = Some(self.start_engine(published)?);
-            self.engine.note_start();
-        }
+        self.ensure_engine(slot, published)?;
         let engine = slot.as_mut().expect("started");
         let changed = changes
             .iter()
@@ -3438,6 +3442,25 @@ impl Checkout {
             .map_or(0, |refreshed| {
                 refreshed.replaced.len() + refreshed.removed.len()
             })
+    }
+
+    fn ensure_engine(
+        &self,
+        slot: &mut Option<GraphEngine>,
+        published: &Arc<Published>,
+    ) -> Result<(), DataError> {
+        if slot
+            .as_ref()
+            .is_some_and(|engine| !Arc::ptr_eq(&engine.published, published))
+        {
+            self.clear_engine_slot(slot);
+        }
+        if slot.is_none() {
+            *slot = Some(self.start_engine(published)?);
+            self.touch_memory();
+            self.engine.note_start();
+        }
+        Ok(())
     }
 
     /// The incremental state for `published`: every stored resolution, and
@@ -6019,6 +6042,68 @@ impl Checkout {
 mod tests {
     use super::*;
     use aft_store::text::plan_pattern;
+
+    #[test]
+    fn memory_figure_engine_start_and_cold_reset_invalidate_before_work_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(root.path(), "src/lib.rs", "pub fn original() {}\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let published = Arc::clone(checkout.live.read().unwrap().published.as_ref().unwrap());
+        let epoch = checkout.memory_epoch();
+        {
+            let mut engine = checkout.engine.lock().unwrap();
+            checkout.ensure_engine(&mut engine, &published).unwrap();
+        }
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "starting the engine invalidates before refresh returns"
+        );
+        assert!(checkout.engine_memory_parts().is_some());
+        let reservation = checkout.reserve_build().unwrap();
+        let epoch = checkout.memory_epoch();
+        checkout.clear_engine_for_build();
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "the engine was released before any new publication"
+        );
+        let mut seen = aft_store::heap::Seen::new();
+        assert_eq!(checkout.memory(&mut seen).engine, EngineMemory::NotStarted);
+        let epoch = checkout.memory_epoch();
+        checkout.clear_engine_for_build();
+        assert_eq!(
+            checkout.memory_epoch(),
+            epoch,
+            "an empty slot changed no memory"
+        );
+        drop(reservation);
+    }
+
+    #[test]
+    fn memory_figure_unchanged_scan_and_adoption_invalidate_replaced_state() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(root.path(), "src/lib.rs", "pub fn original() {}\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let epoch = checkout.memory_epoch();
+        checkout.record_paths(&[b"src/lib.rs".to_vec()]).unwrap();
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "even an unchanged scan replaces the counted state"
+        );
+        assert!(checkout.live.read().unwrap().changes.is_empty());
+        let epoch = checkout.memory_epoch();
+        checkout.adopt_newest().unwrap();
+        assert!(
+            checkout.memory_epoch() > epoch,
+            "adopting a publication replaces counted state and overlays"
+        );
+        assert!(checkout.live.read().unwrap().changes.is_empty());
+    }
 
     #[test]
     fn memory_figure_read_side_allocations_advance_the_checkout_epoch() {

@@ -182,7 +182,9 @@ fn retained_aft_engines() {
                         for (index, ctx) in contexts.iter().enumerate() {
                             let before_walks = memory_figure_walks_for_test();
                             let before_cpu = cpu_ns();
-                            std::hint::black_box(crate::data_layer::surfaces::memory_estimate(ctx));
+                            std::hint::black_box(
+                                crate::data_layer::surfaces::memory_estimate_for_rollup(ctx),
+                            );
                             let elapsed = cpu_ns() - before_cpu;
                             root_cpu += elapsed;
                             let count = memory_figure_walks_for_test() - before_walks;

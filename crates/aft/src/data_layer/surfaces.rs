@@ -1138,6 +1138,16 @@ impl DataLayerMemory {
 /// `None` when the data layer is off. Never binds the checkout and never
 /// waits for a lock.
 pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<DataLayerMemory> {
+    memory_estimate_with(ctx, false)
+}
+
+/// Health reuses dirty figures for up to thirty seconds. Explicit censuses use
+/// [`memory_estimate`] instead, so completed edits are observable immediately.
+pub(crate) fn memory_estimate_for_rollup(ctx: &AppContext) -> Option<DataLayerMemory> {
+    memory_estimate_with(ctx, true)
+}
+
+fn memory_estimate_with(ctx: &AppContext, reuse_dirty: bool) -> Option<DataLayerMemory> {
     Some(match ctx.probe_data_checkout()? {
         // Nothing is held for a checkout that is not bound.
         DataCheckoutProbe::NotBound
@@ -1152,7 +1162,7 @@ pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<DataLayerMemory> {
             let counted_elsewhere = snapshot
                 .as_ref()
                 .map(|snapshot| Arc::as_ptr(snapshot) as usize);
-            checkout.memory_figure(counted_elsewhere, || {
+            let walk = || {
                 let mut seen = aft_store::heap::Seen::new();
                 // aft_inspect's dead-code scan may hold the same snapshot the
                 // checkout's dead-code memo holds; the root's
@@ -1163,7 +1173,12 @@ pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<DataLayerMemory> {
                 let memory = checkout.checkout().memory(&mut seen);
                 let meaning = checkout.meaning_memory(&mut seen);
                 checkout_estimate(memory, meaning, seen.contended())
-            })
+            };
+            if reuse_dirty {
+                checkout.memory_figure(counted_elsewhere, walk)
+            } else {
+                checkout.current_memory_figure(counted_elsewhere, walk)
+            }
         }
     })
 }

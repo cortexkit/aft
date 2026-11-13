@@ -12493,7 +12493,7 @@ impl AppContext {
         let mut estimates = self.memory_estimates_from(walked);
         let data_layer = Self::fold_data_layer_memory(
             &mut estimates,
-            crate::data_layer::surfaces::memory_estimate(self),
+            crate::data_layer::surfaces::memory_estimate_for_rollup(self),
         );
         let measured_age_ms = measured_age_ms.max(
             data_layer
