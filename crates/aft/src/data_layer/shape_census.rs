@@ -69,7 +69,8 @@ impl Census {
     //  language_totals: [{language, sites, exits: {exit_name: sites}}],
     //  top_callers: [{path, symbol, callers}]}.
     // Counts are exact unsigned integers. `targets` counts explicit targets,
-    // not protected declarations. Groups cover all unknown() routes; sum the
+    // not same-named declarations merely kept live without a call edge.
+    // Groups cover all unknown() routes; sum the
     // exits named `unknown*` to get their per-language share of all bound method
     // sites (including dynamic, missing-member and ordinary-edge-preserved sites).
     // Exits: dynamic, missing_member, unknown_go_package, unknown,
@@ -78,7 +79,8 @@ impl Census {
     // exact. An exact/open_type route may return zero targets. Absent exit keys
     // mean zero. Groups/languages sort lexically; top callers sort by descending
     // count then path/symbol, include tests and callback references, and dedup
-    // positional caller nodes, not call sites or lines. Paths are root-relative.
+    // caller declarations by file and source position, not call sites or lines.
+    // Paths are root-relative.
     pub(crate) fn write_if_requested(self, source: &dyn SliceSource) -> Result<(), String> {
         let Some(path) = std::env::var_os("AFT_CALLGRAPH_SHAPE_CENSUS_JSON").map(PathBuf::from)
         else {
@@ -160,7 +162,7 @@ fn top_callers(source: &dyn SliceSource) -> Result<Vec<TopCaller>, String> {
                 .entry((file.clone(), node.scoped_name().to_string()))
                 .or_default();
         }
-        // Duplicate sites/provenances from the same caller contribute once.
+        // Duplicate sites or edge records from the same caller contribute once.
         // Retain only distinct caller/target groups in this file, never sites;
         // the cross-file map holds just one counter per target symbol.
         let mut pairs = BTreeSet::new();
