@@ -155,6 +155,9 @@ fn shells_v1_operation_logs_are_once_per_event_and_content_free() {
         }
     }
 }
+#[cfg(target_os = "linux")]
+#[path = "runtime_perf_tests.rs"]
+mod perf;
 
 fn status_context() -> (
     tempfile::TempDir,

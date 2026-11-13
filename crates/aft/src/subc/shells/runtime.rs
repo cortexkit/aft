@@ -869,6 +869,9 @@ thread_local! {
     static DB_LOCK_DURATIONS: std::cell::RefCell<Vec<std::time::Duration>> = const {std::cell::RefCell::new(Vec::new())};
 }
 
+#[cfg(test)]
+static COLLECT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn with_db_read<T>(
     db: &std::sync::Mutex<crate::db::TrackedConnection>,
     read: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
@@ -997,6 +1000,8 @@ fn collect_at_revision(
     previous: DbFacts,
     revision: u64,
 ) -> Collected {
+    #[cfg(test)]
+    COLLECT_CALLS.fetch_add(1, Ordering::Relaxed);
     let contexts = executor.actor_contexts();
     let bound_roots: std::collections::BTreeSet<_> = contexts
         .iter()
