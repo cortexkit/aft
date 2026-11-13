@@ -2,7 +2,7 @@
 name = "aft-tokenizer"
 version = "0.64.0"
 edition = "2021"
-description = "Claude lookup-encoding tokenizer for Agent File Tools"
+description = "Claude lookup-encoding tokenizer for Agent Foundational Toolkit"
 license = "MIT"
 rust-version.workspace = true
 

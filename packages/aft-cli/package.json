@@ -2,7 +2,7 @@
   "name": "@cortexkit/aft",
   "version": "0.64.0",
   "type": "module",
-  "description": "Unified CLI for Agent File Tools (AFT) — setup, one-shot index snapshots, doctor, and diagnostics across supported agent harnesses (OpenCode, Pi)",
+  "description": "Unified CLI for Agent Foundational Toolkit (AFT) — setup, one-shot index snapshots, doctor, and diagnostics across supported agent harnesses (OpenCode, Pi)",
   "license": "MIT",
   "repository": {
     "type": "git",

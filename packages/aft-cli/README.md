@@ -1,6 +1,6 @@
 # @cortexkit/aft
 
-Unified CLI for [Agent File Tools (AFT)](https://github.com/cortexkit/aft) — setup, doctor, and diagnostics across supported agent harnesses.
+Unified CLI for [Agent Foundational Toolkit (AFT)](https://github.com/cortexkit/aft) — setup, doctor, and diagnostics across supported agent harnesses.
 
 ## Usage
 

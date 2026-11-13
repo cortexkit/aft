@@ -2,7 +2,7 @@
 
 Run the committed wrapper on a Linux host using the existing, unchanged
 `run.py` collection and scoring functions. It makes **fresh collections of both
-binaries** with separate Agent File Tools (AFT) index/inspection caches, then
+binaries** with separate Agent Foundational Toolkit (AFT) index/inspection caches, then
 compares both against the same frozen
 per-corpus-pin oracle records. It never fetches repositories, installs packages,
 compiles Rust/Go, or downloads oracle dependencies.

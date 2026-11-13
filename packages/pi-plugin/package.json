@@ -2,7 +2,7 @@
   "name": "@cortexkit/aft-pi",
   "version": "0.64.0",
   "type": "module",
-  "description": "Pi coding agent extension for Agent File Tools (AFT) — tree-sitter and LSP-powered code analysis",
+  "description": "Pi coding agent extension for Agent Foundational Toolkit (AFT) — tree-sitter and LSP-powered code analysis",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "license": "MIT",
