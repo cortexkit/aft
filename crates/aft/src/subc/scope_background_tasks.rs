@@ -761,6 +761,91 @@ mod tests {
             .starts_with("store_read_failed"));
     }
 
+    fn large_saved_store(storage: &Path) {
+        use crate::bash_background::persistence::PersistedTask;
+
+        let conn = rusqlite::Connection::open(storage.join("aft.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE bash_tasks (task_id TEXT PRIMARY KEY, metadata TEXT NOT NULL, completed_at INTEGER);",
+        )
+        .unwrap();
+        let mut other = selector();
+        other.scope_ref = "another-worker".into();
+        for index in 0..435 {
+            let mut metadata = PersistedTask::starting(
+                format!("bash-{:016x}", 100_000 + index),
+                "other-session".into(),
+                "sleep 30".into(),
+                storage.into(),
+                None,
+                None,
+                true,
+                false,
+            );
+            metadata.scope = Some(subc_protocol::scope::ScopeStamp::new(
+                other.owner.clone(),
+                other.scope_ref.clone(),
+                other.epoch,
+                subc_protocol::scope::ScopeKind::Worker,
+            ));
+            conn.execute(
+                "INSERT INTO bash_tasks VALUES (?1, ?2, NULL)",
+                rusqlite::params![metadata.task_id, serde_json::to_string(&metadata).unwrap()],
+            )
+            .unwrap();
+        }
+        // Match the live store's 23,833 session/task entries in both layouts.
+        for session in 0..233 {
+            let root = if session % 2 == 0 {
+                storage.to_path_buf()
+            } else {
+                storage.join("project-root")
+            };
+            let session_dir = root.join("bash-tasks").join(format!("session-{session}"));
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let count = 101 + usize::from(session < 67);
+            for task in 0..count {
+                let id = format!("bash-{:016x}", session * 1000 + task);
+                let mut metadata = PersistedTask::starting(
+                    id.clone(),
+                    format!("session-{session}"),
+                    "true".into(),
+                    storage.into(),
+                    None,
+                    None,
+                    true,
+                    false,
+                );
+                metadata.status = crate::bash_background::BgTaskStatus::Completed;
+                let task_dir = session_dir.join(&id);
+                std::fs::create_dir_all(task_dir.join("control")).unwrap();
+                std::fs::write(
+                    task_dir.join("control/metadata.json"),
+                    serde_json::to_vec(&metadata).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn scope_background_tasks_large_saved_tree_and_unrelated_rows_are_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        large_saved_store(dir.path());
+        let selected = selector();
+        let params = json!({"scope": selected});
+        let mut replies = Vec::new();
+        for call in 1..=5 {
+            let reply = answer(params.clone(), Some(&selected.owner), &[], dir.path());
+            eprintln!("large saved store call {call}: {}", reply.data);
+            replies.push(reply);
+        }
+        for reply in replies {
+            assert_eq!(reply.data["complete"], true, "{reply:?}");
+            assert_eq!(reply.data["running"], json!([]));
+        }
+    }
+
     #[test]
     fn scope_background_tasks_unloaded_scope_registry_is_not_empty_complete() {
         let dir = tempfile::tempdir().unwrap();
