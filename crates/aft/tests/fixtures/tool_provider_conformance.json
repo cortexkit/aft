@@ -2,9 +2,9 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.15.6",
+      "version": "0.15.7",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "f12d2f206d501266d4b1fe35f8fb0eafbc137fe5430c1abca708eb19087f7fc1",
+      "checksum": "eacc12b7cedba20bfa612db37d9673151efde7a2050c906b38eee49b684ec597",
       "dependency_kind": "normal",
       "release_tag": "cortexkit-role-tool-provider-v0.13.0"
     },
@@ -17,9 +17,9 @@
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.15.7",
+      "version": "0.15.8",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "92a45495b6ec0dd1b8f4cc906dd90985082dd2657f9a7fc58ffce2c8f4b4867a",
+      "checksum": "58b7dc54e796db28d58a3d90dccbd1caedd2a71c49711f0f9e053c1e7c056e46",
       "dependency_kind": "dev",
       "release_tag": "cortexkit-role-tool-provider-conformance-v0.13.1"
     },
@@ -119,7 +119,7 @@
         }
       ],
       "implementation_version": "<built-package-version>",
-      "capabilities": ["tool-catalog-confine/v1", "tool-catalog-model/v1", "tool-views/v1", "session-notices/v1", "call-yield/v1"]
+      "capabilities": ["tool-catalog-confine/v1", "tool-catalog-model/v1", "tool-views/v1", "system-text-facts/v1", "session-notices/v1", "call-yield/v1"]
     },
     "presets": {
       "head": {
@@ -138,6 +138,9 @@
             "catalog_reply_valid",
             "system_text_digests_match_text",
             "system_text_preflight_digest_stable",
+            "system_text_facts_accepted",
+            "system_text_facts_malformed_refused",
+            "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
@@ -211,6 +214,7 @@
             "call_key",
             "schema_pin",
             "system_text",
+            "system-text-facts/v1",
             "held_calls",
             "scope_stamp",
             "late_results",
@@ -233,6 +237,9 @@
             "catalog_reply_valid",
             "system_text_digests_match_text",
             "system_text_preflight_digest_stable",
+            "system_text_facts_accepted",
+            "system_text_facts_malformed_refused",
+            "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
@@ -306,6 +313,7 @@
             "call_key",
             "schema_pin",
             "system_text",
+            "system-text-facts/v1",
             "held_calls",
             "scope_stamp",
             "late_results",
@@ -329,6 +337,9 @@
             "catalog_reply_valid",
             "system_text_digests_match_text",
             "system_text_preflight_digest_stable",
+            "system_text_facts_accepted",
+            "system_text_facts_malformed_refused",
+            "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
@@ -402,6 +413,7 @@
             "call_key",
             "schema_pin",
             "system_text",
+            "system-text-facts/v1",
             "held_calls",
             "scope_stamp",
             "late_results",
@@ -424,6 +436,9 @@
             "catalog_reply_valid",
             "system_text_digests_match_text",
             "system_text_preflight_digest_stable",
+            "system_text_facts_accepted",
+            "system_text_facts_malformed_refused",
+            "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
@@ -497,6 +512,7 @@
             "call_key",
             "schema_pin",
             "system_text",
+            "system-text-facts/v1",
             "held_calls",
             "scope_stamp",
             "late_results",
@@ -520,6 +536,9 @@
             "catalog_reply_valid",
             "system_text_digests_match_text",
             "system_text_preflight_digest_stable",
+            "system_text_facts_accepted",
+            "system_text_facts_malformed_refused",
+            "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
@@ -591,7 +610,8 @@
             "legacy_reply",
             "call_key",
             "schema_pin",
-            "system_text"
+            "system_text",
+            "system-text-facts/v1"
           ]
         },
         "no_hooks": {
@@ -609,6 +629,9 @@
             "catalog_reply_valid",
             "system_text_digests_match_text",
             "system_text_preflight_digest_stable",
+            "system_text_facts_accepted",
+            "system_text_facts_malformed_refused",
+            "system_text_facts_legacy_omitted",
             "catalog_schema_digest_stable",
             "catalog_digest_only",
             "catalog_unknown_preset_refused",
@@ -680,7 +703,8 @@
             "legacy_reply",
             "call_key",
             "schema_pin",
-            "system_text"
+            "system_text",
+            "system-text-facts/v1"
           ]
         }
       }

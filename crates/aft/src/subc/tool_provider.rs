@@ -12,7 +12,7 @@ use cortexkit_role_tool_provider::{
         system_text_digest, CatalogAnswer, CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
     },
     describe::{Major, RoleDescribe},
-    errors,
+    errors, SystemTextFacts,
 };
 use serde_json::{json, Value};
 use subc_protocol::ErrorBody;
@@ -207,6 +207,7 @@ pub(super) fn describe() -> Value {
             "tool-catalog-confine/v1".into(),
             cortexkit_role_tool_provider::CATALOG_MODEL.into(),
             "tool-views/v1".into(),
+            cortexkit_role_tool_provider::SYSTEM_TEXT_FACTS_V1.into(),
             SESSION_NOTICES.into(),
             super::call_yield::CALL_YIELD.into(),
         ]),
@@ -823,10 +824,19 @@ impl HeadSettings {
 }
 
 pub(super) fn validate_catalog_request(
-    body: Value,
+    mut body: Value,
 ) -> Result<(CatalogRequest, CatalogPreset), ErrorBody> {
-    let request: CatalogRequest = serde_json::from_value(body)
+    // Decode facts separately so malformed values name the contract's `facts`
+    // field rather than the generic catalog arguments field.
+    let facts = body
+        .as_object_mut()
+        .and_then(|body| body.remove("facts"))
+        .map(serde_json::from_value::<SystemTextFacts>)
+        .transpose()
+        .map_err(|e| errors::invalid_request("facts", e.to_string()))?;
+    let mut request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
+    request.facts = facts;
     // The tool-provider contract reads a system-text item's preset as
     // optional, where a missing preset asks for the provider's default text.
     // AFT does not offer default text (its manifest does not declare
@@ -1557,6 +1567,8 @@ fn render_catalog(
                 .find(|name| **name == bare || same_tool(name, bare))
                 .map(|name| name.to_string())
         };
+        // `request.facts` is available to this builder, but accepting facts
+        // does not yet change the preset-based text or its digests.
         let text = match preset {
             CatalogPreset::Head if runner_head.is_some() => {
                 head_text(&served, worker, hashline_tags.as_deref())
@@ -4883,6 +4895,128 @@ mod tests {
         // A reply without system text carries no tool names.
         let reply = catalog(json!({}), &[], true).unwrap();
         assert!(reply.get("system_text").is_none());
+    }
+
+    fn system_text_facts() -> Value {
+        json!({
+            "model": {"provider": "other-provider", "id": "gpt-5"},
+            "harness": {"id": "other-harness", "facts": ["files", "shell"]},
+            "tools": ["other_tool", "read", "write"],
+            "idle_start": ["another-sender", "sender"]
+        })
+    }
+
+    #[test]
+    fn system_text_facts_are_declared_and_preserved_for_rendering() {
+        assert!(describe()["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("system-text-facts/v1")));
+        let facts = system_text_facts();
+        let (request, _) = validate_catalog_request(json!({
+            "system_text": {"preset": "head"}, "facts": facts
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(request.facts.unwrap()).unwrap(), facts);
+    }
+
+    #[test]
+    fn system_text_facts_leave_every_presets_text_and_catalog_bytes_unchanged() {
+        let empty_facts = json!({
+            "model": {"provider": "", "id": ""},
+            "harness": {"id": "", "facts": []},
+            "tools": [], "idle_start": []
+        });
+        for preset in CatalogPreset::ALL {
+            for params in [
+                json!({}),
+                json!({"model": {"provider": "vendor", "id": "claude"}}),
+                json!({"model": {"provider": "vendor", "id": "gpt-5"}}),
+            ] {
+                for (text_preset, text_params) in [
+                    (preset.name(), json!({})),
+                    ("broca", json!({"worker": false})),
+                    ("broca", json!({"worker": true})),
+                ] {
+                    let mut body = json!({
+                        "preset": preset.name(), "params": params,
+                        "system_text": {"preset": text_preset, "params": text_params}
+                    });
+                    let without = catalog(body.clone(), &[], true).unwrap();
+                    let text = without["system_text"]["text"].as_str().unwrap();
+                    assert!(!text.is_empty());
+                    for facts in [system_text_facts(), empty_facts.clone()] {
+                        body["facts"] = facts;
+                        let with = catalog(body.clone(), &[], true).unwrap();
+                        assert_eq!(
+                            with["system_text"]["text"].as_str().unwrap().as_bytes(),
+                            text.as_bytes()
+                        );
+                        assert_eq!(
+                            serde_json::to_vec(&with).unwrap(),
+                            serde_json::to_vec(&without).unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_system_text_facts_are_refused_by_name() {
+        let valid = system_text_facts();
+        for facts in [Value::Null, json!(false), json!([]), json!({})] {
+            let error = catalog(
+                json!({"system_text": {"preset": "head"}, "facts": facts}),
+                &[],
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert_eq!(errors::invalid_request_field(&error), Some("facts"));
+        }
+        for pointer in [
+            "/model",
+            "/model/provider",
+            "/model/id",
+            "/harness",
+            "/harness/id",
+            "/harness/facts",
+            "/tools",
+            "/idle_start",
+        ] {
+            let mut facts = valid.clone();
+            *facts.pointer_mut(pointer).unwrap() = Value::Null;
+            let error = catalog(json!({"facts": facts}), &[], true).unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert_eq!(errors::invalid_request_field(&error), Some("facts"));
+        }
+        for pointer in ["/tools", "/idle_start", "/harness/facts"] {
+            for names in [
+                json!(["z", "a"]),
+                json!(["a", "a"]),
+                json!([""]),
+                json!([null]),
+            ] {
+                let mut facts = valid.clone();
+                *facts.pointer_mut(pointer).unwrap() = names;
+                let error = catalog(json!({"facts": facts}), &[], true).unwrap_err();
+                assert_eq!(error.code, "invalid_request");
+                assert_eq!(errors::invalid_request_field(&error), Some("facts"));
+            }
+        }
+        for pointer in ["", "/model", "/harness"] {
+            let mut facts = valid.clone();
+            facts
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".into(), json!(true));
+            let error = catalog(json!({"facts": facts}), &[], true).unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert_eq!(errors::invalid_request_field(&error), Some("facts"));
+        }
     }
 
     #[test]

@@ -3535,6 +3535,7 @@ impl ToolProviderSubject for Subject {
             Capability::CallKey,
             Capability::SchemaPin,
             Capability::SystemText,
+            Capability::SystemTextFacts,
             Capability::LegacyReply,
         ]);
         if self.serves_shell() {
