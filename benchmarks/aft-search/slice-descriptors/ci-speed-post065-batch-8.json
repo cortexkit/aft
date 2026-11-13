@@ -1,0 +1,11 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/parser.rs",
+    "crates/aft/src/lib.rs"
+  ],
+  "note": "Post-0.65 batch 8, on main: the downloaded-grammar loader behind the optional wasm-grammars feature (no language is switched to it yet, so every parsed language keeps its built-in grammar), cheaper health rollups, fallback-walk logging, per-server TypeScript temp folders and a profiler test probe. The ranking-fenced parser.rs and lib.rs changes only add the loader's module and availability states; no scoring, candidate selection or routing changes, so search results are unchanged."
+}
