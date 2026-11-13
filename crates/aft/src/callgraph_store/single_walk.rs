@@ -329,14 +329,14 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
-#[cfg(all(test, feature = "test-hooks"))]
+#[cfg(all(test, feature = "test-hooks", feature = "wasm-grammars"))]
 pub(crate) fn install_luau_parser_for_test(parser: Parser) {
     EXTRACTION_PARSERS.with(|parsers| {
         parsers.borrow_mut().insert(LangId::Luau, parser);
     });
 }
 
-#[cfg(all(test, feature = "test-hooks"))]
+#[cfg(all(test, feature = "test-hooks", feature = "wasm-grammars"))]
 pub(crate) fn retains_luau_parser_for_test() -> bool {
     EXTRACTION_PARSERS.with(|parsers| parsers.borrow().contains_key(&LangId::Luau))
 }

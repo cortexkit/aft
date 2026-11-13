@@ -1190,8 +1190,9 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
 }
 
 // The five largest react-lua runtime modules took 3.4-7.3 s each on an
-// unoptimized Pulley build. Release builds are faster; 30 s leaves about
-// fourfold margin over the slowest measured file while bounding host parsing.
+// unoptimized build using Wasmtime's Pulley bytecode interpreter. Release
+// builds are faster; 30 s leaves about fourfold margin over the slowest
+// measured file while bounding host parsing.
 const LUAU_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[doc(hidden)]
@@ -1220,14 +1221,14 @@ pub fn with_luau_parse_deadline_for_test<T>(
     run()
 }
 
-#[cfg(all(test, feature = "test-hooks"))]
+#[cfg(all(test, feature = "test-hooks", feature = "wasm-grammars"))]
 pub(crate) fn install_luau_parser_for_test(parser: Parser) {
     REUSABLE_PARSERS.with(|parsers| {
         parsers.borrow_mut().insert(LangId::Luau, parser);
     });
 }
 
-#[cfg(all(test, feature = "test-hooks"))]
+#[cfg(all(test, feature = "test-hooks", feature = "wasm-grammars"))]
 pub(crate) fn retains_luau_parser_for_test() -> bool {
     REUSABLE_PARSERS.with(|parsers| parsers.borrow().contains_key(&LangId::Luau))
 }
