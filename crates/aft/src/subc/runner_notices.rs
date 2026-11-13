@@ -278,7 +278,7 @@ struct Address {
     worker: bool,
 }
 
-fn concrete_route_harness(owner: &crate::bash_background::TaskIdentity) -> Option<String> {
+fn concrete_route_harness(principal: Option<&str>, session: &str) -> Option<String> {
     let mut routes = BOUND_ROUTES.get_or_init(Default::default).lock().unwrap();
     routes.retain(|_, route| route.strong_count() > 0);
     let mut harness = None;
@@ -292,7 +292,7 @@ fn concrete_route_harness(owner: &crate::bash_background::TaskIdentity) -> Optio
         else {
             continue;
         };
-        if principal_id != &owner.principal || session_id != &owner.session || raw == "runner" {
+        if principal_id.as_deref() != principal || session_id != session || raw == "runner" {
             continue;
         }
         if harness.as_ref().is_some_and(|previous| previous != raw) {
@@ -302,6 +302,23 @@ fn concrete_route_harness(owner: &crate::bash_background::TaskIdentity) -> Optio
         harness = Some(raw.clone());
     }
     harness
+}
+
+/// Resolve the concrete host used when binding back to a runner session.
+/// The `reserved:broca` principal maps the legacy `runner` label to `broca`;
+/// other principals need an unambiguous live binding before the host is known.
+pub(super) fn concrete_runner_harness(
+    principal: Option<&str>,
+    session: &str,
+    raw_harness: &str,
+) -> Option<String> {
+    if raw_harness != "runner" {
+        Some(raw_harness.to_owned())
+    } else if principal == Some("reserved:broca") {
+        Some("broca".into())
+    } else {
+        concrete_route_harness(principal, session)
+    }
 }
 
 pub(super) fn route_unbound(route: &RouteIdentity) {
@@ -327,13 +344,8 @@ impl Address {
             .as_deref()?
             .strip_prefix("reserved:")?
             .to_string();
-        let raw_harness = if raw_harness != "runner" {
-            raw_harness
-        } else if module == "broca" {
-            "broca".into()
-        } else {
-            concrete_route_harness(owner)?
-        };
+        let raw_harness =
+            concrete_runner_harness(owner.principal.as_deref(), &owner.session, &raw_harness)?;
         Some(Self {
             worker: module == "broca"
                 || stamp.is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker),
