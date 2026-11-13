@@ -26,7 +26,7 @@
     "build": "bun build src/index.ts src/entry/server.mjs --outdir dist --target node --format esm --external effect && tsc --emitDeclarationOnly && bun run build:tui",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "pretest": "node -e \"if (process.env.CI !== 'true') { const { spawnSync } = require('node:child_process'); const result = spawnSync('cargo', ['build'], { cwd: '../..', stdio: 'inherit', shell: process.platform === 'win32' }); process.exit(result.status ?? 1); } else { console.log('Skipping cargo build in CI; workflow builds agent-file-tools before tests.'); }\"",
-    "test": "bun test",
+    "test": "bun run build:tui && bun test",
     "test:e2e": "bun test src/__tests__/e2e/",
     "test:load-matrix": "bun test ./test/load-matrix/load-matrix.ts",
     "lint": "biome check src",
