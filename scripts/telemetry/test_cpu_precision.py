@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+MEASURED_PROFILE = "index-store-no-inspect-post-edit-refresh-v5"
 
 
 def load_script(name: str, filename: str):
@@ -47,9 +48,13 @@ class CpuPrecisionTests(unittest.TestCase):
             ("cpu_seconds", 3.76, 3.75),
         ])
         writer_metrics = {metric: 0.0 for metric in gate.DEFAULT_METRICS}
-        writer_metrics["cpu_seconds"] = below.metrics["cpu_seconds"]
-        writer_run = gate.RunData(Path("writer.csv"), "synthetic-24k", writer_metrics, {}, True, below.row)
-        written = gate.repo_metrics_from_runs("synthetic-24k", baseline, [writer_run])
+        writer_runs = [
+            gate.RunData(Path(f"writer-{index}.csv"), "synthetic-24k",
+                         writer_metrics | {"cpu_seconds": observed.metrics["cpu_seconds"]}, {}, True,
+                         observed.row | {"measurement_profile": MEASURED_PROFILE})
+            for index, observed in enumerate((above, below), 1)
+        ]
+        written = gate.repo_metrics_from_runs("synthetic-24k", baseline, writer_runs)
         persisted = json.loads(json.dumps(written))
         self.assertEqual(persisted["cpu_seconds"]["value"], 3.74)
         line = gate.observation_line("synthetic-24k", [below, above])
@@ -133,6 +138,7 @@ class BaselineProvenanceTests(unittest.TestCase):
 class ColdIndexMeasurementTests(unittest.TestCase):
     def test_measured_config_disables_inspect_without_serializing_indexes(self):
         captured = []
+        phase_marks = []
 
         def configure(command, **kwargs):
             self.assertEqual(command, "configure")
@@ -142,9 +148,10 @@ class ColdIndexMeasurementTests(unittest.TestCase):
         client = SimpleNamespace(proc=object(), request=configure, close=lambda: None)
         sampler = SimpleNamespace(
             start=lambda: None, stop=lambda: None, gaps=[], peak_rss_kb=0,
-            peak_rss_hwm_kb=0, cpu_seconds=None, cpu_precision="0.01-second", disk_write_bytes=None,
+            peak_rss_hwm_kb=0, hwm_available=False, cpu_seconds=None, cpu_precision="0.01-second", disk_write_bytes=None,
         )
-        phases = SimpleNamespace(start=lambda: None, stop=lambda: None, gaps=[], samples=[])
+        phases = SimpleNamespace(start=lambda: None, stop=lambda: None, gaps=[], samples=[],
+                                 mark=lambda *states: phase_marks.append(states))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with patch.object(matrix, "repo_is_git", return_value=True), \
@@ -158,7 +165,8 @@ class ColdIndexMeasurementTests(unittest.TestCase):
             "indexes": {"trigram": True, "callgraph": True, "semantic": False},
             "inspect": {"enabled": False},
         }])
-        self.assertEqual(row["measurement_profile"], "cold-index-no-inspect-v1")
+        self.assertEqual(phase_marks, [("building", "building")])
+        self.assertEqual(row["measurement_profile"], MEASURED_PROFILE)
         self.assertIn("measurement_profile", matrix.CSV_FIELDS)
 
     def test_millisecond_logs_retain_phase_timestamps(self):
@@ -186,7 +194,7 @@ class ColdIndexMeasurementTests(unittest.TestCase):
         launch.assert_not_called()
 
     def test_new_profile_keeps_memory_regression_strict(self):
-        baseline = {"measurement_profile": "cold-index-no-inspect-v1", "metrics": {
+        baseline = {"measurement_profile": MEASURED_PROFILE, "metrics": {
             "peak_rss_mb": {"value": 177.0, "tolerance_pct": 20.0, "absolute_floor": 128.0},
         }}
 
@@ -200,7 +208,7 @@ class ColdIndexMeasurementTests(unittest.TestCase):
     def test_matching_profile_reaches_both_measurements_and_passes(self):
         baseline = gate.self_test_baseline()
         baseline["repos"]["hugo"].update({
-            "measurement_profile": "cold-index-no-inspect-v1",
+            "measurement_profile": MEASURED_PROFILE,
             "metrics": {"peak_rss_mb": {"value": 177.0, "tolerance_pct": 20.0, "absolute_floor": 128.0}},
         })
         with tempfile.TemporaryDirectory() as temporary:
@@ -212,7 +220,8 @@ class ColdIndexMeasurementTests(unittest.TestCase):
                 write_baseline=False, ignore_platform=False, repo="hugo", cache_dir=root / "cache",
                 results_dir=root / "results", aft_binary=None, budget_min=15,
             )
-            run = gate.RunData(Path("fixture.csv"), "hugo", {"peak_rss_mb": 180.0}, {}, True, {})
+            run = gate.RunData(Path("fixture.csv"), "hugo", {"peak_rss_mb": 180.0}, {}, True,
+                               {"measurement_profile": MEASURED_PROFILE})
             with patch.object(gate, "parse_args", return_value=args), \
                     patch.object(gate, "load_baseline", return_value=baseline), \
                     patch.object(gate, "current_platform", return_value="linux-x86_64"), \
@@ -223,11 +232,12 @@ class ColdIndexMeasurementTests(unittest.TestCase):
             self.assertEqual(measure.call_count, 2)
 
     def test_writers_require_measured_profiles_and_preserve_partial_migration(self):
-        profile = "cold-index-no-inspect-v1"
+        profile = MEASURED_PROFILE
         baseline = gate.self_test_baseline()
+        unchanged_redox = json.loads(json.dumps(baseline["repos"]["redox"]))
         metrics = {name: 1.0 for name in gate.DEFAULT_METRICS}
-        runs = {name: [gate.RunData(Path("fixture.csv"), name, metrics, {}, True,
-                                  {"measurement_profile": profile}) for _ in range(2)]
+        runs = {name: [gate.RunData(Path(f"fixture-{index}.csv"), name, metrics.copy(), {}, True,
+                                  {"measurement_profile": profile}) for index in (1, 2)]
                 for name in gate.REPO_ORDER}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -239,21 +249,29 @@ class ColdIndexMeasurementTests(unittest.TestCase):
             written = json.loads(output.read_text())
             self.assertEqual(written["repos"]["hugo"]["measurement_profile"], profile)
             self.assertNotIn("measurement_profile", written["repos"]["redox"])
+            self.assertEqual(written["repos"]["redox"], unchanged_redox)
             output.unlink()
             csvs = [root / f"oss-matrix-run-{index}.csv" for index in (1, 2)]
             for path in csvs:
                 path.touch()
-            with patch.object(gate, "read_run_csv", return_value=[runs[name][0] for name in gate.REPO_ORDER]):
+            csv_rows = {path: [runs[name][index] for name in gate.REPO_ORDER] for index, path in enumerate(csvs)}
+            with patch.object(gate, "read_run_csv", side_effect=csv_rows.__getitem__):
                 self.assertEqual(gate.write_baseline_from_results(output, baseline, root, "linux-x86_64", "CI fixture"), 0)
             written = json.loads(output.read_text())
             self.assertTrue(all(repo["measurement_profile"] == profile for repo in written["repos"].values()))
             output.unlink()
             for bad_profile in (None, "legacy", ""):
-                runs["hugo"][0].row["measurement_profile"] = bad_profile
-                with patch.object(gate, "read_run_csv", return_value=[runs[name][0] for name in gate.REPO_ORDER]):
-                    with self.assertRaisesRegex(ValueError, "measurement profile"):
-                        gate.write_baseline_from_results(output, baseline, root, "linux-x86_64", "CI fixture")
-                self.assertFalse(output.exists())
+                for index in (0, 1):
+                    with self.subTest(profile=bad_profile, run=index + 1):
+                        runs["hugo"][index].row["measurement_profile"] = bad_profile
+                        with self.assertRaisesRegex(ValueError, "measurement profile"):
+                            gate.write_baseline(output, baseline, ["hugo"], runs, binary, root)
+                        self.assertFalse(output.exists())
+                        with patch.object(gate, "read_run_csv", side_effect=csv_rows.__getitem__):
+                            with self.assertRaisesRegex(ValueError, "measurement profile"):
+                                gate.write_baseline_from_results(output, baseline, root, "linux-x86_64", "CI fixture")
+                        self.assertFalse(output.exists())
+                        runs["hugo"][index].row["measurement_profile"] = profile
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
