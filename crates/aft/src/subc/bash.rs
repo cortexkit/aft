@@ -6118,7 +6118,6 @@ mod grant_path_tests {
     #[test]
     fn blocking_bash_hands_back_before_client_deadline() {
         fn held_running_stub(req: RawRequest, ctx: &AppContext) -> Response {
-            std::thread::sleep(Duration::from_millis(20));
             let response = gated_running_stub(req, ctx);
             let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
             BashTimingForTest::wait(&timing.result, "spawn result");
@@ -6176,6 +6175,9 @@ mod grant_path_tests {
                         let _ = release_rx.recv();
                     });
                     occupied_rx.recv().unwrap();
+                    // Startup bookkeeping consumes the receipt-relative budget
+                    // before the reply watchdog is armed, too.
+                    tokio::time::advance(Duration::from_millis(100)).await;
                     BashTimingForTest::release(&timing.result);
                     tokio::select! {
                         biased;
@@ -6183,9 +6185,14 @@ mod grant_path_tests {
                         _ = timing.reply.armed.notified() => {},
                     }
                     let armed_at = tokio::time::Instant::now();
-                    eprintln!("{mode}: reply watchdog armed at {:?}, real offset {:?}", armed_at - started, Instant::now().checked_duration_since(started.into_std()));
                     timing.reply.fire.notify_one();
-                    tokio::time::advance(Duration::from_millis(1499)).await;
+                    // Earlier calls can leave observation timers alive while
+                    // executor startup awaits. Paused Tokio may advance to
+                    // those timers, so target the receipt's absolute boundary
+                    // rather than adding another full interval after arming.
+                    let before_deadline = started + Duration::from_millis(1499);
+                    assert!(armed_at < before_deadline);
+                    tokio::time::advance(before_deadline - armed_at).await;
                     let early_reply = rx.try_recv();
                     assert!(matches!(
                         &early_reply,
