@@ -276,6 +276,18 @@ class LightPREventGateTests(unittest.TestCase):
 
 
 class CISpeedWorkflowTests(unittest.TestCase):
+    def test_default_build_guard_executes_refusals_with_cmake_unavailable(self) -> None:
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/grammar-loader.yml"
+        workflow = workflow_gates.parse_workflow(str(path))
+        job = workflow["jobs"]["default-build"]
+        command = next(step["run"] for step in job["steps"] if "Default build" in step.get("name", ""))
+        self.assertIn("exit 127", command)
+        self.assertLess(command.index('export PATH="$absent:$PATH"'), command.index("cargo check"))
+        self.assertIn("--lib -- grammar_disabled_", command)
+        self.assertIn("grammar_unavailable_survives_the_content_record_boundary --exact", command)
+        self.assertIn('test ! -e "$AFT_NO_CMAKE_MARKER"', command)
+        self.assertNotIn("--features wasm-grammars", command)
+
     def test_release_binary_cache_requires_exact_commit_and_compiler(self) -> None:
         path = Path(__file__).resolve().parents[2] / ".github/workflows/tests.yml"
         workflow = workflow_gates.parse_workflow(str(path))

@@ -3,11 +3,15 @@ name: Grammar loader
 on:
   pull_request:
     paths:
+      - Cargo.toml
+      - crates/**
       - crates/aft/**
       - Cargo.lock
       - scripts/stage-card.sh
       - scripts/ck-aft.entitlements.plist
       - .github/workflows/grammar-loader.yml
+      - .github/workflows/release.yml
+      - .github/workflows/tests.yml
   push:
     branches: [main]
   workflow_dispatch:
@@ -25,7 +29,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Default build needs neither Wasmtime nor CMake
         run: |
+          absent="$RUNNER_TEMP/aft-no-cmake"
+          mkdir -p "$absent"
+          export AFT_NO_CMAKE_MARKER="$absent/invoked"
+          printf '#!/bin/sh\nprintf "CMake is intentionally unavailable in the default-build guard\\n" >&2\n: > "$AFT_NO_CMAKE_MARKER"\nexit 127\n' > "$absent/cmake"
+          chmod +x "$absent/cmake"
+          export PATH="$absent:$PATH"
+          if cmake --version; then exit 1; fi
+          rm -f "$AFT_NO_CMAKE_MARKER"
           cargo check --locked -p agent-file-tools
+          cargo test --locked -p agent-file-tools --features test-hooks --lib -- grammar_disabled_
+          cargo test --locked -p agent-file-tools --features test-hooks --lib -- data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary --exact
+          test ! -e "$AFT_NO_CMAKE_MARKER"
           cargo tree --locked -p agent-file-tools -e features > default-features.txt
           python3 - <<'PY'
           from pathlib import Path
