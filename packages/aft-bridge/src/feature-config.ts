@@ -160,9 +160,16 @@ function readRunningRelease(): readonly [number, number] {
 }
 
 let runningRelease: readonly [number, number] | undefined;
+let runningReleaseOverrideForTest: readonly [number, number] | undefined;
+
+/** Pin release-sensitive tests independently of package versions; reset with undefined after each test. */
+export function setRunningReleaseForTest(release: readonly [number, number] | undefined): void {
+  runningReleaseOverrideForTest = release;
+}
 
 /** The [major, minor] release of this package, read once. */
 export function getRunningRelease(): readonly [number, number] {
+  if (runningReleaseOverrideForTest) return runningReleaseOverrideForTest;
   runningRelease ??= readRunningRelease();
   return runningRelease;
 }

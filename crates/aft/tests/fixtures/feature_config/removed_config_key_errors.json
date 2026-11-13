@@ -2,6 +2,8 @@
   "cases": [
     {
       "name": "base config",
+      "release": "0.65.0",
+      "tier": "user",
       "doc": {
         "opencode": {
           "server_url": "http://127.0.0.1:4096",
@@ -15,6 +17,8 @@
     },
     {
       "name": "first-level harness",
+      "release": "0.65.0",
+      "tier": "user",
       "doc": {
         "harnesses": {
           "opencode": {
@@ -32,6 +36,8 @@
     },
     {
       "name": "deeper ignored harness",
+      "release": "0.65.0",
+      "tier": "user",
       "doc": {
         "harnesses": {
           "opencode": {
@@ -51,6 +57,7 @@
     {
       "name": "removed data-layer keys refuse independently of the idle rename release",
       "release": "0.64.9",
+      "tier": "user",
       "doc": {
         "opencode": {
           "server_url": "http://127.0.0.1:4096"
@@ -86,6 +93,7 @@
     {
       "name": "data-layer keys from the refusing release",
       "release": "0.65.0",
+      "tier": "user",
       "doc": {
         "opencode": {
           "server_url": "http://127.0.0.1:4096"
@@ -122,6 +130,7 @@
     {
       "name": "data-layer keys in a later major release",
       "release": "1.0.0",
+      "tier": "user",
       "doc": {
         "opencode": {
           "server_url": "http://127.0.0.1:4096"
@@ -158,6 +167,7 @@
     {
       "name": "data-layer keys inside an unrelated block are not settings",
       "release": "0.65.0",
+      "tier": "user",
       "doc": {
         "bash": {
           "views": {
@@ -172,6 +182,8 @@
     },
     {
       "name": "names retired in 0.62 or earlier",
+      "release": "0.65.0",
+      "tier": "user",
       "doc": {
         "disabled_tools": [
           "aft_read",
@@ -226,6 +238,8 @@
     },
     {
       "name": "current keys and the binary override are not retired names",
+      "release": "0.65.0",
+      "tier": "user",
       "doc": {
         "disabled_tools": [
           "read",
@@ -254,11 +268,53 @@
         "bridge": {
           "hang_threshold": 2
         },
-        "views": {
-          "idle_checkout_hours": 5
+        "idle": {
+          "checkout_hours": 5
         }
       },
       "errors": []
+    },
+    {
+      "name": "0.64 user idle rename translates in base and harness blocks",
+      "release": "0.64.9",
+      "tier": "user",
+      "doc": {
+        "views": { "idle_checkout_hours": 72 },
+        "harnesses": { "pi": { "views": { "idle_checkout_hours": 12 } } }
+      },
+      "errors": [],
+      "translated": {
+        "idle": { "checkout_hours": 72 },
+        "harnesses": { "pi": { "idle": { "checkout_hours": 12 } } }
+      }
+    },
+    {
+      "name": "0.65 user idle rename refuses base and harness blocks",
+      "release": "0.65.0",
+      "tier": "user",
+      "doc": {
+        "views": { "idle_checkout_hours": 72 },
+        "harnesses": { "pi": { "views": { "idle_checkout_hours": 12 } } }
+      },
+      "errors": [
+        "removed_config_key:views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix",
+        "removed_config_key:harnesses.pi.views.idle_checkout_hours; run npx @cortexkit/aft doctor --fix"
+      ]
+    },
+    {
+      "name": "0.65 project idle rename translates with its existing notice",
+      "release": "0.65.0",
+      "tier": "project",
+      "doc": {
+        "views": { "idle_checkout_hours": 72 },
+        "harnesses": { "pi": { "views": { "idle_checkout_hours": 12 } } }
+      },
+      "errors": [],
+      "translated": {
+        "idle": { "checkout_hours": 72 },
+        "harnesses": { "pi": { "idle": { "checkout_hours": 12 } } }
+      },
+      "notice": "/project/aft.jsonc uses retired keys (harnesses.pi.views.idle_checkout_hours, views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours."
     }
   ]
 }

@@ -1123,12 +1123,13 @@ const CASES: ParityCase[] = [
     user: { harnesses: { pi: { bridge: { hang_threshold: 5 } } } },
   },
   { name: "retired_max_items_user", user: { inspect: { max_drill_down_items: 20 } } },
-  // --- Data-layer keys: views.idle_checkout_hours is translated to
-  //     idle.checkout_hours (clamped). The removed no-effect keys refuse user
-  //     config while project config loads with a notice and drops them. ---
+  // User inputs use the canonical idle key so parity is release-independent.
+  // Explicit user rename cutovers live in feature_config/removed_config_key_errors.json.
+  // Project inputs still exercise translation; removed no-effect keys refuse
+  // user config while project config loads with a notice and drops them.
   {
     name: "retired_idle_checkout_hours_user",
-    user: { views: { idle_checkout_hours: 72 } },
+    user: { idle: { checkout_hours: 72 } },
   },
   {
     name: "retired_idle_checkout_hours_project_clamped",
@@ -1137,14 +1138,14 @@ const CASES: ParityCase[] = [
   },
   {
     name: "retired_idle_checkout_hours_superseded",
-    user: { views: { idle_checkout_hours: 2 }, idle: { checkout_hours: 5 } },
+    user: { idle: { checkout_hours: 5 } },
   },
   {
     name: "retired_idle_checkout_hours_harness",
     harness: "pi",
     user: {
       idle: { root_ttl_minutes: 20 },
-      harnesses: { pi: { views: { idle_checkout_hours: 12 } } },
+      harnesses: { pi: { idle: { checkout_hours: 12 } } },
     },
   },
   {

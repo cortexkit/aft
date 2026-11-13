@@ -140,7 +140,36 @@ fn parse_release(version: &str) -> Option<(u64, u64)> {
 
 /// The (major, minor) release of this build, from the crate version.
 pub fn running_release() -> (u64, u64) {
+    #[cfg(test)]
+    if let Some(release) = RUNNING_RELEASE_OVERRIDE_FOR_TEST.with(|value| value.get()) {
+        return release;
+    }
     parse_release(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+thread_local! {
+    static RUNNING_RELEASE_OVERRIDE_FOR_TEST: std::cell::Cell<Option<(u64, u64)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Pin release-sensitive tests on this thread; dropping the guard restores the prior release.
+#[cfg(test)]
+pub(crate) fn override_running_release_for_test(release: (u64, u64)) -> impl Drop {
+    struct Reset {
+        previous: Option<(u64, u64)>,
+        _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RUNNING_RELEASE_OVERRIDE_FOR_TEST.with(|value| value.set(self.previous));
+        }
+    }
+    Reset {
+        previous: RUNNING_RELEASE_OVERRIDE_FOR_TEST.with(|value| value.replace(Some(release))),
+        _not_send: std::marker::PhantomData,
+    }
 }
 
 /// `0.65.0` for [`DATA_LAYER_KEYS_REFUSED_FROM`], as notices print it.
@@ -1529,11 +1558,15 @@ mod tests {
         .unwrap();
         for case in fixture["cases"].as_array().unwrap() {
             let doc = case["doc"].as_object().unwrap();
-            // A case may name the release that judges it; the data-layer
-            // keys are refused only from DATA_LAYER_KEYS_REFUSED_FROM.
-            let errors = match case.get("release").and_then(Value::as_str) {
-                Some(release) => removed_config_key_errors_at(doc, parse_release(release).unwrap()),
-                None => removed_config_key_errors(doc),
+            let release = parse_release(case["release"].as_str().unwrap()).unwrap();
+            let tier = match case["tier"].as_str().unwrap() {
+                "user" => DocumentTier::User,
+                "project" => DocumentTier::Project,
+                other => panic!("unknown fixture tier: {other}"),
+            };
+            let errors = match tier {
+                DocumentTier::User => removed_config_key_errors_at(doc, release),
+                DocumentTier::Project => removed_errors(doc, release, false),
             };
             let expected = case["errors"]
                 .as_array()
@@ -1542,6 +1575,20 @@ mod tests {
                 .map(|error| error.as_str().unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(errors, expected, "fixture {}", case["name"]);
+            if let Some(translated) = case.get("translated") {
+                assert!(errors.is_empty(), "only accepted files translate");
+                let mut map = doc.clone();
+                let out = translate_document(&mut map, tier);
+                assert_eq!(Value::Object(map), *translated, "fixture {}", case["name"]);
+                if let Some(notice) = case.get("notice") {
+                    assert_eq!(
+                        project_retired_keys_notice("/project/aft.jsonc", &out),
+                        notice.as_str().unwrap(),
+                        "fixture {}",
+                        case["name"]
+                    );
+                }
+            }
         }
     }
 
@@ -1980,6 +2027,22 @@ mod tests {
             running_release(),
             parse_release(env!("CARGO_PKG_VERSION")).unwrap()
         );
+    }
+
+    #[test]
+    fn config_test_release_override_is_thread_local_and_restored() {
+        let actual = running_release();
+        {
+            let _outer = override_running_release_for_test((0, 64));
+            assert_eq!(running_release(), (0, 64));
+            {
+                let _inner = override_running_release_for_test((0, 65));
+                assert_eq!(running_release(), (0, 65));
+            }
+            assert_eq!(running_release(), (0, 64));
+            assert_eq!(std::thread::spawn(running_release).join().unwrap(), actual);
+        }
+        assert_eq!(running_release(), actual);
     }
 
     /// The idle-checkout rename keeps its existing version-gated policy.

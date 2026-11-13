@@ -1,5 +1,5 @@
 {
-  "views": {
-    "idle_checkout_hours": 72
+  "idle": {
+    "checkout_hours": 72
   }
 }

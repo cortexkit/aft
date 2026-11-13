@@ -4287,10 +4287,11 @@ mod tests {
         assert_eq!(disabled.disabled_tools, ["read"]);
     }
 
-    /// Names retired in 0.63 or 0.64 still load in either tier: AFT
+    /// At 0.64, names retired in 0.63 or 0.64 still load in either tier: AFT
     /// translates them in memory and says so in a notice.
     #[test]
     fn names_retired_in_the_last_two_releases_still_translate() {
+        let _release = feature_config::override_running_release_for_test((0, 64));
         for tier_name in ["user", "project"] {
             let hang = resolve_config(&[tier(tier_name, r#"{"bridge":{"hang_threshold":2}}"#)]);
             assert!(hang.errors.is_empty(), "{tier_name}: {:?}", hang.errors);
@@ -5456,6 +5457,7 @@ mod tests {
     /// to an explicit `idle.checkout_hours` in the same file.
     #[test]
     fn retired_views_idle_checkout_hours_becomes_idle_checkout_hours() {
+        let _release = feature_config::override_running_release_for_test((0, 64));
         let user = resolve_config(&[tier("user", r#"{"views":{"idle_checkout_hours":2}}"#)]);
         assert!(user.errors.is_empty(), "{:?}", user.errors);
         assert_eq!(user.config.idle.checkout_hours, 2);
@@ -5477,6 +5479,55 @@ mod tests {
             r#"{"views":{"idle_checkout_hours":2},"idle":{"checkout_hours":5}}"#,
         )]);
         assert_eq!(canonical.config.idle.checkout_hours, 5);
+    }
+
+    #[test]
+    fn config_0_65_idle_rename_refuses_user_but_project_loads_with_notice() {
+        let _release = feature_config::override_running_release_for_test((0, 65));
+        for (doc, key) in [
+            (
+                r#"{"views":{"idle_checkout_hours":72}}"#,
+                "views.idle_checkout_hours",
+            ),
+            (
+                r#"{"harnesses":{"pi":{"views":{"idle_checkout_hours":72}}}}"#,
+                "harnesses.pi.views.idle_checkout_hours",
+            ),
+        ] {
+            let user = tier("user", doc);
+            let rejected = resolve_config_for_harness(&[user.clone()], Some(&Harness::Pi));
+            assert_eq!(
+                rejected.errors,
+                [format!(
+                    "removed_config_key:{key}; run npx @cortexkit/aft doctor --fix"
+                )]
+            );
+            assert!(strict_tier_error(&user, Some(&Harness::Pi)).is_some());
+
+            let project = tier("project", doc);
+            assert!(strict_tier_error(&project, Some(&Harness::Pi)).is_none());
+            let loaded = resolve_config_for_harness(&[project], Some(&Harness::Pi));
+            assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+            assert_eq!(loaded.config.idle.checkout_hours, 72);
+            assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+            let mut map = serde_json::from_str::<Value>(doc)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone();
+            let translation =
+                feature_config::translate_document(&mut map, feature_config::DocumentTier::Project);
+            let notice =
+                feature_config::project_retired_keys_notice("/project/aft.jsonc", &translation);
+            assert!(
+                notice.contains(&format!("uses retired keys ({key})")),
+                "{notice}"
+            );
+            assert!(
+                notice.contains("views.idle_checkout_hours is now idle.checkout_hours"),
+                "{notice}"
+            );
+        }
     }
 
     #[test]

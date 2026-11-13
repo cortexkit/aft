@@ -4,8 +4,8 @@
   },
   "harnesses": {
     "pi": {
-      "views": {
-        "idle_checkout_hours": 12
+      "idle": {
+        "checkout_hours": 12
       }
     }
   }
