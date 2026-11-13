@@ -894,6 +894,8 @@ struct Counter {
     count: AtomicU64,
     bytes: AtomicU64,
     largest: AtomicU64,
+    whole_count: AtomicU64,
+    whole_bytes: AtomicU64,
 }
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -901,26 +903,61 @@ const ZERO: Counter = Counter {
     count: AtomicU64::new(0),
     bytes: AtomicU64::new(0),
     largest: AtomicU64::new(0),
+    whole_count: AtomicU64::new(0),
+    whole_bytes: AtomicU64::new(0),
 };
 
 static COUNTERS: [Counter; SITES.len()] = [ZERO; SITES.len()];
 
-/// Count a read at `site` of a file that was `size` bytes at open, of which
-/// `bytes` were read, when the file is a large read. Bytes and the largest
-/// read are in bytes read.
-pub(crate) fn record(site: Site, size: u64, bytes: u64) {
+#[cfg(test)]
+thread_local! {
+    // Recording tests can exercise the public entry points without racing
+    // readers in other tests or resetting their process-wide observations.
+    static TEST_COUNTERS: std::cell::RefCell<Option<[Counter; SITES.len()]>> = const { std::cell::RefCell::new(None) };
+}
+
+fn with_counter<T>(site: Site, work: impl FnOnce(&Counter) -> T) -> T {
+    #[cfg(test)]
+    let mut work = Some(work);
+    #[cfg(test)]
+    if let Some(result) = TEST_COUNTERS.with(|counters| {
+        counters
+            .borrow()
+            .as_ref()
+            .map(|counters| work.take().unwrap()(&counters[site as usize]))
+    }) {
+        return result;
+    }
+    #[cfg(test)]
+    let work = work.unwrap();
+    work(&COUNTERS[site as usize])
+}
+
+fn record_read(site: Site, size: u64, bytes: u64, whole: bool) {
     if size <= LARGE_READ_BYTES && bytes <= LARGE_READ_BYTES {
         return;
     }
-    let counter = &COUNTERS[site as usize];
-    counter.count.fetch_add(1, Ordering::Relaxed);
-    counter.bytes.fetch_add(bytes, Ordering::Relaxed);
-    counter.largest.fetch_max(bytes, Ordering::Relaxed);
+    with_counter(site, |counter| {
+        counter.count.fetch_add(1, Ordering::Relaxed);
+        counter.bytes.fetch_add(bytes, Ordering::Relaxed);
+        counter.largest.fetch_max(bytes, Ordering::Relaxed);
+        if whole {
+            counter.whole_count.fetch_add(1, Ordering::Relaxed);
+            counter.whole_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Count a streamed read at `site` of a file that was `size` bytes at open, of which
+/// `bytes` were read, when the file is a large read. Bytes and the largest
+/// read are in bytes read.
+pub(crate) fn record(site: Site, size: u64, bytes: u64) {
+    record_read(site, size, bytes, false);
 }
 
 /// Count a whole read of `bytes` bytes at `site`.
 pub(crate) fn record_whole(site: Site, bytes: usize) {
-    record(site, bytes as u64, bytes as u64);
+    record_read(site, bytes as u64, bytes as u64, true);
 }
 
 struct HealthSite {
@@ -928,6 +965,8 @@ struct HealthSite {
     count: u64,
     bytes: u64,
     largest: u64,
+    whole_count: u64,
+    whole_bytes: u64,
 }
 
 fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
@@ -936,10 +975,14 @@ fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
     let mut count = 0_u64;
     let mut bytes = 0_u64;
     let mut largest = 0_u64;
+    let mut whole_count = 0_u64;
+    let mut whole_bytes = 0_u64;
     for site in &sites {
         count = count.saturating_add(site.count);
         bytes = bytes.saturating_add(site.bytes);
         largest = largest.max(site.largest);
+        whole_count = whole_count.saturating_add(site.whole_count);
+        whole_bytes = whole_bytes.saturating_add(site.whole_bytes);
     }
     sites.sort_unstable_by(|left, right| {
         right
@@ -957,6 +1000,8 @@ fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
                 "count": site.count,
                 "bytes": site.bytes,
                 "largest": site.largest,
+                "whole_count": site.whole_count,
+                "whole_bytes": site.whole_bytes,
             })
         })
         .collect::<Vec<_>>();
@@ -964,6 +1009,8 @@ fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
         "count": count,
         "bytes": bytes,
         "largest": largest,
+        "whole_count": whole_count,
+        "whole_bytes": whole_bytes,
         "sites_active": sites_active,
         "top": top,
     })
@@ -971,18 +1018,20 @@ fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
 
 /// Large reads since start, with totals over all sites and a bounded preview
 /// of the four sites that read the most bytes, ordered by bytes then name.
+/// Whole-read counters are a subset of the combined count and byte totals.
 pub(crate) fn health() -> serde_json::Value {
     summarize_health_sites(
         SITES
             .into_iter()
             .map(|(site, name)| {
-                let counter = &COUNTERS[site as usize];
-                HealthSite {
+                with_counter(site, |counter| HealthSite {
                     site: name,
                     count: counter.count.load(Ordering::Relaxed),
                     bytes: counter.bytes.load(Ordering::Relaxed),
                     largest: counter.largest.load(Ordering::Relaxed),
-                }
+                    whole_count: counter.whole_count.load(Ordering::Relaxed),
+                    whole_bytes: counter.whole_bytes.load(Ordering::Relaxed),
+                })
             })
             .collect(),
     )
@@ -1003,6 +1052,8 @@ pub(crate) fn widest_health_for_test() -> serde_json::Value {
                 count: u64::MAX,
                 bytes: u64::MAX,
                 largest: u64::MAX,
+                whole_count: u64::MAX,
+                whole_bytes: u64::MAX,
             })
             .collect(),
     )
@@ -1138,6 +1189,8 @@ mod tests {
                 count: 0,
                 bytes: 0,
                 largest: 0,
+                whole_count: 0,
+                whole_bytes: 0,
             })
             .collect();
         assert_eq!(
@@ -1146,6 +1199,8 @@ mod tests {
                 "count": 0,
                 "bytes": 0,
                 "largest": 0,
+                "whole_count": 0,
+                "whole_bytes": 0,
                 "sites_active": 0,
                 "top": [],
             })
@@ -1161,6 +1216,8 @@ mod tests {
                 count: index as u64 + 1,
                 bytes: (index as u64 % 3 + 1) * 10,
                 largest: index as u64 + 1,
+                whole_count: index as u64 % 2,
+                whole_bytes: (index as u64 % 2) * 10,
             })
             .collect();
         let health = summarize_health_sites(sites);
@@ -1168,13 +1225,15 @@ mod tests {
         assert_eq!(health["count"], 153);
         assert_eq!(health["bytes"], 330);
         assert_eq!(health["largest"], 17);
+        assert_eq!(health["whole_count"], 8);
+        assert_eq!(health["whole_bytes"], 80);
         assert_eq!(
             health["top"],
             serde_json::json!([
-                {"site": "exact_corpus", "count": 12, "bytes": 30, "largest": 12},
-                {"site": "grep_fallback", "count": 3, "bytes": 30, "largest": 3},
-                {"site": "lexical_exactness", "count": 9, "bytes": 30, "largest": 9},
-                {"site": "line_windows", "count": 15, "bytes": 30, "largest": 15},
+                {"site": "exact_corpus", "count": 12, "bytes": 30, "largest": 12, "whole_count": 1, "whole_bytes": 10},
+                {"site": "grep_fallback", "count": 3, "bytes": 30, "largest": 3, "whole_count": 0, "whole_bytes": 0},
+                {"site": "lexical_exactness", "count": 9, "bytes": 30, "largest": 9, "whole_count": 0, "whole_bytes": 0},
+                {"site": "line_windows", "count": 15, "bytes": 30, "largest": 15, "whole_count": 0, "whole_bytes": 0},
             ])
         );
     }
@@ -1186,6 +1245,8 @@ mod tests {
         assert_eq!(health["count"], u64::MAX);
         assert_eq!(health["bytes"], u64::MAX);
         assert_eq!(health["largest"], u64::MAX);
+        assert_eq!(health["whole_count"], u64::MAX);
+        assert_eq!(health["whole_bytes"], u64::MAX);
         let top = health["top"].as_array().unwrap();
         assert_eq!(top.len(), 4);
         let names = top
@@ -1205,7 +1266,49 @@ mod tests {
             assert_eq!(site["count"], u64::MAX);
             assert_eq!(site["bytes"], u64::MAX);
             assert_eq!(site["largest"], u64::MAX);
+            assert_eq!(site["whole_count"], u64::MAX);
+            assert_eq!(site["whole_bytes"], u64::MAX);
         }
+    }
+
+    #[test]
+    fn whole_and_streamed_reads_stay_at_their_sites() {
+        TEST_COUNTERS.with(|counters| *counters.borrow_mut() = Some([ZERO; SITES.len()]));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_COUNTERS.with(|counters| *counters.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        let size = LARGE_READ_BYTES + 1;
+        record_whole(Site::GrepCollect, size as usize);
+        // A partial scan is still a large-file read, but not a whole read.
+        record(Site::GrepCollect, size, 17);
+        record(Site::GrepFallback, size, size);
+        record_whole(Site::ParseSource, (size + 1) as usize);
+        record_whole(Site::GrepCollect, LARGE_READ_BYTES as usize);
+        record(Site::GrepFallback, LARGE_READ_BYTES, LARGE_READ_BYTES);
+        let health = health();
+        assert_eq!(health["count"], 4);
+        assert_eq!(health["bytes"], size * 3 + 18);
+        assert_eq!(health["whole_count"], 2);
+        assert_eq!(health["whole_bytes"], size * 2 + 1);
+        assert_eq!(health["sites_active"], 3);
+        let sites = health["top"].as_array().unwrap();
+        assert_eq!(
+            sites[0],
+            serde_json::json!({
+                "site": "grep_collect", "count": 2, "bytes": size + 17,
+                "largest": size, "whole_count": 1, "whole_bytes": size,
+            })
+        );
+        assert_eq!(sites[1]["site"], "parse_source");
+        assert_eq!(sites[1]["whole_count"], 1);
+        assert_eq!(sites[1]["whole_bytes"], size + 1);
+        assert_eq!(sites[2]["site"], "grep_fallback");
+        assert_eq!(sites[2]["whole_count"], 0);
+        assert_eq!(sites[2]["whole_bytes"], 0);
     }
 
     // White_Space characters of every UTF-8 width, and characters that look

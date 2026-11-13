@@ -2268,8 +2268,83 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
             metrics.insert("data_store_failed_omitted".into(), json!(omitted));
             continue;
         }
+        // Unknown telemetry must not defeat the budget when new producers add
+        // fields. Keep the diagnostic core, but replace the largest remaining
+        // ancillary value with an explicit, named gap rather than losing the
+        // entire metrics object at the daemon's cache boundary.
+        let largest = metrics
+            .iter()
+            .filter(|(key, _)| !protected_health_field(key))
+            .filter(|(key, _)| {
+                !metrics
+                    .get("metrics_fields_omitted")
+                    .and_then(Value::as_array)
+                    .is_some_and(|omitted| omitted.iter().any(|field| field.as_str() == Some(key)))
+            })
+            .filter_map(|(key, value)| {
+                let bytes = serde_json::to_vec(value).ok()?.len();
+                let gap = json!({"omitted": true, "bytes": bytes});
+                // Include the new name in the accounting: replacing a small
+                // scalar with a gap would grow the report instead of shrinking it.
+                let overhead =
+                    serde_json::to_vec(&gap).ok()?.len() + serde_json::to_vec(key).ok()?.len() + 1;
+                (bytes > overhead).then(|| (key.clone(), bytes, gap))
+            })
+            .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)));
+        if let Some((field, _, gap)) = largest {
+            metrics.insert(field.clone(), gap);
+            metrics
+                .entry("metrics_fields_omitted")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .expect("health omitted fields is an array")
+                .push(json!(field));
+            continue;
+        }
+
+        // Refusals and the last identifiable root are more important than the
+        // cap. A protected core that cannot fit is an explicit exceptional
+        // report, not permission to silently remove its failure evidence.
+        metrics.insert("metrics_over_budget".into(), json!(true));
+        let bytes = refresh_metrics_bytes(metrics);
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            let largest = metrics
+                .iter()
+                .filter(|(key, _)| protected_health_field(key))
+                .max_by_key(|(_, value)| serde_json::to_vec(value).map_or(0, |v| v.len()))
+                .map(|(key, _)| key.as_str())
+                .unwrap_or("unknown");
+            log::warn!("health protected metrics exceed budget: bytes={bytes} largest_protected_field={largest}");
+        }
         return;
     }
+}
+
+fn protected_health_field(field: &str) -> bool {
+    // Status and detail live outside metrics and are never budgeted. These
+    // fields keep root identity, failure evidence and freshness inside metrics;
+    // existing row/path trims may compact them, but a gap must never replace them.
+    field.ends_with("_omitted")
+        || matches!(
+            field,
+            "roots"
+                | "cache_roots"
+                | "cache_unavailable"
+                | "root_count"
+                | "actor_count"
+                | "warming_roots"
+                | "data_store_failed"
+                | "data_store_failed_roots"
+                | "stale"
+                | "stale_reason"
+                | "age_ms"
+                | "snapshot_age_ms"
+                | "generated_at_ms"
+                | "metrics_bytes"
+                | "metrics_fields_omitted"
+                | "metrics_over_budget"
+        )
 }
 
 #[derive(Clone)]
@@ -3265,7 +3340,16 @@ fn insert_lifecycle_metrics(
     metrics: &mut Value,
     snapshot: crate::lifecycle_census::LifecycleCensusSnapshot,
 ) {
-    let census = serde_json::to_value(snapshot).expect("lifecycle census serializes");
+    // Explicit status reads need all roots, and status notifications look up
+    // their own root in the cached census. Bound only health's rendering,
+    // before constructing any per-root JSON values.
+    let census = json!({
+        "lsp": health_lsp_metrics(snapshot.lsp),
+        "threads": snapshot.threads,
+        "sqlite": snapshot.sqlite,
+        "children": snapshot.children,
+        "fds": snapshot.fds,
+    });
     let Some(target) = metrics.as_object_mut() else {
         return;
     };
@@ -3275,6 +3359,60 @@ fn insert_lifecycle_metrics(
     for (key, value) in census {
         target.insert(key.clone(), value.clone());
     }
+}
+
+const HEALTH_LSP_APPLICABILITY_ROOT_CAP: usize = 6;
+
+fn health_lsp_metrics(mut lsp: crate::lifecycle_census::LspCensus) -> Value {
+    let mut roots = std::mem::take(&mut lsp.applicability_by_root)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut totals = crate::lsp::manager::ApplicabilityMetrics::default();
+    for (_, root) in &roots {
+        macro_rules! sum {
+            ($($field:ident),+ $(,)?) => {$(
+                totals.$field = totals.$field.saturating_add(root.$field);
+            )+};
+        }
+        sum!(
+            hits,
+            misses,
+            coalesced_hits,
+            retained_content_batches,
+            retained_topology_batches,
+            warm_validations,
+            warm_validation_micros,
+            warm_validation_dependency_count,
+            dependency_count,
+            full_walks,
+            full_walk_micros,
+            absorbed_triggers,
+        );
+        for (reason, count) in &root.invalidations {
+            let total = totals.invalidations.entry(reason).or_default();
+            *total = total.saturating_add(*count);
+        }
+    }
+    roots.sort_unstable_by(|(left_path, left), (right_path, right)| {
+        right
+            .full_walk_micros
+            .cmp(&left.full_walk_micros)
+            .then_with(|| right.misses.cmp(&left.misses))
+            .then_with(|| left_path.cmp(right_path))
+    });
+    let roots_total = roots.len();
+    let roots_omitted = roots_total.saturating_sub(HEALTH_LSP_APPLICABILITY_ROOT_CAP);
+    let by_root = roots
+        .into_iter()
+        .take(HEALTH_LSP_APPLICABILITY_ROOT_CAP)
+        .map(|(path, counters)| (abbreviated_health_path(&path), json!(counters)))
+        .collect::<serde_json::Map<_, _>>();
+    let mut summary = serde_json::to_value(lsp).expect("LSP census serializes");
+    summary["applicability_by_root"] = Value::Object(by_root);
+    summary["applicability_totals"] = json!(totals);
+    summary["applicability_roots_total"] = json!(roots_total);
+    summary["applicability_roots_omitted"] = json!(roots_omitted);
+    summary
 }
 
 pub(super) fn dispatch_liveness_metrics(executor: &Executor) -> Value {
@@ -4720,6 +4858,200 @@ mod tests {
     }
 
     #[test]
+    fn health_lsp_summary_bounds_long_roots_before_json_and_keeps_all_totals() {
+        use crate::lsp::manager::ApplicabilityMetrics;
+        let applicability_by_root = (0..72)
+            .map(|i| {
+                let n = i as u64 + 1;
+                (
+                    format!("/{}root-{i:02}", "long-directory/".repeat(100)),
+                    ApplicabilityMetrics {
+                        hits: n,
+                        misses: n,
+                        coalesced_hits: n,
+                        invalidations: [("config", n)].into_iter().collect(),
+                        retained_content_batches: n,
+                        retained_topology_batches: n,
+                        warm_validations: n,
+                        warm_validation_micros: n,
+                        warm_validation_dependency_count: n as usize,
+                        dependency_count: n as usize,
+                        full_walks: n,
+                        full_walk_micros: if i < 2 { 10_000 } else { n },
+                        absorbed_triggers: n,
+                    },
+                )
+            })
+            .collect();
+        let census = crate::lifecycle_census::LifecycleCensusSnapshot {
+            lsp: crate::lifecycle_census::LspCensus {
+                applicability_by_root,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut metrics = json!({});
+        insert_lifecycle_metrics(&mut metrics, census.clone());
+        // Other consumers must still be able to look up any of the roots.
+        assert_eq!(census.lsp.applicability_by_root.len(), 72);
+        let lsp = metrics["lsp"].clone();
+        assert_eq!(lsp["applicability_roots_total"], 72);
+        assert_eq!(lsp["applicability_roots_omitted"], 66);
+        let roots = lsp["applicability_by_root"].as_object().unwrap();
+        assert_eq!(roots.len(), 6);
+        for i in [0, 1, 68, 69, 70, 71] {
+            assert!(roots
+                .keys()
+                .any(|path| path.ends_with(&format!("/root-{i:02}"))));
+        }
+        for path in roots.keys() {
+            assert!(path.starts_with("<blake3:"));
+            assert!(path.len() < 160);
+        }
+        let totals = &lsp["applicability_totals"];
+        for field in [
+            "hits",
+            "misses",
+            "coalesced_hits",
+            "retained_content_batches",
+            "retained_topology_batches",
+            "warm_validations",
+            "warm_validation_micros",
+            "warm_validation_dependency_count",
+            "dependency_count",
+            "full_walks",
+            "absorbed_triggers",
+        ] {
+            assert_eq!(totals[field], 2628, "{field} must include omitted roots");
+        }
+        assert_eq!(totals["full_walk_micros"], 22625);
+        assert_eq!(totals["invalidations"], json!({"config": 2628}));
+        let metrics = metrics.as_object_mut().unwrap();
+        budget_health_metrics(metrics);
+        assert_eq!(
+            metrics["lsp"], lsp,
+            "the bounded LSP summary must fit intact"
+        );
+        assert!(serde_json::to_vec(metrics).unwrap().len() <= HEALTH_METRICS_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn health_lsp_summary_orders_cost_then_misses_and_saturates_totals() {
+        let lsp = crate::lifecycle_census::LspCensus {
+            applicability_by_root: (0..8)
+                .map(|i| {
+                    (
+                        format!("/root-{i}"),
+                        crate::lsp::manager::ApplicabilityMetrics {
+                            full_walk_micros: u64::MAX,
+                            misses: i,
+                            hits: u64::MAX,
+                            invalidations: [("config", u64::MAX)].into_iter().collect(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let summary = health_lsp_metrics(lsp);
+        assert_eq!(summary["applicability_roots_omitted"], 2);
+        let roots = summary["applicability_by_root"].as_object().unwrap();
+        assert_eq!(roots.len(), 6);
+        assert!(!roots.contains_key("/root-0"));
+        assert!(!roots.contains_key("/root-1"));
+        assert_eq!(
+            summary["applicability_totals"]["full_walk_micros"],
+            u64::MAX
+        );
+        assert_eq!(summary["applicability_totals"]["hits"], u64::MAX);
+        assert_eq!(
+            summary["applicability_totals"]["invalidations"]["config"],
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn health_budget_replaces_unknown_fields_with_largest_first_named_gaps() {
+        let mut metrics = json!({
+            "fresh_liveness": "x".repeat(13000),
+            "future_telemetry": {"payload": "y".repeat(20000)},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let telemetry_bytes = serde_json::to_vec(&metrics["future_telemetry"])
+            .unwrap()
+            .len();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(
+            metrics["metrics_fields_omitted"],
+            json!(["future_telemetry", "fresh_liveness"])
+        );
+        assert_eq!(
+            metrics["future_telemetry"],
+            json!({"omitted": true, "bytes": telemetry_bytes})
+        );
+        assert_eq!(
+            metrics["fresh_liveness"],
+            json!({"omitted": true, "bytes": 13002})
+        );
+        assert_eq!(
+            metrics["metrics_bytes"],
+            serde_json::to_vec(&metrics).unwrap().len()
+        );
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        let expected = metrics.clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics, expected, "rebudgeting must not omit gaps again");
+    }
+
+    #[test]
+    fn health_budget_never_gaps_root_identity_failure_or_freshness_fields() {
+        let core = json!({
+            "roots": [{"project_root": "/failed-root", "state": "degraded", "abbreviated": true,
+                "data_store": {"failure": {"code": "unreadable"}}}],
+            "cache_roots": ["/cache"], "cache_unavailable": {},
+            "root_count": 72, "actor_count": 70, "warming_roots": 2,
+            "root_details_omitted": 71, "cache_roots_omitted": 69, "cache_unavailable_omitted": 2,
+            "data_store_failed_roots": 7, "data_store_failed": [], "data_store_failed_omitted": 7,
+            "stale": true, "stale_reason": "executor_contended", "age_ms": 100,
+            "snapshot_age_ms": 100, "generated_at_ms": 42,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let mut metrics = core.clone();
+        metrics.insert("ancillary".into(), json!("x".repeat(30000)));
+        budget_health_metrics(&mut metrics);
+        for (key, value) in core {
+            assert_eq!(metrics[&key], value, "{key} must survive a fallback gap");
+        }
+        assert_eq!(metrics["metrics_fields_omitted"], json!(["ancillary"]));
+        assert!(serde_json::to_vec(&metrics).unwrap().len() <= HEALTH_METRICS_BUDGET_BYTES);
+        assert!(!metrics.contains_key("metrics_over_budget"));
+    }
+
+    #[test]
+    fn health_budget_marks_an_irreducible_protected_core_instead_of_gapping_it() {
+        let root = json!({"project_root": "/root", "abbreviated": true,
+            "data_store": {"failure": {"error": "x".repeat(20000)}}});
+        let mut metrics = json!({"roots": [root], "ancillary": "y".repeat(30000)})
+            .as_object()
+            .unwrap()
+            .clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["roots"], json!([root]));
+        assert_eq!(metrics["metrics_fields_omitted"], json!(["ancillary"]));
+        assert_eq!(metrics["metrics_over_budget"], true);
+        assert_eq!(
+            metrics["metrics_bytes"],
+            serde_json::to_vec(&metrics).unwrap().len()
+        );
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() > HEALTH_METRICS_BUDGET_BYTES as u64);
+    }
+
+    #[test]
     fn health_borrowed_budget_matches_golden_json_and_digit_boundaries() {
         use serde_json::json;
         let mut tiny = json!({"a":"é"}).as_object().unwrap().clone();
@@ -4729,7 +5061,7 @@ mod tests {
             r#"{"a":"é","metrics_bytes":29}"#
         );
         for length in [
-            0, 58, 59, 60, 61, 957, 958, 959, 960, 9956, 9957, 9958, 9959, 13000,
+            0, 58, 59, 60, 61, 957, 958, 959, 960, 9956, 9957, 9958, 9959,
         ] {
             let mut actual = json!({"fresh_liveness":"x".repeat(length)})
                 .as_object()
@@ -9264,6 +9596,8 @@ mod tests {
             "count": 0,
             "bytes": 0,
             "largest": 0,
+            "whole_count": 0,
+            "whole_bytes": 0,
             "sites_active": 0,
             "top": [],
         }));
@@ -9286,12 +9620,14 @@ mod tests {
             "count": 17,
             "bytes": 85_000_000,
             "largest": 5_000_000,
+            "whole_count": 17,
+            "whole_bytes": 85_000_000,
             "sites_active": 17,
             "top": [
-                {"site": "candidate_text", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
-                {"site": "data_file", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
-                {"site": "degraded_grep", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
-                {"site": "exact_corpus", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+                {"site": "candidate_text", "count": 1, "bytes": 5_000_000, "largest": 5_000_000, "whole_count": 1, "whole_bytes": 5_000_000},
+                {"site": "data_file", "count": 1, "bytes": 5_000_000, "largest": 5_000_000, "whole_count": 1, "whole_bytes": 5_000_000},
+                {"site": "degraded_grep", "count": 1, "bytes": 5_000_000, "largest": 5_000_000, "whole_count": 1, "whole_bytes": 5_000_000},
+                {"site": "exact_corpus", "count": 1, "bytes": 5_000_000, "largest": 5_000_000, "whole_count": 1, "whole_bytes": 5_000_000},
             ],
         })
     }
