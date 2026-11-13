@@ -27,7 +27,7 @@ import {
 } from "../config-watch.js";
 
 type TestConfig = {
-  lsp?: { idle_minutes?: number | "never" };
+  lsp?: { idle_minutes?: number | "never"; max_servers?: number };
   restrict_to_project_root?: boolean;
   disabled_tools?: string[];
   bash?: boolean | Record<string, unknown>;
@@ -67,15 +67,16 @@ function tempDir(): string {
 describe("applyLiveConfigKeys", () => {
   test("inspect categories and LSP idle minutes apply live without deferral", () => {
     const current: TestConfig = {
-      lsp: { idle_minutes: 60 },
+      lsp: { idle_minutes: 60, max_servers: 8 },
       inspect: { categories: { dead_code: true } },
     };
     const next: TestConfig = {
-      lsp: { idle_minutes: "never" },
+      lsp: { idle_minutes: "never", max_servers: 3 },
       inspect: { categories: { dead_code: false } },
     };
     const result = applyLiveConfigKeys(current, next, KEYS);
     expect(result.applied).toContain("lsp.idle_minutes");
+    expect(result.applied).toContain("lsp.max_servers");
     expect(result.applied).toContain("inspect.categories.dead_code");
     expect(result.deferred).toEqual([]);
     expect(result.config).toEqual(next);

@@ -254,7 +254,7 @@ async fn running_hold_restart_unknown_and_withdraw_are_honest() {
     assert_eq!(entry["kind"], "result");
     assert_eq!(
         entry["result"],
-        json!({"content":[{"type":"text","text":""}],"isError":true,"errorCode":"outcome_unknown"})
+        json!({"content":[{"type":"text","text":format!("Task {task}: outcome unknown (AFT lost the command's result).\nCheck this task with bash_status before running the command again.")}],"isError":true,"errorCode":"outcome_unknown"})
     );
     let answer = f
         .checkout_tool(

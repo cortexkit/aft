@@ -1176,6 +1176,45 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         self.state = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.state)
 
+    def test_line_ending_drift_picks_only_pinned_files_whose_bytes_differ(self) -> None:
+        listing = b"\0".join([
+            b"i/lf    w/crlf  attr/-text          \tvectors/a.json",
+            b"i/lf    w/crlf  attr/text eol=lf    \tlf/b.txt",
+            b"i/lf    w/crlf  attr/               \tplain/autocrlf.rs",
+            b"i/lf    w/lf    attr/-text          \tvectors/clean.json",
+            b"i/-text w/-text attr/-text          \tbinary/blob.bin",
+            b"i/lf    w/      attr/-text          \tmissing/gone.json",
+            b"",
+        ])
+        self.assertEqual(self.state.stale_line_ending_paths(listing), [b"vectors/a.json", b"lf/b.txt"])
+
+    def test_line_ending_drift_rewrites_a_file_left_converted_by_an_older_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git = lambda *args: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                                               cwd=repo, check=True, capture_output=True)
+            git("init", "-q")
+            git("config", "core.autocrlf", "true")
+            (repo / "vectors").mkdir()
+            (repo / "vectors/a.json").write_bytes(b'{"a": 1}\n{"b": 2}\n')
+            git("add", ".")
+            git("commit", "-qm", "vectors")
+            # Reproduce a Windows checkout made before the file was pinned.
+            (repo / "vectors/a.json").unlink()
+            git("checkout", "--", "vectors/a.json")
+            self.assertIn(b"\r\n", (repo / "vectors/a.json").read_bytes())
+            # An old, stat-clean file: git trusts its cached stat and never
+            # re-reads it, as on a runner that checked it out runs ago.
+            os.utime(repo / "vectors/a.json", (1_600_000_000, 1_600_000_000))
+            git("update-index", "--refresh")
+            (repo / ".gitattributes").write_text("vectors/** -text\n")
+            git("add", ".gitattributes")
+            git("commit", "-qm", "pin vectors")
+            git("checkout", "--force", "HEAD")
+            self.assertIn(b"\r\n", (repo / "vectors/a.json").read_bytes(), "git keeps the stale bytes")
+            self.state.refresh_line_ending_drift(repo)
+            self.assertEqual((repo / "vectors/a.json").read_bytes(), b'{"a": 1}\n{"b": 2}\n')
+
     def native_jobs(self):
         return [(name, job) for suite in self.suites for name, job in suite["jobs"].items()
                 if job.get("runs-on") in (["self-hosted", "rented-mac"], ["self-hosted", "narli"])]
@@ -1464,6 +1503,29 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
             self.assertTrue(current.exists())
             self.assertTrue(all(not folder.exists() for folder in folders))
             self.assertEqual((target / "warm-dependency").read_bytes(), b"keep")
+
+    def test_low_disk_keeps_the_archive_of_a_run_that_is_still_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "aft-ci"
+            now = 1_700_000_000
+            folders = {}
+            # "active" started its last job an hour ago and still has shards
+            # queued behind other runs; "idle" is past every job's time limit.
+            for name, age in (("idle", self.state.ACTIVE_RUN_SECONDS + 1),
+                              ("active", 3600), ("current", 0)):
+                folder = root / "runs" / name
+                folder.mkdir(parents=True)
+                (folder / "macos-nextest.tar.zst").write_bytes(b"archive")
+                os.utime(folder, (now - age, now - age))
+                folders[name] = folder
+            disk_usage = unittest.mock.Mock(free=10 * 1024**3)
+            with unittest.mock.patch.object(self.state.time, "time", return_value=now), \
+                 unittest.mock.patch.object(self.state.shutil, "disk_usage", return_value=disk_usage), \
+                 unittest.mock.patch("builtins.print"):
+                self.state.prune_run_archives(root, folders["current"])
+            self.assertFalse(folders["idle"].exists())
+            self.assertTrue((folders["active"] / "macos-nextest.tar.zst").exists())
+            self.assertTrue(folders["current"].exists())
 
     def test_cleanup_kills_native_test_descendants_but_not_runner_or_unrelated_processes(self) -> None:
         table = {

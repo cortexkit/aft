@@ -106,6 +106,7 @@ pub fn is_data_file(project_root: &Path, path: &Path) -> bool {
         let mut file = std::fs::File::open(path)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         file.read_to_end(&mut bytes)?;
+        crate::large_read::record_whole(crate::large_read::Site::DataFile, bytes.len());
         Ok((bytes, Some(super::request_files::FileStat::of(&metadata))))
     });
     read.is_ok_and(|fetched| has_long_line(fetched.file.bytes()))

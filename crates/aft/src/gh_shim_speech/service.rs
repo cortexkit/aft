@@ -52,18 +52,15 @@ pub(crate) fn unconfigured_binding_refusals_total() -> u64 {
 
 const UNCONFIGURED_BINDING_LOG_CAP: usize = 4_096;
 
-fn unconfigured_binding_refusal(session: &str, agent: &str, detail: String) -> Refusal {
-    static LOGGED: std::sync::OnceLock<Mutex<HashSet<(String, String)>>> =
-        std::sync::OnceLock::new();
-    UNCONFIGURED_BINDING_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn no_binding_row_refusal(agent: &str, detail: String) -> Refusal {
+    static LOGGED: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
     // Ordinary sessions need not bind any repository to the launching agent.
     // Keep the refusal intact and suppress repeats while the log key is retained.
-    log_unconfigured_binding_refusal(
+    log_no_binding_row_refusal(
         &mut LOGGED
             .get_or_init(Mutex::default)
             .lock()
             .unwrap_or_else(|error| error.into_inner()),
-        session,
         agent,
         &detail,
         UNCONFIGURED_BINDING_LOG_CAP,
@@ -73,26 +70,20 @@ fn unconfigured_binding_refusal(session: &str, agent: &str, detail: String) -> R
     refusal
 }
 
-fn log_unconfigured_binding_refusal(
-    logged: &mut HashSet<(String, String)>,
-    session: &str,
-    agent: &str,
-    detail: &str,
-    cap: usize,
-) {
-    let key = (session.to_owned(), agent.to_owned());
+fn log_no_binding_row_refusal(logged: &mut HashSet<String>, agent: &str, detail: &str, cap: usize) {
+    let key = agent.to_owned();
     if logged.contains(&key) {
         return;
     }
-    // Bound history to 4,096 session/agent keys in the long-lived daemon.
-    // A new key clears a full set; an older session may log once more after that.
+    // Bound history to 4,096 agents in the long-lived daemon.
+    // A new agent clears a full set; an older agent may log once more after that.
     if logged.len() >= cap {
         logged.clear();
     }
     logged.insert(key);
     crate::slog_info!(
         "gh speech binding verification refused: {}",
-        serde_json::json!({"reason": "binding_unverifiable", "detail": detail, "session": session, "agent": agent})
+        serde_json::json!({"reason": "binding_unverifiable", "detail": detail})
     );
 }
 
@@ -690,7 +681,7 @@ pub(crate) fn parse_bindings(
     desired: &BTreeMap<String, String>,
     reply: &Value,
     agent: &str,
-    session: &str,
+    _session: &str,
 ) -> Result<BTreeMap<String, Binding>, Refusal> {
     let invalid = || binding_unverifiable("invalid_binding");
     let reply = reply
@@ -748,11 +739,11 @@ pub(crate) fn parse_bindings(
             .map(|(repo, _)| repo.as_str())
             .collect();
         let detail = format!("no_binding_row: launch_agent={agent:?} repositories={expected:?}");
-        return Err(if expected.is_empty() {
-            unconfigured_binding_refusal(session, agent, detail)
-        } else {
-            binding_unverifiable(detail)
-        });
+        if expected.is_empty() {
+            UNCONFIGURED_BINDING_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(no_binding_row_refusal(agent, detail));
+        }
+        return Err(binding_unverifiable(detail));
     }
     Ok(found)
 }

@@ -76,7 +76,7 @@ pub(crate) fn pause_dispatch(instance: ServerInstanceId) {
 
 fn key(root: &Path) -> ServerKey {
     ServerKey {
-        kind: ServerKind::TypeScript,
+        kind: ServerKind::TypeScript(None),
         root: root.to_path_buf(),
     }
 }
@@ -111,7 +111,7 @@ fn spawn(
     command: &str,
 ) -> LspClient {
     LspClient::spawn_with_reclaim_root(
-        ServerKind::TypeScript,
+        ServerKind::TypeScript(None),
         root.to_path_buf(),
         Path::new("/bin/sh"),
         &["-c".into(), command.into()],
@@ -591,7 +591,7 @@ fn pull_preservation_drops_retired_receipts_before_requeue() {
                 receive_order: None,
                 instance: Some(instance),
                 event: LspEvent::DocumentDiagnosticsPulled {
-                    server_kind: ServerKind::TypeScript,
+                    server_kind: ServerKind::TypeScript(None),
                     root: dir.path().to_path_buf(),
                     file: dir.path().join("main.ts"),
                     epoch: 1,
@@ -703,7 +703,7 @@ fn retired_exit_cleanup_preserves_a_replacement_report_with_the_same_pid() {
     let (current, _old) = replace(&mut manager, dir.path(), "exec cat");
     let pid = manager.clients[&key(dir.path())].child_pid();
     let report = ServerExitReport {
-        kind: ServerKind::TypeScript,
+        kind: ServerKind::TypeScript(None),
         root: dir.path().to_path_buf(),
         pid,
         phase: ServerPhase::Initialize,
@@ -723,7 +723,7 @@ fn retired_exit_cleanup_preserves_a_replacement_report_with_the_same_pid() {
         receive_order: None,
         instance: Some(retired),
         event: LspEvent::ServerExited {
-            server_kind: ServerKind::TypeScript,
+            server_kind: ServerKind::TypeScript(None),
             root: dir.path().to_path_buf(),
             pid,
             reason: ServerExitReason::Eof,

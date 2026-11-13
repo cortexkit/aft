@@ -366,9 +366,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "gh_shim_speech/service.rs",
-        enclosing_item: "log_unconfigured_binding_refusal",
+        enclosing_item: "log_no_binding_row_refusal",
         location_or_primitive: "UNCONFIGURED_BINDING_LOG_CAP, cap, clear",
-        reason: "Internal INFO-log deduplication history is cleared at capacity; older sessions may log again, but refusals and agent-visible result lists are unchanged.",
+        reason: "Internal INFO-log deduplication history is cleared at capacity; older agents may log again, but refusals and agent-visible result lists are unchanged.",
     },
     ExclusionEntry {
         file: "subc/consent.rs",
@@ -783,6 +783,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "consumer_capabilities preview (eight-entry slice cap)",
         reason: "Bounds RouteBind INFO logging only; does not cut a product result list.",
         enclosing_item: "consumer_capabilities",
+    },
+    ExclusionEntry {
+        file: "subc/held_task_recovery.rs",
+        enclosing_item: "recover",
+        location_or_primitive: "missing root log preview (five examples)",
+        reason: "Bounds an INFO log preview only; the total count is logged and no product result list is cut.",
+    },
+    ExclusionEntry {
+        file: "large_read.rs",
+        enclosing_item: "summarize_health_sites",
+        location_or_primitive: "top-site health preview truncate(4)",
+        reason: "Bounds supplemental health telemetry only; count, bytes, largest and sites_active still aggregate every active site, so the preview does not cut a tool result list.",
     },
     ExclusionEntry {
         file: "url_fetch.rs",

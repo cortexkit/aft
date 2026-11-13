@@ -242,6 +242,8 @@ const LspServerEntrySchema = z.object({
 });
 
 const LspConfigSchema = z.object({
+  /** Process-wide server limit, including starts; projects may only lower it. */
+  max_servers: z.number().int().nonnegative().optional(),
   /** Minutes since the last AFT tool call on that repository; default 60. */
   idle_minutes: z
     .union([
@@ -1050,6 +1052,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.lsp?.idle_minutes !== undefined) overrides.lsp_idle_minutes = config.lsp.idle_minutes;
+  if (config.lsp?.max_servers !== undefined) overrides.lsp_max_servers = config.lsp.max_servers;
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
   if (rerank !== undefined) overrides.search = { rerank };
@@ -1639,6 +1642,12 @@ function mergeLspConfig(
   //   - `python` (per-language preference, no executable origin)
   //   - `diagnostics_on_edit` (agent workflow/latency preference only)
   const projectLsp: AftConfig["lsp"] = {};
+  if (
+    overrideLsp?.max_servers !== undefined &&
+    overrideLsp.max_servers <= (baseLsp?.max_servers ?? 8)
+  ) {
+    projectLsp.max_servers = overrideLsp.max_servers;
+  }
   if (overrideLsp?.python !== undefined) projectLsp.python = overrideLsp.python;
   if (overrideLsp?.diagnostics_on_edit !== undefined) {
     projectLsp.diagnostics_on_edit = overrideLsp.diagnostics_on_edit;

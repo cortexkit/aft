@@ -112,7 +112,7 @@ fn manager_with_fake_server() -> LspManager {
 
 fn manager_with_fake_typescript_server() -> LspManager {
     let mut manager = LspManager::new();
-    manager.override_binary(ServerKind::TypeScript, fake_server_path());
+    manager.override_binary(ServerKind::TypeScript(None), fake_server_path());
     manager
 }
 
@@ -315,7 +315,7 @@ fn app_context_with_fake_typescript_lsp() -> AppContext {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     ctx
 }
 
@@ -731,7 +731,7 @@ fn watched_config_file_event_types_follow_current_file_state() {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
 
     let config_snapshot = ctx.config();
     ctx.lsp()
@@ -775,7 +775,7 @@ fn watched_config_file_event_types_accept_explicit_created_changed_deleted() {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
 
     let config_snapshot = ctx.config();
     ctx.lsp()
@@ -816,7 +816,7 @@ fn write_command_reports_created_for_new_config_file() {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     let config_snapshot = ctx.config();
     ctx.lsp()
         .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
@@ -853,7 +853,7 @@ fn write_command_reports_created_for_new_tsconfig_file() {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     let config_snapshot = ctx.config();
     ctx.lsp()
         .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
@@ -891,7 +891,7 @@ fn move_file_reports_deleted_source_and_created_destination_for_config_file() {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     let config_snapshot = ctx.config();
     ctx.lsp()
         .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
@@ -1108,7 +1108,7 @@ fn write_command_reports_changed_for_existing_config_file() {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     let config_snapshot = ctx.config();
     ctx.lsp()
         .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
@@ -1146,7 +1146,7 @@ fn delete_file_command_reports_deleted_for_config_file() {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     let config_snapshot = ctx.config();
     ctx.lsp()
         .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
@@ -1579,7 +1579,8 @@ fn test_lsp_module_not_found_hint_uses_package_manager_path_and_binary() {
 code: 'MODULE_NOT_FOUND'
 ",
     );
-    ctx.lsp().override_binary(ServerKind::TypeScript, script);
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript(None), script);
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "diag-init-crash-pnpm",
@@ -2646,7 +2647,7 @@ fn push_only_per_file_freshness() {
 
     let mut store = DiagnosticsStore::new();
     let server = ServerKey {
-        kind: ServerKind::TypeScript,
+        kind: ServerKind::TypeScript(None),
         root: PathBuf::from("/tmp/aft-push-root"),
     };
     let a = PathBuf::from("/tmp/aft-push-root/a.ts");
@@ -2722,7 +2723,7 @@ fn directory_mode_requires_each_matching_server_to_cover_file() {
         // TypeScript and Biome both match .ts. Only Biome is allowed to start,
         // so a Biome cache entry must not make the file look fully covered.
         lsp.override_binary(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             PathBuf::from("/definitely/missing/ts-lsp"),
         );
         lsp.override_binary(ServerKind::Biome, fake_server_path());
@@ -3442,7 +3443,7 @@ mod mutation_events {
         )
         .with_test_checkpoint_store();
         ctx.lsp()
-            .override_binary(ServerKind::TypeScript, fake_server_path());
+            .override_binary(ServerKind::TypeScript(None), fake_server_path());
         if let Some(watchers) = watchers {
             ctx.lsp()
                 .set_extra_env("AFT_FAKE_LSP_WATCHED_GLOBS", &watchers.to_string());

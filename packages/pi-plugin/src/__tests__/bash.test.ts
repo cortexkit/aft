@@ -10,9 +10,9 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import {
   BASH_HOST_FALLBACK_BANNER,
   BASH_RUNON_DESCRIPTION,
@@ -1065,6 +1065,11 @@ describe("bash tool adapter", () => {
   });
 
   test("foreground leading grep appends aft_search hint", async () => {
+    const src = join(projectRoot, "src");
+    await mkdir(src, { recursive: true });
+    await writeFile(join(src, "file.ts"), "x\n");
+    const old = new Date(Date.now() - 61_000);
+    await utimes(src, old, old);
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const bridge = {
@@ -1091,6 +1096,59 @@ describe("bash tool adapter", () => {
     expect(result.content[0].text).toContain("src/file.ts:1:x");
     expect(result.content[0].text).toContain("DO NOT search code by running grep/rg in bash");
     expect(result.content[0].text).toContain("Use the `aft_search` tool instead");
+  });
+
+  test.each([
+    "relative",
+    "absolute",
+    "hook",
+    "outside",
+  ])("foreground grep hints use the %s workdir without changing the project boundary", async (mode) => {
+    const workdir = await mkdtemp(
+      join(mode === "outside" ? tmpdir() : projectRoot, "aft-grep-workdir-"),
+    );
+    try {
+      const target = join(workdir, "hint-target");
+      await mkdir(target);
+      await writeFile(join(target, "file.ts"), "x\n");
+      const old = new Date(Date.now() - 61_000);
+      await utimes(target, old, old);
+      const workdirArg = mode === "relative" ? relative(projectRoot, workdir) : workdir;
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      if (mode === "hook") {
+        Object.assign(api, {
+          getHook: (name: string) =>
+            name === "bashSpawn"
+              ? async (spawn: { command: string }) => ({ ...spawn, cwd: workdir })
+              : undefined,
+        });
+      }
+      const { bridge, calls } = makeTrackableMockBridge({
+        status: "completed",
+        output: "hint-target/file.ts:1:x",
+      });
+      registerBashTool(api, makeMockContext(bridge), true);
+      const result = (await tools.get("bash")!.execute(
+        "test-call",
+        {
+          command: 'grep -nE "x" hint-target/',
+          workdir: mode === "hook" ? "unused-before-hook" : workdirArg,
+        },
+        undefined,
+        undefined,
+        { cwd: projectRoot },
+      )) as { content: Array<{ text: string }> };
+      expect((calls[0] as [string, Record<string, unknown>])[1].workdir).toBe(workdirArg);
+      expect(result.content[0].text).toContain("hint-target/file.ts:1:x");
+      if (mode === "outside") {
+        expect(result.content[0].text).not.toContain("Use the `aft_search` tool instead");
+      } else {
+        expect(result.content[0].text).toContain("Use the `aft_search` tool instead");
+      }
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
   });
 
   test("foreground filtering grep does not append code-search hint", async () => {

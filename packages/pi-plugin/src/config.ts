@@ -297,6 +297,8 @@ export interface BackupConfig {
 }
 
 export interface LspConfig {
+  /** Process-wide server limit, including starts; default 8. Projects may only lower it. */
+  max_servers?: number;
   /** Minutes since the last AFT tool call on that repository; default 60. */
   idle_minutes?: number | "never";
   servers?: Record<string, Omit<LspServerConfig, "id">>;
@@ -805,6 +807,7 @@ const LspServerEntrySchema = z.object({
 });
 
 const LspConfigSchema = z.object({
+  max_servers: z.number().int().nonnegative().optional(),
   idle_minutes: z
     .union([
       z
@@ -1344,6 +1347,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.lsp?.idle_minutes !== undefined) overrides.lsp_idle_minutes = config.lsp.idle_minutes;
+  if (config.lsp?.max_servers !== undefined) overrides.lsp_max_servers = config.lsp.max_servers;
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
   if (rerank !== undefined) overrides.search = { rerank };
@@ -1751,6 +1755,9 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
   // SAFE project-level fields: python (per-language preference) and
   // diagnostics_on_edit (agent workflow/latency preference only).
   const projectSafe: LspConfig = {};
+  if (override?.max_servers !== undefined && override.max_servers <= (base?.max_servers ?? 8)) {
+    projectSafe.max_servers = override.max_servers;
+  }
   if (override?.python !== undefined) projectSafe.python = override.python;
   if (override?.diagnostics_on_edit !== undefined) {
     projectSafe.diagnostics_on_edit = override.diagnostics_on_edit;

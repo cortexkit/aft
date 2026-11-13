@@ -1859,6 +1859,8 @@ pub(crate) struct Reader {
     file: Option<std::fs::File>,
     direct: bool,
     at: Option<Instant>,
+    /// The opened descriptor's size, taken when it was opened.
+    size_at_open: u64,
 }
 
 pub(crate) fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
@@ -1883,22 +1885,27 @@ pub(crate) fn reader(path: &Path, at: Option<Instant>) -> io::Result<Reader> {
             "not a regular file",
         ));
     }
-    let (file, direct) = if direct {
-        match regular_open(path, true) {
+    let ((file, size_at_open), direct) = if direct {
+        match regular_open_sized(path, true) {
             #[cfg(unix)]
-            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-                (run(path, at, |path| regular_open(&path, false))?, false)
-            }
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => (
+                run(path, at, |path| regular_open_sized(&path, false))?,
+                false,
+            ),
             result => (result?, true),
         }
     } else {
-        (run(path, at, |path| regular_open(&path, false))?, false)
+        (
+            run(path, at, |path| regular_open_sized(&path, false))?,
+            false,
+        )
     };
     Ok(Reader {
         path: path.to_path_buf(),
         file: Some(file),
         direct,
         at,
+        size_at_open,
     })
 }
 
@@ -1976,9 +1983,61 @@ impl Reader {
         self.file = Some(file);
         Ok(buffer)
     }
+
+    /// The file's size when it was opened. A large-file read stops there, so
+    /// bytes a writer appends during the read are not read.
+    pub(crate) fn size_at_open(&self) -> u64 {
+        self.size_at_open
+    }
+
+    /// Append at most `size` more bytes to `buffer`, reading until that many
+    /// arrived or the file ended, with the same deadline and helper handling
+    /// as [`Self::chunk`]. Unlike `chunk` it writes into spare capacity
+    /// without zeroing it first.
+    ///
+    /// The buffer grows by at most `size` bytes: the reservation is exact, so
+    /// it never doubles, and `read_to_end` through `take(size)` only fills
+    /// the room already reserved. When that room is full it probes with a
+    /// stack buffer before growing (std's `default_read_to_end`), and the
+    /// probe of an exhausted `Take` reads nothing.
+    pub(crate) fn append(&mut self, mut buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {
+        if Instant::now() >= deadline(self.at) {
+            return Err(failure(
+                &self.path,
+                "read_deadline_exceeded",
+                "scan deadline elapsed during file read",
+            ));
+        }
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("file read already failed"))?;
+        let read = move || {
+            let before = buffer.len();
+            buffer.try_reserve_exact(size).map_err(io::Error::other)?;
+            (&mut file).take(size as u64).read_to_end(&mut buffer)?;
+            crate::io_accounting::WORK.content_read_bytes.fetch_add(
+                (buffer.len() - before) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok((file, buffer))
+        };
+        let (file, buffer) = if self.direct {
+            read()?
+        } else {
+            run(&self.path, self.at, move |_| read())?
+        };
+        self.file = Some(file);
+        Ok(buffer)
+    }
 }
 
-fn regular_open(path: &Path, _no_follow: bool) -> io::Result<std::fs::File> {
+fn regular_open(path: &Path, no_follow: bool) -> io::Result<std::fs::File> {
+    regular_open_sized(path, no_follow).map(|(file, _)| file)
+}
+
+/// [`regular_open`], with the opened descriptor's size.
+fn regular_open_sized(path: &Path, _no_follow: bool) -> io::Result<(std::fs::File, u64)> {
     if !_no_follow && !std::fs::metadata(path)?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2009,7 +2068,7 @@ fn regular_open(path: &Path, _no_follow: bool) -> io::Result<std::fs::File> {
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, metadata.len()))
 }
 
 fn regular_read(path: &Path, no_follow: bool) -> io::Result<Vec<u8>> {

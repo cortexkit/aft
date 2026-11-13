@@ -358,7 +358,12 @@ impl<'i> SectionsWriter<'i> {
             .ok_or_else(|| format!("parse of {file}: the stored parse could not be read"))?;
         let slice = FileSlice::build(file, &key, &parse, resolution);
         let mut terms = slice_terms(&slice);
-        terms.extend(input_terms(resolution, &facts, subjects));
+        let inputs_terms = {
+            #[cfg(test)]
+            let _phase = super::checkout::publication_tests::phase("sections.input_terms");
+            input_terms(resolution, &facts, subjects)
+        };
+        terms.extend(inputs_terms);
         terms.extend(method_terms(&parse));
         let bytes = super::fragment::encode(resolution);
         #[cfg(test)]

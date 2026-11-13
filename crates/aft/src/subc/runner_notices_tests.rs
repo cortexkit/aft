@@ -95,6 +95,24 @@ impl Completion {
         read_task_at(&paths).unwrap().completion_delivered
     }
 
+    fn frozen(&self) -> SendRequest {
+        use crate::bash_background::persistence::{read_task_at, resolve_task};
+        let _scope = crate::bash_background::task_identity_scope(Some(self.route.task_identity()));
+        let paths = resolve_task(self.storage.path(), &self.task, &self.task).unwrap();
+        let persisted = read_task_at(&paths)
+            .unwrap()
+            .runner_completion_notice
+            .unwrap();
+        let in_memory = self
+            .registry
+            .notice_metadata(&self.task)
+            .unwrap()
+            .runner_completion_notice
+            .unwrap();
+        assert_eq!(envelope(&persisted), envelope(&in_memory));
+        persisted
+    }
+
     fn offer(&self, scheduler: &Scheduler, now: Arc<AtomicU64>) {
         assert!(offer(
             scheduler,
@@ -670,20 +688,168 @@ fn runner_notices_only_completions_on_heads_may_start_idle_runs() {
 }
 
 #[test]
-fn runner_notices_readable_sender_grant_can_disable_idle_start() {
-    use cortexkit_role_llm_runner::read::{HeadMeta, HeadSender};
-    let head = HeadMeta::empty(1, "incarnation");
-    assert_eq!(idle_start_grant(&head), None);
-    let limited = head.clone().with_sender(HeadSender::new(
-        vec!["tool_result".into(), "steer".into()],
-        false,
-    ));
-    assert_eq!(idle_start_grant(&limited), Some(false));
-    let full = head.with_sender(HeadSender::new(
-        vec!["tool_result".into(), "steer".into(), "idle_start".into()],
-        false,
-    ));
-    assert_eq!(idle_start_grant(&full), Some(true));
+fn runner_notices_delivery_refusal_decodes_field_from_wire_and_module_errors() {
+    let request = request("aft:bash:field".into(), "completion".into(), true, false);
+    for field in [json!("delivery"), json!("prompt"), Value::Null, json!(7)] {
+        let error =
+            json!({"code": "invalid_params", "message": "refused", "detail": {"field": field}});
+        let outcomes = [
+            decode_send_reply(&serde_json::to_vec(&error).unwrap()),
+            decode_send_reply(&serde_json::to_vec(&json!({"error": error})).unwrap()),
+            request_failure(CallError::Module(serde_json::from_value(error).unwrap())),
+        ];
+        for outcome in outcomes {
+            assert_eq!(
+                idle_start_fallback(&request, &outcome).is_some(),
+                field == "delivery"
+            );
+        }
+    }
+}
+
+#[test]
+fn runner_notices_completion_delivery_skips_session_head() {
+    for (id, principal, raw, delivery) in [
+        (
+            "bash-00000000000b0f01",
+            "reserved:thalamus-harness",
+            "opencode2",
+            json!(["tool_result", "steer", "idle_start"]),
+        ),
+        (
+            "bash-00000000000b0f02",
+            "reserved:broca",
+            "broca",
+            json!(["tool_result", "steer"]),
+        ),
+    ] {
+        let task = Completion::new_runner(id, 0, principal, raw);
+        let capture = test_endpoint::capture(&task.task, false);
+        let scheduler = Scheduler::default();
+        task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+        let calls: Vec<_> = capture.receiver.try_iter().collect();
+        assert!(!calls
+            .iter()
+            .any(|call| call.request["method"] == "session.head"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request["method"], "session.send");
+        assert_eq!(calls[0].request["params"]["delivery"], delivery);
+        assert_eq!(envelope(&task.frozen()), calls[0].bytes);
+        assert!(task.delivered());
+    }
+}
+
+#[test]
+fn runner_notices_delivery_refusal_freezes_fallback_before_retry() {
+    let task = Completion::new_runner(
+        "bash-00000000000b0f03",
+        0,
+        "reserved:thalamus-harness",
+        "pi",
+    );
+    let capture = test_endpoint::capture(&task.task, true);
+    capture.refuse("invalid_params", Some("delivery"));
+    let scheduler = Scheduler::default();
+    let before = health().2;
+    task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
+    let now = std::time::Instant::now();
+    let Next::Retry(delay) = step(&scheduler, now) else {
+        panic!("lost fallback response must retry");
+    };
+    let first = capture.receiver.try_recv().unwrap();
+    let second = capture.receiver.try_recv().unwrap();
+    assert!(capture.receiver.try_recv().is_err());
+    assert_eq!(
+        first.request["params"]["delivery"],
+        json!(["tool_result", "steer", "idle_start"])
+    );
+    let mut expected = first.request;
+    expected["params"]["delivery"] = json!(["tool_result", "steer"]);
+    assert_eq!(second.request, expected);
+    assert_eq!(
+        second.request["params"]["send_id"],
+        format!("aft:bash:{}", task.task)
+    );
+    assert_eq!(second.request["params"]["notice"], true);
+    assert_eq!(envelope(&task.frozen()), second.bytes);
+    assert!(health().2 > before);
+    assert!(!task.delivered());
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+    assert!(matches!(step(&scheduler, now + delay), Next::Done));
+    let third = capture.receiver.try_recv().unwrap();
+    assert_eq!(third.bytes, second.bytes);
+    assert!(capture.receiver.try_recv().is_err());
+    assert_eq!(capture.effects.load(Ordering::Relaxed), 1);
+    assert!(task.delivered());
+}
+
+#[test]
+fn runner_notices_unrelated_refusals_do_not_remove_idle_start() {
+    for (index, code, field) in [
+        (0, "invalid_params", Some("prompt")),
+        (1, "invalid_params", None),
+        (2, "scope_owner_mismatch", None),
+        (3, "delivery_unsupported", Some("delivery")),
+    ] {
+        let id = format!("bash-{:016x}", 0xb0f10 + index);
+        let task = Completion::new_runner(&id, 0, "reserved:thalamus-harness", "pi");
+        let capture = test_endpoint::capture(&task.task, false);
+        capture.refuse(code, field);
+        let scheduler = Scheduler::default();
+        task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+        let first = capture.receiver.try_recv().unwrap();
+        assert_eq!(
+            first.request["params"]["delivery"],
+            json!(["tool_result", "steer", "idle_start"])
+        );
+        assert_eq!(envelope(&task.frozen()), first.bytes);
+        assert!(capture.receiver.try_recv().is_err(), "{code} {field:?}");
+        assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
+        assert!(task.delivered());
+    }
+}
+
+#[test]
+fn runner_notices_delivery_refusal_falls_back_only_once_and_never_for_workers() {
+    for worker in [true, false] {
+        let task = if worker {
+            Completion::new("bash-00000000000b0f20", 0)
+        } else {
+            Completion::new_runner(
+                "bash-00000000000b0f21",
+                0,
+                "reserved:thalamus-harness",
+                "pi",
+            )
+        };
+        let capture = test_endpoint::capture(&task.task, false);
+        capture.refuse("invalid_params", Some("delivery"));
+        capture.refuse("invalid_params", Some("delivery"));
+        let scheduler = Scheduler::default();
+        task.offer(&scheduler, Arc::new(AtomicU64::new(task.finished)));
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+        let calls: Vec<_> = capture.receiver.try_iter().collect();
+        assert_eq!(calls.len(), if worker { 1 } else { 2 });
+        let last = calls.last().unwrap();
+        assert_eq!(
+            last.request["params"]["delivery"],
+            json!(["tool_result", "steer"])
+        );
+        assert_eq!(envelope(&task.frozen()), last.bytes);
+        assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
+        assert!(task.delivered());
+    }
 }
 
 #[test]

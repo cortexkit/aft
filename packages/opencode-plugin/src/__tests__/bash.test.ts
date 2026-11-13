@@ -1,8 +1,17 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, mock, spyOn, test } from "bun:test";
-import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import {
   BASH_HOST_FALLBACK_BANNER,
   BASH_RUNON_DESCRIPTION,
@@ -1408,27 +1417,82 @@ describe("OpenCode bash adapter", () => {
   });
 
   test("foreground leading grep appends aft_search hint", async () => {
-    const { tool: bash } = createHarness(
-      () => ({
-        success: true,
-        status: "completed",
-        task_id: "task-grep",
-        exit_code: 0,
-        duration_ms: 100,
-        output: "src/file.ts:1:x",
-        truncated: false,
-      }),
-      undefined,
-      true,
-    );
+    const root = await realpath(await mkdtemp(join(tmpdir(), "aft-grep-leading-")));
+    try {
+      const src = join(root, "src");
+      await mkdir(src);
+      await writeFile(join(src, "file.ts"), "x\n");
+      const old = new Date(Date.now() - 61_000);
+      await utimes(src, old, old);
+      const { tool: bash } = createHarness(
+        () => ({
+          success: true,
+          status: "completed",
+          task_id: "task-grep",
+          exit_code: 0,
+          duration_ms: 100,
+          output: "src/file.ts:1:x",
+          truncated: false,
+        }),
+        undefined,
+        true,
+      );
 
-    const output = bashText(
-      await bash.execute({ command: 'grep -nE "x" src/' }, createMockSdkContext()),
-    );
+      const output = bashText(
+        await bash.execute(
+          { command: 'grep -nE "x" src/' },
+          createMockSdkContext({ sessionID: "grep-leading", directory: root, worktree: root }),
+        ),
+      );
 
-    expect(output).toContain("src/file.ts:1:x");
-    expect(output).toContain("DO NOT search code by running grep/rg in bash");
-    expect(output).toContain("Use the `aft_search` tool instead");
+      expect(output).toContain("src/file.ts:1:x");
+      expect(output).toContain("DO NOT search code by running grep/rg in bash");
+      expect(output).toContain("Use the `aft_search` tool instead");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    "relative",
+    "absolute",
+    "outside",
+  ])("foreground grep hints use the %s workdir without changing the project boundary", async (mode) => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "aft-grep-project-")));
+    const workdir = await mkdtemp(join(mode === "outside" ? tmpdir() : root, "aft-grep-workdir-"));
+    try {
+      const target = join(workdir, "hint-target");
+      await mkdir(target);
+      await writeFile(join(target, "file.ts"), "x\n");
+      const old = new Date(Date.now() - 61_000);
+      await utimes(target, old, old);
+      const workdirArg = mode === "relative" ? relative(root, workdir) : workdir;
+      const { calls, tool: bash } = createHarness(
+        () => ({ success: true, status: "completed", output: "hint-target/file.ts:1:x" }),
+        undefined,
+        true,
+      );
+      const output = bashText(
+        await bash.execute(
+          { command: 'grep -nE "x" hint-target/', workdir: workdirArg },
+          createMockSdkContext({
+            sessionID: `grep-workdir-${mode}`,
+            directory: root,
+            worktree: root,
+          }),
+        ),
+      );
+      expect(calls[0].params.workdir).toBe(workdirArg);
+      expect(output).toContain("hint-target/file.ts:1:x");
+      if (mode === "outside") {
+        expect(output).not.toContain("Use the `aft_search` tool instead");
+      } else {
+        expect(output).toContain("Use the `aft_search` tool instead");
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(workdir, { recursive: true, force: true });
+    }
   });
 
   test("foreground filtering grep does not append code-search hint", async () => {

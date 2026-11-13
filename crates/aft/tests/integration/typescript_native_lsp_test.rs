@@ -27,6 +27,7 @@ use super::helpers::{link_cached_executable, AftProcess};
 
 const TS7_ENV: &str = "AFT_TEST_TS7_NODE_MODULES";
 const TS5_ENV: &str = "AFT_TEST_TS5_NODE_MODULES";
+const TS4_ENV: &str = "AFT_TEST_TS4_NODE_MODULES";
 
 /// The install named by `env`, or `None` when the variable is unset. A set
 /// variable that does not point at the expected install fails the test: CI
@@ -44,7 +45,13 @@ fn configured(env: &str) -> Option<PathBuf> {
                 package_json.display()
             )
         });
-    let expected_major = if env == TS7_ENV { "7." } else { "5." };
+    let expected_major = if env == TS7_ENV {
+        "7."
+    } else if env == TS4_ENV {
+        "4."
+    } else {
+        "5."
+    };
     assert!(
         version.starts_with(expected_major),
         "{env} holds typescript {version}, expected {expected_major}x"
@@ -557,6 +564,71 @@ fn mixed_typescript_5_and_7_packages_get_separate_servers() {
 
 /// A marker script that records that it ran; nothing in these tests may run
 /// it.
+#[test]
+fn typescript_4_and_5_shared_root_preserves_version_specific_diagnostics() {
+    let test = "typescript_4_and_5_shared_root_preserves_version_specific_diagnostics";
+    let (Some(ts4), Some(ts5)) = (installed(TS4_ENV, test), installed(TS5_ENV, test)) else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut files = Vec::new();
+    for (name, modules) in [("old", &ts4), ("current", &ts5), ("current-copy", &ts5)] {
+        let package = root.join("packages").join(name);
+        typescript_package(&package, modules);
+        let file = package.join("src/index.ts");
+        write(&file, "export function tuple<const T extends readonly unknown[]>(items: T): T { return items; }\nexport const pair = tuple([\"a\", 1]);\nexport const control: number = \"wrong\";\n");
+        files.push(file);
+    }
+    let mut aft = spawn_configured(&root, &[ts5.join(".bin")]);
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        aft.send(&json!({
+        "id": "sdk-parity", "command": "inspect", "scope": files, "sections": ["diagnostics"]
+    }).to_string())
+    });
+    assert_eq!(response["complete"], true, "{response:#}");
+    let messages = response["details"]["diagnostics"].to_string();
+    assert!(
+        messages.contains("Type parameter declaration expected"),
+        "{response:#}"
+    );
+    // TS 4.9 rejects const type parameters; both TS 5 files retain exactly
+    // their independent assignment error instead of inheriting those errors.
+    for file in &files[1..] {
+        let scoped = crate::helpers::inspect_retrying_cold_deadline(|| {
+            aft.send(&json!({
+            "id": "sdk-current", "command": "inspect", "scope": file, "sections": ["diagnostics"]
+        }).to_string())
+        });
+        assert_eq!(scoped["complete"], true, "{scoped:#}");
+        assert_eq!(scoped["summary"]["diagnostics"]["errors"], 1, "{scoped:#}");
+        assert!(
+            scoped["details"]["diagnostics"]
+                .to_string()
+                .contains("not assignable"),
+            "{scoped:#}"
+        );
+    }
+    let notes = runtime_notes(&mut aft, &files[0]);
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|note| note.starts_with("TypeScript 4."))
+            .count(),
+        1,
+        "{notes:?}"
+    );
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|note| note.starts_with("TypeScript 5."))
+            .count(),
+        1,
+        "{notes:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
 fn sentinel(path: &Path, marker: &Path) {
     let source = format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display());
     link_cached_executable(path, source.as_bytes()).unwrap();

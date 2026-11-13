@@ -31,6 +31,15 @@ import type { PluginContext } from "../types.js";
 import { v2HostToolName } from "../v2-host-tool-names.js";
 
 const HOSTS = ["apply_patch", "bash", "edit", "glob", "grep", "read", "write"];
+const CODEMODE_NAMES: Readonly<Record<string, string>> = {
+  read: "read",
+  grep: "grep",
+  glob: "glob",
+  aft_search: "search",
+  aft_outline: "outline",
+  aft_zoom: "zoom",
+  aft_callgraph: "callgraph",
+};
 
 /** Expected registered names for each user config document (undefined = no file). */
 const CASES: Array<{ name: string; user: unknown; disabled: string[] }> = [
@@ -108,15 +117,22 @@ function v1Names(config: AftConfig): string[] {
   return Object.keys(buildOpenCodeToolMap(stubContext(config), config)).sort();
 }
 
-function v2Names(config: AftConfig): string[] {
+type V2Registration = [namespace: unknown, name: string, codemode: boolean];
+
+function v2Registrations(config: AftConfig): V2Registration[] {
   const definitions = buildOpenCodeToolMap(stubContext(config), config);
-  const added: string[] = [];
+  const added: V2Registration[] = [];
   registerAftTools(
     {
       tool: {
         transform(register) {
           register({
-            add: (definition: V2ProviderTool) => added.push(definition.name),
+            add: (definition: V2ProviderTool) =>
+              added.push([
+                definition.options.namespace,
+                definition.name,
+                definition.options.codemode,
+              ]),
             remove: () => {},
           });
         },
@@ -132,6 +148,16 @@ function expected(disabled: readonly string[]): string[] {
   return CANONICAL_TOOLS.filter((tool) => !disabled.includes(tool)).sort();
 }
 
+function expectedV2(disabled: readonly string[]): V2Registration[] {
+  return expected(disabled)
+    .flatMap<V2Registration>((toolName) => {
+      const direct: V2Registration = [undefined, v2HostToolName(toolName), false];
+      const codeModeName = CODEMODE_NAMES[toolName];
+      return codeModeName ? [direct, ["aft.code", codeModeName, true]] : [direct];
+    })
+    .sort();
+}
+
 describe("OpenCode feature-config registration", () => {
   for (const { name, user, disabled } of CASES) {
     test(`V1 registers canonical tools minus resolved disables: ${name}`, () => {
@@ -141,10 +167,8 @@ describe("OpenCode feature-config registration", () => {
     });
 
     test(`V2 registers canonical tools minus resolved disables: ${name}`, () => {
-      // Same inventory, with bash and apply_patch under OpenCode 2's names.
-      expect(v2Names(loadWithUserConfig(user))).toEqual(
-        expected(disabled).map(v2HostToolName).sort(),
-      );
+      // Disabling a direct tool must also remove its namespaced Code Mode copy.
+      expect(v2Registrations(loadWithUserConfig(user))).toEqual(expectedV2(disabled));
     });
   }
 
@@ -221,9 +245,7 @@ describe("OpenCode feature-config registration", () => {
     // aft_grep name is ignored and only the user defaults remain disabled.
     expect(config.disabled_tools).toEqual(["aft_delete", "aft_move"]);
     expect(v1Names(config)).toEqual(expected(["aft_delete", "aft_move"]));
-    expect(v2Names(config)).toEqual(
-      expected(["aft_delete", "aft_move"]).map(v2HostToolName).sort(),
-    );
+    expect(v2Registrations(config)).toEqual(expectedV2(["aft_delete", "aft_move"]));
     expect(
       getConfigLoadNotices().some(
         (notice) => notice.configPath === projectFile && notice.message.includes("retired keys"),

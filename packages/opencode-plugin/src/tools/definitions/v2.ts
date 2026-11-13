@@ -93,7 +93,7 @@ export interface V2ProviderTool {
   description: string;
   input: ReturnType<typeof tool.schema.object> & Pick<ZodType, "~standard">;
   options: Readonly<Record<string, unknown>> & {
-    codemode: false;
+    codemode: boolean;
   };
   execute(
     input: Record<string, unknown>,

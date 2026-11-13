@@ -148,13 +148,16 @@ fn prepared_bind_watches_keep_the_captured_source() {
 
 #[test]
 fn inspect_categories_and_lsp_idle_reload_without_restart() {
-    let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60}}"#, None);
+    let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60,"max_servers":8}}"#, None);
     write(
         &fixture.user_path,
-        r#"{"lsp":{"idle_minutes":"never"},"inspect":{"categories":{"dead_code":false,"todos":false}}}"#,
+        r#"{"lsp":{"idle_minutes":"never","max_servers":3},"inspect":{"categories":{"dead_code":false,"todos":false}}}"#,
     );
     let outcome = fixture.reload();
     assert!(applied(&outcome).contains(&"lsp.idle_minutes"));
+    assert!(applied(&outcome).contains(&"lsp.max_servers"));
+    assert_eq!(fixture.ctx.config().lsp_max_servers, 3);
+    assert_eq!(fixture.ctx.config().lsp_user_max_servers, Some(3));
     assert!(applied(&outcome).contains(&"inspect.categories"));
     assert!(deferred(&outcome).is_empty());
     assert_eq!(

@@ -164,11 +164,14 @@ pub fn nearest_names<'a>(
                 if metadata.len() > NEAREST_NAME_MAX_FILE_BYTES {
                     continue;
                 }
-                let Ok(fetched) = super::request_files::read_through(
-                    request_files.as_deref(),
-                    path,
-                    super::request_files::read_whole_file,
-                ) else {
+                let Ok(fetched) =
+                    super::request_files::read_through(request_files.as_deref(), path, |path| {
+                        crate::large_read::counted(
+                            crate::large_read::Site::NearestNames,
+                            super::request_files::read_whole_file(path),
+                        )
+                    })
+                else {
                     continue;
                 };
                 fetched.file

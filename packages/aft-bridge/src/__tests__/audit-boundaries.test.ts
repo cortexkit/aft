@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { maybeAppendGrepSearchHint } from "../bash-hints.js";
@@ -32,17 +32,30 @@ test("callgraph preserves a sibling of the home directory", () => {
 });
 
 test("grep slash patterns do not count as path operands", () => {
-  for (const command of [
-    "grep 'a/b' /etc/hosts",
-    "grep -e 'a/b' /etc/hosts",
-    "grep --regexp='a/b' /etc/hosts",
-    "rg -- 'a/b' /etc/hosts",
-  ]) {
-    expect(maybeAppendGrepSearchHint("hits", command, true, "/project")).toBe("hits");
+  const root = mkdtempSync(join(tmpdir(), "aft-grep-patterns-"));
+  try {
+    const old = new Date(Date.now() - 61_000);
+    // A directory matching the pattern would wrongly trigger the hint if the
+    // pattern were collected as a path, even with missing operands suppressed.
+    for (const operand of ["a/b", "src"]) {
+      const dir = join(root, operand);
+      mkdirSync(dir, { recursive: true });
+      utimesSync(dir, old, old);
+    }
+    writeFileSync(join(root, "file.ts"), "a/b\n");
+    for (const command of [
+      "grep 'a/b' /etc/hosts",
+      "grep -e 'a/b' /etc/hosts",
+      "grep --regexp='a/b' /etc/hosts",
+      "rg -- 'a/b' /etc/hosts",
+    ]) {
+      expect(maybeAppendGrepSearchHint("hits", command, true, root)).toBe("hits");
+    }
+    expect(maybeAppendGrepSearchHint("hits", "grep 'a/b' src/", true, root)).not.toBe("hits");
+    expect(maybeAppendGrepSearchHint("hits", "grep 'a/b' file.ts", true, root)).toBe("hits");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
-  expect(maybeAppendGrepSearchHint("hits", "grep 'a/b' file.ts", true, "/project")).not.toBe(
-    "hits",
-  );
 });
 
 import { relativePathEscapesRoot, shortenHomePath } from "../path-display.js";

@@ -6127,15 +6127,20 @@ fn persist_accepted_with_snapshot(
 
 #[tokio::test]
 async fn held_call_startup_reattaches_remote_job_without_a_route_bind() {
-    held_call_startup_remote_result(false).await;
+    held_call_startup_remote_result(false, "").await;
 }
 
 #[tokio::test]
 async fn held_call_startup_lost_remote_job_settles_as_unknown_outcome() {
-    held_call_startup_remote_result(true).await;
+    held_call_startup_remote_result(true, "").await;
 }
 
-async fn held_call_startup_remote_result(lost: bool) {
+#[tokio::test]
+async fn held_call_startup_lost_remote_job_preserves_output() {
+    held_call_startup_remote_result(true, "partial output\n").await;
+}
+
+async fn held_call_startup_remote_result(lost: bool, output: &str) {
     use crate::subc::held_task_recovery::tests as recovery;
     let daemon = daemon(
         if lost { Script::Lost } else { Script::Restart },
@@ -6155,15 +6160,35 @@ async fn held_call_startup_remote_result(lost: bool) {
     registry.detach();
     drop(registry);
     let layout = resolve_task_layout(&session_tasks_dir(&root, "session"), &task_id).unwrap();
+    let mut metadata = read_task(&layout.paths.json).unwrap();
+    let job_id = metadata.remote.as_ref().unwrap().job_id.unwrap();
+    if !output.is_empty() {
+        fs::write(&layout.paths.stdout, output).unwrap();
+        metadata.compressed = false;
+        metadata.completion_has_secret_placeholders = Some(false);
+        metadata.completion_has_env_secrets = Some(false);
+        metadata.completion_has_non_ticket_env_secrets = Some(false);
+        let remote = metadata.remote.as_mut().unwrap();
+        remote.last_seq = Some(1);
+        remote.stdout_len = output.len() as u64;
+        remote.output_received = true;
+        write_task_at(&layout, &metadata).unwrap();
+    }
     let key = recovery::hold_task(&old, &layout, "remote-held");
     drop(old);
     let restarted = recovery::context(&root, &storage);
     let executor = recovery::startup(&restarted).await;
     let frame = recovery::settled(&restarted, &key).await;
     if lost {
+        let result: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        let preview = if output.is_empty() {
+            String::new()
+        } else {
+            format!("Output received before that:\n{output}")
+        };
         assert_eq!(
-            frame.body,
-            crate::db::call_ledger::unknown_held_result().body
+            result["content"][0]["text"],
+            format!("Task {task_id}: outcome unknown (AFT lost the result of build-server job {job_id}).\n{preview}Check this task with bash_status before running the command again.")
         );
     } else {
         let result: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();

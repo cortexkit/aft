@@ -136,6 +136,7 @@ pub(crate) mod io_accounting;
 pub mod jsonc;
 pub mod jsonc_edit;
 pub mod language;
+pub(crate) mod large_read;
 #[doc(hidden)]
 pub mod launch_fds;
 pub mod launch_nonce;

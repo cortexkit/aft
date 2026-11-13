@@ -309,6 +309,25 @@ fn lsp_inspect_classifies_nested_python_node_modules_binary() {
 
 #[test]
 fn lsp_inspect_classifies_non_python_binary_against_project_root() {
+    inspect_non_python_binary_against_project_root(
+        "typescript",
+        "typescript-language-server",
+        true,
+    );
+    // Preserve the nested-workspace case: a nonshared server still resolves
+    // and classifies its executable from the configured repository root.
+    inspect_non_python_binary_against_project_root(
+        "fixture-non-python",
+        "fixture-language-server",
+        false,
+    );
+}
+
+fn inspect_non_python_binary_against_project_root(
+    server_id: &str,
+    binary_name: &str,
+    shared_repository_root: bool,
+) {
     let dir = tempdir().unwrap();
     let repository = dir.path().join("repository");
     let package = repository.join("packages").join("app");
@@ -321,13 +340,25 @@ fn lsp_inspect_classifies_non_python_binary_against_project_root() {
     let project_bin = repository.join("node_modules").join(".bin");
     std::fs::create_dir_all(&project_bin).unwrap();
     let installed_server = if cfg!(windows) {
-        project_bin.join("typescript-language-server.exe")
+        project_bin.join(format!("{binary_name}.exe"))
     } else {
-        project_bin.join("typescript-language-server")
+        project_bin.join(binary_name)
     };
     link_cached_path(&fake_server, &installed_server).unwrap();
     warm_executable(&installed_server, &["--stdio"]);
 
+    let mut lsp = json!({"disabled": ["biome", "oxlint"]});
+    if server_id != "typescript" {
+        lsp["disabled"] = json!(["typescript", "biome", "oxlint"]);
+        let mut servers = json!({});
+        servers[server_id] = json!({
+            "binary": binary_name,
+            "args": ["--stdio"],
+            "extensions": ["ts"],
+            "root_markers": ["package.json"],
+        });
+        lsp["servers"] = servers;
+    }
     let mut aft = AftProcess::spawn_with_env(&[("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1"))]);
     let configure = aft.send(
         &json!({
@@ -335,6 +366,7 @@ fn lsp_inspect_classifies_non_python_binary_against_project_root() {
             "command": "configure",
             "harness": "opencode",
             "project_root": repository,
+            "config": user_config(json!({"lsp": lsp})),
         })
         .to_string(),
     );
@@ -357,12 +389,19 @@ fn lsp_inspect_classifies_non_python_binary_against_project_root() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|server| server["id"] == "typescript")
-        .expect("TypeScript server inspection");
+        .find(|server| server["id"] == server_id)
+        .expect("non-Python server inspection");
+    assert_eq!(server["kind"], server_id);
     assert_eq!(server["binary_source"], "project_node_modules");
     assert_eq!(
         server["workspace_root"],
-        canonicalize_like_product(&package).display().to_string()
+        canonicalize_like_product(if shared_repository_root {
+            &repository
+        } else {
+            &package
+        })
+        .display()
+        .to_string()
     );
     assert_eq!(
         server["binary_path"],

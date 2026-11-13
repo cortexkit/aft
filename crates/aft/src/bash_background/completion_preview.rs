@@ -489,6 +489,30 @@ impl BgTaskRegistry {
         cache: &TerminalOutputCache,
         paths: Option<&TaskPaths>,
     ) -> (String, bool) {
+        self.masked_terminal_preview(metadata, cache, paths, true)
+    }
+
+    /// Shell replies use the terminal render's cap, not the smaller notice cap,
+    /// but need the same intact-output masking and restart-safety checks.
+    pub(super) fn terminal_preview_for_reply(
+        &self,
+        metadata: &PersistedTask,
+        cache: &TerminalOutputCache,
+        paths: Option<&TaskPaths>,
+    ) -> (String, bool) {
+        if cache.output_preview.is_empty() {
+            return (String::new(), cache.output_truncated);
+        }
+        self.masked_terminal_preview(metadata, cache, paths, false)
+    }
+
+    fn masked_terminal_preview(
+        &self,
+        metadata: &PersistedTask,
+        cache: &TerminalOutputCache,
+        paths: Option<&TaskPaths>,
+        notice: bool,
+    ) -> (String, bool) {
         let task = self.task(&metadata.task_id);
         let guard = task.as_ref().map(|task| {
             task.completion_secrets
@@ -581,8 +605,14 @@ impl BgTaskRegistry {
         }
         let masked_values = secrets.redact(&safe_cache.output_preview);
         safe_cache.output_preview = masked_values.into_owned();
-        let (preview, truncated) =
-            completion_preview_pieces_for_cache(&safe_cache, metadata.exit_code);
+        let (preview, truncated) = if notice {
+            completion_preview_pieces_for_cache(&safe_cache, metadata.exit_code)
+        } else {
+            (
+                super::super::output::PiecedText::whole(&safe_cache.output_preview),
+                safe_cache.output_truncated,
+            )
+        };
         let Some(digest) = metadata.completion_ticket_digest.as_deref() else {
             return (preview.text, truncated);
         };

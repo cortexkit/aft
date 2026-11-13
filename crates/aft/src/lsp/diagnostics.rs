@@ -1396,7 +1396,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("a.ts");
         std::fs::write(&file, "first").unwrap();
-        let key = server_key(ServerKind::TypeScript);
+        let key = server_key(ServerKind::TypeScript(None));
         let mut store = DiagnosticsStore::new();
         store.publish(key, file.clone(), Vec::new());
         let hash = |text: &str| Some(*blake3::hash(text.as_bytes()).as_bytes());
@@ -1419,7 +1419,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("a.ts");
         std::fs::write(&file, "first").unwrap();
-        let key = server_key(ServerKind::TypeScript);
+        let key = server_key(ServerKind::TypeScript(None));
         let mut store = DiagnosticsStore::with_capacity(1);
         store.publish(key.clone(), file.clone(), Vec::new());
         let before = super::super::document::CONTENT_HASH_READS.with(|reads| reads.get());
@@ -1443,7 +1443,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("a.ts");
         std::fs::write(&file, "first").unwrap();
-        let key = server_key(ServerKind::TypeScript);
+        let key = server_key(ServerKind::TypeScript(None));
         let mut store = DiagnosticsStore::new();
         store.publish(key.clone(), file.clone(), Vec::new());
         let before = super::super::document::CONTENT_HASH_READS.with(|reads| reads.get());
@@ -1468,7 +1468,11 @@ mod tests {
         std::fs::write(&target, "first").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let mut store = DiagnosticsStore::new();
-        store.publish(server_key(ServerKind::TypeScript), link.clone(), Vec::new());
+        store.publish(
+            server_key(ServerKind::TypeScript(None)),
+            link.clone(),
+            Vec::new(),
+        );
         assert_eq!(
             store.verified_content_hash(&link),
             Some(*blake3::hash(b"first").as_bytes())
@@ -1492,7 +1496,11 @@ mod tests {
         // SAFETY: path is a live, NUL-terminated string and mode is valid.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         let mut store = DiagnosticsStore::new();
-        store.publish(server_key(ServerKind::TypeScript), file.clone(), Vec::new());
+        store.publish(
+            server_key(ServerKind::TypeScript(None)),
+            file.clone(),
+            Vec::new(),
+        );
 
         let unlocked = std::thread::scope(|scope| {
             let reader = scope.spawn(|| store.verified_content_hash(&file));
@@ -1658,7 +1666,7 @@ mod tests {
             from_lsp_diagnostics(file.clone(), vec![without_source], &ServerKind::Rust).is_empty()
         );
         assert_eq!(
-            from_lsp_diagnostics(file, vec![inactive], &ServerKind::TypeScript).len(),
+            from_lsp_diagnostics(file, vec![inactive], &ServerKind::TypeScript(None)).len(),
             1
         );
     }
@@ -1910,7 +1918,7 @@ mod tests {
 
         let servers = [
             server_key(ServerKind::Rust),
-            server_key(ServerKind::TypeScript),
+            server_key(ServerKind::TypeScript(None)),
             server_key(ServerKind::Python),
             server_key(ServerKind::Biome),
         ];
@@ -2156,7 +2164,7 @@ mod tests {
     fn filtered_counts_apply_keep_predicate() {
         let mut store = DiagnosticsStore::new();
         store.publish(
-            server_key(ServerKind::TypeScript),
+            server_key(ServerKind::TypeScript(None)),
             PathBuf::from("/repo/src/app.ts"),
             vec![diag(
                 "/repo/src/app.ts",
@@ -2166,7 +2174,7 @@ mod tests {
             )],
         );
         store.publish(
-            server_key(ServerKind::TypeScript),
+            server_key(ServerKind::TypeScript(None)),
             PathBuf::from("/repo/src/app.test.ts"),
             vec![diag(
                 "/repo/src/app.test.ts",
@@ -2192,7 +2200,7 @@ mod tests {
         // both surface an identical issue. Raw counting double-counts; the
         // status-bar count must collapse to one (matching inspect sort_and_dedup).
         store.publish(
-            server_key(ServerKind::TypeScript),
+            server_key(ServerKind::TypeScript(None)),
             PathBuf::from(file),
             vec![diag(file, 7, "dup", DiagnosticSeverity::Error)],
         );
@@ -2213,7 +2221,7 @@ mod tests {
         // Two servers, genuinely different diagnostics on the same file — both
         // must be counted (dedup keys on location+message+source, not file).
         store.publish(
-            server_key(ServerKind::TypeScript),
+            server_key(ServerKind::TypeScript(None)),
             PathBuf::from(file),
             vec![diag(file, 7, "type error", DiagnosticSeverity::Error)],
         );
@@ -2230,7 +2238,7 @@ mod tests {
         let mut store = DiagnosticsStore::new();
         let file = "/repo/src/app.ts";
         store.publish(
-            server_key(ServerKind::TypeScript),
+            server_key(ServerKind::TypeScript(None)),
             PathBuf::from(file),
             vec![
                 diag(
@@ -2259,7 +2267,7 @@ mod tests {
     fn environmental_flap_does_not_change_filtered_counts() {
         let mut store = DiagnosticsStore::new();
         let file = "/repo/package.json";
-        let key = server_key(ServerKind::TypeScript);
+        let key = server_key(ServerKind::TypeScript(None));
         let env_msg =
             "Failed to fetch schema from https://json.schemastore.org/package.json: network";
 
@@ -2289,7 +2297,7 @@ mod tests {
         let mut store = DiagnosticsStore::new();
         let file = "/repo/src/mixed.ts";
         store.publish(
-            server_key(ServerKind::TypeScript),
+            server_key(ServerKind::TypeScript(None)),
             PathBuf::from(file),
             vec![
                 diag(

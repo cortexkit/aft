@@ -1098,6 +1098,11 @@ pub struct Config {
     #[serde(skip)]
     pub diagnostics_on_edit: bool,
     pub lsp_idle_minutes: LspIdleMinutes,
+    /// Maximum live language servers, including reserved starts.
+    pub lsp_max_servers: usize,
+    /// Trusted user ceiling before project tightening; not a configure input.
+    #[serde(skip)]
+    pub lsp_user_max_servers: Option<usize>,
     /// Extra directories to search when resolving LSP binaries.
     /// The plugin populates these from its own auto-install cache (e.g.
     /// `~/.cache/aft/lsp-packages/<pkg>/node_modules/.bin/`) so an LSP binary
@@ -1202,6 +1207,8 @@ impl Default for Config {
             disabled_lsp: HashSet::new(),
             diagnostics_on_edit: false,
             lsp_idle_minutes: LspIdleMinutes::default(),
+            lsp_max_servers: 8,
+            lsp_user_max_servers: None,
             lsp_paths_extra: Vec::new(),
             lsp_auto_install_binaries: HashSet::new(),
             lsp_inflight_installs: HashSet::new(),

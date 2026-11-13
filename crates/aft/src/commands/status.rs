@@ -459,7 +459,7 @@ impl AppContext {
         // build wrote as today's stores refuse theirs, and is listed the
         // same way, after them. Push projection adds it itself, with this
         // project's other refusals.
-        let data_store_report = if kind == StatusSnapshotKind::Push {
+        let data_store_report = if kind != StatusSnapshotKind::Explicit {
             crate::data_layer::surfaces::report_for_push(self)
         } else {
             crate::data_layer::surfaces::report(self)
@@ -629,7 +629,9 @@ impl AppContext {
         #[cfg(test)]
         cost.mark("payload");
         if let Some(report) = &data_store_report {
-            if kind == StatusSnapshotKind::Push {
+            if kind == StatusSnapshotKind::Operator {
+                crate::data_layer::surfaces::apply_to_status_operator(&mut payload, report);
+            } else if kind == StatusSnapshotKind::Push {
                 crate::data_layer::surfaces::apply_to_status_push(&mut payload, report);
             } else {
                 crate::data_layer::surfaces::apply_to_status(&mut payload, report);

@@ -721,6 +721,10 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
 /// live. The next connect resolves the files afresh and applies a held loosening.
 fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'static str> {
     let mut held = Vec::new();
+    if candidate.lsp_max_servers > floor.lsp_max_servers {
+        candidate.lsp_max_servers = floor.lsp_max_servers;
+        held.push("lsp.max_servers");
+    }
     if !candidate.lsp_idle_minutes.tightens(floor.lsp_idle_minutes) {
         candidate.lsp_idle_minutes = floor.lsp_idle_minutes;
         held.push("lsp.idle_minutes");
@@ -957,6 +961,8 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("idle.root_ttl_minutes", idle.root_ttl_minutes);
     live!("idle.checkout_hours", idle.checkout_hours);
     live!("lsp.idle_minutes", lsp_idle_minutes);
+    live!("lsp.max_servers", lsp_max_servers);
+    live!("lsp.max_servers", lsp_user_max_servers);
     live!("worktree.ram_overlay", worktree.ram_overlay);
     later!("backup.enabled", backup.enabled);
     later!("backup.max_depth", backup.max_depth);
@@ -1105,6 +1111,8 @@ fn classification_is_exhaustive(config: &Config) {
         disabled_lsp: _,
         diagnostics_on_edit: _,
         lsp_idle_minutes: _,
+        lsp_max_servers: _,
+        lsp_user_max_servers: _,
         url_fetch_allow_private: _,
         disabled_tools: _,
         idle,

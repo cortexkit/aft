@@ -620,6 +620,7 @@ pub(super) struct DispatchPathMetrics {
     /// call, each counted once.
     scoped_routes_with_tool_calls: AtomicU64,
     pub(super) scope_descriptions: StdMutex<super::route_census::ScopeDescriptions>,
+    pub(super) scope_background_tasks: super::scope_background_tasks::Metrics,
 }
 
 impl DispatchPathMetrics {
@@ -679,6 +680,7 @@ impl DispatchPathMetrics {
             presetless_tool_calls: StdMutex::new(BTreeMap::new()),
             scoped_routes_with_tool_calls: AtomicU64::new(0),
             scope_descriptions: StdMutex::new(super::route_census::ScopeDescriptions::default()),
+            scope_background_tasks: Default::default(),
         }
     }
 
@@ -1484,6 +1486,7 @@ impl DispatchPathMetrics {
             "bind_acks": self.bind_ack_snapshot(),
             "reliable_push": reliable_push,
             "tool_call_presets": self.tool_call_preset_snapshot(),
+            "scope_background_tasks": self.scope_background_tasks.snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_queued.load(Ordering::Relaxed),
@@ -4370,12 +4373,13 @@ fn assemble_health_report(
         dispatch_path.insert("mutating_lanes".to_string(), mutating_lanes);
     }
     metrics.insert("dispatch_path".to_string(), dispatch_path);
-    let (awaiting_retry, expired) = super::runner_notices::health();
+    let (awaiting_retry, expired, idle_start_fallback) = super::runner_notices::health();
     metrics.insert(
         "runner_notices".to_string(),
         json!({
             "completions_awaiting_retry": awaiting_retry,
             "completions_expired": expired,
+            "completions_idle_start_fallback": idle_start_fallback,
         }),
     );
     metrics.insert(
@@ -4390,6 +4394,9 @@ fn assemble_health_report(
         "filesystem_helpers".to_string(),
         crate::bounded_io::helper_health(),
     );
+    // Reads over 4 MiB: totals over every site, with only the four busiest
+    // sites detailed so telemetry leaves room for root health diagnostics.
+    metrics.insert("large_reads".to_string(), crate::large_read::health());
     // Routes the fleet status dial stopped reopening after a terminal refusal,
     // each naming its target, session and refusal code. An empty list means
     // no route is stopped.
@@ -9180,11 +9187,11 @@ mod tests {
             .is_none());
     }
 
-    /// A one-root reply has room for the data layer's meaning fill at its
-    /// largest: a fill that waits for another, with every count present,
-    /// large, and a failure, keeps the root's full row within the budget.
-    #[test]
-    fn one_root_reply_fits_the_meaning_fill_at_its_largest() {
+    /// Choose large-read telemetry before the first budget pass, so another
+    /// test's process-wide counters cannot decide whether this root fits.
+    fn largest_meaning_fill_health_metrics(
+        large_reads: Value,
+    ) -> (u64, serde_json::Map<String, Value>) {
         use crate::data_layer::surfaces::{MeaningCoverage, MeaningPlane, MeaningReport};
         let executor = Executor::new();
         let (_dir, root) = test_root("meaning-fill-health-budget");
@@ -9194,10 +9201,27 @@ mod tests {
         let dispatch = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
         refresh_until_root_count(&cache, &executor, &app, 1);
-        let mut report = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
-            .metrics
-            .expect("health metrics");
-        let baseline = report["metrics_bytes"].as_u64().unwrap();
+        let roots = fixture_roots(&executor);
+        let indexing_roots = roots.iter().map(|root| root.as_path()).collect::<Vec<_>>();
+        let mut report = super::assemble_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &dispatch,
+            &app,
+            |warming_roots| {
+                crate::cold_build_limiter::progress::snapshot_for_roots(
+                    &indexing_roots,
+                    warming_roots,
+                )
+            },
+        )
+        .metrics
+        .expect("health metrics");
+        let metrics = report.as_object_mut().unwrap();
+        retain_fixture_process_rows(metrics, &roots);
+        metrics.insert("large_reads".into(), large_reads);
+        let baseline = refresh_metrics_bytes(metrics) as u64;
         let fill = MeaningReport {
             plane: MeaningPlane::Serving {
                 complete: false,
@@ -9229,7 +9253,20 @@ mod tests {
         for (key, value) in fill.as_object().unwrap() {
             semantic.insert(key.clone(), value.clone());
         }
-        let mut metrics = report.as_object().unwrap().clone();
+        (baseline, report.as_object().unwrap().clone())
+    }
+
+    /// With no large reads, a one-root reply has room for the meaning fill
+    /// at its largest, including pending work and a backend failure.
+    #[test]
+    fn one_root_reply_fits_the_meaning_fill_at_its_largest() {
+        let (baseline, mut metrics) = largest_meaning_fill_health_metrics(json!({
+            "count": 0,
+            "bytes": 0,
+            "largest": 0,
+            "sites_active": 0,
+            "top": [],
+        }));
         budget_health_metrics(&mut metrics);
         let bytes = metrics["metrics_bytes"].as_u64().unwrap();
         eprintln!(
@@ -9242,6 +9279,108 @@ mod tests {
         assert_eq!(row["semantic_index"]["files_pending"], 20_988);
         assert_eq!(row["semantic_index"]["stage"], "waiting_for_another_fill");
         assert_eq!(row["semantic_index"]["filling"], true);
+    }
+
+    fn seventeen_active_large_read_sites() -> Value {
+        json!({
+            "count": 17,
+            "bytes": 85_000_000,
+            "largest": 5_000_000,
+            "sites_active": 17,
+            "top": [
+                {"site": "candidate_text", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+                {"site": "data_file", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+                {"site": "degraded_grep", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+                {"site": "exact_corpus", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
+            ],
+        })
+    }
+
+    #[test]
+    fn largest_meaning_fill_with_17_active_large_read_sites_abbreviates_root() {
+        let large_reads = seventeen_active_large_read_sites();
+        let (_, fixture) = largest_meaning_fill_health_metrics(large_reads.clone());
+        for (prefix, separator) in [("/", "/"), ("C:\\", "\\")] {
+            for depth in [2048, 3072] {
+                let path = format!(
+                    "{prefix}{}health-root",
+                    format!("segment{separator}").repeat(depth)
+                );
+                let mut metrics = fixture.clone();
+                // The native report can fit on Windows without abbreviation.
+                // Make the root path itself exceed the budget on every platform;
+                // these are report strings, so no filesystem path limit applies.
+                metrics["roots"][0]["project_root"] = json!(path);
+                let before = refresh_metrics_bytes(&mut metrics);
+                assert!(before > HEALTH_METRICS_BUDGET_BYTES);
+                let original_root = metrics["roots"][0].clone();
+                budget_health_metrics(&mut metrics);
+                let encoded = serde_json::to_vec(&metrics).unwrap();
+                eprintln!(
+                    "17 active large-read sites, path_bytes={}, raw={before}, budgeted={}",
+                    path.len(),
+                    encoded.len()
+                );
+                assert!(encoded.len() <= HEALTH_METRICS_BUDGET_BYTES);
+                assert_eq!(metrics["metrics_bytes"], encoded.len() as u64);
+                assert_eq!(metrics["large_reads"], large_reads);
+                assert_eq!(metrics["root_details_omitted"], 0);
+                let root = &metrics["roots"][0];
+                assert_eq!(root["abbreviated"], true);
+                assert_eq!(root["state"], original_root["state"]);
+                assert_eq!(root["actor_count"], original_root["actor_count"]);
+                assert_eq!(
+                    root["semantic_index"],
+                    json!({"status": original_root["semantic_index"]["status"]})
+                );
+                let identity = root["project_root"].as_str().unwrap();
+                assert!(identity.starts_with("<blake3:"));
+                assert!(identity.ends_with("/health-root"));
+            }
+        }
+    }
+
+    #[test]
+    fn largest_meaning_fill_that_fits_preserves_all_reader_fields() {
+        let large_reads = seventeen_active_large_read_sites();
+        let (_, fixture) = largest_meaning_fill_health_metrics(large_reads.clone());
+        for path in ["/health-root", "C:\\health-root"] {
+            for target_bytes in [12_127, HEALTH_METRICS_BUDGET_BYTES] {
+                let mut root = fixture["roots"][0].clone();
+                root["project_root"] = json!(path);
+                assert_eq!(root["semantic_index"]["files_pending"], 20_988);
+                assert_eq!(root["semantic_index"]["filling"], true);
+                assert!(root.get("abbreviated").is_none());
+                // Keep the real root and read counters, but control ancillary
+                // telemetry so a below-budget reply and the exact byte limit
+                // both exercise the fitting branch independently of the host.
+                let mut metrics = json!({
+                    "actor_count": 1,
+                    "root_count": 1,
+                    "root_details_omitted": 0,
+                    "embedding_backend": {"available": false, "last_error": ""},
+                    "large_reads": large_reads,
+                    "roots": [root],
+                    "metrics_bytes": target_bytes,
+                })
+                .as_object()
+                .unwrap()
+                .clone();
+                let base_bytes = encoded_health_metrics_len(&metrics);
+                assert!(base_bytes < target_bytes);
+                metrics["embedding_backend"]["last_error"] =
+                    json!("e".repeat(target_bytes - base_bytes));
+                assert_eq!(refresh_metrics_bytes(&mut metrics), target_bytes);
+                let expected = metrics.clone();
+                budget_health_metrics(&mut metrics);
+                assert_eq!(metrics, expected);
+                assert_eq!(serde_json::to_vec(&metrics).unwrap().len(), target_bytes);
+                eprintln!(
+                    "fitting largest meaning fill, path={path:?}, bytes={target_bytes}, abbreviated={}",
+                    metrics["roots"][0]["abbreviated"]
+                );
+            }
+        }
     }
 
     #[test]
@@ -9352,6 +9491,9 @@ mod tests {
             "embedding_backend": { "available": true, "last_error": null, "since_ms": null },
             "write_ledger_top_10m": ledger,
             "roots": roots,
+            // Every large-read site at its widest, so the entry's worst
+            // size is part of the budget this test checks.
+            "large_reads": crate::large_read::widest_health_for_test(),
         })
         .as_object()
         .expect("metrics object")
@@ -9360,12 +9502,25 @@ mod tests {
         budget_health_metrics(&mut metrics);
         let encoded =
             serde_json::to_vec(&Value::Object(metrics.clone())).expect("encode budgeted metrics");
+        eprintln!(
+            "health metrics with all 17 large-read sites at u64::MAX: {} bytes; large_reads: {} bytes",
+            encoded.len(),
+            serde_json::to_vec(&metrics["large_reads"]).unwrap().len()
+        );
         assert!(
             encoded.len() <= 12 * 1024,
             "health metrics exceeded SUBC headroom: {} bytes",
             encoded.len()
         );
         assert_eq!(metrics["actor_count"], 71);
+        assert_eq!(
+            metrics["large_reads"]["sites_active"].as_u64(),
+            Some(crate::large_read::site_names().count() as u64)
+        );
+        assert_eq!(metrics["large_reads"]["count"], u64::MAX);
+        assert_eq!(metrics["large_reads"]["bytes"], u64::MAX);
+        assert_eq!(metrics["large_reads"]["largest"], u64::MAX);
+        assert_eq!(metrics["large_reads"]["top"].as_array().unwrap().len(), 4);
         assert_eq!(metrics["root_count"], 71);
         assert!(metrics["embedding_backend"].is_object());
         assert_eq!(

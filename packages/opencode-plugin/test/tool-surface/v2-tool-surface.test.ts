@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { DEFAULT_DISABLED_TOOLS, translateConfigDocument } from "@cortexkit/aft-bridge";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
@@ -18,6 +19,7 @@ import {
 } from "../../src/tools/definitions/v2.js";
 import type { PluginContext } from "../../src/types.js";
 import { renameV2ToolReferences, v2HostToolName } from "../../src/v2-host-tool-names.js";
+import directBase from "./fixtures/v2-direct-base.json";
 
 const ALL_TOOLS_CONFIG: AftConfig = {
   tool_surface: "all",
@@ -100,7 +102,14 @@ async function captureRegistration(config: AftConfig = ALL_TOOLS_CONFIG) {
   await Effect.runPromise(
     registerAftTools(context, LOCATION, sharedDefinitions(config)) as Effect.Effect<void>,
   );
-  return { added, removed, updates, beforeHooks, afterHooks };
+  return {
+    added: added.filter((definition) => !definition.options.codemode),
+    codeMode: added.filter((definition) => definition.options.codemode),
+    removed,
+    updates,
+    beforeHooks,
+    afterHooks,
+  };
 }
 
 function jsonSchema(definition: V2ProviderTool): Record<string, unknown> {
@@ -127,7 +136,7 @@ function canonicalV1Schema(name: string, args: Record<string, unknown>): Record<
 }
 
 describe("OpenCode V2 tool surface", () => {
-  test("registers every selected AFT definition as one non-CodeMode provider tool", async () => {
+  test("keeps every selected AFT definition directly available", async () => {
     const definitions = sharedDefinitions();
     const registration = await captureRegistration();
 
@@ -143,6 +152,62 @@ describe("OpenCode V2 tool surface", () => {
       expect(schema).not.toHaveProperty("oneOf");
       expect(schema).not.toHaveProperty("allOf");
     }
+  });
+
+  test("keeps all direct registration bytes identical to the base", async () => {
+    const { added } = await captureRegistration();
+    // Frozen before the double registration: options and all three provider
+    // envelopes include names, descriptions and schemas, including key order.
+    expect(directBase.base).toBe("13993538e7901a8157e6c5768dfad0f704776961");
+    const hashes = Object.fromEntries(
+      added.map((definition) => [
+        definition.name,
+        createHash("sha256")
+          .update(
+            JSON.stringify({
+              options: definition.options,
+              providers: (["openai", "anthropic", "gemini"] as const).map((provider) =>
+                providerDefinitionBytes(provider, definition),
+              ),
+            }),
+          )
+          .digest("hex"),
+      ]),
+    );
+    expect(hashes).toEqual(directBase.sha256);
+  });
+
+  test("offers exactly seven read-only copies with shared schemas and handlers", async () => {
+    const { added, codeMode } = await captureRegistration();
+    const expected = {
+      read: "read",
+      grep: "grep",
+      glob: "glob",
+      search: "aft_search",
+      outline: "aft_outline",
+      zoom: "aft_zoom",
+      callgraph: "aft_callgraph",
+    };
+    expect(codeMode.map((copy) => copy.name).sort()).toEqual(Object.keys(expected).sort());
+    const direct = new Map(added.map((definition) => [definition.name, definition]));
+    for (const copy of codeMode) {
+      const original = direct.get(expected[copy.name as keyof typeof expected])!;
+      expect(copy.options).toEqual({
+        ...original.options,
+        namespace: "aft.code",
+        permission: original.name,
+        codemode: true,
+      });
+      expect(copy.execute).toBe(original.execute);
+      expect(copy.description).toBe(original.description);
+      expect(jsonSchema(copy)).toEqual(jsonSchema(original));
+    }
+    const names = [...added, ...codeMode].map((definition) =>
+      definition.options.namespace
+        ? `${String(definition.options.namespace).replaceAll(".", "_")}_${definition.name}`
+        : definition.name,
+    );
+    expect(new Set(names).size).toBe(names.length);
   });
 
   test("applies identical V1 and V2 config gates to the closed inventory", async () => {
@@ -162,9 +227,23 @@ describe("OpenCode V2 tool surface", () => {
 
     for (const config of profiles) {
       const definitions = sharedDefinitions(config);
-      const { added } = await captureRegistration(config);
+      const { added, codeMode } = await captureRegistration(config);
       expect(added.map((definition) => definition.name)).toEqual(
         Object.keys(definitions).map(v2HostToolName),
+      );
+      const readOnly = [
+        "read",
+        "grep",
+        "glob",
+        "aft_search",
+        "aft_outline",
+        "aft_zoom",
+        "aft_callgraph",
+      ];
+      expect(codeMode.map((copy) => copy.options.permission).sort()).toEqual(
+        Object.keys(definitions)
+          .filter((name) => readOnly.includes(name))
+          .sort(),
       );
     }
   });

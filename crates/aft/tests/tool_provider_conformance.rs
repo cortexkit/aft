@@ -4368,7 +4368,11 @@ async fn conformance_inventory(subject: Subject) {
     assert_eq!(enabled, expected_enabled);
     assert_eq!(skipped, expected_skipped);
     assert_eq!(inapplicable, expected_inapplicable);
-    for case in ["tool_result_v1_valid", "tool_result_legacy_route_unchanged"] {
+    for case in [
+        "tool_result_v1_valid",
+        "tool_result_legacy_route_unchanged",
+        "catalog_schemas_portable",
+    ] {
         assert_eq!(report.outcome(case), Some(&CaseOutcome::Passed));
         eprintln!(
             "{} ({build}): {case} PASS",

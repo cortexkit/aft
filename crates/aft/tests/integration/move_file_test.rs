@@ -92,7 +92,7 @@ fn move_file_config_rename_notifies_deleted_and_created_in_one_event() {
     )
     .with_test_checkpoint_store();
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     notify_and_wait_for_publish(&ctx, &source, "export const open = 2;\n");
 
     let req: RawRequest = serde_json::from_value(json!({

@@ -1,5 +1,6 @@
 use super::*;
 use crate::lsp::client::ServerExitReason;
+use crate::lsp::registry::builtin_servers;
 use serde_json::json;
 
 pub(crate) struct IdleLspFixture {
@@ -23,16 +24,24 @@ impl IdleLspFixture {
             config.clone(),
         ));
         ctx.lsp().override_binary(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             crate::fake_lsp_test_helper::fake_server_binary(),
         );
         ctx.lsp().set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
         ctx.lsp().set_extra_env("AFT_FAKE_LSP_REPORT_SHUTDOWN", "1");
         let busy = tmp.path().join("busy/index.ts");
         let idle = tmp.path().join("idle/index.ts");
-        for file in [&busy, &idle] {
+        for (index, file) in [&busy, &idle].into_iter().enumerate() {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file.parent().unwrap().join("tsconfig.json"), "{}").unwrap();
+            // Distinct SDKs retain two clients even with a shared repository root.
+            let sdk = file.parent().unwrap().join("node_modules/typescript");
+            std::fs::create_dir_all(&sdk).unwrap();
+            std::fs::write(
+                sdk.join("package.json"),
+                format!(r#"{{"version":"5.9.{index}"}}"#),
+            )
+            .unwrap();
             std::fs::write(file, "export const n = 1;\n").unwrap();
             assert_eq!(
                 settled_lsp(&mut ctx.lsp(), |manager| {
@@ -94,6 +103,316 @@ fn idle_hover_params(file: &Path) -> lsp_types::HoverParams {
         "position": { "line": 0, "character": 0 }
     }))
     .unwrap()
+}
+
+#[test]
+fn server_capacity_evicts_least_recently_used_client_and_clears_its_diagnostics() {
+    let fixture = IdleLspFixture::new();
+    let key = fixture
+        .ctx
+        .lsp()
+        .server_key_for_file(&fixture.idle, &fixture.config)
+        .unwrap();
+    {
+        let mut manager = fixture.ctx.lsp();
+        seed_instance_state(&mut manager, &key, &fixture.idle);
+        manager.make_server_capacity(2, 2).unwrap();
+        assert_eq!(manager.server_count(), 1);
+        assert!(!manager.documents.contains_key(&key));
+        assert!(!manager.server_binaries.contains_key(&key));
+        assert!(!manager
+            .diagnostics
+            .has_report_for_server_file(&key, &fixture.idle));
+    }
+    fixture.assert_only_busy();
+}
+
+#[test]
+fn server_capacity_counts_reservations_refuses_without_caching_and_retries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut manager = LspManager::new();
+    manager.override_binary(
+        ServerKind::TypeScript(None),
+        crate::fake_lsp_test_helper::fake_server_binary(),
+    );
+    let config = Config {
+        lsp_max_servers: 2,
+        ..Config::default()
+    };
+    let def = builtin_servers()
+        .into_iter()
+        .find(|def| matches!(def.kind, ServerKind::TypeScript(_)))
+        .unwrap();
+    let mut prepared = Vec::new();
+    let mut keys = Vec::new();
+    for index in 0..23 {
+        let root = tmp.path().join(format!("package{index}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("index.ts");
+        let key = ServerKey {
+            kind: def.kind.clone(),
+            root,
+        };
+        let start = manager.begin_file_server_start(&def, &key, &file, &config);
+        if index < 2 {
+            let FileServerStart::Spawn(spawn) = start else {
+                panic!("start should reserve capacity")
+            };
+            prepared.push(spawn);
+            keys.push(key);
+        } else {
+            let FileServerStart::Failed(ServerAttemptResult::SpawnFailed { reason, .. }) = start
+            else {
+                panic!("capacity must refuse start")
+            };
+            assert!(reason.contains("language server limit reached (lsp.max_servers=2); all running servers are starting or have pending requests"));
+            assert!(manager.failure_to_replay(&key).is_none());
+        }
+        assert!(manager.server_count() <= 2);
+    }
+    let error = manager.make_server_capacity(2, 2).unwrap_err();
+    assert_eq!(error.durability, FailureDurability::Capacity);
+    let LspError::ServerNotReady(reason) = error.error else {
+        panic!("expected capacity reason")
+    };
+    assert_eq!(reason, "language server limit reached (lsp.max_servers=2); all running servers are starting or have pending requests");
+    manager.release_start_reservation(&keys[0]);
+    let retry = ServerKey {
+        kind: def.kind.clone(),
+        root: tmp.path().join("package22"),
+    };
+    assert!(matches!(
+        manager.begin_file_server_start(&def, &retry, &retry.root.join("index.ts"), &config),
+        FileServerStart::Spawn(_)
+    ));
+    manager.starting.clear();
+}
+
+fn capacity_manager(
+    shared: &Arc<parking_lot::Mutex<ServerCapacity>>,
+) -> Arc<parking_lot::Mutex<LspManager>> {
+    let manager = Arc::new(parking_lot::Mutex::new(LspManager::new()));
+    {
+        let mut locked = manager.lock();
+        locked.set_server_capacity(Arc::clone(shared));
+        locked.enable_background_document_pulls(Arc::downgrade(&manager));
+        locked.override_binary(
+            ServerKind::TypeScript(None),
+            crate::fake_lsp_test_helper::fake_server_binary(),
+        );
+    }
+    manager
+}
+
+#[test]
+fn server_capacity_parallel_roots_reserve_atomically_and_dropped_roots_release_slots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = Arc::new(parking_lot::Mutex::new(ServerCapacity::default()));
+    let managers: Vec<_> = (0..3).map(|_| capacity_manager(&shared)).collect();
+    let barrier = Arc::new(std::sync::Barrier::new(23));
+    let def = builtin_servers()
+        .into_iter()
+        .find(|def| matches!(def.kind, ServerKind::TypeScript(_)))
+        .unwrap();
+    let mut workers = Vec::new();
+    for index in 0..23 {
+        let manager = Arc::clone(&managers[index % managers.len()]);
+        let barrier = Arc::clone(&barrier);
+        let def = def.clone();
+        let root = tmp.path().join(format!("root{index}"));
+        std::fs::create_dir_all(&root).unwrap();
+        workers.push(std::thread::spawn(move || {
+            let config = Config {
+                lsp_max_servers: 8,
+                lsp_user_max_servers: Some(8),
+                ..Config::default()
+            };
+            let key = ServerKey {
+                kind: def.kind.clone(),
+                root,
+            };
+            barrier.wait();
+            let start = manager.lock().begin_file_server_start(
+                &def,
+                &key,
+                &key.root.join("index.ts"),
+                &config,
+            );
+            matches!(start, FileServerStart::Spawn(_))
+        }));
+    }
+    assert_eq!(
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|started| *started)
+            .count(),
+        8
+    );
+    assert_eq!(
+        managers
+            .iter()
+            .map(|manager| manager.lock().server_count())
+            .sum::<usize>(),
+        8
+    );
+    assert_eq!(
+        shared
+            .lock()
+            .slots
+            .iter()
+            .filter(|slot| slot.strong_count() > 0)
+            .count(),
+        8
+    );
+    drop(managers);
+    assert!(shared
+        .lock()
+        .slots
+        .iter()
+        .all(|slot| slot.strong_count() == 0));
+    let manager = capacity_manager(&shared);
+    assert!(manager.lock().make_server_capacity(1, 8).is_ok());
+}
+
+#[test]
+fn server_capacity_two_manager_start_race_never_waits_on_the_other_manager() {
+    let shared = Arc::new(parking_lot::Mutex::new(ServerCapacity::default()));
+    let first = capacity_manager(&shared);
+    let second = capacity_manager(&shared);
+    let slot = first.lock().make_server_capacity(8, 1).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let workers: Vec<_> = [first, second]
+        .into_iter()
+        .map(|manager| {
+            let barrier = Arc::clone(&barrier);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut manager = manager.lock();
+                barrier.wait();
+                tx.send(manager.make_server_capacity(8, 1).unwrap_err().durability)
+                    .unwrap();
+            })
+        })
+        .collect();
+    for _ in 0..2 {
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            FailureDurability::Capacity
+        );
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    drop(slot);
+}
+
+#[test]
+fn server_capacity_evicts_global_lru_without_spreading_a_project_limit_to_peers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = Arc::new(parking_lot::Mutex::new(ServerCapacity::default()));
+    let first = capacity_manager(&shared);
+    let second = capacity_manager(&shared);
+    let config = Config {
+        lsp_max_servers: 8,
+        lsp_user_max_servers: Some(2),
+        ..Config::default()
+    };
+    let files: Vec<_> = (0..3)
+        .map(|index| {
+            let root = tmp.path().join(format!("project{index}"));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
+            let file = root.join("index.ts");
+            std::fs::write(&file, "export const value = 1;").unwrap();
+            file
+        })
+        .collect();
+    let mut tightened = config.clone();
+    tightened.lsp_max_servers = 1;
+    assert_eq!(
+        settled_lsp(&mut first.lock(), |manager| manager
+            .ensure_server_for_file(&files[0], &tightened))
+        .len(),
+        1
+    );
+    assert_eq!(
+        settled_lsp(&mut second.lock(), |manager| manager
+            .ensure_server_for_file(&files[1], &config))
+        .len(),
+        1
+    );
+    first
+        .lock()
+        .clients
+        .values_mut()
+        .next()
+        .unwrap()
+        .set_last_used_at_for_test(Instant::now() - Duration::from_secs(300));
+    assert_eq!(
+        settled_lsp(&mut second.lock(), |manager| manager
+            .ensure_server_for_file(&files[2], &config))
+        .len(),
+        1
+    );
+    assert_eq!(first.lock().server_count(), 0);
+    assert_eq!(second.lock().server_count(), 2);
+}
+
+#[test]
+fn server_capacity_prepare_failure_releases_its_process_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = Arc::new(parking_lot::Mutex::new(ServerCapacity::default()));
+    let manager = capacity_manager(&shared);
+    let def = builtin_servers()
+        .into_iter()
+        .find(|def| matches!(def.kind, ServerKind::TypeScript(_)))
+        .unwrap();
+    let key = ServerKey {
+        kind: def.kind.clone(),
+        root: tmp.path().to_path_buf(),
+    };
+    manager
+        .lock()
+        .override_binary(def.kind.clone(), tmp.path().join("missing"));
+    assert!(matches!(
+        manager.lock().begin_file_server_start(
+            &def,
+            &key,
+            &tmp.path().join("index.ts"),
+            &Config::default()
+        ),
+        FileServerStart::Failed(_)
+    ));
+    assert!(manager.lock().capacity_slots.is_empty());
+    assert!(shared
+        .lock()
+        .slots
+        .iter()
+        .all(|slot| slot.strong_count() == 0));
+}
+
+#[cfg(unix)]
+#[test]
+fn server_capacity_does_not_evict_pending_requests_and_retries_when_finished() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut manager = LspManager::new();
+    let mut client = sleeping_rust_client(&manager, tmp.path());
+    let request = client
+        .start_request::<lsp_types::request::HoverRequest>(idle_hover_params(
+            &tmp.path().join("lib.rs"),
+        ))
+        .unwrap();
+    manager.clients.insert(key(tmp.path()), client);
+    assert_eq!(
+        manager.make_server_capacity(1, 1).unwrap_err().durability,
+        FailureDurability::Capacity
+    );
+    assert_eq!(manager.clients.len(), 1);
+    assert!(request.wait(Duration::ZERO).is_err());
+    manager.make_server_capacity(1, 1).unwrap();
+    assert_eq!(manager.server_count(), 0);
 }
 
 #[test]
@@ -234,10 +553,9 @@ fn idle_lsp_document_notifications_refresh_last_use_but_push_diagnostics_do_not(
     let old = Instant::now() - Duration::from_secs(301);
     let mut manager = fixture.ctx.lsp();
     // The manager's own key root, canonical on every platform.
-    let server_root = manager
+    let server_key = manager
         .server_key_for_file(&fixture.idle, &fixture.config)
-        .unwrap()
-        .root;
+        .unwrap();
     let client = manager
         .client_for_file_mut(&fixture.idle, &fixture.config)
         .unwrap();
@@ -272,8 +590,8 @@ fn idle_lsp_document_notifications_refresh_last_use_but_push_diagnostics_do_not(
     manager
         .handle_event(
             &LspEvent::Notification {
-                server_kind: ServerKind::TypeScript,
-                root: server_root,
+                server_kind: server_key.kind,
+                root: server_key.root,
                 method: "textDocument/publishDiagnostics".into(),
                 params: Some(json!({"uri": uri.as_str(), "diagnostics": []})),
             }
@@ -544,7 +862,11 @@ fn overflow_drift_scan_hashes_each_path_once_across_servers() {
     let file = tmp.path().join("main.rs");
     std::fs::write(&file, "fn main() {}\n").unwrap();
     let mut manager = LspManager::new();
-    for kind in [ServerKind::Rust, ServerKind::TypeScript, ServerKind::Biome] {
+    for kind in [
+        ServerKind::Rust,
+        ServerKind::TypeScript(None),
+        ServerKind::Biome,
+    ] {
         manager
             .documents
             .entry(ServerKey {

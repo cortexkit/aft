@@ -53,6 +53,23 @@ pub(crate) struct ProjectTypeScript {
 }
 
 impl ProjectTypeScript {
+    /// Use the loaded SDK's version across copied installations; unknown
+    /// versions share only when they resolve to the same executable.
+    pub(crate) fn server_identity(&self, native: bool) -> std::sync::Arc<str> {
+        if self.major().is_some() {
+            return std::sync::Arc::from(self.version.as_str());
+        }
+        let executable = if native {
+            resolve_native_binary(self).unwrap_or_else(|_| self.package_dir.join("bin/tsc"))
+        } else {
+            self.package_dir.join("lib/tsserver.js")
+        };
+        std::sync::Arc::from(
+            crate::inspect::job::canonicalize_normalized(&executable)
+                .to_string_lossy()
+                .as_ref(),
+        )
+    }
     /// Leading integer of the version ("7.0.2" and "7.1.0-dev.1" are both 7).
     pub(crate) fn major(&self) -> Option<u64> {
         let digits: String = self
@@ -323,11 +340,12 @@ pub(crate) fn project_typescript_for(
     find_project_typescript_package(&source_file, boundary)
 }
 
-/// A TypeScript 7+ installation chosen for a file, and its native binary when
-/// it resolves.
+/// An installation chosen for a file, its resolved SDK identity, and the native
+/// binary when this is a TypeScript 7+ compiler and the binary resolves.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativeTypeScript {
+pub(crate) struct SelectedTypeScript {
     pub(crate) project: ProjectTypeScript,
+    pub(crate) identity: std::sync::Arc<str>,
     pub(crate) binary: Option<PathBuf>,
 }
 
@@ -343,7 +361,7 @@ type SelectionKey = (PathBuf, Option<PathBuf>, u64, u64, Option<u64>);
 
 static SELECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Memo of [`native_typescript_for`] results.
+/// Memo of [`typescript_for_server`] results.
 ///
 /// The applicability walk and scoped inspect ask which TypeScript server
 /// serves every TS/JS file they visit, and each answer costs a canonicalize,
@@ -352,26 +370,25 @@ static SELECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// so the answer is memoized per directory and repeated lookups are one hash
 /// probe. It is emptied on configure and when a watched path that can change
 /// the answer changes (see [`invalidate_typescript_selection`]).
-fn selection_memo() -> &'static parking_lot::Mutex<HashMap<SelectionKey, Option<NativeTypeScript>>>
+fn selection_memo() -> &'static parking_lot::Mutex<HashMap<SelectionKey, Option<SelectedTypeScript>>>
 {
-    static MEMO: OnceLock<parking_lot::Mutex<HashMap<SelectionKey, Option<NativeTypeScript>>>> =
+    static MEMO: OnceLock<parking_lot::Mutex<HashMap<SelectionKey, Option<SelectedTypeScript>>>> =
         OnceLock::new();
     MEMO.get_or_init(Default::default)
 }
 
-/// The TypeScript 7+ installation that serves `source_file`, or `None` when
-/// its nearest installed TypeScript is not the native compiler (or there is
-/// none). `server_root` is only called when the answer is not memoized; it
+/// The installed TypeScript that serves `source_file`, or `None` when none
+/// resolves. `server_root` is only called when the answer is not memoized; it
 /// bounds the walk when the file is outside `project_root`. `markers` is a
 /// fingerprint of the root markers that `server_root` uses, so definitions
 /// with different markers do not share answers.
-pub(crate) fn native_typescript_for(
+pub(crate) fn typescript_for_server(
     source_file: &Path,
     project_root: Option<&Path>,
     markers: u64,
     mode: super::roots::RootPathMode,
     server_root: impl FnOnce() -> Option<PathBuf>,
-) -> Option<NativeTypeScript> {
+) -> Option<SelectedTypeScript> {
     let start = source_file.parent()?;
     let key = (
         start.to_path_buf(),
@@ -398,10 +415,24 @@ pub(crate) fn native_typescript_for(
                     .unwrap_or(&root);
                 find_project_typescript_package(source_file, boundary)
             }
-        }
-        .filter(ProjectTypeScript::is_native_compiler)?;
-        let binary = resolve_native_binary(&project).ok();
-        Some(NativeTypeScript { project, binary })
+        }?;
+        let binary = project
+            .is_native_compiler()
+            .then(|| resolve_native_binary(&project).ok())
+            .flatten();
+        let identity = if project.is_native_compiler() {
+            project.server_identity(true)
+        } else {
+            project
+                .resolved_tsserver()
+                .unwrap_or_else(|| project.clone())
+                .server_identity(false)
+        };
+        Some(SelectedTypeScript {
+            project,
+            identity,
+            binary,
+        })
     });
     let mut memo = selection_memo().lock();
     if memo.len() >= SELECTION_MEMO_CAPACITY {
@@ -417,87 +448,26 @@ pub(crate) fn clear_typescript_selection() {
     // must not become a reusable answer about the changed installation.
     SELECTION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     selection_memo().lock().clear();
-    shared_root_memo().lock().clear();
 }
 
-/// Maps (nearest TypeScript root marker directory, project root) to the root
-/// the shared TypeScript server for that directory runs at. Emptied together
-/// with the selection memo.
-type SharedRootMemo = parking_lot::Mutex<HashMap<(PathBuf, PathBuf, u64, Option<u64>), PathBuf>>;
-
-fn shared_root_memo() -> &'static SharedRootMemo {
-    static MEMO: OnceLock<SharedRootMemo> = OnceLock::new();
-    MEMO.get_or_init(Default::default)
-}
-
-/// The workspace root for the `typescript-language-server` that serves the
-/// package whose nearest root marker directory is `nearest`.
+/// The workspace root for either TypeScript server serving `nearest`.
 ///
 /// One server can serve many packages: tsserver resolves each opened file's
 /// own tsconfig, and runs several configured projects in one process. What it
 /// cannot do is run two TypeScript versions, because the server loads one
-/// `tsserver.js`. So the root moves up from `nearest` through every ancestor
-/// with a root marker that sees the same installed TypeScript version, and
-/// stops at the first ancestor that sees a different one (or none, when
-/// `nearest` has one). Packages that each install the same version then
-/// share the server at the project root instead of starting one per package.
+/// SDK. The server kind carries that SDK identity independently of the root,
+/// so even packages pinned to different versions can use the repository root.
+/// A repository needs no root package.json or hoisted TypeScript installation.
 pub(crate) fn shared_typescript_server_root(
     nearest: &Path,
     project_root: &Path,
-    has_marker: impl Fn(&Path) -> bool,
     mode: super::roots::RootPathMode,
 ) -> PathBuf {
     let project_root = mode.resolve(project_root);
     if !nearest.starts_with(&project_root) {
         return nearest.to_path_buf();
     }
-    let key = (
-        nearest.to_path_buf(),
-        project_root.clone(),
-        SELECTION_GENERATION.load(std::sync::atomic::Ordering::Acquire),
-        super::applicability_cache::capture_id(),
-    );
-    if let Some(root) = shared_root_memo().lock().get(&key) {
-        return root.clone();
-    }
-    // Compare the SDK that will actually be loaded, rather than a shim's
-    // version. Unreadable versions only share when their real paths match.
-    let typescript_of = |dir: &Path| {
-        find_project_typescript_package(&dir.join("package.json"), &project_root).map(|found| {
-            let sdk = found.resolved_tsserver().unwrap_or(found);
-            if sdk.major().is_none() {
-                crate::inspect::job::canonicalize_normalized(&sdk.package_dir)
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                sdk.version
-            }
-        })
-    };
-    let own = typescript_of(nearest);
-    let mut chosen = nearest.to_path_buf();
-    let mut current = nearest.parent();
-    while let Some(dir) = current {
-        if !dir.starts_with(&project_root) {
-            break;
-        }
-        if has_marker(dir) {
-            if typescript_of(dir) != own {
-                break;
-            }
-            chosen = dir.to_path_buf();
-        }
-        if dir == project_root {
-            break;
-        }
-        current = dir.parent();
-    }
-    let mut memo = shared_root_memo().lock();
-    if memo.len() >= SELECTION_MEMO_CAPACITY {
-        memo.clear();
-    }
-    memo.insert(key, chosen.clone());
-    chosen
+    project_root
 }
 
 /// Whether a change to `path` can change which TypeScript server a file gets:

@@ -322,7 +322,7 @@ fn configure_fake_scope_lsp(ctx: &AppContext) {
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
 }
 
@@ -361,7 +361,7 @@ fn inspect(ctx: &AppContext, payload: Value) -> Value {
             ctx.lsp()
                 .override_binary(ServerKind::Rust, fake_server_path());
             ctx.lsp()
-                .override_binary(ServerKind::TypeScript, fake_server_path());
+                .override_binary(ServerKind::TypeScript(None), fake_server_path());
             ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
         }
     }
@@ -887,7 +887,7 @@ fn scoped_inspect_does_not_wait_for_blocked_tier2() {
         threads.spawn(|| {
             for ctx in [&linked_ctx, &owner_ctx] {
                 ctx.lsp()
-                    .override_binary(ServerKind::TypeScript, fake_server_path());
+                    .override_binary(ServerKind::TypeScript(None), fake_server_path());
                 ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
                 for sections in [json!("diagnostics"), Value::Null] {
                     let response = handle_inspect_tool_call(
@@ -1911,7 +1911,7 @@ fn inspect_command_diagnostics_unverified_report_without_a_live_server_returns_p
     let ctx = configured_context(&root);
     ctx.lsp()
         .diagnostics_store_mut_for_test()
-        .publish_with_kind(ServerKind::TypeScript, file.clone(), Vec::new());
+        .publish_with_kind(ServerKind::TypeScript(None), file.clone(), Vec::new());
     ctx.lsp().certify_diagnostic_content_for_test(&file);
     assert!(ctx.lsp().has_authoritative_report_for_file(&file));
 
@@ -2099,7 +2099,7 @@ fn scoped_typescript_file_inspect_starts_only_its_workspace() {
     }
     let ctx = configured_context(&root);
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
     ctx.lsp()
@@ -2122,7 +2122,7 @@ fn scoped_typescript_file_inspect_starts_only_its_workspace() {
     let active = ctx.lsp().active_server_keys();
     assert_eq!(response["scope_files"], 1, "scope was lost: {response:#}");
     assert_eq!(active.len(), 1, "response: {response:#}");
-    assert_eq!(active[0].kind, ServerKind::TypeScript);
+    assert_eq!(active[0].kind, ServerKind::TypeScript(None));
     // No package installs its own TypeScript, so every package sees the same
     // (none) and one server at the outermost TypeScript root serves them all;
     // the scope still starts only that one server, not one per package.
@@ -2219,7 +2219,7 @@ fn wrangler_rust_fixture() -> (tempfile::TempDir, PathBuf) {
 fn configure_fake_rust_and_typescript_lsp(ctx: &AppContext) {
     configure_fake_rust_lsp(ctx);
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
 }
 
 fn active_server_kinds(ctx: &AppContext) -> Vec<ServerKind> {
@@ -4379,7 +4379,7 @@ fn scoped_rust_inspect_omits_the_note_of_a_typescript_server_started_earlier() {
 
     let rust = scoped_diagnostics_inspect(&ctx, "inspect-notes-rust", "src/lib.rs");
     assert!(
-        active_server_kinds(&ctx).contains(&ServerKind::TypeScript),
+        active_server_kinds(&ctx).contains(&ServerKind::TypeScript(None)),
         "precondition: the TypeScript server is still running"
     );
     assert!(
@@ -4486,7 +4486,7 @@ fn publish_external_typescript_report(
 ) {
     ctx.lsp().diagnostics_store_mut_for_test().publish(
         ServerKey {
-            kind: ServerKind::TypeScript,
+            kind: ServerKind::TypeScript(None),
             root: root.to_path_buf(),
         },
         crate::helpers::canonicalize_like_product(file),
@@ -4905,9 +4905,7 @@ fn install_content_pull_native_typescript(package_root: &Path) -> ServerKind {
         "package.json",
         "{\"name\":\"typescript\",\"version\":\"7.0.0\"}\n",
     );
-    ServerKind::TypeScriptNative(Arc::from(
-        crate::helpers::canonicalize_like_product(&package_dir).as_path(),
-    ))
+    ServerKind::TypeScriptNative(Arc::from("7.0.0"))
 }
 
 fn configure_content_pull_typescript_lsp(ctx: &AppContext, native: ServerKind) {
@@ -4918,6 +4916,39 @@ fn configure_content_pull_typescript_lsp(ctx: &AppContext, native: ServerKind) {
         .set_extra_env("AFT_FAKE_LSP_PULL_FROM_CONTENT", "1");
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_SERVER_NAME", "typescript-go");
+}
+
+#[test]
+fn server_capacity_inspect_is_partial_with_producer_and_file_gaps_then_retries() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::helpers::canonicalize_like_product(temp.path());
+    write_file(&root, "tsconfig.json", "{}");
+    write_file(&root, "broken.ts", "export const value = BROKEN;\n");
+    let native = install_content_pull_native_typescript(&root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native);
+    ctx.update_config(|config| config.lsp_max_servers = 0);
+    let refused = scoped_diagnostics_inspect(&ctx, "capacity-refused", "broken.ts");
+    assert_eq!(refused["complete"], false, "{refused:#}");
+    assert_eq!(refused["inspect_terminal"], "partial", "{refused:#}");
+    let gaps = refused["gaps"].as_array().unwrap();
+    for code in ["failed_producer", "uncovered_file"] {
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["kind"] == code || gap["code"] == code),
+            "missing {code}: {refused:#}"
+        );
+    }
+    assert!(gaps.iter().any(|gap| gap.to_string().contains("language server limit reached (lsp.max_servers=0); all running servers are starting or have pending requests")), "{refused:#}");
+    ctx.update_config(|config| config.lsp_max_servers = 1);
+    let retried = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "capacity-retry", "broken.ts")
+    });
+    assert_eq!(retried["complete"], true, "{retried:#}");
+    assert_eq!(
+        retried["summary"]["diagnostics"]["errors"], 1,
+        "{retried:#}"
+    );
 }
 
 #[test]
@@ -5491,7 +5522,7 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     let ctx = configured_context(&root);
     configure_fake_rust_lsp(&ctx);
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
     crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
         startup_manager.ensure_file_open(&pre_opened, &ctx.config())
@@ -5911,7 +5942,7 @@ fn scoped_typescript_inspect_preserves_missing_gopls_mask() {
         config.disabled_lsp.insert("oxlint".into());
     });
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     ctx.lsp()
         .override_binary(ServerKind::Go, root.join("missing-gopls"));
     // Configure takes the project-wide applicability snapshot after the test's
@@ -6003,7 +6034,7 @@ fn held_typescript_with_missing_gopls(
         config.disabled_lsp.insert("oxlint".into());
     });
     ctx.lsp()
-        .override_binary(ServerKind::TypeScript, fake_server_path());
+        .override_binary(ServerKind::TypeScript(None), fake_server_path());
     ctx.lsp()
         .override_binary(ServerKind::Go, root.join("missing-gopls"));
     // Supersedes configure's held walk with one for the configuration above.

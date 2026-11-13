@@ -1107,7 +1107,7 @@ mod tests {
             2,
             Some(&root_a),
             Some(&root_a),
-            Some(&ServerKind::TypeScript),
+            Some(&ServerKind::TypeScript(None)),
         );
         reg.track_child(3, Some(&root_b), Some(&root_b), Some(&ServerKind::Rust));
         let mut rust_a = reg.pids_for_server(&root_a, &ServerKind::Rust);

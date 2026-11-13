@@ -44,6 +44,8 @@ use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 mod engines;
 mod fold;
 #[cfg(test)]
+pub(super) mod publication_tests;
+#[cfg(test)]
 mod todo_tests;
 
 pub use fold::{FoldReport, Folded, OtherFoldReport};
@@ -2352,6 +2354,15 @@ impl Checkout {
                 .map(|&index| GraphSegment::open(segment(index)).map_err(DataError::store))
                 .collect::<Result<Vec<_>, _>>()?;
             let locator = TextLocator::build(&texts).map_err(DataError::store)?;
+            // Sibling worktrees usually name the same units. Their newest
+            // holders depend only on this snapshot, not on the member asking.
+            // Cache misses too, so absent units keep the same unusable-segment
+            // fallback without searching every table again for every sibling.
+            let mut record_holders = HashMap::new();
+            let mut fragment_holders = HashMap::new();
+            let reuse = states.len() > 1;
+            #[cfg(test)]
+            let reuse = reuse && publication_tests::reuse_lookups();
             let mut needs_unusable = false;
             for (member, state) in states.iter().enumerate() {
                 for (position, record) in state.paths().iter().enumerate() {
@@ -2372,7 +2383,18 @@ impl Checkout {
                     if !record.language.is_empty() {
                         let key =
                             RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
-                        match newest_holder(&contents, |content| content.find(key))? {
+                        let holder = if reuse {
+                            *match record_holders.entry(key) {
+                                std::collections::hash_map::Entry::Occupied(entry) => {
+                                    entry.into_mut()
+                                }
+                                std::collections::hash_map::Entry::Vacant(entry) => entry
+                                    .insert(newest_holder(&contents, |content| content.find(key))?),
+                            }
+                        } else {
+                            newest_holder(&contents, |content| content.find(key))?
+                        };
+                        match holder {
                             Some(holder) => {
                                 needed[usable[holder]] = true;
                                 note(member, ReadUnit::Record(key), usable[holder]);
@@ -2382,7 +2404,19 @@ impl Checkout {
                     }
                     if let Some(fragment) = state.fragment(position) {
                         let key = FragmentKey::from_digest(fragment);
-                        match newest_holder(&graphs, |graph| graph.find(key))? {
+                        let holder = if reuse {
+                            *match fragment_holders.entry(key) {
+                                std::collections::hash_map::Entry::Occupied(entry) => {
+                                    entry.into_mut()
+                                }
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    entry.insert(newest_holder(&graphs, |graph| graph.find(key))?)
+                                }
+                            }
+                        } else {
+                            newest_holder(&graphs, |graph| graph.find(key))?
+                        };
+                        match holder {
                             Some(holder) => {
                                 needed[usable[holder]] = true;
                                 note(member, ReadUnit::Fragment(key), usable[holder]);
@@ -2981,6 +3015,8 @@ impl Checkout {
     /// ([`Self::start_from_sibling`]).
     fn publish_changes_as(&self, by_build: bool) -> Result<Option<DeltaReport>, DataError> {
         let started = Instant::now();
+        #[cfg(test)]
+        let mut phase = publication_tests::phase("prepare");
         let (published, changes, covered, text) = {
             let live = self.live.read().expect("no panics while holding it");
             let Some(published) = live.published.clone() else {
@@ -3114,16 +3150,22 @@ impl Checkout {
         // this segment, and that checkout would read it from here; once
         // this checkout edited it away, the other one would keep this
         // segment in the store alone, without ever counting it as its own.
+        #[cfg(test)]
+        publication_tests::next_phase(&mut phase, "reuse");
         let read_by_others = self.read_by_others(&snapshot)?;
         let mut shared = read_by_others
             .as_ref()
             .map_or_else(SharedUnits::default, |read| {
                 read.leave_out(Some(&mut text_units), None, |_| true)
             });
+        #[cfg(test)]
+        publication_tests::next_phase(&mut phase, "write");
         let mut pending = session.create_segment().map_err(DataError::store)?;
         text_units
             .write(pending.writer())
             .map_err(DataError::store)?;
+        #[cfg(test)]
+        publication_tests::next_phase(&mut phase, "sections");
         let fragments = {
             // As `write_sections` writes them, from each file's resolution
             // decoded in turn. The content sections hold exactly the changed
@@ -3156,6 +3198,8 @@ impl Checkout {
                 .finish(pending.writer(), None)
                 .map_err(DataError::Store)?
         };
+        #[cfg(test)]
+        publication_tests::next_phase(&mut phase, "state");
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         let per_path = inputs
             .state
@@ -3189,9 +3233,13 @@ impl Checkout {
         // editing the same files reads few segments and so is seldom built
         // again: without this, every publication of its changes stayed in
         // the store, one more open file each.
+        #[cfg(test)]
+        publication_tests::next_phase(&mut phase, "retirement");
         let unneeded = self.unneeded(&state, true)?;
         let retired_segments = unneeded.segments.len();
         let retired_checkouts = unneeded.checkouts.len();
+        #[cfg(test)]
+        publication_tests::next_phase(&mut phase, "commit");
         session
             .publish(&Publication {
                 add_segments: vec![segment],
@@ -3204,6 +3252,8 @@ impl Checkout {
         // reader holds them.
         let _ = session.reclaim();
         drop(session);
+        #[cfg(test)]
+        publication_tests::next_phase(&mut phase, "accounting");
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         let read = self.segments_read_by(&snapshot, &[&state])?;
         // A segment another checkout reads too holds what this checkout
@@ -3234,6 +3284,8 @@ impl Checkout {
             retired_checkouts,
             ms: 0.0,
         };
+        #[cfg(test)]
+        publication_tests::next_phase(&mut phase, "serve");
         let served = self.serve_new(snapshot, covered)?;
         // The engine resolved what this publication holds: it goes on from
         // there.
@@ -4601,7 +4653,7 @@ struct SegmentsRead {
 }
 
 /// A unit a checkout's state reads from a segment.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ReadUnit {
     Text(ContentKey),
     Record(RecordKey),
@@ -4663,6 +4715,8 @@ fn newest_holder<T>(
         let Some(segment) = segment else {
             continue;
         };
+        #[cfg(test)]
+        publication_tests::note_holder_probe();
         if find(segment).map_err(DataError::store)?.is_some() {
             return Ok(Some(index));
         }

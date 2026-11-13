@@ -1227,7 +1227,7 @@ impl DiagnosticsCollection {
                 sweep
                     .and_then(|sweep| sweep.unanswered.get(file))
                     .filter(|(key, reason)| {
-                        matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript)
+                        matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript(_))
                             || reason.starts_with("analysis_progress_pending:")
                             || ctx.lsp().analysis_progress_authority(key).is_some()
                     })
@@ -1737,7 +1737,7 @@ fn missing_dependency_hint(
     // directory that also has a `package.json` is not an install problem.
     let node_package_server = matches!(
         failure.server_key.kind,
-        ServerKind::TypeScript
+        ServerKind::TypeScript(_)
             | ServerKind::Biome
             | ServerKind::Oxlint
             | ServerKind::Vue
@@ -1987,7 +1987,7 @@ mod payload_count_tests {
                 (
                     file.clone(),
                     ServerKey {
-                        kind: ServerKind::TypeScript,
+                        kind: ServerKind::TypeScript(None),
                         root: external.clone(),
                     },
                 ),
@@ -2279,8 +2279,10 @@ mod payload_count_tests {
         std::fs::write(web.join("package.json"), "{}\n").expect("package.json");
 
         let mut collection = DiagnosticsCollection::default();
-        collection
-            .record_producer_failures(&[binary_missing(ServerKind::TypeScript, &web)], project);
+        collection.record_producer_failures(
+            &[binary_missing(ServerKind::TypeScript(None), &web)],
+            project,
+        );
         assert_eq!(
             collection.producer_failures["typescript"],
             "typescript-language-server is unavailable; no node_modules in web: the project's \
@@ -2390,7 +2392,7 @@ mod payload_count_tests {
         // resolver also searches: the binary is missing for another reason.
         std::fs::create_dir_all(project.join("node_modules")).expect("node_modules");
         assert_eq!(
-            missing_dependency_hint(&binary_missing(ServerKind::TypeScript, &web), project),
+            missing_dependency_hint(&binary_missing(ServerKind::TypeScript(None), &web), project),
             None
         );
     }

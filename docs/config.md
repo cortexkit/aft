@@ -945,6 +945,25 @@ their defaults.
 
 ## Language servers (LSP)
 
+`lsp.max_servers` limits live language-server clients plus starts in progress
+across the AFT process. The default is `8`; use a nonnegative integer (`0`
+prevents new starts). Before refusing a start, AFT detaches and stops the least
+recently used client that is not starting and has no pending requests. If all
+slots are busy, diagnostics inspection is **PARTIAL**, with `failed_producer`
+and `uncovered_file` gaps naming the server that could not run and the files
+left unchecked. A later request retries rather than caching the capacity
+failure. Project config may lower, but never raise, the user's value
+(or the default when unset). A project's lower value limits that root's share,
+not the process budget available to other roots. The limit applies to all
+language-server kinds.
+
+TypeScript packages in one repository share a server per resolved SDK version,
+even with separate `node_modules` installs and no root `package.json`. Packages
+pinned to different SDKs keep separate servers and diagnostics at the same
+repository root. Native TypeScript servers follow the same rule. An unreadable
+version falls back to the canonical executable path instead of merging unknown
+SDKs. Each opened file still uses its nearest TypeScript project configuration.
+
 `lsp.idle_minutes` is **minutes since the last AFT tool call on that repository**,
 not time since the language server last emitted a diagnostic. It defaults to
 `60`; integer values are clamped to `5..=1440`. Set it to `"never"` to disable

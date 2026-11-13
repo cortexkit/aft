@@ -781,6 +781,7 @@ fn configs_equal_including_runtime_only_fields(previous: &Config, next: &Config)
     serialized_equal
         && previous.foreground_wait_window_ms == next.foreground_wait_window_ms
         && previous.diagnostics_on_edit == next.diagnostics_on_edit
+        && previous.lsp_user_max_servers == next.lsp_user_max_servers
         && previous.semantic.subc_connection_file == next.semantic.subc_connection_file
         && previous.semantic.route_project_root == next.semantic.route_project_root
         && previous.semantic.route_harness == next.semantic.route_harness

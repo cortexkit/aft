@@ -451,7 +451,8 @@ fn cold_server_start_leaves_the_lsp_manager_free_and_is_shared() {
     while std::time::Instant::now() < probe_deadline {
         if let Some(lsp) = ctx.try_lsp() {
             // The server is still initializing: no client is published yet.
-            assert_eq!(lsp.server_count(), 0);
+            assert_eq!(lsp.active_client_count(), 0);
+            assert_eq!(lsp.server_count(), 1, "the shared start reserves one slot");
             acquired = true;
             break;
         }

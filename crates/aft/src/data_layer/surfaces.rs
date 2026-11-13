@@ -912,7 +912,8 @@ struct DiskSample {
 
 /// Physical bytes are a timestamped measurement, not a generation invariant:
 /// temporary files can grow without publishing a generation. All checkouts of
-/// a family share one coalesced sampler; no push walks the family directory.
+/// a family share one coalesced sampler; push and operator reads never walk the
+/// family directory on the caller's thread.
 #[derive(Default)]
 pub(crate) struct DiskMeasurement {
     sample: std::sync::Mutex<DiskSample>,
@@ -1283,6 +1284,11 @@ pub(crate) fn apply_to_status_push(payload: &mut Value, report: &DataStoreReport
     apply_to_status_inner(payload, report, true)
 }
 
+/// Operator reads return the last measurement while a coalesced sampler refreshes it.
+pub(crate) fn apply_to_status_operator(payload: &mut Value, report: &DataStoreReport) {
+    apply_to_status_inner(payload, report, true)
+}
+
 fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bool) {
     payload["search_index"] = report.search_index_json();
     if let Some(meaning) = &report.meaning {
@@ -1338,6 +1344,58 @@ fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bo
         object.remove("views");
         object.remove("callgraph_refresh");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn user_commands_operator_projection_returns_without_waiting_and_coalesces_disk_measurements() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("store"), b"first").unwrap();
+    let measurement = Arc::new(DiskMeasurement::default());
+    let gate = Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new()));
+    *measurement.gate.lock().unwrap() = Some(gate.clone());
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let listener: super::runtime::StatusListener = Arc::new(move || {
+        let _ = completed_tx.send(());
+    });
+    measurement.on_change(&listener);
+    let mut report = DataStoreReport::both(PlaneReport::of(READY));
+    report.family_dir = Some(dir.path().to_path_buf());
+    report.disk_measurement = Some(measurement.clone());
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    let reader = {
+        let report = report.clone();
+        std::thread::spawn(move || {
+            let mut payload = json!({"disk":{}});
+            for _ in 0..2 {
+                apply_to_status_operator(&mut payload, &report);
+                read_tx.send(payload.clone()).unwrap();
+            }
+        })
+    };
+    // Both reads must return while the directory walk is held at its test gate.
+    let reads = (0..2)
+        .map(|_| read_rx.recv_timeout(std::time::Duration::from_secs(60)))
+        .collect::<Vec<_>>();
+    *gate.0.lock().unwrap() = false;
+    gate.1.notify_all();
+    reader.join().unwrap();
+    for payload in reads {
+        let payload = payload.expect("operator read waited for the directory walk");
+        assert!(payload["disk"]["data_store_bytes"].is_null());
+        assert_eq!(payload["disk"]["data_store_bytes_stale"], true);
+    }
+    completed_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap();
+    let mut payload = json!({"disk":{}});
+    apply_to_status_operator(&mut payload, &report);
+    assert_eq!(payload["disk"]["data_store_bytes"], 5);
+    assert_eq!(payload["disk"]["data_store_bytes_stale"], false);
+    let sample = measurement.sample.lock().unwrap();
+    assert!(!sample.running);
+    assert!(sample.started.is_some());
+    assert_eq!(sample.walks, 1, "reads within the interval share one walk");
 }
 
 /// zoom's `callgraph` field when the data layer is on: `Some(None)` while

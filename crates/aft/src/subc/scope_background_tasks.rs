@@ -9,6 +9,93 @@ pub(super) const OPERATION: &str = "scope.background_tasks";
 const WALK_LIMIT: usize = 4096;
 const COMMAND_BYTES: usize = 2048;
 
+#[derive(Default)]
+pub(super) struct Metrics {
+    answered: std::sync::atomic::AtomicU64,
+    with_running: std::sync::atomic::AtomicU64,
+    invalid_params: std::sync::atomic::AtomicU64,
+    owner_mismatch: std::sync::atomic::AtomicU64,
+    errors: std::sync::atomic::AtomicU64,
+}
+
+impl Metrics {
+    pub(super) fn snapshot(&self) -> Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        json!({
+            "answered": self.answered.load(Relaxed),
+            "with_running": self.with_running.load(Relaxed),
+            "refused": {
+                "invalid_params": self.invalid_params.load(Relaxed),
+                "scope_owner_mismatch": self.owner_mismatch.load(Relaxed),
+            },
+            "errors": self.errors.load(Relaxed),
+        })
+    }
+}
+
+struct Observation {
+    success: bool,
+    complete: bool,
+    count: usize,
+    code: Option<String>,
+}
+
+impl Observation {
+    fn from_response(response: &Response) -> Self {
+        Self {
+            success: response.success,
+            complete: response.data["complete"].as_bool().unwrap_or(false),
+            count: response.data["running"].as_array().map_or(0, Vec::len),
+            code: response.data["code"].as_str().map(str::to_owned),
+        }
+    }
+
+    fn record(
+        &self,
+        metrics: &Metrics,
+        principal: Option<&Principal>,
+        params: &Value,
+        queued: bool,
+        log: &dyn Fn(&str),
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let outcome = if !queued {
+            metrics.errors.fetch_add(1, Relaxed);
+            "errored".to_owned()
+        } else if self.success {
+            metrics.answered.fetch_add(1, Relaxed);
+            if self.count > 0 {
+                metrics.with_running.fetch_add(1, Relaxed);
+            }
+            if self.complete {
+                "answered".to_owned()
+            } else {
+                metrics.errors.fetch_add(1, Relaxed);
+                "errored".to_owned()
+            }
+        } else {
+            match self.code.as_deref() {
+                Some("invalid_params") => &metrics.invalid_params,
+                Some("scope_owner_mismatch") => &metrics.owner_mismatch,
+                _ => &metrics.errors,
+            }
+            .fetch_add(1, Relaxed);
+            format!("refused code={:?}", self.code)
+        };
+        let scope = serde_json::from_value::<Params>(params.clone())
+            .ok()
+            .map(|p| p.scope);
+        log(&format!(
+            "scope.background_tasks: caller={principal:?} owner={:?} ref={:?} epoch={:?} reported={} running={} outcome={outcome}",
+            scope.as_ref().map(|s| &s.owner),
+            scope.as_ref().map(|s| &s.scope_ref),
+            scope.as_ref().map(|s| s.epoch),
+            self.count,
+            self.count,
+        ));
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Selector {
@@ -347,40 +434,55 @@ pub(super) fn spawn(
     let metrics = metrics.clone();
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&metrics);
-        if let Err(response) = authorize(&params, principal.as_ref()) {
-            let _ = send_management_response(&tx, &frame, OPERATION, response, &metrics).await;
-            return;
-        }
-        let registries = metrics
-            .completion_delivery
-            .registries
-            .try_lock()
-            .map_err(|_| "registry_busy".into())
-            .and_then(|registries| registry_snapshot(expected, &registries));
-        let result = if let Ok(registries) = registries {
-            tokio::time::timeout(
-                Duration::from_millis(1500),
-                tokio::task::spawn_blocking(move || {
-                    answer(params, principal.as_ref(), &registries, &storage)
-                }),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_else(|| {
+        let result = if let Err(response) = authorize(&params, principal.as_ref()) {
+            response
+        } else {
+            let registries = metrics
+                .completion_delivery
+                .registries
+                .try_lock()
+                .map_err(|_| "registry_busy".into())
+                .and_then(|registries| registry_snapshot(expected, &registries));
+            if let Ok(registries) = registries {
+                let answer_params = params.clone();
+                let answer_principal = principal.clone();
+                tokio::time::timeout(
+                    Duration::from_millis(1500),
+                    tokio::task::spawn_blocking(move || {
+                        answer(
+                            answer_params,
+                            answer_principal.as_ref(),
+                            &registries,
+                            &storage,
+                        )
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_else(|| {
+                    Response::success(
+                        "management-scope-background-tasks",
+                        serde_json::to_value(Reply::incomplete("time_budget_exceeded")).unwrap(),
+                    )
+                })
+            } else {
                 Response::success(
                     "management-scope-background-tasks",
-                    serde_json::to_value(Reply::incomplete("time_budget_exceeded")).unwrap(),
+                    serde_json::to_value(Reply::incomplete(registries.err().unwrap())).unwrap(),
                 )
-            })
-        } else {
-            Response::success(
-                "management-scope-background-tasks",
-                serde_json::to_value(Reply::incomplete(registries.err().unwrap())).unwrap(),
-            )
+            }
         };
-        if let Err(error) = send_management_response(&tx, &frame, OPERATION, result, &metrics).await
-        {
+        let observation = Observation::from_response(&result);
+        let sent = send_management_response(&tx, &frame, OPERATION, result, &metrics).await;
+        observation.record(
+            &metrics.scope_background_tasks,
+            principal.as_ref(),
+            &params,
+            sent.is_ok(),
+            &|line| log::info!("{line}"),
+        );
+        if let Err(error) = sent {
             log::warn!("scope.background_tasks: could not queue reply: {error}");
         }
     });
@@ -399,6 +501,120 @@ mod tests {
             scope_ref: "worker-7".into(),
             epoch: 3,
         }
+    }
+
+    fn observe_for_test(
+        metrics: &Metrics,
+        response: &Response,
+        principal: Option<&Principal>,
+        params: &Value,
+        queued: bool,
+    ) -> Vec<String> {
+        let lines = std::cell::RefCell::new(Vec::new());
+        Observation::from_response(response).record(metrics, principal, params, queued, &|line| {
+            lines.borrow_mut().push(line.to_owned());
+        });
+        lines.into_inner()
+    }
+
+    #[tokio::test]
+    async fn scope_background_tasks_spawn_records_answers_and_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = selector();
+        let params = json!({"scope": selected});
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (writer, mut replies) = tokio::sync::mpsc::channel(8);
+        let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 1, vec![]).unwrap();
+        spawn(
+            &writer,
+            &frame,
+            &metrics,
+            Some(selected.owner.clone()),
+            params.clone(),
+            dir.path().into(),
+            Ok(vec![]),
+        );
+        replies.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.scope_background_tasks.snapshot()["answered"] != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        spawn(
+            &writer,
+            &frame,
+            &metrics,
+            Some(Principal::Direct {}),
+            params,
+            dir.path().into(),
+            Ok(vec![]),
+        );
+        replies.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.scope_background_tasks.snapshot()["refused"]["scope_owner_mismatch"] != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["scope_background_tasks"]["answered"],
+            1
+        );
+        assert_eq!(
+            metrics.snapshot(&HashMap::new())["scope_background_tasks"]["refused"]
+                ["scope_owner_mismatch"],
+            1
+        );
+    }
+
+    #[test]
+    fn scope_background_tasks_empty_and_refused_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = selector();
+        let params = json!({"scope": scope});
+        let metrics = Metrics::default();
+        let response = answer(params.clone(), Some(&scope.owner), &[], dir.path());
+        let lines = observe_for_test(&metrics, &response, Some(&scope.owner), &params, true);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("reported=0 running=0 outcome=answered"));
+        assert!(lines[0].contains("worker-7"));
+        assert!(lines[0].contains("prefrontal-core"));
+        assert!(lines[0].contains("epoch=Some(3)"));
+        assert_eq!(metrics.snapshot()["answered"], 1);
+        assert_eq!(metrics.snapshot()["with_running"], 0);
+
+        let caller = Principal::Direct {};
+        let response = authorize(&params, Some(&caller)).unwrap_err();
+        let lines = observe_for_test(&metrics, &response, Some(&caller), &params, true);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("outcome=refused code=Some(\"scope_owner_mismatch\")"));
+        assert_eq!(metrics.snapshot()["refused"]["scope_owner_mismatch"], 1);
+        assert_eq!(metrics.snapshot()["answered"], 1);
+    }
+
+    #[test]
+    fn scope_background_tasks_errors_are_counted() {
+        let scope = selector();
+        let params = json!({"scope": scope});
+        let metrics = Metrics::default();
+        let response = Response::success(
+            "test",
+            serde_json::to_value(Reply::incomplete("registry_busy")).unwrap(),
+        );
+        let lines = observe_for_test(&metrics, &response, Some(&scope.owner), &params, true);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("outcome=errored"));
+        assert_eq!(metrics.snapshot()["answered"], 1);
+        assert_eq!(metrics.snapshot()["errors"], 1);
+        let lines = observe_for_test(&metrics, &response, Some(&scope.owner), &params, false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("outcome=errored"));
+        assert_eq!(metrics.snapshot()["answered"], 1);
+        assert_eq!(metrics.snapshot()["errors"], 2);
     }
 
     #[test]
@@ -680,6 +896,14 @@ mod tests {
         assert_eq!(reply.data["complete"], true, "{reply:?}");
         assert_eq!(reply.data["running"][0]["task_id"], id);
         assert_eq!(reply.data["running"][0]["command"], "sleep 30");
+        let metrics = Metrics::default();
+        let params = json!({"scope": selected});
+        let lines = observe_for_test(&metrics, &reply, Some(&selected.owner), &params, true);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("reported=1 running=1 outcome=answered"));
+        assert!(!lines[0].contains("sleep 30"));
+        assert_eq!(metrics.snapshot()["answered"], 1);
+        assert_eq!(metrics.snapshot()["with_running"], 1);
         let task = registry.task_for_test(&id).unwrap();
         let locked = task.state.lock().unwrap();
         let start = Instant::now();

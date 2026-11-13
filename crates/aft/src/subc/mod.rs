@@ -288,6 +288,7 @@ mod scope_describe;
 mod shells;
 #[cfg(test)]
 mod stack_budget_tests;
+mod user_commands;
 pub(crate) mod watch_delivery;
 #[cfg(all(test, unix))]
 pub(crate) use scope_describe::confirm_secret_rebind_for_test;
@@ -1674,6 +1675,8 @@ enum ManagementAdmission {
     PermissionsOnly,
     /// Phone and simulator operator routes have read-only shell authority only.
     ShellsOnly,
+    /// Occipital relays person commands, not general AFT management authority.
+    UserCommandsOnly,
     /// Tool-provider metadata and custodian feeds without a project root;
     /// grants no management authority or project-tool access.
     ProjectFree {
@@ -6101,6 +6104,15 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        if let Ok(body) = decoded.body() {
+                            if user_commands::is_request(body) {
+                                let principal = management_routes.get(&route).and_then(|identity| identity.principal.as_ref());
+                                if let Err(error) = user_commands::dispatch(&writer_tx, &dispatch_path_metrics, &decoded.frame, principal, body, &routes, &executor).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
                         // Flow routes keep their operation allowlist refusal even
                         // when an operation has a separate operator-only gate.
                         if let Some(identity) = management_routes.get(&route) {
@@ -8668,6 +8680,7 @@ async fn handle_control_request(
                     && !matches!(bind_trust, BindTrust::FirstParty)
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
                     && !permissions::is_cingulate(principal.as_ref())
+                    && !user_commands::is_occipital(principal.as_ref())
                     && !shells::operator(
                         principal.as_ref(),
                         Some(&identity.harness),
@@ -8683,7 +8696,9 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                let admission = if project_free {
+                let admission = if user_commands::is_occipital(principal.as_ref()) {
+                    ManagementAdmission::UserCommandsOnly
+                } else if project_free {
                     ManagementAdmission::ProjectFree {
                         workdir: scope.as_ref().and_then(|stamp| stamp.workdir.clone()),
                         legacy_root: legacy_root.clone(),
@@ -10368,6 +10383,16 @@ fn admit_management_flow_request(
     identity: &ManagementIdentity,
     body: Option<&Value>,
 ) -> Result<(), ErrorBody> {
+    if identity.admission == ManagementAdmission::UserCommandsOnly {
+        return if body.is_some_and(user_commands::is_request) {
+            Ok(())
+        } else {
+            Err(ErrorBody::new(
+                "route_not_admitted",
+                "Occipital's AFT management route serves only user-commands/v1",
+            ))
+        };
+    }
     if identity.admission == ManagementAdmission::ShellsOnly {
         return if body.is_some_and(shells::is_request) {
             Ok(())
@@ -19943,7 +19968,7 @@ mod tests {
         ));
         let _reap = ReapContextChildren(Arc::clone(&ctx));
         ctx.lsp()
-            .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
+            .override_binary(ServerKind::TypeScript(None), fake_lsp::fake_server_binary());
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
         ctx.lsp()
@@ -20134,7 +20159,7 @@ mod tests {
         let release = dir.path().join("resume");
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut client = LspClient::spawn(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             dir.path().to_path_buf(),
             &fake_lsp::fake_server_binary(),
             &[],
@@ -20314,7 +20339,7 @@ mod tests {
         std::fs::write(&file, "// original\n").unwrap();
         let ctx = test_ctx();
         ctx.lsp().override_binary(
-            crate::lsp::registry::ServerKind::TypeScript,
+            crate::lsp::registry::ServerKind::TypeScript(None),
             fake_lsp::fake_server_binary(),
         );
         let guard = ctx.lsp();
@@ -20354,7 +20379,7 @@ mod tests {
         std::fs::write(&file, "// original\n").unwrap();
         let ctx = test_ctx();
         ctx.lsp()
-            .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
+            .override_binary(ServerKind::TypeScript(None), fake_lsp::fake_server_binary());
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
         ctx.lsp()

@@ -6,7 +6,7 @@ mod runtime;
 mod state;
 mod wire;
 pub(super) use admission::{is_request, operator, operator_required};
-pub(super) use runtime::Service;
+pub(super) use runtime::{project_status, Service};
 pub(super) use wire::CAPABILITY;
 
 #[cfg(test)]

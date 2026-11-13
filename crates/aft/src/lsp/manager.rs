@@ -185,17 +185,12 @@ fn server_key_for_definition(
 }
 
 fn server_key_sort(left: &ServerKey, right: &ServerKey) -> std::cmp::Ordering {
-    // Native TypeScript servers share an id and can share a root, so the last
-    // comparison orders them by their TypeScript directory.
-    let native_dir = |kind: &ServerKind| match kind {
-        ServerKind::TypeScriptNative(dir) => Some(Arc::clone(dir)),
-        _ => None,
-    };
+    // SDKs can share both the public server id and the repository root.
     left.kind
         .id_str()
         .cmp(right.kind.id_str())
         .then(left.root.cmp(&right.root))
-        .then_with(|| native_dir(&left.kind).cmp(&native_dir(&right.kind)))
+        .then(left.kind.cmp(&right.kind))
 }
 
 /// Outcome of attempting to ensure a server is running for a single matching
@@ -1055,6 +1050,8 @@ pub struct LspShutdownAllOutcome {
 type ShutdownResult = (Option<ServerKey>, u32, Result<(), LspError>);
 
 pub struct LspManager {
+    capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
+    capacity_slots: HashMap<ServerKey, Arc<()>>,
     #[cfg(test)]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -1331,6 +1328,14 @@ struct StartFailure {
     durability: FailureDurability,
 }
 
+/// App-owned admission state. Weak slots and manager references do not retain
+/// a closed root, and the mutex makes slot checks and reservations atomic.
+#[derive(Default)]
+pub(crate) struct ServerCapacity {
+    slots: Vec<std::sync::Weak<()>>,
+    managers: Vec<std::sync::Weak<parking_lot::Mutex<LspManager>>>,
+}
+
 /// A failed start remembered for one server and workspace root.
 #[derive(Clone, Debug)]
 struct FailedSpawn {
@@ -1386,6 +1391,8 @@ impl LspManager {
     pub fn new() -> Self {
         let (event_tx, event_rx) = unbounded();
         Self {
+            capacity: Arc::default(),
+            capacity_slots: HashMap::new(),
             #[cfg(test)]
             spawn_hook: None,
             #[cfg(test)]
@@ -1455,7 +1462,15 @@ impl LspManager {
         owner: Weak<parking_lot::Mutex<LspManager>>,
     ) {
         self.startup_owner = owner.clone();
+        self.capacity.lock().managers.push(owner.clone());
         self.background_pull_owner = owner;
+    }
+
+    pub(crate) fn set_server_capacity(
+        &mut self,
+        capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
+    ) {
+        self.capacity = capacity;
     }
 
     fn queue_background_document_pull(&mut self, key: &ServerKey, file: &Path) {
@@ -1574,6 +1589,7 @@ impl LspManager {
             // Drop kills the old process group, including any check it started
             // before the worker arrived. The next request starts a safe instance.
             self.clients.remove(&key);
+            self.capacity_slots.remove(&key);
             self.server_binaries.remove(&key);
             self.documents.remove(&key);
             self.diagnostics.clear_server_instance(&key);
@@ -1694,9 +1710,14 @@ impl LspManager {
         self.extra_env.insert(key.to_string(), value.to_string());
     }
 
-    /// Count active LSP server instances.
+    /// Count live clients and in-progress starts without counting a server twice.
     pub fn server_count(&self) -> usize {
         self.clients.len()
+            + self
+                .starting
+                .keys()
+                .filter(|key| !self.clients.contains_key(*key))
+                .count()
     }
 
     /// Estimate the per-server document metadata and diagnostics retained by
@@ -1756,11 +1777,21 @@ impl LspManager {
     }
 
     /// Count currently replayable failed server/root starts without starting a server.
+    /// Files outside every TypeScript project remain named in status, but their
+    /// cached not-applicable outcome is not a start failure.
     pub(crate) fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
         let now = self.retry_clock.now();
         let mut counts = std::collections::BTreeMap::new();
         for (key, failure) in &self.failed_spawns {
             if failure.retry_at.is_some_and(|at| now >= at) {
+                continue;
+            }
+            if matches!(
+                &failure.result,
+                ServerAttemptResult::SpawnFailed { reason, .. }
+                    if reason.strip_prefix("server not ready: ")
+                        .is_some_and(|reason| reason.starts_with(NOT_IN_TYPESCRIPT_PROJECT))
+            ) {
                 continue;
             }
             *counts.entry(key.kind.id_str().to_owned()).or_default() += 1;
@@ -1825,11 +1856,13 @@ impl LspManager {
         // The `typescript` server's marker (package.json, tsconfig.json) is
         // served when its files went to the native TypeScript server instead;
         // naming `typescript` as not applicable there would be wrong.
-        if selected_kinds
-            .iter()
-            .any(|kind| matches!(kind, ServerKind::TypeScriptNative(_)))
-        {
-            selected_kinds.insert(ServerKind::TypeScript);
+        if selected_kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                ServerKind::TypeScript(_) | ServerKind::TypeScriptNative(_)
+            )
+        }) {
+            selected_kinds.insert(ServerKind::TypeScript(None));
         }
         // Only a server that could actually have run is worth naming: one whose
         // binary resolves. Markers of servers the user does not have installed
@@ -2006,6 +2039,9 @@ impl LspManager {
         let Some(reservation) = self.starting.remove(key) else {
             return;
         };
+        if !self.clients.contains_key(key) {
+            self.capacity_slots.remove(key);
+        }
         if reservation
             .signal
             .cancelled
@@ -2070,6 +2106,18 @@ impl LspManager {
         if let Some(cached) = self.failure_to_replay(key) {
             return FileServerStart::Failed(cached);
         }
+        let slot = match self.make_server_capacity(
+            config.lsp_max_servers,
+            config
+                .lsp_user_max_servers
+                .unwrap_or(config.lsp_max_servers),
+        ) {
+            Ok(slot) => slot,
+            Err(failure) => {
+                return FileServerStart::Failed(self.record_file_start_failure(def, key, failure))
+            }
+        };
+        self.capacity_slots.insert(key.clone(), slot);
         self.reap_unreferenced_children_for(key);
         self.log_transient_retry(key);
         match self.prepare_spawn(def, &key.root, file_path, config) {
@@ -2090,11 +2138,14 @@ impl LspManager {
                 );
                 FileServerStart::Spawn(Box::new(prepared))
             }
-            Err(error) => FileServerStart::Failed(self.record_file_start_failure(
-                def,
-                key,
-                prepare_failure(error),
-            )),
+            Err(error) => {
+                self.capacity_slots.remove(key);
+                FileServerStart::Failed(self.record_file_start_failure(
+                    def,
+                    key,
+                    prepare_failure(error),
+                ))
+            }
         }
     }
 
@@ -5904,6 +5955,107 @@ impl LspManager {
         clients
     }
 
+    /// The same eligibility as idle reaping, without an age threshold.
+    fn oldest_idle_client(&self) -> Option<(Instant, ServerKey)> {
+        self.clients
+            .iter()
+            .filter(|(key, client)| {
+                !self.starting.contains_key(*key) && !client.has_pending_requests()
+            })
+            .map(|(key, client)| (client.last_used_at(), key.clone()))
+            .min_by(|(left_time, left), (right_time, right)| {
+                left_time
+                    .cmp(right_time)
+                    .then_with(|| server_key_sort(left, right))
+            })
+    }
+
+    fn capacity_failure(max_servers: usize) -> StartFailure {
+        StartFailure {
+            error: LspError::ServerNotReady(format!("language server limit reached (lsp.max_servers={max_servers}); all running servers are starting or have pending requests")),
+            durability: FailureDurability::Capacity,
+        }
+    }
+
+    /// Requests for a file and inspect's scan for applicable servers both
+    /// reserve here under the manager lock, before spawning. The shared lock
+    /// serializes admission across roots.
+    fn make_server_capacity(
+        &mut self,
+        max_servers: usize,
+        process_limit: usize,
+    ) -> Result<Arc<()>, StartFailure> {
+        // A project's stricter budget applies only to that root, not its peers.
+        while self.server_count() >= max_servers {
+            let (_, key) = self
+                .oldest_idle_client()
+                .ok_or_else(|| Self::capacity_failure(max_servers))?;
+            let client = self.detach_idle_client(&key);
+            Self::spawn_idle_lsp_reap(vec![(key, client)]);
+        }
+        let shared = Arc::clone(&self.capacity);
+        let mut capacity = shared.lock();
+        capacity.slots.retain(|slot| slot.strong_count() > 0);
+        capacity
+            .managers
+            .retain(|manager| manager.strong_count() > 0);
+        while capacity.slots.len() >= process_limit {
+            let mut oldest = self
+                .oldest_idle_client()
+                .map(|(time, key)| (time, key, None));
+            // Never wait for another root while holding this root's lock. Two
+            // concurrent starts may refuse capacity, but cannot deadlock.
+            for owner in &capacity.managers {
+                let Some(owner) = owner.upgrade() else {
+                    continue;
+                };
+                let Some(manager) = owner.try_lock() else {
+                    continue;
+                };
+                if let Some((time, key)) = manager.oldest_idle_client() {
+                    let earlier = oldest.as_ref().is_none_or(|(best_time, best_key, _)| {
+                        time.cmp(best_time)
+                            .then_with(|| server_key_sort(&key, best_key))
+                            .is_lt()
+                    });
+                    if earlier {
+                        oldest = Some((time, key, Some(Arc::clone(&owner))));
+                    }
+                }
+            }
+            let (time, key, owner) = oldest.ok_or_else(|| Self::capacity_failure(process_limit))?;
+            let client = if let Some(owner) = owner {
+                let mut manager = owner
+                    .try_lock()
+                    .ok_or_else(|| Self::capacity_failure(process_limit))?;
+                if manager.oldest_idle_client().as_ref() != Some(&(time, key.clone())) {
+                    return Err(Self::capacity_failure(process_limit));
+                }
+                manager.detach_idle_client(&key)
+            } else {
+                self.detach_idle_client(&key)
+            };
+            Self::spawn_idle_lsp_reap(vec![(key, client)]);
+            capacity.slots.retain(|slot| slot.strong_count() > 0);
+        }
+        let slot = Arc::new(());
+        capacity.slots.push(Arc::downgrade(&slot));
+        Ok(slot)
+    }
+
+    fn detach_idle_client(&mut self, key: &ServerKey) -> LspClient {
+        let client = self.clients.remove(key).expect("selected idle client");
+        self.forget_server_state(Some(key));
+        self.pending_diagnostic_observations
+            .retain(|observation| &observation.server_key != key);
+        self.clients_generation = self.clients_generation.wrapping_add(1);
+        // Removing one idle client is not a teardown of unrelated startups.
+        for reservation in self.starting.values_mut() {
+            reservation.clients_generation = self.clients_generation;
+        }
+        client
+    }
+
     /// Detach idle clients while holding the manager lock, before stopping them.
     /// Requests either reserve a pending response first or find the key absent
     /// and start a replacement; they cannot acquire a half-stopped client.
@@ -5928,7 +6080,7 @@ impl LspManager {
             .collect();
         let mut clients = Vec::with_capacity(keys.len());
         for key in keys {
-            let client = self.clients.remove(&key).expect("selected idle client");
+            let client = self.detach_idle_client(&key);
             let idle = now.saturating_duration_since(client.last_used_at());
             let package = key
                 .root
@@ -5941,13 +6093,7 @@ impl LspManager {
                 idle.as_secs() / 60,
                 ttl.as_secs() / 60
             );
-            self.forget_server_state(Some(&key));
-            self.pending_diagnostic_observations
-                .retain(|observation| observation.server_key != key);
             clients.push((key, client));
-        }
-        if !clients.is_empty() {
-            self.clients_generation = self.clients_generation.wrapping_add(1);
         }
         clients
     }
@@ -5955,6 +6101,12 @@ impl LspManager {
     /// Forget instance-owned state without changing start reservations or
     /// failure backoff. Those have their own generation and retry lifecycles.
     fn forget_server_state(&mut self, key: Option<&ServerKey>) {
+        match key {
+            Some(key) => {
+                self.capacity_slots.remove(key);
+            }
+            None => self.capacity_slots.clear(),
+        }
         let keep = |server: &ServerKey| key.is_some_and(|key| key != server);
         self.inspect_rust_checks.retain(|server, _| keep(server));
         self.server_binaries.retain(|server, _| keep(server));
@@ -7718,17 +7870,25 @@ impl LspManager {
         let mut initialization_options =
             initialization_options_for_spawn(def, source_file, root, &resolution_config)?;
         let has_binary_override = self.binary_overrides.contains_key(&def.kind)
+            || (matches!(def.kind, ServerKind::TypeScript(_))
+                && self
+                    .binary_overrides
+                    .contains_key(&ServerKind::TypeScript(None)))
             || env_binary_override(&def.kind).is_some()
             || def.has_configured_typescript_binary(config);
         let mut runtime_note = None;
         let mut project_typescript = None;
         let mut typescript_lookup = None;
-        let binary = if let ServerKind::TypeScriptNative(package_dir) = &def.kind {
-            let project =
-                ProjectTypeScript::read(package_dir).unwrap_or_else(|| ProjectTypeScript {
-                    version: "unknown".into(),
-                    package_dir: package_dir.to_path_buf(),
-                });
+        let binary = if let ServerKind::TypeScriptNative(identity) = &def.kind {
+            let project = super::typescript_project::project_typescript_for(
+                source_file,
+                root,
+                config.project_root.as_deref(),
+            )
+            .unwrap_or_else(|| ProjectTypeScript {
+                version: identity.to_string(),
+                package_dir: root.join("node_modules/typescript"),
+            });
             // Start the platform binary itself, never node_modules/.bin/tsc:
             // that is a Node wrapper script. A missing platform package is a
             // named gap reported before anything is spawned.
@@ -7750,7 +7910,7 @@ impl LspManager {
             self.resolve_binary(def, root, config)?
         };
         // Explicit binary overrides may wrap their own SDK discovery.
-        if def.kind == ServerKind::TypeScript && !has_binary_override {
+        if matches!(def.kind, ServerKind::TypeScript(_)) && !has_binary_override {
             let (options, note) = if def
                 .args
                 .iter()
@@ -7768,7 +7928,7 @@ impl LspManager {
             initialization_options = Some(options);
             runtime_note = Some(note);
         }
-        if def.kind == ServerKind::TypeScript && !has_binary_override {
+        if matches!(def.kind, ServerKind::TypeScript(_)) && !has_binary_override {
             let boundary = config
                 .project_root
                 .as_deref()
@@ -7888,7 +8048,11 @@ impl LspManager {
         root: &Path,
         config: &Config,
     ) -> Result<PathBuf, LspError> {
-        if let Some(path) = self.binary_overrides.get(&def.kind) {
+        if let Some(path) = self.binary_overrides.get(&def.kind).or_else(|| {
+            matches!(def.kind, ServerKind::TypeScript(_))
+                .then(|| self.binary_overrides.get(&ServerKind::TypeScript(None)))
+                .flatten()
+        }) {
             if path.exists() {
                 return Ok(path.clone());
             }
@@ -8796,7 +8960,7 @@ impl PreparedSpawn {
             };
             let reason = if self.kind == ServerKind::Biome {
                 biome_unavailable_reason(&reason)
-            } else if self.kind == ServerKind::TypeScript {
+            } else if matches!(self.kind, ServerKind::TypeScript(_)) {
                 let root = &self.root;
                 typescript_initialize_failure_reason(
                     reason,
@@ -8838,12 +9002,15 @@ impl PreparedSpawn {
         // The native server is found by package layout alone, so confirm the
         // binary really is TypeScript's language server before trusting its
         // diagnostics for the project.
-        if let (ServerKind::TypeScriptNative(package_dir), Ok(result)) = (&self.kind, &initialize) {
+        if let (ServerKind::TypeScriptNative(_), Ok(result)) = (&self.kind, &initialize) {
             let reported = result.server_info.as_ref().map(|info| info.name.as_str());
             if reported != Some(NATIVE_SERVER_INFO_NAME) {
                 let reason = native_server_misidentified_reason(
                     self.project_typescript.as_ref(),
-                    package_dir,
+                    self.project_typescript
+                        .as_ref()
+                        .map(|project| project.package_dir.as_path())
+                        .unwrap_or(&self.root),
                     &self.binary,
                     reported,
                 );
@@ -9937,7 +10104,7 @@ pub(crate) fn invalidate_applicability_batch(
     // Source edits do not change TypeScript selection. Keep the selector's own
     // input predicate as the authority, rather than duplicating its install rules.
     let custom_ts_marker = config.lsp_servers.iter().any(|server| {
-        server.id == ServerKind::TypeScript.id_str()
+        server.id == ServerKind::TypeScript(None).id_str()
             && server
                 .root_markers
                 .iter()
@@ -10297,7 +10464,7 @@ mod env_binary_override_tests {
 
     #[test]
     fn empty_lsp_binary_override_is_unset_without_mutating_the_process_environment() {
-        let kind = ServerKind::TypeScript;
+        let kind = ServerKind::TypeScript(None);
         assert_eq!(
             env_binary_override_from(&kind, |key| {
                 assert_eq!(key, "AFT_LSP_TYPESCRIPT_BINARY");
@@ -10356,7 +10523,7 @@ mod project_applicability_tests {
             config.disabled_lsp.insert("yaml".into());
         }
         let mut manager = LspManager::new();
-        manager.override_binary(ServerKind::TypeScript, PathBuf::from("/bin/sh"));
+        manager.override_binary(ServerKind::TypeScript(None), PathBuf::from("/bin/sh"));
         manager.override_binary(ServerKind::Yaml, root.join("missing-yaml"));
         manager.override_binary(ServerKind::Go, root.join("missing-gopls"));
         let snapshot = manager
@@ -10365,14 +10532,14 @@ mod project_applicability_tests {
         let ts = snapshot
             .server_keys
             .iter()
-            .find(|key| key.kind == ServerKind::TypeScript)
+            .find(|key| key.kind == ServerKind::TypeScript(None))
             .unwrap()
             .clone();
         manager.store_project_applicability(snapshot);
         // A live transport plus a stored empty report models an authoritative
         // producer without involving a real language server or SDK discovery.
         let client = LspClient::spawn_with_reclaim_root(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             ts.root.clone(),
             Path::new("/bin/sh"),
             &["-c".into(), "while read line; do :; done".into()],
@@ -10436,7 +10603,7 @@ mod project_applicability_tests {
         assert!(scoped
             .server_keys
             .iter()
-            .all(|key| key.kind == ServerKind::TypeScript));
+            .all(|key| key.kind == ServerKind::TypeScript(None)));
         assert_eq!(manager.project_diagnostics_authority(), before);
     }
 }
@@ -10663,6 +10830,88 @@ mod transient_retry_tests {
         );
         manager.note_start_succeeded(&key());
         assert!(manager.cached_start_failure_counts().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_ignores_capacity_refused_start() {
+        let (mut manager, _) = manager_with_clock();
+        let key = key();
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == key.kind)
+            .unwrap();
+        let error = LspError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 2 },
+        ));
+        let durability = process_start_durability(&error);
+        let result =
+            manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+
+        assert!(reason(&result).contains("rust_analyzer_capacity_exhausted"));
+        assert!(manager.cached_start_failure_counts().is_empty());
+        assert!(manager.failure_to_replay(&key).is_none());
+        assert!(manager.transient_backoff.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_ignores_not_applicable_start_but_keeps_status() {
+        let gap = typescript_initialize_failure_reason(
+            super::super::environmental::TS_LS5_NO_INSTALLATION.into(),
+            None,
+            || true,
+        );
+        for durability in [FailureDurability::Permanent, FailureDurability::Transient] {
+            let (mut manager, _) = manager_with_clock();
+            let key = ServerKey {
+                kind: ServerKind::TypeScript(None),
+                ..key()
+            };
+            let def = crate::lsp::registry::builtin_servers()
+                .into_iter()
+                .find(|def| def.kind == key.kind)
+                .unwrap();
+            manager.record_file_start_failure(
+                &def,
+                &key,
+                StartFailure {
+                    error: LspError::ServerNotReady(gap.clone()),
+                    durability,
+                },
+            );
+
+            assert!(manager.cached_start_failure_counts().is_empty());
+            let cached = manager.failure_to_replay(&key).unwrap();
+            assert!(reason(&cached).contains(NOT_IN_TYPESCRIPT_PROJECT));
+            assert_eq!(manager.failed_spawns.len(), 1);
+        }
+    }
+
+    #[test]
+    fn diagnostics_findings_lsp_snapshot_counts_real_spawn_and_environment_failures() {
+        let cases = [
+            (ServerKind::Rust, LspError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))),
+            (ServerKind::Rust, LspError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))),
+            (ServerKind::Rust, LspError::NotFound("rust-analyzer".into())),
+            (ServerKind::Rust, LspError::ServerNotReady("server crashed during initialize: mise ERROR error parsing config file mise.toml".into())),
+            (ServerKind::TypeScript(None), LspError::ServerNotReady("TypeScript SDK unavailable: no tsserver.js".into())),
+        ];
+        let (mut manager, _) = manager_with_clock();
+        for (kind, error) in cases {
+            let key = ServerKey { kind, ..key() };
+            let def = crate::lsp::registry::builtin_servers()
+                .into_iter()
+                .find(|def| def.kind == key.kind)
+                .unwrap();
+            let durability = process_start_durability(&error);
+            manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+
+            assert_eq!(
+                manager.cached_start_failure_counts().get(key.kind.id_str()),
+                Some(&1)
+            );
+            manager.clear_failed_spawns();
+        }
     }
 
     fn reason(result: &ServerAttemptResult) -> &str {
@@ -10911,7 +11160,7 @@ mod diagnostic_capacity_tests {
         let file = root.join("main.ts");
         std::fs::write(&file, "export const x = 1;\n").unwrap();
         let keys: Vec<ServerKey> = [
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             ServerKind::Biome,
             ServerKind::Oxlint,
         ]
@@ -10956,7 +11205,7 @@ mod diagnostic_capacity_tests {
     fn inspect_closed_documents_stay_bounded_and_keep_the_newest() {
         let mut manager = LspManager::new();
         let key = ServerKey {
-            kind: ServerKind::TypeScript,
+            kind: ServerKind::TypeScript(None),
             root: PathBuf::from("/work"),
         };
         let total = INSPECT_CLOSED_DOCUMENTS_CAP * 3;
@@ -10979,7 +11228,7 @@ mod diagnostic_capacity_tests {
     #[test]
     fn late_close_reply_is_ignored_once_and_only_when_recognizable() {
         let key = ServerKey {
-            kind: ServerKind::TypeScript,
+            kind: ServerKind::TypeScript(None),
             root: PathBuf::from("/work"),
         };
         let file = Path::new("/work/a.ts");
@@ -11227,7 +11476,7 @@ mod clear_diagnostics_tests {
 
         let mut manager = LspManager::new();
         let key = ServerKey {
-            kind: ServerKind::TypeScript,
+            kind: ServerKind::TypeScript(None),
             root: canonical_dir.clone(),
         };
         manager.diagnostics_store_mut_for_test().publish(
@@ -11258,7 +11507,7 @@ mod clear_diagnostics_tests {
 
         let mut manager = LspManager::new();
         let key = ServerKey {
-            kind: ServerKind::TypeScript,
+            kind: ServerKind::TypeScript(None),
             root: normalized_file.parent().unwrap().to_path_buf(),
         };
         manager.diagnostics_store_mut_for_test().publish(
@@ -11282,7 +11531,7 @@ mod clear_diagnostics_tests {
 
         let mut manager = LspManager::new();
         let key = ServerKey {
-            kind: ServerKind::TypeScript,
+            kind: ServerKind::TypeScript(None),
             root: normalized_file.parent().unwrap().to_path_buf(),
         };
         manager.diagnostics_store_mut_for_test().publish(
@@ -11341,7 +11590,7 @@ mod clear_diagnostics_tests {
         .unwrap();
         manager.sync_document_version_for_test(
             &ServerKey {
-                kind: ServerKind::TypeScript,
+                kind: ServerKind::TypeScript(None),
                 root: root.clone(),
             },
             &file,
@@ -11351,7 +11600,7 @@ mod clear_diagnostics_tests {
             .event_tx
             .send(
                 LspEvent::Notification {
-                    server_kind: ServerKind::TypeScript,
+                    server_kind: ServerKind::TypeScript(None),
                     root,
                     method: "textDocument/publishDiagnostics".into(),
                     params: Some(params),
@@ -11613,7 +11862,7 @@ mod server_exit_reap_tests {
         root: std::path::PathBuf,
     ) -> LspClient {
         LspClient::spawn_with_reclaim_root(
-            ServerKind::TypeScript,
+            ServerKind::TypeScript(None),
             root,
             Path::new("sh"),
             &[
@@ -11947,7 +12196,8 @@ exit 1
             .failures
             .iter()
             .find(|failure| {
-                failure.server_key.kind == ServerKind::TypeScript && failure.server_key.root == root
+                failure.server_key.kind == ServerKind::TypeScript(None)
+                    && failure.server_key.root == root
             })
             .unwrap_or_else(|| panic!("no root TypeScript failure: {:?}", outcomes.failures));
         let reason = root_failure.reason();
@@ -12244,7 +12494,7 @@ exit 1
                 let file = root.join("index.ts");
                 let def = crate::lsp::registry::servers_for_file(&file, &config)
                     .into_iter()
-                    .find(|def| def.kind == ServerKind::TypeScript)
+                    .find(|def| matches!(def.kind, ServerKind::TypeScript(_)))
                     .unwrap();
                 let prepared = LspManager::new()
                     .prepare_spawn(&def, &root, &file, &config)
@@ -12534,7 +12784,7 @@ mod current_content_diagnostics_tests {
         let file = canonicalize_for_lsp(temp.path()).unwrap().join("a.ts");
         std::fs::write(&file, "broken\n").unwrap();
         let key = ServerKey {
-            kind: ServerKind::TypeScript,
+            kind: ServerKind::TypeScript(None),
             root: file.parent().unwrap().to_path_buf(),
         };
         let mut manager = LspManager::new();

@@ -12,7 +12,7 @@
 
 use std::io::Read;
 use std::path::Path;
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 use std::path::PathBuf;
 use std::sync::{Condvar, Mutex};
 
@@ -147,7 +147,7 @@ fn read_source_bytes_with_limit(path: &Path, limit: u64) -> std::io::Result<Sour
         if file.metadata()?.len() > limit {
             return Ok(SourceBytes::TooLarge);
         }
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, test))]
         bump_source_read_count(path);
         let mut bytes = Vec::new();
         file.take(limit + 1).read_to_end(&mut bytes)?;
@@ -283,12 +283,12 @@ pub(crate) fn write_skipped_files(
     aggregate["skipped_files_count"] = json!(total);
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 static SOURCE_READS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::BTreeMap<PathBuf, usize>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn bump_source_read_count(path: &Path) {
     let reads = SOURCE_READS.get_or_init(Default::default);
     if let Ok(mut reads) = reads.lock() {
@@ -297,8 +297,8 @@ fn bump_source_read_count(path: &Path) {
 }
 
 /// How many times the Tier-2 scanners read `path` as source text in this
-/// process. Debug builds only; lets tests prove a file was or was not opened.
-#[cfg(debug_assertions)]
+/// process. Debug and test builds only; proves a file was or was not opened.
+#[cfg(any(debug_assertions, test))]
 #[doc(hidden)]
 pub fn source_read_count_for_debug(path: &Path) -> usize {
     SOURCE_READS

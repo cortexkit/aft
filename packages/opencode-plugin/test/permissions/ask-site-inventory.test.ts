@@ -68,7 +68,7 @@ describe("OpenCode V2 permission inventory", () => {
   });
 
   test("removes only replaced built-ins and never AFT-prefixed filesystem tools", async () => {
-    const added: string[] = [];
+    const added: Array<[namespace: unknown, name: string, codemode: boolean]> = [];
     const removed: string[] = [];
     const definition = {
       description: "fixture",
@@ -83,7 +83,12 @@ describe("OpenCode V2 permission inventory", () => {
         transform: (transform: (editor: V2ToolEditor) => void) =>
           Effect.sync(() =>
             transform({
-              add: (registered) => added.push(registered.name),
+              add: (registered) =>
+                added.push([
+                  registered.options.namespace,
+                  registered.name,
+                  registered.options.codemode,
+                ]),
               remove: (name) => removed.push(name),
             }),
           ),
@@ -100,7 +105,10 @@ describe("OpenCode V2 permission inventory", () => {
     expect(removed).not.toContain("aft_delete");
     expect(removed).not.toContain("aft_move");
     expect(added).toEqual(
-      [...V2_BUILTIN_REPLACEMENTS, ...V2_AFT_FILESYSTEM_TOOLS].map(v2HostToolName),
+      [...V2_BUILTIN_REPLACEMENTS, ...V2_AFT_FILESYSTEM_TOOLS].flatMap((name) => {
+        const direct = [undefined, v2HostToolName(name), false];
+        return name === "read" ? [direct, ["aft.code", "read", true]] : [direct];
+      }),
     );
   });
 });

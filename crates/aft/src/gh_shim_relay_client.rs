@@ -44,7 +44,7 @@ const MIN_WRITE_DISPATCH_BUDGET: Duration = Duration::from_secs(175);
 const READ_RELAY_BUDGET: Duration = Duration::from_secs(30);
 /// Debug builds only: lets the binary-level tests shorten the relay budget
 /// so a silent daemon does not cost them the full production wait.
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const REQUEST_TIMEOUT_TEST_ENV: &str = "AFT_GH_SHIM_RELAY_TIMEOUT_MS";
 /// Retries of a transient refusal, each reusing the same request nonce.
 const TRANSIENT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(10)];

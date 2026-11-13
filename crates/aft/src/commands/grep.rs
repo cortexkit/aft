@@ -1630,15 +1630,28 @@ impl RowTexts {
 }
 
 fn read_line_windows(file: &Path, rows: &[&GrepMatch]) -> std::io::Result<HashMap<u32, String>> {
-    use crate::commands::semantic_search::snippet_bounds::LineWindow;
     let mut wanted = std::collections::BTreeMap::new();
     for row in rows {
         wanted.insert(row.line, row.column);
     }
-    let mut wanted = wanted.into_iter().peekable();
+    let wanted = wanted.into_iter().peekable();
     let mut reader = crate::project_content::reader_bounded(file, None, false)?;
     #[cfg(test)]
     work_probe::record(file, |work| work.line_scans += 1);
+    let size = reader.size_at_open();
+    let mut read = 0u64;
+    let windows = line_windows_from(&mut reader, &mut read, wanted);
+    crate::large_read::record(crate::large_read::Site::LineWindows, size, read);
+    windows
+}
+
+/// [`read_line_windows`]'s scan, counting the bytes it reads in `read`.
+fn line_windows_from(
+    reader: &mut crate::bounded_io::Reader,
+    read: &mut u64,
+    mut wanted: std::iter::Peekable<std::collections::btree_map::IntoIter<u32, u32>>,
+) -> std::io::Result<HashMap<u32, String>> {
+    use crate::commands::semantic_search::snippet_bounds::LineWindow;
     let mut windows = HashMap::new();
     let mut line = 1u32;
     let mut window = None;
@@ -1646,6 +1659,7 @@ fn read_line_windows(file: &Path, rows: &[&GrepMatch]) -> std::io::Result<HashMa
     let mut buffer = Vec::new();
     loop {
         buffer = reader.chunk(buffer, 64 << 10)?;
+        *read += buffer.len() as u64;
         let eof = buffer.is_empty();
         let mut start = 0;
         loop {
