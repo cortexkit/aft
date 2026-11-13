@@ -1028,6 +1028,7 @@ aft_store::heap_bytes_of_fields!(Located {
     fragment_key,
 });
 aft_store::heap_bytes_of_fields!(StoredSlices {
+    memory_epoch,
     segments,
     paths,
     by_fragment,

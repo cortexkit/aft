@@ -2039,6 +2039,7 @@ aft_store::heap_bytes_of_fields!(SearchFile {
 });
 aft_store::heap_bytes_of_fields!(Subset { set, positions });
 aft_store::heap_bytes_of_fields!(Members {
+    memory_epoch,
     view,
     generation,
     files,
