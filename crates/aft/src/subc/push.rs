@@ -338,8 +338,35 @@ pub(super) fn purge_completion_root(
         .remove(root);
 }
 
-/// Deferred configure maintenance can recover tasks after the bind ack. Call
-/// on bind and maintenance completion so registry replay cannot miss its route.
+pub(super) fn recover_registry_completions_after_maintenance(
+    kind: MaintenanceDrainKind,
+    writer_tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    registry: &crate::bash_background::BgTaskRegistry,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    root: &ProjectRootId,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+) {
+    // Only the configure tail loads durable tasks after bind. Watcher, LSP,
+    // config reload and ordinary completion drains cannot discover more tasks.
+    if kind == MaintenanceDrainKind::ConfigureTail {
+        recover_registry_completions(
+            writer_tx,
+            metrics,
+            registry,
+            routes,
+            root_channels,
+            push_buffer,
+            root,
+            lifecycle_probe,
+        );
+    }
+}
+
+/// Replay durable completions on bind and after a configure tail, which can
+/// recover tasks after the bind ack has already installed their route.
 pub(super) fn recover_registry_completions(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
@@ -368,6 +395,8 @@ pub(super) fn recover_registry_completions(
         .map(RouteIdentity::task_identity)
         .collect();
     let mut retired_backlog = 0usize;
+    let mut retired_runner = 0usize;
+    let mut queued_replays = 0usize;
     for identity in identities {
         let _scope = crate::bash_background::task_identity_scope(Some(identity.clone()));
         let key = ReplayKey {
@@ -387,17 +416,20 @@ pub(super) fn recover_registry_completions(
                 let task_id = completion.task_id.clone();
                 if super::runner_notices::retired(&identity) {
                     if metrics.completion_delivery.settle(&key, &task_id) {
+                        retired_runner += 1;
                         log::info!("runner notice task={task_id} delivered-as-unsendable: thalamus-pi was retired");
                     }
                     continue;
                 }
-                if metrics.completion_delivery.admit(root, &task_id)
-                    && !super::runner_notices::enqueue(
+                if metrics.completion_delivery.admit(root, &task_id) {
+                    if super::runner_notices::enqueue(
                         registry.clone(),
                         completion.into_push_frame(),
-                    )
-                {
-                    metrics.completion_delivery.forget(root, &task_id);
+                    ) {
+                        queued_replays += 1;
+                    } else {
+                        metrics.completion_delivery.forget(root, &task_id);
+                    }
                 }
                 continue;
             }
@@ -449,6 +481,7 @@ pub(super) fn recover_registry_completions(
                 session: identity.session.clone(),
             };
             buffer_push_frame(metrics, push_buffer, key, completion.into_push_frame());
+            queued_replays += 1;
         }
         if let Some(channel) = root_channels
             .get(root)
@@ -477,10 +510,12 @@ pub(super) fn recover_registry_completions(
             );
         }
     }
-    log::info!(
-        "subc completion recovery: root={} queued_runner_backlog_retirements={retired_backlog}",
-        root.as_path().display()
-    );
+    if retired_backlog > 0 || retired_runner > 0 || queued_replays > 0 {
+        log::info!(
+            "subc completion recovery: root={} queued_runner_backlog_retirements={retired_backlog} retired_runner_completions={retired_runner} queued_completion_replays={queued_replays}",
+            root.as_path().display()
+        );
+    }
 }
 
 #[derive(Debug, Default)]

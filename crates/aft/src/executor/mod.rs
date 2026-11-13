@@ -2001,12 +2001,21 @@ impl Executor {
         maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
         rerun: Option<RepeatableJob>,
     ) {
+        // Final LSP receipts must drain after the last route closes, even
+        // though configure, watcher and indexing maintenance are suspended.
+        let command = if job_class == JobClass::Maintenance
+            && maintenance_coalesce_key == Some(MaintenanceCoalesceKey::LspDrain)
+        {
+            "lsp-event-drain".to_owned()
+        } else {
+            job_command(job_class, lane)
+        };
         self.submit_labeled(
             root_id,
             job_class,
             lane,
             request_id,
-            job_command(job_class, lane),
+            command,
             job,
             completion,
             cancellation,
@@ -2068,7 +2077,7 @@ impl Executor {
                     if (job_class == JobClass::Maintenance
                         || command == "inspect"
                         || lane == Lane::ProviderMetadata)
-                        && command != "unbound-teardown-persist"
+                        && !maintenance_allowed_while_unbound(&command)
                     {
                         cancellation = cancellation.map(|token| {
                             token.with_lifecycle(actor.ctx.subc_lifecycle_admission())
@@ -2099,7 +2108,7 @@ impl Executor {
                     }
                     if job_class == JobClass::Maintenance {
                         if (actor.ctx.subc_unbound_quiesced()
-                            && command != "unbound-teardown-persist")
+                            && !maintenance_allowed_while_unbound(&command))
                             || !maintenance_root_exists
                         {
                             admission_error = Some(maintenance_cancelled_response(
@@ -3433,6 +3442,10 @@ fn job_command(job_class: JobClass, lane: Lane) -> String {
     format!("executor::{job_class:?}::{lane:?}")
 }
 
+fn maintenance_allowed_while_unbound(command: &str) -> bool {
+    matches!(command, "unbound-teardown-persist" | "lsp-event-drain")
+}
+
 fn maintenance_cancelled_response(
     request_id: impl Into<String>,
     message: impl Into<String>,
@@ -4710,7 +4723,7 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
                 || run_job.command == "inspect"
                 || run_job.lane == Lane::ProviderMetadata)
                 && ((run_job.ctx.subc_unbound_quiesced()
-                    && run_job.command != "unbound-teardown-persist")
+                    && !maintenance_allowed_while_unbound(&run_job.command))
                     || !run_job.root_id.as_path().is_dir()))
         {
             return cancelled_before_execution();

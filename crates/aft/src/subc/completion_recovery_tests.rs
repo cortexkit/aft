@@ -46,6 +46,89 @@ fn persisted_completion_at(
 }
 
 #[test]
+fn maintenance_recovery_skips_ordinary_drains_but_replays_configure_tail_after_bind() {
+    let (_dir, root) = test_root("completion-maintenance-gate");
+    let storage = tempfile::tempdir().unwrap();
+    let owner = tests::caller_route(&root, "direct", "opencode");
+    persisted_completion(storage.path(), &root, &owner);
+    let registry = BgTaskRegistry::default();
+    let metrics = DispatchPathMetrics::new();
+    let (writer, mut output) = mpsc::channel(4);
+    let channel = route_key(4, 9);
+    let routes = HashMap::from([(channel, owner)]);
+    let channels = HashMap::from([(root.clone(), HashSet::from([channel]))]);
+    let mut buffered = HashMap::new();
+
+    // Bind can precede the configure tail's durable task loading.
+    recover_registry_completions(
+        &writer,
+        &metrics,
+        &registry,
+        &routes,
+        &channels,
+        &mut buffered,
+        &root,
+        None,
+    );
+    assert!(output.try_recv().is_err());
+    assert!(metrics.completion_delivery.unacked.lock().unwrap()[&root].is_empty());
+    registry.replay_session(storage.path(), SESSION).unwrap();
+    assert_eq!(
+        registry.pending_completion_ids(),
+        HashMap::from([(SESSION.into(), HashSet::from([TASK.into()]))])
+    );
+
+    for _ in 0..256 {
+        for kind in [
+            MaintenanceDrainKind::Watcher,
+            MaintenanceDrainKind::Lsp,
+            MaintenanceDrainKind::CompletionDrains,
+            MaintenanceDrainKind::ConfigReload,
+        ] {
+            recover_registry_completions_after_maintenance(
+                kind,
+                &writer,
+                &metrics,
+                &registry,
+                &routes,
+                &channels,
+                &mut buffered,
+                &root,
+                None,
+            );
+        }
+    }
+    assert!(output.try_recv().is_err());
+    assert!(buffered.is_empty());
+    // Recovery refreshes this snapshot even if it finds nothing to send, so
+    // keeping the bind's empty snapshot proves no recovery pass ran.
+    assert!(metrics.completion_delivery.unacked.lock().unwrap()[&root].is_empty());
+
+    for _ in 0..2 {
+        recover_registry_completions_after_maintenance(
+            MaintenanceDrainKind::ConfigureTail,
+            &writer,
+            &metrics,
+            &registry,
+            &routes,
+            &channels,
+            &mut buffered,
+            &root,
+            None,
+        );
+    }
+    let pushed = output.try_recv().unwrap();
+    assert_eq!((pushed.header.channel, pushed.header.epoch), (4, 9));
+    assert_eq!(push_frame_task_id(&pushed).as_deref(), Some(TASK));
+    assert!(
+        output.try_recv().is_err(),
+        "configure replay must not duplicate"
+    );
+    assert!(metrics.completion_delivery.unacked.lock().unwrap()[&root][SESSION].contains(TASK));
+    registry.detach();
+}
+
+#[test]
 fn plugin_completion_churn_recovers_from_registry_once_per_connection() {
     let (_dir, root) = test_root("opencode2-completion-churn");
     let storage = tempfile::tempdir().unwrap();
