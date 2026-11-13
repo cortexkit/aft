@@ -2054,3 +2054,74 @@ fn watchdog_cost_retained_terminal_poll_measurement() {
         }
     }
 }
+
+/// Run alone with --ignored --nocapture --test-threads=1. Each lane measures
+/// calling-thread CPU for real maintenance work, normalized to its timer rate;
+/// fixture creation, rehydration and filesystem teardown are outside the window.
+#[cfg(unix)]
+#[test]
+#[ignore = "measurement: 20,000 finished bundles and 20 running tasks"]
+fn watchdog_cost_large_store_maintenance_measurement() {
+    fn cpu_us() -> u64 {
+        let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        time.tv_sec as u64 * 1_000_000 + time.tv_nsec as u64 / 1_000
+    }
+    let base = tempfile::tempdir().unwrap();
+    let storage = base.path().join("opencode");
+    fs::create_dir(&storage).unwrap();
+    let (registry, db, _) = tests::registry_with_db_and_frames(base.path());
+    for index in 0..20_000 {
+        let (metadata, paths) = fixture(&storage, "history", true, 2);
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, true)
+            .unwrap();
+        if index % 2_000 == 0 {
+            eprintln!("seeded {index}/20000 finished bundles");
+        }
+    }
+    for _ in 0..20 {
+        let (mut metadata, paths) = fixture(&storage, "running", false, 0);
+        metadata.mode = BgMode::Pty;
+        metadata.mark_running(std::process::id(), unsafe { libc::getpgrp() });
+        metadata.finished_at = None;
+        metadata.duration_ms = None;
+        write_task(&paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, true)
+            .unwrap();
+    }
+    assert_eq!(registry.running_tasks().len(), 20);
+    let mut awaiting = HashMap::new();
+    let start = cpu_us();
+    for _ in 0..120 {
+        super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut awaiting);
+    }
+    eprintln!("MAINTENANCE watchdog cpu_us/min={}", cpu_us() - start);
+    let start = cpu_us();
+    // Do not age out the registry history: this isolates periodic bookkeeping.
+    registry.cleanup_finished(Duration::from_secs(365 * 24 * 60 * 60));
+    eprintln!(
+        "MAINTENANCE aft-bash-cleanup cpu_us/min={}",
+        cpu_us() - start
+    );
+    work_counts::reset();
+    let start = cpu_us();
+    let removed = registry.maybe_gc_persisted(&storage).unwrap();
+    eprintln!(
+        "MAINTENANCE aft-bash-task-gc cpu_us/min={} removed={} counts={:?}",
+        cpu_us() - start,
+        removed,
+        work_counts::get()
+    );
+    // These fixtures use the harness PID for read-only liveness checks only.
+    registry.detach();
+}
