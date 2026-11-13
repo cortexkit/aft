@@ -9281,9 +9281,8 @@ mod tests {
         assert_eq!(row["semantic_index"]["filling"], true);
     }
 
-    #[test]
-    fn largest_meaning_fill_with_17_active_large_read_sites_abbreviates_root() {
-        let large_reads = json!({
+    fn seventeen_active_large_read_sites() -> Value {
+        json!({
             "count": 17,
             "bytes": 85_000_000,
             "largest": 5_000_000,
@@ -9294,19 +9293,94 @@ mod tests {
                 {"site": "degraded_grep", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
                 {"site": "exact_corpus", "count": 1, "bytes": 5_000_000, "largest": 5_000_000},
             ],
-        });
-        let (_, mut metrics) = largest_meaning_fill_health_metrics(large_reads.clone());
-        budget_health_metrics(&mut metrics);
-        let encoded = serde_json::to_vec(&metrics).unwrap();
-        eprintln!(
-            "largest meaning fill with 17 active large-read sites: {} bytes",
-            encoded.len()
-        );
-        assert!(encoded.len() <= HEALTH_METRICS_BUDGET_BYTES);
-        assert_eq!(metrics["metrics_bytes"], encoded.len() as u64);
-        assert_eq!(metrics["large_reads"], large_reads);
-        assert_eq!(metrics["root_details_omitted"], 0);
-        assert_eq!(metrics["roots"][0]["abbreviated"], true);
+        })
+    }
+
+    #[test]
+    fn largest_meaning_fill_with_17_active_large_read_sites_abbreviates_root() {
+        let large_reads = seventeen_active_large_read_sites();
+        let (_, fixture) = largest_meaning_fill_health_metrics(large_reads.clone());
+        for (prefix, separator) in [("/", "/"), ("C:\\", "\\")] {
+            for depth in [2048, 3072] {
+                let path = format!(
+                    "{prefix}{}health-root",
+                    format!("segment{separator}").repeat(depth)
+                );
+                let mut metrics = fixture.clone();
+                // The native report can fit on Windows without abbreviation.
+                // Make the root path itself exceed the budget on every platform;
+                // these are report strings, so no filesystem path limit applies.
+                metrics["roots"][0]["project_root"] = json!(path);
+                let before = refresh_metrics_bytes(&mut metrics);
+                assert!(before > HEALTH_METRICS_BUDGET_BYTES);
+                let original_root = metrics["roots"][0].clone();
+                budget_health_metrics(&mut metrics);
+                let encoded = serde_json::to_vec(&metrics).unwrap();
+                eprintln!(
+                    "17 active large-read sites, path_bytes={}, raw={before}, budgeted={}",
+                    path.len(),
+                    encoded.len()
+                );
+                assert!(encoded.len() <= HEALTH_METRICS_BUDGET_BYTES);
+                assert_eq!(metrics["metrics_bytes"], encoded.len() as u64);
+                assert_eq!(metrics["large_reads"], large_reads);
+                assert_eq!(metrics["root_details_omitted"], 0);
+                let root = &metrics["roots"][0];
+                assert_eq!(root["abbreviated"], true);
+                assert_eq!(root["state"], original_root["state"]);
+                assert_eq!(root["actor_count"], original_root["actor_count"]);
+                assert_eq!(
+                    root["semantic_index"],
+                    json!({"status": original_root["semantic_index"]["status"]})
+                );
+                let identity = root["project_root"].as_str().unwrap();
+                assert!(identity.starts_with("<blake3:"));
+                assert!(identity.ends_with("/health-root"));
+            }
+        }
+    }
+
+    #[test]
+    fn largest_meaning_fill_that_fits_preserves_all_reader_fields() {
+        let large_reads = seventeen_active_large_read_sites();
+        let (_, fixture) = largest_meaning_fill_health_metrics(large_reads.clone());
+        for path in ["/health-root", "C:\\health-root"] {
+            for target_bytes in [12_127, HEALTH_METRICS_BUDGET_BYTES] {
+                let mut root = fixture["roots"][0].clone();
+                root["project_root"] = json!(path);
+                assert_eq!(root["semantic_index"]["files_pending"], 20_988);
+                assert_eq!(root["semantic_index"]["filling"], true);
+                assert!(root.get("abbreviated").is_none());
+                // Keep the real root and read counters, but control ancillary
+                // telemetry so a below-budget reply and the exact byte limit
+                // both exercise the fitting branch independently of the host.
+                let mut metrics = json!({
+                    "actor_count": 1,
+                    "root_count": 1,
+                    "root_details_omitted": 0,
+                    "embedding_backend": {"available": false, "last_error": ""},
+                    "large_reads": large_reads,
+                    "roots": [root],
+                    "metrics_bytes": target_bytes,
+                })
+                .as_object()
+                .unwrap()
+                .clone();
+                let base_bytes = encoded_health_metrics_len(&metrics);
+                assert!(base_bytes < target_bytes);
+                metrics["embedding_backend"]["last_error"] =
+                    json!("e".repeat(target_bytes - base_bytes));
+                assert_eq!(refresh_metrics_bytes(&mut metrics), target_bytes);
+                let expected = metrics.clone();
+                budget_health_metrics(&mut metrics);
+                assert_eq!(metrics, expected);
+                assert_eq!(serde_json::to_vec(&metrics).unwrap().len(), target_bytes);
+                eprintln!(
+                    "fitting largest meaning fill, path={path:?}, bytes={target_bytes}, abbreviated={}",
+                    metrics["roots"][0]["abbreviated"]
+                );
+            }
+        }
     }
 
     #[test]
