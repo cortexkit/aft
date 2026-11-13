@@ -84,6 +84,7 @@ SHA="$(git rev-parse --short=12 HEAD)"
 # comes from a release download, not this checkout's HEAD, so there is nothing
 # to compare it against here.
 if [ "$SKIP_BUILD" -eq 0 ]; then
+  bash "$REPO_ROOT/scripts/check-cmake.sh"
   echo "==> running card's changes"
   ck_aft_check_card_source "$DEPLOY" "$STAGING" stage-card || exit 2
 fi
@@ -91,8 +92,8 @@ fi
 BUILD_START="$(date +%s)"
 if [ "$SKIP_BUILD" -eq 0 ]; then
   export AFT_BUILD_GIT_SHA="$(git rev-parse HEAD)"
-  echo "==> cargo build --release -p agent-file-tools (sha $SHA)"
-  cargo build --release -p agent-file-tools --bin aft
+  echo "==> cargo build --features wasm-grammars --release -p agent-file-tools (sha $SHA)"
+  cargo build --features wasm-grammars --release -p agent-file-tools --bin aft
 fi
 BIN="target/release/aft"
 # Never write the dSYM to "$BIN.dSYM": cargo owns that name as a symlink

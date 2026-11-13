@@ -56,6 +56,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
       - name: Start compiler cache (fall back to uncached)
@@ -69,7 +73,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build shared AFT binary (Linux x64)
-        run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
+        run: cargo build --features wasm-grammars --profile "$CARGO_PROFILE" -p agent-file-tools
 
       - name: Report shared binary size
         run: |
@@ -442,6 +446,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -465,6 +470,10 @@ jobs:
           components: rustfmt, clippy, rust-analyzer
           targets: x86_64-pc-windows-msvc
 
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
+
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
         continue-on-error: true
@@ -481,7 +490,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build AFT binary (Windows x64)
-        run: cargo build --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
+        run: cargo build --features wasm-grammars --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
@@ -555,6 +564,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
@@ -573,6 +583,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, rust-analyzer
+
+      - name: Check CMake for wasm-grammars
+        shell: bash
+        run: bash scripts/check-cmake.sh
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         if: runner.environment == 'github-hosted'
@@ -595,7 +609,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build AFT binary (macOS native)
-        run: cargo build --profile "$CARGO_PROFILE" --bin aft -p agent-file-tools --timings
+        run: cargo build --features wasm-grammars --profile "$CARGO_PROFILE" --bin aft -p agent-file-tools --timings
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 

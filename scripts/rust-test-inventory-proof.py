@@ -624,7 +624,8 @@ if any(
     sys.exit(0)
 
 
-baseline_output = run_command(["cargo", "test", "--workspace", "--features", "test-hooks", "--", "--list"])
+run_command(["bash", str(ROOT / "scripts/check-cmake.sh")])
+baseline_output = run_command(["cargo", "test", "--workspace", "--features", "wasm-grammars,test-hooks", "--", "--list"])
 baseline_entries = parse_cargo_list(baseline_output)
 
 unit_bin_command = [
@@ -636,7 +637,7 @@ unit_bin_command = [
     # The same features the CI archive builds with, so listing reuses its
     # compiled library instead of building a second copy without the hooks.
     "--features",
-    "test-hooks",
+    "wasm-grammars,test-hooks",
     "--workspace",
     "--lib",
     "--bins",
@@ -682,7 +683,7 @@ doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "do
 doc_entries: list[CargoEntry] = []
 if doc_baseline_entries:
     doc_output = run_command(
-        ["cargo", "test", "--workspace", "--features", "test-hooks", "--doc", "--", "--list"]
+        ["cargo", "test", "--workspace", "--features", "wasm-grammars,test-hooks", "--doc", "--", "--list"]
     )
     doc_entries = [entry for entry in parse_cargo_list(doc_output) if entry.kind == "doc"]
 
@@ -691,7 +692,7 @@ nextest_command = [
     "nextest",
     "list",
     "--features",
-    "test-hooks",
+    "wasm-grammars,test-hooks",
     "--profile",
     "gate",
     "--workspace",
@@ -731,7 +732,7 @@ watcher_output = run_command([
     "cargo",
     "test",
     "--features",
-    "test-hooks",
+    "wasm-grammars,test-hooks",
     "-p",
     "agent-file-tools",
     "--test",

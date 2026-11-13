@@ -14,10 +14,12 @@ pub const ATTEMPTS_EXHAUSTED: &str = "The <language> grammar couldn't be downloa
 pub const VERIFICATION_FAILED: &str = "The downloaded <language> grammar didn't match its expected hash, so AFT didn't use it; restarting AFT tries again.";
 pub const LOAD_FAILED: &str = "The <language> grammar failed to load; restarting AFT tries again.";
 pub const UNSUPPORTED_PLATFORM: &str = "<language> files aren't supported on this platform yet.";
+pub const SUPPORT_DISABLED: &str = "This AFT build has no downloaded-grammar support, so <language> files can't be parsed. Use a released AFT build, or rebuild with cargo install agent-file-tools --features wasm-grammars (needs CMake 3.12 or later).";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrammarState {
+    SupportDisabled,
     NotDownloaded,
     Downloading,
     NetworkRetry,
@@ -49,6 +51,7 @@ pub struct GrammarUnavailable {
 impl GrammarUnavailable {
     pub(super) fn new(language: &str, state: GrammarState) -> Self {
         let message = match state {
+            GrammarState::SupportDisabled => SUPPORT_DISABLED,
             GrammarState::NotDownloaded => NOT_DOWNLOADED,
             GrammarState::Downloading => DOWNLOADING,
             GrammarState::NetworkRetry => NETWORK_RETRY,

@@ -1,5 +1,5 @@
-//! Signed-runtime qualification of the production grammar loader, without a
-//! daemon, downloads, test hooks or executable-memory entitlements.
+//! Load and parse through the production loader after signing this executable
+//! with macOS hardened runtime and no executable-memory entitlements.
 use std::path::PathBuf;
 
 fn main() -> Result<(), String> {

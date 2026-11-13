@@ -75,7 +75,7 @@ def ensure_binary(path: Path) -> None:
         return
     if os.environ.get("AFT_BINARY_PATH"):
         raise InputFault(f"aft_binary_missing:{path}")
-    command(["cargo", "build", "--release", "-p", "agent-file-tools"])
+    command(["cargo", "build", "--features", "wasm-grammars", "--release", "-p", "agent-file-tools"])
     if not path.is_file():
         raise InputFault(f"aft_binary_missing_after_build:{path}")
     print(f"quality_binary:{path}", flush=True)

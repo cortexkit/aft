@@ -834,7 +834,14 @@ mod tests {
         let super::ManifestJoinError::GrammarUnavailable(error) = error else {
             panic!("grammar availability was flattened")
         };
-        assert_eq!(error.state, crate::grammar::GrammarState::NotDownloaded);
+        assert_eq!(
+            error.state,
+            if cfg!(feature = "wasm-grammars") {
+                crate::grammar::GrammarState::NotDownloaded
+            } else {
+                crate::grammar::GrammarState::SupportDisabled
+            }
+        );
         assert_eq!(error.language, "luau");
         assert_eq!(error.retry_after_ms, None);
         assert_eq!(error.cause, None);

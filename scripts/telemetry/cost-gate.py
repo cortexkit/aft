@@ -584,7 +584,7 @@ def ensure_release_binary(repo_root: Path, requested: str | None) -> Path:
     binary = Path(requested).expanduser() if requested else Path(os.environ.get("AFT_BINARY", repo_root / "target" / "release" / "aft")).expanduser()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         completed = subprocess.run(
-            ["cargo", "build", "--release", "-p", "agent-file-tools", "--quiet"],
+            ["cargo", "build", "--features", "wasm-grammars", "--release", "-p", "agent-file-tools", "--quiet"],
             cwd=str(repo_root),
             text=True,
             check=False,

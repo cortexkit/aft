@@ -414,7 +414,8 @@ echo "→ Rebuilding local binary with new version..."
 # RUSTC_WRAPPER is cleared: the 0.56.2 cut wedged for minutes inside an sccache
 # client that held an idle socket while the server compiled other seats' crates;
 # the release link is a single crate and gains nothing from the cache.
-RUSTC_WRAPPER= cargo build --release -p agent-file-tools --quiet 2>&1 || { echo "Error: Release build failed"; exit 1; }
+bash scripts/check-cmake.sh
+RUSTC_WRAPPER= cargo build --features wasm-grammars --release -p agent-file-tools --quiet 2>&1 || { echo "Error: Release build failed"; exit 1; }
 
 # Update versioned cache only — never write to the flat cache path because
 # other instances may be running a binary from there.
