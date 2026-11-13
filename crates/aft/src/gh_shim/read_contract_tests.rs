@@ -290,10 +290,10 @@ fn read_draft_malformed_and_unknown_refusals_fail_closed_by_code() {
             json!({"isError":true,"error":{"code":"endpoint_not_allowed","message":"no field","transmission":"not_sent"}}),
             "endpoint_not_allowed",
         ),
-        (
-            json!({"result":{"status":200,"body":{},"next_page":null}}),
-            "missing",
-        ),
+        // A lean reply (no `isError`, see `lean_replies_decode_by_their_facade_member`)
+        // with neither facade member is still malformed.
+        (json!({"structuredContent":{"status":200}}), "missing"),
+        (json!({"isError":"no","result":{}}), "missing"),
     ] {
         let error = decode(&value).unwrap_err();
         assert_eq!(error.status(), 86);
