@@ -98,10 +98,12 @@ fn retained_aft_engines() {
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>();
         assert_eq!(seeds.len(), 40);
-        for relative in &seeds {
+        for (seed, relative) in seeds.iter().enumerate() {
             let path = root.join(std::str::from_utf8(relative).unwrap());
             let mut bytes = std::fs::read(&path).unwrap();
-            bytes.extend_from_slice(b"\n// memory profile seed edit\n");
+            // Siblings may reuse a publication that already includes another
+            // root's edits. Unique declarations ensure this refresh is real.
+            bytes.extend_from_slice(format!("\npub fn health_memory_seed_{index}_{seed}() {{ let _ = crate::context::AppContext::new; }}\n").as_bytes());
             std::fs::write(path, bytes).unwrap();
         }
         checkout.checkout().record_paths(&seeds).unwrap();
@@ -110,9 +112,17 @@ fn retained_aft_engines() {
             checkout.checkout().engine_memory_parts().is_some(),
             "engine is retained"
         );
-        println!(
-            "MEMORY_FIXTURE root={index} paths={paths} parts={:?}",
-            checkout.checkout().engine_memory_parts().unwrap()
+        let parts = checkout.checkout().engine_memory_parts().unwrap();
+        let bytes: usize = parts.iter().map(|(_, bytes)| bytes).sum();
+        let bound = parts
+            .iter()
+            .find(|(name, _)| *name == "engine_bound")
+            .unwrap()
+            .1;
+        println!("MEMORY_FIXTURE root={index} paths={paths} bytes={bytes} parts={parts:?}");
+        assert!(
+            bytes >= 100_000_000 && bound >= 20_000_000,
+            "root {index} must retain a realistic engine, not a lazy or empty fixture: {parts:?}"
         );
         assert!(executor.register_actor(ProjectRootId::from_path(&root).unwrap(), Arc::clone(&ctx)));
         contexts.push(ctx);
