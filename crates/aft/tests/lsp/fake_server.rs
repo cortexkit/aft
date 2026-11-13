@@ -939,6 +939,10 @@ pub(crate) fn main() -> io::Result<()> {
                     if std::env::var("AFT_FAKE_LSP_EXIT_ON_SHUTDOWN").as_deref() == Ok("1") {
                         return Ok(());
                     }
+                    if std::env::var("AFT_FAKE_LSP_EXIT_AFTER_SHUTDOWN_RESPONSE").as_deref() == Ok("1") {
+                        write_response(&mut writer, id, Value::Null)?;
+                        return Ok(());
+                    }
                     if std::env::var("AFT_FAKE_LSP_REPORT_SHUTDOWN").as_deref() == Ok("1") {
                         write_custom_notification(&mut writer, "aft-test/shutdownReceived", Value::Null, Value::Null)?;
                     }

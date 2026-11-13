@@ -6372,6 +6372,12 @@ impl LspManager {
 
     fn log_shutdown_error(key: &ServerKey, error: &LspError) {
         match error {
+            LspError::Timeout(message)
+                if message.contains("; did not exit within ")
+                    && message.ends_with("; killed and reaped") =>
+            {
+                slog_warn!("LSP server shutdown {:?}: {}", key, message);
+            }
             LspError::ServerDisconnected(_) => slog_info!(
                 "language server {:?} at {} exited during shutdown",
                 key.kind,
@@ -12620,6 +12626,50 @@ mod idle_reap_shutdown_log_tests {
     use std::time::Duration;
 
     #[test]
+    fn shutdown_response_followed_by_exit_is_clean_and_reaped() {
+        let binary = crate::fake_lsp_test_helper::fake_server_binary();
+        let temp = tempfile::tempdir().unwrap();
+        let registry = LspChildRegistry::new();
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let env = std::collections::HashMap::from([(
+            "AFT_FAKE_LSP_EXIT_AFTER_SHUTDOWN_RESPONSE".to_string(),
+            "1".to_string(),
+        )]);
+        let client = LspClient::spawn(
+            ServerKind::Biome,
+            temp.path().to_path_buf(),
+            &binary,
+            &[],
+            &env,
+            event_tx,
+            registry.clone(),
+        )
+        .expect("spawn fake server");
+        let pid = client.child_pid();
+        let key = ServerKey {
+            kind: ServerKind::Biome,
+            root: temp.path().to_path_buf(),
+        };
+        let (outcome, lines) = crate::logging::capture_log_lines(|| {
+            LspManager::shutdown_all_clients(
+                vec![(key, client)],
+                registry.clone(),
+                Duration::from_secs(3),
+                false,
+            )
+        });
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.starts_with("ERROR ") && !line.starts_with("WARN ")),
+            "logs: {lines:?}"
+        );
+        assert_eq!(outcome.unreaped, 0);
+        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!registry.pids().contains(&pid));
+    }
+
+    #[test]
     fn shutdown_disconnect_and_timeout_log_at_the_right_level_and_reap() {
         use std::collections::HashMap;
 
@@ -12681,7 +12731,7 @@ mod idle_reap_shutdown_log_tests {
     }
 
     #[test]
-    fn shutdown_timeouts_are_errors() {
+    fn routine_log_level_reaped_shutdown_timeout_is_warn_only() {
         let key = ServerKey {
             kind: ServerKind::Biome,
             root: PathBuf::from("/worker-checkout"),
@@ -12698,7 +12748,7 @@ mod idle_reap_shutdown_log_tests {
         });
 
         assert_eq!(lines.len(), 2, "captured shutdown errors: {lines:?}");
-        assert!(lines[0].starts_with("ERROR "), "{}", lines[0]);
+        assert!(lines[0].starts_with("WARN "), "{}", lines[0]);
         assert!(lines[0].contains("did not exit within 5000ms; killed and reaped"));
         assert!(lines[0].contains("/worker-checkout"), "{}", lines[0]);
         assert!(lines[1].starts_with("ERROR "), "{}", lines[1]);
@@ -12764,7 +12814,7 @@ while True:
         assert!(!crate::bash_background::process::is_process_alive(pid));
         assert!(!registry.pids().contains(&pid));
         assert_eq!(lines.len(), 2, "captured shutdown errors: {lines:?}");
-        assert!(lines[0].starts_with("ERROR "), "{}", lines[0]);
+        assert!(lines[0].starts_with("WARN "), "{}", lines[0]);
         assert!(lines[0].contains("did not exit within 5000ms; killed and reaped"));
         assert!(lines[0].contains(&temp.path().display().to_string()));
         assert!(
