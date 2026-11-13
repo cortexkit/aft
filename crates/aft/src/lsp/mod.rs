@@ -29,6 +29,7 @@ pub enum LspError {
     Json(serde_json::Error),
     ServerNotReady(String),
     ServerDisconnected(String),
+    TypeScriptSdkUnavailable(String),
     Timeout(String),
     ServerError { code: i32, message: String },
     NotFound(String),
@@ -40,8 +41,9 @@ impl std::fmt::Display for LspError {
         match self {
             Self::Io(err) => write!(f, "I/O error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
-            Self::ServerNotReady(message) => write!(f, "server not ready: {message}"),
-            Self::ServerDisconnected(message) => write!(f, "server not ready: {message}"),
+            Self::ServerNotReady(message)
+            | Self::ServerDisconnected(message)
+            | Self::TypeScriptSdkUnavailable(message) => write!(f, "server not ready: {message}"),
             Self::Timeout(message) => write!(f, "timeout: {message}"),
             Self::ServerError { code, message } => {
                 write!(f, "server error {code}: {message}")

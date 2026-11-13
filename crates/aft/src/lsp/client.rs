@@ -2327,7 +2327,8 @@ impl LspClient {
         }
 
         let received_before_request = self.writer.received_count();
-        let request = Request::new(id.clone(), method, Some(serde_json::to_value(params)?));
+        let params = serde_json::to_value(params)?;
+        let request = Request::new(id.clone(), method, (!params.is_null()).then_some(params));
         if let Err(err) = self.writer.send(serde_json::to_string(&request)?) {
             self.remove_pending(&id);
             return Err(err);
@@ -2396,7 +2397,7 @@ impl LspClient {
     {
         self.ensure_can_send()?;
         let params = serde_json::to_value(params)?;
-        let notification = Notification::new(N::METHOD, Some(params));
+        let notification = Notification::new(N::METHOD, (!params.is_null()).then_some(params));
         let order = self
             .writer
             .send_ordered(serde_json::to_string(&notification)?)?;
@@ -2406,7 +2407,10 @@ impl LspClient {
         ) {
             self.last_used_at = Instant::now();
         }
-        self.note_analysis_document(N::METHOD, notification.params.as_ref().unwrap());
+        self.note_analysis_document(
+            N::METHOD,
+            notification.params.as_ref().unwrap_or(&Value::Null),
+        );
         Ok(order)
     }
 
@@ -3599,6 +3603,58 @@ mod tests {
             registry,
         )
         .expect("spawn long-lived LSP stand-in")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_shutdown_and_exit_wire_messages_omit_params() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("server.py");
+        let capture = tmp.path().join("messages.json");
+        std::fs::write(
+            &script,
+            r#"
+import json, sys
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line == b'\r\n': break
+        name, value = line.decode().split(':', 1)
+        headers[name.lower()] = value.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+shutdown = read_message()
+response = json.dumps({'jsonrpc': '2.0', 'id': shutdown['id'], 'result': None}).encode()
+sys.stdout.buffer.write(b'Content-Length: %d\r\n\r\n' % len(response) + response)
+sys.stdout.buffer.flush()
+exit_message = read_message()
+with open(sys.argv[1], 'w') as output:
+    json.dump([shutdown, exit_message], output)
+"#,
+        )
+        .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut client = LspClient::spawn(
+            ServerKind::TypeScript(None),
+            tmp.path().to_path_buf(),
+            Path::new("python3"),
+            &[
+                script.to_string_lossy().into_owned(),
+                capture.to_string_lossy().into_owned(),
+            ],
+            &HashMap::new(),
+            tx,
+            LspChildRegistry::new(),
+        )
+        .unwrap();
+        client.shutdown().unwrap();
+        let messages: Value = serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        assert_eq!(messages[0]["method"], "shutdown");
+        assert!(messages[0].get("id").is_some());
+        assert!(messages[0].get("params").is_none(), "{}", messages[0]);
+        assert_eq!(messages[1]["method"], "exit");
+        assert!(messages[1].get("id").is_none());
+        assert!(messages[1].get("params").is_none(), "{}", messages[1]);
     }
 
     #[cfg(unix)]

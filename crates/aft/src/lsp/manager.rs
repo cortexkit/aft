@@ -1336,10 +1336,17 @@ pub(crate) struct ServerCapacity {
     managers: Vec<std::sync::Weak<parking_lot::Mutex<LspManager>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedStartReason {
+    Other,
+    TypeScriptSdkUnavailable,
+}
+
 /// A failed start remembered for one server and workspace root.
 #[derive(Clone, Debug)]
 struct FailedSpawn {
     result: ServerAttemptResult,
+    reason: CachedStartReason,
     /// When a transient failure may be retried; `None` for a permanent one.
     retry_at: Option<Instant>,
 }
@@ -1649,7 +1656,11 @@ impl LspManager {
                 Some(now + backoff)
             }
         };
-        let failed = FailedSpawn { result, retry_at };
+        let failed = FailedSpawn {
+            result,
+            retry_at,
+            reason: CachedStartReason::Other,
+        };
         let reported = failed.reported_result(now);
         self.failed_spawns.insert(key.clone(), failed);
         reported
@@ -1778,12 +1789,16 @@ impl LspManager {
 
     /// Count currently replayable failed server/root starts without starting a server.
     /// Files outside every TypeScript project remain named in status, but their
-    /// cached not-applicable outcome is not a start failure.
+    /// cached not-applicable outcome is not a start failure. Missing TypeScript
+    /// SDKs are likewise environment gaps rather than AFT failures.
     pub(crate) fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
         let now = self.retry_clock.now();
         let mut counts = std::collections::BTreeMap::new();
         for (key, failure) in &self.failed_spawns {
             if failure.retry_at.is_some_and(|at| now >= at) {
+                continue;
+            }
+            if failure.reason == CachedStartReason::TypeScriptSdkUnavailable {
                 continue;
             }
             if matches!(
@@ -2502,10 +2517,17 @@ impl LspManager {
         failure: StartFailure,
     ) -> ServerAttemptResult {
         log_spawn_failure(def, key, &failure.error, self.retry_clock.now());
+        let sdk_unavailable = matches!(failure.error, LspError::TypeScriptSdkUnavailable(_));
         let result = classify_spawn_error(&def.binary, &failure.error);
         // Remember executable failures so subsequent file events skip this
         // (kind, root) pair. Capacity refusals remain eligible on the next request.
-        self.record_failed_spawn(key, result, failure.durability)
+        let result = self.record_failed_spawn(key, result, failure.durability);
+        if sdk_unavailable {
+            if let Some(failure) = self.failed_spawns.get_mut(key) {
+                failure.reason = CachedStartReason::TypeScriptSdkUnavailable;
+            }
+        }
+        result
     }
 
     /// Last step of [`ensure_server_for_file_detailed_unlocked`] for one
@@ -6526,6 +6548,7 @@ impl LspManager {
                     binary: "rust-analyzer".to_string(),
                     reason: "test".to_string(),
                 },
+                reason: CachedStartReason::Other,
                 retry_at: None,
             },
         );
@@ -8018,17 +8041,14 @@ impl LspManager {
             }
             SpawnFailure::Initialize {
                 instance,
-                reason,
+                error,
                 report,
                 durability,
             } => {
                 // Dropping the client in `PreparedSpawn::run` killed a
                 // still-running server, so the report is complete either way.
                 self.remember_exit_report(instance, *report);
-                StartFailure {
-                    error: LspError::ServerNotReady(reason),
-                    durability,
-                }
+                StartFailure { error, durability }
             }
         }
     }
@@ -8260,17 +8280,17 @@ pub(crate) fn rust_failure_with_root_cause(message: &str, stderr_tail: &str) -> 
 /// Explain a TypeScript server that found no usable TypeScript SDK.
 /// `outside_typescript_project` is asked only for a missing installation with
 /// no project TypeScript found, because answering it walks the server root.
-fn typescript_initialize_failure_reason(
+fn typescript_initialize_failure(
     reason: String,
     project_typescript: Option<&ProjectTypeScript>,
     outside_typescript_project: impl FnOnce() -> bool,
-) -> String {
+) -> LspError {
     use super::environmental::{TS_LS5_NO_INSTALLATION, TS_LS6_NO_TSSERVER, TS_NATIVE_NO_TSSERVER};
 
     let no_usable_sdk =
         reason.contains(TS_LS5_NO_INSTALLATION) || reason.contains(TS_LS6_NO_TSSERVER);
     if !no_usable_sdk {
-        return reason;
+        return LspError::ServerNotReady(reason);
     }
     // Nothing installs or declares TypeScript for these files (stray scripts
     // at a workspace root whose packages each install their own). The install
@@ -8281,26 +8301,38 @@ fn typescript_initialize_failure_reason(
         && reason.contains(TS_LS5_NO_INSTALLATION)
         && outside_typescript_project()
     {
-        return format!(
+        return LspError::ServerNotReady(format!(
             "{NOT_IN_TYPESCRIPT_PROJECT}: no installed typescript and no package.json declaring a typescript dependency covers these files, so typescript-language-server has no TypeScript to check them with (it reported: {TS_LS5_NO_INSTALLATION}). Installing dependencies will not change this; to check these files, put them in a package with a tsconfig.json and a typescript dependency."
-        );
+        ));
     }
     // Installing dependencies cannot help a TypeScript 7 project: the native
     // compiler never ships the tsserver.js typescript-language-server loads.
     if let Some(project) = project_typescript.filter(|ts| ts.is_native_compiler()) {
-        return format!(
+        return LspError::TypeScriptSdkUnavailable(format!(
             "TypeScript unavailable: this project uses TypeScript {} (native compiler) at {}, {TS_NATIVE_NO_TSSERVER}. Run the project's tsc --noEmit for type errors. {reason}",
             project.version,
             project.package_dir.display(),
-        );
+        ));
     }
     if reason.contains(TS_LS6_NO_TSSERVER) {
         // The server found a TypeScript package without tsserver.js. That is
         // TypeScript 7 or later somewhere AFT did not look, or a broken
         // install; either way running an install is not the fix.
-        return format!("TypeScript SDK unavailable: the TypeScript installation the language server found has no tsserver.js (TypeScript 7 and later, the native compiler, ship none), so typescript-language-server can't serve it. Check which TypeScript the project resolves; run the project's tsc --noEmit for type errors. {reason}");
+        return LspError::TypeScriptSdkUnavailable(format!("TypeScript SDK unavailable: the TypeScript installation the language server found has no tsserver.js (TypeScript 7 and later, the native compiler, ship none), so typescript-language-server can't serve it. Check which TypeScript the project resolves; run the project's tsc --noEmit for type errors. {reason}"));
     }
-    format!("TypeScript SDK unavailable: the language server could not find a valid TypeScript installation; run bun install or enable LSP auto-install (AFT never installs into the worktree). {reason}")
+    LspError::TypeScriptSdkUnavailable(format!("TypeScript SDK unavailable: the language server could not find a valid TypeScript installation; run bun install or enable LSP auto-install (AFT never installs into the worktree). {reason}"))
+}
+
+#[cfg(test)]
+fn typescript_initialize_failure_reason(
+    reason: String,
+    project_typescript: Option<&ProjectTypeScript>,
+    outside_typescript_project: impl FnOnce() -> bool,
+) -> String {
+    match typescript_initialize_failure(reason, project_typescript, outside_typescript_project) {
+        LspError::ServerNotReady(reason) | LspError::TypeScriptSdkUnavailable(reason) => reason,
+        _ => unreachable!(),
+    }
 }
 
 fn biome_unavailable_reason(reason: &str) -> String {
@@ -8809,7 +8841,7 @@ enum SpawnFailure {
     /// The process started but the `initialize` handshake failed.
     Initialize {
         instance: ServerInstanceId,
-        reason: String,
+        error: LspError,
         report: Box<ServerExitReport>,
         durability: FailureDurability,
     },
@@ -8978,23 +9010,19 @@ impl PreparedSpawn {
             } else {
                 format!("server failed during initialize: {err}")
             };
-            let reason = if self.kind == ServerKind::Biome {
-                biome_unavailable_reason(&reason)
+            let error = if self.kind == ServerKind::Biome {
+                LspError::ServerNotReady(biome_unavailable_reason(&reason))
             } else if matches!(self.kind, ServerKind::TypeScript(_)) {
                 let root = &self.root;
-                typescript_initialize_failure_reason(
-                    reason,
-                    self.project_typescript.as_ref(),
-                    || {
-                        self.typescript_lookup
-                            .as_ref()
-                            .is_some_and(|(file, boundary)| {
-                                !typescript_dependency_declared(file, root, boundary)
-                            })
-                    },
-                )
+                typescript_initialize_failure(reason, self.project_typescript.as_ref(), || {
+                    self.typescript_lookup
+                        .as_ref()
+                        .is_some_and(|(file, boundary)| {
+                            !typescript_dependency_declared(file, root, boundary)
+                        })
+                })
             } else {
-                reason
+                LspError::ServerNotReady(reason)
             };
             if matches!(err, LspError::Timeout(_)) {
                 slog_info!(
@@ -9009,12 +9037,12 @@ impl PreparedSpawn {
             let durability = if matches!(err, LspError::Timeout(_)) {
                 FailureDurability::Transient
             } else {
-                exit_durability(&reason, &report.stderr_tail)
+                exit_durability(&error.to_string(), &report.stderr_tail)
             };
             // Dropping the client here kills a still-running server.
             return Err(SpawnFailure::Initialize {
                 instance: self.instance,
-                reason,
+                error,
                 report: Box::new(report),
                 durability,
             });
@@ -9045,7 +9073,7 @@ impl PreparedSpawn {
                 // would be refused the same way.
                 return Err(SpawnFailure::Initialize {
                     instance: self.instance,
-                    reason,
+                    error: LspError::ServerNotReady(reason),
                     report: Box::new(report),
                     durability: FailureDurability::Permanent,
                 });
@@ -10908,6 +10936,33 @@ mod transient_retry_tests {
     }
 
     #[test]
+    fn diagnostics_findings_lsp_snapshot_ignores_typescript_sdk_failure_but_keeps_status() {
+        for raw in [
+            super::super::environmental::TS_LS5_NO_INSTALLATION,
+            super::super::environmental::TS_LS6_NO_TSSERVER,
+        ] {
+            for durability in [FailureDurability::Permanent, FailureDurability::Transient] {
+                let (mut manager, _) = manager_with_clock();
+                let key = ServerKey {
+                    kind: ServerKind::TypeScript(None),
+                    ..key()
+                };
+                let def = crate::lsp::registry::builtin_servers()
+                    .into_iter()
+                    .find(|def| def.kind == key.kind)
+                    .unwrap();
+                let error = typescript_initialize_failure(raw.into(), None, || false);
+                assert!(matches!(error, LspError::TypeScriptSdkUnavailable(_)));
+                let shown = error.to_string();
+                manager.record_file_start_failure(&def, &key, StartFailure { error, durability });
+                assert!(manager.cached_start_failure_counts().is_empty());
+                assert!(reason(&manager.failure_to_replay(&key).unwrap()).contains(&shown));
+                assert_eq!(manager.failed_spawns.len(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn diagnostics_findings_lsp_snapshot_counts_real_spawn_and_environment_failures() {
         let cases = [
             (ServerKind::Rust, LspError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))),
@@ -10997,6 +11052,7 @@ mod transient_retry_tests {
             .starts_with("transient failure, will retry after 1s: "));
         let at_boundary = FailedSpawn {
             result: spawn_failed(),
+            reason: CachedStartReason::Other,
             retry_at: Some(Instant::now()),
         };
         assert!(reason(&at_boundary.reported_result(Instant::now()))
