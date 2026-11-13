@@ -144,14 +144,18 @@ fn step(scheduler: &Scheduler, now: std::time::Instant) -> Next {
 
 fn wait_for(scheduler: &Scheduler, task: &str, finished: bool) {
     let id = format!("aft:bash:{task}");
+    wait_for_id(scheduler, &id, finished);
+}
+
+fn wait_for_id(scheduler: &Scheduler, id: &str, finished: bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut entries = scheduler.entries.lock().unwrap();
     loop {
         if if finished {
-            !entries.contains_key(&id)
+            !entries.contains_key(id)
         } else {
             entries
-                .get(&id)
+                .get(id)
                 .is_some_and(|entry| entry.retrying && entry.work.is_some())
         } {
             return;
@@ -159,7 +163,7 @@ fn wait_for(scheduler: &Scheduler, task: &str, finished: bool) {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         assert!(
             !left.is_zero(),
-            "notice did not reach scheduled state: {task}"
+            "notice did not reach scheduled state: {id}"
         );
         entries = scheduler.wake.wait_timeout(entries, left).unwrap().0;
     }
@@ -694,6 +698,64 @@ fn runner_notices_recovered_held_failed_settlement_releases_deferred_notice() {
         1,
         "failed recovery must not swallow the only result delivery"
     );
+    {
+        let conn = held.db.lock().unwrap();
+        let row = crate::db::call_ledger::get(&conn, &held.key)
+            .unwrap()
+            .unwrap();
+        let retained: serde_json::Value = serde_json::from_slice(&row.frame.unwrap().body).unwrap();
+        assert_eq!(
+            retained["_aft_recovery_notice"], true,
+            "startup must retain the fallback lane"
+        );
+        conn.execute_batch("DROP TRIGGER fail_held_settlement")
+            .unwrap();
+    }
+    wait_for_id(
+        super::scheduler().unwrap(),
+        &format!("aft:bash-recovery:{}", held.task.task),
+        true,
+    );
+    let result = held.result();
+    assert_eq!(result["result"]["errorCode"], "outcome_unknown");
+    assert_eq!(result["result"]["content"][0]["text"], "");
+    assert!(
+        capture.receiver.try_recv().is_err(),
+        "ending the hold must not send a second notice"
+    );
+}
+
+#[test]
+fn runner_notices_recovered_notice_fallback_survives_restart_observation() {
+    let held = HeldCompletion::new("bash-00000000000b0107");
+    {
+        let conn = held.db.lock().unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_fallback_end BEFORE UPDATE OF state ON call_ledger WHEN NEW.state='Settled' BEGIN SELECT RAISE(ABORT, 'injected fallback failure'); END;").unwrap();
+        assert!(crate::db::call_ledger::settle_task_notice_fallback(
+            &conn,
+            &held.key,
+            &held.task.task
+        )
+        .is_err());
+        conn.execute_batch("DROP TRIGGER fail_fallback_end")
+            .unwrap();
+    }
+    let reopened = crate::db::open(&held.task.storage.path().join("aft.db")).unwrap();
+    let real = crate::db::call_ledger::RecordedFrame {
+        ty: FrameType::Response,
+        body: br#"{"content":[{"type":"text","text":"real output must stay in the notice"}]}"#
+            .to_vec(),
+    };
+    crate::db::call_ledger::observe_task(
+        &reopened,
+        &held.key.carrier,
+        &held.key.call_key,
+        &held.task.task,
+        Some(&real),
+        "ok",
+    )
+    .unwrap();
+    assert_eq!(held.result()["result"]["errorCode"], "outcome_unknown");
 }
 
 #[test]

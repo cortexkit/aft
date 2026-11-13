@@ -1456,6 +1456,47 @@ pub fn observe_task(
 pub struct TaskObservation {
     pub recovered: bool,
     pub delivered_held_result: bool,
+    pub settled_notice_fallback: bool,
+}
+
+/// Remember the notice lane before ending its abandoned hold with the existing
+/// unknown-outcome response. The marker survives restart without freezing a
+/// withdrawal answer or allowing a later recovery to publish the real result.
+pub(crate) fn settle_task_notice_fallback(
+    conn: &Connection,
+    key: &Key,
+    task_id: &str,
+) -> rusqlite::Result<bool> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let Some(row) = get(&tx, key)? else {
+        return Ok(false);
+    };
+    if row.state != State::DispatchStarted
+        || row.task_id.as_deref() != Some(task_id)
+        || !has_held_reply(&row)
+        || row.withdraw_answer.is_some()
+    {
+        return Ok(false);
+    }
+    let mut held: Value = serde_json::from_slice(&row.frame.as_ref().unwrap().body)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    if held["_aft_withdrawn"] == true {
+        return Ok(false);
+    }
+    held["_aft_recovery_notice"] = json!(true);
+    // This write intentionally commits independently: a failed settlement must
+    // leave startup recovery enough information to choose the same lane.
+    tx.execute("UPDATE call_ledger SET frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state='DispatchStarted' AND task_id=?4",
+        params![key.carrier,key.call_key,held.to_string().into_bytes(),task_id])?;
+    tx.commit()?;
+    settle(
+        conn,
+        key,
+        &unknown_held_result(),
+        "outcome_unknown",
+        None,
+        now_ms(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1485,6 +1526,30 @@ pub fn observe_task_with_tool_result_source(
     if let Some(frame) = result.filter(|_| recovered) {
         let row = get(&tx, &key)?;
         if row.as_ref().is_some_and(has_held_reply) {
+            if row
+                .as_ref()
+                .and_then(|row| row.frame.as_ref())
+                .is_some_and(|held| {
+                    serde_json::from_slice::<Value>(&held.body)
+                        .is_ok_and(|held| held["_aft_recovery_notice"] == true)
+                })
+            {
+                settle_row(
+                    &tx,
+                    row.as_ref().unwrap(),
+                    &unknown_held_result(),
+                    "outcome_unknown",
+                    None,
+                    now_ms(),
+                    None,
+                )?;
+                tx.commit()?;
+                return Ok(TaskObservation {
+                    recovered,
+                    delivered_held_result: false,
+                    settled_notice_fallback: true,
+                });
+            }
             let frame = if outcome == "unknown" {
                 unknown_result
                     .cloned()
@@ -1531,6 +1596,7 @@ pub fn observe_task_with_tool_result_source(
             return Ok(TaskObservation {
                 recovered,
                 delivered_held_result,
+                settled_notice_fallback: false,
             });
         }
         if let Some(row) = row {
@@ -1542,6 +1608,7 @@ pub fn observe_task_with_tool_result_source(
     Ok(TaskObservation {
         recovered,
         delivered_held_result: false,
+        settled_notice_fallback: false,
     })
 }
 

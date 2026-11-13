@@ -229,6 +229,7 @@ mod drain;
 mod flow_read;
 mod health;
 pub(crate) mod held_task_recovery;
+pub(crate) use runner_notices::retry_held_notice_fallback;
 #[cfg(test)]
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
