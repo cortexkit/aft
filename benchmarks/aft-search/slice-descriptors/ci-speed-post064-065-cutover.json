@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "0.65 follow-up on batch 7: user config refuses views.enabled, views.callgraph_copies and worktree.ram_overlay (project config gets the existing no-effect notices), test and benchmark harnesses stop sending them, and shells.watch and shells.output are declared as watch operations. Fence files touched only for harness configuration and readiness; ranking and routing are untouched."
+}

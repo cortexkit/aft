@@ -1,6 +1,0 @@
-{
-  "slice_class": "non_ranking",
-  "targeted_mechanism": "none",
-  "kind": "harness",
-  "fixtures": ["harness-goldens"]
-}
