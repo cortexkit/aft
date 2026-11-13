@@ -4930,8 +4930,8 @@ mod tests {
         for preset in CatalogPreset::ALL {
             for params in [
                 json!({}),
-                json!({"model": {"provider": "vendor", "id": "claude"}}),
-                json!({"model": {"provider": "vendor", "id": "gpt-5"}}),
+                json!({"model": {"provider": "vendor", "model": "claude"}}),
+                json!({"model": {"provider": "vendor", "model": "gpt-5"}}),
             ] {
                 for (text_preset, text_params) in [
                     (preset.name(), json!({})),
