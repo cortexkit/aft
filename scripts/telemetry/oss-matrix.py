@@ -30,11 +30,12 @@ DEFAULT_REPOS = (
     "spark", "kubernetes", "elasticsearch", "llvm", "linux", "_nongit-24k", "chromium",
 )
 PLANES = ("search", "callgraph")
-MEASUREMENT_PROFILE = "index-store-no-inspect-refresh-v4"
+MEASUREMENT_PROFILE = "index-store-no-inspect-post-edit-refresh-v5"
 CSV_FIELDS: tuple[str, ...] = (
     "repo", "path", "git", "files", "top_languages", "semantic", "search_status",
     "callgraph_status", "index_store_build_ready_ms", "callgraph_store_build_ready_ms",
     "search_first_query_latency_ms", "callgraph_first_query_latency_ms", "callgraph_refresh_ms", "waiting_on",
+    "edit_apply_ms", "edit_backup_ms", "edit_write_ms", "edit_backup_phases", "edit_write_phases",
     "peak_rss_mb", "peak_rss_sampled_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps", "measurement_profile",
 )
 TEXT_SUFFIXES = {
@@ -818,13 +819,13 @@ def measure_first_queries(client: NdjsonClient, deadline: float) -> dict[str, fl
     return {"search_first_query_latency_ms": search_ms, "callgraph_first_query_latency_ms": callgraph_ms}
 
 
-def measure_refresh(client: NdjsonClient, deadline: float) -> float:
-    """Time a real edit through publication and an exact call-graph read.
+def measure_refresh(client: NdjsonClient, deadline: float) -> dict[str, float]:
+    """Separate edit application from the subsequent verified graph catch-up.
 
     A successful tool response alone can still describe the old graph. Require
     the edge to move between two existing targets before recording a duration.
-    Editing through AFT also exercises its production path for processing
-    the changed file before the next reader answers.
+    The graph timer starts after the edit reply, so backup and durable-write
+    latency are visible separately rather than charged to the refresh budget.
     """
     if not probe_callers(client, deadline, "aft_cost_gate_before"):
         raise NdjsonError("cold call graph did not contain the refresh probe's original edge")
@@ -832,11 +833,32 @@ def measure_refresh(client: NdjsonClient, deadline: float) -> float:
     checked_tool(client, deadline, "edit", path=PROBE_NAME, edits=[{
         "oldString": "{ aft_cost_gate_before(); }", "newString": "{ aft_cost_gate_after(); }",
     }])
+    edit_finished = time.monotonic()
     if not probe_callers(client, deadline, "aft_cost_gate_after"):
         raise NdjsonError("refresh did not publish the new call edge")
     if probe_callers(client, deadline, "aft_cost_gate_before"):
         raise NdjsonError("refresh retained the removed call edge")
-    return (time.monotonic() - started) * 1000.0
+    return {"edit_apply_ms": (edit_finished - started) * 1000.0,
+            "callgraph_refresh_ms": (time.monotonic() - edit_finished) * 1000.0}
+
+
+def edit_phase_metrics(storage: Path) -> dict[str, str]:
+    """Keep the probe's logged slow-edit phases as diagnostics, never budgets."""
+    pattern = re.compile(r"slow edit (backup|write) phase: ([0-9.]+)ms for .*"
+                         + re.escape(PROBE_NAME) + r" \(([^\n]*)\)")
+    metrics: dict[str, str] = {}
+    for path in sorted((storage / "logs").glob("aft-*.log")):
+        try:
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    match = pattern.search(line)
+                    if match:
+                        phase, duration, detail = match.groups()
+                        metrics[f"edit_{phase}_ms"] = duration
+                        metrics[f"edit_{phase}_phases"] = detail
+        except OSError:
+            continue
+    return metrics
 
 
 def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_seconds: float) -> dict[str, str]:
@@ -908,7 +930,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
             row["callgraph_store_build_ready_ms"] = f"{ready_ms['callgraph']:.3f}"
             row.update({metric: f"{value:.3f}" for metric, value in measure_first_queries(client, deadline).items()})
             phases.mark("ready", "refresh")
-            row["callgraph_refresh_ms"] = f"{measure_refresh(client, deadline):.3f}"
+            row.update({metric: f"{value:.3f}" for metric, value in measure_refresh(client, deadline).items()})
             phases.mark("ready", "ready")
             outcome = "ready"
     except BudgetExceeded:
@@ -936,6 +958,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
             row["cpu_precision"] = sampler.cpu_precision
             row["disk_write_bytes"] = str(sampler.disk_write_bytes) if sampler.disk_write_bytes is not None else "n/a"
     metrics = census_metrics(script_dir, root, storage, git, gaps)
+    row.update(edit_phase_metrics(storage))
     row.update({
         "search_status": states["search"],
         "callgraph_status": states["callgraph"],
@@ -1177,7 +1200,7 @@ def phase_self_test() -> int:
 
 def store_self_test() -> int:
     from types import SimpleNamespace
-    from unittest.mock import patch
+    from unittest.mock import mock_open, patch
 
     ready: dict[str, float] = {}
     status = {"success": True, "data_store": {}, "search_index": {"status": "ready"},
@@ -1229,7 +1252,22 @@ def store_self_test() -> int:
         assert "probe's literal" in str(error), error
     else:
         raise AssertionError("an empty first-query result was accepted as a latency")
-    assert measure_refresh(FakeClient(), time.monotonic() + 30) >= 0  # type: ignore[arg-type]
+    assert all(value >= 0 for value in measure_refresh(FakeClient(), time.monotonic() + 30).values())  # type: ignore[arg-type]
+    with patch("time.monotonic", side_effect=[0, 1, 1, 1.521, 1.521, 1.521, 1.556]):
+        separated = measure_refresh(FakeClient(), 1000)  # type: ignore[arg-type]
+    assert abs(separated["edit_apply_ms"] - 521) < 0.000001, separated
+    assert abs(separated["callgraph_refresh_ms"] - 35) < 0.000001, separated
+    slow_log = (f"slow edit backup phase: 276ms for /a path/{PROBE_NAME} (stack_lock:45.9,meta_file:96.0)\n"
+                f"slow edit write phase: 133ms for /a path/{PROBE_NAME} (write_sync:95.2,write_dir_sync:37.7)\n"
+                "slow edit write phase: 999ms for /unrelated.rs (write_sync:999)\n")
+    with patch.object(Path, "glob", return_value=[Path("aft-test.log")]), \
+            patch.object(Path, "open", mock_open(read_data=slow_log)):
+        assert edit_phase_metrics(Path("storage")) == {
+            "edit_backup_ms": "276", "edit_backup_phases": "stack_lock:45.9,meta_file:96.0",
+            "edit_write_ms": "133", "edit_write_phases": "write_sync:95.2,write_dir_sync:37.7",
+        }
+    with patch.object(Path, "glob", return_value=[]):
+        assert edit_phase_metrics(Path("storage")) == {}, "absent slow phases are not zero-duration phases"
     try:
         measure_refresh(FakeClient(stale=True), time.monotonic() + 30)  # type: ignore[arg-type]
     except NdjsonError as error:
@@ -1257,7 +1295,7 @@ def store_self_test() -> int:
             patch.dict(globals(), {"parse_proc_stat_cpu_seconds": lambda _stat: 1.0}):
         sampler._sample_once()
     assert peak_memory_metrics(sampler)["peak_rss_mb"] == "n/a", peak_memory_metrics(sampler)
-    print("oss-matrix store self-test passed: 13 checks (readiness, first-query timers and failures, refresh, stale graph, same-process kernel peak, missing HWM)")
+    print("oss-matrix store self-test passed: 17 checks (readiness, first-query timers and failures, post-edit refresh boundary, slow-edit diagnostics, stale graph, same-process kernel peak, missing HWM)")
     return 0
 
 
