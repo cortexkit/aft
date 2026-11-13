@@ -4,7 +4,7 @@ use super::super::{
 };
 use super::{admission, state, wire::*};
 use crate::bash_background::persistence::BgMode;
-use crate::bash_background::registry::ShellReader;
+use crate::bash_background::registry::{ShellReader, ShellSnapshotCache};
 use crate::bash_background::BgTaskStatus;
 use crate::db::access_grant_rows::GrantHolder;
 use crate::db::access_grants::ScopeKey;
@@ -180,7 +180,7 @@ impl Service {
             }
         }
         let before = state.sequence;
-        if rows && collected.db_available {
+        if collected.rows_refreshed && collected.db_available {
             state.replace(collected.rows, collected.status);
             *self.sources.write().await = collected.sources;
         } else {
@@ -838,6 +838,8 @@ struct DbFacts {
     truncated_roots: std::collections::BTreeSet<String>,
     holders: HashMap<ScopeKey, GrantHolder>,
     saved: Vec<crate::db::bash_tasks::BashTaskRow>,
+    saved_key: Option<(usize, u64, i64)>,
+    samples: ShellSnapshotCache,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -857,6 +859,7 @@ struct Collected {
     sources: HashMap<String, ShellReader>,
     db: DbFacts,
     db_available: bool,
+    rows_refreshed: bool,
 }
 
 #[cfg(test)]
@@ -961,6 +964,8 @@ fn read_db_facts(
     });
     if let Some(mut facts) = loaded {
         facts.saved = std::mem::take(&mut previous.saved);
+        facts.saved_key = previous.saved_key;
+        facts.samples = previous.samples;
         (facts, true)
     } else {
         (previous, false)
@@ -1017,18 +1022,34 @@ fn collect_at_revision(
         roots: bound_roots.clone(),
         db_identity: db.map(|db| std::ptr::from_ref(db) as usize),
     };
-    let dirty = previous.key.as_ref() != Some(&key);
+    let mut dirty = previous.key.as_ref() != Some(&key);
     let mut facts = previous;
     let mut db_available = true;
-    if dirty {
-        if let Some(db) = db {
-            if let Some(saved) = with_db_read(db, |conn| {
-                crate::db::bash_tasks::operator_shell_rows(conn, now().saturating_sub(RETENTION_MS))
-            }) {
-                facts.saved = saved;
+    if let Some(db) = db {
+        let generation = crate::db::bash_tasks::store_revision();
+        if let Some((saved_key, saved)) = with_db_read(db, |conn| {
+            // data_version catches committed writes from other connections
+            // and processes; the process generation covers this connection's
+            // own writes, which SQLite excludes from data_version.
+            let version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+            let saved_key = (std::ptr::from_ref(db) as usize, generation, version);
+            let saved = if facts.saved_key == Some(saved_key) {
+                None
             } else {
-                db_available = false;
+                Some(crate::db::bash_tasks::operator_shell_rows(
+                    conn,
+                    now().saturating_sub(RETENTION_MS),
+                )?)
+            };
+            Ok((saved_key, saved))
+        }) {
+            if let Some(saved) = saved {
+                facts.saved = saved;
+                dirty = true;
             }
+            facts.saved_key = Some(saved_key);
+        } else {
+            db_available = false;
         }
     }
     let observe = db_available && (include_rows || dirty);
@@ -1037,7 +1058,7 @@ fn collect_at_revision(
     for ctx in &contexts {
         if observe {
             let registry = ctx.bash_background();
-            for snapshot in registry.shell_snapshots() {
+            for snapshot in registry.shell_snapshots_cached(&mut facts.samples) {
                 if !state::retained(&project_row(&snapshot, None), now()) {
                     continue;
                 }
@@ -1053,7 +1074,9 @@ fn collect_at_revision(
             if sources.contains_key(&saved.task_id) {
                 continue;
             }
-            if let Some((snapshot, reader)) = ShellReader::persisted(saved) {
+            if let Some((snapshot, reader)) =
+                ShellReader::persisted_cached(saved, &mut facts.samples)
+            {
                 if !state::retained(&project_row(&snapshot, None), now()) {
                     continue;
                 }
@@ -1061,6 +1084,9 @@ fn collect_at_revision(
                 observations.push(snapshot);
             }
         }
+    }
+    if observe {
+        facts.samples.retain(&sources);
     }
     if dirty && db_available {
         let scopes = observations
@@ -1079,7 +1105,7 @@ fn collect_at_revision(
         }
     });
     let mut rows = Vec::new();
-    if include_rows && db_available {
+    if observe {
         for snapshot in observations {
             let mut row = project_row(&snapshot, None);
             row.revision = snapshot.metadata.shell_revision;
@@ -1105,7 +1131,7 @@ fn collect_at_revision(
             .to_string();
         if let Some(registry) = sources.get(&row.task_id) {
             row.revision = registry
-                .shell_revision(&row.task_id, &fingerprint)
+                .shell_revision_if_changed(&row.task_id, &fingerprint)
                 .unwrap_or(row.revision);
         }
     }
@@ -1234,6 +1260,7 @@ fn collect_at_revision(
         sources,
         db: facts,
         db_available,
+        rows_refreshed: observe,
     }
 }
 

@@ -1268,7 +1268,9 @@ pub(crate) struct ScopeKillReport {
 mod scratch_retention;
 #[path = "shell_registry.rs"]
 mod shell_registry;
-pub(crate) use shell_registry::{ShellReader, ShellSnapshot, SHELL_MASK_WITHHELD};
+pub(crate) use shell_registry::{
+    ShellReader, ShellSnapshot, ShellSnapshotCache, SHELL_MASK_WITHHELD,
+};
 #[path = "task_image_cleanup.rs"]
 mod task_image_cleanup;
 
@@ -11175,11 +11177,11 @@ impl BgTaskRegistry {
                 // only this explicit transition may lower the durable bit.
                 if let Some((harness, pool)) = self.db_harness_and_pool_for_task(&task) {
                     let conn = pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
-                    conn.execute(
+                    crate::db::bash_tasks::record_store_write(conn.execute(
                         "UPDATE bash_tasks SET completion_delivered = 0
                          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
                         rusqlite::params![harness, session_id, task_id],
-                    )
+                    ))
                     .map_err(|e| format!("failed to reset promoted task delivery: {e}"))?;
                 }
                 // SQLite is unlocked before taking task state. Keep the fence
@@ -12161,12 +12163,12 @@ impl BgTaskRegistry {
             let Ok(conn) = pool.lock() else {
                 return;
             };
-            let _ = conn.execute(
+            let _ = crate::db::bash_tasks::record_store_write(conn.execute(
                 "UPDATE bash_tasks SET completion_delivered = 1
                  WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
                    AND status IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')",
                 rusqlite::params![harness, session_id, task_id],
-            );
+            ));
         });
     }
 

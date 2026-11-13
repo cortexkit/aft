@@ -159,6 +159,9 @@ fn shells_v1_operation_logs_are_once_per_event_and_content_free() {
 #[path = "runtime_perf_tests.rs"]
 mod perf;
 
+#[path = "runtime_cache_tests.rs"]
+mod cache;
+
 fn status_context() -> (
     tempfile::TempDir,
     Arc<crate::context::AppContext>,
@@ -340,20 +343,21 @@ fn shells_v1_database_facts_scale_with_shells_not_thirty_thousand_scope_rows() {
     DB_LOCK_DURATIONS.with(|durations| durations.borrow_mut().clear());
     let idle = collect_at_revision(&executor, Some(&db), false, first.db, 10);
     assert!(
-        FACTS_SQL_TRACE.with(|trace| trace.borrow().is_empty()),
-        "idle status issued SQL"
-    );
-    assert!(
-        DB_LOCK_DURATIONS.with(|samples| samples.borrow().is_empty()),
-        "idle status acquired aft.db"
+        FACTS_SQL_TRACE.with(|trace| trace
+            .borrow()
+            .iter()
+            .all(|sql| sql == "PRAGMA data_version")),
+        "idle status loaded database rows"
     );
     // A watchdog wakeup without a metadata mutation must not dirty the cache,
     // even when persisted output observation asks for refreshed rows.
     crate::bash_background::shell_metadata::changed();
     let polled = collect_at_revision(&executor, Some(&db), true, idle.db, 10);
     assert_eq!(polled.rows.len(), 3);
-    assert!(FACTS_SQL_TRACE.with(|trace| trace.borrow().is_empty()));
-    assert!(DB_LOCK_DURATIONS.with(|samples| samples.borrow().is_empty()));
+    assert!(FACTS_SQL_TRACE.with(|trace| trace
+        .borrow()
+        .iter()
+        .all(|sql| sql == "PRAGMA data_version")));
     db.lock()
         .unwrap()
         .execute(
