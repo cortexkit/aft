@@ -133,10 +133,12 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
             "read_budget_exhausted"
                 | "repository_not_visible"
                 | "endpoint_not_allowed"
-                | "response_too_large"
                 | "agent_identity_required"
         );
+        // A size refusal can follow a real GitHub response. Reads are safe to
+        // narrow and retry even once the request has reached GitHub.
         if (known_refusal && transmission != "not_sent")
+            || (code == "response_too_large" && !matches!(transmission, "sent" | "not_sent"))
             || (code == "vendor_error" && transmission != "sent")
         {
             return Err(malformed(code, "unexpected transmission"));

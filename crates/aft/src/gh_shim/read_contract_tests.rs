@@ -6,6 +6,143 @@ fn vectors() -> Value {
     ))
     .unwrap()
 }
+
+fn bulk_vectors() -> Vec<(&'static str, &'static [u8], &'static [u8])> {
+    macro_rules! vector {
+        ($name:literal) => {
+            (
+                $name,
+                include_bytes!(concat!(
+                    "../../../../test-vectors/plexus-read-bulk-v1/read-bulk-requests-contract/",
+                    $name,
+                    ".json"
+                ))
+                .as_slice(),
+                include_bytes!(concat!(
+                    "../../../../test-vectors/plexus-read-bulk-v1/read-bulk-replies-contract/",
+                    $name,
+                    ".json"
+                ))
+                .as_slice(),
+            )
+        };
+    }
+    vec![
+        vector!("repo-get-diff"),
+        vector!("search-code"),
+        vector!("search-issues"),
+        vector!("job-log-range"),
+        vector!("refused-response-too-large"),
+        vector!("refused-endpoint-not-allowed-path"),
+    ]
+}
+
+#[test]
+fn plexus_read_bulk_requests_encode_each_upstream_vector_byte_for_byte() {
+    for (name, request, _) in bulk_vectors() {
+        let mut vector: Value = serde_json::from_slice(request).unwrap();
+        let parsed: WireRequest =
+            serde_json::from_value(vector["request"]["params"].clone()).unwrap();
+        vector["request"] = crate::gh_shim_relay::read_call(&parsed, true);
+        let mut encoded = serde_json::to_vec_pretty(&vector).unwrap();
+        encoded.push(b'\n');
+        assert_eq!(encoded, request, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn plexus_read_bulk_replies_use_the_tool_decoder_and_preserve_visible_bytes() {
+    use crate::gh_shim_relay::RelayTransport;
+    fn visible(request: &WireRequest, reply: &Value) -> (i32, Vec<u8>, String) {
+        match executor::decode_reply(request, reply) {
+            Ok(reply) => (0, reply.bytes().unwrap(), String::new()),
+            Err(error) => (error.status(), Vec::new(), error.message("aft-bot")),
+        }
+    }
+    for (name, request, reply) in bulk_vectors() {
+        let request: Value = serde_json::from_slice(request).unwrap();
+        let request: WireRequest =
+            serde_json::from_value(request["request"]["params"].clone()).unwrap();
+        let vector: Value = serde_json::from_slice(reply).unwrap();
+        let bulk_reply = &vector["reply"];
+        let expected = match name {
+            "repo-get-diff" => (0, "diff --git a/src/lib.rs b/src/lib.rs\n", ""),
+            "search-code" => (0, r#"{"total_count":1,"incomplete_results":false,"items":[{"name":"config.rs","path":"src/config.rs"}],"next_page":null}"#, ""),
+            "search-issues" => (0, r#"{"total_count":31,"incomplete_results":false,"items":[{"number":7,"title":"Crash on start"}],"next_page":3}"#, ""),
+            "job-log-range" => (0, "test parser::rejects_bad_input ... FAILED\n", ""),
+            "refused-response-too-large" => (86, "", "worker read response exceeds 1 MiB; narrow the request: GitHub's reply is larger than 1 MiB and was not returned"),
+            "refused-endpoint-not-allowed-path" => (86, "", "worker read endpoint or field path is not allowed; the read was not sent: this argument is not one GitHub bot reads serve"),
+            _ => unreachable!(),
+        };
+        for bulk in [false, true] {
+            let daemon =
+                crate::gh_shim_relay::tests::fake_daemon_with_read_reply(bulk_reply.clone(), bulk)
+                    .await;
+            let transport = daemon.transport().await;
+            let reply = transport
+                .plexus(
+                    "/p",
+                    name,
+                    None,
+                    crate::gh_shim_relay::read_call(&request, false),
+                )
+                .await
+                .unwrap();
+            assert_eq!(&reply, bulk_reply, "{name}, bulk={bulk}");
+            assert_eq!(
+                daemon.requests().last(),
+                Some(&crate::gh_shim_relay::read_call(&request, bulk)),
+                "{name}, bulk={bulk}"
+            );
+            assert_eq!(
+                visible(&request, &reply),
+                (
+                    expected.0,
+                    expected.1.as_bytes().to_vec(),
+                    expected.2.into()
+                ),
+                "{name}, bulk={bulk}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn plexus_read_bulk_too_large_vector_keeps_the_legacy_tool_retryable() {
+    use crate::gh_shim_relay::RelayTransport;
+    let (_, request, reply) = bulk_vectors()
+        .into_iter()
+        .find(|(name, _, _)| *name == "refused-response-too-large")
+        .unwrap();
+    let request: Value = serde_json::from_slice(request).unwrap();
+    let request: WireRequest =
+        serde_json::from_value(request["request"]["params"].clone()).unwrap();
+    let reply: Value = serde_json::from_slice(reply).unwrap();
+    let daemon =
+        crate::gh_shim_relay::tests::fake_daemon_with_read_reply(reply["reply"].clone(), false)
+            .await;
+    let transport = daemon.transport().await;
+    let tool = crate::gh_shim_relay::read_call(&request, false);
+    let reply = transport
+        .plexus("/p", "size-refusal", None, tool.clone())
+        .await
+        .unwrap();
+    assert_eq!(daemon.requests().last(), Some(&tool));
+    for transmission in ["sent", "not_sent"] {
+        let mut reply = reply.clone();
+        reply["error"]["transmission"] = json!(transmission);
+        let error = executor::decode_reply(&request, &reply).unwrap_err();
+        assert!(matches!(error, ReadError::ResponseTooLarge(_)), "{error:?}");
+        assert_eq!(error.message("aft-bot"), "worker read response exceeds 1 MiB; narrow the request: GitHub's reply is larger than 1 MiB and was not returned");
+    }
+    let mut invalid = reply;
+    invalid["error"]["transmission"] = json!("unknown");
+    assert!(executor::decode_reply(&request, &invalid)
+        .unwrap_err()
+        .message("aft-bot")
+        .contains("unexpected transmission"));
+}
+
 fn get() -> ReadRequest {
     ReadRequest::Get {
         path: "/repos/cortexkit/aft/pulls/7/files".into(),
@@ -174,7 +311,6 @@ fn read_draft_transmission_guard_rejects_refusal_and_vendor_mismatches() {
         "read_budget_exhausted",
         "repository_not_visible",
         "endpoint_not_allowed",
-        "response_too_large",
         "agent_identity_required",
         "vendor_error",
     ] {

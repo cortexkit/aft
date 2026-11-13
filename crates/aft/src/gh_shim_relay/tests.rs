@@ -1201,6 +1201,7 @@ struct DaemonLog {
     closes: Vec<Value>,
     /// Every request body sent on an open route.
     requests: Vec<Value>,
+    request_channels: Vec<u16>,
     connections_closed: usize,
 }
 
@@ -1365,6 +1366,7 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                 let seen = {
                                     let mut log = log.lock().unwrap();
                                     log.requests.push(body.clone());
+                                    log.request_channels.push(header.channel);
                                     log.requests.len()
                                 };
                                 let response = script.reply.as_ref().map(|reply| reply(&body,route_scopes.get(&header.channel)))
@@ -1917,6 +1919,97 @@ fn read_worker_stamp() -> ScopeStamp {
     scope
 }
 
+#[tokio::test]
+async fn read_bulk_selection_follows_each_routes_live_advertisement() {
+    let description = Arc::new(Mutex::new(json!({})));
+    let advertised = description.clone();
+    let reply: Value = serde_json::from_str(include_str!(
+        "../../../../test-vectors/plexus-read-bulk-v1/read-bulk-replies-contract/repo-get-diff.json"
+    ))
+    .unwrap();
+    let expected_reply = reply["reply"].clone();
+    let daemon = fake_daemon(DaemonScript {
+        reply: Some(Arc::new(move |body, _| {
+            if body["method"] == "role.describe" {
+                advertised.lock().unwrap().clone()
+            } else {
+                reply["reply"].clone()
+            }
+        })),
+        ..DaemonScript::default()
+    })
+    .await;
+    let transport = daemon.transport().await;
+    let selector = scope_selector(&read_worker_stamp());
+    let parsed = serde_json::from_value(read_params("unused")["request"].clone()).unwrap();
+    let tool = read_call(&parsed, false);
+    let bulk = read_call(&parsed, true);
+    let descriptions = [
+        (
+            json!({"majors":[{"version":"tool-provider/v1","ops":["tool.call"]}]}),
+            false,
+        ),
+        (json!({"capabilities":[READ_BULK_CAPABILITY]}), true),
+        // Rollback on the same daemon connection must not reuse a prior advert.
+        (
+            json!({"majors":[{"version":"tool-provider/v1","ops":["tool.call"]}]}),
+            false,
+        ),
+        (
+            json!({"majors":[{"version":"tool-provider/v1","ops":[READ_BULK_OPERATION]}]}),
+            true,
+        ),
+        (
+            json!({"isError":true,"error":{"code":"unknown_method"}}),
+            false,
+        ),
+        (
+            json!({"capabilities":["plexus:github.read/v1"],"majors":[{"version":"other/v1","ops":[READ_BULK_OPERATION]}]}),
+            false,
+        ),
+        (Value::Null, false),
+    ];
+    for (index, (advert, use_bulk)) in descriptions.into_iter().enumerate() {
+        *description.lock().unwrap() = advert;
+        let result = transport
+            .plexus("/p", "read-bulk-session", Some(&selector), tool.clone())
+            .await
+            .unwrap();
+        assert_eq!(result, expected_reply);
+        let requests = daemon.requests();
+        assert_eq!(requests.len(), (index + 1) * 2);
+        assert_eq!(
+            requests[index * 2],
+            json!({"method":"role.describe","params":{}})
+        );
+        assert_eq!(
+            requests[index * 2 + 1],
+            if use_bulk { &bulk } else { &tool }.clone()
+        );
+        if !use_bulk {
+            assert_eq!(serde_json::to_vec(&requests[index * 2 + 1]).unwrap(), br#"{"name":"github_read","arguments":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"pulls/7/files","accept":"application/vnd.github+json"}}}"#);
+        }
+    }
+    for open in daemon.opens() {
+        assert_eq!(
+            open["target"],
+            serde_json::to_value(subc_protocol::RouteTarget::ToolProvider {
+                module_id: PLEXUS_MODULE_ID.into()
+            })
+            .unwrap()
+        );
+        assert_eq!(open["scope"], serde_json::to_value(&selector).unwrap());
+    }
+    let log = daemon.log.lock().unwrap();
+    assert_eq!(log.opens.len(), 7);
+    for channels in log.request_channels.chunks_exact(2) {
+        assert_eq!(
+            channels[0], channels[1],
+            "probe and read must share the route"
+        );
+    }
+}
+
 #[test]
 fn read_relay_uses_github_read_and_the_ticket_scope_without_identity_fields() {
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read", "read-call", "/p");
@@ -2452,6 +2545,20 @@ pub(crate) async fn fake_daemon_with_reply(
     fake_daemon(DaemonScript {
         reply: Some(reply),
         ..Default::default()
+    })
+    .await
+}
+
+pub(crate) async fn fake_daemon_with_read_reply(reply: Value, bulk: bool) -> FakeDaemon {
+    fake_daemon(DaemonScript {
+        reply: Some(Arc::new(move |body, _| {
+            if body["method"] == "role.describe" {
+                json!({"capabilities": if bulk { vec![READ_BULK_CAPABILITY] } else { vec![] }})
+            } else {
+                reply.clone()
+            }
+        })),
+        ..DaemonScript::default()
     })
     .await
 }

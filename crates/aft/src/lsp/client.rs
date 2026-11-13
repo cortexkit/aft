@@ -2513,10 +2513,22 @@ impl LspClient {
             return Ok(());
         }
 
-        if let Err(err) =
-            self.send_request_with_timeout::<lsp_types::request::Shutdown>((), request_timeout)
-        {
+        let request = match self.start_request::<lsp_types::request::Shutdown>(()) {
+            Ok(request) => request,
+            Err(err) => return self.abort_live_child_after_shutdown_error(err),
+        };
+        if let Err(err) = request.wait(request_timeout) {
             self.state = ServerState::ShuttingDown;
+            if matches!(err, LspError::ServerDisconnected(_)) {
+                return self.abort_live_child_after_shutdown_error(err);
+            }
+            if matches!(err, LspError::Timeout(_)) && self.child.try_wait()?.is_some() {
+                self.state = ServerState::Exited;
+                self.child_registry.untrack(self.child_pid);
+                return Err(LspError::ServerDisconnected(
+                    "server exited during shutdown".into(),
+                ));
+            }
             return self.abort_live_child_after_shutdown_error(err);
         }
 
@@ -2661,7 +2673,11 @@ impl LspClient {
         if self.child.try_wait()?.is_some() {
             self.state = ServerState::Exited;
             self.child_registry.untrack(self.child_pid);
-            return Ok(());
+            return if matches!(err, LspError::ServerDisconnected(_)) {
+                Err(err)
+            } else {
+                Ok(())
+            };
         }
         kill_lsp_child_group(&mut self.child);
         self.wait_for_child_exit_bounded();
@@ -2860,10 +2876,15 @@ impl PendingLspRequest {
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.remove_pending();
-                return Err(LspError::ServerNotReady(format!(
+                let message = format!(
                     "language server {:?} disconnected while waiting for '{}'",
                     self.kind, self.method
-                )));
+                );
+                return Err(if self.method == "shutdown" {
+                    LspError::ServerDisconnected(message)
+                } else {
+                    LspError::ServerNotReady(message)
+                });
             }
         };
 
@@ -3163,6 +3184,36 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_write_failure_after_fake_server_exits_is_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = LspChildRegistry::new();
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let env = HashMap::from([(
+            "AFT_FAKE_LSP_EXIT_AFTER_SHUTDOWN_RESPONSE".to_string(),
+            "1".to_string(),
+        )]);
+        let mut client = LspClient::spawn(
+            ServerKind::Biome,
+            temp.path().to_path_buf(),
+            &crate::fake_lsp_test_helper::fake_server_binary(),
+            &[],
+            &env,
+            event_tx,
+            registry.clone(),
+        )
+        .expect("spawn fake server");
+        let pid = client.child_pid();
+        client
+            .send_request_with_timeout::<lsp_types::request::Shutdown>((), Duration::from_secs(3))
+            .expect("fake server answered shutdown");
+        client.child.wait().expect("fake server exited");
+        let error = LspError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(client.abort_live_child_after_shutdown_error(error).is_ok());
+        assert!(!registry.pids().contains(&pid));
+        assert!(!crate::bash_background::process::is_process_alive(pid));
+    }
 
     #[test]
     fn rust_capacity_refusal_reports_cap_and_current_count() {

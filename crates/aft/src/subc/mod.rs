@@ -6866,8 +6866,8 @@ where
                     }
                 }
                 if let Some(ctx) = executor.actor_context(&root_id) {
-                    push::recover_registry_completions(
-                        &writer_tx, &dispatch_path_metrics, ctx.bash_background(),
+                    push::recover_registry_completions_after_maintenance(
+                        completion.kind, &writer_tx, &dispatch_path_metrics, ctx.bash_background(),
                         &routes, &root_channels, &mut push_buffer, &root_id, lifecycle_probe.as_ref(),
                     );
                 }
@@ -18787,6 +18787,107 @@ mod tests {
         }
         assert!(!meta.maintenance_pending);
         assert_eq!(meta.maintenance_jobs_in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn quiesced_lsp_maintenance_drains_final_events_without_resubmission_loop() {
+        let (_dir, root) = test_root("quiesced-lsp-drain");
+        let ctx = Arc::new(AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        ));
+        ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        ctx.mark_subc_bound();
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        quiesce_unbound_root(&root, &mut live_roots, &executor);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(4);
+        let batch = runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP;
+
+        // Detached readers can still send final receipts during shutdown.
+        // Repeated bursts must be consumed rather than retained until rebind.
+        for _ in 0..4 {
+            for _ in 0..=batch {
+                ctx.lsp()
+                    .enqueue_event_for_test(crate::lsp::client::LspEvent::Notification {
+                        server_kind: crate::lsp::registry::ServerKind::Rust,
+                        root: root.as_path().to_path_buf(),
+                        method: "custom/final".into(),
+                        params: None,
+                    });
+            }
+            for remaining in [1, 0] {
+                let (due, _) = due_maintenance_jobs(
+                    &mut live_roots,
+                    Some(&executor),
+                    &BgSubsBySession::new(),
+                    &BgWakePending::new(),
+                    usize::MAX,
+                    &HashSet::new(),
+                );
+                assert_eq!(due, vec![(root.clone(), MaintenanceDrainKind::Lsp)]);
+                submit_maintenance_job(
+                    &executor,
+                    root.clone(),
+                    MaintenanceDrainKind::Lsp,
+                    Vec::new(),
+                    &tx,
+                    &metrics,
+                );
+                let completion = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(completion.response.success, "{:?}", completion.response);
+                note_maintenance_completion(
+                    live_roots.get_mut(&root).unwrap(),
+                    completion.requeue_kind,
+                    false,
+                    true,
+                );
+                assert_eq!(ctx.lsp().pending_event_count_for_test(), remaining);
+            }
+        }
+
+        for _ in 0..256 {
+            let (due, _) = due_maintenance_jobs(
+                &mut live_roots,
+                Some(&executor),
+                &BgSubsBySession::new(),
+                &BgWakePending::new(),
+                usize::MAX,
+                &HashSet::new(),
+            );
+            assert!(due.is_empty(), "a drained quiesced root must stay idle");
+        }
+        assert_eq!(ctx.lsp().pending_event_count_for_test(), 0);
+
+        ctx.mark_subc_bound();
+        ctx.lsp().resume();
+        live_roots.get_mut(&root).unwrap().unbound_quiesced = false;
+        ctx.lsp()
+            .enqueue_event_for_test(crate::lsp::client::LspEvent::Notification {
+                server_kind: crate::lsp::registry::ServerKind::Rust,
+                root: root.as_path().to_path_buf(),
+                method: "custom/rebound".into(),
+                params: None,
+            });
+        submit_maintenance_job(
+            &executor,
+            root,
+            MaintenanceDrainKind::Lsp,
+            Vec::new(),
+            &tx,
+            &metrics,
+        );
+        let rebound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rebound.response.success);
+        assert_eq!(ctx.lsp().pending_event_count_for_test(), 0);
     }
 
     #[tokio::test]

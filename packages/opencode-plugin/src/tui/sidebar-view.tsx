@@ -33,6 +33,7 @@ import {
   seedCollapsedFromPrefs,
   watchTuiPreferences,
 } from "./preferences";
+import { SidebarFrame, type SidebarTheme } from "./shared-sidebar";
 
 const SINGLE_BORDER = { type: "single" } as any;
 
@@ -429,6 +430,55 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
   // entry. Keep this muted and separate from the DEGRADED badge above.
   const worktreeNote = () => worktreeCacheRoleNote(s()?.cache_role);
 
+  const headerMarkers = () => (
+    <>
+      {s()?.degraded && degradedHeaderMarker(s()?.degraded_reasons ?? []).calm && (
+        <box marginLeft={1}>
+          <text fg={props.palette.warning}>
+            {degradedHeaderMarker(s()?.degraded_reasons ?? []).text}
+          </text>
+        </box>
+      )}
+      {s()?.degraded && !degradedHeaderMarker(s()?.degraded_reasons ?? []).calm && (
+        <box
+          paddingLeft={1}
+          paddingRight={1}
+          marginLeft={1}
+          backgroundColor={props.palette.warning}
+        >
+          <text fg={badgeForeground(props.palette.warning, props.palette.background)}>
+            <b>{degradedHeaderMarker(s()?.degraded_reasons ?? []).text}</b>
+          </text>
+        </box>
+      )}
+    </>
+  );
+
+  const notices = () => (
+    <>
+      {/* These explanations remain visible when the metric rows are collapsed. */}
+      {s()?.degraded && degradedSummary() && (
+        <box marginTop={1} width="100%">
+          <text fg={props.palette.warning}>⚠ {degradedSummary()}</text>
+        </box>
+      )}
+      {!notInitialized() && worktreeNote() && (
+        <box marginTop={1} width="100%">
+          <text fg={props.palette.textMuted}>{worktreeNote()}</text>
+        </box>
+      )}
+      {notInitialized() && (
+        <box marginTop={1} width="100%">
+          {s()!.config_error ? (
+            <text fg={props.palette.error}>✖ {s()!.message}</text>
+          ) : (
+            <text fg={props.palette.textMuted}>{s()!.message || NOT_STARTED_STATUS_TEXT}</text>
+          )}
+        </box>
+      )}
+    </>
+  );
+
   return (
     <box
       width="100%"
@@ -440,276 +490,237 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
       paddingLeft={1}
       paddingRight={1}
     >
-      {/* Header: triangle toggle + AFT badge + binary version + degraded badge.
-          Clicking the header row collapses/expands the panel (mirrors OpenCode's
-          native MCP sidebar section). Only interactive once initialized — the
-          lazy-bridge placeholder has nothing to collapse. */}
-      <box
-        flexDirection="row"
-        justifyContent="space-between"
-        alignItems="center"
-        onMouseDown={() => {
-          if (notInitialized()) return;
-          props.onToggleCollapsed();
+      <SidebarFrame
+        header={{
+          badge: props.prefs.header.label,
+          version:
+            !notInitialized() && props.prefs.header.showVersion
+              ? `v${s()?.version ?? props.pluginVersion}`
+              : undefined,
+          afterBadge: headerMarkers,
         }}
-      >
-        <box flexDirection="row" alignItems="center">
-          {/* Triangle lives inside the accent badge so the toggle reads as one
-              unit: "▶ AFT" / "▼ AFT". Hidden pre-init (nothing to collapse). */}
-          <box paddingLeft={1} paddingRight={1} backgroundColor={props.palette.accent}>
-            <text fg={badgeForeground(props.palette.accent, props.palette.background)}>
-              <b>
-                {notInitialized() ? "" : props.collapsed ? "▶ " : "▼ "}
-                {props.prefs.header.label}
-              </b>
-            </text>
-          </box>
-          {s()?.degraded && degradedHeaderMarker(s()?.degraded_reasons ?? []).calm && (
-            <box marginLeft={1}>
-              <text fg={props.palette.warning}>
-                {degradedHeaderMarker(s()?.degraded_reasons ?? []).text}
-              </text>
-            </box>
-          )}
-          {s()?.degraded && !degradedHeaderMarker(s()?.degraded_reasons ?? []).calm && (
-            <box
-              paddingLeft={1}
-              paddingRight={1}
-              marginLeft={1}
-              backgroundColor={props.palette.warning}
-            >
-              <text fg={badgeForeground(props.palette.warning, props.palette.background)}>
-                <b>{degradedHeaderMarker(s()?.degraded_reasons ?? []).text}</b>
-              </text>
-            </box>
-          )}
-        </box>
-        {!notInitialized() && props.prefs.header.showVersion && (
-          <text fg={props.palette.textMuted}>v{s()?.version ?? props.pluginVersion}</text>
-        )}
-      </box>
-
-      {/* Degraded reason — explains why heavy tools (aft_search, aft_callgraph)
-          are disabled. Surface this prominently so users know to open a real
-          project subdirectory if they want full features. */}
-      {s()?.degraded && degradedSummary() && (
-        <box marginTop={1} width="100%">
-          <text fg={props.palette.warning}>⚠ {degradedSummary()}</text>
-        </box>
-      )}
-
-      {!notInitialized() && worktreeNote() && (
-        <box marginTop={1} width="100%">
-          <text fg={props.palette.textMuted}>{worktreeNote()}</text>
-        </box>
-      )}
-
-      {/* Lazy-bridge placeholder. AFT skips spawning the `aft` binary at
-          plugin init to keep memory/CPU low on OpenCode Desktop sessions
-          that have many projects pinned in the sidebar. The RPC server
-          returns a synthetic `cache_role === "not_initialized"` snapshot
-          until the first tool call routes through `callBridge()` and warms
-          the bridge. Show the explanatory message instead of empty status
-          rows so users understand why metrics are blank. */}
-      {notInitialized() && (
-        <box marginTop={1} width="100%">
-          {s()!.config_error ? (
-            // Config error state: no bridge will ever start in this process,
-            // so the placeholder text would mislead; show the error instead.
-            <text fg={props.palette.error}>✖ {s()!.message}</text>
-          ) : (
-            <text fg={props.palette.textMuted}>{s()!.message || NOT_STARTED_STATUS_TEXT}</text>
-          )}
-        </box>
-      )}
-
-      {/* Collapsed view — condensed status dots + compact compression. Shown
+        accounts={[]}
+        theme={
+          {
+            ...props.palette,
+            // The shared background role is used only as the badge foreground.
+            background: badgeForeground(props.palette.accent, props.palette.background),
+          } as SidebarTheme
+        }
+        appearance={{
+          barWidth: 0,
+          barFilledChar: "",
+          barEmptyChar: "",
+          warnThreshold: 70,
+          errorThreshold: 90,
+        }}
+        showQuota={false}
+        now={0}
+        collapsed={props.collapsed}
+        collapsible={!notInitialized()}
+        onToggle={props.onToggleCollapsed}
+        collapsedSections={() => (
+          <>
+            {notices()}
+            {/* Collapsed view — condensed status dots + compact compression. Shown
           only when initialized AND collapsed. Three rows mirroring the section
           order of the expanded grid. */}
-      {!notInitialized() && props.collapsed && (
-        <box width="100%" flexDirection="column">
-          {props.prefs.sections.searchIndex && (
-            <CollapsedRow palette={props.palette} label="Search Index">
-              <text fg={toneColor(props.palette, searchStatus().tone)}>●</text>
-            </CollapsedRow>
-          )}
-          {props.prefs.sections.semanticIndex && (
-            <CollapsedRow palette={props.palette} label="Semantic Index">
-              <text fg={toneColor(props.palette, semanticStatus().tone)}>●</text>
-            </CollapsedRow>
-          )}
-          {props.prefs.sections.codeHealth && collapsedHealthLights(statusBar()) && (
-            <CollapsedRow palette={props.palette} label="Code Health">
-              <box flexDirection="row" gap={1}>
-                <text
-                  fg={toneColor(props.palette, collapsedHealthLights(statusBar())!.diagnostics)}
-                >
-                  ●
-                </text>
-                <text fg={toneColor(props.palette, collapsedHealthLights(statusBar())!.todos)}>
-                  ●
-                </text>
-              </box>
-            </CollapsedRow>
-          )}
-          {props.prefs.sections.compression && collapsedCompressionValue(s()?.compression) && (
-            <CollapsedRow palette={props.palette} label="Compression">
-              <text fg={props.palette.textMuted}>
-                <b>{collapsedCompressionValue(s()?.compression)}</b>
-              </text>
-            </CollapsedRow>
-          )}
-        </box>
-      )}
-
-      {/* Search index */}
-      {!notInitialized() && !props.collapsed && (
-        <>
-          {props.prefs.sections.searchIndex && (
-            <>
-              <SectionHeader palette={props.palette} title="Search Index" />
-              <StatRow
-                palette={props.palette}
-                label="Status"
-                value={searchStatus().label}
-                tone={searchStatus().tone}
-              />
-              {(s()?.search_index?.files ?? null) != null && (
-                <StatRow
-                  palette={props.palette}
-                  label="Files"
-                  value={formatCount(s()!.search_index.files)}
-                  tone="muted"
-                />
-              )}
-              <StatRow
-                palette={props.palette}
-                label="Disk"
-                value={formatBytes(trigramBytes())}
-                tone="muted"
-              />
-            </>
-          )}
-
-          {props.prefs.sections.semanticIndex && (
-            <>
-              <SectionHeader palette={props.palette} title="Semantic Index" />
-              <StatRow
-                palette={props.palette}
-                label="Status"
-                value={semanticStatus().label}
-                tone={semanticStatus().tone}
-              />
-              {semanticRefreshing() && (
-                <box width="100%">
-                  <text fg={props.palette.textMuted}>{semanticRefreshing()}</text>
-                </box>
-              )}
-              {/* When loading, magic-context-style progress hint helps users see
-          background work is making progress instead of stuck. */}
-              {s()?.semantic_index?.status === "loading" &&
-                s()?.semantic_index?.entries_total != null &&
-                s()!.semantic_index.entries_total! > 0 && (
-                  <StatRow
-                    palette={props.palette}
-                    label="Progress"
-                    value={`${formatCount(s()!.semantic_index.entries_done)} / ${formatCount(
-                      s()!.semantic_index.entries_total,
-                    )}`}
-                    tone="warn"
-                  />
+            {!notInitialized() && props.collapsed && (
+              <box width="100%" flexDirection="column">
+                {props.prefs.sections.searchIndex && (
+                  <CollapsedRow palette={props.palette} label="Search Index">
+                    <text fg={toneColor(props.palette, searchStatus().tone)}>●</text>
+                  </CollapsedRow>
                 )}
-              {(s()?.semantic_index?.entries ?? null) != null && (
-                <StatRow
-                  palette={props.palette}
-                  label="Entries"
-                  value={formatCount(s()!.semantic_index.entries)}
-                  tone="muted"
-                />
-              )}
-              <StatRow
-                palette={props.palette}
-                label="Disk"
-                value={formatBytes(semanticBytes())}
-                tone="muted"
-              />
-            </>
-          )}
+                {props.prefs.sections.semanticIndex && (
+                  <CollapsedRow palette={props.palette} label="Semantic Index">
+                    <text fg={toneColor(props.palette, semanticStatus().tone)}>●</text>
+                  </CollapsedRow>
+                )}
+                {props.prefs.sections.codeHealth && collapsedHealthLights(statusBar()) && (
+                  <CollapsedRow palette={props.palette} label="Code Health">
+                    <box flexDirection="row" gap={1}>
+                      <text
+                        fg={toneColor(
+                          props.palette,
+                          collapsedHealthLights(statusBar())!.diagnostics,
+                        )}
+                      >
+                        ●
+                      </text>
+                      <text
+                        fg={toneColor(props.palette, collapsedHealthLights(statusBar())!.todos)}
+                      >
+                        ●
+                      </text>
+                    </box>
+                  </CollapsedRow>
+                )}
+                {props.prefs.sections.compression &&
+                  collapsedCompressionValue(s()?.compression) && (
+                    <CollapsedRow palette={props.palette} label="Compression">
+                      <text fg={props.palette.textMuted}>
+                        <b>{collapsedCompressionValue(s()?.compression)}</b>
+                      </text>
+                    </CollapsedRow>
+                  )}
+              </box>
+            )}
+          </>
+        )}
+        sections={() => (
+          <>
+            {notices()}
+            {/* Search index */}
+            {!notInitialized() && !props.collapsed && (
+              <>
+                {props.prefs.sections.searchIndex && (
+                  <>
+                    <SectionHeader palette={props.palette} title="Search Index" />
+                    <StatRow
+                      palette={props.palette}
+                      label="Status"
+                      value={searchStatus().label}
+                      tone={searchStatus().tone}
+                    />
+                    {(s()?.search_index?.files ?? null) != null && (
+                      <StatRow
+                        palette={props.palette}
+                        label="Files"
+                        value={formatCount(s()!.search_index.files)}
+                        tone="muted"
+                      />
+                    )}
+                    <StatRow
+                      palette={props.palette}
+                      label="Disk"
+                      value={formatBytes(trigramBytes())}
+                      tone="muted"
+                    />
+                  </>
+                )}
 
-          {/* Human health values are optional. A category stays absent until the
+                {props.prefs.sections.semanticIndex && (
+                  <>
+                    <SectionHeader palette={props.palette} title="Semantic Index" />
+                    <StatRow
+                      palette={props.palette}
+                      label="Status"
+                      value={semanticStatus().label}
+                      tone={semanticStatus().tone}
+                    />
+                    {semanticRefreshing() && (
+                      <box width="100%">
+                        <text fg={props.palette.textMuted}>{semanticRefreshing()}</text>
+                      </box>
+                    )}
+                    {/* Show loading progress so background work does not look stalled. */}
+                    {s()?.semantic_index?.status === "loading" &&
+                      s()?.semantic_index?.entries_total != null &&
+                      s()!.semantic_index.entries_total! > 0 && (
+                        <StatRow
+                          palette={props.palette}
+                          label="Progress"
+                          value={`${formatCount(s()!.semantic_index.entries_done)} / ${formatCount(
+                            s()!.semantic_index.entries_total,
+                          )}`}
+                          tone="warn"
+                        />
+                      )}
+                    {(s()?.semantic_index?.entries ?? null) != null && (
+                      <StatRow
+                        palette={props.palette}
+                        label="Entries"
+                        value={formatCount(s()!.semantic_index.entries)}
+                        tone="muted"
+                      />
+                    )}
+                    <StatRow
+                      palette={props.palette}
+                      label="Disk"
+                      value={formatBytes(semanticBytes())}
+                      tone="muted"
+                    />
+                  </>
+                )}
+
+                {/* Human health values are optional. A category stays absent until the
           server proves it, rather than appearing as a clean zero. */}
-          {props.prefs.sections.codeHealth && statusBar() && (
-            <>
-              <SectionHeader palette={props.palette} title="Code Health" />
-              {(statusBar()!.disabled_categories ?? []).map((key) => (
-                <StatRow
-                  palette={props.palette}
-                  label={key.replaceAll("_", " ")}
-                  value="○ off"
-                  tone="muted"
-                />
-              ))}
-              {statusBar()!.errors !== undefined && (
-                <StatRow
-                  palette={props.palette}
-                  label="Errors"
-                  value={formatCount(statusBar()!.errors)}
-                  tone={statusBar()!.errors! > 0 ? "err" : "muted"}
-                />
-              )}
-              {statusBar()!.warnings !== undefined && (
-                <StatRow
-                  palette={props.palette}
-                  label="Warnings"
-                  value={formatCount(statusBar()!.warnings)}
-                  tone={statusBar()!.warnings! > 0 ? "warn" : "muted"}
-                />
-              )}
-              {statusBar()!.todos !== undefined && (
-                <StatRow
-                  palette={props.palette}
-                  label="TODOs"
-                  value={formatCount(statusBar()!.todos)}
-                  tone="muted"
-                />
-              )}
-            </>
-          )}
+                {props.prefs.sections.codeHealth && statusBar() && (
+                  <>
+                    <SectionHeader palette={props.palette} title="Code Health" />
+                    {(statusBar()!.disabled_categories ?? []).map((key) => (
+                      <StatRow
+                        palette={props.palette}
+                        label={key.replaceAll("_", " ")}
+                        value="○ off"
+                        tone="muted"
+                      />
+                    ))}
+                    {statusBar()!.errors !== undefined && (
+                      <StatRow
+                        palette={props.palette}
+                        label="Errors"
+                        value={formatCount(statusBar()!.errors)}
+                        tone={statusBar()!.errors! > 0 ? "err" : "muted"}
+                      />
+                    )}
+                    {statusBar()!.warnings !== undefined && (
+                      <StatRow
+                        palette={props.palette}
+                        label="Warnings"
+                        value={formatCount(statusBar()!.warnings)}
+                        tone={statusBar()!.warnings! > 0 ? "warn" : "muted"}
+                      />
+                    )}
+                    {statusBar()!.todos !== undefined && (
+                      <StatRow
+                        palette={props.palette}
+                        label="TODOs"
+                        value={formatCount(statusBar()!.todos)}
+                        tone="muted"
+                      />
+                    )}
+                  </>
+                )}
 
-          {/* Compression aggregates. Tabular layout matching Search/Semantic
+                {/* Compression aggregates. Tabular layout matching Search/Semantic
           Index above: each scope ("Session", "Project") renders as a
           subheader followed by two StatRows (Tokens Saved, Compression
           Ratio). Keeps numbers right-aligned in the value column instead
           of jamming them after the label on the same line. */}
-          {props.prefs.sections.compression && compressionRows().length > 0 && (
-            <>
-              <SectionHeader palette={props.palette} title="Compression" />
-              {compressionRows().map((row) =>
-                row.kind === "scope" ? (
-                  <box width="100%">
-                    <text fg={props.palette.text}>{row.label}</text>
-                  </box>
-                ) : (
-                  <StatRow
-                    palette={props.palette}
-                    label={row.label}
-                    value={row.value}
-                    tone="muted"
-                  />
-                ),
-              )}
-            </>
-          )}
+                {props.prefs.sections.compression && compressionRows().length > 0 && (
+                  <>
+                    <SectionHeader palette={props.palette} title="Compression" />
+                    {compressionRows().map((row) =>
+                      row.kind === "scope" ? (
+                        <box width="100%">
+                          <text fg={props.palette.text}>{row.label}</text>
+                        </box>
+                      ) : (
+                        <StatRow
+                          palette={props.palette}
+                          label={row.label}
+                          value={row.value}
+                          tone="muted"
+                        />
+                      ),
+                    )}
+                  </>
+                )}
 
-          {/* Surface failures clearly so users know to act (install ONNX,
+                {/* Surface failures clearly so users know to act (install ONNX Runtime,
           fix config, etc.) rather than silently leaving the panel "off". */}
-          {s()?.semantic_index?.status === "failed" && s()?.semantic_index?.error && (
-            <box marginTop={1} width="100%">
-              <text fg={props.palette.error}>⚠ {s()!.semantic_index.error}</text>
-            </box>
-          )}
-        </>
-      )}
+                {s()?.semantic_index?.status === "failed" && s()?.semantic_index?.error && (
+                  <box marginTop={1} width="100%">
+                    <text fg={props.palette.error}>⚠ {s()!.semantic_index.error}</text>
+                  </box>
+                )}
+              </>
+            )}
+          </>
+        )}
+      />
     </box>
   );
 };

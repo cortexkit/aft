@@ -1,6 +1,19 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+const pluginRoot = join(__dirname, "..", "..");
+beforeAll(() => {
+  if (existsSync(join(pluginRoot, "src/tui-compiled/shared-sidebar-local.tsx"))) return;
+  const built = spawnSync(process.execPath, ["run", "build:tui"], {
+    cwd: pluginRoot,
+    encoding: "utf8",
+  });
+  if (built.status !== 0) throw new Error(`build:tui failed: ${built.stderr}`);
+});
 
 // OpenCode loads the plugin's `./tui` export, which now points at entry.mjs.
 // In a development checkout there is no host virtual runtime registry, so the
@@ -59,4 +72,36 @@ describe("tui entry module resolution", () => {
       expect(/^\d/.test(pin ?? "")).toBe(true);
     }
   });
+
+  test("the bare Bun raw fallback renders the shared frame through both TUI entries", () => {
+    const rendered = spawnSync(
+      process.execPath,
+      // Unlike OpenCode, Bun cannot resolve opentui:runtime-module:* imports,
+      // so the loader must pick raw source. The preload transforms AFT's JSX.
+      ["--preload", "@opentui/solid/preload", "src/__tests__/fixtures/render-sidebar-frame.tsx"],
+      {
+        cwd: pluginRoot,
+        encoding: "utf8",
+        timeout: 30_000,
+        env: {
+          ...process.env,
+          AFT_SIDEBAR_ENTRY_CHECK: "true",
+          AFT_SIDEBAR_SNAPSHOT: JSON.stringify({
+            version: "0.64.0",
+            cache_role: "main",
+            degraded: true,
+            degraded_reasons: ["home_root"],
+            search_index: { status: "ready", files: 12 },
+            semantic_index: { status: "ready" },
+          }),
+        },
+      },
+    );
+    expect(rendered.stderr).toBe("");
+    expect(rendered.status).toBe(0);
+    expect(rendered.stdout).toContain("▼ AFT   DEGRADED");
+    expect(rendered.stdout).toContain("v0.64.0");
+    expect(rendered.stdout).toContain("Search Index");
+    expect(rendered.stdout).toContain("ready");
+  }, 45_000);
 });
