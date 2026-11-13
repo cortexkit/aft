@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import tarfile
 import math
+import re
+import sys
 
 from compare_engine_only_profile import response_bytes
 
@@ -99,6 +101,12 @@ pub mod exact_bench {
     pub static ENABLED: AtomicBool = AtomicBool::new(false);
     static SEEN: OnceLock<Mutex<HashMap<blake3::Hash, usize>>> = OnceLock::new();
     static CACHE: OnceLock<Mutex<(usize, usize)>> = OnceLock::new();
+    static SIZES: OnceLock<Mutex<HashMap<blake3::Hash, (usize, usize)>>> = OnceLock::new();
+    pub(super) fn size(text: &str, prepared: &super::PreparedExactText) {
+        if ENABLED.load(Ordering::Relaxed) {
+            SIZES.get_or_init(Default::default).lock().unwrap().insert(blake3::hash(text.as_bytes()), (text.len(), prepared.retained_bytes()));
+        }
+    }
     pub fn prepared(text: &str) {
         if ENABLED.load(Ordering::Relaxed) {
             *SEEN.get_or_init(Default::default).lock().unwrap().entry(blake3::hash(text.as_bytes())).or_default() += 1;
@@ -110,7 +118,11 @@ pub mod exact_bench {
     pub fn snapshot() -> serde_json::Value {
         let seen = SEEN.get_or_init(Default::default).lock().unwrap();
         let cache = CACHE.get_or_init(Default::default).lock().unwrap();
-        serde_json::json!({"distinct_contents_prepared":seen.len(),"preparations":seen.values().sum::<usize>(),
+        let sizes = SIZES.get_or_init(Default::default).lock().unwrap();
+        serde_json::json!({"distinct_contents_prepared":seen.len(),
+            "distinct_source_bytes":sizes.values().map(|v|v.0).sum::<usize>(),
+            "distinct_prepared_bytes":sizes.values().map(|v|v.1).sum::<usize>(),
+            "working_set_charged_bytes":sizes.values().map(|v|v.1 + 256).sum::<usize>(),"preparations":seen.values().sum::<usize>(),
             "contents_prepared_again":seen.values().filter(|n| **n > 1).count(),
             "repeat_preparations":seen.values().map(|n|n-1).sum::<usize>(),
             "entries":cache.0,"charged_bytes":cache.1})
@@ -129,6 +141,7 @@ def replace(path, old, new):
 def instrument(source):
     exact = source / "crates/aft/src/commands/semantic_search/exact_lane.rs"
     replace(exact, "fn new(text: &str) -> Self {", "fn new(text: &str) -> Self {\n        let _bench = super::waits::time(super::waits::SearchWait::ModelLock);\n        exact_bench::prepared(text);")
+    replace(exact, "        Self {\n            normalized: normalize_exact_phrase(text),\n            symbols,\n        }", "        let prepared = Self {\n            normalized: normalize_exact_phrase(text),\n            symbols,\n        };\n        exact_bench::size(text, &prepared);\n        prepared")
     replace(exact, "pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {", "pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {\n    let _bench = super::waits::time(super::waits::SearchWait::EmbedBackend);")
     replace(exact, "        Arc::clone(prepared)\n    }\n}", "        exact_bench::cache(state.entries.len(), state.bytes);\n        Arc::clone(prepared)\n    }\n}")
     with exact.open("a") as out:
@@ -175,23 +188,69 @@ def replay(args, name, label, profile=False):
         env={**os.environ, "AFT_TEST_DISABLE_FILE_WATCHER": "1"})
 
 
+def parity_bytes(response):
+    """Fresh stores have distinct publication identities as well as process nonces."""
+    normalized = json.loads(response_bytes(response))
+    plan = normalized.get("structuredContent", {}).get("plan", {})
+    generation = plan.get("snapshot_generation")
+    if generation is not None:
+        match = re.fullmatch(r"([0-9]+):[0-9a-f]{32}:([0-9]+)_<process-nonce>", generation)
+        assert match, f"unexpected fresh-store generation: {generation}"
+        plan["snapshot_generation"] = f"{match[1]}:<publication-identity>:{match[2]}_<process-nonce>"
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def self_test():
+    import copy
+    import unittest
+
+    class ParityTests(unittest.TestCase):
+        def setUp(self):
+            self.response = {"text":"snippet", "result_count":2, "results":[{"score":1}, {"score":.5}],
+                             "structuredContent":{"plan":{"snapshot_generation":"1:"+"a"*32+":0_"+"b"*32}}}
+
+        def test_fresh_store_identity_is_only_ignored_field(self):
+            other = copy.deepcopy(self.response)
+            other["structuredContent"]["plan"]["snapshot_generation"] = "1:"+"c"*32+":0_"+"d"*32
+            self.assertEqual(parity_bytes(self.response), parity_bytes(other))
+
+        def test_content_and_generation_counters_are_preserved(self):
+            for key, value in [("text","different snippet"),("result_count",1),("results",[{"score":2},{"score":.5}]),
+                               ("results",list(reversed(self.response["results"]))),
+                               ("structuredContent",{"plan":{"snapshot_generation":"2:"+"a"*32+":0_"+"b"*32}}),
+                               ("structuredContent",{"plan":{"snapshot_generation":"1:"+"a"*32+":1_"+"b"*32}})]:
+                with self.subTest(key=key,value=value):
+                    other = {**self.response,key:value}
+                    self.assertNotEqual(parity_bytes(self.response), parity_bytes(other))
+
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(ParityTests))
+    print(sys.version)
+    return 0 if result.wasSuccessful() else 1
+
+
 def compare(args):
     labels = ["baseline-profile", "candidate-profile", "0-baseline", "1-candidate", "2-candidate", "3-baseline"]
     reports = {}
     reference = None
+    reference_generations = None
     for label in labels:
         rows = [json.loads(line) for line in (args.out / (label + ".jsonl")).read_text().splitlines()]
         assert len(rows) == 6897, (label, len(rows))
-        replies = [response_bytes(row["response"]).decode() for row in rows]
+        replies = [parity_bytes(row["response"]).decode() for row in rows]
         if reference is None:
             reference = replies
         differences = [i for i, (a, b) in enumerate(zip(reference, replies)) if a != b]
         summary = json.loads((args.out / (label + ".jsonl.summary.json")).read_text())
         times = sorted(row["wall_ms"] for row in rows)
+        generations = [row["response"].get("structuredContent", {}).get("plan", {}).get("snapshot_generation", "<absent>") for row in rows]
+        if reference_generations is None:
+            reference_generations = generations
+        summary["raw_generation_tokens"] = sorted(set(generations))
+        summary["generation_metadata_differences"] = sum(a != b for a,b in zip(reference_generations, generations))
         summary.update({"p50_ms":times[math.ceil(len(times)*.50)-1],
                         "p95_ms":times[math.ceil(len(times)*.95)-1],
                         "cpu_ms_per_query":summary["process_cpu_seconds"]*1000/len(rows),
-                        "full_response_sha256":hashlib.sha256("\n".join(replies).encode()).hexdigest(),
+                        "normalized_response_sha256":hashlib.sha256("\n".join(replies).encode()).hexdigest(),
                         "different_queries":differences})
         if "profile" in label:
             names = {"model_lock":"PreparedExactText::new", "embed_backend":"scan_symbols_in_text",
@@ -204,7 +263,7 @@ def compare(args):
     result = {"base":args.base,"candidate":args.candidate,
               "queries_sha256":hashlib.sha256(args.queries.read_bytes()).hexdigest(),
               "profile":"ci-storm; default features; temporary identical instrumentation",
-              "normalization":"Only the random process nonce in snapshot_generation; indexed snapshot prefix must match.",
+              "normalization":"Only fresh-store publication identity and random process nonce in snapshot_generation; publication/overlay counters and all other fields must match (parent approved).",
               "order":["baseline","candidate","candidate","baseline"],
               "runs":reports}
     (args.out / "comparison.json").write_text(json.dumps(result,indent=2)+"\n")
@@ -214,7 +273,7 @@ def compare(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=["baseline", "candidate", "compare"])
+    parser.add_argument("phase", choices=["baseline", "candidate", "inventory", "compare"])
     parser.add_argument("--base", required=True)
     parser.add_argument("--candidate", default="HEAD")
     parser.add_argument("--queries", type=Path, required=True)
@@ -227,6 +286,9 @@ def main():
         archive(args.base, args.out / "frozen")
         build(args, "baseline", args.base)
         replay(args, "baseline", "baseline-profile", True)
+    elif args.phase == "inventory":
+        build(args, "candidate", args.candidate)
+        replay(args, "candidate", "candidate-inventory", True)
     elif args.phase == "candidate":
         build(args, "candidate", args.candidate)
         replay(args, "candidate", "candidate-profile", True)
@@ -237,4 +299,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        raise SystemExit(self_test())
     main()
