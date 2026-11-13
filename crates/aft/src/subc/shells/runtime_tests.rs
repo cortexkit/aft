@@ -165,6 +165,9 @@ mod cache;
 #[path = "runtime_legacy_tests.rs"]
 mod legacy;
 
+#[path = "runtime_idle_tests.rs"]
+mod idle;
+
 fn status_context() -> (
     tempfile::TempDir,
     Arc<crate::context::AppContext>,

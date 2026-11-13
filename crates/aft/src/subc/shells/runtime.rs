@@ -95,8 +95,11 @@ pub(in crate::subc) struct Service {
     refresh_gate: Mutex<()>,
     subscriptions: Mutex<HashMap<(RouteChannel, u64), Subscription>>,
     draining: AtomicBool,
-    enabled: AtomicBool,
     stop: CancellationToken,
+    #[cfg(test)]
+    collect_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    driver_done: CancellationToken,
 }
 
 fn now() -> u64 {
@@ -121,12 +124,19 @@ impl Service {
             subscriptions: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
             stop: CancellationToken::new(),
-            enabled: AtomicBool::new(false),
+            #[cfg(test)]
+            collect_calls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            driver_done: CancellationToken::new(),
         });
         let weak = Arc::downgrade(&service);
         let stop = service.stop.clone();
         let mut changes = crate::bash_background::shell_metadata::subscribe();
+        #[cfg(test)]
+        let driver_done = service.driver_done.clone();
         tokio::spawn(async move {
+            #[cfg(test)]
+            let _driver_done = driver_done.drop_guard();
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 let rows = tokio::select! {
@@ -137,7 +147,7 @@ impl Service {
                 let Some(service) = weak.upgrade() else {
                     break;
                 };
-                if !service.enabled.load(Ordering::Acquire) {
+                if service.subscriptions.lock().await.is_empty() {
                     continue;
                 }
                 let rows = rows
@@ -147,7 +157,7 @@ impl Service {
                         .await
                         .values()
                         .any(ShellReader::is_persisted);
-                service.refresh(rows).await;
+                service.refresh_if_subscribed(rows).await;
                 if rows {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
@@ -157,10 +167,26 @@ impl Service {
     }
 
     async fn refresh(&self, rows: bool) {
+        self.refresh_inner(rows, false).await;
+    }
+
+    async fn refresh_if_subscribed(&self, rows: bool) {
+        self.refresh_inner(rows, true).await;
+    }
+
+    async fn refresh_inner(&self, rows: bool, require_subscription: bool) {
         let _refresh = self.refresh_gate.lock().await;
+        // A viewer may leave while a background refresh waits for a direct
+        // request's refresh. Recheck after acquiring the collection gate so
+        // queued background work cannot restart collection without a viewer.
+        if require_subscription && self.subscriptions.lock().await.is_empty() {
+            return;
+        }
         let executor = self.executor.clone();
         let db = self.app.db();
         let previous = self.db_facts.read().await.clone();
+        #[cfg(test)]
+        self.collect_calls.fetch_add(1, Ordering::Relaxed);
         let collected =
             tokio::task::spawn_blocking(move || collect(&executor, db.as_deref(), rows, previous))
                 .await;
@@ -228,7 +254,6 @@ impl Service {
                 return send_provider_error(tx, metrics, frame, error).await;
             }
         };
-        self.enabled.store(true, Ordering::Release);
         match request {
             admission::Request::List(params) => {
                 let service = self.clone();

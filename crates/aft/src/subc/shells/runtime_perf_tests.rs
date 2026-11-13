@@ -121,7 +121,10 @@ fn shells_watch_collection_fixture() {
     runtime.block_on(async {
         let service = Service::new(app, executor);
         service.refresh(true).await;
-        service.enabled.store(true, Ordering::Release);
+        service.subscriptions.lock().await.insert(
+            (route_key(41, 1), 1),
+            Subscription { cancel: CancellationToken::new(), done: watch::channel(false).1 },
+        );
         let before = COLLECT_CALLS.load(Ordering::Relaxed);
         let start = std::time::Instant::now();
         let until = start + Duration::from_secs(5);
