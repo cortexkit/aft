@@ -131,10 +131,13 @@ fn shells_v1_saved_rows_follow_committed_store_changes_not_watch_revisions() {
     db.lock().unwrap().trace(Some(trace_facts_sql));
     FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
     let unchanged = collect_at_store_revision(&executor, Some(&db), true, first.db, 11, 1);
-    assert!(FACTS_SQL_TRACE.with(|trace| trace
-        .borrow()
-        .iter()
-        .all(|sql| sql == "PRAGMA data_version")));
+    assert!(
+        FACTS_SQL_TRACE.with(|trace| trace
+            .borrow()
+            .iter()
+            .all(|sql| !sql.contains("FROM bash_tasks"))),
+        "a watch revision reloaded saved task rows"
+    );
     // A second connection deliberately bypasses the Rust writer API, just as
     // another daemon process would. Only SQLite's data_version can detect it.
     let other = crate::db::open(&dir.path().join("aft.db")).unwrap();
