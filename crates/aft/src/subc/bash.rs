@@ -6118,6 +6118,7 @@ mod grant_path_tests {
     #[test]
     fn blocking_bash_hands_back_before_client_deadline() {
         fn held_running_stub(req: RawRequest, ctx: &AppContext) -> Response {
+            std::thread::sleep(Duration::from_millis(20));
             let response = gated_running_stub(req, ctx);
             let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
             BashTimingForTest::wait(&timing.result, "spawn result");
@@ -6182,6 +6183,7 @@ mod grant_path_tests {
                         _ = timing.reply.armed.notified() => {},
                     }
                     let armed_at = tokio::time::Instant::now();
+                    eprintln!("{mode}: reply watchdog armed at {:?}, real offset {:?}", armed_at - started, Instant::now().checked_duration_since(started.into_std()));
                     timing.reply.fire.notify_one();
                     tokio::time::advance(Duration::from_millis(1499)).await;
                     let early_reply = rx.try_recv();
