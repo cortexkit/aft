@@ -13692,8 +13692,8 @@ INHERITED FLAGS
             manifest.manifest_version,
             &mut empty,
         )
-        .expect_err("an undeclared flag must refuse");
-        assert_eq!(error.code, RefusalCode::Unclassified);
+        .expect_err("an unsupported output flag must refuse");
+        assert_eq!(error.code, RefusalCode::UnsupportedFlag);
 
         // The field spelling of the same payload is the declared request.
         let field_args = os_args(&[
