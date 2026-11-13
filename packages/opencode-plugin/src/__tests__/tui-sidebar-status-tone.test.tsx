@@ -4,7 +4,7 @@ import { afterAll, describe, expect, mock, test } from "bun:test";
 import { daemonSemanticStatusWords } from "../../../aft-bridge/src/__tests__/test-utils/daemon-status-words.js";
 
 // These module mocks are applied process-globally by Bun. Restore them after
-// this file so the @opentui/solid and solid-js stubs do not leak into other
+// this file so the OpenTUI JSX runtime stubs do not leak into other
 // test files in the same `bun test` run.
 afterAll(() => {
   mock.restore();
@@ -29,14 +29,6 @@ mock.module("@opentui/solid/jsx-runtime", () => ({
   jsx: renderComponent,
   jsxs: renderComponent,
 }));
-mock.module("solid-js", () => ({
-  createEffect: () => undefined,
-  createMemo: (fn: () => unknown) => fn,
-  createSignal: (initial: unknown) => [() => initial, () => undefined],
-  on: (_source: unknown, fn: unknown) => fn,
-  onCleanup: () => undefined,
-}));
-
 const { statusDisplay } = await import("../tui/sidebar-view.tsx");
 const { semanticIndexStatusKind } = await import("../shared/status.js");
 

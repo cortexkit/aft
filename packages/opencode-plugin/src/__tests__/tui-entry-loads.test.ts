@@ -76,7 +76,9 @@ describe("tui entry module resolution", () => {
   test("the bare Bun raw fallback renders the shared frame through both TUI entries", () => {
     const rendered = spawnSync(
       process.execPath,
-      ["src/__tests__/fixtures/render-sidebar-frame.tsx"],
+      // Unlike OpenCode, Bun cannot resolve opentui:runtime-module:* imports,
+      // so the loader must pick raw source. The preload transforms AFT's JSX.
+      ["--preload", "@opentui/solid/preload", "src/__tests__/fixtures/render-sidebar-frame.tsx"],
       {
         cwd: pluginRoot,
         encoding: "utf8",

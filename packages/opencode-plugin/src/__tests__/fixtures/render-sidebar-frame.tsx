@@ -2,8 +2,8 @@
 // Renders the shared AFT sidebar panel with OpenTUI's test renderer and prints
 // the character frame. Run as its own process with the Solid transform
 // preloaded (`bun --preload @opentui/solid/preload`): other test files replace
-// solid-js and the OpenTUI JSX runtime with stubs for the whole test process,
-// and a real render needs the real ones.
+// the OpenTUI JSX runtime with stubs for the whole test process, and a real
+// render needs the real runtime.
 //
 // Input (environment): AFT_SIDEBAR_SNAPSHOT is the status snapshot as JSON,
 // AFT_SIDEBAR_WIDTH the panel width in columns, AFT_SIDEBAR_COLLAPSED selects
