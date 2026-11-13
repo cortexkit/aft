@@ -1,1 +1,1 @@
-OpenCode no longer opens AFT routes for sessions from other locations or sessions whose project directory cannot be resolved.
+Session events in OpenCode no longer open AFT routes in unrelated folders when the session's location is unavailable.
