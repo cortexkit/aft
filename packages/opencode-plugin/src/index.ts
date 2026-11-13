@@ -83,6 +83,7 @@ import {
   closeDeletedSessionRoutes,
   getSessionDirectory,
   getSessionDirectoryCached,
+  getSessionDirectoryForEvent,
   verifySessionDirectory,
   warmSessionDirectory,
 } from "./shared/session-directory.js";
@@ -874,8 +875,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         return;
       }
       if (eventType === "session.created" && sessionID) {
-        const sessionDir =
-          (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
+        const sessionDir = await getSessionDirectoryForEvent(
+          input.client,
+          sessionID,
+          input.directory,
+        );
+        if (!sessionDir) return;
         observeFreshSessionStart(pool, sessionDir, sessionID, "new");
       }
       // OpenCode's lifecycle vocabulary publishes session.deleted for explicit
@@ -893,11 +898,14 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       }
       if (eventType !== "session.idle") return;
       if (!sessionID) return;
-      // Use the session's stored directory rather than the plugin-init cwd:
-      // OpenCode passes process.cwd() in `input.directory`, which can be wrong
-      // for `-s` resumes from another folder.
-      const sessionDir =
-        (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
+      // V2 can deliver location-less events to every Location. A missing
+      // lookup does not establish that this instance owns the session.
+      const sessionDir = await getSessionDirectoryForEvent(
+        input.client,
+        sessionID,
+        input.directory,
+      );
+      if (!sessionDir) return;
       if (!isProjectEnabled(sessionDir)) return;
       await handleIdleBgCompletions({
         ctx,
