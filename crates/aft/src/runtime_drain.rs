@@ -1226,8 +1226,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
         });
     }
     let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
-    let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
-    let apply_ram_search_updates = !shared_artifacts_read_only || ctx.ram_overlay_active();
     let mut semantic_refresh_paths = std::mem::take(&mut state.semantic_refresh_paths);
     let mut status_changed = state.status_changed;
 
@@ -1258,7 +1256,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     WATCHER_DRAIN_SLICE_BUDGET,
                     |path| {
                         if heavy_root_work_allowed
-                            && (!shared_artifacts_read_only || ctx.ram_overlay_active())
                             && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
                             && watcher_path_is_semantic_source(path)
                         {
@@ -1276,13 +1273,11 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
-                    if apply_ram_search_updates {
-                        let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
-                            if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
-                                symbol_cache.invalidate(path);
-                            }
-                        });
-                    }
+                    let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                        if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
+                            symbol_cache.invalidate(path);
+                        }
+                    });
                 },
             ),
             WatcherDrainApplyPhase::SearchIndex => apply_watcher_path_phase(
@@ -1297,8 +1292,8 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 |_path| {},
             ),
             WatcherDrainApplyPhase::SemanticIndex => {
-                // Every root masks stale shared vectors immediately. A writer or
-                // an enabled RAM overlay also queues a private replacement.
+                // Each checkout hides stale embeddings from search immediately
+                // while replacement embeddings are queued for its own state.
                 let mut invalidated_paths = Vec::new();
                 let completed = apply_watcher_path_phase(
                     WatcherDrainApplyPhase::SemanticIndex,
@@ -4118,36 +4113,6 @@ mod watcher_slice_tests {
             ctx.pending_tier2_paths().len(),
             5,
             "every path survives the lifecycle-only generation change"
-        );
-    }
-
-    #[test]
-    fn ram_overlay_is_on_by_default_and_transport_independent() {
-        let temp = tempfile::tempdir().unwrap();
-        let (ctx, _) = context_with_watcher(temp.path());
-        ctx.set_cache_role(true, None);
-        assert!(
-            ctx.shared_artifacts_read_only(),
-            "worktree role is borrow-only"
-        );
-        // A borrowed snapshot describes another checkout, so every borrow-only
-        // root reconciles and overlays it unless the escape hatch turns it off.
-        assert!(
-            ctx.ram_overlay_active(),
-            "worktree.ram_overlay defaults on for borrow-only roots"
-        );
-
-        ctx.update_config(|config| config.worktree.ram_overlay = false);
-        assert!(
-            !ctx.ram_overlay_active(),
-            "overlay follows config + borrow-only, not bind/transport identity"
-        );
-
-        ctx.update_config(|config| config.worktree.ram_overlay = true);
-        ctx.set_cache_role(false, None);
-        assert!(
-            !ctx.ram_overlay_active(),
-            "owner roots stay on the normal writer path even when the gate is on"
         );
     }
 }

@@ -27,6 +27,7 @@ from common import (
     manifest_fingerprint,
     parse_cpu_time,
     strip_jsonc,
+    write_baseline_config,
 )
 
 
@@ -36,16 +37,34 @@ class CommonTests(unittest.TestCase):
           // leading comment
           "url": "https://example.test/a//b",
           "literal": "/* retained */",
-          "views": {"enabled": true,},
+          "indexes": {"semantic": true,},
         }'''
         self.assertEqual(
             json.loads(strip_jsonc(source)),
             {
                 "url": "https://example.test/a//b",
                 "literal": "/* retained */",
-                "views": {"enabled": True},
+                "indexes": {"semantic": True},
             },
         )
+
+    def test_baseline_config_drops_only_the_removed_no_effect_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw) / "source"
+            baseline = Path(raw) / "baseline"
+            (source / ".cortexkit").mkdir(parents=True)
+            original = {
+                "views": {"enabled": False, "callgraph_copies": 2, "idle_checkout_hours": 24},
+                "worktree": {"ram_overlay": False},
+                "indexes": {"semantic": True},
+            }
+            path = source / ".cortexkit" / "aft.jsonc"
+            path.write_text(json.dumps(original))
+            target = write_baseline_config(source, baseline)
+            self.assertEqual(json.loads(target.read_text()), {
+                "views": {"idle_checkout_hours": 24}, "indexes": {"semantic": True},
+            })
+            self.assertEqual(json.loads(path.read_text()), original)
 
     def test_pointer_and_manifest_are_read_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

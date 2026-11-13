@@ -1331,6 +1331,172 @@ fn worker_run_runs_with_its_workers_own_access_never_the_heads() {
 }
 
 #[test]
+fn codemode_worker_runner_route_is_inherited_instead_of_owner_lease() {
+    for made_tool_call in [false, true] {
+        let (mut f, worker_root) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+        with_principal_id(&mut f.routes, channel(4), "reserved:broca");
+        let mut lease = route(
+            &worker_root,
+            "worker-session",
+            worker_stamp("worker-a"),
+            CallMode::Classic,
+        );
+        let lease_data = Arc::get_mut(&mut lease.0).unwrap();
+        lease_data.harness = "runner".into();
+        lease_data
+            .made_tool_call
+            .store(made_tool_call, std::sync::atomic::Ordering::Relaxed);
+        f.routes.insert(channel(3), lease);
+        with_principal_id(&mut f.routes, channel(3), &format!("reserved:{OWNER}"));
+        let runner = &f.routes[&channel(4)];
+        let effective = owner(admit(
+            &f.routes,
+            channel(9),
+            Some(&call("read", json!({"path": "notes.txt"}))),
+        ));
+        assert_eq!(effective.spawn_principal, runner.spawn_principal);
+        assert_eq!(effective.root, runner.root);
+        assert_eq!(effective.project_root, runner.project_root);
+        assert_eq!(effective.session, runner.session);
+        assert_eq!(effective.harness, runner.harness);
+        assert_eq!(effective.disabled_tools, runner.disabled_tools);
+        let run_owner = effective.run_owner.as_ref().unwrap();
+        assert_eq!(run_owner.owner_route_channel, channel(4));
+        assert!(Arc::ptr_eq(&run_owner.owner_route.0, &runner.0));
+    }
+}
+
+#[test]
+fn codemode_owner_exclusion_leaves_plain_worker_owner_calls_unchanged() {
+    let (mut f, _) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    with_principal_id(&mut f.routes, channel(4), &format!("reserved:{OWNER}"));
+    let body = json!({"name": "read", "arguments": {"path": "notes.txt"}});
+    assert!(matches!(
+        super::admit(&f.routes, channel(4), Some(&body), |_| {
+            panic!("plain worker calls must not resolve owner policies")
+        }),
+        Admission::Unchanged
+    ));
+}
+
+#[test]
+fn codemode_worker_with_only_owner_lease_waits_for_runner_route() {
+    let (mut f, _) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    with_principal_id(&mut f.routes, channel(4), &format!("reserved:{OWNER}"));
+    let error = refusal(admit(
+        &f.routes,
+        channel(9),
+        Some(&call("read", json!({"path": "notes.txt"}))),
+    ));
+    assert_eq!(error.code, RUN_OWNER_NOT_BOUND);
+    assert_eq!(
+        error.detail.as_ref().unwrap()["reason"],
+        "worker_route_not_bound"
+    );
+    assert!(error
+        .message
+        .contains("no live runner route of the worker scope"));
+}
+
+#[test]
+fn codemode_worker_disagreeing_runner_routes_remain_ambiguous_with_owner_lease() {
+    let (mut f, worker_root) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    with_principal_id(&mut f.routes, channel(4), "reserved:broca");
+    f.routes.insert(
+        channel(3),
+        route(
+            &worker_root,
+            "worker-session",
+            worker_stamp("worker-a"),
+            CallMode::Classic,
+        ),
+    );
+    with_principal_id(&mut f.routes, channel(3), &format!("reserved:{OWNER}"));
+    f.routes.insert(
+        channel(5),
+        route(
+            &worker_root,
+            "another-worker-session",
+            worker_stamp("worker-a"),
+            CallMode::Classic,
+        ),
+    );
+    with_principal_id(&mut f.routes, channel(5), "reserved:broca");
+    let detail = worker_refusal(&f);
+    assert_eq!(detail["reason"], "worker_route_ambiguous");
+    assert_eq!(detail["channels"], json!([4, 5]));
+    assert!(detail["fields"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("session")));
+}
+
+fn worker_runner_harness_fixture(principal: &str, first: &str, second: &str) -> Fixture {
+    let (mut f, worker_root) = worker_fixture(worker_run_stamp("worker-a", 5, Some("linked")));
+    f.routes.insert(
+        channel(5),
+        route(
+            &worker_root,
+            "worker-session",
+            worker_stamp("worker-a"),
+            CallMode::Classic,
+        ),
+    );
+    for (channel, raw_harness) in [(channel(4), first), (channel(5), second)] {
+        let data = Arc::get_mut(&mut f.routes.get_mut(&channel).unwrap().0).unwrap();
+        // Binds canonicalize the route label but preserve the principal's raw label.
+        data.harness = "runner".into();
+        if let AuthenticatedPrincipal::RouteBind {
+            harness,
+            principal_id,
+            ..
+        } = &mut data.spawn_principal
+        {
+            *harness = raw_harness.into();
+            *principal_id = Some(principal.into());
+        }
+    }
+    f
+}
+
+#[test]
+fn codemode_worker_routes_with_broca_runner_aliases_inherit_one_unchanged_principal() {
+    for (first, second) in [("runner", "broca"), ("broca", "runner")] {
+        let f = worker_runner_harness_fixture("reserved:broca", first, second);
+        let effective = owner(admit(
+            &f.routes,
+            channel(9),
+            Some(&call("read", json!({"path": "notes.txt"}))),
+        ));
+        let runner = &f.routes[&channel(4)];
+        assert_eq!(effective.spawn_principal, runner.spawn_principal);
+        assert_eq!(effective.harness, "runner");
+        assert!(Arc::ptr_eq(
+            &effective.run_owner.as_ref().unwrap().owner_route.0,
+            &runner.0
+        ));
+    }
+}
+
+#[test]
+fn codemode_worker_routes_with_broca_and_opencode2_harnesses_remain_ambiguous() {
+    let f = worker_runner_harness_fixture("reserved:broca", "broca", "opencode2");
+    let detail = worker_refusal(&f);
+    assert_eq!(detail["reason"], "worker_route_ambiguous");
+    assert_eq!(detail["channels"], json!([4, 5]));
+    assert_eq!(detail["fields"], json!(["spawn_principal"]));
+}
+
+#[test]
+fn codemode_worker_routes_with_unresolved_thalamus_runner_harness_remain_ambiguous() {
+    let f = worker_runner_harness_fixture("reserved:thalamus-harness", "runner", "opencode2");
+    let detail = worker_refusal(&f);
+    assert_eq!(detail["reason"], "worker_route_ambiguous");
+    assert_eq!(detail["channels"], json!([4, 5]));
+    assert_eq!(detail["fields"], json!(["spawn_principal"]));
+}
+
+#[test]
 fn agent_run_keeps_no_worker_authority_route() {
     let f = linked_fixture();
     let effective = owner(admit(

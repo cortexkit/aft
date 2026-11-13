@@ -108,12 +108,22 @@ mod tests {
                 "first served definition changed for {pin}"
             );
             for old in kept.history {
+                assert_eq!(fetched.template_revision, old.template_revision + 1);
                 assert!(
                     matches!(
                         fetched.compare_with_kept(&old),
                         ViewChange::Same | ViewChange::NewerTemplate
                     ),
                     "changed frozen view: {pin}"
+                );
+                let mut expected_template = old.template;
+                for slot in ["row", "page"] {
+                    expected_template[slot]["catalog"]["digest"] =
+                        fetched.template[slot]["catalog"]["digest"].clone();
+                }
+                assert_eq!(
+                    fetched.template, expected_template,
+                    "template changed: {pin}"
                 );
             }
         }
@@ -139,10 +149,10 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_views_have_revision_zero_and_null_safe_pages() {
+    fn placeholder_views_have_current_revision_and_null_safe_pages() {
         for (pin, entry) in SHIPPED.iter() {
             let view = view(pin).unwrap();
-            assert_eq!(view.template_revision, 0);
+            assert_eq!(view.template_revision, 1);
             assert_eq!(
                 view.record_schema,
                 if entry.tool.name == "bash" {
@@ -160,6 +170,13 @@ mod tests {
                 let template = &view.template[slot];
                 assert_eq!(template["schema"], "occipital.template/1");
                 assert_eq!(template["profile"], profile);
+                assert_eq!(
+                    template["catalog"],
+                    json!({
+                        "version": "1.1",
+                        "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4"
+                    })
+                );
                 assert_eq!(template["reads"], json!([]));
                 assert!(
                     cortexkit_role_tool_display::canonical_body(template.as_object().unwrap())

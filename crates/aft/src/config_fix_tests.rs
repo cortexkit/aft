@@ -959,7 +959,6 @@ fn doctor_fix_moves_idle_checkout_hours_and_deletes_removed_data_layer_keys() {
         let check =
             feature_config::translate_document(&mut fixed, feature_config::DocumentTier::Project);
         assert!(!check.legacy_input, "{:?}", check.retired_keys);
-        assert!(check.removed_keys.is_empty(), "{:?}", check.removed_keys);
     }
     // An explicit idle.checkout_hours wins over the retired key.
     let migration = migrate_config_text(
@@ -982,8 +981,8 @@ fn doctor_fix_moves_idle_checkout_hours_and_deletes_removed_data_layer_keys() {
 }
 
 /// The automatic rewrite of the user file moves `views.idle_checkout_hours`
-/// but keeps the removed keys (their values still take effect until the code
-/// that reads them is deleted), and its notice names only the key it moved.
+/// but keeps the removed keys for the loader to refuse. Its notice names only
+/// the key it moved; removing refused keys requires an explicit doctor fix.
 /// A file whose only old keys are removed keys is not rewritten at all.
 #[test]
 fn automatic_user_rewrite_moves_idle_checkout_hours_but_keeps_removed_keys() {

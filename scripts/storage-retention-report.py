@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Reads pre-0.64 view storage; does not run against AFT 0.64 or later.
 """Read-only storage census. Never starts AFT, repairs SQLite, or applies a plan.
 
 SQLite is queried ONLY by a separate sqlite3 -readonly process. A checkpointed

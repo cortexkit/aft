@@ -88,7 +88,7 @@ def copy_outputs(tools, output_dir):
     return copied
 
 
-def capture(binary, tree, tools, work, label, views, trace=None, cache_root=None):
+def capture(binary, tree, tools, work, label, trace=None, cache_root=None):
     output = work / label
     env = clean_environment()
     if trace:
@@ -96,8 +96,6 @@ def capture(binary, tree, tools, work, label, views, trace=None, cache_root=None
     argv = [sys.executable, tools / 'parity.py', 'capture', binary,
             tree / 'crates/aft/tests/fixtures/callgraph', (cache_root or work) / (label + '-cache'),
             tools / 'wire-manifest.json', output, '--config', tools / 'wire-policy.json']
-    if views:
-        argv.append('--views')
     run(argv, tree, env)
     return output
 
@@ -146,9 +144,10 @@ def record(sha, include_trace, output_dir):
     if not target.is_absolute():
         target = tree / target
     binary = target / 'debug' / ('aft.exe' if os.name == 'nt' else 'aft')
+    # Historical artifact labels name past configurations and select no runtime variant now.
     for mode in ['legacy', 'views']:
-        first = capture(binary, tree, tools, workspace, 'wire-' + mode + '-first', mode == 'views', cache_root=caches)
-        second = capture(binary, tree, tools, workspace, 'wire-' + mode + '-second', mode == 'views', cache_root=caches)
+        first = capture(binary, tree, tools, workspace, 'wire-' + mode + '-first', cache_root=caches)
+        second = capture(binary, tree, tools, workspace, 'wire-' + mode + '-second', cache_root=caches)
         run([sys.executable, tools / 'parity.py', 'compare', first, second], tree)
         destination = tools / ('wire-' + mode)
         if destination.exists():
@@ -170,7 +169,7 @@ def record(sha, include_trace, output_dir):
         run(['cargo', 'test', '-p', 'agent-file-tools', '--lib', '--', 'store_diet'], tree, traced_env)
         run(['cargo', 'build', '-p', 'agent-file-tools', '--bin', 'aft'], tree)
         for mode in ['legacy', 'views']:
-            output = capture(binary, tree, tools, workspace, 'wire-' + mode + '-traced', mode == 'views', trace, cache_root=caches)
+            output = capture(binary, tree, tools, workspace, 'wire-' + mode + '-traced', trace, cache_root=caches)
             run([sys.executable, tools / 'parity.py', 'compare', tools / ('wire-' + mode), output], tree)
         trace_report = workspace / 'uncovered.json'
         dump(tools / 'trace_exemptions.json', {})

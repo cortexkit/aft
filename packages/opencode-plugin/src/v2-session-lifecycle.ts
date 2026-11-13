@@ -2,7 +2,11 @@ import { Cause, Effect, Stream } from "effect";
 import { markHeldBgCompletions } from "./bg-notifications.js";
 import { error as logError, warn } from "./logger.js";
 import { releaseSessionState } from "./shared/session-cleanup.js";
-import { clearSessionDirectory } from "./shared/session-directory.js";
+import {
+  clearSessionDirectory,
+  getSessionDirectoryForDeletedEvent,
+  getSessionDirectoryForEvent,
+} from "./shared/session-directory.js";
 import { resolveSubagentStatus } from "./shared/subagent-detect.js";
 import { callBashBridge } from "./tools/_shared.js";
 import type { PluginContext } from "./types.js";
@@ -157,6 +161,7 @@ async function killStoppedBackgroundTasks(
   sessionID: string,
   ctx?: PluginContext,
   startedBeforeMs?: number,
+  deletedEvent?: { location?: unknown },
 ): Promise<void> {
   const kills: Array<Promise<void>> = [];
   const visited = new Set<string>();
@@ -179,12 +184,23 @@ async function killStoppedBackgroundTasks(
       dispatch(taskId, kill);
     }
   }
-  if (ctx) {
+  const directory = ctx
+    ? deletedEvent
+      ? getSessionDirectoryForDeletedEvent(client, sessionID, deletedEvent.location)
+      : await getSessionDirectoryForEvent(
+          client,
+          sessionID,
+          (client as { location: { directory: string } }).location.directory,
+        )
+    : null;
+  if (ctx && directory) {
     // Persisted tasks survive a plugin reload. Bind the query and each kill
     // as the stopped owner; task records do not prove parent-child links.
+    // Deletion uses the event's Location or a cached ref, never a fresh
+    // directory lookup for a record the host has removed.
     const runtime = {
       sessionID,
-      directory: (client as { location: { directory: string } }).location.directory,
+      directory,
       directoryIsSessionRoot: true,
     };
     try {
@@ -259,7 +275,12 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
   const host = context as {
     event?: {
       subscribe?: () => Stream.Stream<
-        { type: string; created?: number; data: { sessionID?: string; reason?: string } },
+        {
+          type: string;
+          created?: number;
+          location?: { directory: string; workspaceID?: string };
+          data: { sessionID?: string; reason?: string };
+        },
         unknown
       >;
     };
@@ -298,7 +319,13 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
                     // It also asks the bridge for the tasks this session owns:
                     // after a plugin reload a running command may be known
                     // only there, with no in-memory entry for the session.
-                    const kills = killStoppedBackgroundTasks(context, sessionID, ctx);
+                    const kills = killStoppedBackgroundTasks(
+                      context,
+                      sessionID,
+                      ctx,
+                      undefined,
+                      event,
+                    );
                     rememberDeleted(context, sessionID);
                     sessions.delete(sessionID);
                     releaseSessionState(sessionID);

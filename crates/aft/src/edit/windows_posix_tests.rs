@@ -597,35 +597,40 @@ fn windows_posix_attributes_survive_metadata_guard_in_place() {
 
 #[test]
 fn windows_posix_concurrent_reader_never_loses_destination() {
-    concurrent_reader_never_loses_destination(Fault::None, Method::PosixRename);
+    let (reads, missing) = concurrent_reader_observes_whole_files(Fault::None, Method::PosixRename);
+    assert_eq!(missing, 0, "destination disappeared during {reads} reads");
 }
 
+// Without POSIX rename, the policy is still whole-file replacement: a reader
+// may briefly miss the name, but must never see partial or torn contents.
 #[test]
-fn windows_posix_unsupported_concurrent_reader_never_loses_destination() {
+fn windows_posix_unsupported_concurrent_reader_observes_whole_files() {
     for code in [
         ERROR_NOT_SUPPORTED,
         ERROR_INVALID_PARAMETER,
         ERROR_INVALID_FUNCTION,
     ] {
-        concurrent_reader_never_loses_destination(Fault::Rename(code), Method::MoveFile);
+        concurrent_reader_observes_whole_files(Fault::Rename(code), Method::MoveFile);
     }
 }
 
-fn concurrent_reader_never_loses_destination(fault: Fault, method: Method) {
+fn concurrent_reader_observes_whole_files(fault: Fault, method: Method) -> (usize, usize) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source.txt");
     eprintln!(
         "concurrent-reader fixture={} fault={fault:?}",
         path.display()
     );
-    let bytes = vec![b'x'; 64 * 1024];
-    std::fs::write(&path, &bytes).unwrap();
+    let old = vec![b'x'; 64 * 1024];
+    let new = vec![b'y'; 64 * 1024];
+    std::fs::write(&path, &old).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(Barrier::new(2));
     let reader = {
         let path = path.clone();
         let stop = stop.clone();
         let ready = ready.clone();
+        let (old, new) = (old.clone(), new.clone());
         std::thread::spawn(move || {
             let mut missing = 0;
             let mut missing_codes = std::collections::BTreeMap::new();
@@ -633,8 +638,12 @@ fn concurrent_reader_never_loses_destination(fault: Fault, method: Method) {
             ready.wait();
             while !stop.load(Ordering::Acquire) {
                 match std::fs::read(&path) {
-                    Ok(content) => assert_eq!(content, vec![b'x'; 64 * 1024]),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(content) => assert!(
+                        content == old || content == new,
+                        "reader observed partial or torn contents ({} bytes)",
+                        content.len()
+                    ),
+                    Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
                         missing += 1;
                         *missing_codes.entry(error.raw_os_error()).or_insert(0usize) += 1;
                     }
@@ -647,11 +656,12 @@ fn concurrent_reader_never_loses_destination(fault: Fault, method: Method) {
     };
     ready.wait();
     let writes = std::panic::catch_unwind(|| {
-        for _ in 0..200 {
+        for iteration in 0..200 {
+            let bytes = if iteration % 2 == 0 { &old } else { &new };
             // Early in-place exits do not call the Windows replacement policy.
             // Clear the previous result so they cannot masquerade as a POSIX rename.
             LAST_METHOD.set(None);
-            with_fault(fault, || atomic_write_source(&path, &bytes)).unwrap();
+            with_fault(fault, || atomic_write_source(&path, bytes)).unwrap();
             assert_eq!(
                 LAST_METHOD.get(),
                 Some(method),
@@ -667,8 +677,10 @@ fn concurrent_reader_never_loses_destination(fault: Fault, method: Method) {
     }
     let (reads, missing, missing_codes) = read_result.unwrap();
     eprintln!("concurrent-reader reads={reads} missing_by_os_code={missing_codes:?}");
-    assert!(reads > 0);
-    assert_eq!(missing, 0, "destination disappeared during {reads} reads");
+    assert!(reads > missing, "reader never observed a complete file");
+    assert_eq!(std::fs::read(&path).unwrap(), new);
+    assert_no_temporary(dir.path());
+    (reads, missing)
 }
 
 /// Run on native Windows: cargo test -p agent-file-tools --lib --

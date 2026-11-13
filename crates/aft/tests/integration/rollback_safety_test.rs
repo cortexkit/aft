@@ -64,7 +64,7 @@ impl Fixture {
             )
             .with_test_checkpoint_store(),
         );
-        let mut doc = json!({ "indexes": indexes, "views": { "enabled": false } });
+        let mut doc = json!({ "indexes": indexes });
         if indexes["semantic"] == true {
             doc["semantic"] = json!({
                 "backend": "openai_compatible",

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Exercise opencode branch switches with views enabled and disabled."""
+# Reads pre-0.64 view storage; does not run against AFT 0.64 or later.
+"""Exercise branch switches in an isolated source-checkout session."""
 
 from __future__ import annotations
 
@@ -10,7 +11,6 @@ import re
 import subprocess
 import sys
 import time
-from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +24,6 @@ from common import (
     ToolClient,
     assert_clean_worktree,
     current_generation,
-    ensure_owned_baseline,
     extract_embedding_calls,
     find_subc_daemon_pid,
     git_bytes,
@@ -34,7 +33,6 @@ from common import (
     manifest_entry_count,
     manifest_fingerprint,
     markdown_cell,
-    read_jsonc,
     resolve_root,
     run_checked,
     sample_process,
@@ -43,7 +41,6 @@ from common import (
     wait_cold_work_ready,
     wait_indexes_ready,
     write_json,
-    write_views_off_config,
 )
 
 
@@ -66,16 +63,6 @@ EMBED_RE = re.compile(
     r'semantic embedder refresh: root="(?P<root>[^"]+)" .*? files=(?P<files>\d+) '
     r'chunks=(?P<chunks>\d+) batches=(?P<batches>\d+)\b'
 )
-# Subject log line emitted when a watcher-driven re-embed actually ran.
-# The leading timestamp is env_logger's RFC3339 prefix; the drill only counts
-# lines stamped after the checkout so a previous switch cannot close this row.
-SEMANTIC_REFRESH_RE = re.compile(
-    r"^(?:(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z\s+)?"
-    r".*semantic refresh: (?P<changed>\d+) changed,"
-)
-# Matches the product's SEMANTIC_REFRESH_QUIET_WINDOW_MS: a fast callgraph-correct
-# observation can land before the watcher even schedules a re-embed.
-SEMANTIC_QUIET_WINDOW_S = 15.0
 FUNCTION_PATTERNS = (
     re.compile(r"(?m)^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"),
     re.compile(r"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
@@ -387,22 +374,6 @@ def _parse_log_timestamp(text: str) -> datetime | None:
         return None
 
 
-def semantic_refresh_observed(text: str, checkout_at: datetime) -> bool:
-    """Return whether a post-checkout `semantic refresh: N changed` line is present."""
-    for line in text.splitlines():
-        match = SEMANTIC_REFRESH_RE.search(line)
-        if match is None:
-            continue
-        stamp = match.group("ts")
-        if stamp:
-            parsed = _parse_log_timestamp(stamp + "Z")
-            # Log stamps are second-resolution; drop checkout microseconds so a
-            # refresh in the same second as the switch is not treated as stale.
-            floor = checkout_at.replace(microsecond=0)
-            if parsed is not None and parsed < floor:
-                continue
-        return True
-    return False
 
 
 def _pending_count(value: Any) -> int:
@@ -417,41 +388,8 @@ def _pending_count(value: Any) -> int:
     return 0
 
 
-def readiness_semantic_idle(ready: Mapping[str, Any]) -> bool:
-    """Return whether readiness shows an idle semantic worker with no pending paths."""
-    status = ready.get("status", ready)
-    if not isinstance(status, Mapping):
-        return False
-    semantic = status.get("semantic_index")
-    if not isinstance(semantic, Mapping):
-        return False
-    if semantic.get("status") not in {"ready", "disabled"}:
-        return False
-    if _pending_count(semantic.get("refreshing_count")) > 0:
-        return False
-    if _pending_count(semantic.get("pending_paths")) > 0:
-        return False
-    views = status.get("views")
-    if isinstance(views, Mapping) and _pending_count(views.get("pending_paths")) > 0:
-        return False
-    return True
 
 
-def legacy_row_close_reason(
-    *,
-    log_text: str,
-    checkout_at: datetime,
-    elapsed_s: float,
-    ready: Mapping[str, Any],
-    quiet_window_s: float | None = None,
-) -> str | None:
-    """Name the views-off close condition, or None if the row must keep waiting."""
-    if semantic_refresh_observed(log_text, checkout_at):
-        return "semantic_refresh_complete"
-    window = SEMANTIC_QUIET_WINDOW_S if quiet_window_s is None else quiet_window_s
-    if elapsed_s >= window and readiness_semantic_idle(ready):
-        return "quiet_window_elapsed"
-    return None
 
 
 def contention_metrics(text: str, root: Path) -> dict[str, Any]:
@@ -528,25 +466,23 @@ def perform_switch(
     *,
     mode: str,
     checkout: Path,
-    source_root: Path,
     target_sha: str,
     changed_files: int,
     label: str,
     probe: SwitchProbe,
     client: ToolClient,
-    views_on: bool,
     view_dir: Path,
     storage: Path,
     expected_manifest_fingerprint: str | None,
     standalone_pid: int | None = None,
     cold_work_timeout_s: float = 1800.0,
 ) -> dict[str, Any]:
-    before_generation = current_generation(view_dir) if views_on else None
+    before_generation = current_generation(view_dir)
     before_manifest_fingerprint = (
-        manifest_fingerprint(view_dir, before_generation) if views_on else None
+        manifest_fingerprint(view_dir, before_generation)
     )
-    before_entries = manifest_entry_count(view_dir, before_generation) if views_on else 0
-    daemon_subject = views_on and standalone_pid is None
+    before_entries = manifest_entry_count(view_dir, before_generation)
+    daemon_subject = standalone_pid is None
     before_pid = find_subc_daemon_pid() if daemon_subject else standalone_pid
     if before_pid is None:
         raise SoakError(f"{mode} has no measurement process")
@@ -570,22 +506,13 @@ def perform_switch(
     # loaded machine is visible in the table rather than read as a regression.
     load_at_start = round(os.getloadavg()[0], 2)
     checkout_args = ["checkout", "--quiet", "--detach"]
-    if not views_on:
-        checkout_args.append("--force")
     checkout_args.append(target_sha)
     git_text(checkout, *checkout_args)
-    checkout_at = datetime.now(timezone.utc)
-    checkout_monotonic = time.monotonic()
-    if not views_on:
-        write_views_off_config(source_root, checkout)
 
-    # Views-on still uses the historical 300s probe ceiling. Views-off must
-    # outlive the 15s semantic quiet window plus the embed batches that follow,
-    # so its row is bounded by the same cold-work budget as arm warmup.
-    deadline = started + (300.0 if views_on else cold_work_timeout_s)
+    # Each checkout must finish its publication inside the measured row budget.
+    deadline = started + cold_work_timeout_s
     publication_ms: int | None = None
     time_to_correct_ms: int | None = None
-    semantic_settle_ms: int | None = None
     row_close_reason = "timeout"
     readiness_ms: int | None = None
     readiness_error: str | None = None
@@ -618,7 +545,7 @@ def perform_switch(
         except (SoakError, subprocess.SubprocessError) as error:
             readiness_error = str(error)
             break
-        if views_on and publication_ms is None:
+        if publication_ms is None:
             generation = current_generation(view_dir)
             if generation is not None and generation != before_generation:
                 publication_ms = round((time.monotonic() - started) * 1000)
@@ -637,28 +564,15 @@ def perform_switch(
             time_to_correct_ms = round((time.monotonic() - started) * 1000)
         if answers_correct:
             current_log_text = read_log_window()
-            if views_on:
-                if publication_is_complete(current_log_text, checkout):
-                    row_close_reason = "pending_paths=0"
-                    contention_log_text = current_log_text
-                    break
-            else:
-                close_reason = legacy_row_close_reason(
-                    log_text=current_log_text,
-                    checkout_at=checkout_at,
-                    elapsed_s=time.monotonic() - checkout_monotonic,
-                    ready=ready,
-                )
-                if close_reason is not None:
-                    row_close_reason = close_reason
-                    semantic_settle_ms = round((time.monotonic() - started) * 1000)
-                    contention_log_text = current_log_text
-                    break
+            if publication_is_complete(current_log_text, checkout):
+                row_close_reason = "pending_paths=0"
+                contention_log_text = current_log_text
+                break
         time.sleep(0.25)
 
     if contention_log_text is None:
         contention_log_text = read_log_window()
-    if views_on and publication_ms is None:
+    if publication_ms is None:
         generation = current_generation(view_dir)
         if generation is not None and generation != before_generation:
             publication_ms = round((time.monotonic() - started) * 1000)
@@ -699,23 +613,22 @@ def perform_switch(
             )
         )
     ][-200:]
-    after_generation = current_generation(view_dir) if views_on else None
+    after_generation = current_generation(view_dir)
     after_manifest_fingerprint = (
-        manifest_fingerprint(view_dir, after_generation) if views_on else None
+        manifest_fingerprint(view_dir, after_generation)
     )
-    after_entries = manifest_entry_count(view_dir, after_generation) if views_on else 0
+    after_entries = manifest_entry_count(view_dir, after_generation)
     puts: int | None = None
     puts_source = "not_applicable"
-    if views_on:
-        if publication_puts is not None:
-            puts = publication_puts
-            puts_source = "publication_log"
-        elif reuse_puts is not None:
-            puts = reuse_puts
-            puts_source = "head_reuse"
-        else:
-            puts = abs(after_entries - before_entries)
-            puts_source = "entries_delta"
+    if publication_puts is not None:
+        puts = publication_puts
+        puts_source = "publication_log"
+    elif reuse_puts is not None:
+        puts = reuse_puts
+        puts_source = "head_reuse"
+    else:
+        puts = abs(after_entries - before_entries)
+        puts_source = "entries_delta"
 
     timed_out = time_to_correct_ms is None
     publication = (
@@ -726,8 +639,6 @@ def perform_switch(
             after_manifest_fingerprint,
             expected_manifest_fingerprint,
         )
-        if views_on
-        else "not_applicable"
     )
     return {
         "mode": mode,
@@ -759,7 +670,6 @@ def perform_switch(
         "host_load_1m": {"start": load_at_start, "end": round(os.getloadavg()[0], 2)},
         "readiness_error": readiness_error,
         "time_to_correct_ms": time_to_correct_ms,
-        "semantic_settle_ms": semantic_settle_ms,
         "row_close_reason": row_close_reason,
         "correctness": "timeout" if timed_out else "correct",
         "publication": publication,
@@ -774,8 +684,6 @@ def warm_mode(
     checkout: Path,
     client: ToolClient,
     storage: Path,
-    baseline_storage: Path,
-    views_on: bool,
     standalone_pid: int,
     warm_started: float,
     ceiling_s: float,
@@ -800,15 +708,15 @@ def warm_mode(
     cold = wait_cold_work_ready(
         client,
         root=checkout,
-        storage_root=storage if views_on else baseline_storage,
+        storage_root=storage,
         log_reader=log_reader,
         timeout_s=remaining,
     )
     cold_work_ms = round((time.monotonic() - warm_started) * 1000)
     return {
         "ceiling_ms": round(ceiling_s * 1000),
-        "storage": str(storage if views_on else baseline_storage),
-        "subject": "standalone_views_on" if views_on else "standalone_owned_baseline",
+        "storage": str(storage),
+        "subject": "standalone_source_checkout",
         "readiness_detail_ms": ready["elapsed_ms"],
         "indexes_ready_ms": indexes_ready_ms,
         "cold_gate_detail_ms": cold["elapsed_ms"],
@@ -824,12 +732,10 @@ def exercise_mode(
     *,
     mode: str,
     checkout: Path,
-    source_root: Path,
     head: str,
     transitions: list[tuple[str, str, str, int]],
     probes: Mapping[tuple[str, str], SwitchProbe],
     client: ToolClient,
-    views_on: bool,
     view_dir: Path,
     storage: Path,
     standalone_pid: int,
@@ -839,10 +745,9 @@ def exercise_mode(
         raise SoakError(f"{mode} did not start at HEAD")
     rows: list[dict[str, Any]] = []
     known_manifest_fingerprints: dict[str, str] = {}
-    if views_on:
-        initial_fingerprint = manifest_fingerprint(view_dir)
-        if initial_fingerprint is not None:
-            known_manifest_fingerprints[head] = initial_fingerprint
+    initial_fingerprint = manifest_fingerprint(view_dir)
+    if initial_fingerprint is not None:
+        known_manifest_fingerprints[head] = initial_fingerprint
 
     for source, target, label, changed_files in transitions:
         if git_text(checkout, "rev-parse", "HEAD") != source:
@@ -850,13 +755,11 @@ def exercise_mode(
         row = perform_switch(
             mode=mode,
             checkout=checkout,
-            source_root=source_root,
             target_sha=target,
             changed_files=changed_files,
             label=label,
             probe=probes[(source, target)],
             client=client,
-            views_on=views_on,
             view_dir=view_dir,
             storage=storage,
             expected_manifest_fingerprint=known_manifest_fingerprints.get(target),
@@ -864,7 +767,7 @@ def exercise_mode(
             cold_work_timeout_s=cold_work_timeout_s,
         )
         rows.append(row)
-        if views_on and row["publication"] in {"published", "no_op"}:
+        if row["publication"] in {"published", "no_op"}:
             fingerprint = row["manifest_fingerprint_after"]
             if fingerprint is not None:
                 known_manifest_fingerprints[target] = fingerprint
@@ -878,123 +781,22 @@ def render_table(
     warmups: Mapping[str, Any],
     previous: Mapping[str, Any] | None,
 ) -> str:
-    by_mode = {(row["mode"], row["switch"]): row for row in rows}
-    switches = [row["switch"] for row in rows if row["mode"] == "views-on"]
-    views_on_embeds = sum(row["embeds"] for row in rows if row["mode"] == "views-on")
-    views_off_embeds = sum(row["embeds"] for row in rows if row["mode"] == "views-off")
     lines = [
-        "# opencode views branch-switch drill",
-        "",
-        "## Finding",
-        "",
-        "The isolated views-on subject exercises content-addressed publication without restarting or mutating the live daemon. "
-        f"Views-on used {views_on_embeds} embed batches across the four switches; the legacy arm used {views_off_embeds}.",
-        "",
-        "## Cold-work-gated run",
-        "",
+        "# opencode source-checkout branch-switch drill", "",
         f"Observed at `{refs['observed_at']}` against `{refs['head'][:12]}`.",
-        "",
-        f"- A: first-parent commit `{refs['anchor']['sha'][:12]}` ({refs['anchor']['changed_files']} changed files)",
-        f"- B: branch `{refs['branch']['ref']}` (`{refs['branch']['sha'][:12]}`, {refs['branch']['changed_files']} changed files)",
-        f"- Views-on subject: standalone AFT with isolated view storage; cold work gated in `{warmups['views-on']['cold_work_ms']} ms`.",
-        f"- Views-off subject: standalone AFT on an independent baseline clone and isolated storage; cold work gated in `{warmups['views-off']['cold_work_ms']} ms`.",
-        "",
-        "`cpu_s` and `rss_delta_mb` use the active standalone subject PID for each row. PID changes are recorded as defects rather than subtracting unrelated processes.",
-        "",
-        "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | on contention | on load | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms | off contention | off load |",
-        "|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|",
+        f"Cold work completed in `{warmups['source-checkout']['cold_work_ms']} ms`.", "",
+        "CPU and RSS deltas use one standalone subject PID; PID changes are defects.", "",
+        "| switch | publication_ms | puts | embeds | cpu_s | rss_delta_mb | correct_ms | contention | load |",
+        "|---|---:|---:|---:|---:|---:|---:|---|---|",
     ]
-    for switch in switches:
-        on = by_mode[("views-on", switch)]
-        off = by_mode[("views-off", switch)]
-        values: Iterable[Any] = (
-            switch,
-            "—" if on["publication_ms"] is None else on["publication_ms"],
-            on["puts"],
-            on["embeds"],
-            "—" if on["cpu_s"] is None else on["cpu_s"],
-            "—" if on["rss_delta_mb"] is None else on["rss_delta_mb"],
-            "timeout" if on["time_to_correct_ms"] is None else on["time_to_correct_ms"],
-            on["contention"]["summary"],
-            f"{on['host_load_1m']['start']}→{on['host_load_1m']['end']}",
-            "—" if off["publication_ms"] is None else off["publication_ms"],
-            "—" if off["puts"] is None else off["puts"],
-            off["embeds"],
-            "—" if off["cpu_s"] is None else off["cpu_s"],
-            "—" if off["rss_delta_mb"] is None else off["rss_delta_mb"],
-            "timeout" if off["time_to_correct_ms"] is None else off["time_to_correct_ms"],
-            off["contention"]["summary"],
-            f"{off['host_load_1m']['start']}→{off['host_load_1m']['end']}",
+    for row in rows:
+        values = (
+            row["switch"], row["publication_ms"], row["puts"], row["embeds"], row["cpu_s"],
+            row["rss_delta_mb"], row["time_to_correct_ms"], row["contention"]["summary"],
+            f"{row['host_load_1m']['start']}→{row['host_load_1m']['end']}",
         )
         lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
-    lines.extend(
-        [
-            "",
-            "### Cold-work readiness",
-            "",
-            "Both standalone arm processes were started before either arm switched commits. Each arm first passed query readiness, then waited for semantic progress and root-owned semantic build events to settle and for one full dead-code Tier-2 pass. The first switch began only after both gates cleared.",
-            "",
-            "The earlier `semantic_index.status=ready` observation described an installed queryable resident/view index, not an idle semantic worker. In the status producer, an installed `SemanticIndex` is labeled from the resident index and the live `semantic_build_progress` fields are only attached to the no-index cold-building branch. Fresh isolated standalone storage rules out borrowing another process's legacy index. The gate therefore requires the progress/build lifecycle itself to be terminal rather than accepting the queryable status label.",
-            "",
-            "### Four mechanisms",
-            "",
-            "1. **Forward correctness had both a probe defect and a publication defect.** The Run 2 search query was free text and candidate selection proved only that a name existed on the target; `callers` needs a symbol with a resolvable call site. The drill now uses an exact word-boundary query, requires at least two target occurrences, and verifies both search and a non-empty callers result. A pre-fix instrumented run still showed the product defect: status reported search/semantic `ready` after 934 ms, then `index_event ... outcome=pending ... pending_paths=1`, repeated `callers ... symbol_not_found` for 300 s, and no published event. The semantic-refresh completion path did not retry the pending view publication, so callgraph queries remained pinned to HEAD. Completion now publishes the pending paths; all Run 3 probes converge.",
-            "2. **Switch-back embeddings came from the legacy semantic watcher worker.** Views publication did not suppress the resident `SemanticIndex` refresh, which embedded every watcher-invalidated path from the live checkout. The worker now derives the view semantic full key from source bytes, path, producer version, and model fingerprint, loads an existing `SemanticBlob`, and embeds only misses. Both return legs report zero embed calls; this final warm run also reused vectors on both forward legs.",
-            "3. **The missing generations were failed publications, not valid no-ops.** The target fingerprints are `4b5c2543317f465023...` (A) and `2d6d879d2a496ba71f...` (B), distinct from HEAD `322b78e53d463f91c...`. Run 2 retained the HEAD fingerprint after `outcome=pending`; it had not published an identical manifest. The drill now classifies publication by manifest fingerprint rather than generation alone, and semantic completion publishes the distinct target manifest.",
-            "4. **The puts count mixed roots.** Publication counters without `root=` admitted concurrent work from other roots. View publication phase events and publication summaries now use the same `root=<canonical checkout>` grammar as other `index_event` lines, and the drill accepts counters/events only for the measured root. Run 3 records zero blob puts on every switch.",
-            "",
-            "### Cost attribution",
-            "",
-            "The earlier views-on sample was 281 CPU-s and +1.3 GB RSS versus 125 CPU-s for legacy. Run 3 phase events rule out blob insertion and embedding as the views-only cause: every views row has `blob_puts=0` and zero embed batches. On the two forward publications, `derived.sqlite` materialization took 43,767 ms and 35,783 ms, versus only 1,701/2,460 ms for manifest assembly and 208/285 ms for blob lookup; pointer publication added 7,263/4,380 ms. Materialization therefore consumed 82-83% of the published phase. The checkpointed database is 269,889,536 bytes (257.4 MiB); building a temporary generation alongside the published one accounts for about 514.8 MiB, matching the known ~517 MiB materialization footprint. The remaining RSS variation is process cache/allocator residency. The follow-up target is consequently incremental `derived.sqlite` materialization: remove the 35.8-43.8 s full rewrite and roughly 257 MiB temporary generation per switch.",
-            "",
-            "### Run 3 defects",
-            "",
-        ]
-    )
-    if defects:
-        lines.extend(f"- {defect}" for defect in defects)
-    else:
-        lines.append("No correctness, publication, PID-change, or switch-back reuse defect observed.")
-
-    if previous is not None:
-        lines.extend(
-            [
-                "",
-                "## Run 1 — confounded (historical)",
-                "",
-                "Run 1 used a standalone views-on process and a cold read-only baseline. Its parity divergence and timeout rows are readiness artifacts, not views parity findings. The raw record remains in `branch-drill-run1-confounded.json`.",
-                "",
-                "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | off cpu_s | off rss_delta_mb | off correct_ms |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-            ]
-        )
-        previous_rows = previous.get("rows", [])
-        previous_by_mode = {
-            (row["mode"], row["switch"]): row
-            for row in previous_rows
-            if isinstance(row, dict)
-        }
-        for switch in [
-            row["switch"]
-            for row in previous_rows
-            if isinstance(row, dict) and row.get("mode") == "views-on"
-        ]:
-            on = previous_by_mode[("views-on", switch)]
-            off = previous_by_mode[("views-off", switch)]
-            values = (
-                switch,
-                "—" if on["publication_ms"] is None else on["publication_ms"],
-                on["puts"],
-                on["embeds"],
-                on["cpu_s"],
-                on["rss_delta_mb"],
-                "timeout" if on["time_to_correct_ms"] is None else on["time_to_correct_ms"],
-                off["cpu_s"],
-                off["rss_delta_mb"],
-                "timeout" if off["time_to_correct_ms"] is None else off["time_to_correct_ms"],
-            )
-            lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
-    lines.append("")
+    lines.extend(["", "## Defects", "", *(defects or ["None observed."]), ""])
     return "\n".join(lines)
 
 
@@ -1014,14 +816,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             / ".cache"
             / "aft-views-soak"
             / "0f3900af641f5248"
-            / "views-on-storage"
+            / "source-checkout-storage"
         ),
-        help="isolated storage for the standalone views-on subject",
-    )
-    parser.add_argument(
-        "--baseline-storage",
-        type=Path,
-        help="fresh isolated storage for the standalone views-off subject",
+        help="isolated storage for the standalone source-checkout subject",
     )
     parser.add_argument(
         "--output-dir",
@@ -1040,12 +837,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=1800.0,
         help="per-arm budget for indexes, semantic idle, and the first dead-code pass",
     )
-    parser.add_argument(
-        "--mode",
-        choices=("both", "views-on", "views-off"),
-        default="both",
-        help="Run both arms or one arm for resource-constrained evidence capture",
-    )
     return parser.parse_args(argv)
 
 
@@ -1056,27 +847,13 @@ def main(argv: list[str]) -> int:
         raise SoakError("the branch drill is restricted to the opencode soak root")
     binary = args.binary.expanduser().resolve()
     storage = args.storage.expanduser().resolve()
-    baseline_storage = (
-        args.baseline_storage.expanduser().resolve()
-        if args.baseline_storage is not None
-        else storage.with_name(f"{storage.name}-views-off")
-    )
     output_dir = args.output_dir.expanduser().resolve()
-    if storage == baseline_storage:
-        raise SoakError("views-on and views-off storage must be distinct")
     if not args.allow_reused_storage:
-        if args.mode in {"both", "views-on"}:
-            assert_fresh_storage(storage, "views-on storage")
-        if args.mode in {"both", "views-off"}:
-            assert_fresh_storage(baseline_storage, "views-off storage")
+        assert_fresh_storage(storage, "source-checkout storage")
     output_dir.mkdir(parents=True, exist_ok=True)
     if not binary.is_file() or not binary.stat().st_mode & 0o111:
         raise SoakError(f"placed AFT binary is missing or not executable: {binary}")
-    config = read_jsonc(root / ".cortexkit" / "aft.jsonc")
-    if not isinstance(config.get("views"), dict) or config["views"].get("enabled") is not True:
-        raise SoakError("opencode soak root does not have views.enabled: true")
     assert_clean_worktree(root, "opencode soak root")
-
     original_head = git_text(root, "rev-parse", "HEAD")
     original_branch = git_text(root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1))
     original_config = (root / ".cortexkit" / "aft.jsonc").read_bytes()
@@ -1089,190 +866,69 @@ def main(argv: list[str]) -> int:
         (original_head, branch[1], f"HEAD→{branch[0]}", branch[2]),
         (branch[1], original_head, f"{branch[0]}→HEAD", branch[2]),
     ]
-    baseline = ensure_owned_baseline(root, scope, original_head)
     health_before = health_snapshot(binary)
-    rows: list[dict[str, Any]] = []
-    warmups: dict[str, Any] = {}
-
     try:
-        if args.mode in {"both", "views-off"}:
-            for target in {target for _, target, _, _ in transitions}:
-                git_text(baseline, "fetch", "--quiet", str(root), target)
-            git_text(baseline, "checkout", "--quiet", "--detach", "--force", original_head)
-            write_views_off_config(root, baseline)
-
-        subject_specs: list[dict[str, Any]] = []
-        if args.mode in {"both", "views-on"}:
-            subject_specs.append(
-                {
-                    "mode": "views-on",
-                    "checkout": root,
-                    "source_root": root,
-                    "subject_storage": storage,
-                    "views_on": True,
-                }
+        warm_started = time.monotonic()
+        with NdjsonClient(
+            binary, root, storage, output_dir / "branch-drill.stderr.log",
+            f"branch-drill-source-{int(time.time())}",
+        ) as client:
+            client.configure(Path.home() / ".config" / "cortexkit" / "aft.jsonc")
+            warmup = warm_mode(
+                mode="source-checkout", checkout=root, client=client, storage=storage,
+                standalone_pid=client.proc.pid, warm_started=warm_started,
+                ceiling_s=args.cold_work_timeout_s,
             )
-        if args.mode in {"both", "views-off"}:
-            subject_specs.append(
-                {
-                    "mode": "views-off",
-                    "checkout": baseline,
-                    "source_root": root,
-                    "subject_storage": baseline_storage,
-                    "views_on": False,
-                }
+            rows = exercise_mode(
+                mode="source-checkout", checkout=root, head=original_head,
+                transitions=transitions, probes=probes, client=client,
+                view_dir=storage / "views" / scope, storage=storage,
+                standalone_pid=client.proc.pid, cold_work_timeout_s=args.cold_work_timeout_s,
             )
-
-        with ExitStack() as stack:
-            active_subjects: list[dict[str, Any]] = []
-            for spec in subject_specs:
-                mode = str(spec["mode"])
-                warm_started = time.monotonic()
-                client = stack.enter_context(
-                    NdjsonClient(
-                        binary,
-                        spec["checkout"],
-                        spec["subject_storage"],
-                        output_dir / f"branch-drill-{mode}.stderr.log",
-                        f"views-branch-{mode}-{int(time.time())}",
-                    )
-                )
-                active_subjects.append(
-                    {**spec, "client": client, "warm_started": warm_started}
-                )
-
-            user_config = Path.home() / ".config" / "cortexkit" / "aft.jsonc"
-            for subject in active_subjects:
-                subject["client"].configure(user_config)
-
-            # Keep both processes alive and finish every arm's cold gate before
-            # the first checkout mutation, so no arm warms during measured rows.
-            for subject in active_subjects:
-                client = subject["client"]
-                mode = str(subject["mode"])
-                warmups[mode] = warm_mode(
-                    mode=mode,
-                    checkout=subject["checkout"],
-                    client=client,
-                    storage=storage,
-                    baseline_storage=baseline_storage,
-                    views_on=bool(subject["views_on"]),
-                    standalone_pid=client.proc.pid,
-                    warm_started=float(subject["warm_started"]),
-                    ceiling_s=args.cold_work_timeout_s,
-                )
-
-            for subject in active_subjects:
-                client = subject["client"]
-                rows.extend(
-                    exercise_mode(
-                        mode=str(subject["mode"]),
-                        checkout=subject["checkout"],
-                        source_root=subject["source_root"],
-                        head=original_head,
-                        transitions=transitions,
-                        probes=probes,
-                        client=client,
-                        views_on=bool(subject["views_on"]),
-                        view_dir=storage / "views" / scope,
-                        storage=subject["subject_storage"],
-                        standalone_pid=client.proc.pid,
-                        cold_work_timeout_s=args.cold_work_timeout_s,
-                    )
-                )
     finally:
         current = git_text(root, "rev-parse", "HEAD", allowed=(0, 128))
-        current_branch = git_text(
-            root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1)
-        )
+        current_branch = git_text(root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1))
         if current != original_head or (original_branch and current_branch != original_branch):
             if original_branch:
                 git_text(root, "checkout", "--quiet", original_branch)
             else:
                 git_text(root, "checkout", "--quiet", "--detach", original_head)
-        git_text(baseline, "checkout", "--quiet", "--detach", "--force", original_head)
-        write_views_off_config(root, baseline)
-
     if (root / ".cortexkit" / "aft.jsonc").read_bytes() != original_config:
         raise SoakError("opencode project config did not restore byte-for-byte")
     assert_clean_worktree(root, "restored opencode soak root")
     health_after = health_snapshot(binary)
-
     defects = []
     for row in rows:
         if row["readiness_error"]:
-            defects.append(f"{row['mode']} {row['switch']} readiness failed: {row['readiness_error']}")
+            defects.append(f"{row['switch']} readiness failed: {row['readiness_error']}")
             continue
         if row["correctness"] != "correct":
-            defects.append(
-                f"{row['mode']} {row['switch']} did not return both correct probes after full readiness"
-            )
-        if row["mode"] == "views-on" and row["publication"] in {"missing", "mismatched"}:
-            defects.append(
-                f"{row['switch']} did not publish the expected manifest "
-                f"(outcome={row['publication']})"
-            )
+            defects.append(f"{row['switch']} did not return both correct probes after full readiness")
+        if row["publication"] in {"missing", "mismatched"}:
+            defects.append(f"{row['switch']} did not publish the expected manifest (outcome={row['publication']})")
         if row["measurement_pid_changed"]:
-            defects.append(
-                f"{row['mode']} {row['switch']} measurement PID changed from "
-                f"{row['measurement_pid_before']} to {row['measurement_pid_after']}"
-            )
-        if row["mode"] == "views-on" and row["target"] == original_head and (
-            row["puts"] != 0 or row["embeds"] != 0
-        ):
-            defects.append(
-                f"{row['switch']} reused HEAD with puts={row['puts']} and embeds={row['embeds']}"
-            )
-
-    observed_at = utc_now()
+            defects.append(f"{row['switch']} measurement PID changed from {row['measurement_pid_before']} to {row['measurement_pid_after']}")
+        if row["target"] == original_head and (row["puts"] != 0 or row["embeds"] != 0):
+            defects.append(f"{row['switch']} reused HEAD with puts={row['puts']} and embeds={row['embeds']}")
     refs = {
-        "observed_at": observed_at,
-        "head": original_head,
-        "anchor": {
-            "kind": "first_parent_commit",
-            "sha": anchor[1],
-            "changed_files": anchor[2],
-            "requested_range": [200, 400],
-            "in_requested_range": 200 <= anchor[2] <= 400,
-        },
+        "observed_at": utc_now(), "head": original_head,
+        "anchor": {"kind": "first_parent_commit", "sha": anchor[1], "changed_files": anchor[2],
+                   "requested_range": [200, 400], "in_requested_range": 200 <= anchor[2] <= 400},
         "branch": {"ref": branch[0], "sha": branch[1], "changed_files": branch[2]},
     }
-    previous_path = RESULT_DIR / "branch-drill-run1-confounded.json"
-    previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.is_file() else None
+    warmups = {"source-checkout": warmup}
     result = {
-        "schema_version": 4,
-        "observed_at": observed_at,
-        "root": str(root),
-        "baseline": str(baseline),
-        "baseline_storage": str(baseline_storage),
-        "refs": refs,
-        "measurement_subjects": {
-            "views_on": "standalone_views_on",
-            "views_off": "standalone_owned_baseline",
-        },
-        "warmups": warmups,
-        "health_before": health_before,
-        "health_after": health_after,
-        "rows": rows,
-        "defects": defects,
-        "run1_artifact": previous_path.name if previous is not None else None,
+        "schema_version": 5, "observed_at": refs["observed_at"], "root": str(root),
+        "refs": refs, "measurement_subject": "standalone_source_checkout", "warmups": warmups,
+        "health_before": health_before, "health_after": health_after, "rows": rows, "defects": defects,
     }
-    json_path = output_dir / (
-        "branch-drill.json" if args.mode == "both" else f"branch-drill-{args.mode}.json"
-    )
+    json_path = output_dir / "branch-drill.json"
     write_json(json_path, result)
-    print(f"wrote {json_path}")
-    if args.mode == "both":
-        markdown_path = output_dir / "branch-drill.md"
-        markdown_path.parent.mkdir(parents=True, exist_ok=True)
-        markdown_path.write_text(
-            render_table(rows, refs, defects, warmups, previous), encoding="utf-8"
-        )
-        print(f"wrote {markdown_path}")
-    if defects:
-        print("views branch drill defects:")
-        for defect in defects:
-            print(f"- {defect}")
+    markdown_path = output_dir / "branch-drill.md"
+    markdown_path.write_text(render_table(rows, refs, defects, warmups, None), encoding="utf-8")
+    print(f"wrote {json_path} and {markdown_path}")
+    for defect in defects:
+        print(f"- {defect}")
     return 0
 
 

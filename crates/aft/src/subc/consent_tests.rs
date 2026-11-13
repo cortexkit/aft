@@ -2241,6 +2241,23 @@ fn call_key_for_file(requests: &[Value], file_name: &str) -> String {
 }
 
 #[cfg(unix)]
+async fn wait_for_file_consent_requests(fake: &FakeCingulate, paths: &[&Path]) -> Vec<Value> {
+    let mut requests = Vec::new();
+    // Recovery can resend the same ask, so count neither attempts nor arrival
+    // order: each requested file must have its own consent request on record.
+    wait_for(|| {
+        requests = fake.calls("consent.request");
+        paths.iter().all(|path| {
+            requests
+                .iter()
+                .any(|request| request["paths"] == json!([path]))
+        })
+    })
+    .await;
+    requests
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_folder_grant_leaves_uncovered_asks_pending() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -2433,6 +2450,63 @@ async fn consent_folder_grant_leaves_uncovered_asks_pending() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn consent_folder_grant_request_wait_ignores_replayed_sibling() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(5)));
+    let sub = f.head_root.join("replaydir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let a = sub.join("a.txt");
+    let b = sub.join("b.txt");
+    std::fs::write(&a, "a contents\n").unwrap();
+    std::fs::write(&b, "b contents\n").unwrap();
+    let mut rx1 = f.send_read(&f.worker, &a, 919).await;
+    let requests = wait_for_file_consent_requests(&f.fake, &[&a]).await;
+    let key1 = call_key_for_file(&requests, "a.txt");
+    // Recovery can resend a persisted request before AFT saves the returned
+    // elicitation id in the ask row. Replay it without relying on scheduler timing.
+    let replay = f
+        .fake
+        .reply("consent.request", &requests[0])
+        .unwrap()
+        .unwrap();
+    {
+        let state = f.fake.state.lock().unwrap();
+        assert_eq!(replay["elicitation_id"], json!(state.asks[&key1]));
+        assert_eq!(state.asks.len(), 1, "a replay reuses the existing card");
+    }
+    assert_eq!(f.fake.calls("consent.request").len(), 2);
+    let paths = [a.as_path(), b.as_path()];
+    let waiting = wait_for_file_consent_requests(&f.fake, &paths);
+    tokio::pin!(waiting);
+    // Do not dispatch b.txt until the wait has observed both attempts for
+    // a.txt. A request-count wait completes here, before b.txt can be filed.
+    let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await;
+    assert!(
+        polled.is_pending(),
+        "a replay must not satisfy the wait for b.txt"
+    );
+    let mut rx2 = f.send_read(&f.worker, &b, 920).await;
+    let requests = waiting.await;
+    let key2 = call_key_for_file(&requests, "b.txt");
+    assert_two_sibling_consent_asks(&f, &a, &b);
+    for key in [&key1, &key2] {
+        f.fake
+            .answer(key, json!({"state": "settled", "outcome": "deny"}));
+    }
+    for replies in [&mut rx1, &mut rx2] {
+        let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(code(&reply), "access_declined");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn consent_folder_grant_withdraw_race_uses_recorded_outcome() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let _probe = DirectoryScopeProbeBudgetOverride::generous();
@@ -2446,8 +2520,7 @@ async fn consent_folder_grant_withdraw_race_uses_recorded_outcome() {
     std::fs::write(&b, "b contents\n").unwrap();
     let mut rx1 = f.send_read(&f.worker, &a, 921).await;
     let mut rx2 = f.send_read(&f.worker, &b, 922).await;
-    wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
-    let requests = f.fake.calls("consent.request");
+    let requests = wait_for_file_consent_requests(&f.fake, &[&a, &b]).await;
     let key1 = call_key_for_file(&requests, "a.txt");
     let key2 = call_key_for_file(&requests, "b.txt");
     // Hold the sibling's denial inside its finish so the covering grant's

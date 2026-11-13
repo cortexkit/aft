@@ -3985,7 +3985,11 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
         drr_quantum: 1,
     }));
     let user_config_path = storage.path().join("user-aft.jsonc");
-    std::fs::write(&user_config_path, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#).unwrap();
+    std::fs::write(
+        &user_config_path,
+        r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false}}"#,
+    )
+    .unwrap();
 
     // PRODUCTION entry — passthrough is OFF.
     run_subc_mode(

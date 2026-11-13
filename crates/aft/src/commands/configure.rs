@@ -4897,7 +4897,7 @@ mod tests {
                     "harness": "opencode",
                     "config": [user_tier(json!({
                         "indexes": {"trigram": false, "semantic": false, "callgraph": false},
-                        "views": {"enabled": false}
+
                     }))]
                 }),
                 "bounded-recovery",
@@ -5008,7 +5008,7 @@ mod tests {
                         "harness": harness,
                         "config": [user_tier(json!({
                             "indexes": {"trigram": false, "semantic": false, "callgraph": false},
-                            "views": {"enabled": false}
+
                         }))]
                     }),
                     session,
@@ -5177,7 +5177,6 @@ mod tests {
                     "project_root": project.path(), "storage_dir": ctx._storage.path(), "harness": "opencode",
                     "config": [user_tier(json!({
                         "indexes": {"trigram": false, "semantic": false, "callgraph": false},
-                        "views": {"enabled": false}
                     }))]
                 }),
                 "healthy-recovery",
@@ -5652,7 +5651,7 @@ mod tests {
     }
 
     #[test]
-    fn views_gate_off_does_not_create_view_storage() {
+    fn disabled_indexes_do_not_create_legacy_view_storage() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let project = tempfile::tempdir().unwrap();
@@ -7502,7 +7501,7 @@ mod tests {
             "storage_dir": storage,
             "config": [user_tier(json!({
                 "indexes": { "trigram": true, "semantic": false, "callgraph": false },
-                "views": { "enabled": false },
+
             }))],
         }))
     }
@@ -7672,7 +7671,7 @@ mod tests {
         let legacy = root.join(".pi/aft.jsonc");
         write_config(
             &user,
-            r#"{"indexes":{"trigram":true,"semantic":false,"callgraph":false},"views":{"enabled":false},"url_fetch_allow_private":true}"#,
+            r#"{"indexes":{"trigram":true,"semantic":false,"callgraph":false},"url_fetch_allow_private":true}"#,
         );
         write_config(&legacy, r#"{"callgraph_chunk_size":7}"#);
         let snapshot = crate::subc_config::PreparedBindConfig::read(
@@ -8296,7 +8295,7 @@ mod tests {
             "storage_dir": ctx._storage.path(),
             "config": [user_tier(json!({
                 "indexes": { "trigram": true, "semantic": true, "callgraph": true },
-                "views": { "enabled": true },
+
             }))],
         }));
         assert!(handle_configure_for_test(&req, &ctx).success);
@@ -8448,7 +8447,7 @@ mod tests {
             "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
             "config": [user_tier(json!({
                 "indexes": {"trigram": true, "semantic": true, "callgraph": true},
-                "views": {"enabled": true},
+
             }))],
         }));
 
@@ -8533,7 +8532,7 @@ mod tests {
             "config": [user_tier(json!({
                 "indexes": {"trigram": true, "semantic": true, "callgraph": true},
                 "semantic": {"backend": "openai_compatible", "base_url": "http://127.0.0.1:1"},
-                "views": {"enabled": true},
+
             }))],
         }));
         let response = handle_configure_for_test(&req, &ctx);

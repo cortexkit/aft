@@ -144,14 +144,18 @@ fn step(scheduler: &Scheduler, now: std::time::Instant) -> Next {
 
 fn wait_for(scheduler: &Scheduler, task: &str, finished: bool) {
     let id = format!("aft:bash:{task}");
+    wait_for_id(scheduler, &id, finished);
+}
+
+fn wait_for_id(scheduler: &Scheduler, id: &str, finished: bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut entries = scheduler.entries.lock().unwrap();
     loop {
         if if finished {
-            !entries.contains_key(&id)
+            !entries.contains_key(id)
         } else {
             entries
-                .get(&id)
+                .get(id)
                 .is_some_and(|entry| entry.retrying && entry.work.is_some())
         } {
             return;
@@ -159,7 +163,7 @@ fn wait_for(scheduler: &Scheduler, task: &str, finished: bool) {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         assert!(
             !left.is_zero(),
-            "notice did not reach scheduled state: {task}"
+            "notice did not reach scheduled state: {id}"
         );
         entries = scheduler.wake.wait_timeout(entries, left).unwrap().0;
     }
@@ -412,6 +416,346 @@ fn runner_notices_consumed_terminal_result_suppresses_stale_completion_frame() {
             0
         );
     }
+}
+
+struct HeldCompletion {
+    task: Completion,
+    db: Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    key: crate::db::call_ledger::Key,
+}
+
+impl HeldCompletion {
+    fn new(id: &str) -> Self {
+        use crate::db::call_ledger as ledger;
+        let task = Completion::new_runner(id, 0, "reserved:thalamus-harness", "opencode2");
+        let db = Arc::new(std::sync::Mutex::new(
+            crate::db::open(&task.storage.path().join("aft.db")).unwrap(),
+        ));
+        task.registry.set_harness(crate::harness::Harness::Runner);
+        task.registry.set_db_pool(db.clone());
+        let key = ledger::Key {
+            carrier: "reserved:thalamus-harness".into(),
+            call_key: format!("held-{id}"),
+        };
+        let registered = task.registry.task_for_test(id).unwrap();
+        let mut state = registered.lock_state().unwrap();
+        state.metadata.call_key = Some(crate::bash_background::TaskCallKey {
+            requester: key.carrier.clone(),
+            key: key.call_key.clone(),
+            minted: false,
+        });
+        let paths =
+            crate::bash_background::persistence::resolve_task(task.storage.path(), id, id).unwrap();
+        crate::bash_background::persistence::write_task_at(&paths, &state.metadata).unwrap();
+        std::fs::write(&paths.paths.stdout, "recovered held output\n").unwrap();
+        let conn = db.lock().unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &conn,
+            &state
+                .metadata
+                .to_bash_task_row("runner", &paths.paths)
+                .unwrap(),
+        )
+        .unwrap();
+        let scope = ledger::ScopeIdentity {
+            owner: "reserved:prefrontal-core".into(),
+            scope_ref: id.into(),
+            scope_epoch: 1,
+        };
+        ledger::admit(
+            &conn,
+            &key,
+            "held-command",
+            Some(&scope),
+            ledger::State::DispatchStarted,
+        )
+        .unwrap();
+        ledger::link_task(&conn, &key, id).unwrap();
+        ledger::hold_running(
+            &conn,
+            &key,
+            id,
+            br#"{"content":[],"held":{"reason":"running"}}"#,
+            false,
+        )
+        .unwrap();
+        drop(conn);
+        drop(state);
+        Self { task, db, key }
+    }
+
+    fn result(&self) -> serde_json::Value {
+        let conn = self.db.lock().unwrap();
+        let row = crate::db::call_ledger::get(&conn, &self.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, crate::db::call_ledger::State::Settled);
+        let page: serde_json::Value = serde_json::from_slice(
+            &crate::db::call_ledger::late_results(
+                &conn,
+                &self.key.carrier,
+                "held-notice-test",
+                None,
+                None,
+                crate::db::call_ledger::now_ms(),
+                1_000_000,
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["call_key"], self.key.call_key);
+        entries[0].clone()
+    }
+
+    fn offer(&self, scheduler: &Scheduler) {
+        self.task
+            .offer(scheduler, Arc::new(AtomicU64::new(self.task.finished)));
+    }
+}
+
+#[test]
+fn runner_notices_recovered_held_call_after_route_reopens_delivers_only_call_result() {
+    let held = HeldCompletion::new("bash-00000000000b0101");
+    let capture = test_endpoint::capture(&held.task.task, false);
+    let scheduler = Scheduler::default();
+    // Retain an already-queued completion across the runner's route restart.
+    held.offer(&scheduler);
+    route_unbound(&held.task.route);
+    let mut reopened = super::super::test_support::route_identity_with_harness(
+        &held.task.route.root,
+        &held.task.task,
+        BindTrust::FirstParty,
+        "opencode2",
+    );
+    Arc::get_mut(&mut reopened.0).unwrap().spawn_principal =
+        held.task.route.spawn_principal.clone();
+    route_bound(held.task.registry.clone(), &reopened);
+    held.task.registry.settle_detached_call(&held.task.task);
+    assert!(held.result()["result"]["content"]
+        .to_string()
+        .contains("recovered held output"));
+    assert!(matches!(
+        step(&scheduler, std::time::Instant::now()),
+        Next::Done
+    ));
+    wait_for(super::scheduler().unwrap(), &held.task.task, true);
+    assert!(
+        capture.receiver.try_recv().is_err(),
+        "the real result already reached the held call"
+    );
+}
+
+#[test]
+fn runner_notices_recovered_held_call_withdrawn_before_completion_keeps_notice() {
+    let held = HeldCompletion::new("bash-00000000000b0102");
+    let capture = test_endpoint::capture(&held.task.task, false);
+    let scheduler = Scheduler::default();
+    held.offer(&scheduler);
+    {
+        let conn = held.db.lock().unwrap();
+        let row = crate::db::call_ledger::get(&conn, &held.key)
+            .unwrap()
+            .unwrap();
+        let withdrawal = crate::db::call_ledger::withdraw(
+            &conn,
+            &held.key,
+            row.scope.as_ref(),
+            crate::db::call_ledger::now_ms(),
+            1_000_000,
+        )
+        .unwrap();
+        assert!(matches!(
+            withdrawal,
+            crate::db::call_ledger::Withdrawal::Answer {
+                kill_task: Some(_),
+                ..
+            }
+        ));
+    }
+    held.task.registry.settle_detached_call(&held.task.task);
+    assert!(matches!(
+        step(&scheduler, std::time::Instant::now()),
+        Next::Done
+    ));
+    assert_eq!(
+        capture.receiver.try_iter().count(),
+        1,
+        "withdrawn calls need their completion notice"
+    );
+}
+
+#[test]
+fn runner_notices_recovered_held_call_cancelled_before_completion_keeps_notice() {
+    let held = HeldCompletion::new("bash-00000000000b0106");
+    let capture = test_endpoint::capture(&held.task.task, false);
+    let scheduler = Scheduler::default();
+    held.offer(&scheduler);
+    let cancelled = crate::db::call_ledger::RecordedFrame {
+        ty: FrameType::Error,
+        body: br#"{"code":"cancelled","message":"call cancelled by runner"}"#.to_vec(),
+    };
+    crate::db::call_ledger::settle(
+        &held.db.lock().unwrap(),
+        &held.key,
+        &cancelled,
+        "cancelled",
+        None,
+        crate::db::call_ledger::now_ms(),
+    )
+    .unwrap();
+    held.task.registry.settle_detached_call(&held.task.task);
+    assert!(matches!(
+        step(&scheduler, std::time::Instant::now()),
+        Next::Done
+    ));
+    assert_eq!(capture.receiver.try_iter().count(), 1);
+}
+
+#[test]
+fn runner_notices_recovered_plain_background_task_keeps_notice() {
+    let held = HeldCompletion::new("bash-00000000000b0103");
+    let capture = test_endpoint::capture(&held.task.task, false);
+    {
+        let conn = held.db.lock().unwrap();
+        // A background launch has already settled its call with task guidance,
+        // not a command result or a retained foreground hold.
+        let frame = crate::db::call_ledger::RecordedFrame {
+            ty: FrameType::Response,
+            body: br#"{"content":[{"type":"text","text":"Background task started"}]}"#.to_vec(),
+        };
+        crate::db::call_ledger::settle(
+            &conn,
+            &held.key,
+            &frame,
+            "ok",
+            None,
+            crate::db::call_ledger::now_ms(),
+        )
+        .unwrap();
+    }
+    let scheduler = Scheduler::default();
+    held.offer(&scheduler);
+    held.task.registry.settle_detached_call(&held.task.task);
+    assert!(matches!(
+        step(&scheduler, std::time::Instant::now()),
+        Next::Done
+    ));
+    assert_eq!(capture.receiver.try_iter().count(), 1);
+}
+
+#[test]
+fn runner_notices_recovered_held_settlement_races_send_with_one_delivery() {
+    let held = HeldCompletion::new("bash-00000000000b0104");
+    let capture = test_endpoint::capture(&held.task.task, false);
+    let scheduler = Scheduler::default();
+    held.offer(&scheduler);
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        let registry = held.task.registry.clone();
+        let task = held.task.task.clone();
+        let start = &start;
+        threads.spawn(move || {
+            start.wait();
+            registry.settle_detached_call(&task);
+        });
+        start.wait();
+        assert!(matches!(
+            step(&scheduler, std::time::Instant::now()),
+            Next::Done
+        ));
+    });
+    assert!(held.result()["result"]["content"]
+        .to_string()
+        .contains("recovered held output"));
+    assert_eq!(capture.receiver.try_iter().count(), 0);
+}
+
+#[test]
+fn runner_notices_recovered_held_failed_settlement_releases_deferred_notice() {
+    let held = HeldCompletion::new("bash-00000000000b0105");
+    let capture = test_endpoint::capture(&held.task.task, false);
+    let scheduler = Scheduler::default();
+    held.offer(&scheduler);
+    let conn = held.db.lock().unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_held_settlement BEFORE UPDATE OF state ON call_ledger WHEN NEW.state='Settled' BEGIN SELECT RAISE(ABORT, 'injected settlement failure'); END;").unwrap();
+    std::thread::scope(|threads| {
+        let sending = threads.spawn(|| step(&scheduler, std::time::Instant::now()));
+        assert!(
+            capture
+                .receiver
+                .recv_timeout(Duration::from_millis(30))
+                .is_err(),
+            "notice waits for the settlement decision"
+        );
+        drop(conn);
+        assert!(matches!(sending.join().unwrap(), Next::Done));
+    });
+    assert_eq!(
+        capture.receiver.try_iter().count(),
+        1,
+        "failed recovery must not swallow the only result delivery"
+    );
+    {
+        let conn = held.db.lock().unwrap();
+        let row = crate::db::call_ledger::get(&conn, &held.key)
+            .unwrap()
+            .unwrap();
+        let retained: serde_json::Value = serde_json::from_slice(&row.frame.unwrap().body).unwrap();
+        assert_eq!(
+            retained["_aft_recovery_notice"], true,
+            "startup must retain the fallback lane"
+        );
+        conn.execute_batch("DROP TRIGGER fail_held_settlement")
+            .unwrap();
+    }
+    wait_for_id(
+        super::scheduler().unwrap(),
+        &format!("aft:bash-recovery:{}", held.task.task),
+        true,
+    );
+    let result = held.result();
+    assert_eq!(result["result"]["errorCode"], "outcome_unknown");
+    assert_eq!(result["result"]["content"][0]["text"], "");
+    assert!(
+        capture.receiver.try_recv().is_err(),
+        "ending the hold must not send a second notice"
+    );
+}
+
+#[test]
+fn runner_notices_recovered_notice_fallback_survives_restart_observation() {
+    let held = HeldCompletion::new("bash-00000000000b0107");
+    {
+        let conn = held.db.lock().unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_fallback_end BEFORE UPDATE OF state ON call_ledger WHEN NEW.state='Settled' BEGIN SELECT RAISE(ABORT, 'injected fallback failure'); END;").unwrap();
+        assert!(crate::db::call_ledger::settle_task_notice_fallback(
+            &conn,
+            &held.key,
+            &held.task.task
+        )
+        .is_err());
+        conn.execute_batch("DROP TRIGGER fail_fallback_end")
+            .unwrap();
+    }
+    let reopened = crate::db::open(&held.task.storage.path().join("aft.db")).unwrap();
+    let real = crate::db::call_ledger::RecordedFrame {
+        ty: FrameType::Response,
+        body: br#"{"content":[{"type":"text","text":"real output must stay in the notice"}]}"#
+            .to_vec(),
+    };
+    crate::db::call_ledger::observe_task(
+        &reopened,
+        &held.key.carrier,
+        &held.key.call_key,
+        &held.task.task,
+        Some(&real),
+        "ok",
+    )
+    .unwrap();
+    assert_eq!(held.result()["result"]["errorCode"], "outcome_unknown");
 }
 
 #[test]

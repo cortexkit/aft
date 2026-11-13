@@ -163,7 +163,7 @@ try {
   writeFileSync(join(root, "requests.json"), JSON.stringify(requests, null, 2));
   assert.equal(code, 0, stderr);
   assert.equal(requests.length, 4);
-  assert.ok(JSON.stringify(requests[0].messages).includes("## IMPORTANT NOTICE about your tools"));
+  assert.ok(JSON.stringify(requests[0].messages).includes("# Agent Foundational Toolkit"));
   const names = requests[0].tools.map((entry: any) => entry.function.name);
   for (const name of ["shell", "bash", "patch", "apply_patch"])
     assert.ok(names.includes(name), `${name} not offered`);

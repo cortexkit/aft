@@ -1775,6 +1775,12 @@ impl Drop for ForegroundWaitGuard {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveredDelivery {
+    CallResult,
+    Notice,
+}
+
 /// Sequencing for a task's aft.db mirror.
 ///
 /// The JSON metadata is written while `BgTask::state` is held, so the file
@@ -1798,6 +1804,10 @@ impl Drop for ForegroundWaitGuard {
 /// actor receiving the ack) still finds it.
 #[derive(Default)]
 pub(crate) struct DbWriteOrder {
+    /// Serializes recovered call settlement with the final runner notice send.
+    /// A failed settlement chooses the notice lane instead of losing the result.
+    recovered_delivery: Mutex<Option<RecoveredDelivery>>,
+    recovered_reply_delivered: AtomicBool,
     captured: AtomicU64,
     /// The newest captured row not yet written.
     pending: Mutex<Option<PendingDbWrite>>,
@@ -3946,6 +3956,24 @@ impl BgTaskRegistry {
         let Some(pool) = self.inner.db_pool.read().ok().and_then(|pool| pool.clone()) else {
             return;
         };
+        let order = DbWriteOrder::for_task(&metadata.session_id, &metadata.task_id);
+        let mut delivery = order
+            .recovered_delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if delivery.is_some() {
+            if *delivery == Some(RecoveredDelivery::Notice) {
+                crate::subc::retry_held_notice_fallback(
+                    self.clone(),
+                    metadata.task_id.clone(),
+                    crate::db::call_ledger::Key {
+                        carrier: key.requester.clone(),
+                        call_key: key.key.clone(),
+                    },
+                );
+            }
+            return;
+        }
         let recovered = pool
             .lock()
             .ok()
@@ -3964,6 +3992,9 @@ impl BgTaskRegistry {
         if !recovered {
             return;
         }
+        // Every attempted recovery releases a waiting notice, including render
+        // and database failures. Only a committed held result suppresses it.
+        *delivery = Some(RecoveredDelivery::Notice);
         // Output rendering may read artifacts and take registry locks. Keep it
         // outside the database mutex and never take a task-state lock here.
         crate::slog_info!("recovered bash reply phase=render_started task={} status={:?} mode={:?} captured_bytes={:?} stdout={} stderr={}",
@@ -3990,6 +4021,7 @@ impl BgTaskRegistry {
             carrier: key.requester.clone(),
             call_key: key.key.clone(),
         };
+        let mut fallback_error = Some("recovered result projection unavailable".to_string());
         if let Some((frame, outcome, tool_result_body)) = crate::subc::recovered_bash_frame(
             snapshot,
             &ledger_key,
@@ -4009,7 +4041,7 @@ impl BgTaskRegistry {
                 frame.body.len()
             );
             if let Ok(conn) = pool.lock() {
-                if let Err(error) = crate::db::call_ledger::observe_task_with_tool_result_source(
+                match crate::db::call_ledger::observe_task_with_tool_result_source(
                     &conn,
                     &key.requester,
                     &key.key,
@@ -4019,9 +4051,67 @@ impl BgTaskRegistry {
                     tool_result_body.as_deref(),
                     unknown_result.as_ref(),
                 ) {
-                    crate::slog_warn!("call ledger recovered settlement failed: {error}");
+                    Ok(observation) if observation.delivered_held_result => {
+                        fallback_error = None;
+                        *delivery = Some(RecoveredDelivery::CallResult);
+                        order
+                            .recovered_reply_delivered
+                            .store(true, Ordering::Release);
+                    }
+                    Ok(observation) if observation.settled_notice_fallback => {
+                        fallback_error = None;
+                        crate::slog_info!(
+                            "recovered bash notice fallback settled task={} call_key={}",
+                            metadata.task_id,
+                            key.key
+                        );
+                    }
+                    Ok(_) => {
+                        fallback_error = None;
+                    }
+                    Err(error) => {
+                        fallback_error = Some(error.to_string());
+                    }
                 }
             }
+        }
+        if let Some(error) = fallback_error {
+            crate::slog_warn!("recovered bash notice fallback chosen task={} call_key={} settlement_error={error}", metadata.task_id, key.key);
+            if !self.retry_held_notice_fallback(&metadata.task_id, &ledger_key) {
+                crate::subc::retry_held_notice_fallback(
+                    self.clone(),
+                    metadata.task_id.clone(),
+                    ledger_key,
+                );
+            }
+        }
+    }
+
+    /// Finish only the unknown-outcome hold after the real result chose the
+    /// notice lane. The notice scheduler retries failures without delaying send.
+    pub(crate) fn retry_held_notice_fallback(
+        &self,
+        task: &str,
+        key: &crate::db::call_ledger::Key,
+    ) -> bool {
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(pool) = self.inner.db_pool.read().ok().and_then(|pool| pool.clone()) else {
+            return false;
+        };
+        let Ok(conn) = pool.lock() else { return false };
+        match crate::db::call_ledger::settle_task_notice_fallback(&conn, key, task) {
+            Ok(settled) => {
+                if settled {
+                    crate::slog_info!(
+                        "recovered bash notice fallback settled task={task} call_key={}",
+                        key.call_key
+                    );
+                }
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -9103,8 +9193,35 @@ impl BgTaskRegistry {
 
     pub(crate) fn notice_metadata(&self, task_id: &str) -> Option<PersistedTask> {
         let task = self.task(task_id)?;
-        let state = task.lock_state().ok()?;
-        Some(state.metadata.clone())
+        let mut metadata = task.lock_state().ok()?.metadata.clone();
+        metadata.completion_delivered |= task
+            .db_write_order
+            .recovered_reply_delivered
+            .load(Ordering::Acquire);
+        Some(metadata)
+    }
+
+    /// Resolve a terminal hold even when no persistence callback reaches it,
+    /// then keep the delivery decision fenced through the actual notice send.
+    pub(crate) fn send_runner_completion<T>(
+        &self,
+        task_id: &str,
+        send: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.settle_detached_call(task_id);
+        let task = self.task(task_id)?;
+        let mut delivery = task
+            .db_write_order
+            .recovered_delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *delivery == Some(RecoveredDelivery::CallResult)
+            || task.drain_reply.snapshot().completion_delivered
+        {
+            return None;
+        }
+        *delivery = Some(RecoveredDelivery::Notice);
+        Some(send())
     }
 
     fn task_watch_state(&self, task_id: &str) -> (bool, bool) {
@@ -10676,7 +10793,12 @@ impl BgTaskRegistry {
                     self.forget_task_read_record(&resolved.paths.dir);
                     #[cfg(test)]
                     let before_teardown = super::persistence::work_counts::get();
-                    let removal = delete_task_bundle(&resolved.paths);
+                    // Validated directory handles already hold the bundle open.
+                    // Resolving it again would
+                    // also search every sibling for an interrupted deletion's
+                    // tombstone; a tombstoned bundle has no resolvable task path.
+                    // Deletion still checks the current directory's identity.
+                    let removal = super::persistence::delete_resolved_task(&resolved);
                     #[cfg(test)]
                     super::persistence::work_counts::record_gc_teardown_since(before_teardown);
                     match removal {
@@ -11541,6 +11663,7 @@ impl BgTaskRegistry {
             let paths = task.paths.clone();
             if self.finished_delete_attempt_count(&task_id) >= FINISHED_DELETE_MAX_ATTEMPTS {
                 self.retire_watchdog_task(&task_id);
+                self.remove_cleanup_task(&task);
                 continue;
             }
             let delete_result = if handles_released {
@@ -11614,10 +11737,13 @@ impl BgTaskRegistry {
                                 .push_back(task_id);
                         }
                         Err(lock_error) => {
+                            let lock_message = lock_error.to_string();
+                            drop(lock_error);
                             self.retire_watchdog_task(&task_id);
+                            self.remove_cleanup_task(&task);
                             self.note_finished_delete_abandoned(&task_id);
                             crate::slog_warn!(
-                                "giving up deleting background task bundle {task_id}; leftover path {} could not be retained for retry because the registry lock failed: {error}; {lock_error}. Persisted-task GC can reclaim it on a later replay after its grace period",
+                                "giving up deleting background task bundle {task_id}; leftover path {} could not be retained for retry because the registry lock failed: {error}; {lock_message}. Persisted-task GC can reclaim it on a later replay after its grace period",
                                 paths.dir.display()
                             );
                         }
@@ -11626,7 +11752,6 @@ impl BgTaskRegistry {
             }
         }
         image_cleanup.report();
-        self.prune_session_harnesses();
     }
 
     fn remove_cleanup_task(&self, task: &BgTask) {
@@ -15186,6 +15311,11 @@ impl BgTaskRegistry {
         // can fence any late snapshot instead of restoring a notification.
         let ack_state = owner.as_ref().and_then(|task| task.lock_state().ok());
         if metadata.completion_delivered
+            || owner.as_ref().is_some_and(|task| {
+                task.db_write_order
+                    .recovered_reply_delivered
+                    .load(Ordering::Acquire)
+            })
             || ack_state
                 .as_ref()
                 .is_some_and(|state| state.metadata.completion_delivered)

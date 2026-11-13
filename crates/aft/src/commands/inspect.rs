@@ -4327,7 +4327,7 @@ fn excluded_test_clause(section: &Value) -> String {
 }
 
 /// `2940` as `2,940`.
-fn thousands(value: u64) -> String {
+pub(crate) fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
@@ -8198,7 +8198,6 @@ mod deferred_terminal_tests {
                 "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
                 "config": {
                     "indexes": {"trigram": false, "semantic": false, "callgraph": true},
-                    "views": {"enabled": false},
                 },
             }),
         };

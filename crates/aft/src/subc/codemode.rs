@@ -356,12 +356,12 @@ fn resolve_owner(
             if candidates.is_empty() {
                 return Err(refuse(
                     "worker_route_not_bound",
-                    "no live route of the worker run's parent scope is bound to AFT",
+                    "no live runner route of the worker scope is bound to AFT yet",
                 ));
             }
             // A worker run under a head (or any non-worker) scope would run
             // with that scope's authority, which a worker run never carries.
-            let workers: Vec<_> = candidates
+            let mut workers: Vec<_> = candidates
                 .into_iter()
                 .filter(of_kind(ScopeKind::Worker))
                 .collect();
@@ -369,6 +369,23 @@ fn resolve_owner(
                 return Err(refuse(
                     "parent_not_worker",
                     "the worker run's parent scope is not a worker's scope",
+                ));
+            }
+            // The scope owner's routes keep the worker scope leased; only runner
+            // routes carry the worker's saved tool settings, keyed by runner principal.
+            // Exclude owner-principal routes regardless of tool-call history.
+            let scope_owner = super::principal_id(&Some(parent.owner.clone()));
+            workers.retain(|(_, identity)| {
+                !matches!(
+                    &identity.spawn_principal,
+                    AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
+                        if Some(id.as_str()) == scope_owner.as_deref()
+                )
+            });
+            if workers.is_empty() {
+                return Err(refuse(
+                    "worker_route_not_bound",
+                    "no live runner route of the worker scope is bound to AFT yet",
                 ));
             }
             workers
@@ -648,8 +665,10 @@ fn principal_access_class(principal: &AuthenticatedPrincipal) -> PrincipalAccess
 }
 
 /// Compare the production sandbox and flow-read rules, not the principal ID.
+/// Runner aliases compare equal when notification bind-back resolves them to
+/// the same host; unresolved hosts keep their raw harness labels.
 /// Route channels and epochs identify individual binds, not access settings;
-/// the selected head still supplies its complete, unchanged principal.
+/// this comparison does not change either principal.
 fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal) -> bool {
     match (a, b) {
         (
@@ -658,7 +677,7 @@ fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal)
                 project_root: a_root,
                 harness: a_harness,
                 session_id: a_session,
-                principal_id: _,
+                principal_id: a_principal,
                 route_channel: _,
                 route_epoch: _,
             },
@@ -667,14 +686,25 @@ fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal)
                 project_root: b_root,
                 harness: b_harness,
                 session_id: b_session,
-                principal_id: _,
+                principal_id: b_principal,
                 route_channel: _,
                 route_epoch: _,
             },
         ) => {
+            let a_concrete = super::runner_notices::concrete_runner_harness(
+                a_principal.as_deref(),
+                a_session,
+                a_harness,
+            );
+            let b_concrete = super::runner_notices::concrete_runner_harness(
+                b_principal.as_deref(),
+                b_session,
+                b_harness,
+            );
             a_trust == b_trust
                 && a_root == b_root
-                && a_harness == b_harness
+                && a_concrete.as_deref().unwrap_or(a_harness)
+                    == b_concrete.as_deref().unwrap_or(b_harness)
                 && a_session == b_session
                 && principal_access_class(a) == principal_access_class(b)
         }

@@ -229,6 +229,7 @@ mod drain;
 mod flow_read;
 mod health;
 pub(crate) mod held_task_recovery;
+pub(crate) use runner_notices::retry_held_notice_fallback;
 #[cfg(test)]
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
@@ -13576,7 +13577,11 @@ pub(crate) mod test_support {
     /// Default configure can start index builds that these tests do not exercise.
     pub(super) fn bind_config_without_indexes(root: &std::path::Path) -> std::path::PathBuf {
         let path = root.join("protocol-user-config.json");
-        std::fs::write(&path, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false}}"#,
+        )
+        .unwrap();
         path
     }
     use super::*;
@@ -18108,7 +18113,7 @@ mod tests {
             params: json!({
                 "project_root": dir.path(), "storage_dir": storage.path(), "harness": "runner",
                 "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
-                    "views": {"enabled": true},
+
                     "indexes": {"trigram": false, "semantic": false, "callgraph": false}
                 }).to_string()}],
             }),
@@ -21004,7 +21009,7 @@ mod tests {
                 "source": "/u/aft.jsonc",
                 "doc": json!({
                     "indexes": { "trigram": true, "semantic": false, "callgraph": true },
-                    "views": { "enabled": false },
+
                 }).to_string(),
             }],
         }))
@@ -21234,7 +21239,7 @@ mod tests {
                 "source": "/u/aft.jsonc",
                 "doc": json!({
                     "indexes": { "trigram": true, "semantic": false, "callgraph": false },
-                    "views": { "enabled": false },
+
                     "index": { "roots": [{ "path": standing_root, "indexes": ["search"] }] },
                 }).to_string(),
             }],
@@ -21343,7 +21348,7 @@ mod tests {
                 "source": "/u/aft.jsonc",
                 "doc": json!({
                     "indexes": { "trigram": true, "semantic": false, "callgraph": false },
-                    "views": { "enabled": false },
+
                     "index": { "roots": [{ "path": standing_root, "indexes": ["search"] }] },
                 }).to_string(),
             }],

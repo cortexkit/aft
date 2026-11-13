@@ -2,7 +2,7 @@
 name = "aft-store"
 version = "0.64.0"
 edition = "2024"
-description = "On-disk index formats for Agent File Tools"
+description = "On-disk index formats for Agent Foundational Toolkit"
 license = "MIT"
 rust-version.workspace = true
 

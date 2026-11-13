@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Acquire paired views baselines; never infer a G1–G6 pass from partial coverage.
+"""Acquire checkout-state baselines; do not treat partial coverage as a pass.
 
 Build: cargo build -p agent-file-tools --release --bin aft --example views_perf_daemon
 Test:  python3 scripts/test_views_performance_gate.py
@@ -56,11 +56,11 @@ def require_counters(counters):
     return counters
 
 
-def require_base_ref_prototype(counters, *, views=True, semantic=True):
+def require_base_ref_prototype(counters, *, semantic=True):
     # Each arm starts a fresh daemon; the opt-in selects the base-ref prototype
-    # only when both views and semantic search are enabled.
+    # only when semantic search is enabled.
     expected = (os.environ.get("AFT_VIEWS_BASE_REF_PROTOTYPE") == "1"
-                and views and semantic)
+                and semantic)
     active = counters.get("base_ref_prototype") is True
     if expected and not active:
         raise MeasurementError("prototype-on acquisition did not report metrics.views_work.base_ref_prototype: true")
@@ -316,9 +316,8 @@ class Broker:
         self.stderr.close()
 
 
-def configuration(views, semantic, model):
+def configuration(semantic, model):
     config = {
-        "views": {"enabled": views},
         "indexes": {"trigram": True, "semantic": semantic, "callgraph": True},
         "disabled_tools": [],
         "inspect": {"enabled": True},
@@ -595,16 +594,16 @@ def distributions(rows):
                    "max_s": max(row["wall_s"] for row in samples)} for tool in tools}
 
 
-def run_arm(args, corpus, count, views, out):
+def run_arm(args, corpus, count, out):
     out.mkdir(parents=True, exist_ok=False)
-    config = configuration(views, args.semantic, args.model)
+    config = configuration(args.semantic, args.model)
     subject = args.subjects / out.name
     subject.mkdir(parents=True, exist_ok=False)
     broker = None
     acquisition = None
     # Built before provisioning so a failed clone or checkout still leaves a
     # result.json, and the caller's matrix keeps the arms that did finish.
-    result = {"schema": 1, "corpus": args.corpus, "roots": count, "views": views,
+    result = {"schema": 1, "corpus": args.corpus, "roots": count,
               "profile": "witness-gated-structural-acquisition-v2", "config": config,
               "plane_clock": "public_response_completion",
               "inventory": None, "status": "failed", "gates_certified": [],
@@ -656,7 +655,7 @@ def run_arm(args, corpus, count, views, out):
         acquisition.idle(max(2, args.quiet_minutes * 60), "quiet")
         final = acquisition.sample("final")
         require_base_ref_prototype(final["health"]["metrics"]["views_work"],
-                                   views=views, semantic=args.semantic)
+                                   semantic=args.semantic)
         result["final"] = final
         result["storage"] = storage_sample(subject / "storage")
         result["counter_delta"] = counter_delta(initial["health"]["metrics"]["views_work"], final["health"]["metrics"]["views_work"])
@@ -769,7 +768,6 @@ def main():
     parser.add_argument("--output", required=True, type=Path, help="new evidence directory, outside target/dist/cache")
     parser.add_argument("--subjects", type=Path, help="optional NEW scratch directory retaining clones/stores; default uses job temp space")
     parser.add_argument("--roots", nargs="+", type=int, choices=[1, 5, 15], default=[1, 5, 15])
-    parser.add_argument("--views", nargs="+", choices=["off", "on"], default=["off", "on"])
     parser.add_argument("--warmup-minutes", type=float, default=5)
     parser.add_argument("--activity-minutes", type=float, default=30)
     parser.add_argument("--quiet-minutes", type=float, default=20)
@@ -825,11 +823,9 @@ def main():
                    "argv": sys.argv}
     dump(args.output / "environment.json", environment)
     results = []
-    for index, count in enumerate(args.roots):
-        arms = args.views if index % 2 == 0 else list(reversed(args.views))
-        for arm in arms:
-            results.append(run_arm(args, corpus, count, arm == "on", args.output / f"n{count}-views-{arm}"))
-    dump(args.output / "matrix.json", [{"roots": row["roots"], "views": row["views"], "status": row["status"], "failure": row.get("failure")} for row in results])
+    for count in args.roots:
+        results.append(run_arm(args, corpus, count, args.output / f"n{count}"))
+    dump(args.output / "matrix.json", [{"roots": row["roots"], "status": row["status"], "failure": row.get("failure")} for row in results])
     return 0 if results and all(row["status"] == "measured" for row in results) else 1
 
 

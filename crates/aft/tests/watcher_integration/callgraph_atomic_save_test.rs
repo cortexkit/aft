@@ -74,7 +74,7 @@ fn atomic_save(file: &Path, content: &str) {
     std::fs::rename(&temp, file).unwrap();
 }
 
-fn configure(aft: &mut AftProcess, root: &Path, storage: &Path, views: bool) {
+fn configure(aft: &mut AftProcess, root: &Path, storage: &Path) {
     let response = aft.send(
         &json!({
             "id": "configure-atomic-save",
@@ -84,8 +84,6 @@ fn configure(aft: &mut AftProcess, root: &Path, storage: &Path, views: bool) {
             "storage_dir": storage,
             "config": crate::helpers::user_config(json!({
                 "indexes": { "trigram": true, "semantic": false, "callgraph": true },
-                "views": { "enabled": views },
-                "worktree": { "ram_overlay": false },
             })),
         })
         .to_string(),
@@ -312,14 +310,14 @@ fn assert_atomic_save_reaches_callgraph(aft: &mut AftProcess, file: &Path) {
 }
 
 #[test]
-fn atomic_save_reaches_callgraph_on_a_plain_checkout_with_views_off() {
+fn atomic_save_reaches_callgraph_on_a_plain_checkout() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("project");
     init_repo(&root);
     let mut aft = AftProcess::spawn_with_real_watcher();
-    configure(&mut aft, &root, &base.join("storage"), false);
+    configure(&mut aft, &root, &base.join("storage"));
     assert_atomic_save_reaches_callgraph(&mut aft, &root.join("src/probe.ts"));
     assert!(aft.shutdown().success());
 }
@@ -343,7 +341,7 @@ fn an_answer_given_before_the_watcher_took_the_save_is_not_judged_by_later_evide
         "AFT_TEST_WATCHER_INTAKE_GATE_FILE",
         gate.as_os_str(),
     )]);
-    configure(&mut aft, &root, &base.join("storage"), false);
+    configure(&mut aft, &root, &base.join("storage"));
     let file = root.join("src/probe.ts");
     prepare_for_save(&mut aft, &file);
 
@@ -400,7 +398,7 @@ fn an_answer_given_before_the_watcher_took_the_save_is_not_judged_by_later_evide
 }
 
 #[test]
-fn atomic_save_reaches_callgraph_on_a_linked_worktree_with_views_on() {
+fn atomic_save_reaches_callgraph_on_a_linked_worktree() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     let temp = tempfile::tempdir().unwrap();
     let base = canonical_git_path(temp.path());
@@ -418,9 +416,9 @@ fn atomic_save_reaches_callgraph_on_a_linked_worktree_with_views_on() {
         ],
     );
     let mut aft = AftProcess::spawn_with_real_watcher();
-    configure(&mut aft, &checkout, &base.join("storage"), true);
-    // With views on, every call-graph answer comes from a bind of the
-    // checkout's v3 view that verifies the files against the disk, so there is
+    configure(&mut aft, &checkout, &base.join("storage"));
+    // Each call-graph answer uses the checkout's v3 view, which verifies files
+    // against the disk, so there is
     // no refresh window to observe. A stale answer, should one be served, must
     // still say it is incomplete.
     assert_atomic_save_reaches_callgraph(&mut aft, &checkout.join("src/probe.ts"));

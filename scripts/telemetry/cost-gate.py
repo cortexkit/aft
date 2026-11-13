@@ -26,9 +26,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 SCHEMA_VERSION = 1
-MEASUREMENT_PROFILE = "cold-index-no-inspect-v1"
+MEASUREMENT_PROFILE = "index-store-no-inspect-post-edit-refresh-v5"
 SYNTHETIC_FILE_COUNT = 24_000
 SYNTHETIC_VERSION = "synthetic-v2"
 REPO_ORDER = ("redox", "typescript-eslint", "jupyterlab", "hugo", "synthetic-24k")
@@ -59,20 +60,26 @@ FIXED_REPOSITORIES = {
 # minimum allowed budget; using max(relative_limit, floor) prevents tiny
 # measurements from paging on one scheduler tick of noise.
 DEFAULT_METRICS: dict[str, tuple[float, float]] = {
-    "search_build_ready_ms": (25.0, 3_000.0),
-    "callgraph_build_ready_ms": (25.0, 3_000.0),
-    # The resolution stage's own duration, not its share of the build. A share
-    # rises when resolution slows down and equally when the stages around it
-    # speed up, so a gate on it pages on an extraction speed-up as if it were a
-    # resolution regression. The floor is lower than the other timings because
-    # this interval is measured inside the process and carries no startup or
-    # first-poll cost; it only has to keep a stage of a few milliseconds (the
-    # synthetic tree) from paging on one tick.
-    "callgraph_resolution_ms": (20.0, 500.0),
+    "index_store_build_ready_ms": (25.0, 3_000.0),
+    "callgraph_store_build_ready_ms": (25.0, 3_000.0),
+    "search_first_query_latency_ms": (25.0, 3_000.0),
+    "callgraph_first_query_latency_ms": (25.0, 3_000.0),
+    # Refresh replaces the retired store's resolution budget without widening
+    # its tolerance or floor. It measures an edit through an exact graph read.
+    "callgraph_refresh_ms": (20.0, 500.0),
     "peak_rss_mb": (20.0, 128.0),
     "cpu_seconds": (25.0, 1.0),
-    "search_first_query_ms": (25.0, 3_000.0),
-    "callgraph_first_query_ms": (25.0, 3_000.0),
+}
+METRIC_PREDECESSORS = {
+    "index_store_build_ready_ms": "search_build_ready_ms",
+    "callgraph_store_build_ready_ms": "callgraph_build_ready_ms",
+    "search_first_query_latency_ms": "search_first_query_ms",
+    "callgraph_first_query_latency_ms": "callgraph_first_query_ms",
+    "callgraph_refresh_ms": "callgraph_resolution_ms",
+}
+RETIRED_METRICS = {
+    "search_build_ready_ms", "callgraph_build_ready_ms", "callgraph_resolution_ms", "callgraph_resolution_share_pct",
+    "search_first_query_ms", "callgraph_first_query_ms",
 }
 WAITING_DEFAULT = (25.0, 1.0)
 # Peak RSS, CPU time and wall time are all properties of the machine that runs
@@ -294,6 +301,11 @@ def parse_index_events(log_paths: str) -> dict[str, float]:
 
 def row_metrics(row: dict[str, str]) -> dict[str, float]:
     fields = {
+        "index_store_build_ready_ms": "index_store_build_ready_ms",
+        "callgraph_store_build_ready_ms": "callgraph_store_build_ready_ms",
+        "search_first_query_latency_ms": "search_first_query_latency_ms",
+        "callgraph_first_query_latency_ms": "callgraph_first_query_latency_ms",
+        "callgraph_refresh_ms": "callgraph_refresh_ms",
         "search_build_ready_ms": "search_wall_ms",
         "callgraph_build_ready_ms": "callgraph_wall_ms",
         "callgraph_resolution_ms": "callgraph_resolution_ms",
@@ -304,7 +316,8 @@ def row_metrics(row: dict[str, str]) -> dict[str, float]:
     }
     metrics: dict[str, float] = {}
     for metric, field in fields.items():
-        parsed = compact_p50(row.get(field)) if field.endswith("_ms") else scalar(row.get(field))
+        raw = row.get(metric) if metric == "callgraph_build_ready_ms" and metric in row else row.get(field)
+        parsed = compact_p50(raw) if raw and "/" in raw and field.endswith("_ms") else scalar(raw)
         if parsed is not None:
             metrics[metric] = parsed
     if "callgraph_resolution_ms" not in metrics and "callgraph_resolution_ms" not in row:
@@ -634,7 +647,7 @@ def best_run(runs: list[RunData]) -> RunData:
     ready = [run for run in runs if run.ready]
     if not ready:
         return runs[0]
-    return min(ready, key=lambda run: sum(run.metrics.get(metric, 0.0) for metric in ("search_build_ready_ms", "callgraph_build_ready_ms")))
+    return min(ready, key=lambda run: sum(run.metrics.get(metric, 0.0) for metric in ("index_store_build_ready_ms", "callgraph_store_build_ready_ms")))
 
 
 def metric_object(raw: Any, metric: str, value: float) -> dict[str, float]:
@@ -655,12 +668,13 @@ def metric_object(raw: Any, metric: str, value: float) -> dict[str, float]:
 def repo_metrics_from_runs(name: str, config: dict[str, Any], runs: list[RunData]) -> dict[str, Any]:
     """The two-run minimum per metric, in the shape the baseline stores."""
     ready = [run for run in runs if run.ready]
-    if not ready:
-        raise RuntimeError(f"cannot write baseline: {name} was not ready in either run")
+    if len(runs) != 2 or len(ready) != 2:
+        raise RuntimeError(f"cannot write baseline: {name} needs two ready runs")
     old_metrics = config.get("metrics", {}) if isinstance(config.get("metrics", {}), dict) else {}
     all_metrics = set(old_metrics)
     for run in ready:
         all_metrics.update(run.metrics)
+    all_metrics.difference_update(RETIRED_METRICS)
     # Every fixed repo must carry every core metric, even if a future runner
     # emitted a gap.  Baseline generation fails rather than blessing n/a.
     for metric in DEFAULT_METRICS:
@@ -672,7 +686,16 @@ def repo_metrics_from_runs(name: str, config: dict[str, Any], runs: list[RunData
         values = [value for value in (run.metrics.get(metric) for run in ready) if value is not None]
         if not values:
             continue
-        metrics[metric] = metric_object(old_metrics.get(metric), metric, min(values))
+        previous = old_metrics.get(metric, old_metrics.get(METRIC_PREDECESSORS.get(metric)))
+        written = metric_object(previous, metric, min(values))
+        low, tolerance, floor = baseline_metric(written, metric)
+        limit = max(low * (1 + tolerance / 100), floor)
+        if max(values) > limit:
+            raise RuntimeError(
+                f"cannot write baseline: {name} {metric} two-pass spread "
+                f"{min(values):g}/{max(values):g} exceeds tolerance/floor limit {limit:g}"
+            )
+        metrics[metric] = written
     return metrics
 
 
@@ -776,13 +799,18 @@ def write_baseline_from_results(
 
 
 def require_run_profile(name: str, runs: list[RunData]) -> None:
-    """Only bless rows from the workload that disables AFT's inspect scanners.
-
-    Older rows include opportunistic scanner work and cannot supply a baseline
-    for a measurement that excludes it, even when their numbers look similar.
-    """
+    """Only bless the current store's cold-build and verified-refresh workload."""
     if not runs or any(run.row.get("measurement_profile") != MEASUREMENT_PROFILE for run in runs):
         raise ValueError(f"{name}: results need measurement profile {MEASUREMENT_PROFILE}; re-record on the gate runner")
+
+
+def cpu_model_from_cpuinfo(text: str) -> str:
+    for label in ("model name", "Hardware", "Processor"):
+        for line in text.splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() == label and value.strip():
+                return value.strip()
+    return "unknown"
 
 
 def runner_facts() -> str:
@@ -791,8 +819,8 @@ def runner_facts() -> str:
     Peak RSS and CPU seconds depend on how many cores the process found: the
     callgraph cold build sizes its parse pool from the core count, so two hosts
     with different core counts produce different numbers from identical code.
-    The runner image version is printed by the job, but the core count and
-    memory are not, which leaves the question unanswerable after the fact.
+    Runner images can also land on different CPU models, so record the model
+    and one reported clock reading as diagnostics, not comparison inputs.
     """
     cpus: str
     try:
@@ -810,7 +838,21 @@ def runner_facts() -> str:
                 break
     except (OSError, ValueError, IndexError):
         pass
-    return f"runner: platform={current_platform()} cpus={cpus} memory={memory}"
+    cpu_model = "unknown"
+    cpu_mhz = "unknown"
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8")
+        cpu_model = cpu_model_from_cpuinfo(cpuinfo)
+        for line in cpuinfo.splitlines():
+            key, _, value = line.partition(":")
+            value = " ".join(value.split())
+            if key.strip() == "cpu MHz" and value:
+                cpu_mhz = value
+                break
+    except OSError:
+        pass
+    return (f"runner: platform={current_platform()} cpus={cpus} memory={memory} "
+            f"cpu_model={json.dumps(cpu_model)} cpu_mhz={cpu_mhz}")
 
 
 def observation_line(repo: str, runs: list[RunData]) -> str:
@@ -845,6 +887,13 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
     hwm = [run.row.get("peak_rss_hwm_mb", "n/a") or "n/a" for run in runs if run.ready]
     if any(value != "n/a" for value in hwm):
         parts.append(f"peak_rss_hwm_mb(ungated)={'/'.join(hwm)}")
+    sampled = [run.row.get("peak_rss_sampled_mb", "n/a") or "n/a" for run in runs if run.ready]
+    if any(value != "n/a" for value in sampled):
+        parts.append(f"peak_rss_sampled_mb(ungated)={'/'.join(sampled)}")
+    for diagnostic in ("edit_apply_ms", "edit_backup_ms", "edit_write_ms"):
+        values = [run.row.get(diagnostic, "n/a") or "n/a" for run in runs if run.ready]
+        if any(value != "n/a" for value in values):
+            parts.append(f"{diagnostic}(ungated)={'/'.join(values)}")
     # The resolution share stays visible as a description of where build time
     # went, but it is not a budget: it cannot tell a slower resolution stage
     # from faster stages around it.
@@ -931,14 +980,36 @@ def self_test() -> int:
     temporary = Path(tempfile.mkdtemp(prefix="aft-cost-gate-self-test-"))
     declared_bands = dict(BIMODAL_BANDS)
     try:
+        assert cpu_model_from_cpuinfo("processor : 0\nmodel name : Example CPU 9000\n") == "Example CPU 9000"
+        assert cpu_model_from_cpuinfo("Hardware : ARM Example\nProcessor : generic\n") == "ARM Example"
+        assert cpu_model_from_cpuinfo("processor : 0\n") == "unknown"
+        cpuinfo = ("processor : 0\nmodel name\t: Example CPU @ 2.60GHz\n"
+                   "cpu MHz\t: 2593.905\nprocessor : 1\nmodel name : Other CPU\ncpu MHz : 1000.000\n")
+        for contents, model, mhz in (
+            (cpuinfo, "Example CPU @ 2.60GHz", "2593.905"),
+            ("model name : Model without frequency\n", "Model without frequency", "unknown"),
+            ("", "unknown", "unknown"),
+        ):
+            with patch.object(Path, "read_text", return_value=contents):
+                facts = runner_facts()
+            assert f"cpu_model={json.dumps(model)} cpu_mhz={mhz}" in facts, facts
+        with patch.object(Path, "read_text", side_effect=OSError("no proc filesystem")):
+            assert 'cpu_model="unknown" cpu_mhz=unknown' in runner_facts()
+
         csv_path = temporary / "synthetic.csv"
         fields = [
+            "callgraph_store_build_ready_ms", "search_first_query_latency_ms", "callgraph_first_query_latency_ms",
+            "edit_apply_ms", "edit_backup_ms", "edit_write_ms",
+            "index_store_build_ready_ms", "callgraph_refresh_ms",
             "repo", "outcome", "search_wall_ms", "callgraph_wall_ms",
             "callgraph_resolution_share_pct", "callgraph_resolution_ms", "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s",
             "search_first_query_ms", "callgraph_first_query_ms", "waiting_on", "log_path",
         ]
         rows = [
             {
+                "callgraph_store_build_ready_ms": "126", "search_first_query_latency_ms": "126", "callgraph_first_query_latency_ms": "90",
+                "edit_apply_ms": "521", "edit_backup_ms": "276", "edit_write_ms": "133",
+                "index_store_build_ready_ms": "140", "callgraph_refresh_ms": "110",
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/140/140",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
                 "callgraph_resolution_ms": "1/110/110", "peak_rss_mb": "119", "peak_rss_hwm_mb": "171", "hwm_by_phase": "extraction/ready=+80.0",
@@ -946,6 +1017,9 @@ def self_test() -> int:
                 "callgraph_first_query_ms": "1/90/90", "waiting_on": "build=1", "log_path": "",
             },
             {
+                "callgraph_store_build_ready_ms": "126", "search_first_query_latency_ms": "127", "callgraph_first_query_latency_ms": "91",
+                "edit_apply_ms": "510", "edit_backup_ms": "n/a", "edit_write_ms": "n/a",
+                "index_store_build_ready_ms": "130", "callgraph_refresh_ms": "110",
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/130/130",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
                 "callgraph_resolution_ms": "1/110/110", "peak_rss_mb": "118", "peak_rss_hwm_mb": "170", "hwm_by_phase": "extraction/ready=+60.0",
@@ -1018,11 +1092,36 @@ def self_test() -> int:
         assert "peak_rss_mb=119/118" in line, line
         assert "cpu_seconds[precision=unknown]=13/12" in line, line
         assert observation_line("fixture", []) == "OBSERVED fixture: no ready run"
-        # The high-water mark is recorded beside the sampled peak, and must stay
-        # out of the gate: it has no baseline and must not acquire one.
+        # Historical diagnostic column names must not become extra budgets.
+        # The current profile supplies the kernel HWM through peak_rss_mb.
         assert "peak_rss_hwm_mb(ungated)=171/170" in line, line
         blessed = repo_metrics_from_runs("fixture", baseline_from_file, runs)
+        assert "edit_apply_ms(ungated)=521/510" in line, line
+        assert "edit_backup_ms(ungated)=276/n/a" in line, line
+        assert not {"edit_apply_ms", "edit_backup_ms", "edit_write_ms"}.intersection(blessed), sorted(blessed)
         assert "peak_rss_hwm_mb" not in blessed, sorted(blessed)
+        assert "peak_rss_mb" not in row_metrics({"peak_rss_mb": "n/a", "peak_rss_sampled_mb": "450"})
+        assert not RETIRED_METRICS.intersection(blessed), sorted(blessed)
+        assert (blessed["index_store_build_ready_ms"]["tolerance_pct"],
+                blessed["index_store_build_ready_ms"]["absolute_floor"]) == (25, 130)
+        assert (blessed["callgraph_refresh_ms"]["tolerance_pct"],
+                blessed["callgraph_refresh_ms"]["absolute_floor"]) == (20, 1)
+        # Each replacement budget must reject an actual slowdown in both runs,
+        # not merely accept a file compared with the capture that produced it.
+        for metric, (tolerance, floor) in DEFAULT_METRICS.items():
+            config = {"metrics": {metric: {"value": floor * 2, "tolerance_pct": tolerance, "absolute_floor": floor}}}
+            slow = [RunData(csv_path, "fixture", {metric: floor * 4}, {}, True, {}) for _ in range(2)]
+            assert [failure.metric for failure in compare_repo("fixture", config, slow)] == [metric]
+            missing = [RunData(csv_path, "fixture", {}, {}, True, {}) for _ in range(2)]
+            assert [failure.metric for failure in compare_repo("fixture", config, missing)] == [metric]
+        unstable = [RunData(run.path, run.repo, dict(run.metrics), run.events, run.ready, run.row) for run in runs]
+        unstable[1].metrics["peak_rss_mb"] = 200
+        try:
+            repo_metrics_from_runs("fixture", baseline_from_file, unstable)
+        except RuntimeError as error:
+            assert "two-pass spread" in str(error), error
+        else:
+            raise AssertionError("unstable capture was blessed")
         # The per-phase breakdown is a diagnostic beside the values, and like
         # the high-water mark it must not become a budget.
         assert phase_line("fixture", runs) == "PHASES fixture: extraction/ready=+80.0 | extraction/ready=+60.0"
@@ -1128,7 +1227,7 @@ def self_test() -> int:
         # Only the declared repository and metric are classified this way.
         assert classify_bimodal("hugo", jupyterlab_runs([597.9, 678.1])) == []
 
-        print("cost-gate self-test metrics: pass=6 fail=3")
+        print("cost-gate self-test: 3 CPU-model parsing checks, 4 runner CPU logging controls; 7 core slowdown controls, 7 missing-metric controls, migration and spread checks; legacy comparator controls pass=6 fail=3")
         print("cost-gate self-test passed")
         return 0
     finally:
@@ -1189,7 +1288,7 @@ def main() -> int:
         print(
             f"cost-gate: incompatible measurement profile for {', '.join(incompatible)}; "
             f"re-record baselines on the gate runner with --write-baseline ({MEASUREMENT_PROFILE}). "
-            "Inspect-inclusive measurements cannot bound an inspect-free cold index.",
+            "Legacy store measurements cannot bound the current index-store workload.",
             file=sys.stderr,
         )
         return 2

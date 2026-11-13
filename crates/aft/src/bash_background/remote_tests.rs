@@ -8657,6 +8657,150 @@ fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_
     );
 }
 
+const CHANGED_FILES_PREFIX: &str = "\n  shown-20.txt\n  shown-19.txt\n  shown-18.txt\n  \
+    shown-17.txt\n  shown-16.txt\n  shown-15.txt\n  shown-14.txt\n  shown-13.txt\n  \
+    shown-12.txt\n  shown-11.txt\n  shown-10.txt\n  shown-09.txt\n  shown-08.txt\n  \
+    shown-07.txt\n  shown-06.txt\n  shown-05.txt\n  shown-04.txt\n  shown-03.txt\n  \
+    shown-02.txt\n  shown-01.txt";
+
+fn changed_files_record(remainder: &[&str]) -> TerminalRecord {
+    let mut terminal = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
+    let mut changes: Vec<String> = (1..=20)
+        .rev()
+        .map(|index| format!("shown-{index:02}.txt"))
+        .collect();
+    changes.extend(remainder.iter().map(|path| (*path).to_string()));
+    terminal.workspace_changes = Some(changes);
+    terminal
+}
+
+#[test]
+fn changed_files_report_twenty_paths_keeps_the_original_format_and_order() {
+    assert_eq!(
+        render_terminal_report(&changed_files_record(&[]), &[]).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back:{CHANGED_FILES_PREFIX}"
+        )
+    );
+}
+
+#[test]
+fn changed_files_report_twenty_one_paths_names_the_total_and_one_more() {
+    assert_eq!(
+        render_terminal_report(&changed_files_record(&["src/nested/extra.txt"]), &[]).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back (21 files):\
+             {CHANGED_FILES_PREFIX}\n  and 1 more: src/ (1)"
+        )
+    );
+}
+
+#[test]
+fn changed_files_report_shows_five_largest_folders_and_counts_the_rest_elsewhere() {
+    let terminal = changed_files_record(&[
+        "z/a", "z/b", "z/c", "y/a", "y/b", "x/a", "w/a", "v/a", "u/a", "t/a",
+    ]);
+    assert_eq!(
+        render_terminal_report(&terminal, &[]).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back (30 files):\
+             {CHANGED_FILES_PREFIX}\n  and 10 more: z/ (3), y/ (2), t/ (1), u/ (1), v/ (1), 2 elsewhere"
+        )
+    );
+}
+
+#[test]
+fn changed_files_report_folder_count_ties_sort_by_name() {
+    let terminal =
+        changed_files_record(&["zeta/one", "beta/one", "alpha/one", "beta/two", "alpha/two"]);
+    assert_eq!(
+        render_terminal_report(&terminal, &[]).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back (25 files):\
+             {CHANGED_FILES_PREFIX}\n  and 5 more: alpha/ (2), beta/ (2), zeta/ (1)"
+        )
+    );
+}
+
+#[test]
+fn changed_files_report_top_level_files_count_as_elsewhere() {
+    let terminal = changed_files_record(&["root.txt", "src/item", "root2.txt"]);
+    assert_eq!(
+        render_terminal_report(&terminal, &[]).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back (23 files):\
+             {CHANGED_FILES_PREFIX}\n  and 3 more: src/ (1), 2 elsewhere"
+        )
+    );
+    let terminal = changed_files_record(&["root.txt"]);
+    assert_eq!(
+        render_terminal_report(&terminal, &[]).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back (21 files):\
+             {CHANGED_FILES_PREFIX}\n  and 1 more: 1 elsewhere"
+        )
+    );
+}
+
+#[test]
+fn changed_files_report_escapes_listed_paths_and_folder_names() {
+    let mut terminal = changed_files_record(&["odd\nfolder/sub/file.txt"]);
+    terminal.workspace_changes.as_mut().unwrap()[0] = "listed\nfile.txt".into();
+    let expected_prefix = CHANGED_FILES_PREFIX.replacen("shown-20.txt", "listed\\nfile.txt", 1);
+    assert_eq!(
+        render_terminal_report(&terminal, &[]).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back (21 files):\
+             {expected_prefix}\n  and 1 more: odd\\nfolder/ (1)"
+        )
+    );
+}
+
+#[test]
+fn changed_files_report_uses_comma_separators_for_large_counts() {
+    let mut terminal = changed_files_record(&["one.txt", "two.txt"]);
+    let changes = terminal.workspace_changes.as_mut().unwrap();
+    for (folder, count) in [("node_modules", 1198), (".npm", 60), ("dist", 4)] {
+        changes.extend((0..count).map(|index| format!("{folder}/{index}.txt")));
+    }
+    assert_eq!(
+        render_terminal_report(&terminal, &[]).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back (1,284 files):\
+             {CHANGED_FILES_PREFIX}\n  and 1,264 more: node_modules/ (1,198), .npm/ (60), dist/ (4), 2 elsewhere"
+        )
+    );
+}
+
+#[test]
+fn changed_files_report_excludes_copied_back_paths_before_applying_the_cap() {
+    let mut terminal = changed_files_record(&["returned/extra"]);
+    terminal
+        .workspace_changes
+        .as_mut()
+        .unwrap()
+        .insert(0, "returned/first".into());
+    let copied_back = ["returned/first", "returned/extra"];
+    assert_eq!(
+        render_terminal_report(&terminal, &copied_back).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back:{CHANGED_FILES_PREFIX}"
+        )
+    );
+    terminal
+        .workspace_changes
+        .as_mut()
+        .unwrap()
+        .push("src/one".into());
+    assert_eq!(
+        render_terminal_report(&terminal, &copied_back).unwrap(),
+        format!(
+            "These files changed on the server and were NOT copied back (21 files):\
+             {CHANGED_FILES_PREFIX}\n  and 1 more: src/ (1)"
+        )
+    );
+}
+
 #[test]
 fn unreported_git_untracked_and_ignored_reports_stay_silent() {
     // The build-server runner never fills the Git, untracked-file, or

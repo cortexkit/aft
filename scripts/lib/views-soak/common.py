@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Reads pre-0.64 view storage; does not run against AFT 0.64 or later.
 """Shared, read-mostly helpers for the content-addressed views soak drills."""
 
 from __future__ import annotations
@@ -470,9 +471,15 @@ def read_jsonc(path: Path) -> dict[str, Any]:
     return value
 
 
-def write_views_off_config(source_root: Path, baseline: Path) -> Path:
+def write_baseline_config(source_root: Path, baseline: Path) -> Path:
     config = read_jsonc(source_root / ".cortexkit" / "aft.jsonc")
-    config.pop("views", None)
+    for container, keys in {"views": ("enabled", "callgraph_copies"), "worktree": ("ram_overlay",)}.items():
+        block = config.get(container)
+        if isinstance(block, dict):
+            for key in keys:
+                block.pop(key, None)
+            if not block:
+                config.pop(container)
     target = baseline / ".cortexkit" / "aft.jsonc"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -497,7 +504,7 @@ def ensure_baseline(root: Path, scope: str, head: str) -> Path:
         git_text(baseline, "checkout", "--quiet", "--detach", "--force", head)
     else:
         git_text(root, "worktree", "add", "--quiet", "--detach", str(baseline), head)
-    write_views_off_config(root, baseline)
+    write_baseline_config(root, baseline)
     return baseline
 
 
@@ -514,7 +521,7 @@ def ensure_owned_baseline(root: Path, scope: str, head: str) -> Path:
     else:
         git_text(root, "clone", "--quiet", "--shared", "--no-checkout", str(root), str(baseline))
         git_text(baseline, "checkout", "--quiet", "--detach", head)
-    write_views_off_config(root, baseline)
+    write_baseline_config(root, baseline)
     return baseline
 
 

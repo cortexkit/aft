@@ -53,14 +53,18 @@ test("V2 session.moved clears the cached directory without deleting the session"
 async function rig(parentID: string | undefined = "parent", persistedTaskIds?: string[]) {
   _resetSubagentCacheForTest();
   const bus = await Effect.runPromise(
-    PubSub.unbounded<{ type: string; data: { sessionID: string; reason?: string } }>(),
+    PubSub.unbounded<{
+      type: string;
+      location?: { directory: string };
+      data: { sessionID: string; reason?: string };
+    }>(),
   );
   const scope = await Effect.runPromise(Scope.make());
   const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
   const host = {
     location: { directory: process.cwd() },
     event: { subscribe: () => Stream.fromPubSub(bus) },
-    session: { get: () => Effect.succeed({ parentID }) },
+    session: { get: () => Effect.succeed({ parentID, location: { directory: process.cwd() } }) },
   };
   const bridge = {
     send: async (name: string, args: Record<string, unknown>) => {
@@ -85,7 +89,13 @@ async function rig(parentID: string | undefined = "parent", persistedTaskIds?: s
     ctx,
     calls,
     async event(type: string, reason?: string) {
-      await Effect.runPromise(PubSub.publish(bus, { type, data: { sessionID: "child", reason } }));
+      await Effect.runPromise(
+        PubSub.publish(bus, {
+          type,
+          location: host.location,
+          data: { sessionID: "child", reason },
+        }),
+      );
       await Bun.sleep(10);
     },
     async close() {
@@ -440,7 +450,11 @@ test("V2 replies arriving after session deletion cannot recreate session state",
 test("V2 session deletion after a reload kills only the tasks the bridge says that session owns", async () => {
   _resetSubagentCacheForTest();
   const bus = await Effect.runPromise(
-    PubSub.unbounded<{ type: string; data: { sessionID: string } }>(),
+    PubSub.unbounded<{
+      type: string;
+      location?: { directory: string };
+      data: { sessionID: string };
+    }>(),
   );
   const scope = await Effect.runPromise(Scope.make());
   const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
@@ -465,7 +479,9 @@ test("V2 session deletion after a reload kills only the tasks the bridge says th
   const host = {
     location: { directory: process.cwd() },
     event: { subscribe: () => Stream.fromPubSub(bus) },
-    session: { get: () => Effect.succeed({ parentID: "parent" }) },
+    session: {
+      get: () => Effect.succeed({ parentID: "parent", location: { directory: process.cwd() } }),
+    },
   };
   const ctx = {
     client: host,
@@ -477,7 +493,11 @@ test("V2 session deletion after a reload kills only the tasks the bridge says th
       registerV2SessionLifecycle(host, ctx).pipe(Effect.provideService(Scope.Scope, scope)),
     );
     await Effect.runPromise(
-      PubSub.publish(bus, { type: "session.deleted", data: { sessionID: "deleted-child" } }),
+      PubSub.publish(bus, {
+        type: "session.deleted",
+        location: host.location,
+        data: { sessionID: "deleted-child" },
+      }),
     );
     await Bun.sleep(20);
     const kills = calls.filter((call) => call.name === "bash_kill");

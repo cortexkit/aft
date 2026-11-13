@@ -1254,6 +1254,15 @@ fn gh_shim_broker_large_read_replies_fit_the_body_cap() {
     assert!(error.contains("1048577 bytes"), "{error}");
     assert!(error.contains("1048576 bytes"), "{error}");
     assert!(!error.contains("reply unavailable"), "{error}");
+
+    // A lean Plexus reply (no `isError`) is held to the same body cap.
+    let error = broker_reply_roundtrip(json!({
+        "result":{"status":200,"body":"x".repeat(cap + 1),"next_page":null}
+    }))
+    .unwrap_err();
+    assert!(error.contains("response_too_large"), "{error}");
+    let lean = json!({"result":{"status":200,"body":"ok","next_page":null}});
+    assert_eq!(broker_reply_roundtrip(lean.clone()).unwrap(), lean);
 }
 
 #[test]

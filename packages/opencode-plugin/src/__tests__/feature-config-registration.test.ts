@@ -297,25 +297,21 @@ describe("OpenCode feature-config registration", () => {
     });
   });
 
-  test("a user file's views.idle_checkout_hours becomes idle.checkout_hours; its removed keys get one notice naming only them", () => {
+  test("an older user key still translates: views.idle_checkout_hours becomes idle.checkout_hours", () => {
     const user = {
-      views: { idle_checkout_hours: 72, enabled: true },
-      worktree: { ram_overlay: false },
+      views: { idle_checkout_hours: 72 },
     };
     const config = loadWithUserConfig(user);
     expect(getConfigValidationErrors()).toEqual([]);
     expect(config.idle).toEqual({ checkout_hours: 72 });
-    // The removed keys still reach the engine until the code reading them is deleted.
-    expect(config.views).toEqual({ enabled: true });
-    expect(config.worktree).toEqual({ ram_overlay: false });
+    expect(config).not.toHaveProperty("views");
+    expect(config).not.toHaveProperty("worktree");
     const userPath = join(root, "xdg", "cortexkit", "aft.jsonc");
     expect(readFileSync(userPath, "utf8")).toBe(JSON.stringify(user));
     const notices = getConfigLoadNotices().filter(
       (notice) => notice.configPath === userPath && notice.message !== SEMANTIC_COST_NOTICE,
     );
-    expect(notices.map((notice) => notice.message)).toEqual([
-      `${userPath} sets removed keys (views.enabled, worktree.ram_overlay); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[1]?.[1]} ${REMOVED_DATA_LAYER_NOTES[2]?.[1]}`,
-    ]);
+    expect(notices).toEqual([]);
   });
 
   test("a project file with data-layer keys gets one notice covering the renamed and the removed keys", () => {
@@ -330,7 +326,7 @@ describe("OpenCode feature-config registration", () => {
     expect(config.idle?.checkout_hours).toBe(24);
     const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
     expect(notices.map((notice) => notice.message)).toEqual([
-      `${projectFile} uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours. ${projectFile} sets removed keys (views.callgraph_copies); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
+      `${projectFile} uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
     ]);
   });
 });
@@ -374,4 +370,57 @@ describe("semantic default-on cost notice", () => {
       expect(costNotices()).toHaveLength(0);
     }
   });
+});
+
+describe("removed data-layer config keys", () => {
+  const cases = [
+    {
+      key: "views.enabled",
+      doc: { views: { enabled: true } },
+      notice:
+        "views.enabled is gone because AFT now keeps one index store per repository and always uses it.",
+    },
+    {
+      key: "views.callgraph_copies",
+      doc: { views: { callgraph_copies: 2 } },
+      notice:
+        "views.callgraph_copies is gone because no checkout borrows another checkout's call graph any more.",
+    },
+    {
+      key: "worktree.ram_overlay",
+      doc: { worktree: { ram_overlay: false } },
+      notice:
+        "worktree.ram_overlay is gone because every worktree now has its own index state, so there is no borrowed index to patch in memory.",
+    },
+  ];
+  for (const { key, doc, notice } of cases) {
+    for (const harness of [false, true]) {
+      const input = harness ? { harnesses: { pi: doc } } : doc;
+      const keyPath = harness ? `harnesses.pi.${key}` : key;
+      test(`user config refuses ${keyPath}`, () => {
+        expect(() => loadWithUserConfig(input)).toThrow(
+          `removed_config_key:${keyPath}; run npx @cortexkit/aft doctor --fix`,
+        );
+        expect(readFileSync(join(root, "xdg", "cortexkit", "aft.jsonc"), "utf8")).toBe(
+          JSON.stringify(input),
+        );
+      });
+      test(`project config drops ${keyPath} with its existing notice`, () => {
+        const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+        mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+        writeFileSync(projectFile, JSON.stringify(input));
+        const config = loadWithUserConfig({ format_on_edit: true });
+        expect(getConfigValidationErrors()).toEqual([]);
+        expect(config.format_on_edit).toBe(true);
+        expect(config).not.toHaveProperty("views");
+        expect(config).not.toHaveProperty("worktree");
+        expect(
+          getConfigLoadNotices()
+            .filter((item) => item.configPath === projectFile)
+            .map((item) => item.message),
+        ).toEqual([notice]);
+        expect(readFileSync(projectFile, "utf8")).toBe(JSON.stringify(input));
+      });
+    }
+  }
 });

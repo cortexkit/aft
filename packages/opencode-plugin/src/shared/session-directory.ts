@@ -50,11 +50,16 @@ interface SessionInfo {
  * same test for its own session lookup.
  */
 interface V2SessionInfo {
-  location?: { directory?: unknown };
+  location?: { directory?: unknown; workspaceID?: string };
+}
+
+interface SessionLocation {
+  directory: string;
+  workspaceID?: string;
 }
 
 interface V2PluginContextShape {
-  location: { directory: string };
+  location: SessionLocation;
   session: {
     get(input: { sessionID: string }): Effect.Effect<V2SessionInfo | undefined, unknown>;
   };
@@ -92,6 +97,8 @@ interface OpenCodeClientShape {
 interface CacheEntry {
   /** Resolved directory, or `null` while a failed lookup is cooling down. */
   directory: string | null;
+  /** V2 Location refs distinguish workspaces that share a directory. */
+  location?: SessionLocation;
   /** When the answer was recorded; failed lookups become retryable after 30 seconds. */
   recordedAt: number;
 }
@@ -104,8 +111,9 @@ const lookupGenerations = new Map<string, object>();
 /**
  * Resolve the project directory the session was created with from the SDK's
  * session object. Returns the SDK-reported directory, or `null` when the
- * lookup is unavailable/fails — callers should fall back to the runtime's
- * directory in that case.
+ * lookup is unavailable/fails. Only session-scoped tool calls may fall back
+ * to their runtime directory; broadcast events must not open a route without
+ * a resolved session directory.
  *
  * This function is best-effort: any error (missing `client.session.get`,
  * network failure, malformed response) is logged and recorded as a
@@ -139,6 +147,55 @@ export async function getSessionDirectory(
   return lookup;
 }
 
+/** Session events may open routes only in the owning V2 Location. */
+export async function getSessionDirectoryForEvent(
+  client: unknown,
+  sessionId: string,
+  instanceDirectory: string,
+): Promise<string | null> {
+  const directory = await getSessionDirectory(client, sessionId, instanceDirectory);
+  if (
+    isV2PluginContext(client) &&
+    (directory !== client.location.directory ||
+      cache.get(sessionId)?.location?.workspaceID !== client.location.workspaceID)
+  )
+    return null;
+  return directory;
+}
+
+/** Deleted records cannot be queried: prefer the event's Location, then a previously resolved ref. */
+export function getSessionDirectoryForDeletedEvent(
+  client: unknown,
+  sessionId: string,
+  eventLocation: unknown,
+): string | null {
+  if (!sessionId || !isV2PluginContext(client)) return null;
+  let location: SessionLocation | undefined;
+  if (eventLocation === undefined) {
+    location = cache.get(sessionId)?.location;
+  } else {
+    if (!eventLocation || typeof eventLocation !== "object") return null;
+    const ref = eventLocation as { directory?: unknown; workspaceID?: unknown };
+    if (
+      typeof ref.directory !== "string" ||
+      !ref.directory ||
+      (ref.workspaceID !== undefined && typeof ref.workspaceID !== "string")
+    )
+      return null;
+    location = { directory: ref.directory, workspaceID: ref.workspaceID };
+    // The cleanup's bridge call also consults this cache. Preserve the event's
+    // ownership proof there instead of asking the host for an already-deleted record.
+    setCache(sessionId, location.directory, location);
+  }
+  if (
+    !location ||
+    location.directory !== client.location.directory ||
+    location.workspaceID !== client.location.workspaceID
+  )
+    return null;
+  return location.directory;
+}
+
 /** A late success may repair its provisional answer, but never overwrite a newer lookup. */
 async function boundedLookup(
   client: unknown,
@@ -152,6 +209,7 @@ async function boundedLookup(
     if (oldest !== undefined) lookupGenerations.delete(oldest);
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let location: CacheEntry["location"];
   try {
     const timeout = new Promise<null>((resolve) => {
       timer = setTimeout(() => {
@@ -163,10 +221,12 @@ async function boundedLookup(
       }, LOOKUP_TIMEOUT_MS);
     });
     const directory = await Promise.race([
-      lookupSessionDirectory(client, sessionId, fallbackDirectory)
+      lookupSessionDirectory(client, sessionId, fallbackDirectory, (ref) => {
+        location = ref;
+      })
         .then((directory) => {
           if (lookupGenerations.get(sessionId) === generation && directory !== null) {
-            setCache(sessionId, directory);
+            setCache(sessionId, directory, location);
           }
           return directory;
         })
@@ -175,7 +235,7 @@ async function boundedLookup(
         }),
       timeout,
     ]);
-    setCache(sessionId, directory);
+    setCache(sessionId, directory, location);
     return directory;
   } finally {
     clearTimeout(timer);
@@ -186,8 +246,9 @@ async function lookupSessionDirectory(
   client: unknown,
   sessionId: string,
   fallbackDirectory: string,
+  onLocation: (location: NonNullable<CacheEntry["location"]>) => void,
 ): Promise<string | null> {
-  if (isV2PluginContext(client)) return lookupV2SessionDirectory(client, sessionId);
+  if (isV2PluginContext(client)) return lookupV2SessionDirectory(client, sessionId, onLocation);
 
   const c = client as OpenCodeClientShape;
   const sessionApi = c?.session;
@@ -236,6 +297,7 @@ async function lookupSessionDirectory(
 async function lookupV2SessionDirectory(
   context: V2PluginContextShape,
   sessionId: string,
+  onLocation: (location: NonNullable<CacheEntry["location"]>) => void,
 ): Promise<string | null> {
   let dir: string | null = null;
   let failure: string | undefined;
@@ -247,8 +309,10 @@ async function lookupV2SessionDirectory(
       ),
     );
     const directory = session?.location?.directory;
-    if (typeof directory === "string" && directory.length > 0) dir = directory;
-    else failure = "the session record has no location.directory";
+    if (typeof directory === "string" && directory.length > 0) {
+      dir = directory;
+      onLocation({ directory, workspaceID: session?.location?.workspaceID });
+    } else failure = "the session record has no location.directory";
   } catch (err) {
     failure = err instanceof Error ? err.message || err.name : String(err);
   }
@@ -261,9 +325,13 @@ async function lookupV2SessionDirectory(
   return dir;
 }
 
-function setCache(sessionId: string, directory: string | null): void {
+function setCache(
+  sessionId: string,
+  directory: string | null,
+  location?: CacheEntry["location"],
+): void {
   if (cache.has(sessionId)) cache.delete(sessionId);
-  cache.set(sessionId, { directory, recordedAt: Date.now() });
+  cache.set(sessionId, { directory, location, recordedAt: Date.now() });
   if (cache.size > CACHE_MAX_ENTRIES) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);

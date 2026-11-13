@@ -12,13 +12,17 @@ use cortexkit_role_tool_provider::{
         system_text_digest, CatalogAnswer, CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
     },
     describe::{Major, RoleDescribe},
-    errors,
+    errors, SystemTextFacts,
 };
 use serde_json::{json, Value};
 use subc_protocol::ErrorBody;
 
 use super::manifest;
 use crate::hashline::integration::RegistrationRequest;
+
+mod guidance;
+#[cfg(test)]
+mod guidance_text_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -207,6 +211,7 @@ pub(super) fn describe() -> Value {
             "tool-catalog-confine/v1".into(),
             cortexkit_role_tool_provider::CATALOG_MODEL.into(),
             "tool-views/v1".into(),
+            cortexkit_role_tool_provider::SYSTEM_TEXT_FACTS_V1.into(),
             SESSION_NOTICES.into(),
             super::call_yield::CALL_YIELD.into(),
         ]),
@@ -650,101 +655,6 @@ static RUNNER_HEAD_TOOLS: LazyLock<RunnerHeadTools> = LazyLock::new(|| {
     }
 });
 
-/// The lines every preset's system text shares, one per served code tool.
-/// `spell` gives the name a bare catalog tool is served under, or `None` when
-/// the catalog does not serve it.
-fn code_tool_lines(text: &mut String, spell: &dyn Fn(&str) -> Option<String>) {
-    if let Some(search) = spell("search") {
-        text.push_str(&format!(
-            "Use {search} to locate code by concept, identifier, or literal before reading it.\n"
-        ));
-    }
-    if let Some(outline) = spell("outline") {
-        text.push_str(&format!(
-            "Use {outline} to map source structure before reading specific sections.\n"
-        ));
-    }
-    if let Some(zoom) = spell("zoom") {
-        text.push_str(&format!(
-            "Use {zoom} to inspect named symbols, with callgraph: true for one-level calls.\n"
-        ));
-    }
-    if let Some(callgraph) = spell("callgraph") {
-        text.push_str(&format!(
-            "Use {callgraph} for callers, impact, and multi-level execution or data-flow traces.\n"
-        ));
-    }
-    if let Some(inspect) = spell("inspect") {
-        text.push_str(&format!("Use {inspect} after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\n"));
-    }
-    if let Some(read) = spell("read") {
-        text.push_str(&format!(
-            "Use {read} for files and bounded line ranges, not shell commands to explore source.\n"
-        ));
-    }
-}
-
-/// `spell` for a catalog that serves every tool under its bare name.
-fn bare_spelling<'a>(names: &'a [&'a str]) -> impl Fn(&str) -> Option<String> + 'a {
-    move |bare| names.contains(&bare).then(|| bare.to_string())
-}
-
-/// System instructions for the primary (`head`) session. The legacy `broca`
-/// text request can set `worker` to append a reminder to stay in scope.
-pub(super) fn broca_text(names: &[&str], worker: bool) -> String {
-    head_text(&bare_spelling(names), worker, None)
-}
-
-/// [`broca_text`] with each tool spelled by `spell`, and the line a hashline
-/// session is given about which calls mint the tags its patches address.
-fn head_text(
-    spell: &dyn Fn(&str) -> Option<String>,
-    worker: bool,
-    hashline_tags: Option<&str>,
-) -> String {
-    let mut text = String::from("# Agent File Tools\n\n");
-    code_tool_lines(&mut text, spell);
-    if spell("bash").is_some() {
-        text.push_str("Use bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n");
-    }
-    if let Some(sentence) = hashline_tags {
-        text.push_str(&format!("**Hashline edit tags**: {sentence}\n"));
-    }
-    if worker {
-        text.push_str(WORKER_SCOPE_LINE);
-    }
-    text
-}
-
-const WORKER_SCOPE_LINE: &str = "As a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n";
-
-/// The `worker` preset's system text. A delegated worker is never woken once
-/// its turn ends, so it is told how to wait on a command and never to end its
-/// turn on one. The wait limit is named by its setting with its default,
-/// because the live value is the project's to configure.
-pub(super) fn worker_text(names: &[&str]) -> String {
-    let has = |name: &str| names.contains(&name);
-    let mut text = String::from("# Agent File Tools\n\n");
-    code_tool_lines(&mut text, &bare_spelling(names));
-    if has("bash") {
-        text.push_str("Use bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.\n");
-    }
-    if has("bash_watch") {
-        text.push_str("A command in the background never wakes you: wait on it with bash_watch before you report a result, and watch again while it is still running. Don't poll bash_status or sleep to wait.\n");
-    }
-    text.push_str(WORKER_SCOPE_LINE);
-    text
-}
-
-/// The `reader` preset's system text: what the session can and cannot do,
-/// then the shared line for each code tool it has.
-pub(super) fn reader_text(names: &[&str]) -> String {
-    let mut text = String::from("# Agent File Tools\n\n");
-    text.push_str("This session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\n");
-    code_tool_lines(&mut text, &bare_spelling(names));
-    text
-}
-
 #[cfg(test)]
 pub(super) fn catalog(
     body: Value,
@@ -823,10 +733,19 @@ impl HeadSettings {
 }
 
 pub(super) fn validate_catalog_request(
-    body: Value,
+    mut body: Value,
 ) -> Result<(CatalogRequest, CatalogPreset), ErrorBody> {
-    let request: CatalogRequest = serde_json::from_value(body)
+    // Decode facts separately so malformed values name the contract's `facts`
+    // field rather than the generic catalog arguments field.
+    let facts = body
+        .as_object_mut()
+        .and_then(|body| body.remove("facts"))
+        .map(serde_json::from_value::<SystemTextFacts>)
+        .transpose()
+        .map_err(|e| errors::invalid_request("facts", e.to_string()))?;
+    let mut request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
+    request.facts = facts;
     // The tool-provider contract reads a system-text item's preset as
     // optional, where a missing preset asks for the provider's default text.
     // AFT does not offer default text (its manifest does not declare
@@ -1557,14 +1476,13 @@ fn render_catalog(
                 .find(|name| **name == bare || same_tool(name, bare))
                 .map(|name| name.to_string())
         };
-        let text = match preset {
-            CatalogPreset::Head if runner_head.is_some() => {
-                head_text(&served, worker, hashline_tags.as_deref())
-            }
-            CatalogPreset::Head => broca_text(&names, worker),
-            CatalogPreset::Worker => worker_text(&names),
-            CatalogPreset::Reader => reader_text(&names),
-        };
+        let text = guidance::render(
+            preset,
+            request.facts.as_ref(),
+            &served,
+            worker,
+            hashline_tags.as_deref(),
+        );
         // The item digest is the SHA-256 hex of the exact UTF-8 text returned,
         // so a runner can check the text against it from this reply alone. The
         // protocol crate owns that definition; the preflight digest reuses it
@@ -4885,6 +4803,145 @@ mod tests {
         assert!(reply.get("system_text").is_none());
     }
 
+    fn system_text_facts() -> Value {
+        json!({
+            "model": {"provider": "other-provider", "id": "gpt-5"},
+            "harness": {"id": "other-harness", "facts": ["files", "shell"]},
+            "tools": ["other_tool", "read", "write"],
+            "idle_start": ["another-sender", "sender"]
+        })
+    }
+
+    #[test]
+    fn runner_guidance_token_counts() {
+        for preset in CatalogPreset::ALL {
+            let mut request = json!({
+                "preset": preset.name(), "system_text": {"preset": preset.name()}
+            });
+            if preset == CatalogPreset::Head {
+                request["params"] = json!({"model": {"provider": "vendor", "model": "gpt-5"}});
+            }
+            let reply = catalog(request, &[], true).unwrap();
+            let text = reply["system_text"]["text"].as_str().unwrap();
+            let tokens = aft_tokenizer::count_tokens(text).unwrap();
+            assert!(tokens > 0);
+            println!("runner guidance {}: {tokens} Claude tokens", preset.name());
+        }
+    }
+
+    #[test]
+    fn system_text_facts_are_declared_and_preserved_for_rendering() {
+        assert!(describe()["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("system-text-facts/v1")));
+        let facts = system_text_facts();
+        let (request, _) = validate_catalog_request(json!({
+            "system_text": {"preset": "head"}, "facts": facts
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(request.facts.unwrap()).unwrap(), facts);
+    }
+
+    #[test]
+    fn system_text_facts_leave_every_presets_text_and_catalog_bytes_unchanged() {
+        let empty_facts = json!({
+            "model": {"provider": "", "id": ""},
+            "harness": {"id": "", "facts": []},
+            "tools": [], "idle_start": []
+        });
+        for preset in CatalogPreset::ALL {
+            for params in [
+                json!({}),
+                json!({"model": {"provider": "vendor", "model": "claude"}}),
+                json!({"model": {"provider": "vendor", "model": "gpt-5"}}),
+            ] {
+                for (text_preset, text_params) in [
+                    (preset.name(), json!({})),
+                    ("broca", json!({"worker": false})),
+                    ("broca", json!({"worker": true})),
+                ] {
+                    let mut body = json!({
+                        "preset": preset.name(), "params": params,
+                        "system_text": {"preset": text_preset, "params": text_params}
+                    });
+                    let without = catalog(body.clone(), &[], true).unwrap();
+                    let text = without["system_text"]["text"].as_str().unwrap();
+                    assert!(!text.is_empty());
+                    for facts in [system_text_facts(), empty_facts.clone()] {
+                        body["facts"] = facts;
+                        let with = catalog(body.clone(), &[], true).unwrap();
+                        assert_eq!(
+                            with["system_text"]["text"].as_str().unwrap().as_bytes(),
+                            text.as_bytes()
+                        );
+                        assert_eq!(
+                            serde_json::to_vec(&with).unwrap(),
+                            serde_json::to_vec(&without).unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_system_text_facts_are_refused_by_name() {
+        let valid = system_text_facts();
+        for facts in [Value::Null, json!(false), json!([]), json!({})] {
+            let error = catalog(
+                json!({"system_text": {"preset": "head"}, "facts": facts}),
+                &[],
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert_eq!(errors::invalid_request_field(&error), Some("facts"));
+        }
+        for pointer in [
+            "/model",
+            "/model/provider",
+            "/model/id",
+            "/harness",
+            "/harness/id",
+            "/harness/facts",
+            "/tools",
+            "/idle_start",
+        ] {
+            let mut facts = valid.clone();
+            *facts.pointer_mut(pointer).unwrap() = Value::Null;
+            let error = catalog(json!({"facts": facts}), &[], true).unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert_eq!(errors::invalid_request_field(&error), Some("facts"));
+        }
+        for pointer in ["/tools", "/idle_start", "/harness/facts"] {
+            for names in [
+                json!(["z", "a"]),
+                json!(["a", "a"]),
+                json!([""]),
+                json!([null]),
+            ] {
+                let mut facts = valid.clone();
+                *facts.pointer_mut(pointer).unwrap() = names;
+                let error = catalog(json!({"facts": facts}), &[], true).unwrap_err();
+                assert_eq!(error.code, "invalid_request");
+                assert_eq!(errors::invalid_request_field(&error), Some("facts"));
+            }
+        }
+        for pointer in ["", "/model", "/harness"] {
+            let mut facts = valid.clone();
+            facts
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".into(), json!(true));
+            let error = catalog(json!({"facts": facts}), &[], true).unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert_eq!(errors::invalid_request_field(&error), Some("facts"));
+        }
+    }
+
     #[test]
     fn no_legacy_tool_name_shadows_a_role_operation() {
         // Legacy routes answer role.describe and tool.catalog and refuse the
@@ -5477,7 +5534,7 @@ mod tests {
                 system_text_digest(text)
             );
             assert!(text.contains("bash_watch"), "{text}");
-            assert!(text.contains("`bash.worker_wait_max_ms`, 30 minutes by default"));
+            assert!(text.contains("bash.worker_wait_max_ms, 30 minutes by default"));
             for phrase in HEAD_ONLY_WORDING {
                 assert!(!text.to_lowercase().contains(phrase), "{phrase:?}: {text}");
             }
@@ -5891,24 +5948,21 @@ mod tests {
                 assert_eq!(unresolved_references(&reply), Vec::<String>::new());
                 let text = reply["system_text"]["text"].as_str().unwrap();
                 for line in [
-                    "Use aft_search to locate code",
-                    "Use aft_outline to map source structure",
-                    "Use aft_zoom to inspect named symbols, with callgraph: true",
-                    "Use aft_callgraph for callers",
-                    "Use aft_inspect after editing",
-                    "Use read for files",
-                    "Use bash with wait: true",
+                    "start with aft_search;",
+                    "Then aft_outline for structure, aft_zoom for named symbols, read for line ranges.",
+                    "**Relationships**: aft_callgraph for callers",
+                    "**After edits**: run aft_inspect for diagnostics;",
+                    "Pass wait: true when you need a long command's result before anything else.",
                 ] {
                     assert!(text.contains(line), "{model}: {text}");
                 }
-                // Respelled tool names are all that differ from the model-less text.
+                // Runner heads also get the watch sentence, which a model-less
+                // head cannot use because its catalog has no bash_watch.
                 let mut bare_text = text.to_string();
                 for bare in &renamed {
-                    bare_text = bare_text.replace(
-                        &format!("Use {} ", plugin_name(bare)),
-                        &format!("Use {bare} "),
-                    );
+                    bare_text = bare_text.replace(&plugin_name(bare), bare);
                 }
+                bare_text = bare_text.replace(" Block on it with bash_watch only when nothing else is left, and never loop bash_status.", "");
                 assert_eq!(bare_text, without["system_text"]["text"].as_str().unwrap());
                 let mut sorted = expected.clone();
                 sorted.sort();

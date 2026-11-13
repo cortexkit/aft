@@ -1,0 +1,6 @@
+# Agent Foundational Toolkit
+
+{% if preset == 'reader' %}This session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.
+{% endif %}{% include 'code' %}{% if preset != 'reader' %}**Status bar**: `[AFT E.. W.. | T..]` appears when a count changes. E above 0 usually means your last edit broke something; `?` means unknown, not zero.
+{% include 'commands' %}{% endif %}{% if preset == 'head' and hashline_tags %}**Hashline edit tags**: {{ hashline_tags }}
+{% endif %}{% if preset == 'worker' or (preset == 'head' and worker) %}{% include 'scope' %}{% endif %}

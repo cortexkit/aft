@@ -119,11 +119,10 @@ def arguments():
     parser.add_argument("--transport", choices=("standalone", "subc"), default="standalone")
     parser.add_argument("--broker", type=Path, help="views_perf_daemon example binary for subc")
     parser.add_argument("--baseline", type=Path, help="Run paired lifecycle matrix against this binary")
-    parser.add_argument("--views-startup-memory-mib", type=float, default=1024,
+    parser.add_argument("--checkout-startup-memory-mib", type=float, default=1024,
                         help="Reported startup-memory reference only; never gates")
     parser.add_argument("--repo", type=Path, help="Real checkout, not a small fixture")
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--views", choices=("on", "off"), default="on")
     parser.add_argument("--label", default="current")
     parser.add_argument("--phase", choices=("cold-alone", "cold-traffic", "in-process-warm", "warm-restart"), default="in-process-warm")
     parser.add_argument("--state", type=Path, help="Reuse warmed state for steady runs only")
@@ -462,7 +461,7 @@ async def wait_ready(client, args, variants, result):
 def markdown(result):
     gate = result["summary"]
     verdict = "MEASUREMENT ONLY" if gate["passed"] is None else "PASS" if gate["passed"] else "FAIL"
-    lines = [f"# {result['label']} — {result['phase']} — views {result['views']}: {verdict}", "",
+    lines = [f"# {result['label']} — {result['phase']}: {verdict}", "",
              f"Repo: `{result['repository']['head']}` at `{result['repository']['path']}`",
              f"Binary SHA256: `{result['binary_sha256']}`", "",
               "| Tool | Calls | p50 ms | p95 ms | p99 ms | Max ms | Errors | Refusals | Backlog p95 ms |",
@@ -480,7 +479,7 @@ def markdown(result):
               f"Steady busy fraction: {gate.get('steady_busy_fraction', 'n/a')}",
                f"Peak RSS: {result['peak_rss_bytes'] / 2**20:.1f} MiB",
                f"Phase RSS (sampled current RSS, not cumulative HWM): {json.dumps(result['phase_peak_rss_bytes'])}",
-               f"Views startup-memory budget (report only): {json.dumps(result['views_startup_memory_budget'])}",
+               f"Views startup-memory budget (report only): {json.dumps(result['checkout_startup_memory_budget'])}",
                f"Achieved arrivals/minute: {gate.get('steady_calls_per_minute', 'n/a')}",
               f"Errors/refusals: {len(gate['errors'])}",
               f"Allocated repo disk: {result['repository']['disk_bytes'] / 2**30:.2f} GiB",
@@ -496,7 +495,7 @@ async def main(args):
     args.out.mkdir(parents=True, exist_ok=False)
     variants = workload(args.repo)
     config = {"indexes": {"trigram": True, "semantic": False, "callgraph": True},
-              "views": {"enabled": args.views == "on"}, "inspect": {"enabled": False},
+              "inspect": {"enabled": False},
               "lsp": {"disabled": ["rust"]}}
     state = args.state.resolve() if args.state else args.out / "state"
     if args.phase != "warm-restart" and state.exists():
@@ -519,7 +518,7 @@ async def main(args):
     for path in (state / "config/cortexkit/aft.jsonc", state / "home/.config/cortexkit/aft.jsonc"):
         path.write_text(json.dumps(config))
     result = {"schema_version": 3, "label": args.label, "transport": args.transport,
-              "views": args.views, "phase": args.phase,
+              "phase": args.phase,
               "binary_sha256": digest.hexdigest(), "state": str(state),
               "repository": repository_info(args.repo), "config": config,
               "parameters": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
@@ -646,11 +645,10 @@ async def main(args):
     result["peak_rss_bytes"] = max((s["peak_rss_bytes"] for s in samples), default=0)
     result["phase_peak_rss_bytes"] = {name: max(s["rss_bytes"] for s in samples if s["phase"] == name)
                                       for name in sorted({s["phase"] for s in samples})}
-    result["views_startup_memory_budget"] = {
-        "name": "views-startup-memory", "gating": False,
-        "reference_bytes": int(args.views_startup_memory_mib * 2**20),
-        "observed_bytes": max((s["peak_rss_bytes"] for s in samples if s["phase"] == "startup"), default=0)
-                          if args.views == "on" else None}
+    result["checkout_startup_memory_budget"] = {
+        "name": "checkout-startup-memory", "gating": False,
+        "reference_bytes": int(args.checkout_startup_memory_mib * 2**20),
+        "observed_bytes": max((s["peak_rss_bytes"] for s in samples if s["phase"] == "startup"), default=0)}
     result["daemon_timings"] = client.timings
     result["index_events"] = client.events
     result["protocol_errors"] = client.protocol_errors
@@ -680,30 +678,29 @@ async def paired_matrix(args):
     matrix = {"schema_version": 1, "repository": original, "workload": inputs,
               "affinity": sorted(getattr(os, "sched_getaffinity")(0)), "cases": []}
     for transport in ("standalone", "subc"):
-        for views in ("off", "on"):
-            for label, binary in (("baseline", args.baseline), ("candidate", args.binary)):
-                warm_state = None
-                for phase in ("cold-alone", "in-process-warm", "warm-restart"):
-                    case = argparse.Namespace(**vars(args))
-                    case.baseline = None
-                    case.binary, case.label, case.transport, case.views = binary, label, transport, views
-                    case.phase = phase
-                    case.out = args.out / f"{transport}-{views}-{label}-{phase}"
-                    case.state = warm_state if phase == "warm-restart" else None
-                    if workload(args.repo) != inputs or git(args.repo, "rev-parse", "HEAD") != original["head"]:
-                        raise RuntimeError("paired subject or workload changed")
-                    code = await main(case)
-                    result = json.loads((case.out / "result.json").read_text())
-                    if phase == "in-process-warm":
-                        warm_state = Path(result["state"])
-                    matrix["cases"].append({"transport": transport, "views": views, "label": label,
-                        "phase": phase, "exit_code": code, "path": case.out.name,
-                        "binary_sha256": result["binary_sha256"], "summary": result["summary"],
-                        "readiness": result.get("readiness"), "binds": result.get("binds"),
-                        "phase_peak_rss_bytes": result["phase_peak_rss_bytes"],
-                        "views_startup_memory_budget": result["views_startup_memory_budget"]})
-                    # Checkpoint after each phase so a failed remote job keeps its completed cases.
-                    (args.out / "matrix.json").write_text(json.dumps(matrix, indent=2) + "\n")
+        for label, binary in (("baseline", args.baseline), ("candidate", args.binary)):
+            warm_state = None
+            for phase in ("cold-alone", "in-process-warm", "warm-restart"):
+                case = argparse.Namespace(**vars(args))
+                case.baseline = None
+                case.binary, case.label, case.transport = binary, label, transport
+                case.phase = phase
+                case.out = args.out / f"{transport}-{label}-{phase}"
+                case.state = warm_state if phase == "warm-restart" else None
+                if workload(args.repo) != inputs or git(args.repo, "rev-parse", "HEAD") != original["head"]:
+                    raise RuntimeError("paired subject or workload changed")
+                code = await main(case)
+                result = json.loads((case.out / "result.json").read_text())
+                if phase == "in-process-warm":
+                    warm_state = Path(result["state"])
+                matrix["cases"].append({"transport": transport, "label": label,
+                    "phase": phase, "exit_code": code, "path": case.out.name,
+                    "binary_sha256": result["binary_sha256"], "summary": result["summary"],
+                    "readiness": result.get("readiness"), "binds": result.get("binds"),
+                    "phase_peak_rss_bytes": result["phase_peak_rss_bytes"],
+                    "checkout_startup_memory_budget": result["checkout_startup_memory_budget"]})
+                # Checkpoint after each phase so a failed remote job keeps its completed cases.
+                (args.out / "matrix.json").write_text(json.dumps(matrix, indent=2) + "\n")
     return int(any(c["exit_code"] for c in matrix["cases"]))
 
 
@@ -809,7 +806,7 @@ class DeadlineTests(unittest.IsolatedAsyncioTestCase):
 
         self_test = self
         result = {}
-        args = argparse.Namespace(ready_timeout=.01, timeout=.01, views="on", phase="in-process-warm")
+        args = argparse.Namespace(ready_timeout=.01, timeout=.01, phase="in-process-warm")
         self.assertTrue(await wait_ready(Client(), args, [{}, {"search": {}, "callgraph": {}}], result))
         self.assertEqual(result["readiness"]["ready_s"]["semantic"], "disabled")
 
@@ -824,7 +821,7 @@ class DeadlineTests(unittest.IsolatedAsyncioTestCase):
                              {"success": False, "code": "callgraph_building"})
 
         result = {}
-        args = argparse.Namespace(ready_timeout=.01, timeout=.01, views="off", phase="steady")
+        args = argparse.Namespace(ready_timeout=.01, timeout=.01, phase="steady")
         self.assertFalse(await wait_ready(Client(), args, [{}, {"search": {}, "callgraph": {}}], result))
         self.assertIsNone(result["readiness"]["ready_s"]["callgraph"])
 
@@ -838,7 +835,7 @@ class DeadlineTests(unittest.IsolatedAsyncioTestCase):
                              "text": "[index: fallback]\ntrigram: building"}
 
         result = {}
-        args = argparse.Namespace(ready_timeout=.01, timeout=.01, views="off", phase="cold-alone")
+        args = argparse.Namespace(ready_timeout=.01, timeout=.01, phase="cold-alone")
         self.assertFalse(await wait_ready(Client(), args, [{}, {"search": {}, "callgraph": {}}], result))
         self.assertIsNone(result["readiness"]["ready_s"]["search"])
 

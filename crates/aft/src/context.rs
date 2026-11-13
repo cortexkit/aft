@@ -8208,15 +8208,6 @@ impl AppContext {
         self.daemonless_query_mode.load(Ordering::SeqCst)
     }
 
-    /// True when this root is borrow-only and `worktree.ram_overlay` is on.
-    ///
-    /// Search and symbol-cache watcher arms may then apply local edits to the
-    /// in-RAM trigram delta. Persist stays fail-closed: a borrow-only root
-    /// never writes the shared `cache.bin`, overlay or not.
-    pub fn ram_overlay_active(&self) -> bool {
-        self.shared_artifacts_read_only() && self.config().worktree.ram_overlay
-    }
-
     pub fn is_worktree_bridge(&self) -> bool {
         *self.is_worktree_bridge.lock()
     }

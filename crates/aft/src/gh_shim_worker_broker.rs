@@ -534,7 +534,13 @@ async fn write_reply<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     mut response: RelayReply,
 ) -> std::io::Result<()> {
-    if response.ok && response.data["isError"] == false {
+    // Lean Plexus replies omit `isError`; there a missing `error` member marks
+    // success, so the size cap applies to both reply forms.
+    let is_error = match response.data.get("isError") {
+        Some(flag) => flag != &Value::Bool(false),
+        None => response.data.get("error").is_some(),
+    };
+    if response.ok && !is_error {
         if let Some(result) = response.data.get("result") {
             let body = result.get("body").unwrap_or(result);
             let size = match body.as_str() {

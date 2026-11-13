@@ -74,7 +74,7 @@ where
     panic!("timed out waiting for {label}; last response: {last_response:?}");
 }
 
-fn exact_memo_watcher_content_changes(views: bool) {
+fn exact_memo_watcher_content_changes() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
     let project = tempfile::tempdir().expect("create project dir");
     let seed = project.path().join("seed.rs");
@@ -96,7 +96,6 @@ fn exact_memo_watcher_content_changes(views: bool) {
             "project_root": project.path(),
             "config": user_config(json!({
                 "indexes": { "trigram": true, "semantic": false },
-                "views": { "enabled": views },
             })),
         }),
     );
@@ -125,7 +124,7 @@ fn exact_memo_watcher_content_changes(views: bool) {
                 .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "watcher_pending"));
             if !pending {
                 eprintln!(
-                    "exact memo watcher views={views} {label}: {}",
+                    "exact memo watcher {label}: {}",
                     json!({
                         "results": response["results"],
                         "complete": response["complete"],
@@ -201,18 +200,13 @@ fn exact_memo_watcher_content_changes(views: bool) {
             vec!["created.rs", "edited.rs", "seed.rs"],
             vec!["created.rs", "edited.rs"],
         ],
-        "exact memo must follow accepted watcher changes (views={views})"
+        "exact memo must follow accepted watcher changes"
     );
 }
 
 #[test]
-fn exact_memo_real_watcher_views_off_content_changes() {
-    exact_memo_watcher_content_changes(false);
-}
-
-#[test]
-fn exact_memo_real_watcher_views_on_content_changes() {
-    exact_memo_watcher_content_changes(true);
+fn exact_memo_real_watcher_content_changes() {
+    exact_memo_watcher_content_changes();
 }
 
 #[cfg(debug_assertions)]

@@ -1,6 +1,8 @@
 //! Remote jobs use the ordinary task registry and its raw output artifacts.
 #[cfg(unix)]
 use super::*;
+#[cfg(unix)]
+use crate::commands::inspect::thousands;
 use crate::exec_remote::types::*;
 #[cfg(unix)]
 use crate::exec_remote::{
@@ -6011,10 +6013,10 @@ fn append_output_loss(metadata: &mut PersistedTask) {
 
 /// What the runner reported about the workspace after a remote run, printed
 /// after the command's output. Writes on the server are never copied back,
-/// so every change it reports is named. A kind of change the runner reported
-/// as empty says nothing; a kind it did not report says so, on its own line,
-/// instead of reading as "nothing changed". `None` when the command did not
-/// run remotely or there is nothing to say.
+/// so changes are listed with a folder summary for long lists. A kind of
+/// change the runner reported as empty says nothing; a kind it did not report
+/// says so, on its own line, instead of reading as "nothing changed". `None`
+/// when the command did not run remotely or there is nothing to say.
 #[cfg(unix)]
 pub(crate) fn remote_report(
     metadata: &crate::bash_background::persistence::PersistedTask,
@@ -6070,22 +6072,64 @@ fn render_terminal_report(terminal: &TerminalRecord, copied_back: &[&str]) -> Op
     let mut blocks: Vec<String> = Vec::new();
     let mut unreported: Vec<&str> = Vec::new();
 
-    let left_on_server = |paths: &'_ [String]| -> Vec<String> {
-        paths
-            .iter()
-            .filter(|path| !copied_back.contains(&path.as_str()))
-            .cloned()
-            .collect()
-    };
-    match terminal.workspace_changes.as_deref().map(left_on_server) {
-        Some(changes) if changes.is_empty() => {}
+    match &terminal.workspace_changes {
         Some(changes) => {
-            let mut block =
-                String::from("These files changed on the server and were NOT copied back:");
-            for changed in &changes {
-                block.push_str(&format!("\n  {}", path(changed)));
+            const PATH_LIMIT: usize = 20;
+            const GROUP_LIMIT: usize = 5;
+            let mut count = 0;
+            let mut listed = String::new();
+            let mut folders = std::collections::BTreeMap::<&str, usize>::new();
+            let mut elsewhere = 0;
+            // Only render the displayed prefix; the remainder needs folder counts, not lines.
+            for changed in changes
+                .iter()
+                .filter(|changed| !copied_back.contains(&changed.as_str()))
+            {
+                count += 1;
+                if count <= PATH_LIMIT {
+                    listed.push_str(&format!("\n  {}", path(changed)));
+                } else if let Some((folder, _)) = changed.split_once('/') {
+                    *folders.entry(folder).or_default() += 1;
+                } else {
+                    elsewhere += 1;
+                }
             }
-            blocks.push(block);
+            if count > 0 {
+                let mut block =
+                    String::from("These files changed on the server and were NOT copied back");
+                if count > PATH_LIMIT {
+                    block.push_str(&format!(" ({} files)", thousands(count as u64)));
+                }
+                block.push(':');
+                block.push_str(&listed);
+                if count > PATH_LIMIT {
+                    let mut groups: Vec<_> = folders.into_iter().collect();
+                    groups.sort_by(|(a, a_count), (b, b_count)| {
+                        b_count.cmp(a_count).then_with(|| a.cmp(b))
+                    });
+                    let mut summary = Vec::new();
+                    for (index, (folder, folder_count)) in groups.into_iter().enumerate() {
+                        if index < GROUP_LIMIT {
+                            summary.push(format!(
+                                "{} ({})",
+                                path(&format!("{folder}/")),
+                                thousands(folder_count as u64)
+                            ));
+                        } else {
+                            elsewhere += folder_count;
+                        }
+                    }
+                    if elsewhere > 0 {
+                        summary.push(format!("{} elsewhere", thousands(elsewhere as u64)));
+                    }
+                    block.push_str(&format!(
+                        "\n  and {} more: {}",
+                        thousands((count - PATH_LIMIT) as u64),
+                        summary.join(", ")
+                    ));
+                }
+                blocks.push(block);
+            }
         }
         None => unreported.push("changed files"),
     }

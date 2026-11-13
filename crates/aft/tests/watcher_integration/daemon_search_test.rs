@@ -18,7 +18,6 @@ struct Daemon {
     child: Child,
     stream: TcpStream,
     corr: u64,
-    views: bool,
 }
 
 impl Drop for Daemon {
@@ -37,16 +36,11 @@ async fn receive(stream: &mut TcpStream) -> Frame {
 }
 
 impl Daemon {
-    async fn start(root: &Path, state: &Path, views: bool) -> Self {
-        Self::start_with_attach_gate(root, state, views, None).await
+    async fn start(root: &Path, state: &Path) -> Self {
+        Self::start_with_attach_gate(root, state, None).await
     }
 
-    async fn start_with_attach_gate(
-        root: &Path,
-        state: &Path,
-        views: bool,
-        gate: Option<&Path>,
-    ) -> Self {
+    async fn start_with_attach_gate(root: &Path, state: &Path, gate: Option<&Path>) -> Self {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -74,7 +68,6 @@ impl Daemon {
             json!({
                 "storage_dir": state.join("storage"),
                 "indexes": {"trigram": true, "semantic": false, "callgraph": false},
-                "views": {"enabled": views},
                 "git": {"co_author": "off"},
                 "bash": {"shell": "/bin/bash"},
             })
@@ -179,7 +172,6 @@ impl Daemon {
             child,
             stream,
             corr: 10,
-            views,
         }
     }
 
@@ -252,14 +244,12 @@ async fn wait_visible(daemon: &mut Daemon, relative: &str, marker: &str, timeout
         if data["index_status"] == "Ready"
             && data["total_matches"] == 1
             && search_found
-            && (!daemon.views || data["complete"] == true)
+            && data["complete"] == true
         {
-            if daemon.views {
-                assert_eq!(
-                    data["files_read_directly"], 0,
-                    "views must serve the index: {grep}"
-                );
-            }
+            assert_eq!(
+                data["files_read_directly"], 0,
+                "checkout index must serve the answer: {grep}"
+            );
             return;
         }
         assert!(
@@ -272,15 +262,10 @@ async fn wait_visible(daemon: &mut Daemon, relative: &str, marker: &str, timeout
 
 #[tokio::test]
 async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
-    external_changes_reach_indexed_grep_and_search(false).await;
+    external_changes_reach_indexed_grep_and_search().await;
 }
 
-#[tokio::test]
-async fn bound_daemon_views_on_external_changes_reach_indexed_grep_and_search() {
-    external_changes_reach_indexed_grep_and_search(true).await;
-}
-
-async fn external_changes_reach_indexed_grep_and_search(views: bool) {
+async fn external_changes_reach_indexed_grep_and_search() {
     let _serial = crate::helpers::watcher_serial_lock();
     let project = tempfile::tempdir().unwrap();
     let root = project.path();
@@ -317,7 +302,7 @@ async fn external_changes_reach_indexed_grep_and_search(views: bool) {
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "add crate"]);
     git(root, &["checkout", "-q", "-"]);
-    let mut daemon = Daemon::start(root, state.path(), views).await;
+    let mut daemon = Daemon::start(root, state.path()).await;
     assert_visible(
         &mut daemon,
         "crates/old/src/lib.rs",
@@ -423,9 +408,7 @@ async fn external_changes_reach_indexed_grep_and_search(views: bool) {
             && data["complete"] == true
             && data["total_matches"] == 2050
         {
-            if views {
-                assert_eq!(data["files_read_directly"], 0, "{result}");
-            }
+            assert_eq!(data["files_read_directly"], 0, "{result}");
             break;
         }
         assert!(
@@ -449,7 +432,7 @@ async fn external_changes_reach_indexed_grep_and_search(views: bool) {
         "{after_large}"
     );
     println!(
-        "daemon_arrivals views={views} small_rescans=0 large_rescans={} large_walk_fallbacks={}",
+        "daemon_arrivals small_rescans=0 large_rescans={} large_walk_fallbacks={}",
         rescan_total(&after_large) - rescan_total(&after_small),
         after_large["directory_walk_fallbacks_total"]
             .as_u64()
@@ -546,7 +529,7 @@ async fn bound_daemon_index_readiness_does_not_imply_watcher_readiness() {
     .unwrap();
     let gate = state.path().join("watcher-attach.hold");
     std::fs::write(&gate, b"hold").unwrap();
-    let mut daemon = Daemon::start_with_attach_gate(root, state.path(), true, Some(&gate)).await;
+    let mut daemon = Daemon::start_with_attach_gate(root, state.path(), Some(&gate)).await;
     assert_visible(&mut daemon, "crates/old/src/lib.rs", "watcher_startup_seed").await;
     let held_deadline = Instant::now() + Duration::from_secs(15);
     while !gate.with_extension("waiting").exists() {
@@ -593,7 +576,7 @@ async fn bound_daemon_index_readiness_does_not_imply_watcher_readiness() {
 
 #[cfg(feature = "test-timing-hooks")]
 #[tokio::test]
-async fn bound_daemon_views_on_file_changes_before_registration_are_not_complete_misses() {
+async fn bound_daemon_file_changes_before_registration_are_not_complete_misses() {
     let _serial = crate::helpers::watcher_serial_lock();
     let project = tempfile::tempdir().unwrap();
     let root = project.path();
@@ -603,7 +586,7 @@ async fn bound_daemon_views_on_file_changes_before_registration_are_not_complete
     std::fs::write(&indexed, "// indexed_before_attach_seed\n").unwrap();
     let gate = state.path().join("file-window-attach.hold");
     std::fs::write(&gate, b"hold").unwrap();
-    let mut daemon = Daemon::start_with_attach_gate(root, state.path(), true, Some(&gate)).await;
+    let mut daemon = Daemon::start_with_attach_gate(root, state.path(), Some(&gate)).await;
     assert_visible(
         &mut daemon,
         "crates/old/src/lib.rs",

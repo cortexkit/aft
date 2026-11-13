@@ -8,6 +8,8 @@ use super::{
 };
 
 pub(super) const FLOW_OPERATIONS: &[&str] = &[super::diagnostics_findings::OPERATION];
+/// Management queries whose reply is a stream that ends only on cancel.
+const SHELLS_STREAM_OPERATIONS: &[&str] = &["shells.watch", "shells.output"];
 
 pub(super) fn is_bash_family_tool(name: &str) -> bool {
     name == "bash" || name == "powershell" || name.starts_with("bash_")
@@ -719,6 +721,16 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 concurrency: Concurrency::ModuleManaged,
             },
         ])
+        // shells/v1's watch and output replies are streams that stay open
+        // until the caller cancels. Declaring them as watches lets the daemon
+        // catalog say so, and Callosum relays a phone subscription only to an
+        // operation declared this way.
+        .operation_delivery(
+            SHELLS_STREAM_OPERATIONS
+                .iter()
+                .map(|op| ((*op).to_owned(), subc_protocol::manifest::OperationDelivery::Watch))
+                .collect(),
+        )
         .flow_operations(Some(
             FLOW_OPERATIONS.iter().map(|op| (*op).to_owned()).collect(),
         ))
@@ -1002,6 +1014,23 @@ mod tests {
                 "shells/v1",
                 "user-commands/v1"
             ]))
+        );
+    }
+
+    #[test]
+    fn shells_streams_are_declared_watches_and_nothing_else_is() {
+        let manifest = build_manifest_for_host(true);
+        for op in ["shells.watch", "shells.output"] {
+            assert!(manifest.is_watch_operation(op), "{op} must be a watch");
+        }
+        for op in ["shells.list", "aft.status", "commands.describe"] {
+            assert!(!manifest.is_watch_operation(op), "{op} is unary");
+        }
+        assert_eq!(manifest.operation_delivery.len(), 2);
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            wire["operation_delivery"],
+            json!({"shells.output": "watch", "shells.watch": "watch"})
         );
     }
 
@@ -1379,6 +1408,13 @@ mod tests {
             top.insert(
                 "flow_operations".to_owned(),
                 json!(["diagnostics.findings"])
+            ),
+            None
+        );
+        assert_eq!(
+            top.insert(
+                "operation_delivery".to_owned(),
+                json!({"shells.output": "watch", "shells.watch": "watch"})
             ),
             None
         );

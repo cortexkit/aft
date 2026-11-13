@@ -398,7 +398,6 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
         storage_dir: Some(storage.path().to_path_buf()),
         ..aft::config::Config::default()
     };
-    config.views.enabled = false;
     config.indexes.trigram = false;
     config.indexes.semantic = false;
     config.indexes.callgraph = false;
@@ -414,7 +413,6 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
         "project_root": root, "storage_dir": storage.path(),
         "config": crate::helpers::user_config(json!({
             "indexes": {"trigram": false, "semantic": false, "callgraph": false},
-            "views": {"enabled": false}
         }))
     }))
     .unwrap();

@@ -278,7 +278,7 @@ struct Address {
     worker: bool,
 }
 
-fn concrete_route_harness(owner: &crate::bash_background::TaskIdentity) -> Option<String> {
+fn concrete_route_harness(principal: Option<&str>, session: &str) -> Option<String> {
     let mut routes = BOUND_ROUTES.get_or_init(Default::default).lock().unwrap();
     routes.retain(|_, route| route.strong_count() > 0);
     let mut harness = None;
@@ -292,7 +292,7 @@ fn concrete_route_harness(owner: &crate::bash_background::TaskIdentity) -> Optio
         else {
             continue;
         };
-        if principal_id != &owner.principal || session_id != &owner.session || raw == "runner" {
+        if principal_id.as_deref() != principal || session_id != session || raw == "runner" {
             continue;
         }
         if harness.as_ref().is_some_and(|previous| previous != raw) {
@@ -302,6 +302,23 @@ fn concrete_route_harness(owner: &crate::bash_background::TaskIdentity) -> Optio
         harness = Some(raw.clone());
     }
     harness
+}
+
+/// Resolve the concrete host used when binding back to a runner session.
+/// The `reserved:broca` principal maps the legacy `runner` label to `broca`;
+/// other principals need an unambiguous live binding before the host is known.
+pub(super) fn concrete_runner_harness(
+    principal: Option<&str>,
+    session: &str,
+    raw_harness: &str,
+) -> Option<String> {
+    if raw_harness != "runner" {
+        Some(raw_harness.to_owned())
+    } else if principal == Some("reserved:broca") {
+        Some("broca".into())
+    } else {
+        concrete_route_harness(principal, session)
+    }
 }
 
 pub(super) fn route_unbound(route: &RouteIdentity) {
@@ -327,13 +344,8 @@ impl Address {
             .as_deref()?
             .strip_prefix("reserved:")?
             .to_string();
-        let raw_harness = if raw_harness != "runner" {
-            raw_harness
-        } else if module == "broca" {
-            "broca".into()
-        } else {
-            concrete_route_harness(owner)?
-        };
+        let raw_harness =
+            concrete_runner_harness(owner.principal.as_deref(), &owner.session, &raw_harness)?;
         Some(Self {
             worker: module == "broca"
                 || stamp.is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker),
@@ -650,11 +662,53 @@ fn deliver(
                 log::warn!("runner notice {send_id} retired: retry budget exhausted");
                 return Next::Done;
             }
-            Next::Retry(Duration::from_millis(
-                (250u64 << attempt.min(8)).min(60_000),
-            ))
+            Next::Retry(retry_delay(attempt))
         }
     }
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis((250u64 << attempt.min(8)).min(60_000))
+}
+
+pub(crate) fn retry_held_notice_fallback(
+    registry: crate::bash_background::BgTaskRegistry,
+    task: String,
+    key: crate::db::call_ledger::Key,
+) {
+    let Some(scheduler) = scheduler() else {
+        log::warn!(
+            "held notice fallback retry scheduler unavailable task={task} call_key={}",
+            key.call_key
+        );
+        return;
+    };
+    let mut attempt = 0;
+    let id = format!("aft:bash-recovery:{task}");
+    let work: Work = Box::new(move || {
+        if registry.retry_held_notice_fallback(&task, &key) {
+            Next::Done
+        } else {
+            let delay = retry_delay(attempt);
+            attempt = attempt.saturating_add(1);
+            Next::Retry(delay)
+        }
+    });
+    // A durable held call must not lose its only terminal retry when the
+    // best-effort notice queue is full. Keep one retry per persisted task.
+    scheduler
+        .entries
+        .lock()
+        .unwrap()
+        .entry(id)
+        .or_insert_with(|| Scheduled {
+            work: Some(work),
+            due: std::time::Instant::now(),
+            completion: false,
+            retrying: false,
+            expedite: false,
+        });
+    scheduler.wake.notify_all();
 }
 
 #[cfg(test)]
@@ -1093,7 +1147,18 @@ fn offer(
                             return retry(FailureClass::Persistence, error);
                         }
                     }
-                    let outcome = runtime.block_on(send(&path, &address, &request));
+                    let send_request = |request: &SendRequest| {
+                        if completion {
+                            registry
+                                .send_runner_completion(&task_id, || {
+                                    runtime.block_on(send(&path, &address, request))
+                                })
+                                .unwrap_or(Outcome::Accepted)
+                        } else {
+                            runtime.block_on(send(&path, &address, request))
+                        }
+                    };
+                    let outcome = send_request(&request);
                     if completion && !address.worker {
                         if let Some(request) = idle_start_fallback(&request, &outcome) {
                             // A delivery refusal records no send_id on the runner, so the
@@ -1110,7 +1175,7 @@ fn offer(
                                 "runner notice task={task_id} session={} retrying without idle_start after delivery refusal",
                                 owner.session
                             );
-                            return runtime.block_on(send(&path, &address, &request));
+                            return send_request(&request);
                         }
                     }
                     outcome

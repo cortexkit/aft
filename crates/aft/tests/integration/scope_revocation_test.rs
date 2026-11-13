@@ -2497,10 +2497,8 @@ fn worker_codemode_background_task_is_private_to_its_catalog_bound_route() {
                 let catalog = read_frame_timeout(&mut daemon.stream, "worker catalog").await;
                 assert_eq!(catalog.header.ty, FrameType::Response, "{catalog:?}");
             }
-            // Closing Broca's route leaves its saved catalog binding available.
-            // Only the scope owner's route stays live, avoiding conflicting spawn authority.
-            send_route_goodbye(&mut daemon.stream, 2, 104).await;
-            no_extra_frames_until_pong(&mut daemon.stream, 105, "worker host detached").await;
+            // Both routes stay live while the run starts. The owner's route is
+            // core's lease and is never a run owner, so Broca's route owns the run.
             bind_route_as(
                 &mut daemon.stream,
                 &daemon.root1,

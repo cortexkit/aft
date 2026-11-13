@@ -656,7 +656,6 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
         "project_root": root, "storage_dir": storage.path(),
         "config": super::helpers::user_config(json!({
             "indexes": {"trigram": true, "semantic": true, "callgraph": true},
-            "views": {"enabled": true}
         }))
     });
     let response = aft.send(&bind.to_string());

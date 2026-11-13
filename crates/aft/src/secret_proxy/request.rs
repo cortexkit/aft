@@ -13,6 +13,7 @@ use secret_rules::material::{check_admissible, encode_for_location};
 use secret_rules::target::{authority_matches_connect, normalize_request_target, ConnectAuthority};
 use zeroize::Zeroizing;
 
+use super::diagnostics::{log_refusal, Reason, Refusal};
 use super::{full, refusal, Body, State};
 
 pub(super) async fn forward(
@@ -40,13 +41,23 @@ pub(super) async fn forward(
     let result = if let Some(lease) = &lease {
         prepare_and_send(request, &authority, &state, lease.clone(), &mut audit).await
     } else {
-        Err(String::new())
+        Err(Refusal::new(Reason::RequestLimit))
     };
-    if let Err(label) = &result {
-        audit.refused_for(label);
+    if let Err(error) = &result {
+        let label = if error.label.is_empty() {
+            fallback
+        } else {
+            &error.label
+        };
+        log_refusal(&state, error.reason, label, &authority.host);
+        audit.refused_for(&error.label);
     }
-    let response = result.unwrap_or_else(|label| {
-        let label = if label.is_empty() { fallback } else { &label };
+    let response = result.unwrap_or_else(|error| {
+        let label = if error.label.is_empty() {
+            fallback
+        } else {
+            &error.label
+        };
         let bytes = Zeroizing::new(format!(
             "{}: {label} ({})\n",
             super::PROXY_REFUSAL,
@@ -82,10 +93,13 @@ async fn prepare_and_send(
     state: &Arc<State>,
     lease: Arc<tokio::sync::OwnedSemaphorePermit>,
     audit: &mut super::audit::RequestAudit<'_>,
-) -> Result<Response<Body>, String> {
-    let fail = || String::new();
-    if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
-        return Err(fail());
+) -> Result<Response<Body>, Refusal> {
+    let fail = || Refusal::new(Reason::InvalidRequest);
+    if state.stopped.load(Ordering::Acquire) {
+        return Err(Refusal::new(Reason::Stopped));
+    }
+    if !state.generation_valid() {
+        return Err(Refusal::new(Reason::GenerationInvalid));
     }
     let target = request
         .uri()
@@ -106,7 +120,10 @@ async fn prepare_and_send(
         &target,
     )
     .is_err()
-        || request.uri().scheme_str().is_some_and(|s| s != "https")
+    {
+        return Err(Refusal::new(Reason::HostMismatch));
+    }
+    if request.uri().scheme_str().is_some_and(|s| s != "https")
         || (request.version() != Version::HTTP_2 && request.uri().authority().is_some())
     {
         return Err(fail());
@@ -133,7 +150,10 @@ async fn prepare_and_send(
                         .iter()
                         .any(|label| label == placeholder.label)
                     {
-                        return Err(placeholder.label.to_owned());
+                        return Err(Refusal::for_label(
+                            Reason::UnscannedLabel,
+                            placeholder.label,
+                        ));
                     }
                 }
             }
@@ -149,10 +169,10 @@ async fn prepare_and_send(
     let mut body = body_buffer(has_json);
     if has_json {
         while let Some(frame) = incoming.frame().await {
-            let frame = frame.map_err(|_| fail())?;
+            let frame = frame.map_err(|_| Refusal::new(Reason::BodyInvalid))?;
             if let Some(data) = frame.data_ref() {
                 if body.len().saturating_add(data.len()) > 1024 * 1024 {
-                    return Err(fail());
+                    return Err(Refusal::new(Reason::BodyInvalid));
                 }
                 if body.len() + data.len() > body.capacity() {
                     let mut grown = Zeroizing::new(Vec::with_capacity(
@@ -164,7 +184,7 @@ async fn prepare_and_send(
                 body.extend_from_slice(data);
             }
             if frame.trailers_ref().is_some() {
-                return Err(fail());
+                return Err(Refusal::new(Reason::BodyInvalid));
             }
         }
     }
@@ -197,7 +217,8 @@ async fn prepare_and_send(
         .collect();
     let structure = RequestView::new(&target, headers).with_body(&body);
     if has_json && !labels.is_empty() {
-        secret_rules::location::validate_json_request(&structure).map_err(|_| fail())?;
+        secret_rules::location::validate_json_request(&structure)
+            .map_err(|_| Refusal::new(Reason::BodyInvalid))?;
     }
     if evaluate_request_with_connect(&structure, authority, &[], &[])
         .refusal
@@ -271,18 +292,21 @@ async fn prepare_and_send(
                 | crate::secret::requests::UseError::Cancelled
                 | crate::secret::requests::UseError::Unavailable),
             ) => return Ok(not_approved(label, &authority.host, state, reason)),
-            Err(_) => return Err(label.clone()),
+            Err(crate::secret::requests::UseError::InvalidPlan(_)) => {
+                return Err(Refusal::for_label(Reason::LocationMismatch, label))
+            }
+            Err(_) => return Err(Refusal::for_label(Reason::VaultUnavailable, label)),
         };
         match answer {
             crate::secret::UseAnswer::NotFound => continue,
             crate::secret::UseAnswer::Released(released) => {
                 let (location, material) = released.into_parts();
                 let location = secret_rules::location::parse_vault_location(&location)
-                    .ok_or_else(|| label.clone())?;
+                    .ok_or_else(|| Refusal::for_label(Reason::LocationMismatch, label))?;
                 // Without a pending card, the vault reveals a deposit location only
                 // when releasing its key, so location-dependent refusals can follow that release.
                 let rule = secret_rules::location::LabelRule {
-                    label: label.clone(),
+                    label: label.to_string(),
                     host: addressed.host.clone(),
                     port: authority.port,
                     path_prefix: addressed.path.clone(),
@@ -294,7 +318,7 @@ async fn prepare_and_send(
                     .map(|(n, v)| HeaderField::value(n.as_str(), v.as_bytes()))
                     .collect();
                 let view = RequestView::new(&target, headers).with_body(&body);
-                let dummy = [(label.clone(), b"proxy-planning-value-0000".to_vec())];
+                let dummy = [(label.to_string(), b"proxy-planning-value-0000".to_vec())];
                 if evaluate_request_with_connect(
                     &view,
                     authority,
@@ -304,17 +328,17 @@ async fn prepare_and_send(
                 .refusal
                 .is_some()
                 {
-                    return Err(label.clone());
+                    return Err(Refusal::for_label(Reason::LocationMismatch, label));
                 }
                 check_admissible(material.expose(), label, &rule.location)
-                    .map_err(|_| label.clone())?;
+                    .map_err(|_| Refusal::for_label(Reason::MaterialInvalid, label))?;
                 state
                     .install(label, material.expose())
-                    .map_err(|_| label.clone())?;
+                    .map_err(|_| Refusal::for_label(Reason::MaterialInstall, label))?;
                 rules.push(rule);
                 materials.push(Some(material));
             }
-            _ => return Err(label.clone()),
+            _ => return Err(Refusal::for_label(Reason::VaultUnavailable, label)),
         }
     }
     let headers = parts
@@ -331,14 +355,15 @@ async fn prepare_and_send(
         .collect();
     let plan = evaluate_request_with_connect(&view, authority, &rules, &dummy);
     if plan.refusal.is_some() {
-        return Err(fail());
+        return Err(Refusal::new(Reason::LocationMismatch));
     }
     if has_json {
-        let json: serde_json::Value = serde_json::from_slice(&body).map_err(|_| fail())?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| Refusal::new(Reason::BodyInvalid))?;
         for rule in &rules {
             if let Location::Json(pointer) = &rule.location {
                 if json.pointer(pointer).is_some_and(|v| !v.is_string()) {
-                    return Err(rule.label.clone());
+                    return Err(Refusal::for_label(Reason::LocationMismatch, &rule.label));
                 }
             }
         }
@@ -360,10 +385,12 @@ async fn prepare_and_send(
                 ..
             } = outcome
             {
-                let material = material.as_ref().ok_or_else(fail)?;
+                let material = material
+                    .as_ref()
+                    .ok_or_else(|| Refusal::new(Reason::MaterialInvalid))?;
                 let encoded = Zeroizing::new(
                     encode_for_location(material.expose(), &rule.label, &rule.location)
-                        .map_err(|_| rule.label.clone())?,
+                        .map_err(|_| Refusal::for_label(Reason::MaterialInvalid, &rule.label))?,
                 );
                 match &rule.location {
                     Location::Query(_) => query_edits.push((*byte_start, *byte_end, encoded)),
@@ -450,21 +477,31 @@ async fn prepare_and_send(
                 }),
             Ordering::Release,
         );
-        if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
-            return Err(fail());
+        if state.stopped.load(Ordering::Acquire) {
+            return Err(Refusal::new(Reason::Stopped));
         }
-        audit.decide(&rules, &plan.labels)?;
-        if state.stopped.load(Ordering::Acquire) || !state.generation_valid() {
-            return Err(fail());
+        if !state.generation_valid() {
+            return Err(Refusal::new(Reason::GenerationInvalid));
+        }
+        audit
+            .decide(&rules, &plan.labels)
+            .map_err(|label| Refusal::for_label(Reason::AuditFailed, &label))?;
+        if state.stopped.load(Ordering::Acquire) {
+            return Err(Refusal::new(Reason::Stopped));
+        }
+        if !state.generation_valid() {
+            return Err(Refusal::new(Reason::GenerationInvalid));
         }
         let response = upstream.send(outbound);
         drop(materials);
         response
     };
-    let response = response.await.map_err(|_| fail())?;
+    let response = response
+        .await
+        .map_err(|_| Refusal::new(Reason::UpstreamSend))?;
     super::response::forward(response, state.clone(), client_upgrade, lease)
         .await
-        .map_err(|_| fail())
+        .map_err(|_| Refusal::new(Reason::ResponseInvalid))
 }
 
 fn not_approved(
@@ -477,9 +514,10 @@ fn not_approved(
         label, host, reason,
     ));
     let mut response = Response::new(full(Bytes::from(
-        state
-            .scrub(body.as_bytes())
-            .unwrap_or_else(|_| super::PROXY_REFUSAL.as_bytes().to_vec()),
+        state.scrub(body.as_bytes()).unwrap_or_else(|_| {
+            log_refusal(state, Reason::ScrubFailed, label, host);
+            super::PROXY_REFUSAL.as_bytes().to_vec()
+        }),
     )));
     *response.status_mut() = hyper::StatusCode::FORBIDDEN;
     response
@@ -534,14 +572,14 @@ pub(super) fn body_buffer(_has_json: bool) -> Zeroizing<Vec<u8>> {
 fn apply_edits(
     input: &[u8],
     edits: &mut [(usize, usize, Zeroizing<Vec<u8>>)],
-) -> Result<Zeroizing<Vec<u8>>, String> {
+) -> Result<Zeroizing<Vec<u8>>, Refusal> {
     edits.sort_by_key(|e| e.0);
     let capacity = input.len() + edits.iter().map(|e| e.2.len()).sum::<usize>();
     let mut out = Zeroizing::new(Vec::with_capacity(capacity));
     let mut cursor = 0;
     for (start, end, value) in edits {
         if *start < cursor || *start > *end || *end > input.len() {
-            return Err(String::new());
+            return Err(Refusal::new(Reason::InvalidRequest));
         }
         out.extend_from_slice(&input[cursor..*start]);
         out.extend_from_slice(value);
@@ -587,8 +625,7 @@ async fn connect_upstream(
     authority: &ConnectAuthority,
     state: &State,
     websocket: bool,
-) -> Result<Upstream, String> {
-    let fail = || String::new();
+) -> Result<Upstream, Refusal> {
     let socket = tokio::time::timeout(state.idle_timeout(), async {
         #[cfg(test)]
         {
@@ -600,8 +637,8 @@ async fn connect_upstream(
         tokio::net::TcpStream::connect((super::network_host(&authority.host), authority.port)).await
     })
     .await
-    .map_err(|_| fail())?
-    .map_err(|_| fail())?;
+    .map_err(|_| Refusal::new(Reason::UpstreamConnectTimeout))?
+    .map_err(|_| Refusal::new(Reason::UpstreamConnect))?;
     let socket = super::limits::IdleIo::new(socket, state.idle_timeout());
     let mut config = state.upstream.clone();
     config.alpn_protocols = if websocket {
@@ -611,16 +648,16 @@ async fn connect_upstream(
     };
     let name =
         rustls::pki_types::ServerName::try_from(super::network_host(&authority.host).to_owned())
-            .map_err(|_| fail())?;
+            .map_err(|_| Refusal::new(Reason::UpstreamTls))?;
     let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(name, socket)
         .await
-        .map_err(|_| fail())?;
+        .map_err(|_| Refusal::new(Reason::UpstreamTls))?;
     if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
         let (sender, connection) =
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
                 .await
-                .map_err(|_| fail())?;
+                .map_err(|_| Refusal::new(Reason::UpstreamHttp))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -628,7 +665,7 @@ async fn connect_upstream(
     } else {
         let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
             .await
-            .map_err(|_| fail())?;
+            .map_err(|_| Refusal::new(Reason::UpstreamHttp))?;
         tokio::spawn(async move {
             let _ = connection.with_upgrades().await;
         });

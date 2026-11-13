@@ -617,69 +617,6 @@ pub fn normalize_git_co_author(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-pub const DEFAULT_VIEWS_CALLGRAPH_COPIES: u32 = 4;
-pub const MAX_VIEWS_CALLGRAPH_COPIES: u32 = 256;
-
-/// Content-addressed index view assembly.
-///
-/// Both keys are removed from the documented configuration: the per-repository
-/// data store replaces views, so they no longer have anything to choose. A
-/// config file that sets them gets a removal notice (see
-/// [`crate::feature_config::REMOVED_DATA_LAYER_PATHS`]), and `doctor --fix`
-/// deletes them. Until the views code is deleted, the values a file supplies
-/// still reach these fields, so the views route keeps working for its tests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ViewsConfig {
-    /// Enable manifest-backed index views. Default false.
-    pub enabled: bool,
-    /// How many checkouts of one repository keep their own call graph,
-    /// besides the main checkout. Another checkout reads the main checkout's
-    /// graph and its answers say which of its files differ. 0 makes every
-    /// other checkout read the main checkout's graph.
-    pub callgraph_copies: u32,
-}
-
-impl Default for ViewsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            callgraph_copies: DEFAULT_VIEWS_CALLGRAPH_COPIES,
-        }
-    }
-}
-
-/// Borrow-only checkout behavior that never writes shared on-disk artifacts.
-///
-/// `worktree.ram_overlay` is removed from the documented configuration like
-/// the `views` keys above: with one data store per repository every checkout
-/// has its own state, so there is no borrowed snapshot to patch. Until the
-/// code that serves a worktree from another checkout's indexes is deleted, a
-/// value a file supplies still reaches it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WorktreeConfig {
-    /// When true (the default), a borrow-only root (a linked worktree, or a
-    /// clone or copy of a repository whose live checkout owns the shared
-    /// artifacts) compares the borrowed search snapshot with its own files
-    /// before reporting ready, then applies its own file-watcher events to the
-    /// in-RAM trigram delta and invalidates the symbol cache so search
-    /// reflects local edits. Semantic embeddings are added only for files
-    /// changed after bind, and the callgraph stays frozen. Never persists to the
-    /// shared `cache.bin`.
-    ///
-    /// Setting it false serves the borrowed snapshot as it is, which lists the
-    /// owner's files instead of this checkout's. It remains only as an escape
-    /// hatch while the new default is tried in daily use.
-    pub ram_overlay: bool,
-}
-
-impl Default for WorktreeConfig {
-    fn default() -> Self {
-        Self { ram_overlay: true }
-    }
-}
-
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 /// Which reranker, if any, reorders the head of `aft_search` results.
@@ -1031,8 +968,6 @@ pub struct Config {
     pub indexes: IndexesConfig,
     /// User-tier standing roots. Empty by default, so normal session indexing is unchanged.
     pub index: IndexConfig,
-    /// Content-addressed index view assembly. Disabled by default.
-    pub views: ViewsConfig,
     /// Whether `aft_search` is registered, which is exactly "`aft_search` is not
     /// in `disabled_tools`". It is derived from the resolved disabled list and
     /// says nothing about index state or backend presence. Used only to pick
@@ -1079,8 +1014,6 @@ pub struct Config {
     pub search: SearchConfig,
     pub inspect: InspectConfig,
     pub backup: BackupConfig,
-    /// Linked-worktree RAM overlay. Default on; see [`WorktreeConfig`].
-    pub worktree: WorktreeConfig,
     /// Resolved GitHub integration gates. User configuration only.
     pub github: GithubConfig,
     /// Binary configuration for the managed `gh` shim (no enable state).
@@ -1178,7 +1111,6 @@ impl Default for Config {
             restrict_to_project_root: false,
             indexes: IndexesConfig::default(),
             index: IndexConfig::default(),
-            views: ViewsConfig::default(),
             aft_search_registered: true,
             callgraph_chunk_size: 100,
             experimental_bash_rewrite: false,
@@ -1197,7 +1129,6 @@ impl Default for Config {
             search: SearchConfig::default(),
             inspect: InspectConfig::default(),
             backup: BackupConfig::default(),
-            worktree: WorktreeConfig::default(),
             github: GithubConfig::default(),
             gh_shim: GhShimConfig::default(),
 

@@ -2,7 +2,7 @@
   "name": "@cortexkit/aft-opencode",
   "version": "0.64.0",
   "type": "module",
-  "description": "OpenCode plugin for Agent File Tools (AFT) — tree-sitter and lsp powered code analysis",
+  "description": "OpenCode plugin for Agent Foundational Toolkit (AFT) — tree-sitter and lsp powered code analysis",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "license": "MIT",

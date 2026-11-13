@@ -213,11 +213,10 @@ def run(args):
     cpu_by_repeat = []
     # Scratch lives inside the checkout: give the copy its own Git root at the
     # evidence commit rather than inheriting the build checkout's identity.
-    with runtime_evidence_tree(tree, views_enabled=True) as root, \
+    with runtime_evidence_tree(tree) as root, \
             vector_server(pack["vectors"], str(pack["embed_template_version"]), output / "vectors.log") as vectors, \
             rerank_server() as reranker:
         config = {
-            "views": {"enabled": False},
             "inspect": {"enabled": False},
             "indexes": {"trigram": True, "semantic": True, "callgraph": False},
             "lsp": {"auto_install": False},

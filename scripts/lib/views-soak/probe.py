@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Reads pre-0.64 view storage; does not run against AFT 0.64 or later.
 """Parity and storage-accounting probe for a configured views-soak root."""
 
 from __future__ import annotations
@@ -244,10 +245,6 @@ def main(argv: list[str]) -> int:
     if not binary.is_file() or not binary.stat().st_mode & 0o111:
         raise SoakError(f"placed AFT binary is missing or not executable: {binary}")
     root, scope = resolve_root(args.root)
-    project_config = read_jsonc(root / ".cortexkit" / "aft.jsonc")
-    views = project_config.get("views")
-    if not isinstance(views, dict) or views.get("enabled") is not True:
-        raise SoakError(f"views.enabled is not true in {root}/.cortexkit/aft.jsonc")
     head = git_text(root, "rev-parse", "HEAD")
 
     accounting = view_accounting(storage, root, scope)
@@ -315,13 +312,13 @@ def main(argv: list[str]) -> int:
         ],
         "query_count": len(queries),
         "readiness": {
-            "views_on_daemon_ms": root_warmup["elapsed_ms"],
-            "views_off_baseline_ms": baseline_warmup["elapsed_ms"],
+            "source_daemon_ms": root_warmup["elapsed_ms"],
+            "independent_clone_ms": baseline_warmup["elapsed_ms"],
             "baseline_storage": str(baseline_storage),
         },
         "measurement_subjects": {
-            "views_on": "running_subc_daemon",
-            "views_off": "standalone_owned_baseline",
+            "source_checkout": "running_subc_daemon",
+            "independent_clone": "standalone_owned_baseline",
         },
         "parity": parity,
         "divergence": divergence,

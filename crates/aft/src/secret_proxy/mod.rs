@@ -53,6 +53,7 @@
 //! length limit.
 
 mod audit;
+mod diagnostics;
 mod limits;
 mod peer;
 mod request;
@@ -197,6 +198,8 @@ pub(crate) struct State {
     test_idle_timeout_ms: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     test_upstream: Mutex<std::collections::HashMap<String, SocketAddr>>,
+    #[cfg(test)]
+    test_refusals: Mutex<Vec<String>>,
 }
 
 impl State {
@@ -418,6 +421,8 @@ impl SecretProxy {
             test_idle_timeout_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_upstream: Mutex::default(),
+            #[cfg(test)]
+            test_refusals: Mutex::default(),
         });
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|_| ProxyError::Initialization)?;
@@ -579,34 +584,56 @@ async fn connect(
     state: Arc<State>,
     lease: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
-    let refused = || refusal("", "");
-    if request.method() != Method::CONNECT || state.stopped.load(Ordering::Acquire) {
-        return Ok(refused());
+    use diagnostics::Reason;
+    let host = request
+        .uri()
+        .authority()
+        .and_then(|value| ConnectAuthority::parse(value.as_str()).ok())
+        .map(|authority| authority.host)
+        .unwrap_or_default();
+    let refused = |reason| {
+        diagnostics::log_refusal(
+            &state,
+            reason,
+            state
+                .config
+                .scanned_labels
+                .first()
+                .map_or("", String::as_str),
+            &host,
+        );
+        refusal("", "")
+    };
+    if request.method() != Method::CONNECT {
+        return Ok(refused(Reason::ConnectMethod));
+    }
+    if state.stopped.load(Ordering::Acquire) {
+        return Ok(refused(Reason::Stopped));
     }
     let mut credentials = request.headers().get_all("proxy-authorization").iter();
     if credentials.next().map(|v| v.as_bytes()) != Some(state.expected_auth.as_slice())
         || credentials.next().is_some()
     {
-        return Ok(refused());
+        return Ok(refused(Reason::ProxyAuth));
     }
     let Some(authority) = request.uri().authority() else {
-        return Ok(refused());
+        return Ok(refused(Reason::ConnectAuthority));
     };
     let Ok(authority) = ConnectAuthority::parse(authority.as_str()) else {
-        return Ok(refused());
+        return Ok(refused(Reason::ConnectAuthority));
     };
     if request.headers().get_all("host").iter().any(|h| {
         h.to_str().ok().is_none_or(|h| {
             secret_rules::target::authority_matches_connect(&authority, Some(h), None, "/").is_err()
         })
     }) {
-        return Ok(refused());
+        return Ok(refused(Reason::HostMismatch));
     }
     let intercepted = state.is_https_port(authority.port);
     let tls = if intercepted {
         match state.tls_for(&authority.host) {
             Ok(tls) => Some(tls),
-            Err(()) => return Ok(refused()),
+            Err(()) => return Ok(refused(Reason::TlsConfiguration)),
         }
     } else {
         None
@@ -621,7 +648,8 @@ async fn connect(
         .await
         {
             Ok(Ok(socket)) => Some(limits::IdleIo::new(socket, state.idle_timeout())),
-            _ => return Ok(refused()),
+            Ok(Err(_)) => return Ok(refused(Reason::UpstreamConnect)),
+            Err(_) => return Ok(refused(Reason::UpstreamConnectTimeout)),
         }
     };
     tokio::spawn(async move {
