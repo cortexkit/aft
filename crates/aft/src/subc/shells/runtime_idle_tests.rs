@@ -6,9 +6,12 @@ fn replace_command(ctx: &crate::context::AppContext, task: &ResolvedTask, comman
     let mut metadata = read_task_at(task).unwrap();
     metadata.command = command.into();
     write_task_at(task, &metadata).unwrap();
-    ctx.bash_background()
-        .insert_shell_fixture(metadata, task.paths.clone())
-        .unwrap();
+    let db = ctx.db().unwrap();
+    crate::db::bash_tasks::upsert_bash_task(
+        &db.lock().unwrap(),
+        &metadata.to_bash_task_row("test", &task.paths).unwrap(),
+    )
+    .unwrap();
 }
 
 async fn receive(
@@ -19,13 +22,19 @@ async fn receive(
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let frame = output.recv().await.expect("shells writer closed");
+            if frame.header.corr == corr && frame.header.ty == FrameType::Error {
+                panic!(
+                    "shells request {corr} failed: {}",
+                    String::from_utf8_lossy(frame.body())
+                );
+            }
             if frame.header.corr == corr && frame.header.ty == ty {
                 return serde_json::from_slice(frame.body()).unwrap();
             }
         }
     })
     .await
-    .expect("shells request did not produce its frame")
+    .unwrap_or_else(|_| panic!("shells request {corr} did not produce {ty:?}"))
 }
 
 async fn request(
