@@ -124,7 +124,7 @@ fn exact_memo_watcher_content_changes() {
                 .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "watcher_pending"));
             if !pending {
                 eprintln!(
-                    "exact memo watcher views={views} {label}: {}",
+                    "exact memo watcher {label}: {}",
                     json!({
                         "results": response["results"],
                         "complete": response["complete"],

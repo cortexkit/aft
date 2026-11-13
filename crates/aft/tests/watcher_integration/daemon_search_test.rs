@@ -432,7 +432,7 @@ async fn external_changes_reach_indexed_grep_and_search() {
         "{after_large}"
     );
     println!(
-        "daemon_arrivals views={views} small_rescans=0 large_rescans={} large_walk_fallbacks={}",
+        "daemon_arrivals small_rescans=0 large_rescans={} large_walk_fallbacks={}",
         rescan_total(&after_large) - rescan_total(&after_small),
         after_large["directory_walk_fallbacks_total"]
             .as_u64()
