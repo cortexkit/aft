@@ -22,10 +22,10 @@ test("V2 context and compaction inject the V1 workflow guidance under V2 tool na
   if (v1 === null) throw new Error("expected a workflow hints block");
   const expected = renameV2ToolReferences(v1);
   expect(expected).not.toBe(v1);
-  expect(expected).toContain("`shell`");
+  expect(expected).toContain("cat in shell.");
   expect(runtime.overrides.get("edit_slot_survives")).toBe(false);
   expect(expected).not.toContain("**Hashline edit tags**");
-  expect(expected).not.toContain("**AFT status bar**");
+  expect(expected).not.toContain("**Status bar**");
   for (const name of ["context", "compaction"]) {
     const hook = runtime.sessionHooks.get(name);
     expect(hook).toBeDefined();
