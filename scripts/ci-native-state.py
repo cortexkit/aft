@@ -212,7 +212,48 @@ def _clear_read_only_and_retry(function, path, _error) -> None:
     function(path)
 
 
+def stale_line_ending_paths(eol_listing: bytes) -> list[bytes]:
+    """Pick tracked files whose working bytes break their line-ending attribute.
+
+    `eol_listing` is `git ls-files --eol -z` output. Only files the attributes
+    pin exactly (`-text`) or to LF (`eol=lf`) count; ordinary text files may
+    legitimately differ from the index under core.autocrlf.
+    """
+    stale = []
+    for record in eol_listing.split(b"\0"):
+        info, tab, path = record.partition(b"\t")
+        fields = info.decode("ascii", "replace").split(None, 2)
+        if not tab or len(fields) < 3:
+            continue
+        index, work, attr = fields[0][2:], fields[1][2:], fields[2][5:]
+        pinned = attr.startswith("-text") or "eol=lf" in attr
+        if pinned and work and work != index:
+            stale.append(path)
+    return stale
+
+
+def refresh_line_ending_drift(checkout: Path) -> None:
+    # A persistent checkout keeps a file's old bytes when a later commit changes
+    # its .gitattributes rule: git still sees the file as unmodified, so neither
+    # checkout nor reset rewrites it. Rewrite just those files from the index.
+    listing = subprocess.run(["git", "ls-files", "--eol", "-z"], cwd=checkout,
+                             check=True, capture_output=True).stdout
+    stale = stale_line_ending_paths(listing)
+    if not stale:
+        return
+    # checkout-index skips a file whose cached stat still matches, even with
+    # --force, so remove each stale copy before writing it from the index.
+    for path in stale:
+        (checkout / os.fsdecode(path)).unlink()
+    subprocess.run(["git", "checkout-index", "-z", "--stdin"], cwd=checkout,
+                   check=True, input=b"\0".join(stale) + b"\0")
+    print(f"Re-checked out {len(stale)} file(s) whose line-ending attribute changed:")
+    for path in stale:
+        print(f"  {path.decode('utf-8', 'replace')}")
+
+
 def setup(root: Path, run_dir: Path) -> None:
+    refresh_line_ending_drift(Path.cwd())
     target = root / "target"
     target.mkdir(parents=True, exist_ok=True)
     clean_oversized_target(target)
