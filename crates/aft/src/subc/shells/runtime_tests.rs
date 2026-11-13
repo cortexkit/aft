@@ -1,6 +1,156 @@
 use super::*;
 use crate::bash_background::persistence::TaskArtifact;
 
+fn output_log(frame: &Frame) -> OperationLog {
+    OperationLog {
+        op: "shells.output",
+        caller: "desktop",
+        channel: frame.header.channel,
+        started: Instant::now(),
+    }
+}
+
+#[test]
+fn shells_v1_operation_logs_are_once_per_event_and_content_free() {
+    use subc_protocol::Principal;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (task_id, lines) = crate::logging::capture_log_lines(|| {
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (snapshot, reader, _task) = captured(dir.path(), b"private output bytes", false, true);
+            let task_id = snapshot.metadata.task_id.clone();
+            let service = Service::new(App::default_shared(), Arc::new(Executor::new()));
+            let sample = super::super::samples::row(&task_id, "background", false);
+            for index in 0..51 {
+                let mut row = sample.clone();
+                if index != 0 {
+                    row.task_id = format!("bash-{index:016x}");
+                }
+                service.state.write().await.rows.insert(row.task_id.clone(), row);
+            }
+            service.sources.write().await.insert(task_id.clone(), reader);
+            let identity = ManagementIdentity {
+                principal: Some(Principal::Reserved { module_id: "callosum".into() }),
+                harness: Some("fed-phone:private-person".into()),
+                ..Default::default()
+            };
+            let metrics = DispatchPathMetrics::new();
+            let (tx, mut frames) = tokio::sync::mpsc::channel(16);
+            let request = |corr| Frame::build(
+                FrameType::Request, subc_protocol::Flags(0), 41, 1, corr, b"{}".to_vec(),
+            ).unwrap();
+            fn receive(frames: &mut tokio::sync::mpsc::Receiver<Frame>) -> tokio::time::Timeout<impl std::future::Future<Output = Option<Frame>> + '_> {
+                tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            }
+
+            // Holding refresh proves the timer includes work queued before the reply.
+            let refresh = service.refresh_gate.lock().await;
+            service.dispatch(&tx, &metrics, &request(1), &identity, &json!({"method":"shells.list"})).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(refresh);
+            let list = receive(&mut frames).await.unwrap().unwrap();
+            assert_eq!(list.header.ty, FrameType::Response);
+            assert_eq!(serde_json::from_slice::<Value>(&list.body).unwrap()["result"]["rows"].as_array().unwrap().len(), 50);
+
+            service.dispatch(&tx, &metrics, &request(2), &identity, &json!({"method":"shells.watch"})).await.unwrap();
+            // Two initial resync parts must still produce only one open log.
+            for _ in 0..2 {
+                assert_eq!(receive(&mut frames).await.unwrap().unwrap().header.ty, FrameType::StreamData);
+            }
+            assert!(service.cancel(route_key(41, 1), 2).await);
+            assert_eq!(receive(&mut frames).await.unwrap().unwrap().header.ty, FrameType::StreamEnd);
+
+            let mut ended = project_row(&snapshot, None);
+            ended.command = sample.command;
+            service.state.write().await.rows.insert(task_id.clone(), ended);
+            service.dispatch(&tx, &metrics, &request(3), &identity, &json!({"method":"shells.output","params":{"task_id":task_id}})).await.unwrap();
+            loop {
+                if receive(&mut frames).await.unwrap().unwrap().header.ty == FrameType::StreamEnd {
+                    break;
+                }
+            }
+            service.dispatch(&tx, &metrics, &request(4), &identity, &json!({"method":"shells.output","params":{"task_id":"secret-command\nsecond-line","ansi":"invalid"}})).await.unwrap();
+            assert_eq!(receive(&mut frames).await.unwrap().unwrap().header.ty, FrameType::Error);
+            service.drain().await;
+            service.stop();
+            task_id
+        })
+    });
+    let lines: Vec<_> = lines
+        .into_iter()
+        .filter(|line| line.starts_with("INFO shells/v1 "))
+        .collect();
+    assert_eq!(lines.len(), 6, "one line per event: {lines:?}");
+    let normalized: Vec<_> = lines
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .map(|field| {
+                    if let Some(value) = field.strip_prefix("elapsed_ms=") {
+                        value.parse::<u128>().unwrap();
+                        "elapsed_ms=<ms>"
+                    } else {
+                        field
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    assert_eq!(
+        normalized[0],
+        "INFO shells/v1 list: caller=phone channel=41 rows=50 elapsed_ms=<ms>"
+    );
+    let elapsed: u128 = lines[0]
+        .split("elapsed_ms=")
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        elapsed >= 30,
+        "list latency omitted refresh wait: {}",
+        lines[0]
+    );
+    assert_eq!(
+        normalized[1],
+        "INFO shells/v1 open: op=shells.watch caller=phone channel=41 elapsed_ms=<ms>"
+    );
+    assert_eq!(normalized[2], "INFO shells/v1 end: op=shells.watch caller=phone channel=41 reason=client_cancel elapsed_ms=<ms>");
+    assert_eq!(normalized[3], format!("INFO shells/v1 open: op=shells.output caller=phone channel=41 elapsed_ms=<ms> task_id={task_id:?}"));
+    assert_eq!(normalized[4], "INFO shells/v1 end: op=shells.output caller=phone channel=41 reason=task_finished elapsed_ms=<ms>");
+    assert_eq!(
+        normalized[5],
+        "INFO shells/v1 refusal: op=shells.output code=invalid_params"
+    );
+    for line in &lines {
+        assert!(
+            !line.contains('\n') && !line.contains('\r'),
+            "multiline event: {line:?}"
+        );
+        for content in [
+            "TOKEN",
+            "fixture-secret-value",
+            "cargo test",
+            "REDACTED",
+            "secret-command",
+            "second-line",
+            "private output bytes",
+            "printf progress",
+            "/work/project",
+            "session-alf",
+            "plain-session",
+            "private-person",
+        ] {
+            assert!(!line.contains(content), "content leaked in log: {line}");
+        }
+    }
+}
+
 fn status_context() -> (
     tempfile::TempDir,
     Arc<crate::context::AppContext>,
@@ -745,10 +895,12 @@ async fn shells_v1_output_real_files_default_backfill_exact_resume_and_end_recor
                 ..Default::default()
             },
             &CancellationToken::new(),
-            &CancellationToken::new()
+            &CancellationToken::new(),
+            &output_log(&frame),
         )
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
     assert!(
         began.elapsed() >= Duration::from_secs(1),
         "four backfill chunks must use separate 250 ms ticks"
@@ -804,6 +956,7 @@ async fn shells_v1_output_real_files_default_backfill_exact_resume_and_end_recor
             },
             &CancellationToken::new(),
             &CancellationToken::new(),
+            &output_log(&frame),
         )
         .await
         .unwrap();
@@ -1128,6 +1281,7 @@ async fn shells_v1_output_pty_screen_uses_masked_renderer_and_cursor() {
             },
             &CancellationToken::new(),
             &CancellationToken::new(),
+            &output_log(&frame),
         )
         .await
         .unwrap();

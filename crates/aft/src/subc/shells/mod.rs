@@ -5,7 +5,7 @@ mod output;
 mod runtime;
 mod state;
 mod wire;
-pub(super) use admission::{is_request, operator, operator_required};
+pub(super) use admission::{is_request, operator, operator_refusal, operator_required};
 pub(super) use runtime::{project_status, Service};
 pub(super) use wire::CAPABILITY;
 

@@ -6133,7 +6133,7 @@ where
                                 let result = if let Some(identity) = management_routes.get(&route) {
                                     shells_service.dispatch(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, body).await
                                 } else {
-                                    send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, shells::operator_required()).await
+                                    send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, shells::operator_refusal(body)).await
                                 };
                                 if let Err(error) = result { break Err(error); }
                                 continue;
