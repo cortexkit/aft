@@ -137,6 +137,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: oss-cost-gate-${{ github.run_id }}
-          path: cost-gate-results
+          # Keep measurement evidence, not index payloads or copied executables.
+          # The full stores took an hour to fetch and are not used for verdicts.
+          path: |
+            cost-gate-results/**/*.csv
+            cost-gate-results/**/*.md
+            cost-gate-results/**/*.log
+            cost-gate-results/cost-baselines.candidate.json
+            cost-gate-results/exact-recall.json
           if-no-files-found: error
           retention-days: 30
