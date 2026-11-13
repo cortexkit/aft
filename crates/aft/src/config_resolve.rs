@@ -4072,7 +4072,7 @@ mod tests {
         assert!(drop_keys(&result).contains(&"inspect.categories.dead_code".to_string()));
     }
 
-    /// One document per name retired in 0.62 or earlier, with the name the
+    /// One document per refused retired name, with the name the
     /// refusal reports. Every entry of `REFUSED_RETIRED_PATHS` and every
     /// prefixed tool name appears.
     fn refused_retired_documents() -> Vec<(&'static str, Value)> {
@@ -4152,6 +4152,18 @@ mod tests {
                 "inspect.max_drill_down_items",
                 serde_json::json!({"inspect": {"max_drill_down_items": 20}}),
             ),
+            (
+                "views.enabled",
+                serde_json::json!({"views": {"enabled": true}}),
+            ),
+            (
+                "views.callgraph_copies",
+                serde_json::json!({"views": {"callgraph_copies": 2}}),
+            ),
+            (
+                "worktree.ram_overlay",
+                serde_json::json!({"worktree": {"ram_overlay": false}}),
+            ),
         ];
         for (alias, _) in feature_config::LEGACY_TOOL_ALIASES {
             documents.push((alias, serde_json::json!({"disabled_tools": [alias]})));
@@ -4159,13 +4171,13 @@ mod tests {
         documents
     }
 
-    /// A name retired in 0.62 or earlier is refused with `removed_config_key`
+    /// A refused retired name produces `removed_config_key`
     /// in the user config, also inside a harness block, and `doctor --fix`
     /// rewrites the file into one that loads. A project config with the same
     /// name loads, with the name translated exactly as `doctor --fix` would
     /// rewrite it.
     #[test]
-    fn names_retired_two_releases_ago_are_refused_and_doctor_fix_repairs_them() {
+    fn refused_retired_user_keys_are_refused_and_doctor_fix_repairs_them() {
         let documents = refused_retired_documents();
         let listed: std::collections::BTreeSet<&str> =
             documents.iter().map(|(name, _)| *name).collect();
