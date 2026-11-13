@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUBC_CORE_TAG="subc-core-v0.14.0"
+# Held subscriptions from SDK 0.22.8+ need daemon 0.20.40+; the AFT module's
+# protocol floor is higher, at daemon 0.20.154.
+SUBC_CORE_TAG="subc-core-v0.21.3"
 SUBC_CORE_WIRE_VERSION="2"
 SUBC_REPO="cortexkit/subconscious"
 BIN_NAME="ck-subc"
@@ -58,7 +60,7 @@ sha256_file() {
 
 read_expected_sha() {
   local sidecar="$1"
-  tr -d '[:space:]' < "$sidecar"
+  awk 'NR == 1 { print $1; exit }' "$sidecar"
 }
 
 sidecar_matches() {
@@ -98,13 +100,41 @@ extract_cached_binary() {
   trap - RETURN
 }
 
+self_test() (
+  local test_dir expected sidecar
+  test_dir="$(mktemp -d "${TMPDIR:-/tmp}/subc-core-checksum-test.XXXXXX")"
+  trap 'rm -rf "$test_dir"' EXIT
+  SHA256_TOOL="$(resolve_sha256_tool)"
+  expected="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  EXPECTED_SHA256="$expected"
+  : > "$test_dir/probe.zip"
+  for form in bare filename; do
+    sidecar="$test_dir/$form.sha256"
+    if [[ "$form" == bare ]]; then
+      printf '%s\n' "$expected" > "$sidecar"
+    else
+      printf '%s  probe.zip\n' "$expected" > "$sidecar"
+    fi
+    [[ "$(read_expected_sha "$sidecar")" == "$expected" ]] || fail "Could not read $form checksum sidecar"
+    sidecar_matches "$test_dir/probe.zip" "$sidecar" || fail "Could not match $form checksum sidecar"
+    verify_or_fail "$test_dir/probe.zip" "$sidecar"
+  done
+  echo 'fetch-subc-core self-test: 2 checksum formats passed'
+)
+
+case "${1:-}" in
+  --print-tag) printf '%s\n' "$SUBC_CORE_TAG"; exit 0 ;;
+  --print-wire-version) printf '%s\n' "$SUBC_CORE_WIRE_VERSION"; exit 0 ;;
+  --self-test) self_test; exit 0 ;;
+esac
+
 TARGET="$(resolve_target)"
 case "$TARGET" in
   darwin-arm64)
-    EXPECTED_SHA256="170021619fe1d89617e9b85c06cab58ce5f834bc386d43ded60e32a5db227604"
+    EXPECTED_SHA256="03da4455a8653356ee58b06abdafd713d47cfcd89aa42cbc1e5077269bbb193e"
     ;;
   linux-x64)
-    EXPECTED_SHA256="33e6285726408a96998cc4be74ad0c1797fb4f3d7e2a1bc33a7f5f83c4755ac0"
+    EXPECTED_SHA256="2d5e01bf027e7ad2f74ce2907c33b484c3017c64520ac4da84795e69c39aad79"
     ;;
 esac
 SHA256_TOOL="$(resolve_sha256_tool)"

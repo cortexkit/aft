@@ -326,6 +326,7 @@ jobs:
         run: |
           path="$(./scripts/fetch-subc-core.sh)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "wire_version=$(./scripts/fetch-subc-core.sh --print-wire-version)" >> "$GITHUB_OUTPUT"
 
       - name: Bun test (all packages)
         run: bun run test:unit
@@ -335,7 +336,7 @@ jobs:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
-          SUBC_CORE_WIRE_VERSION: "2"
+          SUBC_CORE_WIRE_VERSION: ${{ steps.subc_core.outputs.wire_version }}
 
   unit-linux-real-daemon:
     name: Real-daemon tool-provider tests (Linux)
@@ -414,6 +415,7 @@ jobs:
         run: |
           path="$(./scripts/fetch-subc-core.sh)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "wire_version=$(./scripts/fetch-subc-core.sh --print-wire-version)" >> "$GITHUB_OUTPUT"
       # Real process startup, git fixtures and module attachment can exceed Bun's
       # five-second unit default. Individual deadline assertions remain unchanged.
       - name: Run e2e suite
@@ -423,7 +425,7 @@ jobs:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
-          SUBC_CORE_WIRE_VERSION: "2"
+          SUBC_CORE_WIRE_VERSION: ${{ steps.subc_core.outputs.wire_version }}
           AFT_SUBC_E2E_LOG_DIR: ${{ runner.temp }}/aft-subc-e2e-logs
       - name: Upload subc diagnostics on failure
         if: failure()
@@ -1527,6 +1529,7 @@ jobs:
         run: |
           path="$(./scripts/fetch-subc-core.sh)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "wire_version=$(./scripts/fetch-subc-core.sh --print-wire-version)" >> "$GITHUB_OUTPUT"
 
       - name: Bun test (all packages)
         run: |
@@ -1542,7 +1545,7 @@ jobs:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
           AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
-          SUBC_CORE_WIRE_VERSION: "2"
+          SUBC_CORE_WIRE_VERSION: ${{ steps.subc_core.outputs.wire_version }}
 
       - name: Clean native test processes
         if: always()

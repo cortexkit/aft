@@ -15,6 +15,7 @@ on:
       - "packages/opencode-plugin/test/matrix/**"
       - "packages/opencode-plugin/test/load-matrix/**"
       - ".github/opencode-version.txt"
+      - "scripts/fetch-subc-core.sh"
       - ".github/workflows/beta-pin-gate.yml"
   workflow_dispatch: {}
 
@@ -57,6 +58,7 @@ jobs:
         run: |
           path="$(./scripts/fetch-subc-core.sh)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "wire_version=$(./scripts/fetch-subc-core.sh --print-wire-version)" >> "$GITHUB_OUTPUT"
 
       - name: Build aft binary (load matrix probe requirement)
         run: cargo build --bin aft
@@ -69,7 +71,7 @@ jobs:
       - name: Run load and acceptance matrix with isolated HOME and XDG roots
         env:
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
-          SUBC_CORE_WIRE_VERSION: "2"
+          SUBC_CORE_WIRE_VERSION: ${{ steps.subc_core.outputs.wire_version }}
         run: |
           set -euo pipefail
           ISOLATION="${{ runner.temp }}/beta-pin-isolation"
