@@ -812,14 +812,16 @@ pub(crate) fn read_call(parsed: &crate::gh_shim::read_contract::Request, bulk: b
 }
 
 fn read_bulk_call(mut arguments: Value) -> Value {
-    // The bulk contract omits the default JSON Accept value. Keep the
-    // legacy tool encoding unchanged for providers without the operation.
+    // Match the canonical encoding in test-vectors/plexus-read-bulk-v1: sorted
+    // keys and no default JSON Accept. Older providers keep the legacy bytes.
     if arguments.pointer("/args/accept").and_then(Value::as_str)
         == Some("application/vnd.github+json")
     {
         arguments["args"].as_object_mut().unwrap().remove("accept");
     }
-    json!({"method": READ_BULK_OPERATION, "params": arguments})
+    let mut body = json!({"method": READ_BULK_OPERATION, "params": arguments});
+    body.sort_all_objects();
+    body
 }
 
 fn advertises_read_bulk(description: &Value) -> bool {

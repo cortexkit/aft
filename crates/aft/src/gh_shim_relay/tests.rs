@@ -1987,7 +1987,7 @@ async fn read_bulk_selection_follows_each_routes_live_advertisement() {
             if use_bulk { &bulk } else { &tool }.clone()
         );
         if !use_bulk {
-            assert_eq!(serde_json::to_vec(&requests[index * 2 + 1]).unwrap(), br#"{"arguments":{"action":"github.repo.get","args":{"accept":"application/vnd.github+json","path":"pulls/7/files"},"repository":"cortexkit/aft"},"name":"github_read"}"#);
+            assert_eq!(serde_json::to_vec(&requests[index * 2 + 1]).unwrap(), br#"{"name":"github_read","arguments":{"action":"github.repo.get","repository":"cortexkit/aft","args":{"path":"pulls/7/files","accept":"application/vnd.github+json"}}}"#);
         }
     }
     for open in daemon.opens() {
