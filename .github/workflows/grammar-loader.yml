@@ -58,7 +58,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     defaults:
@@ -80,6 +80,16 @@ jobs:
           cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- grammar_
       - name: Process restart and concurrent publication
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
+      - name: Native Windows ARM64 load-and-parse smoke
+        if: matrix.os == 'windows-11-arm'
+        run: |
+          cargo build --locked -p agent-file-tools --bin aft --target aarch64-pc-windows-msvc --features wasm-grammars
+          smoke="$PWD/target/grammar-arm64-smoke"
+          mkdir -p "$smoke/storage/grammars" "$smoke/home" "$smoke/config" "$smoke/cache" "$smoke/state" "$smoke/data"
+          hash="$(python -c 'import json; print(json.load(open("crates/aft/src/grammar/manifest.json"))["sha256"])')"
+          cp "crates/aft/tests/fixtures/grammars/$hash.wasm" "$smoke/storage/grammars/"
+          env -u AFT_STORAGE_DIR -u AFT_CACHE_DIR HOME="$smoke/home" XDG_CONFIG_HOME="$smoke/config" XDG_CACHE_HOME="$smoke/cache" XDG_STATE_HOME="$smoke/state" XDG_DATA_HOME="$smoke/data" target/aarch64-pc-windows-msvc/debug/aft.exe grammar-smoke --storage-dir "$smoke/storage" --file "$PWD/grammars/corpus/features.luau" > "$smoke/result.json"
+          python -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["engine_target"] == "pulley"; assert not v["test_seams"]; assert v["tree"].startswith("(chunk ")' "$smoke/result.json"
       - name: Hardened Pulley smoke without executable-memory entitlements
         if: runner.os == 'macOS'
         run: |
@@ -132,5 +142,5 @@ jobs:
           from pathlib import Path
           dependencies = Path('grammar-arm-dependencies.txt').read_text()
           assert 'wasmtime v36.0.20' in dependencies
-          print('Windows ARM64: Pulley runtime included; no native execution fallback')
+          print('Windows ARM64 dependency compile checked; native execution is covered on windows-11-arm')
           PY
