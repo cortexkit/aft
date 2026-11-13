@@ -29,7 +29,7 @@ fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
     let mut new_state = state::State::new("same-epoch".into());
     let filter = Filter {
         agent_ids: None,
-        include_workers: true,
+        include_workers: Some(true),
         cursor: None,
     };
     for step in 0..9 {
