@@ -45,6 +45,7 @@ fn bound_context(root: &Path, storage: &Path) -> Arc<AppContext> {
         checkout.fresh_view(Duration::from_secs(300)),
         crate::data_layer::runtime::Fresh::Ready(_)
     ));
+    checkout.wait_for_memory_profile_idle_for_test();
     ctx
 }
 
