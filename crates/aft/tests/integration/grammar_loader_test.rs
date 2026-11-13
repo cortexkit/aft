@@ -39,6 +39,7 @@ fn command(root: &Path, download: bool) -> Command {
         .env_remove("AFT_TEST_GRAMMAR_FAULT")
         .env_remove("AFT_TEST_GRAMMAR_QUERIES")
         .env_remove("AFT_TEST_GRAMMAR_CLOCK_FILE")
+        .env_remove("AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS")
         .env_remove("AFT_TEST_GRAMMAR_EXTRACTOR_VERSION")
         .env_remove("AFT_TEST_GRAMMAR_TRANSPORT_FILE");
     command
@@ -81,6 +82,40 @@ fn grammar_loader_retained_file_parsers_compile_once_and_never_download() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("\"state\":\"not_downloaded\""));
     assert!(!directory.join(format!("{HASH}.wasm")).exists());
+}
+
+#[test]
+fn grammar_loader_parse_timeout_is_typed_for_the_file_and_has_no_partial_answer() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("storage/grammars");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::copy(fixture(), directory.join(format!("{HASH}.wasm"))).unwrap();
+    let source = root.path().join("expensive.luau");
+    std::fs::write(
+        &source,
+        "local function f(x) if x then return x + 1 else return 0 end end\n".repeat(500),
+    )
+    .unwrap();
+    let normal = result(
+        command(root.path(), false)
+            .arg("--file")
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert!(normal["tree"].as_str().unwrap().starts_with("(chunk "));
+    let timed = command(root.path(), false)
+        .arg("--file")
+        .arg(&source)
+        .env("AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS", "1")
+        .output()
+        .unwrap();
+    assert!(!timed.status.success());
+    assert!(timed.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&timed.stderr).unwrap();
+    assert_eq!(error["code"], "grammar_parse_timeout");
+    assert_eq!(error["path"], source.to_string_lossy().as_ref());
+    assert_eq!(error["timeout_ms"], 1);
 }
 
 fn result(output: Output) -> serde_json::Value {

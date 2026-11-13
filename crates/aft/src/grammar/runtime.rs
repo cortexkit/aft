@@ -158,8 +158,8 @@ impl GrammarRegistry {
         if current.as_ref() != Some(&root) {
             *current = Some(root);
             let generation = entry.root_generation.wrapping_add(1);
-            // A compiled language is process-resident and hash-pinned. Only
-            // root-specific attempts and failures are reset on reconfiguration.
+            // Every root uses the same manifest hash, so a compiled language
+            // remains in memory. Only root-specific attempts and failures reset.
             *entry = Entry {
                 root_generation: generation,
                 loading: entry.loading,
@@ -335,7 +335,13 @@ impl GrammarRegistry {
             (Some(download::DownloadFailure::Verification), _) => {
                 entry.state = GrammarState::VerificationFailed
             }
-            (_, Some(Err(_))) => self.failed_attempt(&mut entry, FailureCause::Storage),
+            (_, Some(Err(error))) => {
+                log::warn!(
+                    "grammar storage unavailable at {}: {error}",
+                    storage.folder().display()
+                );
+                self.failed_attempt(&mut entry, FailureCause::Storage);
+            }
             (_, Some(Ok(bytes))) => {
                 if entry.language.is_none() {
                     entry.loading = true;

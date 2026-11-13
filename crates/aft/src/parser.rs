@@ -1189,7 +1189,10 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
     })
 }
 
-const LUAU_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+// The five largest react-lua runtime modules took 3.4-7.3 s each on an
+// unoptimized Pulley build. Release builds are faster; 30 s leaves about
+// fourfold margin over the slowest measured file while bounding host parsing.
+const LUAU_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[doc(hidden)]
 pub fn parse_luau_source(path: &Path, source: &str) -> Result<Tree, AftError> {
