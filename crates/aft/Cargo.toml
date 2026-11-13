@@ -108,7 +108,7 @@ path = "tests/applicability_cost.rs"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
 
 [features]
-# Source builds need CMake 3.12+ only when downloaded grammars are enabled.
+# Source builds need CMake 3.18+ only when downloaded grammars are enabled.
 wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl"]
 test-scope-owner = []
 # Explicit opt-in for cross-process timing controls used by integration tests.

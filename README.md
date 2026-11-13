@@ -260,7 +260,7 @@ does **not** require CMake and does not include downloaded-grammar support.
 To include the Pulley-interpreted downloaded grammars used by released binaries,
 build with `--features wasm-grammars` (for example,
 `cargo install agent-file-tools --features wasm-grammars`). That optional feature
-also requires **CMake 3.12 or later** on `PATH` while building; installed binaries
+also requires **CMake 3.18 or later** on `PATH` while building; installed binaries
 do not need CMake at runtime. Check the prerequisite with
 `bash scripts/check-cmake.sh` before building with the feature.
 

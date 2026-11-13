@@ -22,14 +22,15 @@ check() {
   fi
   if [[ "$expected" != 0 ]]; then
     result="$(< "$scratch/result")"
-    [[ "$result" == *"CMake 3.12 or later"* && "$result" == *"wasm-grammars"* ]] || exit 1
+    [[ "$result" == *"CMake 3.18 or later"* && "$result" == *"wasm-grammars"* ]] || exit 1
   fi
   checks=$((checks + 1))
 }
 
 check missing 1 ''
-check old 1 'cmake version 3.11.4'
-check minimum 0 'cmake version 3.12.0'
+check old 1 'cmake version 3.17.6'
+check former-minimum 1 'cmake version 3.12.0'
+check minimum 0 'cmake version 3.18.0'
 check current 0 'cmake version 3.31.6'
 check next-major 0 'cmake version 4.4.4'
 check invalid 1 'unknown cmake version'
