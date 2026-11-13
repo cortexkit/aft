@@ -51,6 +51,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grammar_disabled_message_is_owner_approved() {
+        assert_eq!(crate::grammar::state::SUPPORT_DISABLED, "This AFT build has no downloaded-grammar support, so <language> files can't be parsed. Use a released AFT build, or rebuild with cargo install agent-file-tools --features wasm-grammars (needs CMake 3.12 or later).");
+        assert_eq!(unavailable().message, "This AFT build has no downloaded-grammar support, so Luau files can't be parsed. Use a released AFT build, or rebuild with cargo install agent-file-tools --features wasm-grammars (needs CMake 3.12 or later).");
+    }
+
+    #[test]
     fn grammar_disabled_build_refuses_without_touching_storage() {
         let root = tempfile::tempdir().unwrap();
         let storage = root.path().join("never-created");

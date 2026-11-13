@@ -64,7 +64,14 @@ impl GrammarUnavailable {
         Self {
             language: language.into(),
             state,
-            message: message.replace("<language>", language),
+            message: message.replace(
+                "<language>",
+                if state == GrammarState::SupportDisabled && language == "luau" {
+                    "Luau"
+                } else {
+                    language
+                },
+            ),
             cause: None,
             retry_after_ms: None,
         }

@@ -212,8 +212,8 @@ jobs:
           # otherwise the verify step in the second publish can race against
           # index propagation and fail with "no matching package found".
           sleep 30
-          cargo publish --features wasm-grammars --package agent-file-tools \
-            || { ec=$?; cargo publish --features wasm-grammars --package agent-file-tools --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+          cargo publish --package agent-file-tools --features wasm-grammars \
+            || { ec=$?; cargo publish --package agent-file-tools --features wasm-grammars --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -287,9 +287,9 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Release library codegen (shipped profile)
-        run: cargo build --features wasm-grammars --release --lib -p agent-file-tools --timings
+        run: cargo build --release --lib -p agent-file-tools --timings --features wasm-grammars
       - name: Build
-        run: cargo build --features wasm-grammars --release --bin aft -p agent-file-tools --timings
+        run: cargo build --release --bin aft -p agent-file-tools --timings --features wasm-grammars
       # Strip BEFORE signing, never after: v0.51.1 shipped a SIGKILL-on-load
       # arm64 binary (#238) because strip ran after signing, and strip's
       # automatic re-sign produced a corrupt signature.
@@ -377,7 +377,7 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Build
-        run: cargo build --features wasm-grammars --release --target x86_64-apple-darwin
+        run: cargo build --release --target x86_64-apple-darwin --features wasm-grammars
 
       - name: Strip binary
         run: strip target/x86_64-apple-darwin/release/aft
@@ -458,7 +458,7 @@ jobs:
       - name: Build
         # Keep line tables only until objcopy detaches them below; shipped code
         # and optimization settings are unchanged.
-        run: cross build --features wasm-grammars --release --target aarch64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"'
+        run: cross build --release --target aarch64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"' --features wasm-grammars
 
       - name: Install ARM64 debug extraction tools
         run: |
@@ -518,7 +518,7 @@ jobs:
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
-        run: cross build --features wasm-grammars --release --target x86_64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"'
+        run: cross build --release --target x86_64-unknown-linux-gnu --config 'profile.release.strip=false' --config 'profile.release.split-debuginfo="off"' --features wasm-grammars
 
       - name: Split and verify Linux debug symbols
         run: python3 scripts/release-debug-symbols.py linux --binary target/x86_64-unknown-linux-gnu/release/aft --archive release-debug/aft-linux-x64-debug.zip
@@ -650,7 +650,7 @@ jobs:
 
       - name: Build
         # MSVC keeps debug info in a PDB, not in the shipped executable.
-        run: cargo build --features wasm-grammars --release --target aarch64-pc-windows-msvc --config 'profile.release.strip=false'
+        run: cargo build --release --target aarch64-pc-windows-msvc --config 'profile.release.strip=false' --features wasm-grammars
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
@@ -749,13 +749,13 @@ jobs:
         shell: pwsh
 
       - name: Release library codegen (shipped profile)
-        run: cargo build --features wasm-grammars --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false'
+        run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false' --features wasm-grammars
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Build
-        run: cargo build --features wasm-grammars --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false'
+        run: cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false' --features wasm-grammars
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}

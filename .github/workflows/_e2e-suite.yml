@@ -73,7 +73,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build shared AFT binary (Linux x64)
-        run: cargo build --features wasm-grammars --profile "$CARGO_PROFILE" -p agent-file-tools
+        run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools --features wasm-grammars
 
       - name: Report shared binary size
         run: |
@@ -490,7 +490,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build AFT binary (Windows x64)
-        run: cargo build --features wasm-grammars --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
+        run: cargo build --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --features wasm-grammars
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
@@ -609,7 +609,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build AFT binary (macOS native)
-        run: cargo build --features wasm-grammars --profile "$CARGO_PROFILE" --bin aft -p agent-file-tools --timings
+        run: cargo build --profile "$CARGO_PROFILE" --bin aft -p agent-file-tools --timings --features wasm-grammars
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
