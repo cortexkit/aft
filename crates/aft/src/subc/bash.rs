@@ -539,6 +539,7 @@ mod frame_loop_lock_tests {
                 Arc::new(drain::BashCallClaim::default()),
                 None,
                 false,
+                crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
             ),
         )
         .await
@@ -1664,6 +1665,7 @@ async fn await_runon_launch_reply(
     server_completion: bool,
     reply_deadline: Option<Instant>,
     background_runon: bool,
+    reply_budget: crate::commands::blocking_wait::ReplyBudget,
 ) -> Option<Response> {
     let deadline = deadline?;
     let task_id = response.data.get("task_id")?.as_str()?.to_owned();
@@ -1694,27 +1696,24 @@ async fn await_runon_launch_reply(
                 })
             });
             let read_deadline = if background_runon {
-                Instant::now() + Duration::from_millis(100)
+                reply_budget.now() + Duration::from_millis(100)
             } else {
-                deadline.max(Instant::now() + RUNON_CAPTURE_READ_GRACE)
+                deadline.max(reply_budget.now() + RUNON_CAPTURE_READ_GRACE)
             };
-            match tokio::time::timeout_at(read_deadline.into(), observation).await {
+            match reply_budget.timeout_at(read_deadline, observation).await {
                 Ok(Ok(Some(reply))) => return reply,
                 Ok(Ok(None)) if background_runon => {
                     return Some(with_capture_warning(response));
                 }
-                Ok(Ok(None)) if Instant::now() < deadline => {
+                Ok(Ok(None)) if reply_budget.now() < deadline => {
                     // tool-provider CONTRACT.md §4.4: a completed pending-state
                     // read proves the local supervisor of the remote job is live.
                     if let Some(progress) = &cancel.keepalive {
                         progress.report();
                     }
-                    tokio::time::sleep_until(
-                        (Instant::now() + Duration::from_millis(20))
-                            .min(deadline)
-                            .into(),
-                    )
-                    .await;
+                    reply_budget
+                        .sleep_until((reply_budget.now() + Duration::from_millis(20)).min(deadline))
+                        .await;
                 }
                 // The state read itself overran the deadline and its grace;
                 // reading it again could block the reply just as long.
@@ -1744,7 +1743,7 @@ async fn await_runon_launch_reply(
         biased;
         _ = claim.module_loop_claimed() => None,
         _ = cancel.cancelled() => None,
-        _ = async { tokio::time::sleep_until(reply_deadline.unwrap().into()).await }, if reply_deadline.is_some() => cached_runon_launch_reply(&registry, &task_id, session, response, background_runon),
+        _ = async { reply_budget.sleep_until(reply_deadline.unwrap()).await }, if reply_deadline.is_some() => cached_runon_launch_reply(&registry, &task_id, session, response, background_runon),
         _ = async {
             while !cancel.drain.is_active() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2176,7 +2175,7 @@ pub(super) fn submit_deferred_bash(
     // Granted permissions resume a call after a prompt, which may outlast the
     // startup allowance. Start admission now, but keep the caller's reply clock.
     let startup_started_at = if permissions_granted.is_some() {
-        Instant::now()
+        reply_budget.now()
     } else {
         received_at
     };
@@ -2423,10 +2422,13 @@ pub(super) fn submit_deferred_bash(
     let foreground_runon_timeout = raw_args.get("timeout").and_then(Value::as_u64);
     let startup_deadline =
         reply_budget.cap(startup_started_at + Duration::from_millis(startup_window));
-    let receipt = Arc::new(crate::bash_background::SpawnReceipt::new_with_start_time(
-        startup_deadline,
-        startup_started_at,
-    ));
+    let receipt = Arc::new(
+        crate::bash_background::SpawnReceipt::new_with_start_time(
+            startup_deadline,
+            startup_started_at,
+        )
+        .with_reply_clock(reply_budget),
+    );
     let changed_files_budget = (spawn_ctx.config().bash.changed_files
         != crate::config::BashChangedFiles::Off
         && (server_completion
@@ -3033,7 +3035,7 @@ pub(super) fn submit_deferred_bash(
                     Some(crate::bash_background::StartupClockForTest::Expired) => return,
                     None => {},
                 }
-                tokio::time::sleep_until(startup_deadline.into()).await;
+                reply_budget.sleep_until(startup_deadline).await;
             } => {
                 // Settling the receipt is the one synchronization point with
                 // the startup job: it takes the receipt lock that every commit
@@ -3054,13 +3056,13 @@ pub(super) fn submit_deferred_bash(
                             _ = timing.inline_settle.wait() => None,
                         }
                     } else {
-                        tokio::time::timeout_at(reply_budget.cap(Instant::now() + INLINE_STARTUP_SETTLE).into(), &mut spawn_future).await.ok()
+                        reply_budget.timeout_at(reply_budget.cap(reply_budget.now() + INLINE_STARTUP_SETTLE), &mut spawn_future).await.ok()
                     }
                     #[cfg(not(test))]
-                    tokio::time::timeout_at(reply_budget.cap(Instant::now() + INLINE_STARTUP_SETTLE).into(), &mut spawn_future).await.ok()
+                    reply_budget.timeout_at(reply_budget.cap(reply_budget.now() + INLINE_STARTUP_SETTLE), &mut spawn_future).await.ok()
                 } else if !owns_command && matches!(outcome, crate::bash_background::StartupOutcome::Task(_)) && blocking_cap_ms.is_some() {
                     let wait_deadline = reply_budget.cap(received_at + Duration::from_millis(blocking_cap_ms.unwrap()));
-                    tokio::time::timeout_at(wait_deadline.into(), &mut spawn_future).await.ok()
+                    reply_budget.timeout_at(wait_deadline, &mut spawn_future).await.ok()
                 } else {
                     None
                 };
@@ -3072,11 +3074,11 @@ pub(super) fn submit_deferred_bash(
                         capture_target = register_capture_target(&response);
                         let response = if blocking_intent && capture_deadline.is_some() {
                             if let Some(task_id) = response.data["task_id"].as_str().map(str::to_owned) {
-                                tokio::time::timeout_at(reply_budget.deadline.into(), warn_if_runon_capture_missing(spawn_ctx.bash_background().clone(), task_id, session_id.clone(), copy_response(&response))).await.unwrap_or_else(|_| with_capture_warning(&response))
+                                reply_budget.timeout_at(reply_budget.deadline, warn_if_runon_capture_missing(spawn_ctx.bash_background().clone(), task_id, session_id.clone(), copy_response(&response))).await.unwrap_or_else(|_| with_capture_warning(&response))
                             } else { response }
                         } else {
-                            let reply = await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, owns_command, Some(capture_reply_deadline), background_runon).await.unwrap_or(response);
-                            foreground_runon_reply(reply, foreground_runon_deadline, background_runon, &cancel, foreground_runon_timeout, startup_window, worker_session, format_context.bash_watch_available.unwrap_or(worker_session))
+                            let reply = await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline, &cancel, &claim, owns_command, Some(capture_reply_deadline), background_runon, reply_budget).await.unwrap_or(response);
+                            foreground_runon_reply(reply, foreground_runon_deadline.map(|at| reply_budget.io_deadline(at)), background_runon, &cancel, foreground_runon_timeout, startup_window, worker_session, format_context.bash_watch_available.unwrap_or(worker_session))
                         };
                         // This task runs on the shared subc runtime outside any session scope.
                         crate::log_ctx::with_session(Some(session_id.to_string()), || {
@@ -3110,12 +3112,13 @@ pub(super) fn submit_deferred_bash(
                 owns_command,
                 Some(capture_reply_deadline),
                 background_runon,
+                reply_budget,
             )
             .await
             {
                 let response = foreground_runon_reply(
                     response,
-                    foreground_runon_deadline,
+                    foreground_runon_deadline.map(|at| reply_budget.io_deadline(at)),
                     background_runon,
                     &cancel,
                     foreground_runon_timeout,
@@ -3315,6 +3318,7 @@ pub(super) fn submit_deferred_bash(
                     claim.clone(),
                     repeat,
                     server_completion,
+                    reply_budget,
                 );
                 // Continue awaiting the executor result after sending the caller
                 // a background task id: a later panic must still stop the module.
@@ -3337,7 +3341,7 @@ pub(super) fn submit_deferred_bash(
                                 return;
                             }
                         }
-                        wait_for_bash_reply_deadline(reply_deadline).await;
+                        wait_for_bash_reply_deadline(reply_deadline, reply_budget).await;
                     } => {
                         if claim.claim_for_deadline_handoff() {
                             if program_held {
@@ -3392,7 +3396,10 @@ pub(super) fn submit_deferred_bash(
     });
 }
 
-async fn wait_for_bash_reply_deadline(deadline: Instant) {
+async fn wait_for_bash_reply_deadline(
+    deadline: Instant,
+    reply_budget: crate::commands::blocking_wait::ReplyBudget,
+) {
     // Fixtures that test a reply produced by the wait task itself, such as a
     // failed promotion, hold this timer. Otherwise a slow runner lets the
     // deadline handoff answer first with its "still running" reply. While held,
@@ -3402,7 +3409,7 @@ async fn wait_for_bash_reply_deadline(deadline: Instant) {
     if std::env::var("AFT_TEST_SUBC_BASH_REPLY_TIMER").as_deref() == Ok("held") {
         return std::future::pending::<()>().await;
     }
-    tokio::time::sleep_until(deadline.into()).await;
+    reply_budget.sleep_until(deadline).await;
     // Promotion probes require the executor job to start before racing its held
     // result against this timer. The two-second reply assertion includes this
     // rendezvous; calls without timing hooks keep the ordinary deadline.
@@ -3413,6 +3420,33 @@ async fn wait_for_bash_reply_deadline(deadline: Instant) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod suspend_deadline_tests {
+    use super::*;
+    use futures_util::FutureExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[tokio::test]
+    async fn bash_reply_deadline_is_due_on_first_resume_poll() {
+        let suspend = Box::leak(Box::new(AtomicU64::new(0)));
+        let receipt = Instant::now();
+        let budget = crate::commands::blocking_wait::ReplyBudget::new(receipt, None)
+            .with_suspend_clock(suspend);
+        let deadline = receipt + Duration::from_secs(270);
+        assert!(wait_for_bash_reply_deadline(deadline, budget)
+            .now_or_never()
+            .is_none());
+        suspend.store(2_000_000, Ordering::SeqCst);
+        assert!(wait_for_bash_reply_deadline(deadline, budget)
+            .now_or_never()
+            .is_some());
+        assert!(
+            Instant::now() < deadline,
+            "command's awake-time kill clock is untouched"
+        );
     }
 }
 
@@ -3595,6 +3629,7 @@ async fn run_deferred_bash_wait(
     claim: Arc<drain::BashCallClaim>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     server_completion: bool,
+    reply_budget: crate::commands::blocking_wait::ReplyBudget,
 ) {
     let run_scoped = cancel.run_scope.is_some();
     let Some(wait_ctx) = executor.actor_context(&root) else {
@@ -3737,7 +3772,7 @@ async fn run_deferred_bash_wait(
                     detach_on_user_message,
                     worker_session,
                     worker_cap_ms.map(|_| Duration::from_millis(crate::commands::bash_orchestrate::worker_wait_max_ms(&wait_ctx))),
-                    remote_handback.map(|(at, _)| at),
+                    remote_handback.map(|(at, _)| reply_budget.io_deadline(at)),
                 )
                 .await
             } => {
@@ -3750,7 +3785,7 @@ async fn run_deferred_bash_wait(
                         progress.report();
                     }
                 }
-                let promotion_due = !block_to_completion && Instant::now() >= deadline;
+                let promotion_due = !block_to_completion && reply_budget.now() >= deadline;
                 // While the module drains, every foreground wait (wait:true,
                 // block_to_completion, or a plain wait window) is detached into
                 // a background task so its request can answer before the drain
@@ -3948,7 +3983,7 @@ async fn run_deferred_bash_wait(
                                             &session_for_poll,
                                         ),
                                     ),
-                                Instant::now(),
+                                reply_budget.now(),
                                 &request_id_for_poll,
                             ) {
                                 crate::commands::bash_orchestrate::BashStep::Done(response) => {
@@ -6109,7 +6144,7 @@ mod grant_path_tests {
                     let budget = crate::commands::blocking_wait::ReplyBudget::new(
                         started.into_std(),
                         Some((started + Duration::from_secs(3)).into_std()),
-                    );
+                    ).with_runtime_clock();
                     let mut args = json!({"command":"sleep 10","timeout":10000});
                     args[mode] = json!(true);
                     let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
@@ -6140,18 +6175,32 @@ mod grant_path_tests {
                         let _ = release_rx.recv();
                     });
                     occupied_rx.recv().unwrap();
+                    // Startup bookkeeping consumes the receipt-relative budget
+                    // before the reply watchdog is armed, too.
+                    tokio::time::advance(Duration::from_millis(100)).await;
                     BashTimingForTest::release(&timing.result);
                     tokio::select! {
                         biased;
                         done = rx.recv() => panic!("{mode}: answered before reply watchdog: {:?}", done.map(|done| copy_response(done.response_for_test()))),
                         _ = timing.reply.armed.notified() => {},
                     }
+                    let armed_at = tokio::time::Instant::now();
                     timing.reply.fire.notify_one();
-                    tokio::time::advance(Duration::from_millis(1499)).await;
+                    // Earlier calls can leave observation timers alive while
+                    // executor startup awaits. Paused Tokio may advance to
+                    // those timers, so target the receipt's absolute boundary
+                    // rather than adding another full interval after arming.
+                    let before_deadline = started + Duration::from_millis(1499);
+                    assert!(armed_at < before_deadline);
+                    tokio::time::advance(before_deadline - armed_at).await;
+                    let early_reply = rx.try_recv();
                     assert!(matches!(
-                        rx.try_recv(),
+                        &early_reply,
                         Err(mpsc::error::TryRecvError::Empty)
-                    ));
+                    ), "{mode}: reply before deadline; armed after {:?}, now {:?}: {:?}",
+                        armed_at - started,
+                        tokio::time::Instant::now() - started,
+                        early_reply.map(|done| copy_response(done.response_for_test())));
 
                     let cutoff = started + Duration::from_millis(2500);
                     // A running blocking job inhibits Tokio's automatic clock
@@ -7640,6 +7689,7 @@ mod grant_path_tests {
                     false,
                     None,
                     false,
+                    crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
                 )
                 .await
                 .is_none(),
@@ -9231,6 +9281,7 @@ mod grant_path_tests {
                         Some(if expire_read { Instant::now() - Duration::from_secs(2) } else { Instant::now() + Duration::from_secs(60) }), &cancel,
                         &drain::BashCallClaim::default(), false,
                         (!background && !expire_read).then(Instant::now), background,
+                        crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
                     ).await;
                     drop(state);
                     release_tx.send(()).unwrap();

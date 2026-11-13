@@ -20,6 +20,7 @@ import type {
   ToolCallResult,
 } from "./transport.js";
 import { HOST_TOOL_NAMES_FIELD, WORKER_SESSION_FIELD } from "./transport.js";
+import { DEADLINE_POLL_MS, RequestDeadline, WaitClock } from "./wait-clock.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 /** Default floor of the hang watchdog's silence window (`hangWindowMinMs`). */
@@ -217,6 +218,7 @@ export type BridgeTimer = unknown;
  */
 export interface BridgeClock {
   now(): number;
+  awakeNow?(): number;
   setTimeout(callback: () => void, ms: number): BridgeTimer;
   clearTimeout(timer: BridgeTimer): void;
 }
@@ -225,6 +227,7 @@ export interface BridgeClock {
 // globalThis.setTimeout (as some tests do) still sees bridge timers.
 const SYSTEM_CLOCK: BridgeClock = {
   now: () => Date.now(),
+  awakeNow: () => performance.now(),
   setTimeout: (callback, ms) => setTimeout(callback, ms),
   clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
 };
@@ -666,6 +669,7 @@ export class BinaryBridge implements AftProjectTransport {
   private hangWindowMinMs: number;
   private hangProbeTimeoutMs: number;
   private readonly clock: BridgeClock;
+  private readonly waitClock: WaitClock;
   private lateShellReplyGraceMs: number;
   private maxRestarts: number;
   private configured = false;
@@ -751,6 +755,10 @@ export class BinaryBridge implements AftProjectTransport {
     this.hangWindowMinMs = options?.hangWindowMinMs ?? DEFAULT_MIN_HANG_WINDOW_MS;
     this.hangProbeTimeoutMs = options?.hangProbeTimeoutMs ?? DEFAULT_HANG_PROBE_TIMEOUT_MS;
     this.clock = options?.clock ?? SYSTEM_CLOCK;
+    this.waitClock = new WaitClock(
+      () => this.clock.now(),
+      () => this.clock.awakeNow?.() ?? this.clock.now(),
+    );
     this.lateShellReplyGraceMs =
       options?.lateShellReplyGraceMs ?? DEFAULT_LATE_SHELL_REPLY_GRACE_MS;
     this.maxRestarts = options?.maxRestarts ?? 3;
@@ -1341,11 +1349,18 @@ export class BinaryBridge implements AftProjectTransport {
         // rejects other requests: one slow call says nothing about the calls
         // of other sessions sharing this child, and a child that is truly
         // hung is caught by the hang watchdog, which watches its silence.
-        const timer = this.clock.setTimeout(() => {
+        const deadline = new RequestDeadline(this.waitClock, effectiveTimeoutMs);
+        const expire = () => {
           const entry = this.pending.get(id);
           if (!entry) return;
+          const remaining = deadline.remaining();
+          if (remaining > 0) {
+            entry.timer = this.clock.setTimeout(expire, Math.min(remaining, DEADLINE_POLL_MS));
+            return;
+          }
           if (
             keepBridgeOnTimeout &&
+            !deadline.resumed &&
             this.holdForLateShellReply(id, entry, effectiveTimeoutMs, requestSessionId)
           ) {
             return;
@@ -1367,6 +1382,9 @@ export class BinaryBridge implements AftProjectTransport {
                 command,
                 effectiveTimeoutMs,
                 `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
+                deadline.resumed && SHELL_TASK_COMMANDS.has(command)
+                  ? { kind: "unknown" }
+                  : undefined,
               ),
             );
             return;
@@ -1376,7 +1394,8 @@ export class BinaryBridge implements AftProjectTransport {
               `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry. A timed-out mutation may still complete; inspect before repeating it.`,
             ),
           );
-        }, effectiveTimeoutMs);
+        };
+        const timer = this.clock.setTimeout(expire, Math.min(effectiveTimeoutMs, DEADLINE_POLL_MS));
 
         const entry: PendingRequest = {
           resolve,
@@ -2152,15 +2171,22 @@ export class BinaryBridge implements AftProjectTransport {
     // as a timeout that reports what AFT answered.
     entry.resolve = (response) => settle(shellOutcomeFromLateReply(response));
     this.clock.clearTimeout(entry.timer);
-    entry.timer = this.clock.setTimeout(() => {
+    const deadline = new RequestDeadline(this.waitClock, graceMs, false);
+    const expire = () => {
       if (this.pending.get(id) !== entry) return;
+      const remaining = deadline.remaining();
+      if (remaining > 0) {
+        entry.timer = this.clock.setTimeout(expire, Math.min(remaining, DEADLINE_POLL_MS));
+        return;
+      }
       this.pending.delete(id);
       entry.onSettled?.();
       this.warnVia(
         `Request "${entry.command}" (id=${id}) got no reply within ${graceMs}ms after its deadline`,
       );
       settle({ kind: "unknown" });
-    }, graceMs);
+    };
+    entry.timer = this.clock.setTimeout(expire, Math.min(graceMs, DEADLINE_POLL_MS));
     return true;
   }
 

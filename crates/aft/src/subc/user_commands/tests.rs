@@ -48,13 +48,48 @@ fn context() -> (tempfile::TempDir, Arc<AppContext>, Arc<Executor>) {
 }
 
 fn route(root: &ProjectRootId, principal: &str) -> RouteIdentity {
-    let mut route = crate::subc::test_support::route_identity(root, "chat");
-    let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
-        &mut Arc::get_mut(&mut route.0).unwrap().spawn_principal
+    session_route(root, principal, "opencode", "chat", "head")
+}
+
+fn session_route(
+    root: &ProjectRootId,
+    principal: &str,
+    harness: &str,
+    session: &str,
+    scope_kind: &str,
+) -> RouteIdentity {
+    let mut route = crate::subc::test_support::route_identity(root, session);
+    let data = Arc::get_mut(&mut route.0).unwrap();
+    data.harness = harness
+        .parse::<crate::harness::Harness>()
+        .unwrap()
+        .wire_label();
+    let AuthenticatedPrincipal::RouteBind {
+        principal_id,
+        harness: raw,
+        ..
+    } = &mut data.spawn_principal
     else {
         unreachable!()
     };
     *principal_id = Some(principal.into());
+    *raw = harness.into();
+    data.scope = Some(
+        serde_json::from_value(json!({
+            "owner":{"kind":"reserved", "module_id":"prefrontal-core"},
+            "ref":format!("{scope_kind}-scope"), "scope_epoch":1, "kind":scope_kind,
+            "owner_authorized":true,
+            "attributes": if scope_kind == "ephemeral" {
+                json!({"agent_id":"agent", "run_id":"run"})
+            } else {
+                json!({"agent_id":"agent"})
+            }
+        }))
+        .unwrap(),
+    );
+    if scope_kind == "ephemeral" {
+        data.call_mode = subc_protocol::call_mode::CallMode::Codemode;
+    }
     route
 }
 
@@ -198,6 +233,197 @@ fn user_commands_session_lookup_matches_attested_runner_harness_and_session() {
     assert!(resolve_session(&routes, &executor, &subject)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn user_commands_session_lookup_core_and_runner_routes_preserve_project_status() {
+    let (dir, ctx, executor) = context();
+    let root = ProjectRootId::from_path(dir.path()).unwrap();
+    for (runner, harness, core_harness, core_routes, runner_routes) in [
+        ("thalamus-harness", "opencode2", "opencode2", 32, 1),
+        ("broca", "broca", "runner", 44, 9),
+        ("broca", "broca", "broca", 1, 1),
+        ("broca", "runner", "runner", 1, 1),
+    ] {
+        for (core_count, runner_count) in [
+            (core_routes, 0),
+            (0, runner_routes),
+            (core_routes, runner_routes),
+        ] {
+            let session = "chat";
+            let subject = contract::SessionRef::new(
+                runner,
+                if harness == "runner" {
+                    "broca"
+                } else {
+                    harness
+                },
+                session,
+            );
+            let mut routes = HashMap::new();
+            let mut channel = 1;
+            for (principal, raw_harness, count) in [
+                (
+                    "reserved:prefrontal-core".to_string(),
+                    core_harness,
+                    core_count,
+                ),
+                (format!("reserved:{runner}"), harness, runner_count),
+            ] {
+                for _ in 0..count {
+                    routes.insert(
+                        route_key(channel, 1),
+                        session_route(&root, &principal, raw_harness, session, "head"),
+                    );
+                    channel += 1;
+                }
+            }
+            for building in [false, true] {
+                *ctx.semantic_index_status().write().unwrap() = if building {
+                    crate::context::SemanticIndexStatus::Building {
+                        stage: "embedding".into(),
+                        files: Some(10),
+                        entries_done: Some(4),
+                        entries_total: Some(10),
+                    }
+                } else {
+                    crate::context::SemanticIndexStatus::ready()
+                };
+                let mut body = request("commands.preview");
+                body["params"]["subject"]["session"] = encode(&subject);
+                let reply = call(Some(&occipital()), &body, |session| {
+                    let resolved = resolve_session(&routes, &executor, session)?;
+                    let bound = resolved.as_ref().expect("working head must be bound");
+                    assert!(Arc::ptr_eq(bound, &ctx));
+                    assert_eq!(bound.config().project_root.as_deref(), Some(dir.path()));
+                    Ok(resolved)
+                })
+                .unwrap();
+                let preview: contract::Preview = serde_json::from_value(reply).unwrap();
+                preview.check().unwrap();
+                assert!(preview.available);
+                assert_eq!(preview.reason, None);
+                let meaning = &preview.table.as_ref().unwrap().rows[2].cells[0];
+                assert_eq!(
+                    meaning.state.as_deref(),
+                    Some(if building { "building" } else { "ready" })
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn user_commands_thalamus_runner_alias_requires_unique_live_concrete_evidence() {
+    let (dir, ctx, executor) = context();
+    let root = ProjectRootId::from_path(dir.path()).unwrap();
+    let subject = contract::SessionRef::new("thalamus-harness", "opencode2", "chat");
+    let mut routes = HashMap::from([(
+        route_key(1, 1),
+        session_route(&root, "reserved:prefrontal-core", "runner", "chat", "head"),
+    )]);
+    let mut body = request("commands.preview");
+    body["params"]["subject"]["session"] = encode(&subject);
+    let not_bound = call(Some(&occipital()), &body, |session| {
+        resolve_session(&routes, &executor, session)
+    })
+    .unwrap();
+    assert_eq!(not_bound["available"], false);
+    assert_eq!(not_bound["reason"], "not_bound");
+
+    // Concrete labels on unrelated sessions or principals are not evidence.
+    for (channel, principal, session) in [
+        (2, "reserved:thalamus-harness", "other-chat"),
+        (3, "reserved:broca", "chat"),
+        (4, "direct", "chat"),
+    ] {
+        routes.insert(
+            route_key(channel, 1),
+            session_route(&root, principal, "opencode2", session, "head"),
+        );
+    }
+    assert!(resolve_session(&routes, &executor, &subject)
+        .unwrap()
+        .is_none());
+
+    // Harness evidence is independent of whether the route has a project actor.
+    let evidence_dir = tempfile::tempdir().unwrap();
+    let evidence_root = ProjectRootId::from_path(evidence_dir.path()).unwrap();
+    for principal in ["reserved:thalamus-harness", "reserved:prefrontal-core"] {
+        routes.insert(
+            route_key(5, 1),
+            session_route(&evidence_root, principal, "opencode2", "chat", "head"),
+        );
+        assert!(Arc::ptr_eq(
+            &resolve_session(&routes, &executor, &subject)
+                .unwrap()
+                .unwrap(),
+            &ctx
+        ));
+        routes.insert(
+            route_key(6, 1),
+            session_route(&evidence_root, principal, "claude-code", "chat", "head"),
+        );
+        assert!(resolve_session(&routes, &executor, &subject)
+            .unwrap()
+            .is_none());
+        routes.remove(&route_key(6, 1));
+        routes.remove(&route_key(5, 1));
+    }
+}
+
+#[test]
+fn user_commands_session_lookup_scopes_only_conflict_for_another_project_root() {
+    let (dir, ctx, executor) = context();
+    let root = ProjectRootId::from_path(dir.path()).unwrap();
+    let (other_dir, other_ctx, _) = context();
+    let other_root = ProjectRootId::from_path(other_dir.path()).unwrap();
+    assert!(executor.register_actor(other_root.clone(), other_ctx));
+    let subject = contract::SessionRef::new("thalamus-harness", "opencode2", "chat");
+    let mut routes = HashMap::new();
+    for (channel, kind) in [(1, "head"), (2, "worker"), (3, "ephemeral")] {
+        routes.insert(
+            route_key(channel, 1),
+            session_route(&root, "reserved:prefrontal-core", "opencode2", "chat", kind),
+        );
+    }
+    for (channel, principal, harness, session) in [
+        (4, "reserved:prefrontal-core", "opencode2", "other-chat"),
+        (5, "direct", "opencode2", "chat"),
+        (6, "reserved:broca", "opencode2", "chat"),
+        (7, "reserved:prefrontal-core", "claude-code", "chat"),
+    ] {
+        routes.insert(
+            route_key(channel, 1),
+            session_route(&other_root, principal, harness, session, "head"),
+        );
+    }
+    assert!(Arc::ptr_eq(
+        &resolve_session(&routes, &executor, &subject)
+            .unwrap()
+            .unwrap(),
+        &ctx
+    ));
+    let mut body = request("commands.preview");
+    body["params"]["subject"]["session"] = encode(&subject);
+    for kind in ["head", "worker", "ephemeral"] {
+        routes.insert(
+            route_key(8, 1),
+            session_route(
+                &other_root,
+                "reserved:prefrontal-core",
+                "opencode2",
+                "chat",
+                kind,
+            ),
+        );
+        let not_bound = call(Some(&occipital()), &body, |session| {
+            resolve_session(&routes, &executor, session)
+        })
+        .unwrap();
+        assert_eq!(not_bound["available"], false);
+        assert_eq!(not_bound["reason"], "not_bound");
+    }
 }
 
 #[test]

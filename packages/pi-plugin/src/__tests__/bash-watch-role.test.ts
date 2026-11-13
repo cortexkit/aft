@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import {
   BridgeTransportUnavailableError,
+  WaitClock,
   watchClock,
   watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
@@ -117,6 +118,37 @@ function useFakeWatchClock(): { now: () => number; restore: () => void } {
 }
 
 describe("Pi bash_watch caller role", () => {
+  test("Pi bash_watch cap includes suspend at the first wake observation", async () => {
+    const real = { source: watchClock.source, sleep: watchClock.sleep };
+    let awake = 0;
+    let wall = 0;
+    let slept = false;
+    const clock = new WaitClock(
+      () => wall,
+      () => awake,
+    );
+    watchClock.source = clock;
+    watchClock.sleep = async (ms) => {
+      awake += ms;
+      wall += ms;
+      if (awake >= 250_000 && !slept) {
+        slept = true;
+        wall += 2_000_000;
+      }
+    };
+    try {
+      const tool = watchTool(() => ({ success: true, status: "running", mode: "pipes" }), {
+        bash: { worker_wait_max_ms: 270_000 },
+      });
+      const result = await watch(tool, { task_id: "bash-suspend" }, false);
+      expect(result.content[0].text).toContain("Waited 2250000ms (limit 270000ms)");
+      expect(result.content[0].text).toContain("timeout reached without match");
+      expect(awake).toBe(250_000);
+    } finally {
+      watchClock.source = real.source;
+      watchClock.sleep = real.sleep;
+    }
+  });
   test("watchCallerRole: headless or pi-magic-context subagent is a worker, UI is primary", () => {
     expect(watchCallerRole({ hasUI: false }, {})).toBe("worker");
     expect(watchCallerRole({ hasUI: true }, {})).toBe("primary");

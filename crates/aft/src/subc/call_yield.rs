@@ -583,14 +583,14 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
             }
             let now = std::time::Instant::now();
             Some((
-                crate::commands::blocking_wait::ReplyBudget {
-                    received_at: now.checked_sub(std::time::Duration::from_millis(
+                crate::commands::blocking_wait::ReplyBudget::with_deadline(
+                    now.checked_sub(std::time::Duration::from_millis(
                         (now_ms - started_ms) as u64,
                     ))?,
-                    deadline: now.checked_add(std::time::Duration::from_millis(
+                    now.checked_add(std::time::Duration::from_millis(
                         (deadline_ms - now_ms) as u64,
                     ))?,
-                },
+                ),
                 limit_ms,
             ))
         })();
@@ -783,10 +783,10 @@ mod tests {
         }
         let _stop = StopChild(metadata.pgid.unwrap());
         let watch: crate::protocol::RawRequest = serde_json::from_value(json!({"id":"watch", "command":"bash_watch", "session_id":"restart-worker", "task_id":task,"timeout_ms":3000})).unwrap();
-        let budget = crate::commands::blocking_wait::ReplyBudget {
-            received_at: std::time::Instant::now() - std::time::Duration::from_millis(750),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
-        };
+        let budget = crate::commands::blocking_wait::ReplyBudget::with_deadline(
+            std::time::Instant::now() - std::time::Duration::from_millis(750),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        );
         let wait = WatchWait::new(old.clone(), watch, budget, 3000);
         let key = ledger::Key {
             carrier: "broca".into(),

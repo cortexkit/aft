@@ -1551,10 +1551,9 @@ async function waitForBashStatus(
   role: WatchCallerRole,
   abortSignal?: AbortSignal,
 ): Promise<Record<string, unknown> & { waited: BashStatusWaited }> {
-  // The deadline and the reported elapsed time both come from a monotonic
-  // clock, so a wall-clock step during the wait can neither end it early nor
-  // inflate the time the reply says it waited. An undefined wait has no
-  // deadline: it ends only on exit, a match, a new message, or an abort.
+  // The deadline and reported elapsed time include suspend. Backward wall
+  // steps cannot extend the wait; large forward steps count as suspend.
+  // An undefined wait ends only on exit, a match, a new message, or an abort.
   const startedAt = watchClock.now();
   const deadline =
     effectiveWaitMs === undefined ? Number.POSITIVE_INFINITY : startedAt + effectiveWaitMs;

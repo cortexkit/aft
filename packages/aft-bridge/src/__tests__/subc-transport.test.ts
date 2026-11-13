@@ -582,6 +582,112 @@ function withoutStructuredText(envelopeResponse: Record<string, unknown>): Recor
 }
 
 describe("SubcTransport.toolCall", () => {
+  test("the SDK client uses the same ten-second sleep grace as the bridge", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+    let sleepGraceMs: number | undefined;
+    const pool = new SubcTransportPool({
+      connectionFile: "/fake/connection.json",
+      harness: "opencode",
+      connect: async (options) => {
+        sleepGraceMs = options.sleepGraceMs;
+        return client;
+      },
+    });
+    try {
+      await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sleep-grace", "bash", {});
+      expect(sleepGraceMs).toBe(10_000);
+      expect(client.requests[0]?.options?.sleepGraceMs).toBeUndefined();
+    } finally {
+      await pool.shutdown();
+    }
+  });
+  for (const stage of ["connect", "route"]) {
+    for (const timerFirst of [true, false]) {
+      test(`suspend during ${stage} accepts wake delivery with ${timerFirst ? "timer" : "I/O"} first`, async () => {
+        const clock = new ManualClock();
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const client = new FakeClient(async () =>
+          envelope({ success: true, task_id: "bash-wake", status: "running", text: "ok" }),
+        );
+        if (stage === "route") client.routeOpenGate = gate;
+        let connects = 0;
+        const pool = new SubcTransportPool({
+          connectionFile: "/fake/connection.json",
+          harness: "opencode",
+          clock,
+          connect: async () => {
+            connects++;
+            if (stage === "connect") await gate;
+            return client;
+          },
+        });
+        try {
+          const call = pool
+            .getBridge(TEST_PROJECT_ROOT)
+            .toolCall("sleep", "bash", {}, { transportTimeoutMs: 270_000 });
+          await settleMicrotasks();
+          clock.advance(250_000);
+          clock.suspend(2_000_000);
+          if (timerFirst) clock.resume();
+          release();
+          await settleMicrotasks();
+          clock.resume();
+          expect(await call).toMatchObject({ task_id: "bash-wake" });
+          expect(connects).toBe(1);
+          expect(client.requests).toHaveLength(1);
+          expect(client.requests[0]?.options?.sleepGraceMs).toBe(0);
+        } finally {
+          release();
+          await pool.shutdown();
+        }
+      });
+    }
+
+    test(`silence during ${stage} times out after one resume allowance without dispatch`, async () => {
+      const clock = new ManualClock();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+      if (stage === "route") client.routeOpenGate = gate;
+      const pool = new SubcTransportPool({
+        connectionFile: "/fake/connection.json",
+        harness: "opencode",
+        clock,
+        connect: async () => {
+          if (stage === "connect") await gate;
+          return client;
+        },
+      });
+      try {
+        const outcome = pool
+          .getBridge(TEST_PROJECT_ROOT)
+          .toolCall("sleep", "bash", {}, { transportTimeoutMs: 270_000 })
+          .then(
+            () => null,
+            (error) => error,
+          );
+        await settleMicrotasks();
+        clock.suspend(2_000_000);
+        clock.resume();
+        await settleMicrotasks();
+        clock.advance(9_999);
+        expect(client.requests).toHaveLength(0);
+        clock.suspend(2_000_000);
+        clock.resume();
+        expect(await outcome).toBeInstanceOf(Error);
+        expect(client.requests).toHaveLength(0);
+      } finally {
+        release();
+        await settleMicrotasks();
+        await pool.shutdown();
+      }
+    });
+  }
   test("decodes routed progress chunks in order for only the requesting callback", async () => {
     const client = new FakeClient(async (channel, body, options) => {
       expect(body).toHaveProperty("handles_progress", true);
@@ -3023,3 +3129,5 @@ test("per-match ACK of the last terminal watch releases the finished task carrie
     await pool.shutdown();
   }
 });
+
+import { ManualClock } from "./test-utils/manual-clock.js";

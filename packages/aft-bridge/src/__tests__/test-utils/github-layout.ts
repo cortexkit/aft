@@ -212,7 +212,11 @@ export function githubLayoutTests(installer: Installer): void {
             layout: "standalone",
           }),
         );
-        const result = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+        // A loaded CI machine can take longer than the 2 s production budget
+        // just to start the script; the check must run to completion here.
+        const result = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch, {
+          __smokeTimeoutMsForTests: 30_000,
+        });
         expect(result.cachedBinDirs).not.toContain(dirname(binary));
         await result.installsComplete;
         expect(result.cachedBinDirs).toContain(dirname(binary));

@@ -54,10 +54,7 @@ impl QuietWatch {
             handle_deferred_with_budget(
                 &request,
                 ctx.clone(),
-                crate::commands::blocking_wait::ReplyBudget {
-                    received_at: now,
-                    deadline: now + reply_window,
-                },
+                crate::commands::blocking_wait::ReplyBudget::with_deadline(now, now + reply_window),
             )
         };
         let DispatchOutcome::Deferred(pending) = outcome else {

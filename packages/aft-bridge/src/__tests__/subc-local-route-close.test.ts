@@ -11,7 +11,7 @@
  * real client's `closeRoute` rejection is what the caller sees.
  */
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -44,6 +44,7 @@ import {
   SubcTransportShuttingDownError,
 } from "../subc-transport.js";
 import { TEST_INFLIGHT_ROOT, TEST_PROJECT_ROOT } from "./subc-test-roots.js";
+import { ManualClock } from "./test-utils/manual-clock.js";
 
 interface FakeDaemon {
   connectionFile: string;
@@ -363,6 +364,93 @@ describe("a route the plugin closes under an in-flight call (real SubcClient, fa
     cleanups.push(() => pool.shutdown());
     return { pool, daemon };
   }
+
+  test("a real SubcClient request keeps its correlation through sleep and accepts the grace reply", async () => {
+    const { pool, daemon } = await rig();
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    daemon.reply = LIVE_REPLY;
+    await bridge.send("read", { session_id: "sdk-sleep" });
+    daemon.reply = null;
+    const sdk = (
+      pool as unknown as {
+        client: { pending: Map<string, { sleepGrace?: { used: boolean } }> };
+      }
+    ).client;
+    const previous = new Set(sdk.pending.keys());
+    const nativeNow = Date.now.bind(Date);
+    const nativeTimeout = globalThis.setTimeout;
+    const nativeClearTimeout = globalThis.clearTimeout;
+    const nativeWaitFor = async (condition: () => boolean) => {
+      const cutoff = nativeNow() + 2_000;
+      while (!condition()) {
+        if (nativeNow() >= cutoff) throw new Error("real SDK did not dispatch the expected event");
+        await new Promise<void>((resolve) => nativeTimeout(resolve, 1));
+      }
+    };
+    const clock = new ManualClock();
+    // Keep TCP and the SDK's setImmediate arbitration real. Only its wall,
+    // awake and timeout sources are simulated; the SDK owns the correlation.
+    const wall = spyOn(Date, "now").mockImplementation(() => clock.now());
+    const awake = spyOn(performance, "now").mockImplementation(() => clock.awakeNow());
+    const timers = spyOn(globalThis, "setTimeout").mockImplementation(
+      ((callback: () => void, ms: number) =>
+        -(clock.setTimeout(callback, ms) as number)) as typeof setTimeout,
+    );
+    const clears = spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      if (typeof timer === "number" && timer < 0) clock.clearTimeout(-timer);
+      else nativeClearTimeout(timer);
+    });
+    try {
+      let settlements = 0;
+      const call = bridge.send(
+        "bash",
+        { session_id: "sdk-sleep", command: "start once" },
+        { transportTimeoutMs: 1_000 },
+      );
+      const outcome = call.then(
+        (value) => {
+          settlements++;
+          return { value };
+        },
+        (error) => {
+          settlements++;
+          return { error };
+        },
+      );
+      await nativeWaitFor(() => daemon.requests.length === 2);
+      const key = [...sdk.pending.keys()].find((key) => !previous.has(key));
+      expect(key).toBeDefined();
+      const pending = sdk.pending.get(key!);
+      clock.advance(250);
+      clock.suspend(5_000);
+      clock.resume();
+      await nativeWaitFor(() => pending?.sleepGrace?.used === true);
+      expect(sdk.pending.get(key!)).toBe(pending);
+      expect(settlements).toBe(0);
+      clock.advance(9_999);
+      expect(settlements).toBe(0);
+      expect(
+        daemon.respond(1, {
+          content: [{ type: "text", text: "running" }],
+          isError: false,
+          structuredContent: { success: true, task_id: "bash-sdk-wake", status: "running" },
+        }),
+      ).toBe(true);
+      await nativeWaitFor(() => settlements === 1);
+      expect(await outcome).toMatchObject({
+        value: { success: true, task_id: "bash-sdk-wake", status: "running" },
+      });
+      expect(sdk.pending.has(key!)).toBe(false);
+      expect(daemon.requests).toHaveLength(2);
+      expect(daemon.connections).toBe(1);
+      expect(daemon.closedRoutes).toEqual([]);
+    } finally {
+      clears.mockRestore();
+      timers.mockRestore();
+      awake.mockRestore();
+      wall.mockRestore();
+    }
+  });
 
   test("pool shutdown (also run on host exit) reports an in-flight bash call as outcome-unknown", async () => {
     const { pool, daemon } = await rig();

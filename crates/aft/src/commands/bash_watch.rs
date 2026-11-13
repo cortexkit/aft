@@ -581,7 +581,7 @@ impl WatchJob {
         let mut stderr = StreamScan::default();
         let waited = |reason, matched| Waited {
             reason,
-            elapsed_ms: started.elapsed().as_millis() as u64,
+            elapsed_ms: self.budget.elapsed().as_millis() as u64,
             limit_ms: deadline.saturating_duration_since(started).as_millis() as u64,
             matched,
             scan_incomplete: false,
@@ -633,7 +633,7 @@ impl WatchJob {
                     None,
                 ));
             }
-            let now = Instant::now();
+            let now = self.budget.now();
             // A nearby process kill may extend an ordinary watch limit, never
             // the reply deadline: the caller must receive its task id in time.
             let window_dropped = stdout.dropped || stderr.dropped;
@@ -675,11 +675,12 @@ impl WatchJob {
             let pause = if now >= deadline {
                 // The command is about to be killed; keep polling until the
                 // terminal timeout result is visible instead of handing it off.
-                poll_delay(started.elapsed())
+                poll_delay(self.budget.elapsed())
             } else {
-                poll_delay(started.elapsed()).min(deadline - now)
+                poll_delay(self.budget.elapsed()).min(deadline - now)
             }
-            .min(self.budget.deadline - now);
+            .min(self.budget.deadline - now)
+            .min(Duration::from_millis(100));
             if held {
                 std::thread::sleep(pause);
             } else if cancellation.wait_for_cancellation(pause)
@@ -719,7 +720,7 @@ impl WatchJob {
             if pty && index == 1 {
                 break;
             }
-            if Instant::now() >= self.budget.deadline {
+            if self.budget.now() >= self.budget.deadline {
                 scan.has_more = true;
                 continue;
             }
@@ -740,7 +741,7 @@ impl WatchJob {
                             paths,
                             artifact,
                             scan.next,
-                            self.budget.deadline,
+                            self.budget.io_deadline(self.budget.deadline),
                         )
                     })
             } else {
@@ -749,7 +750,7 @@ impl WatchJob {
                     &self.session,
                     artifact,
                     scan.next,
-                    self.budget.deadline,
+                    self.budget.io_deadline(self.budget.deadline),
                 )
             };
             let page = match page {
@@ -758,7 +759,8 @@ impl WatchJob {
                     // The helper's queue-wait or access cap can expire before the reply deadline.
                     // A timed-out read did not establish EOF, even for an exited task.
                     scan.read_timed_out = error.kind() == std::io::ErrorKind::TimedOut;
-                    scan.has_more = scan.read_timed_out || Instant::now() >= self.budget.deadline;
+                    scan.has_more =
+                        scan.read_timed_out || self.budget.now() >= self.budget.deadline;
                     continue;
                 }
             };
@@ -1198,6 +1200,23 @@ mod tests {
             result.matched,
             Some(("FINAL-MATCH".into(), 65534, Some("stdout")))
         );
+    }
+
+    #[test]
+    fn direct_watch_reply_budget_is_due_at_resume_before_scanning_a_match() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (_dir, mut job, _snapshot) = approved_terminal_watch_fixture();
+        let suspend = Box::leak(Box::new(AtomicU64::new(0)));
+        job.budget = job.budget.with_suspend_clock(suspend);
+        job.limit_ms = 270_000;
+        suspend.store(2_000_000, Ordering::SeqCst);
+        let result = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        assert!(
+            result.matched.is_none(),
+            "expired reply budget must not scan more output"
+        );
+        assert!(result.elapsed_ms >= 2_000_000);
+        assert_eq!(result.limit_ms, 270_000);
     }
 
     #[test]

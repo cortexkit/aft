@@ -504,6 +504,25 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         self.jobs = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))["jobs"]
 
+    def test_fetched_daemon_jobs_read_wire_version_from_the_shared_pin(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        consumers = 0
+        for name in ("_unit-suite.yml", "beta-pin-gate.yml"):
+            workflow = workflow_gates.parse_workflow(str(root / ".github/workflows" / name))
+            for job in workflow["jobs"].values():
+                steps = job.get("steps", [])
+                fetches = [step for step in steps if step.get("id") == "subc_core"]
+                if not fetches:
+                    continue
+                self.assertEqual(len(fetches), 1)
+                self.assertIn("./scripts/fetch-subc-core.sh --print-wire-version", fetches[0]["run"])
+                for step in steps:
+                    env = step.get("env", {})
+                    if env.get("SUBC_CORE_BIN") == "${{ steps.subc_core.outputs.path }}":
+                        self.assertEqual(env.get("SUBC_CORE_WIRE_VERSION"), "${{ steps.subc_core.outputs.wire_version }}")
+                        consumers += 1
+        self.assertEqual(consumers, 4)
+
     def test_real_daemon_job_runs_ignored_tool_provider_tests_on_landing_events(self) -> None:
         job = self.jobs["unit-linux-real-daemon"]
         self.assertEqual(job["name"], "Real-daemon tool-provider tests (Linux)")

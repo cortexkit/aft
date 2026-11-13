@@ -708,9 +708,21 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/health.rs",
-        enclosing_item: "budget_health_metrics, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
-        location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row (including ready roots) are abbreviated with full identity digests and root status instead of omitted; omitted root, sweep, cache, retention and failed-store name rows are counted exactly and aggregate counters remain present",
+        enclosing_item: "budget_health_metrics, gap_largest_ancillary_health_field, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
+        location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop, named top-level telemetry gaps under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics, and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row are abbreviated with full identity digests and root status instead of omitted; omitted rows are counted exactly and aggregate counters remain; oversized ancillary fields become named gaps with original byte sizes, never replacing root identity, failure or freshness fields",
+    },
+    ExclusionEntry {
+        file: "subc/health.rs",
+        enclosing_item: "health_lsp_metrics",
+        location_or_primitive: "HEALTH_LSP_APPLICABILITY_ROOT_CAP .take()",
+        reason: "health-only LSP cost preview, not a paginated result list; six roots ordered by full-walk time then misses are rendered with bounded digest-backed paths; applicability totals cover all roots with exact total and omitted counts, while the cached census and explicit status keep all roots",
+    },
+    ExclusionEntry {
+        file: "lsp/child_registry.rs",
+        enclosing_item: "health_for_children",
+        location_or_primitive: "LSP_CHILD_ROOT_DETAIL_CAP / split_off before child-row construction",
+        reason: "LSP child health telemetry bounds roots before rendering per-kind rows; exact omitted-root, child-count and RSS totals cover every omitted root, not a paginated tool result list",
     },
     ExclusionEntry {
         file: "subc/route_census.rs",
@@ -794,7 +806,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         file: "large_read.rs",
         enclosing_item: "summarize_health_sites",
         location_or_primitive: "top-site health preview truncate(4)",
-        reason: "Bounds supplemental health telemetry only; count, bytes, largest and sites_active still aggregate every active site, so the preview does not cut a tool result list.",
+        reason: "Bounds supplemental health telemetry only; count, bytes, largest, whole_count, whole_bytes and sites_active still aggregate every active site, so the preview does not cut a tool result list.",
     },
     ExclusionEntry {
         file: "url_fetch.rs",
@@ -858,7 +870,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/scope_background_tasks.rs",
-        enclosing_item: "running, scan_saved, expected_roots, registry_snapshot",
+        enclosing_item: "running, scan_saved, scan_sessions, next_entry, expected_roots, registry_snapshot",
         location_or_primitive: "COMMAND_BYTES and WALK_LIMIT",
         reason: "owner-only management snapshot, not an agent result list; command_truncated identifies the UTF-8 command ceiling and complete false with a reason discloses every bounded or failed walk",
     },

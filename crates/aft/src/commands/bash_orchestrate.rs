@@ -560,12 +560,16 @@ pub fn build_bash_outcome(
             params.wait,
         )
     });
-    let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
+    let wait_clock = crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None);
+    let deadline = wait_clock.now() + Duration::from_millis(wait_window_ms);
     // A blocking wait on a remote task ends here even while its job waits in
     // the runner's queue; see `remote_block_handback_ms`.
     let remote_handback = (params.block_to_completion || params.wait).then(|| {
         let waited_ms = remote_block_handback_ms(params.timeout, worker_cap_ms);
-        (Instant::now() + Duration::from_millis(waited_ms), waited_ms)
+        (
+            wait_clock.now() + Duration::from_millis(waited_ms),
+            waited_ms,
+        )
     });
     // A capped blocking wait detaches at its deadline instead of blocking on.
     let block_to_completion =
@@ -627,7 +631,7 @@ pub fn build_bash_outcome(
                     bash_watch_available,
                 ))
             } else if let Some(waited_ms) = remote_handback
-                .filter(|(at, _)| Instant::now() >= *at)
+                .filter(|(at, _)| wait_clock.now() >= *at)
                 .map(|(_, waited_ms)| waited_ms)
                 .filter(|_| {
                     ctx.bash_background()
@@ -653,7 +657,7 @@ pub fn build_bash_outcome(
                             ctx.bash_background()
                                 .hard_kill_remaining(&task_id_for_poll, &session_id_for_poll),
                         ),
-                    Instant::now(),
+                    wait_clock.now(),
                     &request_id_for_poll,
                 ) {
                     BashStep::Done(response) => Some(response),
@@ -1818,6 +1822,23 @@ mod tests {
             BashStep::Done(_) => panic!("running snapshot should not finish"),
             BashStep::Wait => panic!("deadline should promote when not blocking"),
         }
+    }
+
+    #[test]
+    fn caller_wait_promotes_at_resume_without_changing_the_command_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let suspend = Box::leak(Box::new(AtomicU64::new(0)));
+        let now = Instant::now();
+        let clock =
+            crate::commands::blocking_wait::ReplyBudget::new(now, None).with_suspend_clock(suspend);
+        let deadline = now + Duration::from_secs(270);
+        suspend.store(2_000_000, Ordering::SeqCst);
+        let running = snapshot("running", false, None, BgTaskStatus::Running, None);
+        assert!(matches!(
+            decide_bash_step(running, deadline, false, false, clock.now(), "resume"),
+            BashStep::Promote
+        ));
+        assert!(Instant::now() < deadline);
     }
 
     #[test]

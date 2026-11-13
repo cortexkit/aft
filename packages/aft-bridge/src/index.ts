@@ -499,6 +499,7 @@ export {
 } from "./transport-factory.js";
 export { readBinaryVersionOffThread } from "./version-probe.js";
 export { mintViewToken, type ViewToken } from "./view-token.js";
+export { WaitClock } from "./wait-clock.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
 export type {
   RustZoomBatchEntry,

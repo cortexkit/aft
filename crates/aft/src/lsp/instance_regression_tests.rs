@@ -630,7 +630,7 @@ fn retired_exit_consumes_only_its_saved_report_across_restarts() {
         let retired_pid = report.pid;
         let _ = manager.absorb_spawn_failure(SpawnFailure::Initialize {
             instance: retired,
-            reason: "server failed during initialize".into(),
+            error: LspError::ServerNotReady("server failed during initialize".into()),
             report: Box::new(report.clone()),
             durability: FailureDurability::Transient,
         });

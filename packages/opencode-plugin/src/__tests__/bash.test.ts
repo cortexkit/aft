@@ -22,6 +22,7 @@ import {
   BridgeTransportTimeoutError,
   BridgeTransportUnavailableError,
   REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
+  WaitClock,
   watchClock,
   watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
@@ -46,6 +47,7 @@ import {
 } from "../tools/bash.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import { createBashWriteTool } from "../tools/bash_write.js";
+import { projectV2Tool } from "../tools/definitions/v2.js";
 import type { PluginContext } from "../types.js";
 import { mockAsk, mockAskDeny, noopAsk } from "./test-helpers";
 
@@ -1705,6 +1707,57 @@ describe("bash_status tool", () => {
       killTool: createBashKillTool(ctx),
       writeTool: createBashWriteTool(ctx),
     };
+  }
+
+  for (const host of ["V1", "V2"]) {
+    test(`${host} bash_watch cap includes suspend at the first wake observation`, async () => {
+      _resetSubagentCacheForTest();
+      __resetSyncWatchAbortForTests();
+      const real = { source: watchClock.source, sleep: watchClock.sleep };
+      let awake = 0;
+      let wall = 0;
+      let slept = false;
+      const clock = new WaitClock(
+        () => wall,
+        () => awake,
+      );
+      watchClock.source = clock;
+      watchClock.sleep = async (ms) => {
+        awake += ms;
+        wall += ms;
+        if (awake >= 250_000 && !slept) {
+          slept = true;
+          wall += 2_000_000;
+        }
+      };
+      try {
+        const { ctx, watchTool } = makeCtx(
+          () => ({ success: true, status: "running", mode: "pipes" }),
+          {
+            bash: { worker_wait_max_ms: 270_000 },
+          } as PluginContext["config"],
+        );
+        ctx.client = createSubagentClient();
+        const runtime = createMockSdkContext({ sessionID: `sleep-${host}` });
+        const result =
+          host === "V1"
+            ? await watchTool.execute({ taskId: "bash-suspend" }, runtime)
+            : JSON.stringify(
+                await Effect.runPromise(
+                  projectV2Tool("bash_watch", watchTool, { directory: process.cwd() }).execute(
+                    { taskId: "bash-suspend" },
+                    runtime as never,
+                  ),
+                ),
+              );
+        expect(result).toContain("Waited 2250000ms (limit 270000ms)");
+        expect(result).toContain("timeout reached without match");
+        expect(awake).toBe(250_000);
+      } finally {
+        watchClock.source = real.source;
+        watchClock.sleep = real.sleep;
+      }
+    });
   }
 
   test("PTY incomplete capture status preserves command outcome and shows warning", async () => {
