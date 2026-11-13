@@ -579,7 +579,7 @@ fn grammar_real_parse_deadline_discards_a_reused_parser_and_returns_no_partial_t
     stored(directory.path());
     let language = registry.stored().unwrap();
     let make_parser = || {
-        let mut parser = tree_sitter::Parser::new();
+        let mut parser = crate::callgraph_store::join::extraction_work::CountingParser::new();
         prepare_parser(&mut parser).unwrap();
         parser.set_language(&language).unwrap();
         parser

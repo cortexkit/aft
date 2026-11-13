@@ -1179,6 +1179,8 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
                 parser
             }
         };
+        #[cfg(test)]
+        parser.note_parse();
         let result = parse_with_parser(&mut parser, path, source, lang, None);
         if result.is_ok() {
             parsers.insert(lang, parser);
@@ -1229,7 +1231,7 @@ pub(crate) fn retains_luau_parser_for_test() -> bool {
 
 /// One parsing boundary for fresh and reused dynamic-language parsers.
 pub(crate) fn parse_with_parser(
-    parser: &mut Parser,
+    parser: &mut tree_sitter::Parser,
     path: &Path,
     source: &str,
     lang: LangId,
@@ -1290,7 +1292,10 @@ pub(crate) fn parse_with_parser(
 }
 
 /// A Wasm language must have a store attached before set_language can run it.
-pub(crate) fn initialize_parser(parser: &mut Parser, lang: LangId) -> Result<(), AftError> {
+pub(crate) fn initialize_parser(
+    parser: &mut tree_sitter::Parser,
+    lang: LangId,
+) -> Result<(), AftError> {
     let grammar = grammar_for(lang)?;
     if lang == LangId::Luau {
         crate::grammar::prepare_parser(parser)?;
