@@ -557,7 +557,8 @@ export function createBashTool(
       const metadata = metadataUpdater(context);
       const rawCommand = args.command as string;
       const command = rawCommand;
-      const cwd = (args.workdir as string | undefined) ?? context.directory;
+      const workdir = args.workdir as string | undefined;
+      const cwd = workdir ?? context.directory;
 
       // Detect whether the calling session is a subagent (has a non-empty parentID).
       const subagentStatus = await resolveSubagentStatus(
@@ -666,7 +667,7 @@ export function createBashTool(
           {
             command,
             timeout: rawTimeout,
-            workdir: args.workdir,
+            workdir,
             env: shellEnv?.env ?? {},
             description,
             background: effectiveBackground,
@@ -784,7 +785,14 @@ export function createBashTool(
       const output = (data.output as string | undefined) ?? "";
       const rendered = usedHostFallback
         ? output
-        : maybeAppendGrepSearchHint(output, command, aftSearchRegistered, projectRootFor(context));
+        : maybeAppendGrepSearchHint(
+            output,
+            command,
+            aftSearchRegistered,
+            projectRootFor(context),
+            undefined,
+            workdir,
+          );
       const metadataPayload = foregroundMetadata(description, data, rendered);
       await metadata(metadataPayload);
       return {

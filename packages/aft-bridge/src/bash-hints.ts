@@ -453,11 +453,12 @@ export function maybeAppendGrepSearchHint(
   aftSearchRegistered: boolean,
   projectRoot?: string,
   platform: NodeJS.Platform = process.platform,
+  workdir?: string,
 ): string {
   if (output === "") return output;
   if (!commandInvokesCodeSearch(command, platform)) return output;
   if (output.includes(GREP_SEARCH_HINT_PREFIX)) return output;
-  if (shouldSuppressGrepSearchHint(command, projectRoot, platform)) return output;
+  if (shouldSuppressGrepSearchHint(command, projectRoot, platform, workdir)) return output;
 
   const hint = aftSearchRegistered ? GREP_SEARCH_AFT_SEARCH_HINT : GREP_SEARCH_GREP_HINT;
   return `${output}\n\n${hint}`;
@@ -467,6 +468,7 @@ function shouldSuppressGrepSearchHint(
   command: string,
   projectRoot: string | undefined,
   platform: NodeJS.Platform,
+  workdir: string | undefined,
 ): boolean {
   const statements = splitTopLevelStatements(command, platform);
   if (statements === null) return false;
@@ -483,7 +485,9 @@ function shouldSuppressGrepSearchHint(
   // grep that runs outside the project root must NOT be nudged toward it. `null`
   // means the cwd became unknown (dynamic/`cd -`) and we can't confirm the grep
   // is in-project — treat such greps as external (suppress).
-  let effectiveCwd: string | null = resolvedRoot;
+  // Explicit workdirs resolve against the indexed project, just as execution
+  // does. Keep that project boundary separate from the command's starting cwd.
+  let effectiveCwd: string | null = paths.resolve(resolvedRoot, workdir ?? ".");
   let sawCodeSearchStatement = false;
 
   for (const statement of statements) {

@@ -508,6 +508,35 @@ describe("maybeAppendGrepSearchHint", () => {
     ).toBe(output);
   });
 
+  test("resolves explicit workdirs separately from the indexed project boundary", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-cwd-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "aft-bash-hints-outside-"));
+    try {
+      const workdir = path.join(root, "nested");
+      const target = path.join(workdir, "target");
+      fs.mkdirSync(target, { recursive: true });
+      fs.mkdirSync(path.join(outside, "target"));
+      fs.writeFileSync(path.join(root, "target"), "foo\n");
+      const old = new Date(Date.now() - 61_000);
+      fs.utimesSync(target, old, old);
+      fs.utimesSync(path.join(outside, "target"), old, old);
+      for (const cwd of ["nested", workdir]) {
+        expect(maybeAppendGrepSearchHint("hit", "rg foo target", true, root, undefined, cwd)).toBe(
+          `hit\n\n${AFT_SEARCH_HINT}`,
+        );
+      }
+      expect(
+        maybeAppendGrepSearchHint("hit", "rg foo target", true, root, undefined, outside),
+      ).toBe("hit");
+      expect(
+        maybeAppendGrepSearchHint("hit", "cd .. && rg foo target", true, root, undefined, workdir),
+      ).toBe("hit");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   test("does NOT append when grep path operand is dynamic", () => {
     const output = "match";
     expect(maybeAppendGrepSearchHint(output, 'grep x "$HOME/foo"', true, projectRoot)).toBe(output);
@@ -701,7 +730,23 @@ describe("maybeAppendGrepSearchHint — Windows path operands", () => {
             command,
           ).toBe(nudges ? `hit\n\n${GREP_TOOL_HINT}` : "hit");
         }
+        for (const cwd of ["app", path.win32.join(projectRoot, "app")]) {
+          expect(
+            maybeAppendGrepSearchHint("hit", "rg foo .", false, projectRoot, "win32", cwd),
+          ).toBe("hit");
+        }
+        expect(
+          maybeAppendGrepSearchHint(
+            "hit",
+            "rg foo .",
+            false,
+            projectRoot,
+            "win32",
+            String.raw`C:\Users\dev\elsewhere`,
+          ),
+        ).toBe("hit");
         expect(stats).toHaveBeenCalledWith(path.win32.join(projectRoot, "src"));
+        expect(stats).toHaveBeenCalledWith(path.win32.join(projectRoot, "app"));
         expect(stats).toHaveBeenCalledWith(path.win32.join(projectRoot, "app/Cargo.toml"));
       } finally {
         stats.mockRestore();

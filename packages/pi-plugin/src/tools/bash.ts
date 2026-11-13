@@ -902,6 +902,7 @@ export function registerBashTool(
       }
 
       const bridgeCommand = spawnContext.command;
+      const workdir = spawnContext.cwd ?? params.workdir;
 
       let streamed = "";
       let usedHostFallback = false;
@@ -917,7 +918,7 @@ export function registerBashTool(
               {
                 command: bridgeCommand,
                 timeout,
-                workdir: spawnContext.cwd ?? params.workdir,
+                workdir,
                 env: spawnContext.env,
                 description: params.description,
                 background: effectiveBackground,
@@ -1068,7 +1069,7 @@ export function registerBashTool(
       return bashResult(
         usedHostFallback || isPowerShell
           ? output
-          : withBashHints(output, bridgeCommand, aftSearchRegistered, extCtx.cwd),
+          : withBashHints(output, bridgeCommand, aftSearchRegistered, extCtx.cwd, workdir),
         details,
       );
     },
@@ -1128,12 +1129,15 @@ function withBashHints(
   command: string,
   aftSearchRegistered: boolean,
   projectRoot: string,
+  workdir?: string,
 ): string {
   return maybeAppendGrepSearchHint(
     maybeAppendConflictsHint(output),
     command,
     aftSearchRegistered,
     projectRoot,
+    undefined,
+    workdir,
   );
 }
 
