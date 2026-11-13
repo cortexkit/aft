@@ -708,9 +708,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/health.rs",
-        enclosing_item: "budget_health_metrics, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
+        enclosing_item: "budget_health_metrics, gap_largest_ancillary_health_field, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
         location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal, v2_family_sweeps and data_store_failed pop, named top-level telemetry gaps under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row are abbreviated with full identity digests and root status instead of omitted; omitted rows are counted exactly and aggregate counters remain; unknown oversized ancillary fields become named gaps with original byte sizes, never replacing root identity, failure or freshness fields",
+        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics, and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row are abbreviated with full identity digests and root status instead of omitted; omitted rows are counted exactly and aggregate counters remain; oversized ancillary fields become named gaps with original byte sizes, never replacing root identity, failure or freshness fields",
     },
     ExclusionEntry {
         file: "subc/health.rs",

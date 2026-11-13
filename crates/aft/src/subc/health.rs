@@ -2223,6 +2223,11 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         if trimmed_cache_path {
             continue;
         }
+        // Current root failure, progress and privacy details are more useful
+        // than ancillary telemetry, including fields added by new producers.
+        if gap_largest_ancillary_health_field(metrics) {
+            continue;
+        }
         // Current refusals and unhealthy roots are more useful than ancillary
         // telemetry. After compacting that telemetry, discard ordinary ready
         // roots first; keep the original order among the surviving rows.
@@ -2268,40 +2273,6 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
             metrics.insert("data_store_failed_omitted".into(), json!(omitted));
             continue;
         }
-        // Unknown telemetry must not defeat the budget when new producers add
-        // fields. Keep the diagnostic core, but replace the largest remaining
-        // ancillary value with an explicit, named gap rather than losing the
-        // entire metrics object at the daemon's cache boundary.
-        let largest = metrics
-            .iter()
-            .filter(|(key, _)| !protected_health_field(key))
-            .filter(|(key, _)| {
-                !metrics
-                    .get("metrics_fields_omitted")
-                    .and_then(Value::as_array)
-                    .is_some_and(|omitted| omitted.iter().any(|field| field.as_str() == Some(key)))
-            })
-            .filter_map(|(key, value)| {
-                let bytes = serde_json::to_vec(value).ok()?.len();
-                let gap = json!({"omitted": true, "bytes": bytes});
-                // Include the new name in the accounting: replacing a small
-                // scalar with a gap would grow the report instead of shrinking it.
-                let overhead =
-                    serde_json::to_vec(&gap).ok()?.len() + serde_json::to_vec(key).ok()?.len() + 1;
-                (bytes > overhead).then(|| (key.clone(), bytes, gap))
-            })
-            .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)));
-        if let Some((field, _, gap)) = largest {
-            metrics.insert(field.clone(), gap);
-            metrics
-                .entry("metrics_fields_omitted")
-                .or_insert_with(|| json!([]))
-                .as_array_mut()
-                .expect("health omitted fields is an array")
-                .push(json!(field));
-            continue;
-        }
-
         // Refusals and the last identifiable root are more important than the
         // cap. A protected core that cannot fit is an explicit exceptional
         // report, not permission to silently remove its failure evidence.
@@ -2319,6 +2290,39 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         }
         return;
     }
+}
+
+fn gap_largest_ancillary_health_field(metrics: &mut serde_json::Map<String, Value>) -> bool {
+    let largest = metrics
+        .iter()
+        .filter(|(key, _)| !protected_health_field(key))
+        .filter(|(key, _)| {
+            !metrics
+                .get("metrics_fields_omitted")
+                .and_then(Value::as_array)
+                .is_some_and(|omitted| omitted.iter().any(|field| field.as_str() == Some(key)))
+        })
+        .filter_map(|(key, value)| {
+            let bytes = serde_json::to_vec(value).ok()?.len();
+            let gap = json!({"omitted": true, "bytes": bytes});
+            // Include the new name in the accounting: replacing a small
+            // scalar with a gap would grow the report instead of shrinking it.
+            let overhead =
+                serde_json::to_vec(&gap).ok()?.len() + serde_json::to_vec(key).ok()?.len() + 1;
+            (bytes > overhead).then(|| (key.clone(), bytes, gap))
+        })
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)));
+    let Some((field, _, gap)) = largest else {
+        return false;
+    };
+    metrics.insert(field.clone(), gap);
+    metrics
+        .entry("metrics_fields_omitted")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .expect("health omitted fields is an array")
+        .push(json!(field));
+    true
 }
 
 fn protected_health_field(field: &str) -> bool {
@@ -4972,6 +4976,75 @@ mod tests {
     }
 
     #[test]
+    fn health_live_shaped_lsp_fleet_gaps_telemetry_before_semantic_failure_detail() {
+        let (_, mut metrics) =
+            largest_meaning_fill_health_metrics(seventeen_active_large_read_sites());
+        let mut failed = metrics["roots"][0].clone();
+        failed["project_root"] = json!("/projects/failed-root");
+        failed["state"] = json!("degraded");
+        failed["semantic_index"] = json!({
+            "status": "backend_unavailable", "reason": "connection refused by embedding backend",
+            "since_ms": 42, "next_retry_ms": 1000,
+        });
+        let mut ready = metrics["roots"][0].clone();
+        ready["project_root"] = json!("/projects/ready-root");
+        let mut warming = metrics["roots"][0].clone();
+        warming["project_root"] = json!("/projects/warming-root");
+        metrics.insert("roots".into(), json!([failed, ready, warming]));
+        metrics.insert("root_count".into(), json!(3));
+        metrics.insert("actor_count".into(), json!(3));
+        metrics.insert("root_details_omitted".into(), json!(0));
+        metrics.insert(
+            "lsp".into(),
+            health_lsp_metrics(crate::lifecycle_census::LspCensus {
+                applicability_by_root: (0..68)
+                    .map(|i| {
+                        (
+                            format!("/{}checkout-{i}", "scratch/".repeat(100)),
+                            crate::lsp::manager::ApplicabilityMetrics {
+                                hits: 1000,
+                                misses: 10,
+                                full_walks: 10,
+                                full_walk_micros: 5000,
+                                invalidations: [("config", 10)].into_iter().collect(),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(metrics["lsp"]["applicability_roots_total"], 68);
+        assert_eq!(metrics["lsp"]["applicability_roots_omitted"], 62);
+        assert_eq!(metrics["lsp"]["applicability_totals"]["hits"], 68000);
+        let roots = metrics["roots"].clone();
+        let before = metrics.clone();
+        assert!(refresh_metrics_bytes(&mut metrics) > HEALTH_METRICS_BUDGET_BYTES);
+        budget_health_metrics(&mut metrics);
+        assert!(serde_json::to_vec(&metrics).unwrap().len() <= HEALTH_METRICS_BUDGET_BYTES);
+        assert_eq!(
+            metrics["roots"], roots,
+            "telemetry must yield before current root evidence"
+        );
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert_eq!(
+            metrics["roots"][0]["semantic_index"]["reason"],
+            "connection refused by embedding backend"
+        );
+        let omitted = metrics["metrics_fields_omitted"].as_array().unwrap();
+        assert!(!omitted.is_empty());
+        for field in omitted {
+            let field = field.as_str().unwrap();
+            assert_eq!(metrics[field]["omitted"], true);
+            assert_eq!(
+                metrics[field]["bytes"],
+                serde_json::to_vec(&before[field]).unwrap().len()
+            );
+        }
+    }
+
+    #[test]
     fn health_budget_replaces_unknown_fields_with_largest_first_named_gaps() {
         let mut metrics = json!({
             "fresh_liveness": "x".repeat(13000),
@@ -5112,7 +5185,9 @@ mod tests {
         cached.insert("fresh_liveness".into(), json!("f".repeat(1000)));
         super::budget_health_metrics(&mut cached);
         assert_eq!(cached["roots"].as_array().unwrap().len(), 1);
-        assert_eq!(cached["roots"][0]["abbreviated"], true);
+        // Ancillary liveness yields first so the current root keeps its full diagnostics.
+        assert!(cached["roots"][0].get("abbreviated").is_none());
+        assert_eq!(cached["fresh_liveness"]["omitted"], true);
         assert_eq!(cached["roots"][0]["project_root"], "ordinary");
         assert_eq!(
             cached["metrics_bytes"],
@@ -5244,8 +5319,7 @@ mod tests {
             "detail": "optional root telemetry".repeat(100)
         });
         assert!(ordinary_ready_health_root(&root));
-        // Leave room for compact identities and status, but not the full paths
-        // and optional root telemetry. Fresh liveness counters must not yield.
+        // Force ancillary telemetry to compete with the last root's full detail.
         let mut metrics = json!({
             "root_count": 1, "root_details_omitted": 0, "roots": [root],
             "cache_roots": [cache_path], "cache_roots_omitted": 0,
@@ -5259,7 +5333,8 @@ mod tests {
         assert_eq!(metrics["roots"].as_array().unwrap().len(), 1);
         assert_eq!(metrics["cache_roots"].as_array().unwrap().len(), 1);
         let root = &metrics["roots"][0];
-        assert_eq!(root["abbreviated"], true);
+        // Ancillary liveness yields first so the last root keeps its full detail.
+        assert!(root.get("abbreviated").is_none());
         assert_eq!(root["state"], "ready");
         assert_eq!(root["actor_count"], 1);
         assert_eq!(
@@ -5269,18 +5344,19 @@ mod tests {
         for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
             assert_eq!(root[component]["status"], "disabled");
         }
-        for (identity, path, basename) in [
-            (&root["project_root"], &root_path, "/project"),
-            (&metrics["cache_roots"][0], &cache_path, "/cache"),
-        ] {
-            let identity = identity.as_str().unwrap();
-            assert!(identity.contains(blake3::hash(path.as_bytes()).to_hex().as_str()));
-            assert!(identity.ends_with(basename));
-        }
+        // Ancillary liveness yields before the root path, while cache paths still compact first.
+        assert_eq!(root["project_root"], root_path);
+        let cache_identity = metrics["cache_roots"][0].as_str().unwrap();
+        assert!(cache_identity.contains(blake3::hash(cache_path.as_bytes()).to_hex().as_str()));
+        assert!(cache_identity.ends_with("/cache"));
         assert_eq!(metrics["root_count"], 1);
         assert_eq!(metrics["root_details_omitted"], 0);
         assert_eq!(metrics["cache_roots_omitted"], 0);
-        assert_eq!(metrics["fresh_liveness"].as_str().unwrap().len(), 11000);
+        // Ancillary liveness is a named gap rather than displacing root diagnostics.
+        assert_eq!(
+            metrics["fresh_liveness"],
+            json!({"omitted": true, "bytes": 11002})
+        );
         let bytes = serde_json::to_vec(&metrics).unwrap().len();
         assert_eq!(metrics["metrics_bytes"], bytes);
         assert!(bytes <= HEALTH_METRICS_BUDGET_BYTES, "{bytes}");
@@ -5311,8 +5387,7 @@ mod tests {
             "roots": [{
                 "project_root": paths[0], "state": "degraded", "data_store": store
             }],
-            // Fixed live counters already use most of the budget in a real
-            // report; failed-root names and error paths must yield before them.
+            // Ancillary telemetry competes with the bounded failed-root names.
             "fresh_liveness": "x".repeat(11400)
         });
         failed.insert_into(&mut metrics);
@@ -5329,7 +5404,8 @@ mod tests {
         assert_eq!(metrics["metrics_bytes"], bytes);
         assert_eq!(metrics["data_store_failed_roots"], 50);
         let names = metrics["data_store_failed"].as_array().unwrap();
-        assert!(!names.is_empty() && names.len() < 5);
+        // Ancillary liveness yields first so all five bounded failure names survive.
+        assert_eq!(names.len(), 5);
         assert_eq!(
             names.len() as u64 + metrics["data_store_failed_omitted"].as_u64().unwrap(),
             50
@@ -5345,7 +5421,11 @@ mod tests {
             metrics["roots"][0]["data_store"]["reason"],
             reason::BIND_FAILED
         );
-        assert_eq!(metrics["fresh_liveness"].as_str().unwrap().len(), 11400);
+        // Ancillary liveness is a named gap rather than displacing failure evidence.
+        assert_eq!(
+            metrics["fresh_liveness"],
+            json!({"omitted": true, "bytes": 11402})
+        );
         let once = metrics.clone();
         budget_health_metrics(metrics);
         assert_eq!(*metrics, once, "budgeting must be idempotent");
@@ -9659,7 +9739,11 @@ mod tests {
                 );
                 assert!(encoded.len() <= HEALTH_METRICS_BUDGET_BYTES);
                 assert_eq!(metrics["metrics_bytes"], encoded.len() as u64);
-                assert_eq!(metrics["large_reads"], large_reads);
+                // Large-read telemetry yields before root detail, even when the path still needs abbreviation.
+                assert_eq!(
+                    metrics["large_reads"],
+                    json!({"omitted": true, "bytes": serde_json::to_vec(&large_reads).unwrap().len()})
+                );
                 assert_eq!(metrics["root_details_omitted"], 0);
                 let root = &metrics["roots"][0];
                 assert_eq!(root["abbreviated"], true);
@@ -9849,20 +9933,15 @@ mod tests {
             encoded.len()
         );
         assert_eq!(metrics["actor_count"], 71);
+        // Large-read telemetry yields before any root rows; its all-site counters have separate summary tests.
         assert_eq!(
-            metrics["large_reads"]["sites_active"].as_u64(),
-            Some(crate::large_read::site_names().count() as u64)
+            metrics["large_reads"],
+            json!({"omitted": true, "bytes": serde_json::to_vec(&crate::large_read::widest_health_for_test()).unwrap().len()})
         );
-        assert_eq!(metrics["large_reads"]["count"], u64::MAX);
-        assert_eq!(metrics["large_reads"]["bytes"], u64::MAX);
-        assert_eq!(metrics["large_reads"]["largest"], u64::MAX);
-        assert_eq!(metrics["large_reads"]["top"].as_array().unwrap().len(), 4);
         assert_eq!(metrics["root_count"], 71);
         assert!(metrics["embedding_backend"].is_object());
-        assert_eq!(
-            metrics["write_ledger_top_10m"].as_array().map(Vec::len),
-            Some(3)
-        );
+        // Ledger telemetry yields before root rows after its paths have been compacted.
+        assert_eq!(metrics["write_ledger_top_10m"]["omitted"], true);
         assert_eq!(
             metrics["metrics_bytes"].as_u64(),
             Some(encoded.len() as u64)
