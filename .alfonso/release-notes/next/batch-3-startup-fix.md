@@ -1,1 +1,0 @@
-- AFT no longer stops answering for several seconds after a restart when its database holds a long history of shell commands.

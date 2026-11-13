@@ -1,1 +1,0 @@
-- Coalesce per-root language-server applicability walks with a short settle window and one follow-up for changes received during a walk.

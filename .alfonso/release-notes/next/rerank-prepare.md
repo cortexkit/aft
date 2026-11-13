@@ -1,1 +1,0 @@
-- Search prepares matching-line text only when needed, reducing concurrent rerank CPU without changing results.

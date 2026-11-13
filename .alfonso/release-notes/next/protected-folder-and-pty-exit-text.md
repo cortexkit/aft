@@ -1,2 +1,0 @@
-- Protected CortexKit module data, module state, and AFT storage refusals explain why file tools cannot open them and which commands to use instead.
-- PTY tasks with lost exit status report exit status unknown without an exit code; real kills keep their status and reason.

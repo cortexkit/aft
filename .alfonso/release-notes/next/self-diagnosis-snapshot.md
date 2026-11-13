@@ -1,1 +1,0 @@
-- AFT self-diagnosis now uses complete root evidence and each snapshot part's freshness window, so large heaps and size-trimmed health reports do not produce spurious unknown findings.
