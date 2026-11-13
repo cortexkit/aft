@@ -7,6 +7,7 @@ import type { BridgeClock, BridgeTimer } from "../../bridge.js";
  */
 export class ManualClock implements BridgeClock {
   private current: number;
+  private awake = 0;
   private nextId = 1;
   private readonly timers = new Map<number, { due: number; callback: () => void }>();
 
@@ -16,6 +17,23 @@ export class ManualClock implements BridgeClock {
 
   now(): number {
     return this.current;
+  }
+
+  awakeNow(): number {
+    return this.awake;
+  }
+
+  suspend(ms: number): void {
+    this.current += ms;
+  }
+
+  stepWall(ms: number): void {
+    this.current += ms;
+  }
+
+  /** Dispatch held timers at wake, never rewinding either clock. */
+  resume(): void {
+    this.advance(0);
   }
 
   setTimeout(callback: () => void, ms: number): BridgeTimer {
@@ -48,9 +66,12 @@ export class ManualClock implements BridgeClock {
       if (nextId === undefined) break;
       const timer = this.timers.get(nextId);
       this.timers.delete(nextId);
-      this.current = nextDue;
+      const next = Math.max(this.current, nextDue);
+      this.awake += next - this.current;
+      this.current = next;
       timer?.callback();
     }
+    this.awake += target - this.current;
     this.current = target;
   }
 }

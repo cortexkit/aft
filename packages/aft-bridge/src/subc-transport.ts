@@ -42,7 +42,7 @@ import {
 
 import { log, warn } from "./active-logger.js";
 import { isTerminalStatus } from "./bash-format.js";
-import type { StatusSnapshot } from "./bridge.js";
+import type { BridgeClock, StatusSnapshot } from "./bridge.js";
 import { isRouteOpenReloadWindowError, isRouteRequestReloadRefusal } from "./error-contract.js";
 import {
   asCanonicalRootPath,
@@ -70,6 +70,7 @@ import {
   PRESET_FIELD,
   WORKER_SESSION_FIELD,
 } from "./transport.js";
+import { deadlineTimer, RequestDeadline, WaitClock } from "./wait-clock.js";
 
 /** The subc pool is closing and cannot carry another request. */
 export class SubcTransportShuttingDownError extends SubcCallError {
@@ -555,6 +556,8 @@ const DEFAULT_SESSION_ID = "__default__";
 const LOCALLY_SATISFIED_COMMANDS = new Set(["configure"]);
 
 export interface SubcTransportPoolOptions {
+  /** Wall/awake clocks and scheduler for caller-owned admission deadlines. */
+  clock?: BridgeClock;
   /** Absolute path to the subc connection file (user-tier `subc.connection_file`). */
   connectionFile: string;
   /** Harness identity carried in every BindIdentity ("opencode" | "pi" | …). */
@@ -1509,6 +1512,8 @@ export class SubcTransportPool implements AftTransportPool {
   readonly harness: string;
   private readonly connectionFile: string;
   private readonly handshakeTimeoutMs?: number;
+  private readonly clock: BridgeClock;
+  private readonly waitClock: WaitClock;
   private readonly consumerIdentity: ConsumerIdentity | null | undefined;
   private readonly hostScopes: boolean;
   /** Scope identity is host-session-wide, even when the session uses multiple project roots. */
@@ -1586,6 +1591,16 @@ export class SubcTransportPool implements AftTransportPool {
   private editSlotSurvivesCaptured = false;
 
   constructor(options: SubcTransportPoolOptions) {
+    this.clock = options.clock ?? {
+      now: () => Date.now(),
+      awakeNow: () => performance.now(),
+      setTimeout: (callback, ms) => setTimeout(callback, ms),
+      clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+    };
+    this.waitClock = new WaitClock(
+      () => this.clock.now(),
+      () => this.clock.awakeNow?.() ?? this.clock.now(),
+    );
     this.connectionFile = options.connectionFile;
     this.harness = options.harness;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs;
@@ -2388,12 +2403,14 @@ export class SubcTransportPool implements AftTransportPool {
     expectedGeneration?: RootGeneration,
     abortSignal?: AbortSignal,
   ): Promise<unknown> {
-    const callStartedAt = performance.now();
+    const callStartedAt = this.waitClock.now();
     const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
+    const deadline = new RequestDeadline(this.waitClock, callDeadlineMs);
     // Charge shared backoff delays even when an injected sleeper advances no real time.
     let scheduledDelayMs = 0;
-    const spentMs = (): number => Math.max(performance.now() - callStartedAt, scheduledDelayMs);
-    const remainingMs = (): number => callDeadlineMs - spentMs();
+    const spentMs = (): number => Math.max(this.waitClock.now() - callStartedAt, scheduledDelayMs);
+    const remainingMs = (): number =>
+      deadline.remaining() - Math.max(0, scheduledDelayMs - (this.waitClock.now() - callStartedAt));
     const root = asCanonicalRootPath(identity.project_root);
     let generation = expectedGeneration;
     if (this.lifecycleEnabled()) {
@@ -2414,13 +2431,15 @@ export class SubcTransportPool implements AftTransportPool {
           const remaining = remainingMs();
           if (remaining <= 0)
             throw keyChanged ?? callDeadlinePassedError(undefined, callDeadlineMs);
-          let timer: ReturnType<typeof setTimeout> | undefined;
+          let cancelTimer: (() => void) | undefined;
           try {
             // Each attempt calls SubcClient.connect anew, which re-reads the connection file.
             const acquired = await Promise.race([
               this.ensureClient(),
               new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
-                timer = setTimeout(() => resolve(CALL_DEADLINE_EXPIRED), remaining);
+                cancelTimer = deadlineTimer(this.clock, remainingMs, () =>
+                  resolve(CALL_DEADLINE_EXPIRED),
+                );
               }),
             ]);
             if (acquired === CALL_DEADLINE_EXPIRED) {
@@ -2433,25 +2452,24 @@ export class SubcTransportPool implements AftTransportPool {
             keyChanged = error;
             if (spentMs() + this.nextRouteReopenDelayMs() >= callDeadlineMs) throw error;
           } finally {
-            clearTimeout(timer);
+            cancelTimer?.();
           }
           const { delayMs, wait } = this.waitForRouteReopenBackoff();
           scheduledDelayMs = spentMs() + delayMs;
           // A shared retry sleeper may outlive this caller's remaining budget.
-          let retryTimer: ReturnType<typeof setTimeout> | undefined;
+          let cancelRetryTimer: (() => void) | undefined;
           try {
             const waited = await Promise.race([
               wait,
               new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
-                retryTimer = setTimeout(
-                  () => resolve(CALL_DEADLINE_EXPIRED),
-                  callDeadlineMs - (performance.now() - callStartedAt),
+                cancelRetryTimer = deadlineTimer(this.clock, remainingMs, () =>
+                  resolve(CALL_DEADLINE_EXPIRED),
                 );
               }),
             ]);
             if (waited === CALL_DEADLINE_EXPIRED) throw keyChanged;
           } finally {
-            clearTimeout(retryTimer);
+            cancelRetryTimer?.();
           }
         }
         this.assertRecordLive(record);
@@ -2515,9 +2533,11 @@ export class SubcTransportPool implements AftTransportPool {
       }> => {
         const remaining = remainingMs();
         if (remaining <= 0) throw callDeadlinePassedError(lastRefusal, callDeadlineMs);
-        let timer: ReturnType<typeof setTimeout> | undefined;
+        let cancelTimer: (() => void) | undefined;
         const expired = new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
-          timer = setTimeout(() => resolve(CALL_DEADLINE_EXPIRED), remaining);
+          cancelTimer = deadlineTimer(this.clock, remainingMs, () =>
+            resolve(CALL_DEADLINE_EXPIRED),
+          );
         });
         try {
           const opened = await Promise.race([openRoute(), expired]);
@@ -2526,7 +2546,7 @@ export class SubcTransportPool implements AftTransportPool {
           }
           return opened;
         } finally {
-          clearTimeout(timer);
+          cancelTimer?.();
         }
       };
 
@@ -2628,6 +2648,9 @@ export class SubcTransportPool implements AftTransportPool {
           entry.inflight += 1;
           let request: Promise<unknown>;
           try {
+            // The pinned SDK owns the dispatched correlation and its plain timer.
+            // It has no re-arm hook yet; only our connect/route races can grant
+            // the resume allowance without discarding or replaying a request.
             request = client.request(route, body, {
               timeoutMs: Math.ceil(requestTimeoutMs),
               onProgress,

@@ -36,6 +36,63 @@ fn safety_margin(window: Duration) -> Duration {
 pub(crate) struct ReplyBudget {
     pub(crate) received_at: Instant,
     pub(crate) deadline: Instant,
+    clock: WaitClock,
+}
+
+/// Project suspend-inclusive elapsed time onto the receipt's Instant timeline.
+/// Task lifetime and hard-kill deadlines keep using their original clock.
+#[derive(Clone, Copy, Debug)]
+struct WaitClock {
+    awake: Instant,
+    continuous: Duration,
+    #[cfg(test)]
+    suspend: Option<&'static std::sync::atomic::AtomicU64>,
+}
+
+impl WaitClock {
+    fn new() -> Self {
+        Self {
+            awake: Instant::now(),
+            continuous: continuous_now(),
+            #[cfg(test)]
+            suspend: None,
+        }
+    }
+
+    fn now(self) -> Instant {
+        let elapsed = continuous_now().saturating_sub(self.continuous);
+        #[cfg(test)]
+        let elapsed = elapsed
+            + Duration::from_millis(
+                self.suspend
+                    .map_or(0, |clock| clock.load(std::sync::atomic::Ordering::SeqCst)),
+            );
+        self.awake + elapsed
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn continuous_now() -> Duration {
+    #[cfg(target_os = "linux")]
+    let id = libc::CLOCK_BOOTTIME;
+    // Darwin's CLOCK_MONOTONIC includes suspend; Linux's does not.
+    #[cfg(target_os = "macos")]
+    let id = libc::CLOCK_MONOTONIC;
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: clock_gettime initializes the timespec on success.
+    let result = unsafe { libc::clock_gettime(id, time.as_mut_ptr()) };
+    assert_eq!(result, 0, "suspend-inclusive clock unavailable");
+    // SAFETY: the successful clock_gettime call initialized time.
+    let time = unsafe { time.assume_init() };
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn continuous_now() -> Duration {
+    // Windows Instant uses QueryPerformanceCounter, which includes standby
+    // and hibernation.
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed()
 }
 
 impl ReplyBudget {
@@ -68,14 +125,64 @@ impl ReplyBudget {
         let end = client_deadline
             .unwrap_or_else(|| received_at + Duration::from_millis(LEGACY_TRANSPORT_MS));
         let window = end.saturating_duration_since(received_at);
+        Self::with_deadline(received_at, end - safety_margin(window))
+    }
+
+    pub(crate) fn with_deadline(received_at: Instant, deadline: Instant) -> Self {
         Self {
             received_at,
-            deadline: end - safety_margin(window),
+            deadline,
+            clock: WaitClock::new(),
         }
     }
 
     pub(crate) fn cap(&self, deadline: Instant) -> Instant {
         deadline.min(self.deadline)
+    }
+
+    pub(crate) fn now(&self) -> Instant {
+        self.clock.now()
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.now().saturating_duration_since(self.received_at)
+    }
+
+    pub(crate) fn io_deadline(&self, deadline: Instant) -> Instant {
+        Instant::now() + deadline.saturating_duration_since(self.now())
+    }
+
+    /// Short scheduler sleeps ensure an awake-only runtime timer cannot retain
+    /// a long pre-suspend remainder. Only the continuous clock decides expiry.
+    pub(crate) async fn sleep_until(&self, deadline: Instant) {
+        loop {
+            let remaining = deadline.saturating_duration_since(self.now());
+            if remaining.is_zero() {
+                return;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        }
+    }
+
+    pub(crate) async fn timeout_at<F: std::future::Future>(
+        &self,
+        deadline: Instant,
+        future: F,
+    ) -> Result<F::Output, ()> {
+        tokio::select! {
+            biased;
+            output = future => Ok(output),
+            _ = self.sleep_until(deadline) => Err(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_suspend_clock(
+        mut self,
+        clock: &'static std::sync::atomic::AtomicU64,
+    ) -> Self {
+        self.clock.suspend = Some(clock);
+        self
     }
 
     /// Refund restoration time only to the internal startup allowance. The
@@ -84,6 +191,7 @@ impl ReplyBudget {
         Self {
             received_at: self.received_at + elapsed,
             deadline: self.deadline,
+            ..self
         }
     }
 }
@@ -109,6 +217,26 @@ pub(crate) fn clamp_worker_wait_ms(configured: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn suspend_makes_wait_and_reply_budget_due_at_resume() {
+        use futures_util::FutureExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let suspend = Box::leak(Box::new(AtomicU64::new(0)));
+        let receipt = Instant::now();
+        let budget = ReplyBudget::new(receipt, Some(receipt + Duration::from_secs(280)))
+            .with_suspend_clock(suspend);
+        let wait_deadline = budget.cap(receipt + Duration::from_secs(270));
+        suspend.store(2_000_000, Ordering::SeqCst);
+        assert!(
+            Instant::now() < wait_deadline,
+            "awake clock did not reach the wait limit"
+        );
+        assert!(budget.now() >= budget.deadline);
+        assert!(budget.elapsed() >= Duration::from_secs(2_000));
+        // Poll once at resume: no further awake-time scheduler tick is needed.
+        assert!(budget.sleep_until(wait_deadline).now_or_never().is_some());
+    }
 
     #[test]
     fn launch_restore_wait_refunds_startup_but_not_caller_deadline() {

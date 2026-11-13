@@ -58,6 +58,7 @@ pub(crate) struct SpawnReceipt {
     changed_files_deadline: std::sync::OnceLock<crate::bash_changed_files::SharedCallDeadline>,
     state: std::sync::Mutex<SpawnReceiptState>,
     deadline: std::time::Instant,
+    reply_clock: crate::commands::blocking_wait::ReplyBudget,
     startup_steps: std::sync::Mutex<StartupSteps>,
     #[cfg(feature = "test-timing-hooks")]
     startup_clock_for_test: Option<StartupClockForTest>,
@@ -241,6 +242,14 @@ pub(crate) enum StartupOutcome {
 }
 
 impl SpawnReceipt {
+    pub(crate) fn with_reply_clock(
+        mut self,
+        clock: crate::commands::blocking_wait::ReplyBudget,
+    ) -> Self {
+        self.reply_clock = clock;
+        self
+    }
+
     pub(crate) fn bind_changed_files_deadline(
         &self,
         deadline: crate::bash_changed_files::SharedCallDeadline,
@@ -272,6 +281,7 @@ impl SpawnReceipt {
             state: std::sync::Mutex::new(SpawnReceiptState::Pending),
             changed_files_deadline: std::sync::OnceLock::new(),
             deadline,
+            reply_clock: crate::commands::blocking_wait::ReplyBudget::new(startup_started_at, None),
             startup_steps: std::sync::Mutex::new(StartupSteps::new(startup_started_at)),
             #[cfg(feature = "test-timing-hooks")]
             startup_clock_for_test: match std::env::var("AFT_TEST_SUBC_BASH_STARTUP_CLOCK")
@@ -289,8 +299,7 @@ impl SpawnReceipt {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*state, SpawnReceiptState::Pending)
-            || std::time::Instant::now() >= self.deadline
+        if !matches!(*state, SpawnReceiptState::Pending) || self.reply_clock.now() >= self.deadline
         {
             return;
         }
@@ -335,7 +344,7 @@ impl SpawnReceipt {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = std::time::Instant::now();
+        let now = self.reply_clock.now();
         #[cfg(feature = "test-timing-hooks")]
         let now = match self.startup_clock_for_test {
             Some(StartupClockForTest::Frozen) => self.deadline - std::time::Duration::from_nanos(1),
@@ -504,6 +513,20 @@ mod spawn_receipt_tests {
     #[test]
     fn commit_after_the_deadline_is_refused_even_before_the_timer_settles_it() {
         let receipt = SpawnReceipt::new(Instant::now());
+        assert!(commit_task(&receipt).is_err());
+        assert_eq!(receipt.expire(), StartupOutcome::Refused);
+    }
+
+    #[test]
+    fn startup_receipt_refuses_commit_at_resume_before_timer_dispatch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let suspend = Box::leak(Box::new(AtomicU64::new(0)));
+        let now = Instant::now();
+        let clock =
+            crate::commands::blocking_wait::ReplyBudget::new(now, None).with_suspend_clock(suspend);
+        let receipt =
+            SpawnReceipt::new(now + std::time::Duration::from_secs(15)).with_reply_clock(clock);
+        suspend.store(60_000, Ordering::SeqCst);
         assert!(commit_task(&receipt).is_err());
         assert_eq!(receipt.expire(), StartupOutcome::Refused);
     }
