@@ -30,7 +30,7 @@ def integration_targets(metadata: dict) -> list[str]:
 def command(metadata: dict, mode: str, archive_file: str | None = None) -> list[str]:
     # A nextest filterset selects archive/list contents only: cargo still builds
     # every default test target unless explicit Cargo target selectors are used.
-    args = ["cargo", "nextest", mode, "--workspace", "--features", "wasm-grammars,test-hooks"]
+    args = ["cargo", "nextest", mode, "--workspace", "--features", "test-hooks", "--features", "wasm-grammars"]
     for name in integration_targets(metadata):
         args.extend(["--test", name])
     args.extend(["-E", FILTER])
