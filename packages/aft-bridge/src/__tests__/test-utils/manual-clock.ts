@@ -7,6 +7,7 @@ import type { BridgeClock, BridgeTimer } from "../../bridge.js";
  */
 export class ManualClock implements BridgeClock {
   private current: number;
+  private wallOffset = 0;
   private awake = 0;
   private nextId = 1;
   private readonly timers = new Map<number, { due: number; callback: () => void }>();
@@ -16,7 +17,7 @@ export class ManualClock implements BridgeClock {
   }
 
   now(): number {
-    return this.current;
+    return this.current + this.wallOffset;
   }
 
   awakeNow(): number {
@@ -28,7 +29,7 @@ export class ManualClock implements BridgeClock {
   }
 
   stepWall(ms: number): void {
-    this.current += ms;
+    this.wallOffset += ms;
   }
 
   /** Dispatch held timers at wake, never rewinding either clock. */

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { RequestDeadline, WaitClock } from "../wait-clock.js";
+import { deadlineTimer, RequestDeadline, WaitClock } from "../wait-clock.js";
 import { ManualClock } from "./test-utils/manual-clock.js";
 
 function timeline() {
@@ -27,11 +27,19 @@ describe("suspend-inclusive wait clock", () => {
   test("a backward wall step gives no extra wait time", () => {
     const { scheduler, clock } = timeline();
     const deadline = new RequestDeadline(clock, 1_000);
+    let expired = 0;
+    const cancel = deadlineTimer(
+      scheduler,
+      () => deadline.remaining(),
+      () => expired++,
+    );
     scheduler.stepWall(-50_000);
     expect(deadline.remaining()).toBe(1_000);
     scheduler.advance(1_000);
     expect(deadline.remaining()).toBe(0);
     expect(deadline.resumed).toBe(false);
+    expect(expired).toBe(1);
+    cancel();
   });
 
   test("suspend that ended before the deadline does not buy a later allowance", () => {

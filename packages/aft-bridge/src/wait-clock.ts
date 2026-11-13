@@ -71,10 +71,6 @@ export class RequestDeadline {
     }
     return Math.max(0, this.deadline - now);
   }
-
-  charge(ms: number): void {
-    this.deadline -= ms;
-  }
 }
 
 export interface WaitScheduler {
