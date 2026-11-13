@@ -150,10 +150,24 @@ fn run_list_workflow(
                     )))
     })
     .collect();
-    if workflows.len() == 1 {
-        Ok(workflows.remove(0))
-    } else {
-        get(direct(), execute)
+    // Non-interactive ResolveWorkflow refuses missing or ambiguous names:
+    // https://github.com/cli/cli/blob/3d5a9e355a837f2f5ee78d7484c118cc1342ad1a/pkg/cmd/workflow/shared/shared.go#L213-L232
+    match workflows.len() {
+        0 => Err(refused(format!(
+            "could not find any workflows named {selector}"
+        ))),
+        1 => Ok(workflows.remove(0)),
+        _ => {
+            let paths: Vec<_> = workflows
+                .iter()
+                .filter_map(|workflow| workflow["path"].as_str())
+                .filter_map(|path| path.rsplit('/').next())
+                .collect();
+            Err(refused(format!(
+                "could not resolve to a unique workflow; found: {}",
+                paths.join(" ")
+            )))
+        }
     }
 }
 

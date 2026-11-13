@@ -1281,6 +1281,109 @@ fn v20_run_list_workflow_names_include_disabled_states_with_all() {
 }
 
 #[test]
+fn v20_run_list_unknown_workflow_name_refuses_without_direct_lookup() {
+    for (selector, workflows) in [
+        ("missing", json!([])),
+        ("CI", json!([{"name":"CI extra","state":"active"}])),
+        ("SS", json!([{"name":"ß","state":"active"}])),
+        (
+            "CI",
+            json!([
+                {"name":"CI","state":"disabled_manually"},
+                {"name":"CI","state":"disabled_inactivity"}
+            ]),
+        ),
+    ] {
+        let plan = planned(&[
+            "run",
+            "list",
+            "--workflow",
+            selector,
+            "--json",
+            "databaseId",
+        ]);
+        let mut calls = 0;
+        let mut output = Vec::new();
+        let error = render::run(
+            &plan,
+            &mut |request| {
+                calls += 1;
+                assert_eq!(
+                    calls, 1,
+                    "name resolution must not fall back to direct lookup"
+                );
+                assert_eq!(
+                    *request,
+                    ReadRequest::Get {
+                        path: "/repos/cortexkit/aft/actions/workflows?per_page=100&page=1".into(),
+                        accept: None,
+                    }
+                );
+                let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+                executor::decode_reply(
+                    &wire,
+                    &json!({"isError":false,"result":{
+                        "status":200,"body":{"workflows":workflows},"next_page":null
+                    }}),
+                )
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(&error, ReadError::Refused(_)));
+        assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
+        assert_eq!(
+            error.message("test-bot"),
+            format!("could not find any workflows named {selector}")
+        );
+        assert_eq!(calls, 1);
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn v20_run_list_ambiguous_workflow_names_refuse_after_all_pages() {
+    for second_state in ["active", "disabled_manually"] {
+        let mut raw = vec!["run", "list", "--workflow", "CI", "--json", "databaseId"];
+        if second_state != "active" {
+            raw.push("--all");
+        }
+        let plan = planned(&raw);
+        let mut calls = 0;
+        let mut output = Vec::new();
+        let error = render::run(
+            &plan,
+            &mut |request| {
+                calls += 1;
+                assert!(calls <= 2, "ambiguous names must not query runs or use direct lookup");
+                assert_eq!(*request, ReadRequest::Get {
+                    path: format!("/repos/cortexkit/aft/actions/workflows?per_page=100&page={calls}"),
+                    accept: None,
+                });
+                let (workflow, next_page) = if calls == 1 {
+                    (json!({"id":7,"name":"CI","state":"active","path":".github/workflows/ci.yml"}), Some(2))
+                } else {
+                    (json!({"id":8,"name":"ci","state":second_state,"path":".github/workflows/build.yaml"}), None)
+                };
+                let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+                executor::decode_reply(&wire, &json!({"isError":false,"result":{
+                    "status":200,"body":{"workflows":[workflow]},"next_page":next_page
+                }}))
+            },
+            &mut output,
+        ).unwrap_err();
+        assert!(matches!(&error, ReadError::Refused(_)));
+        assert_eq!(error.status(), REFUSAL_EXIT_STATUS);
+        assert_eq!(
+            error.message("test-bot"),
+            "could not resolve to a unique workflow; found: ci.yml build.yaml"
+        );
+        assert_eq!(calls, 2);
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
 fn v20_workflow_run_list_keeps_ten_row_pages_and_trims_to_limit() {
     let plan = planned(&[
         "run",
