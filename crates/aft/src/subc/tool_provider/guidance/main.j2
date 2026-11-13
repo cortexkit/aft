@@ -1,0 +1,8 @@
+# Agent File Tools
+
+{% if preset == 'reader' %}This session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.
+{% endif %}{% include 'code' %}{% if preset == 'head' %}{% if tools.bash %}Use bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.
+{% endif %}{% if hashline_tags %}**Hashline edit tags**: {{ hashline_tags }}
+{% endif %}{% if worker %}{% include 'scope' %}{% endif %}{% elif preset == 'worker' %}{% if tools.bash %}Use bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.
+{% endif %}{% if tools.bash_watch %}A command in the background never wakes you: wait on it with bash_watch before you report a result, and watch again while it is still running. Don't poll bash_status or sleep to wait.
+{% endif %}{% include 'scope' %}{% endif %}
