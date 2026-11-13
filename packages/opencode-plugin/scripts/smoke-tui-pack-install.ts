@@ -249,7 +249,14 @@ try {
 console.log("host-virtual shared frame rendered expanded and collapsed through V1/V2 packed entries");
 console.log("stubbed runtime probe loaded the compiled TUI path");
 `;
-  run("bun", ["-e", stubbedRuntimeProbe, installedPackageRoot], installRoot);
+  // OpenTUI hosts provide reactive Solid, not Node's default server-rendering
+  // export. The browser condition selects that same client runtime for both
+  // the virtual-module stubs and the ordinary imports they expose.
+  run(
+    "bun",
+    ["--conditions=browser", "-e", stubbedRuntimeProbe, installedPackageRoot],
+    installRoot,
+  );
   check("stubbed virtual runtime probe imports the compiled TUI entry", true);
 
   const rawFallbackProbe = `
