@@ -5384,6 +5384,14 @@ impl Checkout {
                 dead_code_files,
             }
         });
+        // No live state means the estimate is busy as a whole. Do not walk a
+        // large engine whose bytes cannot be attributed in that estimate.
+        if live.is_none() {
+            return CheckoutMemory {
+                live,
+                engine: EngineMemory::Busy,
+            };
+        }
         let engine = match self.engine.try_lock() {
             Ok(engine) => match engine.as_ref() {
                 Some(engine) => {

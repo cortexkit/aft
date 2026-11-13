@@ -1045,3 +1045,20 @@ aft_store::heap_bytes_of_fields!(StoredSlices {
     token,
     failures,
 });
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn memory_figure_stored_read_failures_advance_the_epoch() {
+        let Held::All(slices) = StoredSlices::open_files_if_held(Vec::new(), &[]).unwrap() else {
+            panic!("empty slices need no stored records");
+        };
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        slices.track_memory(Arc::clone(&epoch));
+        slices.fail("a stored record could not be decoded".into());
+        assert_eq!(epoch.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(slices.failures().len(), 1);
+    }
+}

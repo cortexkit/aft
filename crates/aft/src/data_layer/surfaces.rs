@@ -2887,7 +2887,7 @@ mod tests {
             ["existing_gap", "checkout_memory_stale"]
         );
         for plane in [search, callgraph, semantic] {
-            assert_eq!(plane.status, "estimated");
+            assert_eq!(plane.status, "ready");
             assert_eq!(plane.bytes_status, "partial");
             assert_eq!(plane.counts["data_layer_measured_age_ms"], 29_000);
             assert_eq!(plane.not_estimated, ["checkout_memory_stale"]);

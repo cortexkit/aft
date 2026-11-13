@@ -1149,6 +1149,14 @@ struct MemoryFigureVersion {
     counted_elsewhere: Option<usize>,
 }
 
+struct CachedMemoryFigure {
+    measured_at: Instant,
+    attempted_at: Instant,
+    version: MemoryFigureVersion,
+    figure: super::surfaces::DataLayerMemory,
+    incomplete_attempt: bool,
+}
+
 pub(crate) struct DataCheckout {
     work: Arc<Work>,
     quiet: Arc<QuietTimer>,
@@ -1160,13 +1168,7 @@ pub(crate) struct DataCheckout {
     todos_readable: AtomicBool,
     /// The last memory figure the census walked for this checkout, and when
     /// (see [`Self::memory_figure`]).
-    memory_figure: std::sync::Mutex<
-        Option<(
-            Instant,
-            MemoryFigureVersion,
-            super::surfaces::DataLayerMemory,
-        )>,
-    >,
+    memory_figure: std::sync::Mutex<Option<CachedMemoryFigure>>,
     disk_measurement: Arc<super::surfaces::DiskMeasurement>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
@@ -1969,35 +1971,51 @@ impl DataCheckout {
         let now = Instant::now();
         #[cfg(test)]
         let now = crate::context::memory_walk_now_for_test();
-        if let Some((at, walked_at, figure)) = slot.as_ref() {
-            let age = now.saturating_duration_since(*at);
-            let reuse = *walked_at == epoch || age < MEMORY_FIGURE_MAX_AGE;
+        if let Some(previous) = slot.as_ref() {
+            let age = now.saturating_duration_since(previous.measured_at);
+            let complete =
+                !previous.incomplete_attempt && previous.figure.shared.not_estimated.is_empty();
+            let reuse = (previous.version == epoch && complete)
+                || now.saturating_duration_since(previous.attempted_at) < MEMORY_FIGURE_MAX_AGE;
             #[cfg(all(test, target_os = "linux"))]
             let reuse = if MEMORY_FIGURE_BASELINE.with(std::cell::Cell::get) {
-                *walked_at == epoch && age < MEMORY_FIGURE_MAX_AGE
+                previous.version == epoch && age < MEMORY_FIGURE_MAX_AGE
             } else {
                 reuse
             };
             if reuse {
-                return figure
-                    .clone()
-                    .with_measurement_age(age, *walked_at != epoch);
+                return previous.figure.clone().with_measurement_age(
+                    age,
+                    previous.version != epoch || previous.incomplete_attempt,
+                );
             }
         }
         #[cfg(test)]
         MEMORY_FIGURE_WALKS.with(|walks| walks.set(walks.get() + 1));
         let figure = walk();
         if figure.shared.status == "busy" || !figure.shared.not_estimated.is_empty() {
-            // Retry next time instead of caching a lock gap for thirty seconds.
-            // A prior complete walk is more useful than dropping its bytes;
-            // its age and stale gap disclose that this attempt was incomplete.
-            return slot.as_ref().map_or(figure.clone(), |(at, _, previous)| {
-                previous
-                    .clone()
-                    .with_measurement_age(now.saturating_duration_since(*at), true)
-            });
+            // Keep a prior complete figure instead of discarding its bytes or
+            // extending busy. Rate-limit incomplete map walks too; their age
+            // and gaps remain visible until the next attempt can measure more.
+            if let Some(previous) = slot.as_mut() {
+                previous.attempted_at = now;
+                previous.incomplete_attempt = true;
+                return previous.figure.clone().with_measurement_age(
+                    now.saturating_duration_since(previous.measured_at),
+                    true,
+                );
+            }
+            if figure.shared.status == "busy" {
+                return figure;
+            }
         }
-        *slot = Some((now, epoch, figure.clone()));
+        *slot = Some(CachedMemoryFigure {
+            measured_at: now,
+            attempted_at: now,
+            version: epoch,
+            figure: figure.clone(),
+            incomplete_attempt: false,
+        });
         figure.with_measurement_age(Duration::ZERO, version() != epoch)
     }
 
@@ -2674,7 +2692,41 @@ mod tests {
     }
 
     #[test]
-    fn memory_figure_retries_contention_without_extending_busy() {
+    fn memory_figure_partial_walk_is_retried_even_without_an_epoch_change() {
+        let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
+        let handle = &fixture.handle;
+        let estimate = || super::super::surfaces::DataLayerMemory {
+            shared: crate::memory::MemoryEstimate::estimated(100),
+            text: 0,
+            callgraph: 0,
+            meaning: 0,
+        };
+        let epoch = Instant::now();
+        crate::context::with_memory_walk_clock_for_test(epoch, || {
+            handle.memory_figure(None, || {
+                let mut partial = estimate();
+                partial.shared = partial.shared.gap("locked_parts");
+                partial.shared.bytes_status = "partial";
+                partial
+            })
+        });
+        let walks = memory_figure_walks_for_test();
+        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(3), || {
+            handle.memory_figure(None, || {
+                panic!("a partial map walk must also be rate-limited")
+            })
+        });
+        let complete = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(30),
+            || handle.memory_figure(None, estimate),
+        );
+        assert_eq!(memory_figure_walks_for_test(), walks + 1);
+        assert_eq!(complete.shared.bytes_status, "estimated");
+        assert!(complete.shared.not_estimated.is_empty());
+    }
+
+    #[test]
+    fn memory_figure_throttles_contention_without_extending_busy() {
         let fixture = PublicationFixture::new(Duration::from_secs(3600), Duration::from_secs(3600));
         let handle = &fixture.handle;
         let complete = || super::super::surfaces::DataLayerMemory {
@@ -2692,13 +2744,20 @@ mod tests {
             epoch + Duration::from_secs(30),
             || handle.memory_figure(None, super::super::surfaces::DataLayerMemory::busy_checkout),
         );
-        assert_eq!(busy.shared.status, "estimated");
+        assert_eq!(busy.shared.status, "ready");
         assert_eq!(busy.shared.bytes_status, "partial");
         assert_eq!(busy.callgraph, 1000);
         assert_eq!(busy.measured_age_ms(), 30_000);
         let walks = memory_figure_walks_for_test();
-        let retried = crate::context::with_memory_walk_clock_for_test(
+        let held = crate::context::with_memory_walk_clock_for_test(
             epoch + Duration::from_secs(33),
+            || handle.memory_figure(None, complete),
+        );
+        assert_eq!(memory_figure_walks_for_test(), walks);
+        assert_eq!(held.measured_age_ms(), 33_000);
+        assert_eq!(held.shared.bytes_status, "partial");
+        let retried = crate::context::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(60),
             || handle.memory_figure(None, complete),
         );
         assert_eq!(memory_figure_walks_for_test(), walks + 1);
