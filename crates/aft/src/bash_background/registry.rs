@@ -1532,7 +1532,7 @@ pub(crate) struct RegistryInner {
     /// to disk with no handle in place. Installing a handle writes each listed
     /// task's current row; without that, a task that finished in the gap would
     /// keep a missing or stale (still running) row.
-    db_writes_awaiting_pool: Mutex<HashSet<String>>,
+    db_writes_awaiting_pool: Mutex<HashMap<String, super::store_writes::Ticket>>,
     /// Whether the current interval without a handle has been logged, so the
     /// skipped writes are reported once per interval instead of once each.
     db_detached_logged: AtomicBool,
@@ -1823,6 +1823,7 @@ struct PendingDbWrite {
     registry: BgTaskRegistry,
     paths: TaskPaths,
     metadata: PersistedTask,
+    ticket: Option<super::store_writes::Ticket>,
 }
 
 type DbWriteOrderKey = (String, String);
@@ -1883,10 +1884,14 @@ impl DbWriteOrder {
             .take();
         if let Some(pending) = pending {
             if pending.seq > *written {
-                pending
-                    .registry
-                    .dual_write_task(&pending.paths, &pending.metadata);
+                pending.registry.dual_write_task_tracked(
+                    &pending.paths,
+                    &pending.metadata,
+                    pending.ticket,
+                );
                 *written = pending.seq;
+            } else if let Some(ticket) = pending.ticket {
+                ticket.resolved();
             }
         }
         written
@@ -1957,12 +1962,18 @@ impl<'a> DeferredDbWrites<'a> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if pending.as_ref().is_none_or(|pending| pending.seq < seq) {
-            *pending = Some(PendingDbWrite {
+            let next = PendingDbWrite {
                 seq,
                 registry: self.registry.clone(),
                 paths: self.task.paths.clone(),
                 metadata: metadata.clone(),
-            });
+                ticket: self.registry.task_row_ticket(&self.task.paths, metadata),
+            };
+            if let Some(old) = pending.replace(next) {
+                if let Some(ticket) = old.ticket {
+                    ticket.resolved();
+                }
+            }
         }
         self.captured = true;
     }
@@ -2187,7 +2198,7 @@ impl BgTaskRegistry {
                 db_pool: RwLock::new(None),
                 runner_completion_delivery_cutover: std::sync::OnceLock::new(),
                 speech_db_path: RwLock::new(None),
-                db_writes_awaiting_pool: Mutex::new(HashSet::new()),
+                db_writes_awaiting_pool: Mutex::new(HashMap::new()),
                 db_detached_logged: AtomicBool::new(false),
                 db_harness: RwLock::new(None),
                 session_harnesses: Mutex::new(HashMap::new()),
@@ -2621,14 +2632,14 @@ impl BgTaskRegistry {
         }
         self.inner.compression_aggregates.clear();
         self.inner.db_detached_logged.store(false, Ordering::SeqCst);
-        // Taken after the handle is installed: a write that found no handle
+        // Read after the handle is installed: a write that found no handle
         // recorded its task while holding the handle's read lock, so it is
         // either in this set or saw the new handle and wrote its own row.
         let awaiting = self
             .inner
             .db_writes_awaiting_pool
             .lock()
-            .map(|mut awaiting| std::mem::take(&mut *awaiting))
+            .map(|awaiting| awaiting.keys().cloned().collect::<HashSet<_>>())
             .unwrap_or_default();
         let tasks = self
             .inner
@@ -2648,6 +2659,17 @@ impl BgTaskRegistry {
                 // its row if it has none.
                 self.ensure_task_row(&task);
             }
+        }
+        // Evicted tasks can no longer supply a row. Release their queued
+        // tickets but retain a sticky gap rather than claiming DB authority.
+        let held = self
+            .inner
+            .tasks
+            .lock()
+            .ok()
+            .map(|tasks| tasks.keys().cloned().collect::<HashSet<_>>());
+        if let (Ok(mut awaiting), Some(held)) = (self.inner.db_writes_awaiting_pool.lock(), held) {
+            awaiting.retain(|id, _| held.contains(id));
         }
         if written > 0 {
             crate::slog_info!(
@@ -3756,7 +3778,7 @@ impl BgTaskRegistry {
 
     /// Records that `task_id`'s aft.db row write found no handle attached, and
     /// logs the first such write of each interval without a handle.
-    fn queue_task_row_until_db_attaches(&self, task_id: &str) {
+    fn queue_task_row_until_db_attaches(&self, task_id: &str, ticket: super::store_writes::Ticket) {
         if let Ok(mut awaiting) = self.inner.db_writes_awaiting_pool.lock() {
             // Ids of tasks this registry no longer holds have nothing left to
             // write; drop them as the set grows so a root whose database never
@@ -3764,10 +3786,12 @@ impl BgTaskRegistry {
             // caller may already hold the task map.
             if awaiting.len() >= 1024 && awaiting.len().is_power_of_two() {
                 if let Ok(tasks) = self.inner.tasks.try_lock() {
-                    awaiting.retain(|id| tasks.contains_key(id));
+                    awaiting.retain(|id, _| tasks.contains_key(id));
                 }
             }
-            awaiting.insert(task_id.to_string());
+            if let Some(old) = awaiting.insert(task_id.to_string(), ticket) {
+                old.resolved();
+            }
         }
         if !self.inner.db_detached_logged.swap(true, Ordering::SeqCst) {
             crate::slog_info!(
@@ -3777,6 +3801,49 @@ impl BgTaskRegistry {
     }
 
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
+        self.dual_write_task_tracked(paths, metadata, self.task_row_ticket(paths, metadata));
+    }
+
+    fn task_row_ticket(
+        &self,
+        paths: &TaskPaths,
+        metadata: &PersistedTask,
+    ) -> Option<super::store_writes::Ticket> {
+        let harness = metadata
+            .harness
+            .clone()
+            .or_else(|| self.fallback_db_harness());
+        if harness.is_none()
+            && self
+                .inner
+                .db_pool
+                .read()
+                .ok()
+                .is_some_and(|pool| pool.is_none())
+        {
+            // Unconfigured library registries intentionally have no store.
+            return None;
+        }
+        let root = paths.session_dir.parent()?.parent()?;
+        let segment = harness
+            .and_then(|harness| harness.parse::<crate::harness::Harness>().ok())
+            .map(|harness| harness.storage_segment());
+        let storage = if segment
+            .is_some_and(|segment| root.file_name() == Some(std::ffi::OsStr::new(&segment)))
+        {
+            root.parent().unwrap_or(root)
+        } else {
+            root
+        };
+        Some(super::store_writes::Ticket::new(storage))
+    }
+
+    fn dual_write_task_tracked(
+        &self,
+        paths: &TaskPaths,
+        metadata: &PersistedTask,
+        mut ticket: Option<super::store_writes::Ticket>,
+    ) {
         super::shell_metadata::facts_changed();
         let pool = {
             let slot = self.inner.db_pool.read().ok();
@@ -3790,7 +3857,9 @@ impl BgTaskRegistry {
                 // lock is held while queueing so `set_db_pool` cannot drain
                 // the queue between this check and the insert.
                 if self.fallback_db_harness().is_some() {
-                    self.queue_task_row_until_db_attaches(&metadata.task_id);
+                    if let Some(ticket) = ticket.take() {
+                        self.queue_task_row_until_db_attaches(&metadata.task_id, ticket);
+                    }
                 }
             }
             pool
@@ -3852,6 +3921,15 @@ impl BgTaskRegistry {
                 metadata.task_id,
                 error
             );
+        } else {
+            if let Some(ticket) = ticket.take() {
+                ticket.resolved();
+            }
+            if let Ok(mut awaiting) = self.inner.db_writes_awaiting_pool.lock() {
+                if let Some(ticket) = awaiting.remove(&metadata.task_id) {
+                    ticket.resolved();
+                }
+            }
         }
         drop(conn);
         self.settle_recovered_call(metadata, paths, row);
@@ -25602,6 +25680,108 @@ mod tests {
         .unwrap()
         .expect("bash_tasks row");
         assert_eq!(row.status, "completed", "the deferred row write must land");
+    }
+
+    fn scope_task_store_fixture() -> (
+        tempfile::TempDir,
+        BgTaskRegistry,
+        Arc<Mutex<TrackedConnection>>,
+        Arc<BgTask>,
+    ) {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        let layout =
+            super::super::persistence::allocate_task_layout(storage.path(), "session").unwrap();
+        let mut metadata = PersistedTask::starting(
+            layout.paths.task_id.clone(),
+            "session".into(),
+            "true".into(),
+            storage.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.harness = Some("opencode".into());
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        metadata.completion_delivered = true;
+        write_task_at(&layout, &metadata).unwrap();
+        registry.dual_write_task(&layout.paths, &metadata);
+        registry
+            .insert_registered_task(
+                metadata,
+                layout.paths.clone(),
+                false,
+                None,
+                storage.path().into(),
+            )
+            .unwrap();
+        let task = registry.task(&layout.paths.task_id).unwrap();
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
+        (storage, registry, db, task)
+    }
+
+    #[test]
+    fn scope_background_tasks_store_coalesced_writes_release_tickets() {
+        let (storage, registry, _db, task) = scope_task_store_fixture();
+        let metadata = task.lock_state().unwrap().metadata.clone();
+        let mut older = DeferredDbWrites::new(&registry, &task);
+        older.capture(&metadata);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 1);
+        let mut newer = DeferredDbWrites::new(&registry, &task);
+        newer.capture(&metadata);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 1);
+        drop(newer);
+        drop(older);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
+        assert!(super::super::store_writes::authoritative(storage.path()));
+    }
+
+    #[test]
+    fn scope_background_tasks_store_deferred_until_attach_releases_tickets() {
+        let (storage, registry, db, task) = scope_task_store_fixture();
+        let metadata = task.lock_state().unwrap().metadata.clone();
+        registry.clear_db_pool();
+        registry.dual_write_task(&task.paths, &metadata);
+        registry.dual_write_task(&task.paths, &metadata);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 1);
+        assert!(!super::super::store_writes::authoritative(storage.path()));
+        registry.set_db_pool(db);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
+        assert!(super::super::store_writes::authoritative(storage.path()));
+    }
+
+    #[test]
+    fn scope_background_tasks_store_evicted_queued_task_releases_ticket_but_retains_gap() {
+        let (storage, registry, db, task) = scope_task_store_fixture();
+        let metadata = task.lock_state().unwrap().metadata.clone();
+        registry.clear_db_pool();
+        registry.dual_write_task(&task.paths, &metadata);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 1);
+        registry.inner.tasks.lock().unwrap().remove(&task.task_id);
+        registry.set_db_pool(db);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
+        assert!(!super::super::store_writes::authoritative(storage.path()));
+    }
+
+    #[test]
+    fn scope_background_tasks_store_successful_retry_releases_tickets_and_failure_stays_sticky() {
+        let (storage, registry, db, task) = scope_task_store_fixture();
+        let metadata = task.lock_state().unwrap().metadata.clone();
+        db.lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE bash_tasks RENAME TO hidden_bash_tasks")
+            .unwrap();
+        registry.dual_write_task(&task.paths, &metadata);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
+        assert!(!super::super::store_writes::authoritative(storage.path()));
+        db.lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE hidden_bash_tasks RENAME TO bash_tasks")
+            .unwrap();
+        registry.dual_write_task(&task.paths, &metadata);
+        assert_eq!(super::super::store_writes::outstanding(storage.path()), 0);
+        assert!(!super::super::store_writes::authoritative(storage.path()));
     }
 
     /// A deferred aft.db write that reaches the database after a newer one

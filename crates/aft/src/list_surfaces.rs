@@ -858,7 +858,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc/scope_background_tasks.rs",
-        enclosing_item: "running, scan_saved, expected_roots, registry_snapshot",
+        enclosing_item: "running, scan_saved, scan_sessions, next_entry, expected_roots, registry_snapshot",
         location_or_primitive: "COMMAND_BYTES and WALK_LIMIT",
         reason: "owner-only management snapshot, not an agent result list; command_truncated identifies the UTF-8 command ceiling and complete false with a reason discloses every bounded or failed walk",
     },
