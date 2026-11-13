@@ -356,12 +356,12 @@ fn resolve_owner(
             if candidates.is_empty() {
                 return Err(refuse(
                     "worker_route_not_bound",
-                    "no live route of the worker run's parent scope is bound to AFT",
+                    "no live runner route of the worker scope is bound to AFT yet",
                 ));
             }
             // A worker run under a head (or any non-worker) scope would run
             // with that scope's authority, which a worker run never carries.
-            let workers: Vec<_> = candidates
+            let mut workers: Vec<_> = candidates
                 .into_iter()
                 .filter(of_kind(ScopeKind::Worker))
                 .collect();
@@ -369,6 +369,23 @@ fn resolve_owner(
                 return Err(refuse(
                     "parent_not_worker",
                     "the worker run's parent scope is not a worker's scope",
+                ));
+            }
+            // The scope owner's routes keep the worker scope leased; only runner
+            // routes carry the worker's saved tool settings, keyed by runner principal.
+            // Exclude owner-principal routes regardless of tool-call history.
+            let scope_owner = super::principal_id(&Some(parent.owner.clone()));
+            workers.retain(|(_, identity)| {
+                !matches!(
+                    &identity.spawn_principal,
+                    AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
+                        if Some(id.as_str()) == scope_owner.as_deref()
+                )
+            });
+            if workers.is_empty() {
+                return Err(refuse(
+                    "worker_route_not_bound",
+                    "no live runner route of the worker scope is bound to AFT yet",
                 ));
             }
             workers
