@@ -25,6 +25,7 @@ fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
     }
     let primed = collect_at_revision(&executor, Some(&db), true, DbFacts::default(), 0);
     let mut cached = collect_at_revision(&executor, Some(&db), true, primed.db, 0).db;
+    let mut legacy = DbFacts::default();
     let mut old_state = state::State::new("same-epoch".into());
     let mut new_state = state::State::new("same-epoch".into());
     let filter = Filter {
@@ -92,11 +93,13 @@ fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
             assert_eq!(opens, 0, "unchanged retained tasks were reopened");
         }
         if step == 2 || step == 3 {
-            assert_eq!(opens, 2, "an unrelated task was sampled");
+            assert_eq!(
+                opens,
+                if step == 3 { 1 } else { 2 },
+                "an unrelated task was sampled"
+            );
         }
-        // A fresh collection uses the pre-cache observation path: no saved
-        // samples or database rows survive from the preceding revision.
-        let fresh = collect_at_revision(&executor, Some(&db), true, DbFacts::default(), step);
+        let fresh = super::legacy::collect_legacy(&executor, Some(&db), true, legacy, step);
         let mut actual_rows = actual.rows.clone();
         let mut fresh_rows = fresh.rows.clone();
         actual_rows.sort_by(|a, b| a.task_id.cmp(&b.task_id));
@@ -116,6 +119,7 @@ fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
             "watch frames at step {step}"
         );
         cached = actual.db;
+        legacy = fresh.db;
     }
 }
 
@@ -123,10 +127,10 @@ fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
 fn shells_v1_saved_rows_follow_committed_store_changes_not_watch_revisions() {
     let (dir, _ctx, executor, app) = status_context();
     let db = app.db().unwrap();
-    let first = collect_at_revision(&executor, Some(&db), true, DbFacts::default(), 10);
+    let first = collect_at_store_revision(&executor, Some(&db), true, DbFacts::default(), 10, 1);
     db.lock().unwrap().trace(Some(trace_facts_sql));
     FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
-    let unchanged = collect_at_revision(&executor, Some(&db), true, first.db, 11);
+    let unchanged = collect_at_store_revision(&executor, Some(&db), true, first.db, 11, 1);
     assert!(FACTS_SQL_TRACE.with(|trace| trace
         .borrow()
         .iter()
@@ -139,10 +143,10 @@ fn shells_v1_saved_rows_follow_committed_store_changes_not_watch_revisions() {
     let row = metadata.to_bash_task_row("test", &task.paths).unwrap();
     let tx = other.unchecked_transaction().unwrap();
     tx.execute("INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,started_at,completed_at,stdout_path,stderr_path,metadata) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", rusqlite::params![row.harness,row.session_id,row.task_id,row.project_key,row.command,row.cwd,row.status,row.started_at,row.completed_at,row.stdout_path,row.stderr_path,row.metadata]).unwrap();
-    let before_commit = collect_at_revision(&executor, Some(&db), false, unchanged.db, 11);
+    let before_commit = collect_at_store_revision(&executor, Some(&db), false, unchanged.db, 11, 1);
     assert!(before_commit.rows.is_empty());
     tx.commit().unwrap();
-    let committed = collect_at_revision(&executor, Some(&db), false, before_commit.db, 11);
+    let committed = collect_at_store_revision(&executor, Some(&db), false, before_commit.db, 11, 1);
     assert!(committed.rows_refreshed);
     assert_eq!(committed.rows.len(), 1);
     db.lock().unwrap().trace(None);
@@ -197,8 +201,7 @@ fn shells_v1_local_store_writer_generations_cover_insert_update_delete_and_rollb
         .unwrap()
         .is_none());
     row.completed_at = Some(1);
-    row.stdout_path = None;
-    row.stderr_path = None;
+    std::fs::remove_dir_all(&task.paths.dir).unwrap();
     upsert_bash_task(&conn, &row).unwrap();
     changed(&|| {
         assert_eq!(

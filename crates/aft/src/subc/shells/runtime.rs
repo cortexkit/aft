@@ -1005,6 +1005,24 @@ fn collect_at_revision(
     previous: DbFacts,
     revision: u64,
 ) -> Collected {
+    collect_at_store_revision(
+        executor,
+        db,
+        include_rows,
+        previous,
+        revision,
+        crate::db::bash_tasks::store_revision(),
+    )
+}
+
+fn collect_at_store_revision(
+    executor: &Executor,
+    db: Option<&std::sync::Mutex<crate::db::TrackedConnection>>,
+    include_rows: bool,
+    previous: DbFacts,
+    revision: u64,
+    generation: u64,
+) -> Collected {
     #[cfg(test)]
     COLLECT_CALLS.fetch_add(1, Ordering::Relaxed);
     let contexts = executor.actor_contexts();
@@ -1026,7 +1044,6 @@ fn collect_at_revision(
     let mut facts = previous;
     let mut db_available = true;
     if let Some(db) = db {
-        let generation = crate::db::bash_tasks::store_revision();
         if let Some((saved_key, saved)) = with_db_read(db, |conn| {
             // data_version catches committed writes from other connections
             // and processes; the process generation covers this connection's
@@ -1105,7 +1122,7 @@ fn collect_at_revision(
         }
     });
     let mut rows = Vec::new();
-    if observe {
+    if observe && db_available {
         for snapshot in observations {
             let mut row = project_row(&snapshot, None);
             row.revision = snapshot.metadata.shell_revision;

@@ -105,6 +105,7 @@ pub(crate) struct ShellReader {
     order: Arc<DbWriteOrder>,
     format_scans: Arc<Mutex<HashMap<TaskArtifact, FormatScan>>>,
     stop: Option<tokio_util::sync::CancellationToken>,
+    persisted_terminal: bool,
 }
 
 impl ShellReader {
@@ -172,6 +173,7 @@ impl ShellReader {
         {
             return None;
         }
+        let persisted_terminal = metadata.is_terminal();
         #[cfg(unix)]
         if !metadata.is_terminal() {
             let _ = super::remote::terminal_metadata_from_proof(&mut metadata);
@@ -214,6 +216,7 @@ impl ShellReader {
             paths: task.paths,
             format_scans: Default::default(),
             stop: None,
+            persisted_terminal,
         };
         metadata.command = if metadata.has_safe_completion_redaction_after_restart() {
             crate::log_redact::redact_command(&metadata.command).into_owned()
@@ -267,7 +270,9 @@ impl ShellReader {
         task_id: &str,
         fingerprint: &str,
     ) -> Result<u64, String> {
-        if self.live.is_none() && self.metadata.shell_fingerprint.as_deref() == Some(fingerprint) {
+        if self.persisted_terminal
+            && self.metadata.shell_fingerprint.as_deref() == Some(fingerprint)
+        {
             return Ok(self.metadata.shell_revision);
         }
         self.shell_revision(task_id, fingerprint)
@@ -437,11 +442,73 @@ impl BgTaskRegistry {
             order: task.db_write_order.clone(),
             format_scans: Default::default(),
             stop: None,
+            persisted_terminal: false,
         })
     }
     #[cfg(test)]
     pub(crate) fn shell_snapshots(&self) -> Vec<ShellSnapshot> {
-        self.shell_snapshots_cached(&mut ShellSnapshotCache::default())
+        let tasks: Vec<_> = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        tasks
+            .into_iter()
+            .filter_map(|task| {
+                let state = task.lock_state().ok()?;
+                let stdout = state.buffer.stream_len(StreamKind::Stdout);
+                let stderr = if state.metadata.mode == BgMode::Pty {
+                    0
+                } else {
+                    state.buffer.stream_len(StreamKind::Stderr)
+                };
+                let path = if state.metadata.mode == BgMode::Pty {
+                    &task.paths.pty
+                } else {
+                    &task.paths.stdout
+                };
+                let last_output_at_ms = (stdout + stderr > 0)
+                    .then(|| {
+                        [path, &task.paths.stderr]
+                            .iter()
+                            .filter_map(|path| {
+                                std::fs::metadata(path)
+                                    .ok()?
+                                    .modified()
+                                    .ok()?
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|duration| duration.as_millis() as u64)
+                            })
+                            .max()
+                    })
+                    .flatten();
+                let mut metadata = state.metadata.clone();
+                let secrets = task
+                    .completion_secrets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                metadata.command = match secrets.as_ref() {
+                    Some(secrets) => {
+                        crate::log_redact::redact_command(&secrets.redact(&metadata.command))
+                            .into_owned()
+                    }
+                    None if metadata.has_safe_completion_redaction_after_restart() => {
+                        crate::log_redact::redact_command(&metadata.command).into_owned()
+                    }
+                    None => crate::log_redact::SECRET_PLACEHOLDER.into(),
+                };
+                Some(ShellSnapshot {
+                    metadata,
+                    stdout,
+                    stderr,
+                    last_output_at_ms,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn shell_snapshots_cached(

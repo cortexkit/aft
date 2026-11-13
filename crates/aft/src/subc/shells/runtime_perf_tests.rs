@@ -78,30 +78,40 @@ fn append(paths: &TaskPaths) {
 fn shells_watch_collection_fixture() {
     let (_dir, executor, app, active) = fixture();
     let db = app.db().unwrap();
-    let mut facts = collect_at_revision(&executor, Some(&db), true, DbFacts::default(), 0).db;
-    let mut cpu = 0;
-    let mut wall = Duration::ZERO;
-    let mut opens = 0;
-    let mut queries = 0;
     db.lock().unwrap().trace(Some(trace_facts_sql));
-    for revision in 1..=40 {
-        for paths in &active {
-            append(paths);
+    for legacy in [true, false] {
+        let collect = if legacy {
+            super::legacy::collect_legacy
+        } else {
+            collect_at_revision
+        };
+        let mut facts = collect(&executor, Some(&db), true, DbFacts::default(), 0).db;
+        let mut cpu = 0;
+        let mut wall = Duration::ZERO;
+        let mut opens = 0;
+        let mut file_opens = 0;
+        let mut queries = 0;
+        for revision in 1..=40 {
+            for paths in &active {
+                append(paths);
+            }
+            ARTIFACT_OPENS.with(|count| count.set(0));
+            crate::bash_background::persistence::work_counts::reset();
+            FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
+            let start = std::time::Instant::now();
+            let cpu_start = cpu_ns();
+            let collected = collect(&executor, Some(&db), true, facts, revision);
+            cpu += cpu_ns() - cpu_start;
+            wall += start.elapsed();
+            assert_eq!(collected.rows.len(), 300);
+            facts = collected.db;
+            opens += ARTIFACT_OPENS.with(|count| count.get());
+            file_opens += crate::bash_background::persistence::work_counts::get().opens;
+            queries += FACTS_SQL_TRACE.with(|trace| trace.borrow().len());
         }
-        ARTIFACT_OPENS.with(|count| count.set(0));
-        FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
-        let start = std::time::Instant::now();
-        let cpu_start = cpu_ns();
-        let collected = collect_at_revision(&executor, Some(&db), true, facts, revision);
-        cpu += cpu_ns() - cpu_start;
-        wall += start.elapsed();
-        assert_eq!(collected.rows.len(), 300);
-        facts = collected.db;
-        opens += ARTIFACT_OPENS.with(|count| count.get());
-        queries += FACTS_SQL_TRACE.with(|trace| trace.borrow().len());
+        println!("{}: 40 roots / 300 retained / 5 output producers / 40 revisions: CPU {:.3} ms/revision, wall {:.3} ms/revision, artifact opens {:.1}/revision, persistence file/directory opens {:.1}/revision, SQL statements {:.1}/revision", if legacy { "legacy" } else { "cached" }, cpu as f64 / 40e6, wall.as_secs_f64() * 25.0, opens as f64 / 40.0, file_opens as f64 / 40.0, queries as f64 / 40.0);
     }
     db.lock().unwrap().trace(None);
-    println!("40 roots / 300 retained / 5 output producers / 40 revisions: CPU {:.3} ms/revision, wall {:.3} ms/revision, artifact opens {:.1}/revision, SQL statements {:.1}/revision", cpu as f64 / 40e6, wall.as_secs_f64() * 25.0, opens as f64 / 40.0, queries as f64 / 40.0);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

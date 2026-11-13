@@ -162,6 +162,9 @@ mod perf;
 #[path = "runtime_cache_tests.rs"]
 mod cache;
 
+#[path = "runtime_legacy_tests.rs"]
+mod legacy;
+
 fn status_context() -> (
     tempfile::TempDir,
     Arc<crate::context::AppContext>,
@@ -298,9 +301,9 @@ fn shells_v1_database_facts_scale_with_shells_not_thirty_thousand_scope_rows() {
     FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
     DB_LOCK_DURATIONS.with(|durations| durations.borrow_mut().clear());
     db.lock().unwrap().trace(Some(trace_facts_sql));
-    // Supply an explicit revision to isolate the cache test from other tests'
-    // concurrent registry writes. Production supplies the metadata revision.
-    let first = collect_at_revision(&executor, Some(&db), true, DbFacts::default(), 10);
+    // Supply explicit revisions to isolate this cache test from other tests'
+    // concurrent registry and store writes. Production reads both generations.
+    let first = collect_at_store_revision(&executor, Some(&db), true, DbFacts::default(), 10, 1);
     let sql = FACTS_SQL_TRACE.with(|trace| trace.borrow().clone());
     let durations = DB_LOCK_DURATIONS.with(|samples| samples.borrow().clone());
     assert!(first.db_available);
@@ -341,7 +344,7 @@ fn shells_v1_database_facts_scale_with_shells_not_thirty_thousand_scope_rows() {
     );
     FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
     DB_LOCK_DURATIONS.with(|durations| durations.borrow_mut().clear());
-    let idle = collect_at_revision(&executor, Some(&db), false, first.db, 10);
+    let idle = collect_at_store_revision(&executor, Some(&db), false, first.db, 10, 1);
     assert!(
         FACTS_SQL_TRACE.with(|trace| trace
             .borrow()
@@ -352,7 +355,7 @@ fn shells_v1_database_facts_scale_with_shells_not_thirty_thousand_scope_rows() {
     // A watchdog wakeup without a metadata mutation must not dirty the cache,
     // even when persisted output observation asks for refreshed rows.
     crate::bash_background::shell_metadata::changed();
-    let polled = collect_at_revision(&executor, Some(&db), true, idle.db, 10);
+    let polled = collect_at_store_revision(&executor, Some(&db), true, idle.db, 10, 1);
     assert_eq!(polled.rows.len(), 3);
     assert!(FACTS_SQL_TRACE.with(|trace| trace
         .borrow()
@@ -366,7 +369,7 @@ fn shells_v1_database_facts_scale_with_shells_not_thirty_thousand_scope_rows() {
         )
         .unwrap();
     FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
-    let changed = collect_at_revision(&executor, Some(&db), true, polled.db, 11);
+    let changed = collect_at_store_revision(&executor, Some(&db), true, polled.db, 11, 1);
     assert!(changed.db_available);
     assert!(
         !FACTS_SQL_TRACE.with(|trace| trace.borrow().is_empty()),
