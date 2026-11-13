@@ -52,7 +52,12 @@ cd ../../..
 The fastembed default model is `all-MiniLM-L6-v2`; network access to its public
 Hugging Face files is needed. Every build has fresh model/cache directories, so
 model download/initialization is part of the measured cold meaning run. No remote
-embedding service is configured. Text and meaning runs do not build a call graph.
+embedding service is configured. Because standalone `runner` sessions do not
+admit semantic roots automatically, the user-tier configure document explicitly
+selects this checkout through `index.roots` with `search` and `semantic`. The
+build JSON records this admission source; it does not impersonate an interactive
+OpenCode/Pi session. Configure starts the fill without running a search query.
+Text and meaning runs do not build a call graph.
 Tests remain in the normal AFT corpus; Git/AFT ignore rules still apply. Git LFS
 payloads and submodules are not populated, matching a plain shallow checkout.
 

@@ -61,6 +61,11 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(config["semantic"]["backend"], "fastembed")
             self.assertFalse(config["inspect"]["enabled"])
             self.assertTrue(client.arguments["_bypass_size_limits"])
+            self.assertEqual(client.arguments["harness"], "runner")
+            if mode == "meaning":
+                self.assertEqual(config["index"]["roots"], [{"path": str(self.root), "indexes": ["search", "semantic"]}])
+            else:
+                self.assertNotIn("index", config)
 
     def test_missing_index_state_is_not_ready(self):
         self.assertEqual(RUN.states({}, "meaning"), {"semantic_index": "unknown"})

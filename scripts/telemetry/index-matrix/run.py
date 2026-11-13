@@ -120,6 +120,10 @@ def configure(client, root, env, mode, timeout):
                           "semantic": mode in ("meaning", "full"),
                           "callgraph": mode == "full"},
               "inspect": {"enabled": False}, "semantic": {"backend": "fastembed"}}
+    if mode in ("meaning", "full"):
+        # Runner sessions do not open interactive semantic roots. Measurement
+        # consent is explicit, so admit only this checkout as a standing root.
+        config["index"] = {"roots": [{"path": str(root), "indexes": ["search", "semantic"]}]}
     return checked(client.request("configure", timeout_s=timeout,
                    project_root=str(root), harness="runner", storage_dir=env["AFT_STORAGE_DIR"],
                    config=[{"tier": "user", "source": "<index-matrix>", "doc": json.dumps(config)}],
@@ -195,6 +199,7 @@ def measure_build(binary, root, folder, mode, args):
     census = folder / "call-shape.json" if mode == "full" else None
     env = isolated_environment(folder, census)
     result = {"mode": mode, "outcome": "failed", "guard_bytes": args.guard_gib * 1024 ** 3,
+              "semantic_admission": "user-tier index.roots selecting search and semantic" if mode in ("meaning", "full") else None,
               "guard_kind": "cgroup-v2 memory.max; swap disabled" if args.cgroup_parent else "RLIMIT_AS (address space, conservative RSS upper bound)",
               "gaps": []}
     client = sampler = phases = None
