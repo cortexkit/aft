@@ -1,15 +1,21 @@
+import { fileURLToPath } from "node:url";
 import { ADAPTER_UNIMPLEMENTED_TOOLS, CANONICAL_TOOLS } from "@cortexkit/aft-bridge";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig, resolvedDisabledTools } from "./config.js";
 import { detectPiHarness, type PiHarness } from "./harness.js";
-import { withOmpInternalUrls } from "./omp-internal-urls.js";
+import { projectAftCall, withOmpInternalUrls } from "./omp-internal-urls.js";
 import {
   outsideAccessPolicyFor,
   prepareToolDefinitionForRegistration,
   recordSessionCwd,
+  resolveSessionId,
   withOutsidePermissionOperation,
 } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
@@ -21,6 +27,7 @@ import { registerImportTools } from "./tools/imports.js";
 import { registerInspectTool } from "./tools/inspect.js";
 import { registerNavigateTool } from "./tools/navigate.js";
 import { registerReadingTools } from "./tools/reading.js";
+import { asRecord } from "./tools/render-helpers.js";
 import { registerSafetyTool } from "./tools/safety.js";
 import { registerSemanticTool } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
@@ -242,6 +249,10 @@ export function bindToolRegistrationFunnel(
     );
     originalRegisterTool({
       ...prepared,
+      // Declared explicitly, not inferred: the binding below admits only
+      // tools whose host-recorded `sourceInfo.path` equals this same constant.
+      // Non-OMP hosts get no such field; they have no such contract to honor.
+      ...(effectiveHarness === "omp" ? { sourcePath: TOOL_SOURCE_PATH } : {}),
       execute(toolCallId, params, signal, onUpdate, context) {
         recordSessionCwd((context as { cwd?: unknown } | undefined)?.cwd);
         return withOutsidePermissionOperation(
@@ -347,4 +358,97 @@ export function refreshPiRevisionReadTools(
   const boundPi = bindToolRegistrationFunnel(pi, ctx);
   registerHoistedTools(boundPi, ctx, surface);
   registerReadingTools(boundPi, ctx, surface);
+}
+
+/** Shared source identity for registered tools and their binding. */
+export const TOOL_SOURCE_PATH: string = fileURLToPath(import.meta.url);
+
+type AftCapability = "observation" | "mutation" | "execution" | "native-url";
+
+const TOOL_CAPABILITIES: Readonly<Record<string, readonly AftCapability[]>> = {
+  read: ["observation", "native-url"],
+  write: ["mutation", "native-url"],
+  edit: ["mutation", "native-url"],
+  grep: ["observation", "native-url"],
+  bash: ["execution", "native-url"],
+  powershell: ["execution"],
+  aft_outline: ["observation"],
+  aft_zoom: ["observation"],
+  aft_search: ["observation"],
+  aft_inspect: ["observation"],
+  aft_callgraph: ["observation"],
+  aft_conflicts: ["observation"],
+  aft_import: ["mutation"],
+  aft_safety: ["observation", "mutation"],
+  aft_delete: ["mutation"],
+  aft_move: ["mutation"],
+  ast_grep_search: ["observation"],
+  ast_grep_replace: ["observation", "mutation"],
+  bash_status: ["observation"],
+  bash_watch: ["observation"],
+  bash_write: ["execution"],
+  bash_kill: ["execution"],
+};
+
+/** Answer correlated v1 requests from the live registry, regardless of extension load order. */
+export function registerAftBinding(pi: ExtensionAPI, ctx: PluginContext): () => void {
+  if (detectPiHarness(pi) !== "omp") return () => {};
+  let latestContext: ExtensionContext | undefined;
+  const capture = (_event: unknown, extCtx?: ExtensionContext): void => {
+    if (extCtx) latestContext = extCtx;
+  };
+  // Observing tool_call would disable host speculation; capture lifecycle context instead.
+  pi.on("session_start", capture);
+  pi.on("session_tree", capture);
+  pi.on("before_agent_start", capture);
+  pi.on("agent_start", capture);
+  pi.on("turn_start", capture);
+  pi.on("input", capture);
+  const subscription = pi.events.on("aft:binding-request", (payload: unknown) => {
+    const extCtx = latestContext;
+    const request = asRecord(payload);
+    if (!extCtx || request?.v !== 1) return;
+    const sessionId = resolveSessionId(extCtx);
+    if (
+      !sessionId ||
+      request.sessionId !== sessionId ||
+      typeof request.requestId !== "string" ||
+      !request.requestId
+    )
+      return;
+    let tools: Array<{ name: string; sourcePath: string; capabilities: AftCapability[] }>;
+    try {
+      const active = new Set(pi.getActiveTools());
+      tools = pi
+        .getAllTools()
+        .filter(
+          (tool) =>
+            tool.sourceInfo?.path === TOOL_SOURCE_PATH &&
+            active.has(tool.name) &&
+            TOOL_CAPABILITIES[tool.name] !== undefined,
+        )
+        .map(({ name }) => ({
+          name,
+          sourcePath: TOOL_SOURCE_PATH,
+          capabilities: [...TOOL_CAPABILITIES[name]],
+        }));
+    } catch {
+      return;
+    }
+    if (tools.length === 0) return;
+    pi.events.emit("aft:binding", {
+      v: 1,
+      sessionId,
+      requestId: request.requestId,
+      tools,
+      project: (name: string, input: Record<string, unknown>, cwd: string) =>
+        projectAftCall(ctx, name, input, cwd, extCtx),
+    });
+  });
+  const unsubscribe = (): void => {
+    latestContext = undefined;
+    subscription();
+  };
+  pi.on("session_shutdown", unsubscribe);
+  return unsubscribe;
 }
