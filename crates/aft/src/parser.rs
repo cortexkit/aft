@@ -1169,42 +1169,137 @@ fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<T
     work_counters::CACHED_PARSER_PARSES.with(|count| count.set(count.get() + 1));
     REUSABLE_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(lang) {
-            #[cfg(test)]
-            work_counters::GRAMMAR_LOADS.with(|count| count.set(count.get() + 1));
-            let grammar = grammar_for(lang)?;
-            let mut parser = Parser::new();
-            if lang == LangId::Luau {
-                crate::grammar::prepare_parser(&mut parser)?;
+        let mut parser = match parsers.remove(&lang) {
+            Some(parser) => parser,
+            None => {
+                #[cfg(test)]
+                work_counters::GRAMMAR_LOADS.with(|count| count.set(count.get() + 1));
+                let mut parser = Parser::new();
+                initialize_parser(&mut parser, lang)?;
+                parser
             }
-            parser.set_language(&grammar).map_err(|error| {
-                crate::slog_error!("grammar init failed for {:?}: {}", lang, error);
-                AftError::ParseError {
-                    message: format!("grammar init failed for {:?}: {}", lang, error),
-                }
-            })?;
-            // A failed parse must not leave a retained parser for a dynamic
-            // language. Built-in parser reuse keeps its existing behaviour.
-            if lang == LangId::Luau {
-                let tree = parser
-                    .parse(source, None)
-                    .ok_or_else(|| AftError::ParseError {
-                        message: format!("tree-sitter parse returned None for {}", path.display()),
-                    })?;
-                entry.insert(parser);
-                return Ok(tree);
-            }
-            entry.insert(parser);
+        };
+        let result = parse_with_parser(&mut parser, path, source, lang, None);
+        if result.is_ok() {
+            parsers.insert(lang, parser);
         }
-
-        parsers
-            .get_mut(&lang)
-            .expect("parser inserted for language")
-            .parse(source, None)
-            .ok_or_else(|| AftError::ParseError {
-                message: format!("tree-sitter parse returned None for {}", path.display()),
-            })
+        result
     })
+}
+
+const LUAU_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[doc(hidden)]
+pub fn parse_luau_source(path: &Path, source: &str) -> Result<Tree, AftError> {
+    parse_source_with_cached_parser(path, source, LangId::Luau)
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static LUAU_TEST_DEADLINE: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn with_luau_parse_deadline_for_test<T>(
+    deadline: std::time::Duration,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LUAU_TEST_DEADLINE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(LUAU_TEST_DEADLINE.with(|slot| slot.replace(Some(deadline))));
+    run()
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+pub(crate) fn install_luau_parser_for_test(parser: Parser) {
+    REUSABLE_PARSERS.with(|parsers| {
+        parsers.borrow_mut().insert(LangId::Luau, parser);
+    });
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+pub(crate) fn retains_luau_parser_for_test() -> bool {
+    REUSABLE_PARSERS.with(|parsers| parsers.borrow().contains_key(&LangId::Luau))
+}
+
+/// One parsing boundary for fresh and reused dynamic-language parsers.
+pub(crate) fn parse_with_parser(
+    parser: &mut Parser,
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    old_tree: Option<&Tree>,
+) -> Result<Tree, AftError> {
+    let no_tree = || AftError::ParseError {
+        message: format!("tree-sitter parse returned None for {}", path.display()),
+    };
+    if lang != LangId::Luau {
+        return parser.parse(source, old_tree).ok_or_else(no_tree);
+    }
+    #[cfg(feature = "test-hooks")]
+    let deadline = {
+        static FROM_ENV: std::sync::LazyLock<Option<std::time::Duration>> =
+            std::sync::LazyLock::new(|| {
+                std::env::var("AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS")
+                    .ok()
+                    .map(|value| {
+                        std::time::Duration::from_millis(
+                            value.parse().expect("test parse deadline milliseconds"),
+                        )
+                    })
+            });
+        LUAU_TEST_DEADLINE
+            .with(|slot| slot.get())
+            .or(*FROM_ENV)
+            .unwrap_or(LUAU_PARSE_DEADLINE)
+    };
+    #[cfg(not(feature = "test-hooks"))]
+    let deadline = LUAU_PARSE_DEADLINE;
+    let start = std::time::Instant::now();
+    let mut expired = false;
+    // This bounds host parsing, but cannot interrupt one lex or scanner call
+    // that never returns: Tree-sitter exposes no Wasmtime store-budget hook.
+    // Built-in native grammars have the same single-call interruption gap.
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if start.elapsed() >= deadline {
+            expired = true;
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let bytes = source.as_bytes();
+    let tree = parser.parse_with_options(
+        &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+        old_tree,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+    );
+    if expired || start.elapsed() >= deadline {
+        return Err(AftError::GrammarParseTimeout {
+            path: path.display().to_string(),
+            language: "luau".into(),
+            timeout_ms: deadline.as_millis().min(u64::MAX as u128) as u64,
+        });
+    }
+    tree.ok_or_else(no_tree)
+}
+
+/// A Wasm language must have a store attached before set_language can run it.
+pub(crate) fn initialize_parser(parser: &mut Parser, lang: LangId) -> Result<(), AftError> {
+    let grammar = grammar_for(lang)?;
+    if lang == LangId::Luau {
+        crate::grammar::prepare_parser(parser)?;
+    }
+    parser
+        .set_language(&grammar)
+        .map_err(|error| AftError::ParseError {
+            message: format!("grammar init failed for {lang:?}: {error}"),
+        })
 }
 
 #[cfg(feature = "test-hooks")]

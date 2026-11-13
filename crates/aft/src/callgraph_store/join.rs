@@ -43,7 +43,9 @@ pub(crate) mod syntax_index;
 use super::facts::{BlobKey, FactPaths, NoProjectFacts, ProjectFacts};
 use crate::callgraph::{self, FileCallData, SymbolMeta};
 use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
-use crate::parser::{grammar_for, LangId};
+#[cfg(test)]
+use crate::parser::grammar_for;
+use crate::parser::LangId;
 use crate::symbols::SymbolKind;
 use std::collections::HashMap;
 use std::path::Path;
@@ -60,6 +62,11 @@ pub const SUPERSEDED_PUBLISH: &str = "checkout view owner superseded; publicatio
 /// An error raised while decoding parse payloads or resolving checkout references.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestJoinError {
+    GrammarParseTimeout {
+        path: String,
+        language: String,
+        timeout_ms: u64,
+    },
     GrammarUnavailable(crate::grammar::GrammarUnavailable),
     Cancelled,
     UnsupportedLanguage(String),
@@ -70,6 +77,12 @@ pub enum ManifestJoinError {
 impl fmt::Display for ManifestJoinError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::GrammarParseTimeout {
+                path, timeout_ms, ..
+            } => write!(
+                formatter,
+                "grammar parse exceeded {timeout_ms} ms for {path}"
+            ),
             Self::GrammarUnavailable(error) => formatter.write_str(&error.message),
             Self::Cancelled => formatter.write_str(SUPERSEDED_PUBLISH),
             Self::UnsupportedLanguage(language) => {
@@ -87,6 +100,15 @@ impl std::error::Error for ManifestJoinError {}
 /// it is neither a malformed source file nor a successful empty record.
 pub(crate) fn extraction_error(error: crate::error::AftError) -> ManifestJoinError {
     match error {
+        crate::error::AftError::GrammarParseTimeout {
+            path,
+            language,
+            timeout_ms,
+        } => ManifestJoinError::GrammarParseTimeout {
+            path,
+            language,
+            timeout_ms,
+        },
         crate::error::AftError::GrammarUnavailable {
             language,
             state,
@@ -287,12 +309,17 @@ impl CallgraphBlob {
             Some(tree) => tree,
             None => {
                 let mut parser = Parser::new();
-                parser
-                    .set_language(&grammar_for(lang).map_err(extraction_error)?)
-                    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-                parser.parse(source, None).ok_or_else(|| {
-                    ManifestJoinError::Parse("tree-sitter returned no tree".to_string())
-                })?
+                crate::parser::initialize_parser(&mut parser, lang).map_err(extraction_error)?;
+                #[cfg(test)]
+                parser.note_parse();
+                crate::parser::parse_with_parser(
+                    &mut parser,
+                    Path::new("<reference-content>"),
+                    source,
+                    lang,
+                    None,
+                )
+                .map_err(extraction_error)?
             }
         };
         let root = tree.root_node();

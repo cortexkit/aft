@@ -6,8 +6,6 @@
 
 use std::path::Path;
 
-use tree_sitter::Parser;
-
 use crate::context::AppContext;
 use crate::edit;
 use crate::extract::{
@@ -15,7 +13,7 @@ use crate::extract::{
     ReturnKind,
 };
 use crate::indent::detect_indent;
-use crate::parser::{detect_language, grammar_for, LangId};
+use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 
 /// Handle an `extract_function` request.
@@ -159,26 +157,15 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let grammar = match grammar_for(lang) {
-        Ok(grammar) => grammar,
-        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
-    };
-    let mut parser = Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return Response::error(
-            &req.id,
-            "parse_error",
-            "extract_function: failed to initialize parser",
-        );
-    }
-    let tree = match parser.parse(source.as_bytes(), None) {
-        Some(t) => t,
-        None => {
-            return Response::error(
+    let tree = match crate::parser::FileParser::parse_source(&path, &source, lang) {
+        Ok(tree) => tree,
+        Err(error) => {
+            return Response::error_with_data(
                 &req.id,
-                "parse_error",
-                "extract_function: failed to parse file",
-            );
+                error.code(),
+                error.to_string(),
+                error.to_error_json(),
+            )
         }
     };
 

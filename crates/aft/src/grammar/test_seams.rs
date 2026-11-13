@@ -98,6 +98,7 @@ impl GrammarRegistry {
             queries: options.queries,
             fault: RwLock::new(options.fault),
             listeners: Mutex::new(Vec::new()),
+            load_hook: Mutex::new(None),
         })
     }
 
@@ -112,7 +113,9 @@ impl GrammarRegistry {
     pub fn wait_until_settled(&self, timeout: std::time::Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut entry = self.entry.lock();
-        while entry.state == GrammarState::Downloading && entry.language.is_none() {
+        while (entry.state == GrammarState::Downloading || entry.loading)
+            && entry.language.is_none()
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return false;

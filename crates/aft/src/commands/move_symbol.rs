@@ -13,7 +13,7 @@ use crate::context::AppContext;
 use crate::edit;
 use crate::imports;
 use crate::lsp_hints;
-use crate::parser::{detect_language, grammar_for, parse_source_with_cached_parser, LangId};
+use crate::parser::{detect_language, parse_source_with_cached_parser, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::SymbolKind;
 
@@ -1620,6 +1620,7 @@ fn rewrite_consumer_imports(
 
     if paths_equivalent(consumer_file, source_file)
         && content_references_identifier(content, lang, symbol_name)
+            .map_err(|error| vec![error.to_error_json().to_string()])?
     {
         if let Some(insert_edit) = build_add_moved_import_edit(
             content,
@@ -2230,23 +2231,23 @@ enum IdentifierNamespace {
     Type,
 }
 
-fn content_references_identifier(content: &str, lang: LangId, symbol_name: &str) -> bool {
-    let Ok(grammar) = grammar_for(lang) else {
-        return false;
-    };
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return false;
-    }
-    let Some(tree) = parser.parse(content.as_bytes(), None) else {
-        return false;
-    };
+fn content_references_identifier(
+    content: &str,
+    lang: LangId,
+    symbol_name: &str,
+) -> Result<bool, crate::error::AftError> {
+    let tree =
+        crate::parser::FileParser::parse_source(Path::new("<move-consumer>"), content, lang)?;
 
     let root = tree.root_node();
     if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
-        node_references_identifier(&root, content, symbol_name)
+        Ok(node_references_identifier(&root, content, symbol_name))
     } else {
-        node_references_identifier_naive(&root, content, symbol_name)
+        Ok(node_references_identifier_naive(
+            &root,
+            content,
+            symbol_name,
+        ))
     }
 }
 

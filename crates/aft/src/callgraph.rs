@@ -15,8 +15,6 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use serde_json::Value;
 use tree_sitter::Node;
-#[cfg(not(test))]
-use tree_sitter::Parser;
 
 use crate::callgraph_store::disk_facts::DiskFacts;
 use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
@@ -28,7 +26,9 @@ use crate::calls::{extract_calls_full_with, extract_rust_value_references_with};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::imports::{self, ImportBlock};
-use crate::parser::{detect_language, detect_language_from_source, grammar_for, LangId};
+#[cfg(test)]
+use crate::parser::grammar_for;
+use crate::parser::{detect_language, detect_language_from_source, LangId};
 use crate::symbols::{Range, Symbol, SymbolKind};
 
 // ---------------------------------------------------------------------------
@@ -4064,13 +4064,13 @@ thread_local! {
     static REEXPORT_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn parse_reexport_source(source: &str, lang: LangId) -> Option<tree_sitter::Tree> {
+fn parse_reexport_source(
+    source: &str,
+    lang: LangId,
+) -> Result<tree_sitter::Tree, crate::error::AftError> {
     #[cfg(test)]
     REEXPORT_PARSE_COUNT.with(|count| count.set(count.get() + 1));
-    let grammar = grammar_for(lang).ok()?;
-    let mut parser = Parser::new();
-    parser.set_language(&grammar).ok()?;
-    parser.parse(source, None)
+    crate::parser::FileParser::parse_source(Path::new("<reexport-source>"), source, lang)
 }
 
 fn resolve_reexported_symbol_inner<F, D>(
@@ -4104,7 +4104,7 @@ where
         });
     }
 
-    let tree = parse_reexport_source(&source, lang)?;
+    let tree = parse_reexport_source(&source, lang).ok()?;
     let from_dir = canon.parent().unwrap_or_else(|| Path::new("."));
 
     let mut cursor = tree.root_node().walk();

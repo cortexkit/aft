@@ -568,6 +568,68 @@ fn grammar_engine_failure_is_not_reported_as_a_restartable_load() {
     assert_eq!(error.retry_after_ms, None);
 }
 
+#[cfg(feature = "test-hooks")]
+#[test]
+fn grammar_real_parse_deadline_discards_a_reused_parser_and_returns_no_partial_tree() {
+    use crate::parser::{
+        install_luau_parser_for_test, parse_luau_source, retains_luau_parser_for_test,
+        with_luau_parse_deadline_for_test,
+    };
+    let (directory, registry, _, _) = setup([]);
+    stored(directory.path());
+    let language = registry.stored().unwrap();
+    let make_parser = || {
+        let mut parser = tree_sitter::Parser::new();
+        prepare_parser(&mut parser).unwrap();
+        parser.set_language(&language).unwrap();
+        parser
+    };
+    let source = "local function f(x) if x then return x + 1 else return 0 end end\n".repeat(4_000);
+    let path = std::path::Path::new("deadline.luau");
+    install_luau_parser_for_test(make_parser());
+    let start = Instant::now();
+    assert!(!parse_luau_source(path, &source)
+        .unwrap()
+        .root_node()
+        .has_error());
+    assert!(
+        start.elapsed() > Duration::from_millis(1),
+        "the input must actually exceed the small test budget"
+    );
+    assert!(retains_luau_parser_for_test());
+    let start = Instant::now();
+    let error = with_luau_parse_deadline_for_test(Duration::from_millis(1), || {
+        parse_luau_source(path, &source)
+    })
+    .unwrap_err();
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let json = error.to_error_json();
+    assert_eq!(json["code"], "grammar_parse_timeout");
+    assert_eq!(json["path"], "deadline.luau");
+    assert_eq!(json["timeout_ms"], 1);
+    assert!(!retains_luau_parser_for_test());
+    install_luau_parser_for_test(make_parser());
+    assert!(!parse_luau_source(path, &source)
+        .unwrap()
+        .root_node()
+        .has_error());
+    let mut index_parser = crate::callgraph_store::join::extraction_work::CountingParser::new();
+    prepare_parser(&mut index_parser).unwrap();
+    index_parser.set_language(&language).unwrap();
+    crate::callgraph_store::join::single_walk::install_luau_parser_for_test(index_parser);
+    let result = with_luau_parse_deadline_for_test(Duration::from_millis(1), || {
+        crate::callgraph_store::join::single_walk::parse_source(
+            &source,
+            crate::parser::LangId::Luau,
+        )
+    });
+    assert!(matches!(
+        result,
+        Err(crate::callgraph_store::join::ManifestJoinError::GrammarParseTimeout { .. })
+    ));
+    assert!(!crate::callgraph_store::join::single_walk::retains_luau_parser_for_test());
+}
+
 #[test]
 fn grammar_concurrent_requests_share_one_background_attempt() {
     struct Gated {
@@ -789,4 +851,33 @@ fn grammar_old_root_attempt_cannot_poison_a_new_root() {
     let entry = registry.entry.lock();
     assert_eq!(entry.state, GrammarState::NotDownloaded);
     assert_eq!(entry.failures, 0);
+}
+
+#[test]
+fn grammar_slow_loading_does_not_hold_the_registry_state_mutex() {
+    let (directory, registry, _, _) = setup([]);
+    stored(directory.path());
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    *registry.load_hook.lock() = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+    }));
+    let loading = registry.clone();
+    let thread = std::thread::spawn(move || loading.stored());
+    started.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(registry.entry.try_lock().is_some());
+    assert_eq!(
+        registry.request().unwrap_err().state,
+        GrammarState::Downloading
+    );
+    let ready = registry.subscribe();
+    assert_eq!(registry.compile_ms(), 0.0);
+    release.send(()).unwrap();
+    thread.join().unwrap().unwrap();
+    assert_eq!(
+        ready.recv_timeout(Duration::from_secs(2)).unwrap(),
+        registry.identity()
+    );
+    assert_eq!(registry.compile_count(), 1);
 }

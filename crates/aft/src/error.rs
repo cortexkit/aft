@@ -9,6 +9,11 @@ pub(crate) const FILE_CHANGED_SINCE_READ_MESSAGE: &str =
 /// and a human-readable `message`.
 #[derive(Debug)]
 pub enum AftError {
+    GrammarParseTimeout {
+        path: String,
+        language: String,
+        timeout_ms: u64,
+    },
     GrammarUnavailable {
         language: String,
         state: crate::grammar::GrammarState,
@@ -75,6 +80,7 @@ impl AftError {
     /// Returns the error code string used in JSON error responses.
     pub fn code(&self) -> &'static str {
         match self {
+            AftError::GrammarParseTimeout { .. } => "grammar_parse_timeout",
             AftError::GrammarUnavailable { .. } => "grammar_unavailable",
             AftError::SymbolNotFound { .. } => "symbol_not_found",
             AftError::AmbiguousSymbol { .. } => "ambiguous_symbol",
@@ -97,6 +103,14 @@ impl AftError {
     ///
     /// Shape: `{ "code": "...", "message": "..." }`
     pub fn to_error_json(&self) -> serde_json::Value {
+        if let Self::GrammarParseTimeout {
+            path,
+            language,
+            timeout_ms,
+        } = self
+        {
+            return serde_json::json!({ "code": self.code(), "message": self.to_string(), "path": path, "language": language, "timeout_ms": timeout_ms });
+        }
         if let Self::GrammarUnavailable {
             language,
             state,
@@ -126,6 +140,7 @@ impl AftError {
 impl fmt::Display for AftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AftError::GrammarParseTimeout { path, timeout_ms, .. } => write!(f, "Luau parsing exceeded the {timeout_ms} ms time limit for {path}; no syntax tree was returned."),
             AftError::GrammarUnavailable { message, .. } => f.write_str(message),
             AftError::DeniedFloor { path } => {
                 f.write_str(&crate::access_policy::aft_storage_denial_message(path))

@@ -56,6 +56,7 @@ impl Clock for MonotonicClock {
 
 struct Entry {
     root_generation: u64,
+    loading: bool,
     language: Option<Language>,
     state: GrammarState,
     failures: u8,
@@ -69,6 +70,7 @@ impl Default for Entry {
     fn default() -> Self {
         Self {
             root_generation: 0,
+            loading: false,
             language: None,
             state: GrammarState::NotDownloaded,
             failures: 0,
@@ -78,6 +80,12 @@ impl Default for Entry {
             compile_ms: 0.0,
         }
     }
+}
+
+struct Loaded {
+    language: Result<Language, GrammarState>,
+    compiles: usize,
+    milliseconds: f64,
 }
 
 pub struct GrammarRegistry {
@@ -90,6 +98,8 @@ pub struct GrammarRegistry {
     queries: Vec<String>,
     fault: RwLock<storage::StorageFault>,
     listeners: Mutex<Vec<std::sync::mpsc::Sender<String>>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    load_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 static REGISTRY: OnceLock<Arc<GrammarRegistry>> = OnceLock::new();
@@ -125,6 +135,8 @@ impl GrammarRegistry {
             queries: vec!["(chunk) @root".into()],
             fault: RwLock::new(storage::StorageFault::None),
             listeners: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            load_hook: Mutex::new(None),
         });
         #[cfg(feature = "test-hooks")]
         return test_seams::from_environment(registry);
@@ -150,6 +162,7 @@ impl GrammarRegistry {
             // root-specific attempts and failures are reset on reconfiguration.
             *entry = Entry {
                 root_generation: generation,
+                loading: entry.loading,
                 language: entry.language.take(),
                 compiles: entry.compiles,
                 compile_ms: entry.compile_ms,
@@ -170,12 +183,17 @@ impl GrammarRegistry {
     }
 
     fn unavailable(&self, entry: &Entry) -> GrammarUnavailable {
-        let mut result = GrammarUnavailable::new(&self.manifest.language, entry.state);
-        if entry.state == GrammarState::AttemptsExhausted {
+        let state = if entry.loading {
+            GrammarState::Downloading
+        } else {
+            entry.state
+        };
+        let mut result = GrammarUnavailable::new(&self.manifest.language, state);
+        if state == GrammarState::AttemptsExhausted {
             result.cause = entry.cause;
         }
         if matches!(
-            entry.state,
+            state,
             GrammarState::NetworkRetry | GrammarState::StorageRetry
         ) {
             result.retry_after_ms = Some(entry.retry_at.saturating_sub(self.clock.now_ms()));
@@ -183,37 +201,68 @@ impl GrammarRegistry {
         result
     }
 
-    /// A single-flight synchronous stored load; it never starts a download.
-    /// The lock also covers query validation, so no caller sees a partial load.
+    /// Verify and compile a stored grammar without holding the state mutex.
+    /// Waiters release that mutex and have a finite wait; command-level request
+    /// calls report an in-progress load immediately instead of waiting for it.
     pub fn stored(&self) -> Result<Language, GrammarUnavailable> {
         let mut entry = self.entry.lock();
+        let wait_until = Instant::now() + std::time::Duration::from_secs(30);
+        while entry.loading {
+            let remaining = wait_until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.unavailable(&entry));
+            }
+            self.changed.wait_for(&mut entry, remaining);
+        }
         if let Some(language) = &entry.language {
             return Ok(language.clone());
         }
-        {
-            if matches!(
-                entry.state,
-                GrammarState::NotDownloaded | GrammarState::VerificationFailed
-            ) {
-                let Some(storage) = self.storage() else {
-                    return Err(self.unavailable(&entry));
-                };
-                match storage.read(&self.manifest) {
-                    Ok(Some(bytes)) => self.load(&mut entry, bytes),
-                    Ok(None) => {}
-                    Err(_) => self.failed_attempt(&mut entry, FailureCause::Storage),
-                }
-            }
-            entry
-                .language
-                .clone()
-                .ok_or_else(|| self.unavailable(&entry))
+        if matches!(
+            entry.state,
+            GrammarState::LoadFailed
+                | GrammarState::UnsupportedPlatform
+                | GrammarState::Downloading
+        ) {
+            return Err(self.unavailable(&entry));
         }
+        let Some(storage) = self.storage() else {
+            return Err(self.unavailable(&entry));
+        };
+        let generation = entry.root_generation;
+        entry.loading = true;
+        drop(entry);
+        let read = storage.read(&self.manifest);
+        let loaded = match &read {
+            Ok(Some(bytes)) => Some(self.compile_language(bytes)),
+            _ => None,
+        };
+        let mut entry = self.entry.lock();
+        entry.loading = false;
+        if let Some(loaded) = loaded {
+            self.publish_load(&mut entry, loaded);
+        } else if read.is_err() && entry.root_generation == generation {
+            let cooling_down =
+                entry.state == GrammarState::StorageRetry && self.clock.now_ms() < entry.retry_at;
+            if !cooling_down && entry.state != GrammarState::AttemptsExhausted {
+                self.failed_attempt(&mut entry, FailureCause::Storage);
+            }
+        }
+        self.changed.notify_all();
+        entry
+            .language
+            .clone()
+            .ok_or_else(|| self.unavailable(&entry))
     }
 
     /// Called only by named-file command handlers. Stored bytes always win over
     /// a download, including the very first qualifying call after a restart.
     pub fn request(self: &Arc<Self>) -> Result<Language, GrammarUnavailable> {
+        {
+            let entry = self.entry.lock();
+            if entry.loading {
+                return Err(self.unavailable(&entry));
+            }
+        }
         if let Ok(language) = self.stored() {
             return Ok(language);
         }
@@ -263,13 +312,14 @@ impl GrammarRegistry {
 
     fn download(&self, storage: storage::Storage, generation: u64) {
         let transport = self.transport.get_or_init(|| {
-            download::HttpsTransport::new().map(|t| Arc::new(t) as Arc<dyn download::Transport>)
+            download::HttpsTransport::new()
+                .map(|transport| Arc::new(transport) as Arc<dyn download::Transport>)
         });
-        let result = match transport {
+        let fetched = match transport {
             Ok(transport) => download::fetch(&self.manifest, transport.as_ref()),
             Err(_) => Err(download::DownloadFailure::Network),
         };
-        let (failure, stored) = match result {
+        let (failure, stored) = match fetched {
             Ok(bytes) => (None, Some(storage.publish(&self.manifest, &bytes))),
             Err(error) => (Some(error), None),
         };
@@ -286,47 +336,77 @@ impl GrammarRegistry {
                 entry.state = GrammarState::VerificationFailed
             }
             (_, Some(Err(_))) => self.failed_attempt(&mut entry, FailureCause::Storage),
-            (_, Some(Ok(bytes))) => self.load(&mut entry, bytes),
+            (_, Some(Ok(bytes))) => {
+                if entry.language.is_none() {
+                    entry.loading = true;
+                    drop(entry);
+                    let loaded = self.compile_language(&bytes);
+                    entry = self.entry.lock();
+                    entry.loading = false;
+                    self.publish_load(&mut entry, loaded);
+                }
+            }
             _ => entry.state = GrammarState::LoadFailed,
         }
         self.changed.notify_all();
     }
 
-    fn load(&self, entry: &mut Entry, bytes: Vec<u8>) {
-        if let Err(error) = ENGINE.as_ref() {
-            entry.state = engine_failure(error).state;
-            self.changed.notify_all();
-            return;
+    fn compile_language(&self, bytes: &[u8]) -> Loaded {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = self.load_hook.lock().take() {
+            hook();
         }
+        let engine = match ENGINE.as_ref() {
+            Ok(engine) => engine,
+            Err(error) => {
+                return Loaded {
+                    language: Err(engine_failure(error).state),
+                    compiles: 0,
+                    milliseconds: 0.0,
+                }
+            }
+        };
+        let mut compiles = 0;
+        let mut milliseconds = 0.0;
         let result = (|| {
-            let engine = ENGINE.as_ref().map_err(Clone::clone)?;
-            let mut store = tree_sitter::WasmStore::new(engine).map_err(|e| e.to_string())?;
-            entry.compiles += 1;
+            let mut store =
+                tree_sitter::WasmStore::new(engine).map_err(|error| error.to_string())?;
+            compiles = 1;
             let start = Instant::now();
-            let language = store.load_language(&self.manifest.language, &bytes);
-            entry.compile_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let language = language.map_err(|e| e.to_string())?;
+            let language = store.load_language(&self.manifest.language, bytes);
+            milliseconds = start.elapsed().as_secs_f64() * 1000.0;
+            let language = language.map_err(|error| error.to_string())?;
             if language.abi_version() != self.manifest.abi {
                 return Err("grammar ABI differs from manifest".into());
             }
             for query in &self.queries {
-                tree_sitter::Query::new(&language, query).map_err(|e| e.to_string())?;
+                tree_sitter::Query::new(&language, query).map_err(|error| error.to_string())?;
             }
             Ok::<_, String>(language)
         })();
-        match result {
+        let language = result.map_err(|error| {
+            log::warn!("{} grammar load failed: {error}", self.manifest.language);
+            GrammarState::LoadFailed
+        });
+        Loaded {
+            language,
+            compiles,
+            milliseconds,
+        }
+    }
+
+    fn publish_load(&self, entry: &mut Entry, loaded: Loaded) {
+        entry.compiles += loaded.compiles;
+        entry.compile_ms = loaded.milliseconds;
+        match loaded.language {
             Ok(language) => {
                 entry.language = Some(language);
                 self.listeners
                     .lock()
                     .retain(|listener| listener.send(self.identity().into()).is_ok());
             }
-            Err(error) => {
-                log::warn!("{} grammar load failed: {error}", self.manifest.language);
-                entry.state = GrammarState::LoadFailed;
-            }
+            Err(state) => entry.state = state,
         }
-        self.changed.notify_all();
     }
 
     /// Subscribe before the grammar is loaded; a ready grammar immediately emits its hash.

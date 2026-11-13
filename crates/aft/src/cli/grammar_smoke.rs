@@ -73,15 +73,11 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         }
         parse_file(&file)?
     } else {
-        let language = registry
-            .stored()
-            .map_err(|e| serde_json::to_string(&e).unwrap_or_default())?;
-        let mut parser = tree_sitter::Parser::new();
-        aft::grammar::prepare_parser(&mut parser).map_err(|e| e.message)?;
-        parser.set_language(&language).map_err(|e| e.to_string())?;
-        parser
-            .parse("local function f() return 1 end", None)
-            .ok_or("grammar smoke parse returned no tree")?
+        aft::parser::parse_luau_source(
+            std::path::Path::new("<grammar-smoke>"),
+            "local function f() return 1 end",
+        )
+        .map_err(|error| error.to_error_json().to_string())?
     };
     if tree.root_node().has_error() || tree.root_node().kind() != "chunk" {
         return Err("grammar smoke parse failed".into());
