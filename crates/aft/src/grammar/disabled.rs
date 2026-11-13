@@ -46,6 +46,10 @@ pub fn prepare_parser(_parser: &mut tree_sitter::Parser) -> Result<(), GrammarUn
     Err(unavailable())
 }
 
+pub fn engine_target() -> Result<&'static str, GrammarUnavailable> {
+    Err(unavailable())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

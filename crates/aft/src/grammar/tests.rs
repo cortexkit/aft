@@ -496,6 +496,7 @@ fn grammar_load_and_query_failures_are_terminal_without_readiness() {
 
 #[test]
 fn grammar_engine_is_fixed_to_pulley_on_every_platform() {
+    assert_eq!(engine_target().unwrap(), "pulley");
     assert!(ENGINE
         .as_ref()
         .expect("Pulley engine must be available")

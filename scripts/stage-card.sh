@@ -187,7 +187,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     echo "stage-card: signed grammar load failed; refusing to stage" >&2
     exit 2
   fi
-  if ! python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert not v["test_seams"]; assert v["engine_target"] == "pulley64"; assert v["hash"] == sys.argv[2]; assert v["tree"].startswith("(chunk ")' "$GRAMMAR_SMOKE/result.json" "$GRAMMAR_HASH"; then
+  if ! python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert not v["test_seams"]; assert v["engine_target"] == "pulley"; assert v["hash"] == sys.argv[2]; assert v["tree"].startswith("(chunk ")' "$GRAMMAR_SMOKE/result.json" "$GRAMMAR_HASH"; then
     rm -rf "$GRAMMAR_SMOKE"
     rm -f "$TMP"
     echo "stage-card: grammar smoke did not verify the production grammar" >&2

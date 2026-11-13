@@ -27,6 +27,19 @@ static ENGINE: LazyLock<Result<tree_sitter::wasmtime::Engine, String>> = LazyLoc
     Ok(engine)
 });
 
+/// Report the target family from Wasmtime's actual engine, not the requested
+/// configuration. Wasmtime's public query distinguishes Pulley from native.
+pub fn engine_target() -> Result<&'static str, GrammarUnavailable> {
+    let engine = ENGINE.as_ref().map_err(|_| {
+        GrammarUnavailable::new(&manifest().language, GrammarState::UnsupportedPlatform)
+    })?;
+    Ok(if engine.is_pulley() {
+        "pulley"
+    } else {
+        "native"
+    })
+}
+
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }

@@ -31,7 +31,7 @@ fn main() -> Result<(), String> {
         "{}",
         serde_json::json!({
             "hash": registry.identity(),
-            "engine_target": "pulley64",
+            "engine_target": aft::grammar::engine_target().map_err(|error| error.message)?,
             "tree": tree.root_node().to_sexp(),
             "test_hooks": cfg!(feature = "test-hooks"),
         })

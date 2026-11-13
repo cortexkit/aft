@@ -87,7 +87,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         return Err("grammar smoke parse failed".into());
     }
     let mut result = serde_json::json!({
-        "language": "luau", "engine_target": "pulley64", "hash": registry.identity(), "compile_ms": registry.compile_ms(),
+        "language": "luau", "engine_target": aft::grammar::engine_target().map_err(|error| error.message)?, "hash": registry.identity(), "compile_ms": registry.compile_ms(),
         "tree": tree.root_node().to_sexp(), "test_seams": cfg!(feature = "test-hooks"),
     });
     #[cfg(all(feature = "test-hooks", feature = "wasm-grammars"))]
