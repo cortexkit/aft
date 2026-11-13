@@ -1917,8 +1917,15 @@ async fn open_and_send(
             reply = consumer.request(&route, READ_BULK_PROBE.to_vec(), CallOptions { timeout:reply_timeout, ..CallOptions::default() }) => reply,
         };
         match read_bulk_probe_outcome(description) {
-            Ok(true) => bytes = read_bulk,
-            Ok(false) => {}
+            Ok(true) => {
+                // Plexus's own audit can't tell this op from the tool call, so
+                // AFT's log is where a reader learns which path a read took.
+                crate::slog_info!("gh_shim relay: plexus advertises github.read.bulk; sending the read through it");
+                bytes = read_bulk;
+            }
+            Ok(false) => crate::slog_info!(
+                "gh_shim relay: plexus doesn't advertise github.read.bulk; sending github_read as a tool call"
+            ),
             // The read still goes out as the tool call, but a probe that
             // could not tell must say so: a silent fallback hid a wrong probe
             // shape for every read on a live provider.
