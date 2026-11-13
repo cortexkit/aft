@@ -15,7 +15,7 @@ const APPROVED_TEXT = `# Agent Foundational Toolkit
 
 const WITHOUT_SEARCH_OR_BASH = `# Agent Foundational Toolkit
 
-**Finding code**: Then aft_outline for structure, aft_zoom for named symbols, read for line ranges.
+**Finding code**: aft_outline for structure, aft_zoom for named symbols, read for line ranges.
 **Relationships**: aft_callgraph for callers, impact, and execution or data-flow traces.
 **Web pages**: aft_outline with a URL as target, then aft_zoom on a heading.
 **Parallel calls**: send independent read-only calls in one response.

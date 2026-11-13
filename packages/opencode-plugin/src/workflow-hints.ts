@@ -55,7 +55,8 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   }
   if (has("aft_outline") && has("aft_zoom") && has("read")) {
     finding.push(
-      "Then aft_outline for structure, aft_zoom for named symbols, read for line ranges.",
+      // "Then" only follows the search sentence; alone, the sentence starts at the tool.
+      `${finding.length ? "Then " : ""}aft_outline for structure, aft_zoom for named symbols, read for line ranges.`,
     );
   }
   if (hasBash) {
