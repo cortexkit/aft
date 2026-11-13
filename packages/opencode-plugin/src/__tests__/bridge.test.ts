@@ -674,8 +674,8 @@ describe("BinaryBridge lifecycle", () => {
 
   test("per-request transportTimeoutMs override sets the request deadline", async () => {
     const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
-    // Advance wall time, awake time and timer delivery together: compressing
-    // only setTimeout callbacks does not consume the request's elapsed budget.
+    // Advance both deadline clocks (wall time and monotonic elapsed time) with
+    // timer delivery: compressing only setTimeout callbacks spends no budget.
     const clock = new ManualClock();
 
     try {
