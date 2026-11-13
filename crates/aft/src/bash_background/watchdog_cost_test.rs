@@ -2055,9 +2055,9 @@ fn watchdog_cost_retained_terminal_poll_measurement() {
     }
 }
 
-/// Run alone with --ignored --nocapture --test-threads=1. Each lane measures
-/// calling-thread CPU for real maintenance work, normalized to its timer rate;
-/// fixture creation, rehydration and filesystem teardown are outside the window.
+/// Run alone with --ignored --nocapture --test-threads=1. Measure calling-thread
+/// CPU for one minute's timer work: 120 watchdog passes, one finished-task
+/// cleanup, and one persisted GC pass. Setup and final store teardown are excluded.
 #[cfg(unix)]
 #[test]
 #[ignore = "measurement: 20,000 finished bundles and 20 running tasks"]
@@ -2094,7 +2094,11 @@ fn watchdog_cost_large_store_maintenance_measurement() {
         metadata.mark_running(std::process::id(), unsafe { libc::getpgrp() });
         metadata.finished_at = None;
         metadata.duration_ms = None;
-        write_task(&paths.json, &metadata).unwrap();
+        write_task_at(
+            &resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap(),
+            &metadata,
+        )
+        .unwrap();
         registry
             .insert_rehydrated_task(metadata, paths, true)
             .unwrap();
