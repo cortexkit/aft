@@ -46,6 +46,8 @@ struct WaitClock {
     awake: Instant,
     continuous: Duration,
     #[cfg(test)]
+    base_now: Option<fn() -> Instant>,
+    #[cfg(test)]
     suspend: Option<&'static std::sync::atomic::AtomicU64>,
 }
 
@@ -55,12 +57,18 @@ impl WaitClock {
             awake: Instant::now(),
             continuous: continuous_now(),
             #[cfg(test)]
+            base_now: None,
+            #[cfg(test)]
             suspend: None,
         }
     }
 
     fn now(self) -> Instant {
         let elapsed = continuous_now().saturating_sub(self.continuous);
+        #[cfg(test)]
+        let elapsed = self
+            .base_now
+            .map_or(elapsed, |now| now().saturating_duration_since(self.awake));
         #[cfg(test)]
         let elapsed = elapsed
             + Duration::from_millis(
@@ -185,6 +193,16 @@ impl ReplyBudget {
         self
     }
 
+    /// A test driving Tokio time must use that same clock for expiry, not just
+    /// for scheduler wakeups. Opt in per budget so native-clock suspend tests
+    /// and other calls keep their independent time sources.
+    #[cfg(test)]
+    pub(crate) fn with_runtime_clock(mut self) -> Self {
+        self.clock.awake = tokio::time::Instant::now().into_std();
+        self.clock.base_now = Some(|| tokio::time::Instant::now().into_std());
+        self
+    }
+
     /// Refund restoration time only to the internal startup allowance. The
     /// caller's absolute reply deadline, including delivery margin, stays fixed.
     pub(crate) fn after_launch_restore(self, elapsed: Duration) -> Self {
@@ -217,6 +235,32 @@ pub(crate) fn clamp_worker_wait_ms(configured: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_clock_drives_reply_expiry_and_combines_with_suspend() {
+        use futures_util::{poll, FutureExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let receipt = tokio::time::Instant::now().into_std();
+        let suspend = Box::leak(Box::new(AtomicU64::new(0)));
+        let budget =
+            ReplyBudget::new(receipt, Some(receipt + Duration::from_secs(3))).with_runtime_clock();
+        let suspend_budget = budget.with_suspend_clock(suspend);
+        assert_eq!(budget.deadline, receipt + Duration::from_millis(1_500));
+        let wait = budget.sleep_until(budget.deadline);
+        tokio::pin!(wait);
+        assert!(poll!(wait.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1_499)).await;
+        assert_eq!(budget.elapsed(), Duration::from_millis(1_499));
+        assert!(poll!(wait.as_mut()).is_pending());
+        suspend.store(1, Ordering::SeqCst);
+        assert!(suspend_budget
+            .sleep_until(budget.deadline)
+            .now_or_never()
+            .is_some());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(poll!(wait.as_mut()).is_ready());
+        assert_eq!(budget.elapsed(), Duration::from_millis(1_500));
+    }
 
     #[tokio::test]
     async fn suspend_makes_wait_and_reply_budget_due_at_resume() {

@@ -6144,7 +6144,7 @@ mod grant_path_tests {
                     let budget = crate::commands::blocking_wait::ReplyBudget::new(
                         started.into_std(),
                         Some((started + Duration::from_secs(3)).into_std()),
-                    );
+                    ).with_runtime_clock();
                     let mut args = json!({"command":"sleep 10","timeout":10000});
                     args[mode] = json!(true);
                     let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
