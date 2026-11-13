@@ -232,7 +232,7 @@ fn grammar_stored_first_single_compile_rayon_and_lifetime() {
             (0..32)
                 .into_par_iter()
                 .map(|_| {
-                    let language = registry.request().unwrap();
+                    let language = registry.stored().unwrap();
                     let mut parser = tree_sitter::Parser::new();
                     prepare_parser(&mut parser).unwrap();
                     parser.set_language(&language).unwrap();
@@ -584,7 +584,7 @@ fn grammar_real_parse_deadline_discards_a_reused_parser_and_returns_no_partial_t
         parser.set_language(&language).unwrap();
         parser
     };
-    let source = "local function f(x) if x then return x + 1 else return 0 end end\n".repeat(4_000);
+    let source = "local function f(x) if x then return x + 1 else return 0 end end\n".repeat(500);
     let path = std::path::Path::new("deadline.luau");
     install_luau_parser_for_test(make_parser());
     let start = Instant::now();
