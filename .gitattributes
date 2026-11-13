@@ -79,3 +79,6 @@ crates/secret-rules/tests/vectors/** text eol=lf
 # of their exact bytes and compared byte-for-byte against our serializers,
 # so a Windows checkout with core.autocrlf=true must not rewrite them.
 test-vectors/** -text
+# The vendored user-command corpus includes the publisher's SHA256SUMS, which
+# checks every file's exact bytes, including README.md, on every platform.
+crates/aft/tests/fixtures/user-commands-v1/** -text
