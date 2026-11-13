@@ -26,7 +26,7 @@ PROJECTS = {
     "Perl/perl5": ["Perl", "C"],
     "neovim/neovim": ["Lua", "C"],
     "torvalds/linux": ["C"],
-    "llvm/llvm-project": ["C++"],
+    "chromium/chromium": ["C++"],
     "NVIDIA/TensorRT-LLM": ["CUDA"],
     "ml-explore/mlx": ["Metal"],
     "ziglang/zig": ["Zig"],
@@ -98,7 +98,10 @@ def main():
         "repositories": [],
     }
     args.cache.mkdir(parents=True, exist_ok=True)
-    records = {row["repository"]: row for row in existing["repositories"]}
+    records = {row["repository"]: row for row in existing["repositories"] if row["repository"] in PROJECTS}
+    for row in records.values():
+        host = "gitlab.com" if row["repository"] == "gitlab-org/gitlab" else "github.com"
+        row.setdefault("clone_url", f"https://{host}/{row['repository']}.git")
     for repo in selected:
         if args.resume and repo in records:
             continue
