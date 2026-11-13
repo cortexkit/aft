@@ -166,3 +166,81 @@ inside the 300 s probe budget on Linux, with 6,034,950,864 bytes including `.git
 The 30 s polling probe observed completion at 240.0028163800016 s (an upper bound,
 not exact clone CPU time). This is practical within the 360 GB disk budget.
 The manifest independently pins Chromium's subsequently observed default head.
+
+## Detached full matrix and evidence collection
+
+`matrix.py` orders the manifest by tracked-file count (the available consistent
+size measure), with Chromium always last. Each repository runs text, meaning,
+then the full census build and queries; a cgroup-killed full build is a recorded
+result, not a reason to stop the matrix. Results contain `guard_killed`, kernel
+cgroup `memory.peak`, OOM events, last observed VmHWM and elapsed time. Cgroup peak
+includes charged file cache and is **not** mislabeled process VmHWM; when a killed
+process's final `/proc` sample is unavailable, exact terminal VmHWM stays empty.
+
+Every meaning/full phase writes `semantic-failures.json`: native failed-file
+count, any names supplied in structured status, the complete semantic status,
+and all raw failure/error log lines (including any filenames AFT prints). Missing
+names are explicitly unavailable, never reconstructed. These fields also reach
+the repository CSV. An AFT semantic status of `ready` with nonzero `files_failed`
+remains an observation, not a claim that every file was embedded successfully.
+
+Example on the dedicated server, from `/root/aft`:
+
+```sh
+systemd-run --unit=aft-index-matrix --collect \
+  --property=WorkingDirectory=/root/aft --property=KillSignal=SIGINT \
+  --property=TimeoutStopSec=60 \
+  --setenv=ORT_DYLIB_PATH=/root/onnx/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so \
+  /usr/bin/python3 scripts/telemetry/index-matrix/matrix.py \
+  --results /root/aft/target/index-matrix/full-matrix -- \
+  --aft-binary /root/aft-default --shape-binary /root/aft-shape \
+  --aft-source-commit 0672e983c119ab0e24cb4492c47c8c54f0e4127e \
+  --shape-source-commit c1efafc8eb15b81e972ca80a895887e0fe45317c \
+  --build-profile ci-storm --cgroup-parent /sys/fs/cgroup --drop-caches \
+  --timeout-s 86400
+```
+
+This full-matrix series uses a separate results folder from the Neovim run
+recorded in `.cortexkit/internal-docs/investigations/index-matrix/README.md`.
+Its per-build deadline is 86,400 seconds rather than that run's 360 seconds. `matrix-plan.json` records the actual UTC start, source
+commit, order, commands and input hashes; `matrix-state.json` records the current
+repository and each finished result. Logs stay on local disk and SSH disconnects
+do not terminate the systemd service. Follow progress with:
+
+```sh
+systemctl status aft-index-matrix --no-pager
+journalctl -u aft-index-matrix --no-pager
+python3 -m json.tool target/index-matrix/full-matrix/matrix-state.json
+# Per-project phase heartbeats and raw AFT logs:
+tail -f target/index-matrix/full-matrix/ml-explore--mlx/run.log
+df -h /
+```
+
+Stop safely with `systemctl stop aft-index-matrix` (SIGINT permits raw-result
+cleanup), then reissue the launch command to resume. Completed repositories with
+identical inputs are skipped. Unfinished attempts remain on disk as evidence;
+a retry builds from empty storage and fresh model/HOME/XDG folders in a new
+attempt directory, rather than continuing a partially built index.
+Do not update runner/driver files or binaries during a running series. Changed
+inputs require a new results folder. The driver pauses instead of deleting data
+if free disk falls below 20 GiB before a project or 10 GiB during one; inspect
+`paused_reason`, free space deliberately, then resume.
+
+Keep keys only on the local collector. From the worker worktree, pull each
+finished repository (success or failure), excluding checkouts, models and binary
+stores but retaining raw JSON/CSV/status/query responses and AFT logs:
+
+```sh
+python3 scripts/telemetry/index-matrix/collect.py \
+  --server root@2.29.202.177 \
+  --identity target/hetzner-measure/id_ed25519 \
+  --known-hosts target/hetzner-measure/known_hosts \
+  --remote-results /root/aft/target/index-matrix/full-matrix \
+  --output .cortexkit/internal-docs/investigations/index-matrix/full-matrix \
+  --watch
+```
+
+Without `--watch`, collection runs once. `--stop-after N` hands off after copying
+N distinct finished projects. Subsequent collectors use `collection.json` to
+avoid repeating unchanged copies. A separate collector is required after worker
+handoff; no credentials or reverse-SSH connection are installed on the server.

@@ -50,9 +50,12 @@ def generate(manifest, results, output):
         for mode in ("text", "meaning", "full"):
             build = result.get(mode, {})
             row[mode + "_outcome"] = build.get("outcome", "not_measured")
-            for metric in ("vmhwm_bytes", "wall_ns", "cpu_s", "store_bytes", "store_allocated_bytes", "storage_bytes", "model_bytes"):
+            for metric in ("vmhwm_bytes", "vmhwm_observed_bytes", "cgroup_memory_peak_bytes", "oom_killed", "wall_ns", "cpu_s", "store_bytes", "store_allocated_bytes", "storage_bytes", "model_bytes"):
                 row[mode + "_" + metric] = build.get(metric)
             row[mode + "_reason"] = build.get("reason")
+            failures = build.get("semantic_failures", {})
+            row[mode + "_files_failed"] = failures.get("files_failed")
+            row[mode + "_reported_failed_file_names"] = json.dumps(failures.get("reported_file_names")) if failures else None
             row[mode + "_census_observations"] = build.get("census_observations")
             for component, value in build.get("census_observed_max_bytes", {}).items():
                 row[mode + "_census_observed_max_bytes_" + component] = value

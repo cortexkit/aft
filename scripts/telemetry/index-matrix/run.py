@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
@@ -82,6 +83,7 @@ class Client(OSS.NdjsonClient):
         self.log = log.open("ab")
         self.events_path = log.with_suffix(".memory-events")
         self.cgroup = None
+        self.guard_measurement = None
         # RLIMIT_AS is a conservative fallback: RSS cannot exceed address space.
         # Its refusal is not evidence that resident memory would exceed 48 GiB.
         command = ["prlimit", f"--as={guard_bytes}", "--", str(binary)]
@@ -105,8 +107,20 @@ class Client(OSS.NdjsonClient):
             self.log.close()
             if self.cgroup:
                 self.events_path.write_text((self.cgroup / "memory.events").read_text())
+                self.guard_measurement = read_cgroup_measurement(self.cgroup)
+                save(self.events_path.with_suffix(".cgroup.json"), self.guard_measurement)
                 self.cgroup.rmdir()
 
+
+
+def read_cgroup_measurement(directory):
+    """The cgroup peak survives an OOM kill, unlike the process's /proc files."""
+    result: dict[str, Any] = {"events": {key: int(value) for key, value in
+                         (line.split() for line in (directory / "memory.events").read_text().splitlines())}}
+    peak = directory / "memory.peak"
+    result["memory_peak_bytes"] = int(peak.read_text()) if peak.exists() else None
+    result["peak_definition"] = "cgroup-v2 memory.peak; includes charged file cache, not process RSS"
+    return result
 
 
 def checked(response, operation):
@@ -194,6 +208,41 @@ def census_observed_max(path):
     return observations, maxima
 
 
+def semantic_failure_record(folder):
+    latest = {}
+    statuses = folder / "status.jsonl"
+    if statuses.exists():
+        with statuses.open() as handle:
+            for line in handle:
+                latest = json.loads(line)["response"].get("semantic_index", {})
+    names = set()
+    def failure_paths(value):
+        if isinstance(value, list):
+            for item in value:
+                failure_paths(item)
+        elif isinstance(value, str):
+            names.add(value)
+        elif isinstance(value, dict):
+            for key in ("path", "file", "file_path", "filename"):
+                if isinstance(value.get(key), str):
+                    names.add(value[key])
+    for key in ("failed_files", "failed_file_names", "file_failures", "failures"):
+        failure_paths(latest.get(key))
+    evidence = []
+    for path in sorted((folder / "storage/logs").glob("*.log")) + [folder / "stderr.log"]:
+        if not path.exists():
+            continue
+        with path.open(errors="replace") as handle:
+            for number, line in enumerate(handle, 1):
+                if "fail" in line.lower() or "error" in line.lower():
+                    evidence.append({"log": str(path.relative_to(folder)), "line": number, "text": line.rstrip("\n")})
+    result = {"files_failed": latest.get("files_failed"), "reported_file_names": sorted(names),
+              "names_reported_by_status": bool(names), "semantic_status": latest, "failure_log_lines": evidence,
+              "note": "Only names explicitly supplied by AFT are listed; raw failure/error log lines retain any additional names and reasons."}
+    save(folder / "semantic-failures.json", result)
+    return result
+
+
 def measure_build(binary, root, folder, mode, args):
     folder.mkdir(parents=True, exist_ok=False)
     census = folder / "call-shape.json" if mode == "full" else None
@@ -235,6 +284,8 @@ def measure_build(binary, root, folder, mode, args):
             # Sample while the process is alive: /proc vanishes after shutdown.
             sampler.stop()
             result.update({"vmhwm_bytes": sampler.peak_rss_hwm_kb * 1024 if sampler.hwm_available else None,
+                           "vmhwm_observed_bytes": sampler.peak_rss_hwm_kb * 1024 if sampler.peak_rss_hwm_kb else None,
+                           "vmhwm_final_sample_available": sampler.hwm_available,
                            "sampled_rss_bytes": sampler.peak_rss_kb * 1024,
                            "cpu_s": sampler.cpu_seconds, "cpu_precision": sampler.cpu_precision,
                            "disk_write_bytes": sampler.disk_write_bytes})
@@ -247,6 +298,16 @@ def measure_build(binary, root, folder, mode, args):
             gap = client.close()
             if gap:
                 result["gaps"].append(gap)
+            if client.guard_measurement:
+                result["guard_measurement"] = client.guard_measurement
+                result["cgroup_memory_peak_bytes"] = client.guard_measurement.get("memory_peak_bytes")
+                events = client.guard_measurement["events"]
+                result["oom_killed"] = events.get("oom_kill", 0) > 0 or events.get("oom_group_kill", 0) > 0
+                if result["oom_killed"]:
+                    result["outcome"] = "guard_killed"
+                    result["reason"] = f"cgroup memory.max killed AFT: {events}"
+        if mode in ("meaning", "full"):
+            result["semantic_failures"] = semantic_failure_record(folder)
         observations, maxima = census_observed_max(folder / "memory-census.jsonl")
         result["census_observations"] = observations
         result["census_observed_max_bytes"] = maxima

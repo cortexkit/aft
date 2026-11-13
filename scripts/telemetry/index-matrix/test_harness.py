@@ -25,6 +25,8 @@ def module(name, filename):
 RUN = module("matrix_run_test", "run.py")
 TABLES = module("matrix_tables_test", "tables.py")
 PIN = module("matrix_pin_test", "pin.py")
+MATRIX = module("matrix_driver_test", "matrix.py")
+COLLECT = module("matrix_collector_test", "collect.py")
 
 
 class HarnessTests(unittest.TestCase):
@@ -157,6 +159,46 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(result["file_counts_by_language"], {"Ruby": 2})
         self.assertEqual(result["submodule_count"], 1)
         self.assertIsNone(result["checkout_bytes"])
+
+    def test_cgroup_peak_and_oom_event_survive_process_disappearance(self):
+        (self.root / "memory.events").write_text("low 0\nhigh 0\nmax 13\noom 1\noom_kill 1\noom_group_kill 0\n")
+        (self.root / "memory.peak").write_text("51539607552\n")
+        result = RUN.read_cgroup_measurement(self.root)
+        self.assertEqual(result["events"]["oom_kill"], 1)
+        self.assertEqual(result["memory_peak_bytes"], 51539607552)
+        self.assertIn("not process RSS", result["peak_definition"])
+
+    def test_semantic_failures_keep_names_and_raw_log_evidence(self):
+        (self.root / "status.jsonl").write_text(json.dumps({"response": {"semantic_index": {
+            "files_failed": 2, "failed_files": [{"path": "lib/a.lua"}, "lib/b.lua"]}}}) + "\n")
+        (self.root / "stderr.log").write_text("failed to read lib/c.lua: invalid UTF-8\n")
+        result = RUN.semantic_failure_record(self.root)
+        self.assertEqual(result["files_failed"], 2)
+        self.assertEqual(result["reported_file_names"], ["lib/a.lua", "lib/b.lua"])
+        self.assertIn("lib/c.lua", result["failure_log_lines"][0]["text"])
+        self.assertTrue((self.root / "semantic-failures.json").is_file())
+
+    def test_matrix_orders_smallest_first_and_chromium_last(self):
+        entries = [{"repository": name, "tracked_files": count} for name, count in
+                   (("large/repo", 100), ("chromium/chromium", 1), ("small/repo", 10))]
+        self.assertEqual([row["repository"] for row in MATRIX.ordered(entries)],
+                         ["small/repo", "large/repo", "chromium/chromium"])
+
+    def test_collector_pulls_only_finished_projects_and_does_not_copy_keys(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace(server="root@example", identity=self.root / "private-key", known_hosts=self.root / "known_hosts",
+                               remote_results="/root/aft/target/results", output=self.root / "backup")
+        state = {"repositories": {"small/repo": {"status": "completed", "finished_at": "now", "full_outcome": "guard_killed"},
+                                  "busy/repo": {"status": "running"}}}
+        response = SimpleNamespace(stdout=json.dumps(state), returncode=0)
+        copied = {}
+        with patch.object(COLLECT.subprocess, "run", return_value=response) as invoke:
+            COLLECT.collect_once(args, copied)
+        self.assertEqual(copied, {"small/repo": "now"})
+        commands = [call.args[0] for call in invoke.call_args_list]
+        self.assertTrue(any("small--repo/" in " ".join(command) for command in commands))
+        self.assertFalse(any("busy--repo/" in " ".join(command) for command in commands))
+        self.assertTrue(all(str(args.identity) not in command[-1] for command in commands))
 
     def test_cgroup_joins_before_exec_and_disables_swap(self):
         parent = self.root / "cgroups"
