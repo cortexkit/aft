@@ -15,6 +15,8 @@ import subprocess
 import tarfile
 import math
 
+from compare_engine_only_profile import response_bytes
+
 ROOT = Path(__file__).resolve().parents[2]
 DRIVER = r'''
 #![allow(clippy::unwrap_used, clippy::print_stderr)]
@@ -180,7 +182,7 @@ def compare(args):
     for label in labels:
         rows = [json.loads(line) for line in (args.out / (label + ".jsonl")).read_text().splitlines()]
         assert len(rows) == 6897, (label, len(rows))
-        replies = [json.dumps(row["response"], sort_keys=True, separators=(",", ":")) for row in rows]
+        replies = [response_bytes(row["response"]).decode() for row in rows]
         if reference is None:
             reference = replies
         differences = [i for i, (a, b) in enumerate(zip(reference, replies)) if a != b]
@@ -202,6 +204,7 @@ def compare(args):
     result = {"base":args.base,"candidate":args.candidate,
               "queries_sha256":hashlib.sha256(args.queries.read_bytes()).hexdigest(),
               "profile":"ci-storm; default features; temporary identical instrumentation",
+              "normalization":"Only the random process nonce in snapshot_generation; indexed snapshot prefix must match.",
               "order":["baseline","candidate","candidate","baseline"],
               "runs":reports}
     (args.out / "comparison.json").write_text(json.dumps(result,indent=2)+"\n")

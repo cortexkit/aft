@@ -778,6 +778,10 @@ struct PreparedExactEntry {
     bytes: usize,
 }
 
+// Charge map slack and the Arc/OnceLock allocation even before text is ready.
+// Small files must not hit an unrelated entry limit while bytes remain free.
+const PREPARED_EXACT_ENTRY_BYTES: usize = 256;
+
 #[derive(Default)]
 struct PreparedExactCacheState {
     entries: HashMap<blake3::Hash, PreparedExactEntry>,
@@ -834,22 +838,26 @@ impl PreparedExactCache {
                 (Arc::clone(&entry.text), true)
             } else {
                 waits::record_prepared_text(|counts| counts.misses += 1);
-                // Bound placeholders as well as prepared bytes. A placeholder
-                // single-flights parallel queries without holding the map lock
-                // during normalization and symbol scanning.
-                if state.entries.len() >= 1024 {
+                // Reserve metadata before insertion, so in-flight placeholders
+                // share the same byte budget as completed preparations.
+                while state.bytes + PREPARED_EXACT_ENTRY_BYTES > self.max_bytes
+                    && !state.entries.is_empty()
+                {
                     state.evict_oldest();
-                    waits::record_prepared_text(|counts| counts.evicted_by_count += 1);
+                    waits::record_prepared_text(|counts| counts.evicted_by_bytes += 1);
                 }
                 let cell = Arc::new(OnceLock::new());
-                state.entries.insert(
-                    digest,
-                    PreparedExactEntry {
-                        text: Arc::clone(&cell),
-                        last_used: clock,
-                        bytes: 0,
-                    },
-                );
+                if PREPARED_EXACT_ENTRY_BYTES <= self.max_bytes {
+                    state.entries.insert(
+                        digest,
+                        PreparedExactEntry {
+                            text: Arc::clone(&cell),
+                            last_used: clock,
+                            bytes: PREPARED_EXACT_ENTRY_BYTES,
+                        },
+                    );
+                    state.bytes += PREPARED_EXACT_ENTRY_BYTES;
+                }
                 (cell, false)
             }
         };
@@ -865,8 +873,8 @@ impl PreparedExactCache {
         drop(other_wait);
         let mut state = waits::timed(SearchWait::PrepareCache, || self.state.lock());
         if let Some(entry) = state.entries.get_mut(&digest) {
-            if Arc::ptr_eq(&entry.text, &cell) && entry.bytes == 0 {
-                entry.bytes = prepared.retained_bytes();
+            if Arc::ptr_eq(&entry.text, &cell) && entry.bytes == PREPARED_EXACT_ENTRY_BYTES {
+                entry.bytes += prepared.retained_bytes();
                 state.bytes += prepared.retained_bytes();
             }
         }
@@ -907,11 +915,9 @@ pub(crate) fn verify_cached_exact_matches_in_text_with_member(
 /// gets a new digest and prepares them afresh.
 pub(super) fn prepare_exact_text(text: &str, digest: blake3::Hash) -> Arc<PreparedExactText> {
     static CACHE: OnceLock<PreparedExactCache> = OnceLock::new();
-    // Prepared text runs about twice the size of its source (the normalized
-    // copy plus the symbol list). On AFT's own tree, about 18 MB of text,
-    // that is 36-40 MB, and a 32 MiB cap evicted an entry on every miss
-    // (hit rate 66-80% under eight concurrent searches). The cache is
-    // process-wide, so this cap is its whole memory cost.
+    // The process-wide budget includes text, lazy symbol normalization, and
+    // per-entry metadata. Only bytes drive eviction: a count cap discarded
+    // reusable small files while the byte budget still had room.
     CACHE
         .get_or_init(|| PreparedExactCache::new(64 * 1024 * 1024))
         .prepare(digest, text)
@@ -1778,6 +1784,55 @@ pub(crate) mod tests {
             crate::search_hot_path_measurements::counts().exact_preparations,
             2
         );
+    }
+
+    #[test]
+    fn exact_preparation_keeps_more_than_1024_small_contents_within_byte_budget() {
+        let cache = PreparedExactCache::new(1024 * 1024);
+        let texts = (0..1100)
+            .map(|index| format!("fn cached_{index}() {{}}\n"))
+            .collect::<Vec<_>>();
+        let prepared = texts
+            .iter()
+            .map(|text| cache.prepare(blake3::hash(text.as_bytes()), text))
+            .collect::<Vec<_>>();
+        for (text, expected) in texts.iter().zip(&prepared) {
+            let actual = cache.prepare(blake3::hash(text.as_bytes()), text);
+            assert!(Arc::ptr_eq(expected, &actual));
+        }
+        assert_eq!(
+            cache
+                .preparations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            texts.len(),
+            "unchanged small contents must not be prepared again at the old count limit"
+        );
+        let state = cache.state.lock();
+        assert_eq!(state.entries.len(), texts.len());
+        assert_eq!(
+            state.bytes,
+            prepared
+                .iter()
+                .map(|text| text.retained_bytes())
+                .sum::<usize>()
+                + texts.len() * PREPARED_EXACT_ENTRY_BYTES
+        );
+        assert!(state.bytes <= cache.max_bytes);
+    }
+
+    #[test]
+    fn exact_preparation_metadata_and_text_share_one_budget() {
+        let text = "fn bounded() {}\n";
+        let digest = blake3::hash(text.as_bytes());
+        let charge = PreparedExactText::new(text).retained_bytes() + PREPARED_EXACT_ENTRY_BYTES;
+        let cache = PreparedExactCache::new(charge - 1);
+        cache.prepare(digest, text);
+        assert!(cache.state.lock().entries.is_empty());
+        assert_eq!(cache.state.lock().bytes, 0);
+        let fits = PreparedExactCache::new(charge);
+        fits.prepare(digest, text);
+        assert_eq!(fits.state.lock().entries.len(), 1);
+        assert_eq!(fits.state.lock().bytes, charge);
     }
 
     #[test]
