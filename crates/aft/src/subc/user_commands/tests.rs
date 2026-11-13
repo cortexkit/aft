@@ -457,11 +457,81 @@ fn user_commands_bound_startup_keeps_five_facts_without_inventing_diagnostics() 
         ]
     );
     for fact in &facts[2..4] {
-        assert_eq!(fact.data.state.as_deref(), Some("unavailable"));
+        assert_eq!(fact.data.state.as_deref(), Some("building"));
         assert_eq!(fact.data.value, None);
     }
     assert_eq!(facts[4].data.value, Some(0.0));
     assert_eq!(facts[4].data.unit.as_deref(), Some("count"));
+}
+
+#[test]
+fn user_commands_diagnostics_count_states() {
+    for (values, expected) in [
+        (
+            json!({"errors":null,"warnings":null,"diagnostics":"no_language_server"}),
+            "off",
+        ),
+        (
+            json!({"errors":null,"warnings":null,"diagnostics":"pending","disabled_categories":["diagnostics"]}),
+            "off",
+        ),
+        (
+            json!({"errors":null,"warnings":null,"diagnostics":"pending"}),
+            "building",
+        ),
+        (
+            json!({"errors":null,"warnings":null,"diagnostics":null}),
+            "building",
+        ),
+        (Value::Null, "unavailable"),
+        (json!({"diagnostics":null}), "unavailable"),
+    ] {
+        let mut input = snapshot(false);
+        input["status_bar_values"] = values;
+        let result = preview(&input, None);
+        result.check().unwrap();
+        for fact in &result.facts.unwrap()[2..4] {
+            assert_eq!(fact.data.state.as_deref(), Some(expected), "{input}");
+            assert_eq!(fact.data.value, None);
+        }
+    }
+
+    let mut input = snapshot(false);
+    input["status_bar_values"] = json!({"errors":2,"warnings":0,"diagnostics":"pending"});
+    let result = preview(&input, None);
+    let facts = result.facts.unwrap();
+    assert_eq!(facts[2].data.value, Some(2.0));
+    assert_eq!(facts[2].data.tone.as_deref(), Some("danger"));
+    assert_eq!(facts[3].data.value, Some(0.0));
+    assert_eq!(facts[3].data.unit.as_deref(), Some("count"));
+}
+
+#[test]
+fn user_commands_index_file_count_states() {
+    for (index, expected, count) in [
+        (json!({"status":"off"}), Some("off"), None),
+        (json!({"status":"off","files":10}), Some("off"), None),
+        (json!({"status":"building"}), Some("building"), None),
+        (json!({"status":"building","files":10}), None, Some(10.0)),
+        (json!({"status":"ready"}), Some("unavailable"), None),
+        (json!({"status":"stale"}), Some("unavailable"), None),
+        (json!({"status":"paused"}), Some("unavailable"), None),
+        (json!({"status":"ready","files":10}), None, Some(10.0)),
+    ] {
+        for (row, key) in ["search_index", "callgraph_store", "semantic_index"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut input = snapshot(false);
+            input[key] = index.clone();
+            let result = preview(&input, None);
+            result.check().unwrap();
+            let table = result.table.unwrap();
+            let files = &table.rows[row].cells[1];
+            assert_eq!(files.state.as_deref(), expected, "{key}: {index}");
+            assert_eq!(files.value, count, "{key}: {index}");
+        }
+    }
 }
 
 #[test]

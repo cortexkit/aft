@@ -241,6 +241,35 @@ fn number(value: Option<u64>, unit: &str) -> contract::FactValue {
     }
 }
 
+fn diagnostic_count(values: &Value, category: &str) -> contract::FactValue {
+    if let Some(count) = values[category].as_u64() {
+        return number(Some(count), "count");
+    }
+    let disabled = values["disabled_categories"]
+        .as_array()
+        .is_some_and(|categories| categories.iter().any(|item| item == "diagnostics"));
+    if disabled || values["diagnostics"] == "no_language_server" {
+        return contract::FactValue::state("off");
+    }
+    if values.get(category).is_some_and(Value::is_null)
+        && (values["diagnostics"] == "pending"
+            || values.get("diagnostics").is_some_and(Value::is_null))
+    {
+        return contract::FactValue::state("building");
+    }
+    contract::FactValue::state("unavailable")
+}
+
+fn index_files(index: &Value, index_state: &contract::FactValue) -> contract::FactValue {
+    match index_state.state.as_deref() {
+        Some("off") => contract::FactValue::state("off"),
+        Some("building") if index["files"].as_u64().is_none() => {
+            contract::FactValue::state("building")
+        }
+        _ => number(index["files"].as_u64(), "count"),
+    }
+}
+
 fn preview(snapshot: &Value, running: Option<usize>) -> contract::Preview {
     if [
         "search_index",
@@ -259,7 +288,7 @@ fn preview(snapshot: &Value, running: Option<usize>) -> contract::Preview {
         graph = contract::FactValue::state("off");
     }
     let meaning = state(&snapshot["semantic_index"]);
-    let mut errors = number(snapshot["status_bar_values"]["errors"].as_u64(), "count");
+    let mut errors = diagnostic_count(&snapshot["status_bar_values"], "errors");
     if errors.value.is_some_and(|value| value > 0.0) {
         errors.tone = Some("danger".into());
     }
@@ -275,7 +304,7 @@ fn preview(snapshot: &Value, running: Option<usize>) -> contract::Preview {
         contract::Fact::new("Errors", errors),
         contract::Fact::new(
             "Warnings",
-            number(snapshot["status_bar_values"]["warnings"].as_u64(), "count"),
+            diagnostic_count(&snapshot["status_bar_values"], "warnings"),
         ),
         contract::Fact::new(
             "Shells running",
@@ -291,10 +320,8 @@ fn preview(snapshot: &Value, running: Option<usize>) -> contract::Preview {
         ]
         .into_iter()
         .map(|(label, key, state)| {
-            contract::TableRow::new(
-                label,
-                vec![state, number(snapshot[key]["files"].as_u64(), "count")],
-            )
+            let files = index_files(&snapshot[key], &state);
+            contract::TableRow::new(label, vec![state, files])
         })
         .collect(),
     ));
