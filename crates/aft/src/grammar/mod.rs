@@ -83,8 +83,8 @@ pub struct GrammarRegistry {
 static REGISTRY: OnceLock<Arc<GrammarRegistry>> = OnceLock::new();
 
 /// Set the artifact location from the handling context, without reading or
-/// compiling a grammar. Call only when the handling context opts into dynamic
-/// parsing; built-in-only contexts must not consult grammar storage.
+/// compiling a grammar. Call only when the caller opts into dynamic parsing;
+/// callers using built-in grammars only must not consult grammar storage.
 pub fn configure(config: &crate::config::Config) -> Arc<GrammarRegistry> {
     let root = crate::root_cache::cache_root(config);
     let registry = REGISTRY.get_or_init(|| GrammarRegistry::new(root.clone()));
