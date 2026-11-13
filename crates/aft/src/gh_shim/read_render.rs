@@ -112,6 +112,51 @@ fn list(
     }
 }
 
+fn run_list_workflow(
+    plan: &Plan,
+    selector: &str,
+    execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
+) -> Result<Value, ReadError> {
+    // Match gh's FindWorkflow/getWorkflowsByName: IDs and YAML filenames use
+    // direct lookup; names use whole-name Unicode simple case folding and the
+    // run command's allowed workflow states. Source:
+    // https://github.com/cli/cli/blob/3d5a9e355a837f2f5ee78d7484c118cc1342ad1a/pkg/cmd/workflow/shared/shared.go#L128-L192
+    let direct = || plan.path(&format!("actions/workflows/{}", segment(selector)));
+    let lowercase = selector.to_ascii_lowercase();
+    if (!selector.is_empty() && selector.bytes().all(|byte| byte.is_ascii_digit()))
+        || lowercase.ends_with(".yml")
+        || lowercase.ends_with(".yaml")
+    {
+        return get(direct(), execute);
+    }
+    let name = regex::Regex::new(&format!(r"(?i)\A{}\z", regex::escape(selector)))
+        .map_err(|error| failed(error.to_string()))?;
+    let mut workflows: Vec<_> = list(
+        plan.path("actions/workflows"),
+        Some("workflows"),
+        None,
+        execute,
+    )?
+    .into_iter()
+    .filter(|workflow| {
+        workflow["name"]
+            .as_str()
+            .is_some_and(|value| name.is_match(value))
+            && (workflow["state"] == "active"
+                || (plan.flag("all")
+                    && matches!(
+                        workflow["state"].as_str(),
+                        Some("disabled_manually" | "disabled_inactivity")
+                    )))
+    })
+    .collect();
+    if workflows.len() == 1 {
+        Ok(workflows.remove(0))
+    } else {
+        get(direct(), execute)
+    }
+}
+
 fn search(
     plan: &Plan,
     query_text: String,
@@ -596,10 +641,7 @@ fn native(
         }
         "run list" => {
             let path = if let Some(workflow) = plan.value("workflow") {
-                let workflow = get(
-                    plan.path(&format!("actions/workflows/{}", segment(workflow))),
-                    execute,
-                )?;
+                let workflow = run_list_workflow(plan, workflow, execute)?;
                 if !plan.flag("all") && workflow["state"] != "active" {
                     return Err(refused(
                         "the selected workflow is disabled; include --all to read its runs",

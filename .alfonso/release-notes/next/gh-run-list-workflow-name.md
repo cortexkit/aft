@@ -1,0 +1,1 @@
+- `gh run list --workflow` resolves workflow names to IDs in worker sessions instead of failing with HTTP 404.
