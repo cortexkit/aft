@@ -169,6 +169,18 @@ The manifest independently pins Chromium's subsequently observed default head.
 
 ## Detached full matrix and evidence collection
 
+The active dedicated-server series started at **2026-11-13T23:30:40.416178Z**
+from source commit `fcf1199a8d6b8e52e9d1a03cceca244983c863a2`, as systemd unit
+`aft-index-matrix.service`. Its result root is
+`/root/aft/target/index-matrix/full-matrix`. The launch command below is the
+command used for that series. MLX and Neovim both finished text, meaning, full
+census and 330 timed queries; their finished artifacts have been copied into
+`.cortexkit/internal-docs/investigations/index-matrix/full-matrix/` locally.
+MLX reported zero failed semantic files; Neovim reported the same two unnamed
+failures in both meaning/full phases, preserved in `semantic-failures.json`.
+The service remains running. To keep copying later results after worker handoff,
+start `collect.py --watch` with the command below; no collector runs on the server.
+
 `matrix.py` orders the manifest by tracked-file count (the available consistent
 size measure), with Chromium always last. Each repository runs text, meaning,
 then the full census build and queries; a cgroup-killed full build is a recorded
