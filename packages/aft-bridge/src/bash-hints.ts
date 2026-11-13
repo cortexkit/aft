@@ -111,17 +111,16 @@ export function watchPollDelayMs(elapsedMs: number): number {
 }
 
 /**
- * Clock and sleep used by the bash_watch wait loops. Production uses the
- * suspend-inclusive elapsed clock and a real timer; tests replace both fields so a wait that
- * lasts minutes of simulated time runs in milliseconds.
+ * Clock and sleep used by the bash_watch wait loops. Tests can inject the
+ * WaitClock source without replacing the production elapsed-time calculation.
  */
-const waitClock = new WaitClock();
-
 export const watchClock: {
+  source: WaitClock;
   now: () => number;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 } = {
-  now: () => waitClock.now(),
+  source: new WaitClock(),
+  now: () => watchClock.source.now(),
   sleep: abortableSleep,
 };
 

@@ -1713,7 +1713,7 @@ describe("bash_status tool", () => {
     test(`${host} bash_watch cap includes suspend at the first wake observation`, async () => {
       _resetSubagentCacheForTest();
       __resetSyncWatchAbortForTests();
-      const real = { now: watchClock.now, sleep: watchClock.sleep };
+      const real = { source: watchClock.source, sleep: watchClock.sleep };
       let awake = 0;
       let wall = 0;
       let slept = false;
@@ -1721,7 +1721,7 @@ describe("bash_status tool", () => {
         () => wall,
         () => awake,
       );
-      watchClock.now = () => clock.now();
+      watchClock.source = clock;
       watchClock.sleep = async (ms) => {
         awake += ms;
         wall += ms;
@@ -1754,7 +1754,7 @@ describe("bash_status tool", () => {
         expect(result).toContain("timeout reached without match");
         expect(awake).toBe(250_000);
       } finally {
-        watchClock.now = real.now;
+        watchClock.source = real.source;
         watchClock.sleep = real.sleep;
       }
     });

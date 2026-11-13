@@ -119,7 +119,7 @@ function useFakeWatchClock(): { now: () => number; restore: () => void } {
 
 describe("Pi bash_watch caller role", () => {
   test("Pi bash_watch cap includes suspend at the first wake observation", async () => {
-    const real = { now: watchClock.now, sleep: watchClock.sleep };
+    const real = { source: watchClock.source, sleep: watchClock.sleep };
     let awake = 0;
     let wall = 0;
     let slept = false;
@@ -127,7 +127,7 @@ describe("Pi bash_watch caller role", () => {
       () => wall,
       () => awake,
     );
-    watchClock.now = () => clock.now();
+    watchClock.source = clock;
     watchClock.sleep = async (ms) => {
       awake += ms;
       wall += ms;
@@ -145,7 +145,7 @@ describe("Pi bash_watch caller role", () => {
       expect(result.content[0].text).toContain("timeout reached without match");
       expect(awake).toBe(250_000);
     } finally {
-      watchClock.now = real.now;
+      watchClock.source = real.source;
       watchClock.sleep = real.sleep;
     }
   });
