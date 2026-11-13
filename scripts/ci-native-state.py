@@ -139,9 +139,18 @@ def setup_windows_tool_paths() -> dict[str, Union[Path, str]]:
     return values
 
 
+# Every job creates its own folder inside its run's folder, which moves the
+# run folder's modification time. Jobs stop after 90 minutes, so a run whose
+# folder hasn't changed for longer than this has no job left that can still
+# need its test archive.
+ACTIVE_RUN_SECONDS = 3 * 3600
+
+
 def prune_run_archives(root: Path, run_dir: Path) -> None:
     # Cancelled runs may never finalize. Bound archive retention without ever
-    # traversing Cargo's shared target directory.
+    # traversing Cargo's shared target directory. Several runs share this
+    # runner one job at a time, so low disk must never remove the archive of a
+    # run that still has jobs queued: those jobs would fail to find it.
     before = shutil.disk_usage(root).free
     low_disk = before < 40 * 1024**3
     now = time.time()
@@ -153,7 +162,8 @@ def prune_run_archives(root: Path, run_dir: Path) -> None:
     if low_disk:
         print(f"CI archive disk free before pruning: {before / 1024**3:.1f} GiB", flush=True)
     for old in archives:
-        if low_disk or now - old.stat().st_mtime > 86400:
+        idle = now - old.stat().st_mtime
+        if (low_disk and idle > ACTIVE_RUN_SECONDS) or idle > 86400:
             print(f"Removing CI run archive {old}", flush=True)
             shutil.rmtree(old)
     if low_disk:

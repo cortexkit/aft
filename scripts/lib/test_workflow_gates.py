@@ -1465,6 +1465,29 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
             self.assertTrue(all(not folder.exists() for folder in folders))
             self.assertEqual((target / "warm-dependency").read_bytes(), b"keep")
 
+    def test_low_disk_keeps_the_archive_of_a_run_that_is_still_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "aft-ci"
+            now = 1_700_000_000
+            folders = {}
+            # "active" started its last job an hour ago and still has shards
+            # queued behind other runs; "idle" is past every job's time limit.
+            for name, age in (("idle", self.state.ACTIVE_RUN_SECONDS + 1),
+                              ("active", 3600), ("current", 0)):
+                folder = root / "runs" / name
+                folder.mkdir(parents=True)
+                (folder / "macos-nextest.tar.zst").write_bytes(b"archive")
+                os.utime(folder, (now - age, now - age))
+                folders[name] = folder
+            disk_usage = unittest.mock.Mock(free=10 * 1024**3)
+            with unittest.mock.patch.object(self.state.time, "time", return_value=now), \
+                 unittest.mock.patch.object(self.state.shutil, "disk_usage", return_value=disk_usage), \
+                 unittest.mock.patch("builtins.print"):
+                self.state.prune_run_archives(root, folders["current"])
+            self.assertFalse(folders["idle"].exists())
+            self.assertTrue((folders["active"] / "macos-nextest.tar.zst").exists())
+            self.assertTrue(folders["current"].exists())
+
     def test_cleanup_kills_native_test_descendants_but_not_runner_or_unrelated_processes(self) -> None:
         table = {
             1: (0, "/runner/Runner.Listener"), 2: (1, "/runner/Runner.Worker"),
