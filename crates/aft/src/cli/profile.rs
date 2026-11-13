@@ -36,13 +36,6 @@ const TOP_SYMBOLS: usize = 10;
 // (a real stripped ck-aft sample) run everywhere; only macOS calls them at runtime.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SAMPLE_ROOT_COLUMN: usize = 6;
-#[cfg(test)]
-#[inline(never)]
-#[no_mangle]
-pub extern "C" fn aft_profile_probe() -> usize {
-    std::hint::black_box(0xA_F7usize)
-}
-
 const WAIT_MARKERS: &[&str] = &[
     "semaphore_wait_trap",
     "semaphore_timedwait_trap",
@@ -4207,67 +4200,63 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn test_binary_text_load_address(binary: &Path) -> u64 {
-        let text = command_text(Command::new("otool").arg("-l").arg(binary))
-            .unwrap_or_else(|error| panic!("otool must inspect the cargo test binary: {error}"));
-        let lines = text.lines().collect::<Vec<_>>();
-        let text_segment = lines
-            .iter()
-            .position(|line| line.trim() == "segname __TEXT")
-            .expect("cargo test binary has a __TEXT segment");
-        lines[text_segment..]
-            .iter()
-            .find_map(|line| line.trim().strip_prefix("vmaddr "))
-            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-            .expect("__TEXT segment has a hexadecimal vmaddr")
-    }
-
-    #[cfg(target_os = "macos")]
     #[test]
     fn atos_symbolication_integration_uses_own_debug_binary_when_available() {
         if which::which("atos").is_err() {
             eprintln!("SKIP: atos is not installed");
             return;
         }
-        let binary = std::env::current_exe().expect("test binary path");
         if which::which("dsymutil").is_err() {
             eprintln!("SKIP: dsymutil is not installed");
             return;
         }
-        let dsym = std::env::temp_dir().join(format!(
-            "aft-profile-probe-{}-{}.dSYM",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time after Unix epoch")
-                .as_nanos()
-        ));
-        // dsymutil writes a bundle outside any TempDir; remove it however the
-        // test ends.
-        struct RemoveBundleOnDrop(std::path::PathBuf);
-        impl Drop for RemoveBundleOnDrop {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _dsym_cleanup = RemoveBundleOnDrop(dsym.clone());
-        // A debug test binary can be ~400 MB; allow five minutes for dsymutil
-        // on loaded runners, leaving time to diagnose atos before the test cap.
-        command_text_with_timeout(
-            Command::new("dsymutil").arg(&binary).arg("-o").arg(&dsym),
-            Duration::from_secs(300),
+        let fixture = tempfile::tempdir().expect("profile fixture directory");
+        let source = fixture.path().join("probe.c");
+        let object = fixture.path().join("probe.o");
+        let binary = fixture.path().join("aft-profile-probe");
+        let dsym = fixture.path().join("aft-profile-probe.dSYM");
+        // Keep dSYM construction independent of AFT's growing debug test binary.
+        // The fixture reports its own live __TEXT-relative address, including
+        // ASLR, rather than borrowing an address from the test harness.
+        fs::write(
+            &source,
+            r#"#include <mach-o/dyld.h>
+#include <stdint.h>
+#include <stdio.h>
+__attribute__((noinline)) unsigned aft_profile_probe(void) {
+    volatile unsigned value = 0xAF7;
+    return value;
+}
+int main(void) {
+    if (aft_profile_probe() != 0xAF7) return 1;
+    printf("%llx\n", (unsigned long long)((uintptr_t)&aft_profile_probe -
+                                         (uintptr_t)_dyld_get_image_header(0)));
+    return 0;
+}
+"#,
         )
-        .unwrap_or_else(|error| panic!("dsymutil must create a test-binary dSYM: {error}"));
-        let dwarf = debug_file_in(&dsym, &binary).expect("test binary dSYM contains DWARF");
-        let _ = aft_profile_probe();
-        unsafe extern "C" {
-            fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
-        }
-        let slide = unsafe { _dyld_get_image_vmaddr_slide(0) };
-        let load_address = (test_binary_text_load_address(&binary) as i128 + slide as i128) as u64;
-        let offset = (aft_profile_probe as *const () as usize as u64)
-            .checked_sub(load_address)
-            .expect("profile probe belongs to the test binary __TEXT segment");
+        .expect("write profile fixture");
+        command_text(
+            Command::new("clang")
+                .args(["-g", "-O0", "-c"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&object),
+        )
+        .unwrap_or_else(|error| panic!("clang must compile the debug probe: {error}"));
+        command_text(Command::new("clang").arg(&object).arg("-o").arg(&binary))
+            .unwrap_or_else(|error| panic!("clang must link the debug probe: {error}"));
+        let started = Instant::now();
+        command_text(Command::new("dsymutil").arg(&binary).arg("-o").arg(&dsym))
+            .unwrap_or_else(|error| panic!("dsymutil must create a probe dSYM: {error}"));
+        eprintln!(
+            "probe dsymutil: {:?}, binary: {} bytes",
+            started.elapsed(),
+            fs::metadata(&binary).unwrap().len()
+        );
+        let dwarf = debug_file_in(&dsym, &binary).expect("probe dSYM contains DWARF");
+        let address = command_text(&mut Command::new(&binary)).expect("run debug probe");
+        let offset = u64::from_str_radix(address.trim(), 16).expect("probe prints its own offset");
         // Thousands of distinct addresses force streaming replies past pipe
         // capacity; duplicate offsets would be deduplicated before reaching atos.
         let offsets = (0..8192)
@@ -4275,7 +4264,7 @@ mod tests {
             .collect::<Vec<_>>();
         let offset = format!("0x{offset:x}");
         let symbols = symbolicate_macos(&dwarf, &offsets)
-            .unwrap_or_else(|error| panic!("atos must symbolicate the test-binary dSYM: {error}"));
+            .unwrap_or_else(|error| panic!("atos must symbolicate the probe dSYM: {error}"));
         assert_eq!(
             symbols.len(),
             offsets.len(),
