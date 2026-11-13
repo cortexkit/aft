@@ -157,7 +157,14 @@ def wait_ready(client, mode, deadline, output, sampler=None, phases=None):
                 if mode in ("meaning", "full") and status["semantic_index"].get("backend") != "fastembed":
                     raise ValueError("semantic backend is not fastembed")
                 return status
-            if any(value in {"disabled", "failed", "suspended", "paused", "backend_unavailable", "unavailable"} for value in status_states.values()):
+            feature_keys = {"search_index": "search_index", "semantic_index": "semantic_search", "callgraph_store": "callgraph_store"}
+            # Configure acknowledges before deferred maintenance installs the
+            # semantic worker. Its initial disabled status is not a failure
+            # while the configured feature is enabled; wait for installation.
+            failed = any(value in {"failed", "suspended", "paused", "backend_unavailable", "unavailable"}
+                         or (value in {"disabled", "off"} and status.get("features", {}).get(feature_keys[key]) is False)
+                         for key, value in status_states.items())
+            if failed:
                 raise OSS.NdjsonError(f"index not ready: {status_states}")
             time.sleep(min(0.25, max(0, deadline - time.monotonic())))
 
@@ -173,7 +180,7 @@ def census_observed_max(path):
             if not response.get("success") or not isinstance(response.get("process"), dict):
                 continue
             observations += 1
-            values = {"process." + key: value for key, value in response["process"].items() if type(value) is int}
+            values = {"process." + key: value for key, value in response["process"].items() if type(value) is int and key.endswith("_bytes")}
             for detail in response.get("roots", {}).values():
                 for key, value in detail.get("planes", {}).items():
                     if type(value) is int:

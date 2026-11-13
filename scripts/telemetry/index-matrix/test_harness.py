@@ -65,6 +65,29 @@ class HarnessTests(unittest.TestCase):
     def test_missing_index_state_is_not_ready(self):
         self.assertEqual(RUN.states({}, "meaning"), {"semantic_index": "unknown"})
 
+    def test_readiness_waits_for_configured_semantic_worker_installation(self):
+        class Fake:
+            polls = 0
+            def request(self, command, **kwargs):
+                if command == "memory.census":
+                    return {"success": True, "process": {"rss_bytes": 123}, "roots": {}}
+                self.polls += 1
+                return {"success": True, "features": {"semantic_search": True},
+                        "semantic_index": {"status": "disabled" if self.polls == 1 else "ready", "backend": "fastembed"}}
+        client = Fake()
+        with patch.object(RUN.time, "sleep"):
+            status = RUN.wait_ready(client, "meaning", RUN.time.monotonic() + 10, self.root)
+        self.assertEqual(client.polls, 2)
+        self.assertEqual(status["semantic_index"]["status"], "ready")
+
+    def test_census_component_maxima_only_label_byte_fields_as_bytes(self):
+        path = self.root / "census.jsonl"
+        path.write_text(json.dumps({"response": {"success": True, "process": {"rss_bytes": 101, "allocator_observation_age_ms": 2},
+                                                "roots": {"/project": {"planes": {"search": 17, "semantic": 3}}}}}) + "\n")
+        observations, maxima = RUN.census_observed_max(path)
+        self.assertEqual(observations, 1)
+        self.assertEqual(maxima, {"process.rss_bytes": 101, "root.planes.search": 17, "root.planes.semantic": 3})
+
     def test_shape_rejects_estimated_or_duplicate_groups(self):
         value = {"schema_version": 1, "top_callers": [], "groups": [{"language": "lua", "member": "get", "sites": 7, "targets": 2}]}
         self.assertIs(RUN.validate_shape(value), value)
