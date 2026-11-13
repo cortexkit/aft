@@ -230,9 +230,8 @@ describe("Pi buildHintsFromConfig", () => {
     };
     const out = buildHintsFromConfig(config, new Set());
     expect(out).not.toBeNull();
-    // Hoisted bash name (bash, not aft_bash) appears in the foreground-default
-    // long-running guidance.
-    expect(out).toContain("`bash({ command, wait: true })`");
+    // The code-finding warning names the registered bash tool, not aft_bash.
+    expect(out).toContain("Don't find or read code with grep, find, sed or cat in bash.");
     expect(out).toContain("**After edits**: run aft_inspect for diagnostics;");
   });
 
