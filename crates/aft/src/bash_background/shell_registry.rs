@@ -145,6 +145,7 @@ impl ShellReader {
         self.live.is_none()
     }
 
+    #[cfg(test)]
     pub(crate) fn persisted(row: BashTaskRow) -> Option<(ShellSnapshot, Self)> {
         Self::persisted_observed(row).map(|(snapshot, reader, _)| (snapshot, reader))
     }
