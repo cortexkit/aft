@@ -8847,6 +8847,52 @@ enum SpawnFailure {
     },
 }
 
+pub(crate) struct TypeScriptTempDir(PathBuf);
+
+impl TypeScriptTempDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TypeScriptTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn typescript_server_temp_dir(
+    kind: &ServerKind,
+    storage_root: &Path,
+    env: &mut HashMap<String, String>,
+) -> std::io::Result<Option<TypeScriptTempDir>> {
+    if !matches!(kind, ServerKind::TypeScript(_)) {
+        return Ok(None);
+    }
+    let parent = storage_root.join("lsp-tmp");
+    crate::private_storage::create_dir_all(&parent)?;
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let path = parent.join(format!("typescript-{:032x}", u128::from_le_bytes(random)));
+    // A private, randomly named directory is created atomically; an existing
+    // path is never reused, including remnants of an abruptly stopped AFT.
+    crate::private_storage::create_dir(&path)?;
+    let directory = TypeScriptTempDir(path);
+    let path = directory.path().to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TypeScript temp path is not UTF-8",
+        )
+    })?;
+    // typescript-language-server creates a per-UID folder with a racy
+    // existsSync/mkdirSync pair during macOS startup. Different SDK versions
+    // can start together for one root, so even a per-workspace TMPDIR collides.
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        env.insert(key.into(), path.into());
+    }
+    Ok(Some(directory))
+}
+
 impl PreparedSpawn {
     fn inspect_initialize_timeout(&self) -> Duration {
         self.test_initialize_timeout()
@@ -8923,6 +8969,13 @@ impl PreparedSpawn {
                     })
                 })
                 .flatten();
+        let typescript_temp_dir =
+            typescript_server_temp_dir(&self.kind, &self.storage_root, &mut self.env).map_err(
+                |error| SpawnFailure::NotStarted {
+                    exit_log_line: format!("TypeScript temporary directory unavailable: {error}"),
+                    error: LspError::Io(error),
+                },
+            )?;
         let mut client = match LspClient::spawn_with_reclaim_root(
             self.kind.clone(),
             self.root.clone(),
@@ -8952,6 +9005,7 @@ impl PreparedSpawn {
                 });
             }
         };
+        client._typescript_temp_dir = typescript_temp_dir;
         #[cfg(test)]
         if let Some(hook) = &self.spawned_hook {
             hook(client.child_pid());
@@ -10769,6 +10823,61 @@ mod windows_server_key_tests {
 #[cfg(test)]
 mod failure_hint_tests {
     use super::{failure_hint, rust_failure_with_root_cause, rustup_missing_component};
+
+    #[test]
+    fn typescript_server_temp_roots_are_private_distinct_and_owned() {
+        use super::{typescript_server_temp_dir, ServerKind};
+        use std::collections::HashMap;
+        let storage = tempfile::tempdir().unwrap();
+        let mut env = HashMap::from([("TMPDIR".into(), "ambient-shared-temp".into())]);
+        let old = typescript_server_temp_dir(
+            &ServerKind::TypeScript(Some("4.9.5".into())),
+            storage.path(),
+            &mut env,
+        )
+        .unwrap()
+        .unwrap();
+        let old_path = old.path().to_path_buf();
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            assert_eq!(std::path::Path::new(&env[key]), old_path);
+        }
+        let current = typescript_server_temp_dir(
+            &ServerKind::TypeScript(Some("5.9.3".into())),
+            storage.path(),
+            &mut env,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(old.path(), current.path());
+        assert!(current.path().starts_with(storage.path()));
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            assert_eq!(std::path::Path::new(&env[key]), current.path());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(current.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+        std::fs::create_dir(old.path().join("typescript-language-server501")).unwrap();
+        std::fs::create_dir(current.path().join("typescript-language-server501")).unwrap();
+        drop(old);
+        assert!(!old_path.exists());
+        assert!(current.path().is_dir());
+        let before = env.clone();
+        assert!(
+            typescript_server_temp_dir(&ServerKind::Rust, storage.path(), &mut env)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(env, before);
+    }
 
     /// rust-analyzer's bare "Failed to load workspaces." status gains the
     /// Cargo error line from its stderr; a status that already quotes Cargo's
