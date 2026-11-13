@@ -161,14 +161,14 @@ describe("OpenCode 2 registered surface", () => {
     expect(shared.bash.description).toContain("use bash({wait:true})");
   });
 
-  test("the workflow hints name shell once renamed and keep bash the program", () => {
+  test("the trimmed workflow hints name the registered shell tool once renamed", () => {
     const tools = definitions();
     const hints = buildHintsForRegisteredTools(CONFIG, new Set(Object.keys(tools)));
     if (hints === null) throw new Error("expected a hints block");
     const v2 = renameV2ToolReferences(hints);
-    expect(v2).toContain("`shell({ command, wait: true })`");
-    expect(v2).toContain("python, node, bash itself, vim");
-    expect(v2).not.toContain("`bash`");
+    expect(v2).toContain("Don't find or read code with grep, find, sed or cat in shell.");
+    expect(v2).toContain("Pass wait: true when you need a long command's result");
+    expect(v2).not.toMatch(/\bbash\b/);
   });
 });
 

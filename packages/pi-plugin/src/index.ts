@@ -1,5 +1,5 @@
 /**
- * AFT (Agent File Tools) extension for Pi coding agent.
+ * AFT (Agent Foundational Toolkit) extension for Pi coding agent.
  *
  * Config is loaded from two levels (project overrides user):
  * - User:    ~/.config/cortexkit/aft.jsonc (XDG_CONFIG_HOME-aware)

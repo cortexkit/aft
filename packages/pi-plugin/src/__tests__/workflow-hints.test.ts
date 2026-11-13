@@ -39,162 +39,36 @@ describe("Pi hashline tag-source guidance", () => {
 });
 
 describe("Pi buildWorkflowHints", () => {
-  test("renders all four sections with every tool registered and bg enabled", () => {
-    const out = buildWorkflowHints({
-      bashBackgroundEnabled: true,
-      bashCompressionEnabled: true,
-      absentTools: new Set(),
-    });
-    expect(out).not.toBeNull();
-    expect(out).toContain("## IMPORTANT NOTICE about your tools");
-    // Opening notice: non-standard tool set, reach for it first (parity).
-    expect(out).toContain("You are equipped with a non-standard tool set");
-    expect(out).toContain("Always reach for these tools first");
-    expect(out).toContain("**Parallel tool calls**");
-    expect(out).toContain("emit them in ONE response instead of serializing");
-    expect(out).toContain("**Web/URL access**");
-    expect(out).toContain('`aft_outline({ target: "<url>" })`');
-    expect(out).not.toContain("aft_outline({ url })");
-    expect(out).toContain("**Code exploration**");
-    expect(out).toContain("`aft_search` is the primary code-search tool");
-    expect(out).not.toContain("hint");
-    expect(out).toContain("auto-routes concepts, identifiers, regex");
-    // Imperative anti-bash-grep steer with concrete reflex translations (parity).
-    expect(out).toContain("DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash`");
-    expect(out).toContain("the bash path is unindexed, unranked, serial");
-    // Portable bash code-search STOP steer
-    expect(out).toContain(
-      "If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead.",
-    );
-    expect(out).toContain("Reflex translations:");
-    expect(out).toContain('aft_search({ query: "handleAuth" })');
-    expect(out).toContain("Use `aft_callgraph`");
-    expect(out).toContain("**Codebase health & diagnostics**");
-    expect(out).toContain("`aft_inspect`");
-    expect(out).toContain("diagnostics");
-    expect(out).toContain("before you run tests or commit");
-    expect(out).toContain("does not surface compile/type errors automatically");
-    expect(out).toContain("**Long-running commands**");
-    // Foreground-default guidance (parity with OpenCode).
-    expect(out).toContain("run them in the FOREGROUND");
-    expect(out).toContain("wait: true");
-    expect(out).toContain("auto-promote can hand you a reminder");
-    expect(out).toContain("`background: true` is ONLY for when you have OTHER useful work");
-    expect(out).toContain("Do NOT background a command and then immediately `bash_watch` it");
-    expect(out).toContain("the user can interrupt");
-    expect(out).toContain("Never loop `bash_status`");
-    expect(out).not.toContain("taskId");
-  });
-
-  test("replaces zoom steering with read when zoom is disabled", () => {
+  test("omits unavailable navigation tools without fallback wording", () => {
     const out = buildWorkflowHints({
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       absentTools: new Set(["aft_zoom"]),
     });
-    expect(out).toContain("→ `read` for symbol(s)");
     expect(out).not.toContain("aft_zoom");
-    expect(out).toContain(
-      "If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline` instead.",
-    );
+    expect(out).not.toContain("Then aft_outline");
+    expect(out).not.toContain("**Web pages**");
+    expect(out).toContain("start with aft_search;");
   });
 
-  test("omits bash STOP steer when bash is absent", () => {
-    const out = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
-      absentTools: new Set(["bash"]),
-    });
-    expect(out).not.toContain("STOP —");
-  });
-
-  test("steers to grep tool when aft_search is absent", () => {
-    const out = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
-      absentTools: new Set(["aft_search"]),
-    });
-    expect(out).toContain(
-      "If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead.",
-    );
-  });
-
-  test("omits bg-bash section when background is disabled", () => {
-    const out = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
-      absentTools: new Set(),
-    });
-    expect(out).not.toContain("**Long-running commands**");
-  });
-
-  test("shows pipe guidance only when compression is enabled", () => {
-    const on = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: true,
-      absentTools: new Set(),
-    });
-    expect(on).toContain("bash output is auto-compressed for non-piped commands");
-    expect(on).toContain("Piped commands run verbatim and show the pipeline's output");
-    expect(on).toContain("`bun test | grep fail` → run `bun test`");
-    // The agent can't check the config — the section is gated instead of hedged.
-    expect(on).not.toContain("compression is on,");
-
-    const off = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
-      absentTools: new Set(),
-    });
-    expect(off).not.toContain("bash output is auto-compressed");
-    expect(off).not.toContain("`bun test | grep fail`");
-  });
-
-  test("omits navigate when aft_callgraph is absent", () => {
-    const out = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
-      absentTools: new Set(["aft_callgraph"]),
-    });
-    expect(out).not.toContain("Use `aft_callgraph`");
-  });
-
-  test("inspect hint is gated by registered tool availability", () => {
-    const registered = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
-      absentTools: new Set(),
-    });
-    expect(registered).toContain("**Codebase health & diagnostics**");
-    expect(registered).toContain("aft_inspect");
-
-    const minimal = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
-      absentTools: new Set(["aft_inspect"]),
-    });
-    expect(minimal).not.toContain("**Codebase health & diagnostics**");
-    expect(minimal).not.toContain("aft_inspect");
-  });
-
-  test("returns null when all sections gated off by absentTools", () => {
-    const out = buildWorkflowHints({
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
-      absentTools: new Set([
-        "aft_outline",
-        "aft_zoom",
-        "aft_search",
-        "aft_callgraph",
-        "aft_inspect",
-        "grep",
-        "read",
-        "bash",
-        "bash_status",
-      ]),
-    });
-    // null proves the parallel-tool-call frame is never emitted on its own
-    // (unshift runs only when sections already have content).
-    expect(out).toBeNull();
+  test("returns null when only the safety tool is registered", () => {
+    expect(
+      buildWorkflowHints({
+        bashBackgroundEnabled: false,
+        bashCompressionEnabled: false,
+        absentTools: new Set([
+          "aft_outline",
+          "aft_zoom",
+          "aft_search",
+          "aft_callgraph",
+          "aft_inspect",
+          "grep",
+          "read",
+          "bash",
+          "bash_status",
+        ]),
+      }),
+    ).toBeNull();
   });
 });
 
@@ -359,7 +233,7 @@ describe("Pi buildHintsFromConfig", () => {
     // Hoisted bash name (bash, not aft_bash) appears in the foreground-default
     // long-running guidance.
     expect(out).toContain("`bash({ command, wait: true })`");
-    expect(out).toContain("**Codebase health & diagnostics**");
+    expect(out).toContain("**After edits**: run aft_inspect for diagnostics;");
   });
 
   test("never names the removed prefixed host tools", () => {

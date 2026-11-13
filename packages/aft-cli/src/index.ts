@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * @cortexkit/aft — unified CLI for Agent File Tools.
+ * @cortexkit/aft — unified CLI for Agent Foundational Toolkit.
  *
  * Entry point parses argv and dispatches to commands. Harness selection
  * (OpenCode, Pi) is auto-detected from installed config paths; explicit
